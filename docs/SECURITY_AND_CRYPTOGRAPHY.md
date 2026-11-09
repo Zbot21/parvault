@@ -151,7 +151,7 @@ Executed across 100 virtual mesh nodes hosting **50 vaults $\times$ 100 MB (`5.0
 - **Proactive Witness Self-Healing:** `58` degraded stripes automatically repaired back to `20/20` shards in `442.49 ms`
 - **End-to-End Vault Restoration:** **50 / 50 vaults (`5,000,000,000 bytes`) verified with `0 bytes` data loss**
 
-### 8.3 8-Profile Network & Hardware Degradation Matrix (`parvault benchmark-matrix`)
+### 8.3 8-Profile Network & Hardware Degradation Matrix (`parvault-bench benchmark-matrix`)
 | Profile ID | Degradation Scenario | Simulated Network & Hardware Conditions | Recovery Strategy | Integrity Status |
 | :--- | :--- | :--- | :--- | :---: |
 | **1. `FiberLanBaseline`** | Gigabit LAN / Fiber Homelab | `1 ms` RTT, `0%` packet loss, NVMe I/O | Hedged $K$-of-$N$ parallel read | **PASS (`0 bytes` lost)** |

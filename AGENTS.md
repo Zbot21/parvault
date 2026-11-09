@@ -1,6 +1,6 @@
 # AI Agent & Systems Engineer Guide (`AGENTS.md`)
 
-This document is the authoritative architectural, security, and verification manual for AI coding agents and human systems engineers working on **`parvault`** (library crate `parvault`, binaries `parvault` and `parvault-seed`).
+This document is the authoritative architectural, security, and verification manual for AI coding agents and human systems engineers working on **`parvault`** (library crate `parvault`, binaries `parvault`, `parvault-seed`, and `parvault-bench`).
 
 ---
 
@@ -12,11 +12,13 @@ This document is the authoritative architectural, security, and verification man
 1. **Library Crate (`parvault` — `src/lib.rs`):**
    Embeddable Rust API exposing streaming encryption, Reed-Solomon erasure coding over $GF(2^8)$, incremental folder synchronization (`FolderSyncEngine`), Web-of-Trust admission, Proof-of-Retrievability (`PoR`), and elastic bootstrap state machines.
 2. **Client & Peer Daemon (`parvault` — `src/main.rs`):**
-   Runs on user workstations, laptops, desktops, or homelab nodes that own plaintext folders (`watch-folder`, `diff-folder`, `restore-folder`, `recover-from-seed`, `file store`, `file restore`, `identity`, `issue-device-cert`, `verify-device-cert`, `scrub`, `status`, `daemon start`). Holds the user's client-side `MasterKey` / `PqVaultMasterKey`.
+   Runs on user workstations, laptops, desktops, or homelab nodes that own plaintext folders (`watch-folder`, `diff-folder`, `list-snapshot`, `restore-folder`, `recover-from-seed`, `file store`, `file restore`, `identity`, `issue-device-cert`, `verify-device-cert`, `scrub`, `leave`, `status`, `daemon start`). Holds the user's client-side `MasterKey` / `PqVaultMasterKey`.
 3. **Standalone Zero-Trust Seed & Redundancy Server (`parvault-seed` — `src/bin/parvault-seed.rs`):**
    Runs on headless 24/7 hardware (NAS, Raspberry Pi, Unraid/TrueNAS, VPS) in two strictly zero-plaintext modes (`holds_own_plaintext_files == false`):
    - `--mode homelab-vault` (`SeedServerMode::HomelabRedundancyVault`): Authenticates the owner's personal devices via post-quantum `PersonalDeviceCert`s (`0.0x` self-quota tax) and answers network PoR audits 24/7 to earn `TrustLevel::HighUptimeAnchor` (`16-of-20` `EarnedHomelabAnchorPool`, `5.0x` reciprocity multiplier).
    - `--mode public-bootstrap` (`SeedServerMode::PublicNetworkBootstrapper`): Stateless `FoundationSeedAnchor` that ingests only anonymized `.bshard` leases during cold-start (`1..19` peers) and automatically drains to `0` shards as verified organic community peers join.
+4. **Empirical Benchmark & Simulation Suite (`parvault-bench` — `src/bin/parvault-bench.rs`):**
+   Dedicated benchmark binary (`benchmark` / `10-node`, `benchmark100-node` / `100-node`, and `benchmark-matrix` / `matrix`) separated from the production `parvault` binary so user installations stay lean.
 
 ---
 

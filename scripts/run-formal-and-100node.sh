@@ -63,8 +63,8 @@ echo "========================================================================"
 echo " PART 3: 100-Node Empirical Validation Run (50 x 100 MB Vaults, 30% Churn)"
 echo "========================================================================"
 
-cargo build --release --bin parvault
-"$CARGO_TARGET_DIR/release/parvault" benchmark100-node \
+cargo build --release --bin parvault-bench
+"$CARGO_TARGET_DIR/release/parvault-bench" benchmark100-node \
   --num-nodes 100 \
   --num-vaults 50 \
   --vault-size-mb 100 \

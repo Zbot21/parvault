@@ -49,17 +49,22 @@ Global option: `-c, --config <PATH>` loads a custom `config.toml` file before ex
 | `parvault restore-folder` | `--snapshot <PATH>` *(required)*<br>`--out-dir <PATH>` *(required)*<br>`--key-hex <HEX>` *(optional)*<br>`--file <REL_PATH>` *(optional selective single-file restore)* | Reconstructs Reed-Solomon shards in $GF(2^8)$, verifies `AES-256-GCM` tags and end-to-end file SHA-256 on a staging file, blocks path/symlink traversal (`resolve_safe_restore_path`), and atomically writes the restored directory tree (or just `--file <REL_PATH>`) into `<out-dir>`. |
 | `parvault recover-from-seed` | `--seed-phrase <PHRASE>` *(required)*<br>`--vault-namespace <NS>` *(default: `"default"`)*<br>`--catalog-envelope <PATH>` *(required)*<br>`--out-dir <PATH>` *(required)* | **Zero-Local-State "House Fire" Recovery (`ADR-15`):** Deterministically re-derives `MasterKey`, 512-bit `PqVaultMasterKey`, `NodeIdentity`, and `dht_key` from `(seed_phrase, vault_namespace)` using 10,000 rounds of key stretching, opens the `EncryptedVaultCatalogEnvelope`, and restores the entire directory tree into `<out-dir>`. |
 
-### 2.3 Single-File Vault Operations, Scrubbing, Daemon & Benchmarks
+### 2.3 Single-File Vault Operations, Scrubbing, Graceful Leave & Daemon
 | Command | Flags & Arguments | Description |
 | :--- | :--- | :--- |
 | `parvault file store` | `<PATH>` or `--path <PATH>` *(required)*<br>`--tier <consumer\|mixed\|homelab\|relay>` *(default: `consumer`)*<br>`--key-hex <HEX>` *(optional)* | Streams a single file in 16 MiB stripes, encrypts with `AES-256-GCM`, encodes into Reed-Solomon shards, and writes the encrypted manifest. |
 | `parvault file restore` | `<MANIFEST_OR_ROOT>` or `--manifest-or-root <ARG>` *(required)*<br>`<OUTPUT>` or `--output <PATH>` *(required)*<br>`--key-hex <HEX>` *(optional)* | Reconstructs and decrypts a single file from its 64-character hex File Merkle Root or `.manifest.bin` path. |
 | `parvault scrub` | *(none)* | Scans every local `.shard` and `.bshard` file on disk, recomputes leaf SHA-256 digests, and quarantines any bit-rotted shard files (`BlockStore::scrub_all_shards`). |
+| `parvault leave` | `--handoff-to <CSV>` *(optional)*<br>`--keep-local` *(optional)* | Gracefully decommissions the node, performing a `1.0x` direct shard handoff and writing a signed `graceful_departure_receipt.json` that preserves Earned Standing without PoR slashing. |
 | `parvault status` | *(none)* | Displays node configuration, active transport (`TCP + Noise XX + Yamux`), storage quota usage, minimum free disk reserve, bandwidth rate limits, SLA erasure pools, and Earned Standing ladder. |
 | `parvault daemon start` | `--listen <MULTIADDR>` *(default: `/ip4/0.0.0.0/tcp/4001`)*<br>`--enable-quic` *(optional)* | Starts the asynchronous P2P storage, Kademlia DHT, Gossipsub slashing, and stateless PoR responder daemon. |
-| `parvault benchmark` | `--nodes <CSV>` `--payload-mib <MIB>` `--por-challenges <N>` `--killed-node-indices <CSV>` | Runs the 10-node live containerized Noise XX + PoR + 4-node kill recovery benchmark. |
-| `parvault benchmark100-node` | `--num-nodes 100` `--num-vaults 50` `--vault-size-mb 100` `--churn-percent 30` | Runs the 100-node scale & 30% rolling churn benchmark with proactive `18/20` witness repair. |
-| `parvault benchmark-matrix` | `--payload-kb <KB>` *(default: `256`)* | Runs the 8-Profile Network & Hardware Degradation Matrix with Hedged Parallel $K$-of-$N$ recovery. |
+
+### 2.4 Dedicated Empirical Benchmark Binary (`parvault-bench`)
+| Command | Flags & Arguments | Description |
+| :--- | :--- | :--- |
+| `parvault-bench benchmark` *(alias: `10-node`)* | `--nodes <CSV>` `--payload-mib <MIB>` `--por-challenges <N>` `--killed-node-indices <CSV>` | Runs the 10-node live containerized Noise XX + PoR + 4-node kill recovery benchmark. |
+| `parvault-bench benchmark100-node` *(alias: `100-node`)* | `--num-nodes 100` `--num-vaults 50` `--vault-size-mb 100` `--churn-percent 30` | Runs the 100-node scale & 30% rolling churn benchmark with proactive `18/20` witness repair. |
+| `parvault-bench benchmark-matrix` *(alias: `matrix`)* | `--payload-kb <KB>` *(default: `256`)* | Runs the 8-Profile Network & Hardware Degradation Matrix with Hedged Parallel $K$-of-$N$ recovery. |
 
 ---
 

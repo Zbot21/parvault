@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "parvault-seed"
 path = "src/bin/parvault-seed.rs"
 
+[[bin]]
+name = "parvault-bench"
+path = "src/bin/parvault-bench.rs"
+
 [lib]
 name = "parvault"
 path = "src/lib.rs"

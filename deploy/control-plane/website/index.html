@@ -484,7 +484,7 @@
       <span class="sec-num">Reproducible via CLI</span>
     </h2>
     <p>
-      Every protocol invariant is model-checked in <strong>TLA+ (TLC)</strong> and <strong>Stateright</strong>, and every performance target is reproducible directly from the binary using <code>parvault benchmark-matrix</code> and <code>parvault benchmark100-node</code>:
+      Every protocol invariant is model-checked in <strong>TLA+ (TLC)</strong> and <strong>Stateright</strong>, and every performance target is reproducible directly from the dedicated benchmark binary using <code>parvault-bench benchmark-matrix</code> and <code>parvault-bench benchmark100-node</code>:
     </p>
     <table class="util-table">
       <thead>
@@ -497,19 +497,19 @@
       </thead>
       <tbody>
         <tr>
-          <td><strong>100-Node Rolling Churn Benchmark</strong> (<code>parvault benchmark100-node</code>)</td>
+          <td><strong>100-Node Rolling Churn Benchmark</strong> (<code>parvault-bench benchmark100-node</code>)</td>
           <td>100 nodes across 10 ASNs, <code>50 &times; 100 MB</code> (<code>5.0 GB</code>) vaults, <code>30%</code> node reboot churn</td>
           <td class="mono">Boot: <strong>30.9 ms</strong> | Upload: <strong>5.43 s</strong> | <strong>5,700</strong> PoR audits | <strong>120</strong> shards self-healed (<code>10.7%</code> repair tax)</td>
           <td class="ok">PASS (0 Bytes Lost)</td>
         </tr>
         <tr>
-          <td><strong>10-Node Docker + <code>tc netem</code> Hard-Kill</strong> (<code>parvault benchmark</code>)</td>
+          <td><strong>10-Node Docker + <code>tc netem</code> Hard-Kill</strong> (<code>parvault-bench benchmark</code>)</td>
           <td>1 GiB streaming vault, <code>5 ms</code> delay, <code>1%</code> packet loss, simultaneous <code>docker kill</code> of 4/10 nodes</td>
           <td class="mono">PoR p99.9: <strong>25.09 ms</strong> (&le; 300 ms SLA) | Full 1 GiB GF(2<sup>8</sup>) restore: <strong>52.74 s</strong></td>
           <td class="ok">PASS (SHA-256 Match)</td>
         </tr>
         <tr>
-          <td><strong>8-Profile Degraded Network Matrix</strong> (<code>parvault benchmark-matrix</code>)</td>
+          <td><strong>8-Profile Degraded Network Matrix</strong> (<code>parvault-bench benchmark-matrix</code>)</td>
           <td>15% packet loss Wi-Fi mesh, 260 ms satellite, 1-core Cortex-A53 gateway, 10% Byzantine poisoners, PQ Hybrid + Onion mode</td>
           <td class="mono">Hedged parallel <code>N</code>-read speedup: <strong>1.14x – 1.44x</strong> | Peak RAM: <strong>3.52 MiB</strong></td>
           <td class="ok">8/8 Profiles PASS</td>

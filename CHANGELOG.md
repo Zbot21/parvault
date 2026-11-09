@@ -25,7 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - Dynamic Uptime Trust Ladder (`UntrustedProbationary` $\to$ `VerifiedNeighbor` $\to$ `HighUptimeAnchor` $\to$ `SlashedQuarantined`) with `/24` subnet caps (`1`, `2`, `4`, `0`) and incremental `FolderSyncEngine`.
 - **4-Layer Cryptographic Shard Anonymization & Degraded-Network Hedged Recovery (`ADR-11`):**
   - Unlinkable 256-bit `BlindedShardId` locators ($\Omega_{\text{search}} \ge 2^{224}$), per-shard `BlindedShardCapability` keys ($V_i$), single-use `AnonymousQuotaVoucher`s, and 1-hop onion relay envelopes (`src/storage/anonymity.rs`).
-  - Hedged parallel $K$-of-$N$ shard recovery validated across the 8-profile degradation matrix (`parvault benchmark-matrix`, `src/bench_matrix.rs`).
+  - Hedged parallel $K$-of-$N$ shard recovery validated across the 8-profile degradation matrix (`parvault-bench benchmark-matrix`, `src/bench_matrix.rs`).
 - **Post-Quantum Hybrid Cryptography (`ADR-12`):**
   - `HybridKemKeypair` combining classical `X25519` with **NIST FIPS 203 `ML-KEM-768`** via `HKDF-SHA512`.
   - `HybridPqSigningKeypair` combining classical `Ed25519` with **NIST FIPS 204 `ML-DSA-65`**.

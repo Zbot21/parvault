@@ -109,7 +109,7 @@ echo "========================================================================"
 echo " STEP 4: Running 1 GiB 10-Node Validation Benchmark + 4-Node Hard Kill  "
 echo "========================================================================"
 
-"$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/parvault" benchmark \
+"$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/parvault-bench" benchmark \
   --nodes "10.42.1.11:4001,10.42.1.12:4001,10.42.1.13:4001,10.42.1.14:4001,10.42.1.15:4001,10.42.1.16:4001,10.42.1.17:4001,10.42.2.18:4001,10.42.2.19:4001,10.42.2.20:4001" \
   --payload-mib 1024 \
   --por-challenges 50 \

@@ -133,49 +133,6 @@ pub enum Commands {
         #[arg(long)]
         key_hex: Option<String>,
     },
-    /// Run the 10-Node Empirical Validation Benchmark over live libp2p + Noise containers.
-    Benchmark {
-        /// Comma-separated list of target node IP:port addresses.
-        #[arg(
-            long,
-            default_value = "10.42.1.11:4001,10.42.1.12:4001,10.42.1.13:4001,10.42.1.14:4001,10.42.1.15:4001,10.42.1.16:4001,10.42.1.17:4001,10.42.2.18:4001,10.42.2.19:4001,10.42.2.20:4001"
-        )]
-        nodes: String,
-
-        /// Total payload size in MiB (default 1024 MiB = 1 GiB).
-        #[arg(long, default_value_t = 1024)]
-        payload_mib: usize,
-
-        /// Number of concurrent PoR challenges to fire across the 10 nodes.
-        #[arg(long, default_value_t = 50)]
-        por_challenges: usize,
-
-        /// Comma-separated 0-based indices of nodes to simulate hard-killed during restore (e.g. "0,1,2,3").
-        #[arg(long, default_value = "0,1,2,3")]
-        killed_node_indices: String,
-
-        /// Optional shell command to execute right before reconstruction to hard-kill container nodes.
-        #[arg(long)]
-        kill_cmd: Option<String>,
-    },
-    /// Run the 100-Node Empirical Validation Benchmark (50 x 100 MB vaults, continuous PoR, 30% rolling churn).
-    Benchmark100Node {
-        /// Number of daemon nodes in the mesh (default 100 across 10 metro ASN cohorts).
-        #[arg(long, default_value_t = 100)]
-        num_nodes: usize,
-
-        /// Number of concurrent file vaults to store and audit (default 50).
-        #[arg(long, default_value_t = 50)]
-        num_vaults: usize,
-
-        /// Size of each file vault in MB (default 100 MB).
-        #[arg(long, default_value_t = 100)]
-        vault_size_mb: usize,
-
-        /// Rolling node reboot churn percentage (default 30%).
-        #[arg(long, default_value_t = 30)]
-        churn_percent: usize,
-    },
     /// Continuously watch and back up a local directory tree to the Neighborhood Cloud mesh (ADR-10).
     WatchFolder {
         /// Path to the local directory to back up.
@@ -291,14 +248,6 @@ pub enum Commands {
         /// Keep local shard copies on disk after handoff (default: false — removes evacuated shards when `--handoff-to` is provided).
         #[arg(long, default_value_t = false)]
         keep_local: bool,
-    },
-    /// Run the 8-Profile Network & Hardware Degradation Benchmark Matrix (covering 5%-15% packet loss,
-    /// asymmetric broadband, satellite latency, constrained 1-core gateways, Byzantine poisoning,
-    /// 4-layer onion shard anonymization, and Hedged Parallel N-Read recovery).
-    BenchmarkMatrix {
-        /// Per-profile payload size in KiB (default 256 KiB).
-        #[arg(long, default_value_t = 256)]
-        payload_kb: usize,
     },
 }
 
