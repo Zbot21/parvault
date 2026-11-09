@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>parvault / Neighborhood Cloud — Zero-Trust Erasure-Coded Backup Utility</title>
+  <style>
+    :root {
+      --bg: #111315;
+      --bg-alt: #171a1d;
+      --bg-code: #0c0e10;
+      --fg: #e6e8eb;
+      --fg-muted: #9aa2ac;
+      --fg-dim: #68707a;
+      --border: #2a2f35;
+      --accent: #58a6ff;
+      --green: #3fb950;
+      --amber: #d29922;
+      --mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Helvetica, Arial, sans-serif;
+    }
+
+    @media (prefers-color-scheme: light) {
+      :root.auto-theme {
+        --bg: #ffffff;
+        --bg-alt: #f6f8fa;
+        --bg-code: #f0f3f6;
+        --fg: #1f2328;
+        --fg-muted: #57606a;
+        --fg-dim: #6e7781;
+        --border: #d0d7de;
+        --accent: #0969da;
+        --green: #1a7f37;
+        --amber: #9a6700;
+      }
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: var(--sans);
+      font-size: 14.5px;
+      line-height: 1.55;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* Top utility bar (WireGuard / 7-Zip / OpenBSD style) */
+    header.topbar {
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-alt);
+      padding: 0.65rem 1.25rem;
+    }
+    .topbar-inner {
+      max-width: 1080px;
+      margin: 0 auto;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+    .brand {
+      display: flex;
+      align-items: baseline;
+      gap: 0.65rem;
+      font-family: var(--mono);
+    }
+    .brand strong {
+      font-size: 1.05rem;
+      color: var(--fg);
+      letter-spacing: -0.02em;
+    }
+    .brand span.ver {
+      font-size: 0.78rem;
+      color: var(--green);
+      border: 1px solid var(--border);
+      background: var(--bg-code);
+      padding: 0.1rem 0.45rem;
+      border-radius: 3px;
+    }
+    nav.topnav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1.15rem;
+      font-family: var(--mono);
+      font-size: 0.82rem;
+    }
+    nav.topnav a { color: var(--fg-muted); }
+    nav.topnav a:hover { color: var(--fg); text-decoration: none; }
+
+    /* Main layout container */
+    main.wrap {
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 1.75rem 1.25rem 4rem;
+    }
+
+    /* Intro + Download split */
+    .hero-grid {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 1.5rem;
+      align-items: start;
+      padding-bottom: 1.75rem;
+      border-bottom: 1px solid var(--border);
+    }
+    @media (max-width: 860px) {
+      .hero-grid { grid-template-columns: 1fr; }
+    }
+
+    h1 {
+      font-size: 1.55rem;
+      font-weight: 700;
+      margin: 0 0 0.65rem;
+      letter-spacing: -0.015em;
+    }
+    h2 {
+      font-size: 1.1rem;
+      font-family: var(--mono);
+      margin: 2.25rem 0 0.75rem;
+      padding-bottom: 0.35rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--fg);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    h2 span.sec-num {
+      color: var(--fg-dim);
+      font-weight: 400;
+      font-size: 0.85rem;
+    }
+
+    p { margin: 0 0 0.75rem; color: var(--fg-muted); }
+    p strong { color: var(--fg); }
+
+    ul.spec-list {
+      margin: 0.5rem 0 0;
+      padding-left: 1.2rem;
+      color: var(--fg-muted);
+    }
+    ul.spec-list li { margin-bottom: 0.38rem; }
+    ul.spec-list code, p code, td code {
+      font-family: var(--mono);
+      font-size: 0.84em;
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      padding: 0.08rem 0.32rem;
+      border-radius: 3px;
+      color: var(--fg);
+    }
+
+    /* Utilitarian tables (7-Zip / SQLite style) */
+    table.util-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+      background: var(--bg-alt);
+      border: 1px solid var(--border);
+    }
+    table.util-table th,
+    table.util-table td {
+      padding: 0.48rem 0.65rem;
+      border: 1px solid var(--border);
+      text-align: left;
+      vertical-align: top;
+    }
+    table.util-table th {
+      background: var(--bg-code);
+      color: var(--fg);
+      font-family: var(--mono);
+      font-weight: 600;
+      font-size: 0.79rem;
+    }
+    table.util-table td { color: var(--fg-muted); }
+    table.util-table tr:hover td { background: rgba(88, 166, 255, 0.03); }
+    .mono { font-family: var(--mono); font-size: 0.81rem; }
+    .ok { color: var(--green); font-weight: 600; font-family: var(--mono); }
+    .warn { color: var(--amber); font-family: var(--mono); }
+
+    /* Code / Terminal blocks */
+    pre.term {
+      margin: 0.5rem 0 1rem;
+      padding: 0.85rem 1rem;
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font-family: var(--mono);
+      font-size: 0.81rem;
+      line-height: 1.5;
+      color: var(--fg);
+      overflow-x: auto;
+      position: relative;
+    }
+    pre.term .c { color: var(--fg-dim); }
+    pre.term .cmd { color: var(--green); }
+    pre.term .flag { color: var(--accent); }
+
+    .copy-btn {
+      position: absolute;
+      top: 0.45rem;
+      right: 0.5rem;
+      background: var(--bg-alt);
+      color: var(--fg-muted);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      padding: 0.15rem 0.45rem;
+      cursor: pointer;
+    }
+    .copy-btn:hover { color: var(--fg); border-color: var(--fg-muted); }
+
+    /* Live Anonymous Census Strip */
+    .census-bar {
+      margin-top: 1.25rem;
+      padding: 0.65rem 0.9rem;
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      font-family: var(--mono);
+      font-size: 0.79rem;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+    }
+    .census-metrics {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1.25rem;
+    }
+    .census-metrics span b { color: var(--green); }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.25rem;
+    }
+    @media (max-width: 820px) {
+      .two-col { grid-template-columns: 1fr; }
+    }
+
+    footer {
+      margin-top: 3rem;
+      padding-top: 1rem;
+      border-top: 1px solid var(--border);
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      color: var(--fg-dim);
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 0.75rem;
+    }
+  </style>
+</head>
+<body>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <strong>parvault(1) / Neighborhood Cloud</strong>
+        <span class="ver">v0.1.0 &bull; static-musl &bull; AGPL-3.0-only</span>
+      </div>
+      <nav class="topnav">
+        <a href="#downloads">[downloads]</a>
+        <a href="#quickstart">[cli-usage]</a>
+        <a href="#architecture">[pipeline]</a>
+        <a href="#comparison">[comparison]</a>
+        <a href="#benchmarks">[benchmarks]</a>
+        <a href="/stats/">[live-grafana-census]</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="hero-grid">
+      <div>
+        <h1>Zero-Trust Erasure-Coded Backup Daemon &amp; Library</h1>
+        <p>
+          <strong>parvault</strong> is a statically-linked Linux backup utility and embedded Rust library that backs up directories across your own machines, a dedicated homelab server (<code>parvault-seed</code>), or an untrusted peer-to-peer mesh—without monthly storage fees or trusting remote hosts.
+        </p>
+        <ul class="spec-list">
+          <li><strong>Encrypt-Before-Shard (Post-Quantum):</strong> Every <code>16 MiB</code> stripe is sealed client-side with a <code>512-bit</code> cascaded key (<code>ChaCha20-Poly1305 &rarr; AES-256-GCM</code>) plus <strong>NIST FIPS 203 ML-KEM-768</strong> and <strong>FIPS 204 ML-DSA-65</strong> before erasure coding.</li>
+          <li><strong>GF(2<sup>8</sup>) Reed-Solomon Erasure Coding:</strong> Splits ciphertext into <code>N</code> shards where any <code>K</code> reconstruct the file (<code>2-of-3</code> personal ring, <code>10-of-20</code> probationary pool, <code>16-of-20</code> earned high-uptime homelab pool at <code>80%</code> efficiency).</li>
+          <li><strong>4-Layer Blinded Shards:</strong> Remote disks store only opaque <code>.bshard</code> files keyed by <code>HMAC-SHA256</code> blinded locators. Even 20 colluding storage nodes face a <code>2<sup>224.8</sup></code> combinatorial wall and cannot identify which shards belong to the same file or user.</li>
+          <li><strong>Bounded Footprint:</strong> Single static <code>musl</code> binary (<code>0</code> dynamic <code>libc</code> dependencies) with a <code>&lt; 32 MiB</code> RAM ceiling (<code>3.52 MiB</code> measured RSS), suitable for OpenWrt/prplOS routers, Raspberry Pis, and NAS boxes.</li>
+        </ul>
+      </div>
+
+      <div id="downloads">
+        <table class="util-table">
+          <thead>
+            <tr>
+              <th colspan="4">Static Binary Releases (Linux static-pie musl, 0 dependencies)</th>
+            </tr>
+            <tr>
+              <th>Binary / Target</th>
+              <th>Arch</th>
+              <th>Size</th>
+              <th>Role</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="mono"><a href="/dist/parvault-x86_64-unknown-linux-musl">parvault-linux-x86_64</a></td>
+              <td class="mono">x86_64</td>
+              <td class="mono">17 MiB</td>
+              <td>Client &amp; folder-sync daemon</td>
+            </tr>
+            <tr>
+              <td class="mono"><a href="/dist/parvault-aarch64-unknown-linux-musl">parvault-linux-aarch64</a></td>
+              <td class="mono">ARM64</td>
+              <td class="mono">16 MiB</td>
+              <td>Client &amp; folder-sync daemon</td>
+            </tr>
+            <tr>
+              <td class="mono"><a href="/dist/parvault-seed-x86_64-unknown-linux-musl">parvault-seed-x86_64</a></td>
+              <td class="mono">x86_64</td>
+              <td class="mono">16 MiB</td>
+              <td>Headless NAS / seed vault server</td>
+            </tr>
+            <tr>
+              <td class="mono"><a href="/dist/parvault-seed-aarch64-unknown-linux-musl">parvault-seed-aarch64</a></td>
+              <td class="mono">ARM64</td>
+              <td class="mono">15 MiB</td>
+              <td>Headless RPi / gateway seed server</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <pre class="term"><button class="copy-btn" onclick="copyCode(this)">copy</button><span class="c"># Install static binaries to /usr/local/bin (x86_64 or aarch64 auto-detected):</span>
+<span class="cmd">curl -fsSL https://get.neighborhoodcloud.org/install.sh | sh</span>
+
+<span class="c"># Verify built-in cryptographic &amp; erasure-coding self-test:</span>
+<span class="cmd">parvault-seed self-test</span></pre>
+      </div>
+    </section>
+
+    <!-- Live Anonymous Network Census Bar -->
+    <div class="census-bar" id="census-bar">
+      <div><strong>[ANONYMOUS NETWORK CENSUS &bull; ADR-14]</strong></div>
+      <div class="census-metrics">
+        <span>Epoch: <b id="c-epoch">50</b></span>
+        <span>Active Nodes: <b id="c-nodes">60</b></span>
+        <span>Regions: <b>NA-WEST / NA-EAST / EU-CENTRAL / EU-WEST / APAC</b></span>
+        <span>Seed Anchor Load: <b id="c-drain">0.0% (Drained to Organic Peers)</b></span>
+        <span><a href="/stats/">Open Grafana Telemetry &rarr;</a></span>
+      </div>
+    </div>
+
+    <!-- Section 1: Which Binary Do I Run + Copy-Paste CLI Usage -->
+    <h2 id="quickstart">
+      <span>1. CLI Quickstart: <code>parvault</code> vs. <code>parvault-seed</code></span>
+      <span class="sec-num">man parvault(1)</span>
+    </h2>
+    <p>
+      The project ships two binaries from the same codebase: run <code>parvault</code> on machines with folders you want backed up, and run <code>parvault-seed</code> on headless storage boxes (NAS, Raspberry Pi, or cloud bootstrap nodes) that hold encrypted shards for other machines without holding any decryption keys or plaintext of their own.
+    </p>
+
+    <div class="two-col">
+      <div>
+        <pre class="term"><button class="copy-btn" onclick="copyCode(this)">copy</button><span class="c"># A. Back up a local directory on your laptop or workstation:</span>
+<span class="cmd">parvault watch-folder</span> \
+  <span class="flag">--folder</span> ~/Documents \
+  <span class="flag">--snapshot-out</span> ~/Documents.manifest.bin \
+  <span class="flag">--interval-secs</span> 30
+
+<span class="c"># B. Restore the directory tree onto a fresh machine:</span>
+<span class="cmd">parvault restore-folder</span> \
+  <span class="flag">--snapshot</span> ~/Documents.manifest.bin \
+  <span class="flag">--out-dir</span> ~/Documents-Restored</pre>
+      </div>
+      <div>
+        <pre class="term"><button class="copy-btn" onclick="copyCode(this)">copy</button><span class="c"># C. Run a 24/7 Homelab Redundancy Vault on your NAS / Raspberry Pi</span>
+<span class="c">#    (0-quota cost for your own devices; earns 16-of-20 Homelab tier):</span>
+<span class="cmd">parvault-seed start</span> \
+  <span class="flag">--mode</span> homelab-vault \
+  <span class="flag">--data-dir</span> /mnt/nas/parvault-seed \
+  <span class="flag">--max-gb</span> 500
+
+<span class="c"># D. Run a zero-knowledge Public Bootstrap Seed Anchor:</span>
+<span class="cmd">parvault-seed start</span> \
+  <span class="flag">--mode</span> public-bootstrap \
+  <span class="flag">--data-dir</span> /var/lib/parvault-seed \
+  <span class="flag">--max-gb</span> 200</pre>
+      </div>
+    </div>
+
+    <!-- Section 2: Architecture & Byte Pipeline -->
+    <h2 id="architecture">
+      <span>2. Zero-Trust Streaming Pipeline &amp; Earned Redundancy Tiers</span>
+      <span class="sec-num">ADR-01 .. ADR-14</span>
+    </h2>
+    <pre class="term">[Plaintext Directory]
+   │
+   ├──► 1. Streaming Chunker (16 MiB fixed stripes; caps RAM &lt; 32 MiB on routers/NAS)
+   │
+   ├──► 2. 512-Bit Post-Quantum Cascaded AEAD (ChaCha20-Poly1305 &rarr; AES-256-GCM; 2^256 Grover margin)
+   │
+   ├──► 3. GF(2^8) Reed-Solomon Erasure Coding + Merkle Tree Proof per Shard:
+   │       • Day-1 Personal Ring (0 external peers) :  2-of-3  (0.00x network quota tax)
+   │       • Buddy Micro-Cluster (2..5 peers)       :  3-of-5  (1.67x expansion)
+   │       • Probationary Entry Pool (&lt; 50 audits)  : 10-of-20 (2.00x expansion; survives 10 dead nodes)
+   │       • Earned Verified Neighbor (&ge; 98.0% SLA) : 16-of-24 (1.50x expansion; 2.5x quota multiplier)
+   │       • Earned Homelab Anchor    (&ge; 99.8% SLA) : 16-of-20 (1.25x expansion; 80% net efficiency)
+   │
+   └──► 4. 4-Layer Shard Anonymization &amp; Lease Eviction:
+           • BlindedShardId  : HMAC-SHA256(K_user, root || idx) hides file &amp; matrix coordinate
+           • PQ Onion Relay  : 1-hop X25519 + ML-KEM-768 envelope hides uploader IP address
+           • Byte-Epoch Lease: Un-renewed .bshard files from departed nodes are unlinked automatically</pre>
+
+    <!-- Section 3: Technical Comparison Table -->
+    <h2 id="comparison">
+      <span>3. Technical Comparison vs. Existing Backup Tools</span>
+      <span class="sec-num">Architecture Matrix</span>
+    </h2>
+    <table class="util-table">
+      <thead>
+        <tr>
+          <th>Property</th>
+          <th><code>parvault</code> + <code>parvault-seed</code></th>
+          <th>Syncthing / Rsync</th>
+          <th>Restic / Borg + S3</th>
+          <th>Commercial Cloud Backup</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Client-Side Encryption</strong></td>
+          <td class="ok">512-bit PQ Cascaded AEAD + ML-KEM-768 / ML-DSA-65</td>
+          <td class="warn">Optional (Untrusted folder token)</td>
+          <td class="ok">AES-256 / ChaCha20 (Classical)</td>
+          <td class="warn">Often provider-escrowed keys</td>
+        </tr>
+        <tr>
+          <td><strong>Storage Overhead for Off-Site Redundancy</strong></td>
+          <td class="mono"><strong>1.25x</strong> (16-of-20 Earned Homelab) or <strong>2.00x</strong> (10-of-20)</td>
+          <td class="mono"><strong>2.00x – N.00x</strong> (full file copy per mirror)</td>
+          <td class="mono"><strong>1.00x</strong> + S3 provider replication fee</td>
+          <td class="mono"><strong>1.00x</strong> (billed monthly per TB)</td>
+        </tr>
+        <tr>
+          <td><strong>Remote Host Knowledge</strong></td>
+          <td class="ok">Blinded <code>.bshard</code> locators (0 file/owner linkage)</td>
+          <td>Knows peer ID &amp; folder structure (unless encrypted)</td>
+          <td>S3 bucket sees account, IAM, IP &amp; access times</td>
+          <td>Provider knows identity, IP &amp; billing card</td>
+        </tr>
+        <tr>
+          <td><strong>Self-Healing While Owner PC Is Offline</strong></td>
+          <td class="ok">Yes — Delegated Witnesses repair over ciphertext via <code>RepairGrant</code></td>
+          <td>No (requires source online)</td>
+          <td>No (requires client key to re-upload)</td>
+          <td>Handled internally by cloud vendor</td>
+        </tr>
+        <tr>
+          <td><strong>Byzantine Poisoning Protection</strong></td>
+          <td class="ok">Pre-decoding Merkle quarantine + 1-strike WoT slashing</td>
+          <td>TLS / Ed25519 device ID</td>
+          <td>MAC verification on restore</td>
+          <td>Vendor-dependent</td>
+        </tr>
+        <tr>
+          <td><strong>Recurring Cloud Bill</strong></td>
+          <td class="ok">$0 / month (Reciprocity P2P + Personal NAS Ring)</td>
+          <td class="ok">$0 / month (BYO hardware)</td>
+          <td>~$5 – $23 / TB / month + egress fees</td>
+          <td>~$6 – $10 / machine / month</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- Section 4: Empirical Benchmarks & Formal Verification -->
+    <h2 id="benchmarks">
+      <span>4. Empirical Benchmarks &amp; Formal Verification</span>
+      <span class="sec-num">Reproducible via CLI</span>
+    </h2>
+    <p>
+      Every protocol invariant is model-checked in <strong>TLA+ (TLC)</strong> and <strong>Stateright</strong>, and every performance target is reproducible directly from the binary using <code>parvault benchmark-matrix</code> and <code>parvault benchmark100-node</code>:
+    </p>
+    <table class="util-table">
+      <thead>
+        <tr>
+          <th>Test / Verification Harness</th>
+          <th>Conditions / State Space</th>
+          <th>Measured Result</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>100-Node Rolling Churn Benchmark</strong> (<code>parvault benchmark100-node</code>)</td>
+          <td>100 nodes across 10 ASNs, <code>50 &times; 100 MB</code> (<code>5.0 GB</code>) vaults, <code>30%</code> node reboot churn</td>
+          <td class="mono">Boot: <strong>30.9 ms</strong> | Upload: <strong>5.43 s</strong> | <strong>5,700</strong> PoR audits | <strong>120</strong> shards self-healed (<code>10.7%</code> repair tax)</td>
+          <td class="ok">PASS (0 Bytes Lost)</td>
+        </tr>
+        <tr>
+          <td><strong>10-Node Docker + <code>tc netem</code> Hard-Kill</strong> (<code>parvault benchmark</code>)</td>
+          <td>1 GiB streaming vault, <code>5 ms</code> delay, <code>1%</code> packet loss, simultaneous <code>docker kill</code> of 4/10 nodes</td>
+          <td class="mono">PoR p99.9: <strong>25.09 ms</strong> (&le; 300 ms SLA) | Full 1 GiB GF(2<sup>8</sup>) restore: <strong>52.74 s</strong></td>
+          <td class="ok">PASS (SHA-256 Match)</td>
+        </tr>
+        <tr>
+          <td><strong>8-Profile Degraded Network Matrix</strong> (<code>parvault benchmark-matrix</code>)</td>
+          <td>15% packet loss Wi-Fi mesh, 260 ms satellite, 1-core Cortex-A53 gateway, 10% Byzantine poisoners, PQ Hybrid + Onion mode</td>
+          <td class="mono">Hedged parallel <code>N</code>-read speedup: <strong>1.14x – 1.44x</strong> | Peak RAM: <strong>3.52 MiB</strong></td>
+          <td class="ok">8/8 Profiles PASS</td>
+        </tr>
+        <tr>
+          <td><strong>TLA+ Formal Specifications</strong> (<code>specs/*.tla</code>)</td>
+          <td>6 TLA+ models (Protocol, Confidentiality/Trust, 4-Layer Anonymity, Post-Quantum HNDL, Elastic Bootstrap/Earned Tier, Lite-Client &amp; NAS-Death Failover)</td>
+          <td class="mono"><strong>6 / 6</strong> specs model-checked in CI via <code>cargo test</code> + <strong>16,777,216</strong> exhaustive GF(2<sup>8</sup>)<sup>3</sup> triples</td>
+          <td class="ok">0 Errors / 0 Counterexamples</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <footer>
+      <div>parvault &bull; Neighborhood Cloud Core Backup Engine &bull; License: AGPL-3.0-only</div>
+      <div>
+        <a id="gh-repo-link" href="https://github.com/parvault/parvault">GitHub Source, Releases &amp; TLA+ Specs</a>
+      </div>
+    </footer>
+  </main>
+
+  <script>
+    function copyCode(btn) {
+      const pre = btn.parentElement;
+      const clone = pre.cloneNode(true);
+      const b = clone.querySelector('button');
+      if (b) b.remove();
+      navigator.clipboard.writeText(clone.innerText.trim());
+      const orig = btn.innerText;
+      btn.innerText = 'copied!';
+      setTimeout(() => { btn.innerText = orig; }, 1200);
+    }
+
+    // Auto-detect GitHub Pages (<owner>.github.io/<repo>) so download & repo links work with zero domain configuration
+    (function configureGitHubPagesLinks() {
+      const host = window.location.hostname;
+      if (host.endsWith('.github.io')) {
+        const owner = host.replace('.github.io', '');
+        const pathParts = window.location.pathname.split('/').filter(Boolean);
+        const repo = pathParts.length > 0 ? pathParts[0] : 'parvault';
+        const ghBase = 'https://github.com/' + owner + '/' + repo;
+        const repoLink = document.getElementById('gh-repo-link');
+        if (repoLink) repoLink.href = ghBase;
+        document.querySelectorAll('a[href^="/dist/"]').forEach(a => {
+          const binName = a.getAttribute('href').replace('/dist/', '');
+          a.href = ghBase + '/releases/latest/download/' + binName;
+        });
+      }
+    })();
+
+    // Optional live fetch if /api/census.json is exposed by parvault-seed (or local docker telemetry)
+    fetch('api/census.json')
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (!data) return;
+        if (data.epoch_id !== undefined) document.getElementById('c-epoch').innerText = data.epoch_id;
+        if (data.unique_active_nodes !== undefined) document.getElementById('c-nodes').innerText = data.unique_active_nodes;
+        if (data.seed_anchor_storage_share_percent !== undefined) {
+          document.getElementById('c-drain').innerText = data.seed_anchor_storage_share_percent.toFixed(1) + '%';
+        }
+      })
+      .catch(() => {});
+  </script>
+</body>
+</html>

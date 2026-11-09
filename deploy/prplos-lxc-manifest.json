@@ -1,0 +1,57 @@
+{
+  "schema_version": "1.0",
+  "container_name": "parvault-daemon",
+  "vendor": "Neighborhood Cloud / Project ParVault",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "target_platforms": [
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-musl"
+  ],
+  "runtime": {
+    "type": "prplos-lxc",
+    "entrypoint": "/usr/local/bin/parvault",
+    "args": [
+      "daemon",
+      "start",
+      "--config",
+      "/etc/parvault/config.toml",
+      "--listen",
+      "/ip4/0.0.0.0/tcp/4001"
+    ],
+    "restart_policy": "always",
+    "restart_backoff_sec": 5
+  },
+  "resources": {
+    "memory_limit_mb": 64,
+    "memory_soft_limit_mb": 32,
+    "cpu_shares": 256,
+    "max_cpu_percent_por_audit": 2,
+    "storage_mounts": [
+      {
+        "source": "/mnt/nvme0/parvault-vault",
+        "destination": "/var/lib/parvault",
+        "options": ["rw", "noatime", "nosuid", "nodev"]
+      }
+    ]
+  },
+  "network": {
+    "mode": "bridge",
+    "ports": [
+      { "protocol": "tcp", "port": 4001, "description": "libp2p TCP + Noise XX + Yamux" },
+      { "protocol": "udp", "port": 4001, "description": "Optional QUIC listener (ADR-08)" },
+      { "protocol": "udp", "port": 5353, "description": "mDNS zero-config LAN discovery" }
+    ],
+    "locality_policy": {
+      "intra_asn_ratio": 0.70,
+      "inter_asn_ratio": 0.30,
+      "target_rtt_ms": 5
+    }
+  },
+  "security": {
+    "read_only_rootfs": true,
+    "drop_capabilities": ["ALL"],
+    "keep_capabilities": ["NET_BIND_SERVICE"],
+    "tpm2_enclave_device": "/dev/tpmrm0"
+  }
+}

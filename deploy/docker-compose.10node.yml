@@ -1,0 +1,74 @@
+version: "3.9"
+
+# 10-Node Validation Mesh on 10.42.0.0/16 with simulated 5ms latency and 1% packet loss (tc netem)
+x-parvault-node: &parvault-node
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile.musl
+  cap_add:
+    - NET_ADMIN
+  entrypoint:
+    - /bin/sh
+    - -c
+    - |
+      tc qdisc add dev eth0 root netem delay 5ms loss 1% || true
+      exec /usr/local/bin/parvault daemon start --listen /ip4/0.0.0.0/tcp/4001
+
+services:
+  node01:
+    <<: *parvault-node
+    networks:
+      meshnet:
+        ipv4_address: 10.42.1.11
+  node02:
+    <<: *parvault-node
+    networks:
+      meshnet:
+        ipv4_address: 10.42.1.12
+  node03:
+    <<: *parvault-node
+    networks:
+      meshnet:
+        ipv4_address: 10.42.1.13
+  node04:
+    <<: *parvault-node
+    networks:
+      meshnet:
+        ipv4_address: 10.42.1.14
+  node05:
+    <<: *parvault-node
+    networks:
+      meshnet:
+        ipv4_address: 10.42.1.15
+  node06:
+    <<: *parvault-node
+    networks:
+      meshnet:
+        ipv4_address: 10.42.1.16
+  node07:
+    <<: *parvault-node
+    networks:
+      meshnet:
+        ipv4_address: 10.42.1.17
+  node08:
+    <<: *parvault-node
+    networks:
+      meshnet:
+        ipv4_address: 10.42.2.18
+  node09:
+    <<: *parvault-node
+    networks:
+      meshnet:
+        ipv4_address: 10.42.2.19
+  node10:
+    <<: *parvault-node
+    networks:
+      meshnet:
+        ipv4_address: 10.42.2.20
+
+networks:
+  meshnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.42.0.0/16

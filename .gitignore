@@ -1,0 +1,37 @@
+# Rust / Cargo build outputs
+/target/
+**/target/
+C*Users*/
+
+# Local ParVault vault state, keys, and shard test artifacts
+.parvault-data/
+.parvault-seed-data/
+*.shard
+*.bshard
+*.manifest.bin
+*.catalog.bin
+*.envelope.bin
+*.device-cert.json
+graceful_departure_receipt.json
+blinded_leases.bin
+master_key.sealed
+owner_pq_keypair.bin
+node_identity.seed
+*.tmp.*
+*.parvault_restore_staging
+
+# Private founder / operator project management & launch playbooks
+/project_management/
+
+# Compiled release binary staging (built by CI/CD on release tags)
+/dist/*
+
+# TLA+ TLC model checker working states
+/specs/states/
+*.dot
+
+# Environment & OS files
+.env
+.env.*
+.DS_Store
+Thumbs.db

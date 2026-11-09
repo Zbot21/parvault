@@ -1,0 +1,68 @@
+name: Release — Static musl Binaries & SHA256SUMS
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-static-musl:
+    name: Build Static musl (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            linker: x86_64-linux-musl-gcc
+          - target: aarch64-unknown-linux-musl
+            linker: aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl cross-compilation toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+      - name: Build static parvault and parvault-seed binaries
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+          fi
+          cargo build --release --target ${{ matrix.target }} --bin parvault --bin parvault-seed
+          mkdir -p release-dist
+          cp target/${{ matrix.target }}/release/parvault release-dist/parvault-${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/parvault-seed release-dist/parvault-seed-${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: release-dist/*
+
+  publish-release:
+    name: Generate SHA256SUMS & Publish GitHub Release
+    needs: build-static-musl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Generate SHA256SUMS
+        run: |
+          cd artifacts
+          chmod +x parvault-* parvault-seed-*
+          ./parvault-seed-x86_64-unknown-linux-musl self-test
+          sha256sum parvault-* parvault-seed-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/parvault-*
+            artifacts/parvault-seed-*
+            artifacts/SHA256SUMS
+          generate_release_notes: true

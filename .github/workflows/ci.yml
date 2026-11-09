@@ -1,0 +1,61 @@
+name: CI — Rust Test Suites & TLA+ Formal Verification
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  TLA2TOOLS_JAR: /tmp/tla2tools.jar
+
+jobs:
+  rust-tests:
+    name: Rust Unit, Integration, Red-Team & TLA+ Integration Suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Download TLA+ Tools (tla2tools.jar) for Rust TLA+ Integration Tests
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar \
+            -o /tmp/tla2tools.jar
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Build binaries (parvault + parvault-seed)
+        run: cargo build --release --bins
+      - name: Run all integration, formal (Stateright + TLA+ TLC) & red-team test suites
+        run: cargo test --release
+      - name: Run parvault-seed self-test
+        run: ./target/release/parvault-seed self-test
+
+  tla-model-check:
+    name: TLA+ TLC Formal Model Checking (6 Specs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Download TLA+ Tools (tla2tools.jar)
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar \
+            -o /tmp/tla2tools.jar
+      - name: Verify all 6 TLA+ Protocol Specifications
+        run: |
+          cd specs
+          for spec in ParVaultProtocol ParVaultConfidentialityAndTrust ParVaultAnonymity ParVaultPostQuantum ParVaultBootstrapAndEarnedTier ParVaultLiteClientAndSeedFailover; do
+            echo "===> Model checking ${spec}.tla ..."
+            java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -cleanup -config "${spec}.cfg" "${spec}.tla"
+          done

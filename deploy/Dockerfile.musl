@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1
+# Static musl cross-compiler build pipeline for parvault (x86_64 & aarch64)
+FROM rust:1.82-alpine AS builder
+
+ARG TARGET_ARCH=x86_64-unknown-linux-musl
+
+RUN apk add --no-cache \
+    build-base \
+    musl-dev \
+    pkgconfig \
+    git \
+    ca-certificates
+
+RUN rustup target add ${TARGET_ARCH}
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock* ./
+COPY src ./src
+
+RUN cargo build --release --target ${TARGET_ARCH} --bin parvault --bin parvault-seed \
+    && cp target/${TARGET_ARCH}/release/parvault /build/parvault-static \
+    && cp target/${TARGET_ARCH}/release/parvault-seed /build/parvault-seed-static
+
+# Runtime container (includes iproute2 for 10-node tc netem validation runs)
+FROM alpine:3.20
+
+RUN apk add --no-cache \
+    ca-certificates \
+    iproute2 \
+    iputils
+
+COPY --from=builder /build/parvault-static /usr/local/bin/parvault
+COPY --from=builder /build/parvault-seed-static /usr/local/bin/parvault-seed
+
+VOLUME ["/var/lib/parvault"]
+EXPOSE 4001/tcp 4001/udp 5353/udp
+
+ENTRYPOINT ["/usr/local/bin/parvault"]
+CMD ["daemon", "start", "--listen", "/ip4/0.0.0.0/tcp/4001"]
