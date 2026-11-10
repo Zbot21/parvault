@@ -76,7 +76,7 @@ pub fn generate_por_challenge(
     let mut nonce = [0u8; 32];
     rng.fill_bytes(&mut nonce);
 
-    let max_window = shard_total_len.min(4096).max(1);
+    let max_window = shard_total_len.clamp(1, 4096);
     let length = if shard_total_len <= 64 {
         shard_total_len.max(1)
     } else {
@@ -163,7 +163,7 @@ pub fn compute_multi_salted_commitment(nonce: &[u8; 32], segment_slices: &[Vec<u
     let mut hasher = Sha256::new();
     hasher.update(nonce);
     for slice in segment_slices {
-        hasher.update(&(slice.len() as u32).to_be_bytes());
+        hasher.update((slice.len() as u32).to_be_bytes());
         hasher.update(slice);
     }
     let digest = hasher.finalize();
@@ -199,7 +199,7 @@ pub fn generate_multi_segment_por_challenge(
             ((s as u64 + 1) * stride).min(shard_total_len.max(1))
         };
         let stratum_len = end_bound.saturating_sub(start_bound).max(1);
-        let seg_len = stratum_len.min(256).max(1);
+        let seg_len = stratum_len.clamp(1, 256);
         let max_off = start_bound + stratum_len.saturating_sub(seg_len);
         let offset = if max_off <= start_bound {
             start_bound

@@ -549,10 +549,8 @@ impl ElasticBootstrapEngine {
             .map_err(|e| BootstrapError::ReedSolomon(e.to_string()))?;
 
         let mut reconstructed_ciphertext = Vec::with_capacity(original_ciphertext_len);
-        for shard_opt in old_shards.into_iter().take(k_old) {
-            if let Some(shard) = shard_opt {
-                reconstructed_ciphertext.extend_from_slice(&shard);
-            }
+        for shard in old_shards.into_iter().take(k_old).flatten() {
+            reconstructed_ciphertext.extend_from_slice(&shard);
         }
         reconstructed_ciphertext.truncate(original_ciphertext_len);
 
@@ -1767,10 +1765,8 @@ impl CorrelatedOutageController {
 
         let shard_len = base_buf[0].as_ref().map(|s| s.len()).unwrap_or(1);
         let mut ciphertext = Vec::with_capacity(original_ciphertext_len);
-        for s_opt in base_buf.iter().take(k) {
-            if let Some(s) = s_opt {
-                ciphertext.extend_from_slice(s);
-            }
+        for s in base_buf.iter().take(k).flatten() {
+            ciphertext.extend_from_slice(s);
         }
         ciphertext.truncate(original_ciphertext_len);
 

@@ -234,6 +234,7 @@ pub enum MeshWireRequest {
     PorAudit(PorChallenge),
     /// Fetch a full ciphertext shard for file restore or authenticated witness repair (ADR-04).
     /// `owner_signature` explicitly carries `(owner_pub, signed_payload, sig_r, sig_s)`.
+    #[allow(clippy::type_complexity)]
     GetCiphertextShard {
         shard_id: ShardId,
         owner_signature: Option<([u8; 32], Vec<u8>, [u8; 32], [u8; 32])>,

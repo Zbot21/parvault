@@ -366,7 +366,7 @@ fn test_exhaustive_bit_precise_gf256_and_sharding_bounds() {
         for base in [1usize, 2, 15, 16, 17, 1023, 1024, 65535, 16 * 1024 * 1024] {
             for delta in 0..=32 {
                 let ciphertext_len = base + delta;
-                let shard_len = (ciphertext_len + k_data - 1) / k_data;
+                let shard_len = ciphertext_len.div_ceil(k_data);
                 assert!(shard_len >= 1);
                 assert!(shard_len * k_data >= ciphertext_len);
                 assert!(shard_len * k_data - ciphertext_len < k_data);

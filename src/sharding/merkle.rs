@@ -100,7 +100,7 @@ impl MerkleTree {
         let mut levels = vec![leaves];
         while levels.last().expect("non-empty").len() > 1 {
             let prev = levels.last().expect("non-empty");
-            let mut next = Vec::with_capacity((prev.len() + 1) / 2);
+            let mut next = Vec::with_capacity(prev.len().div_ceil(2));
             for chunk in prev.chunks(2) {
                 let left = &chunk[0];
                 let right = if chunk.len() == 2 {

@@ -440,7 +440,7 @@ async fn main() -> anyhow::Result<()> {
                 2,
             );
 
-            let initial_organic = organic_peers.min(3).max(1);
+            let initial_organic = organic_peers.clamp(1, 3);
             let mut initial_candidates = Vec::new();
             for i in 0..initial_organic {
                 initial_candidates.push(ElasticPeerCandidate {

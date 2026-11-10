@@ -253,7 +253,7 @@ fn test_persistent_identity_and_shareable_personal_device_cert_tokens() {
 
     // Verify HomelabRedundancyVault accepts the deserialized cert with 0 quota charge
     let quota = QuotaManager::new(100 * 1024 * 1024, 10 * 1024 * 1024);
-    let store = BlockStore::new(&base.join("seed"), quota).unwrap();
+    let store = BlockStore::new(base.join("seed"), quota).unwrap();
     let mut seed_server =
         ZeroTrustSeedServer::new_homelab_vault("nas-seed", store, pq_1.public_key(), 2);
     let shard_bytes = vec![0x42u8; 1024];

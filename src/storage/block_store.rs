@@ -1004,12 +1004,7 @@ impl BlockStore {
                             session_key,
                             maybe_grant,
                         )
-                        .map_err(|e| {
-                            StorageError::Io(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                e.to_string(),
-                            ))
-                        })?;
+                        .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
                 } else if let Some(stem) = fname.strip_suffix(".bshard") {
                     let blinded_id =
                         blinded_idx_snapshot
@@ -1061,12 +1056,7 @@ impl BlockStore {
                             30,
                             delete_verifier,
                         )
-                        .map_err(|e| {
-                            StorageError::Io(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                e.to_string(),
-                            ))
-                        })?;
+                        .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
                 }
             } else {
                 let target_shards_dir = target_root.join("shards");
@@ -1203,7 +1193,7 @@ impl BlockStore {
         let use_network = self
             .mesh_client
             .as_ref()
-            .map_or(false, |c| !c.all_network_endpoints().is_empty());
+            .is_some_and(|c| !c.all_network_endpoints().is_empty());
 
         loop {
             let mut buf = vec![0u8; stripe_cap];
@@ -1241,12 +1231,7 @@ impl BlockStore {
                         tier,
                         session_key,
                     )
-                    .map_err(|e| {
-                        StorageError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e.to_string(),
-                        ))
-                    })?
+                    .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?
             } else {
                 for (idx, shard_bytes) in shard_set.shards.iter().enumerate() {
                     let shard_id = ShardId {
@@ -1353,7 +1338,7 @@ impl BlockStore {
 
                 if let Some(client) = net_client {
                     let remote_slots = client.fetch_stripe_shards(stripe, client.identity());
-                    for (slot, rem) in shard_slots.iter_mut().zip(remote_slots.into_iter()) {
+                    for (slot, rem) in shard_slots.iter_mut().zip(remote_slots) {
                         if slot.is_none() && rem.is_some() {
                             *slot = rem;
                         }

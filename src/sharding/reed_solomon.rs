@@ -58,7 +58,7 @@ pub fn encode_with_params(
     let shard_len = if original_ciphertext_len == 0 {
         1
     } else {
-        (original_ciphertext_len + k_data - 1) / k_data
+        original_ciphertext_len.div_ceil(k_data)
     };
 
     let total_shards = k_data + m_parity;

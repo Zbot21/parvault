@@ -1052,14 +1052,14 @@ impl FolderSyncEngine {
             for stripe_meta in &entry.manifest.stripes {
                 // Reassemble the 1.0x encrypted stripe ciphertext from the local K data shards
                 let mut surviving = vec![None; stripe_meta.shard_hashes.len()];
-                for idx in 0..k_data {
+                for (idx, slot) in surviving.iter_mut().enumerate().take(k_data) {
                     let shard_id = ShardId {
                         stripe_merkle_root: stripe_meta.stripe_merkle_root,
                         shard_index: idx as u32,
                         shard_hash: stripe_meta.shard_hashes[idx],
                     };
                     let bytes = self.store.get_shard(&shard_id)?;
-                    surviving[idx] = Some(bytes);
+                    *slot = Some(bytes);
                 }
                 let ciphertext_bytes = reconstruct_ciphertext_stripe(
                     surviving,
@@ -1107,7 +1107,7 @@ impl FolderSyncEngine {
         if let Some(seed) = seed_server {
             let mut seed_shards = vec![None; n_total];
             let mut gathered = 0usize;
-            for idx in 0..n_total {
+            for (idx, slot) in seed_shards.iter_mut().enumerate().take(n_total) {
                 let shard_id = ShardId {
                     stripe_merkle_root: stripe_meta.stripe_merkle_root,
                     shard_index: idx as u32,
@@ -1120,7 +1120,7 @@ impl FolderSyncEngine {
                 };
                 if let Some(bytes) = maybe_bytes {
                     if hash_shard_leaf(idx as u32, &bytes) == stripe_meta.shard_hashes[idx] {
-                        seed_shards[idx] = Some(bytes);
+                        *slot = Some(bytes);
                         gathered += 1;
                         if gathered >= k_data {
                             break;
@@ -1151,7 +1151,7 @@ impl FolderSyncEngine {
         // 2. NAS / Seedbox is Dead or Unreachable -> Fail over to Direct Mesh Reconstruction!
         let mut mesh_shards = vec![None; n_total];
         let mut gathered_mesh = 0usize;
-        for idx in 0..n_total {
+        for (idx, slot) in mesh_shards.iter_mut().enumerate().take(n_total) {
             let shard_id = ShardId {
                 stripe_merkle_root: stripe_meta.stripe_merkle_root,
                 shard_index: idx as u32,
@@ -1160,7 +1160,7 @@ impl FolderSyncEngine {
             for peer_store in mesh_peer_stores {
                 if let Ok(bytes) = peer_store.get_shard(&shard_id) {
                     if hash_shard_leaf(idx as u32, &bytes) == stripe_meta.shard_hashes[idx] {
-                        mesh_shards[idx] = Some(bytes);
+                        *slot = Some(bytes);
                         gathered_mesh += 1;
                         break;
                     }
@@ -1275,6 +1275,7 @@ impl FolderSyncEngine {
     /// Reconstructs and decrypts **only** the 16 MiB stripe(s) overlapping `[offset, offset + length)`
     /// of `relative_path` (via `seed_server` fast-path or direct `mesh_peer_stores` fallback if the NAS
     /// is dead), returning the exact requested plaintext slice without downloading the rest of the file!
+    #[allow(clippy::too_many_arguments)]
     pub fn restore_file_byte_range(
         &self,
         snapshot: &FolderSnapshotManifest,
@@ -1407,7 +1408,7 @@ impl FolderSyncEngine {
         let dht_key = master_key.derive_vault_root_dht_key(vault_namespace);
         let store_ref = store.borrow();
 
-        let catalog_envelope = if let Some(ref client) = store_ref.mesh_client() {
+        let catalog_envelope = if let Some(client) = store_ref.mesh_client() {
             if !client.all_network_endpoints().is_empty() {
                 match client
                     .get_dht_envelope(&dht_key, crate::network::DhtEnvelopeKind::VaultCatalog)

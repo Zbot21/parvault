@@ -871,8 +871,8 @@ fn test_mechanism7_2000_node_isp_mass_outage_waves_1000_down_500_down_500_up() {
 
     // Wave 1: 1,000 nodes go down simultaneously (10 of 20 ISPs suffer total blackout -> 1,000 online)
     let mut mask_wave1 = vec![true; total_nodes];
-    for node in 0..1_000 {
-        mask_wave1[node] = false;
+    for slot in mask_wave1.iter_mut().take(1_000) {
+        *slot = false;
     }
     let report1 = CorrelatedOutageController::evaluate_outage_wave(
         "Wave 1: -1,000 ISP Nodes Down (1,000/2,000 Online)",
@@ -896,8 +896,8 @@ fn test_mechanism7_2000_node_isp_mass_outage_waves_1000_down_500_down_500_up() {
 
     // Wave 2: Another 500 nodes go down (1,500/2,000 offline = 75% blackout, only 500 online)
     let mut mask_wave2 = mask_wave1.clone();
-    for node in 1_000..1_500 {
-        mask_wave2[node] = false;
+    for slot in mask_wave2.iter_mut().take(1_500).skip(1_000) {
+        *slot = false;
     }
     let report2 = CorrelatedOutageController::evaluate_outage_wave(
         "Wave 2: -500 More Nodes Down (500/2,000 Online, 75% Outage)",
@@ -918,8 +918,8 @@ fn test_mechanism7_2000_node_isp_mass_outage_waves_1000_down_500_down_500_up() {
 
     // Wave 3: 500 of the first 1,000 offline nodes come back online (1,000/2,000 online again!)
     let mut mask_wave3 = mask_wave2.clone();
-    for node in 0..500 {
-        mask_wave3[node] = true;
+    for slot in mask_wave3.iter_mut().take(500) {
+        *slot = true;
     }
     let report3 = CorrelatedOutageController::evaluate_outage_wave(
         "Wave 3: +500 Nodes Return from Wave 1 (1,000/2,000 Online)",
@@ -977,8 +977,8 @@ fn test_mechanism7_2000_node_isp_mass_outage_waves_1000_down_500_down_500_up() {
     // Now kill 12 out of 28 shards (including 10 of the original 20 shards = 50% base loss!):
     // 16 shards survive out of 28 -> full 16-of-20 Homelab recovery succeeds during the outage!
     let mut after_12_killed: Vec<Option<Vec<u8>>> = extended_16of28.into_iter().map(Some).collect();
-    for kill_idx in 0..12 {
-        after_12_killed[kill_idx] = None;
+    for slot in after_12_killed.iter_mut().take(12) {
+        *slot = None;
     }
     let rs_16of28 = ReedSolomon::new(16, 12).expect("RS 16-of-28");
     rs_16of28

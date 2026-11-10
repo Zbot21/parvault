@@ -489,8 +489,7 @@ async fn main() -> anyhow::Result<()> {
                                     {
                                         continue;
                                     }
-                                    let start =
-                                        (stripe_meta.stripe_index as u64) * (stripe_cap as u64);
+                                    let start = stripe_meta.stripe_index * (stripe_cap as u64);
                                     let mut slice_buf = Vec::new();
                                     if file_handle.seek(SeekFrom::Start(start)).is_ok() {
                                         let _ = (&mut file_handle)

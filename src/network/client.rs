@@ -95,10 +95,12 @@ pub fn is_network_peer_addr(raw: &str) -> bool {
     }
     // Check `host:port` where port is a valid u16 and not a Windows drive letter like `C:\...`
     if let Some((left, right)) = s.rsplit_once(':') {
-        if left.len() > 1 && !right.contains('/') && !right.contains('\\') {
-            if right.parse::<u16>().is_ok() {
-                return true;
-            }
+        if left.len() > 1
+            && !right.contains('/')
+            && !right.contains('\\')
+            && right.parse::<u16>().is_ok()
+        {
+            return true;
         }
     }
     false
@@ -297,10 +299,8 @@ impl MeshClient {
                         request_response::Event::OutboundFailure {
                             request_id, error, ..
                         },
-                    )) => {
-                        if Some(request_id) == target_req_id {
-                            anyhow::bail!("wire request failed to {target_maddr}: {error:?}");
-                        }
+                    )) if Some(request_id) == target_req_id => {
+                        anyhow::bail!("wire request failed to {target_maddr}: {error:?}");
                     }
                     _ => {}
                 }
@@ -722,7 +722,7 @@ impl MeshClient {
                     _ => None,
                 };
                 if let Some(ver) = valid_ver {
-                    if best.as_ref().map_or(true, |(best_v, _)| ver > *best_v) {
+                    if best.as_ref().is_none_or(|(best_v, _)| ver > *best_v) {
                         best = Some((ver, env));
                     }
                 }
