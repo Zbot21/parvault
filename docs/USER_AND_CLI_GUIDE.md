@@ -32,7 +32,11 @@ This manual provides the complete command-line reference, step-by-step operation
 
 ## 2. Complete `parvault` CLI Reference
 
-Global option: `-c, --config <PATH>` loads a custom `config.toml` file before executing any subcommand.
+Global options (available on all subcommands):
+- `-c, --config <PATH>`: Load a custom `config.toml` file.
+- `--data-dir <PATH>`: Override local data directory for shards, manifests, and identity keys.
+- `--peers <CSV>`: Comma-separated list of mesh peer `Multiaddr`s or `host:port` endpoints (overrides `bootstrap_peers` / `PARVAULT_PEERS`).
+- `--seed-addr <ADDR>`: Paired `parvault-seed` `Multiaddr` or `host:port` endpoint (overrides `lite_seed_addr` / `PARVAULT_SEED_ADDR`).
 
 ### 2.1 Identity & Personal Device Certificates
 | Command | Flags & Arguments | Description |
@@ -45,30 +49,26 @@ Global option: `-c, --config <PATH>` loads a custom `config.toml` file before ex
 | Command | Flags & Arguments | Description |
 | :--- | :--- | :--- |
 | `parvault diff-folder` | `--folder <PATH>` *(required)*<br>`--snapshot <PATH>` *(optional)*<br>`--key-hex <HEX>` *(optional)* | Performs a read-only dry-run scan of `<folder>` (respecting `.parvaultignore`), compares streaming 64 KiB SHA-256 digests against `<snapshot>`, and prints added, modified, unchanged, deleted, and ignored file counts without writing shards. |
-| `parvault watch-folder` | `--folder <PATH>` *(required)*<br>`--snapshot-out <PATH>` *(default: `./folder_snapshot.manifest.bin`)*<br>`--tier <consumer\|mixed\|homelab\|relay>` *(default: `homelab`)*<br>`--interval-secs <SECS>` *(default: `5`)*<br>`--once` *(run 1 pass and exit)*<br>`--dry-run` *(preview changes without writing shards)*<br>`--prune-deleted` *(delete orphaned local shards for removed files)*<br>`--key-hex <HEX>` *(optional)*<br>`--seed-phrase <PHRASE>` *(optional)*<br>`--vault-namespace <NS>` *(default: `"default"`)*<br>`--catalog-out <PATH>` *(optional `.catalog.bin`)* | Incrementally backs up new and modified files in `<folder>` using constant-memory 64 KiB streaming SHA-256 checks and 16 MiB `AES-256-GCM` + Reed-Solomon stripes. When `--seed-phrase` and `--catalog-out` are provided, also seals a post-quantum `EncryptedVaultCatalogEnvelope` for zero-local-state disaster recovery. |
-| `parvault restore-folder` | `--snapshot <PATH>` *(required)*<br>`--out-dir <PATH>` *(required)*<br>`--key-hex <HEX>` *(optional)*<br>`--file <REL_PATH>` *(optional selective single-file restore)* | Reconstructs Reed-Solomon shards in $GF(2^8)$, verifies `AES-256-GCM` tags and end-to-end file SHA-256 on a staging file, blocks path/symlink traversal (`resolve_safe_restore_path`), and atomically writes the restored directory tree (or just `--file <REL_PATH>`) into `<out-dir>`. |
-| `parvault recover-from-seed` | `--seed-phrase <PHRASE>` *(required)*<br>`--vault-namespace <NS>` *(default: `"default"`)*<br>`--catalog-envelope <PATH>` *(required)*<br>`--out-dir <PATH>` *(required)* | **Zero-Local-State "House Fire" Recovery (`ADR-15`):** Deterministically re-derives `MasterKey`, 512-bit `PqVaultMasterKey`, `NodeIdentity`, and `dht_key` from `(seed_phrase, vault_namespace)` using 10,000 rounds of key stretching, opens the `EncryptedVaultCatalogEnvelope`, and restores the entire directory tree into `<out-dir>`. |
+| `parvault watch-folder` | `--folder <PATH>` *(required)*<br>`--snapshot-out <PATH>` *(default: `./folder_snapshot.manifest.bin`)*<br>`--tier <consumer\|mixed\|homelab\|relay>` *(default: `homelab`)*<br>`--interval-secs <SECS>` *(default: `5`)*<br>`--once` *(run 1 pass and exit)*<br>`--dry-run` *(preview changes without writing shards)*<br>`--prune-deleted` *(delete orphaned local & remote shards for removed files)*<br>`--key-hex <HEX>` *(optional)*<br>`--seed-phrase <PHRASE>` *(optional)*<br>`--vault-namespace <NS>` *(default: `"default"`)*<br>`--catalog-out <PATH>` *(optional `.catalog.bin`)*<br>`--lite-seed-dir <MULTIADDR_OR_PATH>` *(alias: `--lite-seed-addr`)*<br>`--device-cert <PATH_OR_TOKEN>` *(optional)* | Incrementally backs up new and modified files in `<folder>` using constant-memory 64 KiB streaming SHA-256 checks and 16 MiB `AES-256-GCM` + Reed-Solomon stripes distributed across `--peers` over `libp2p`. When `--seed-phrase` is provided, also seals and publishes a post-quantum `EncryptedVaultCatalogEnvelope` to the Kademlia DHT for zero-local-state disaster recovery. |
+| `parvault list-snapshot` | `--snapshot <PATH>` *(required)* | Lists all file paths, byte sizes, stripe counts, and Merkle root prefixes inside `<snapshot>` with zero shard downloads (`ADR-17`). |
+| `parvault restore-folder` | `--snapshot <PATH>` *(required)*<br>`--out-dir <PATH>` *(alias: `--target-dir`, required)*<br>`--key-hex <HEX>` *(optional)*<br>`--file <REL_PATH>` *(optional single-file restore)*<br>`--filter <CSV>` *(optional glob/prefix subset restore)* | Reconstructs Reed-Solomon shards in $GF(2^8)$ across `--peers`, verifies `AES-256-GCM` tags and end-to-end file SHA-256 on a staging file, blocks path/symlink traversal (`resolve_safe_restore_path`), and atomically writes the restored directory tree into `<out-dir>`. |
+| `parvault recover-from-seed` | `--seed-phrase <PHRASE>` *(required)*<br>`--vault-namespace <NS>` *(default: `"default"`)*<br>`--catalog-envelope <PATH>` *(optional; if omitted, queries Kademlia DHT via `--peers`)*<br>`--out-dir <PATH>` *(default: `./recovered_vault`)*<br>`--filter <CSV>` *(optional glob/prefix subset recovery)* | **Zero-Local-State "House Fire" Recovery (`ADR-15` / `ADR-17`):** Deterministically re-derives `MasterKey`, 512-bit `PqVaultMasterKey`, `NodeIdentity`, and `dht_key` from `(seed_phrase, vault_namespace)` using memory-hard `Argon2id` (`64 MiB`, `t=3`, `p=4`) + `HKDF-SHA256`, fetches and opens the highest-version `EncryptedVaultCatalogEnvelope`, and restores the directory tree into `<out-dir>`. |
 
 ### 2.3 Single-File Vault Operations, Scrubbing, Graceful Leave & Daemon
 | Command | Flags & Arguments | Description |
 | :--- | :--- | :--- |
-| `parvault file store` | `<PATH>` or `--path <PATH>` *(required)*<br>`--tier <consumer\|mixed\|homelab\|relay>` *(default: `consumer`)*<br>`--key-hex <HEX>` *(optional)* | Streams a single file in 16 MiB stripes, encrypts with `AES-256-GCM`, encodes into Reed-Solomon shards, and writes the encrypted manifest. |
-| `parvault file restore` | `<MANIFEST_OR_ROOT>` or `--manifest-or-root <ARG>` *(required)*<br>`<OUTPUT>` or `--output <PATH>` *(required)*<br>`--key-hex <HEX>` *(optional)* | Reconstructs and decrypts a single file from its 64-character hex File Merkle Root or `.manifest.bin` path. |
+| `parvault file store` | `<PATH>` or `--path <PATH>` *(required)*<br>`--tier <consumer\|mixed\|homelab\|relay>` *(default: `consumer`)*<br>`--key-hex <HEX>` *(optional)* | Streams a single file in 16 MiB stripes, encrypts with `AES-256-GCM`, encodes into Reed-Solomon shards, distributes shards across `--peers`, and publishes the encrypted manifest to the DHT. |
+| `parvault file restore` | `<MANIFEST_OR_ROOT>` or `--manifest-or-root <ARG>` *(required)*<br>`<OUTPUT>` or `--output <PATH>` *(required)*<br>`--key-hex <HEX>` *(optional)* | Reconstructs and decrypts a single file from its 64-character hex File Merkle Root (fetching the manifest and shards over `--peers`) or `.manifest.bin` path. |
 | `parvault scrub` | *(none)* | Scans every local `.shard` and `.bshard` file on disk, recomputes leaf SHA-256 digests, and quarantines any bit-rotted shard files (`BlockStore::scrub_all_shards`). |
-| `parvault leave` | `--handoff-to <CSV>` *(optional)*<br>`--keep-local` *(optional)* | Gracefully decommissions the node, performing a `1.0x` direct shard handoff and writing a signed `graceful_departure_receipt.json` that preserves Earned Standing without PoR slashing. |
+| `parvault leave` | `--handoff-to <CSV>` *(optional `Multiaddr`s or paths)*<br>`--keep-local` *(optional)* | Gracefully decommissions the node, performing a `1.0x` direct shard handoff over `libp2p` (preserving PoR session keys and `RepairGrant`s) and writing a signed `graceful_departure_receipt.json`. |
 | `parvault status` | *(none)* | Displays node configuration, active transport (`TCP + Noise XX + Yamux`), storage quota usage, minimum free disk reserve, bandwidth rate limits, SLA erasure pools, and Earned Standing ladder. |
-| `parvault daemon start` | `--listen <MULTIADDR>` *(default: `/ip4/0.0.0.0/tcp/4001`)*<br>`--enable-quic` *(optional)* | Starts the asynchronous P2P storage, Kademlia DHT, Gossipsub slashing, and stateless PoR responder daemon. |
-
-### 2.4 Dedicated Empirical Benchmark Binary (`parvault-bench`)
-| Command | Flags & Arguments | Description |
-| :--- | :--- | :--- |
-| `parvault-bench benchmark` *(alias: `10-node`)* | `--nodes <CSV>` `--payload-mib <MIB>` `--por-challenges <N>` `--killed-node-indices <CSV>` | Runs the 10-node live containerized Noise XX + PoR + 4-node kill recovery benchmark. |
-| `parvault-bench benchmark100-node` *(alias: `100-node`)* | `--num-nodes 100` `--num-vaults 50` `--vault-size-mb 100` `--churn-percent 30` | Runs the 100-node scale & 30% rolling churn benchmark with proactive `18/20` witness repair. |
-| `parvault-bench benchmark-matrix` *(alias: `matrix`)* | `--payload-kb <KB>` *(default: `256`)* | Runs the 8-Profile Network & Hardware Degradation Matrix with Hedged Parallel $K$-of-$N$ recovery. |
+| `parvault daemon start` | `--listen <MULTIADDR>` *(default: `/ip4/0.0.0.0/tcp/4001`)*<br>`--enable-quic` *(optional)* | Starts the asynchronous P2P storage, Kademlia DHT, Gossipsub slashing, periodic bit-rot scrubber, and stateless PoR responder daemon. |
 
 ---
 
 ## 3. Complete `parvault-seed` CLI Reference
+
+Global option: `--peers <CSV>` (`PARVAULT_PEERS`) configures mesh peer `Multiaddr`s for Lite-Client stripe syndication and handoff.
 
 | Command | Flags & Arguments | Description |
 | :--- | :--- | :--- |
@@ -76,10 +76,11 @@ Global option: `-c, --config <PATH>` loads a custom `config.toml` file before ex
 | `parvault-seed identity` | `--data-dir <PATH>` *(default: `./.parvault-seed-data`)* | Displays or initializes the seed server's persistent `Device Peer ID` and `Owner PQ Public Key Hex` (`HybridPqPublicKey`). |
 | `parvault-seed issue-device-cert` | `--device-peer-id <ID>` *(required)*<br>`--device-label <LABEL>` *(default: `"personal-device"`)*<br>`--data-dir <PATH>` *(default: `./.parvault-seed-data`)*<br>`--cert-out <PATH>` *(optional)* | Issues a post-quantum `PersonalDeviceCert` signed by the seed server's persistent owner PQ keypair and prints both JSON and the `PARVAULT-CERT-V1:<hex>` token. |
 | `parvault-seed verify-device-cert` | `--cert <PATH_OR_JSON_OR_TOKEN>` *(required)*<br>`--data-dir <PATH>` *(default: `./.parvault-seed-data`)*<br>`--owner-pq-pubkey-hex <HEX>` *(optional)* | Verifies a `PersonalDeviceCert` against the seed server's configured `owner-pq-pubkey-hex`. |
-| `parvault-seed status` | `--data-dir <PATH>` *(default: `./.parvault-seed-data`)* | Prints the live storage allocation, active blinded leases, earned trust level, and JSON telemetry report. |
+| `parvault-seed status` | `--data-dir <PATH>` *(default: `./.parvault-seed-data`)*<br>`--mode <homelab-vault\|public-bootstrap>` *(default: `homelab-vault`)* | Prints the live storage allocation, active blinded leases, earned trust level, and JSON telemetry report. |
 | `parvault-seed drain-plan` | `--data-dir <PATH>` *(default: `./.parvault-seed-data`)*<br>`--organic-peers <N>` *(default: `20`)*<br>`--target-n <N>` *(default: `20`)* | Simulates and previews deterministic `SeedAnchorDrainMigration` steps showing how shards drain off the seed server onto verified organic peers. |
 | `parvault-seed sweep-expired` | `--data-dir <PATH>` *(default: `./.parvault-seed-data`)*<br>`--current-epoch <EPOCH>` *(required)* | Physically unlinks expired `.bshard` files where `lease_expires_epoch + grace_epochs <= current_epoch`. |
 | `parvault-seed scrub` | `--data-dir <PATH>` *(default: `./.parvault-seed-data`)* | Runs `BlockStore::scrub_all_shards` on the seed server's data directory to detect and quarantine silent disk bit-rot. |
+| `parvault-seed leave` | `--data-dir <PATH>` *(default: `./.parvault-seed-data`)*<br>`--handoff-to <CSV>` *(optional `Multiaddr`s or paths)*<br>`--keep-local` *(optional)* | Gracefully decommissions the seed server, performing a `1.0x` direct shard handoff over `libp2p` and writing a signed `graceful_departure_receipt.json`. |
 | `parvault-seed self-test` | *(none)* | Executes an automated end-to-end self-test verifying `HomelabRedundancyVault` (PQ cert verification + 200 PoR heartbeats -> `16-of-20`) and `PublicNetworkBootstrapper` (lease sweep + organic peer auto-drain -> `0` bytes). |
 
 ---
@@ -89,7 +90,7 @@ Global option: `-c, --config <PATH>` loads a custom `config.toml` file before ex
 ### 4.1 Finding Your `device-peer-id` and `owner-pq-pubkey-hex` (`identity`)
 
 Every `parvault` and `parvault-seed` node automatically generates and persists its cryptographic identity inside `<data_dir>` on first run:
-- `node_identity.key`: 32-byte `Ed25519` seed (`NodeIdentity`), from which your deterministic `device-peer-id` (`parvault-peer-<16_hex_chars>`) is derived.
+- `node_identity.seed`: 32-byte `Ed25519` seed (`NodeIdentity`), from which your deterministic `device-peer-id` (`parvault-peer-<16_hex_chars>`) and `libp2p` `PeerId` are derived.
 - `owner_pq_keypair.bin`: Post-Quantum hybrid signing keypair (`Ed25519 + NIST FIPS 204 ML-DSA-65`), whose public key is displayed as `Owner PQ Public Key Hex`.
 
 Run `parvault identity` on your laptop:
@@ -209,7 +210,7 @@ What if a house fire, flood, or theft destroys your laptop **and** your local `.
      --catalog-envelope ./family-vault.catalog.bin \
      --out-dir ./restored-family-vault
    ```
-   `recover-from-seed` runs 10,000 rounds of domain-separated SHA-256 key stretching + HKDF-SHA256 to reconstruct your exact `MasterKey`, 512-bit `PqVaultMasterKey`, `NodeIdentity`, and `dht_key`, verifies the catalog's zero-knowledge signature, and restores every file bit-for-bit.
+   `recover-from-seed` runs memory-hard `Argon2id` (`m = 64 MiB`, `t = 3`, `p = 4`) + `HKDF-SHA256` to reconstruct your exact `MasterKey`, 512-bit `PqVaultMasterKey`, `NodeIdentity`, and `dht_key`, verifies the catalog's zero-knowledge signature, and restores every file bit-for-bit.
 
 4. **Selective Partial Restore (`--filter`) & Zero-Download Catalog Browsing (`list-snapshot`):**
    If your home NAS dies and your laptop only has a 512 GiB SSD, you never have to restore your entire multi-terabyte vault at once. First, browse the snapshot catalog (`list-snapshot` downloads **zero** shards), or pass `--filter` (comma-separated path prefixes, exact paths, or `*`/`?` globs) to `restore-folder` or `recover-from-seed`:
@@ -225,13 +226,13 @@ What if a house fire, flood, or theft destroys your laptop **and** your local `.
    ```
 
 5. **Laptop Lite-Client Mode (`--lite-seed-dir` & `--device-cert`):**
-   Run your laptop in `LiteSeedBacked` mode (`ADR-17`) so your laptop uploads `1.0x` locally-encrypted `AES-256-GCM` stripes to your `parvault-seed` box while your `parvault-seed` box performs the `16-of-20` Reed-Solomon encoding and mesh syndication:
+   Run your laptop in `LiteSeedBacked` mode (`ADR-17`) so your laptop uploads `1.0x` locally-encrypted `AES-256-GCM` stripes to your `parvault-seed` box over `libp2p` while your `parvault-seed` box performs the `16-of-20` Reed-Solomon encoding and mesh syndication:
    ```bash
-   parvault watch-folder \
+   parvault --peers "/ip4/10.42.1.11/tcp/4001,/ip4/10.42.1.12/tcp/4001" watch-folder \
      --folder ./laptop-workspace \
      --snapshot-out ./laptop.manifest.bin \
-     --lite-seed-dir /mnt/nas/parvault-seed \
-     --device-cert ~/.parvault-data/laptop.cert.bin \
+     --lite-seed-dir /ip4/10.42.1.10/tcp/4002 \
+     --device-cert ./laptop.device-cert.json \
      --once
    ```
    Because your laptop and `parvault-seed` share the identical `FolderSnapshotManifest` and `ShardId` protocol, if your `parvault-seed` NAS ever dies, your laptop automatically fails over to reconstructing any $K$-of-$N$ surviving shards directly from the Neighborhood Cloud mesh.

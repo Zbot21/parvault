@@ -238,12 +238,27 @@ pub struct BlockStore {
 }
 
 impl BlockStore {
-    pub fn new(root_dir: impl AsRef<Path>, quota: QuotaManager) -> Result<Self, StorageError> {
+    pub fn new(root_dir: impl AsRef<Path>, mut quota: QuotaManager) -> Result<Self, StorageError> {
         let root_dir = root_dir.as_ref().to_path_buf();
         let shards_dir = root_dir.join("shards");
         let manifests_dir = root_dir.join("manifests");
         fs::create_dir_all(&shards_dir)?;
         fs::create_dir_all(&manifests_dir)?;
+        quota.bind_persistence_dir(&root_dir);
+        if quota.used_storage_bytes() == 0 {
+            if let Ok(entries) = fs::read_dir(&shards_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if let Some(fname) = p.file_name().and_then(|n| n.to_str()) {
+                        if let Some(stem) = fname.strip_suffix(".shard") {
+                            if let Ok(meta) = p.metadata() {
+                                quota.record_shard_stored("local", stem.to_string(), meta.len());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let max_bytes = quota.max_storage_bytes();
         let leases_file = root_dir.join("blinded_leases.bin");
         let (initial_leases, initial_id_map) = if leases_file.exists() {
@@ -943,6 +958,7 @@ impl BlockStore {
             .lock()
             .map(|m| m.values().map(|b| (b.file_key(), *b)).collect())
             .unwrap_or_default();
+        let por_verifier = crate::por::PorVerifierEngine::with_persistence_dir(300, &self.root_dir);
 
         for (idx, path) in shard_files.iter().enumerate() {
             let fname = path
@@ -973,14 +989,20 @@ impl BlockStore {
                         shard_index: idx as u32,
                         shard_hash: crate::sharding::hash_shard_leaf(idx as u32, &bytes),
                     });
+                    let (maybe_session_key, maybe_grant) =
+                        por_verifier.get_shard_session_and_grant(&shard_id);
+                    let session_key = maybe_session_key.unwrap_or_else(|| {
+                        departing_identity
+                            .derive_stripe_por_session_key(&shard_id.stripe_merkle_root)
+                    });
                     client
                         .put_shard(
                             &target_str,
                             &departing_identity.device_peer_id(),
                             shard_id,
                             bytes.clone(),
-                            [0x55u8; 32],
-                            None,
+                            session_key,
+                            maybe_grant,
                         )
                         .map_err(|e| {
                             StorageError::Io(std::io::Error::new(
@@ -997,13 +1019,37 @@ impl BlockStore {
                                 locator: content_sha,
                                 content_sha256: content_sha,
                             });
-                    let mk = MasterKey::from_bytes(departing_identity.signing_seed_bytes());
-                    let (_, capability) =
-                        BlindedShardCapability::derive_keypair(&mk, &blinded_id.locator);
-                    let voucher = AnonymousQuotaVoucher::mint(
-                        departing_identity,
-                        (bytes.len() * 2) as u64,
-                    );
+                    let (capability, delete_verifier) = if let Ok(mgr) = self.blinded_leases.lock()
+                    {
+                        if let Some(entry) = mgr.lease_entry(&blinded_id.locator) {
+                            let cap_pub = entry.capability_pubkey.unwrap_or_else(|| {
+                                let mk =
+                                    MasterKey::from_bytes(departing_identity.signing_seed_bytes());
+                                BlindedShardCapability::derive_keypair(&mk, &blinded_id.locator)
+                                    .1
+                                    .capability_pubkey
+                            });
+                            (
+                                BlindedShardCapability {
+                                    locator: blinded_id.locator,
+                                    capability_pubkey: cap_pub,
+                                },
+                                entry.delete_verifier,
+                            )
+                        } else {
+                            let mk = MasterKey::from_bytes(departing_identity.signing_seed_bytes());
+                            let (_, cap) =
+                                BlindedShardCapability::derive_keypair(&mk, &blinded_id.locator);
+                            (cap, [0u8; 32])
+                        }
+                    } else {
+                        let mk = MasterKey::from_bytes(departing_identity.signing_seed_bytes());
+                        let (_, cap) =
+                            BlindedShardCapability::derive_keypair(&mk, &blinded_id.locator);
+                        (cap, [0u8; 32])
+                    };
+                    let voucher =
+                        AnonymousQuotaVoucher::mint(departing_identity, (bytes.len() * 2) as u64);
                     client
                         .put_blinded_shard(
                             &target_str,
@@ -1013,7 +1059,7 @@ impl BlockStore {
                             voucher,
                             1,
                             30,
-                            [0u8; 32],
+                            delete_verifier,
                         )
                         .map_err(|e| {
                             StorageError::Io(std::io::Error::new(
@@ -1095,9 +1141,8 @@ impl BlockStore {
                     now_ms,
                 ) {
                     let _ = self.put_dht_manifest_envelope(env.clone());
-                    let _ = client.put_dht_envelope(
-                        crate::network::DhtWireEnvelope::ClassicalManifest(env),
-                    );
+                    let _ = client
+                        .put_dht_envelope(crate::network::DhtWireEnvelope::ClassicalManifest(env));
                 }
             }
         }
@@ -1124,10 +1169,7 @@ impl BlockStore {
         if let Some(ref client) = self.mesh_client {
             if !client.all_network_endpoints().is_empty() {
                 if let Ok(crate::network::DhtWireEnvelope::ClassicalManifest(env)) = client
-                    .get_dht_envelope(
-                        &dht_key,
-                        crate::network::DhtEnvelopeKind::ClassicalManifest,
-                    )
+                    .get_dht_envelope(&dht_key, crate::network::DhtEnvelopeKind::ClassicalManifest)
                 {
                     return env.open(master_key);
                 }
@@ -1188,13 +1230,16 @@ impl BlockStore {
             // 3. Distribute shards over libp2p via MeshClient if network peers are configured, else local BlockStore.
             let assigned_peers = if use_network {
                 let client = self.mesh_client.as_ref().expect("checked use_network");
+                let session_key = client
+                    .identity()
+                    .derive_stripe_por_session_key(&shard_set.stripe_merkle_root);
                 client
                     .distribute_stripe_shards(
                         client.identity(),
                         owner_peer_id,
                         &shard_set,
                         tier,
-                        [0x77u8; 32],
+                        session_key,
                     )
                     .map_err(|e| {
                         StorageError::Io(std::io::Error::new(
@@ -1296,8 +1341,7 @@ impl BlockStore {
                         None
                     }
                 } else if has_net_assigned {
-                    let id = NodeIdentity::load_or_generate_in_dir(&self.root_dir)
-                        .unwrap_or_else(|_| NodeIdentity::generate());
+                    let id = NodeIdentity::from_master_key(master_key);
                     Some(crate::network::MeshClient::new(
                         id,
                         stripe.assigned_peers.clone(),

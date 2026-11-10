@@ -267,7 +267,7 @@
     <div class="topbar-inner">
       <div class="brand">
         <strong>parvault(1) / Neighborhood Cloud</strong>
-        <span class="ver">v0.1.0 &bull; static-musl &bull; AGPL-3.0-only</span>
+        <span class="ver">v0.2.0 &bull; static-musl &bull; AGPL-3.0-only</span>
       </div>
       <nav class="topnav">
         <a href="#downloads">[downloads]</a>
@@ -397,13 +397,13 @@
     <!-- Section 2: Architecture & Byte Pipeline -->
     <h2 id="architecture">
       <span>2. Zero-Trust Streaming Pipeline &amp; Earned Redundancy Tiers</span>
-      <span class="sec-num">ADR-01 .. ADR-14</span>
+      <span class="sec-num">ADR-01 .. ADR-17</span>
     </h2>
     <pre class="term">[Plaintext Directory]
    │
    ├──► 1. Streaming Chunker (16 MiB fixed stripes; caps RAM &lt; 32 MiB on routers/NAS)
    │
-   ├──► 2. 512-Bit Post-Quantum Cascaded AEAD (ChaCha20-Poly1305 &rarr; AES-256-GCM; 2^256 Grover margin)
+   ├──► 2. 512-Bit Post-Quantum Cascaded AEAD (Argon2id + AES-256-GCM &rarr; ChaCha20-Poly1305; 2^256 Grover margin)
    │
    ├──► 3. GF(2^8) Reed-Solomon Erasure Coding + Merkle Tree Proof per Shard:
    │       • Day-1 Personal Ring (0 external peers) :  2-of-3  (0.00x network quota tax)
@@ -480,11 +480,11 @@
 
     <!-- Section 4: Empirical Benchmarks & Formal Verification -->
     <h2 id="benchmarks">
-      <span>4. Empirical Benchmarks &amp; Formal Verification</span>
-      <span class="sec-num">Reproducible via CLI</span>
+      <span>4. Live Docker P2P Regression &amp; Formal Verification</span>
+      <span class="sec-num">Reproducible via CI &amp; CLI</span>
     </h2>
     <p>
-      Every protocol invariant is model-checked in <strong>TLA+ (TLC)</strong> and <strong>Stateright</strong>, and every performance target is reproducible directly from the dedicated benchmark binary using <code>parvault-bench benchmark-matrix</code> and <code>parvault-bench benchmark100-node</code>:
+      Every protocol invariant is model-checked in <strong>TLA+ (TLC)</strong> and <strong>Stateright</strong>, and end-to-end P2P operation is verified across 13 isolated Docker containers using <code>bash scripts/docker_acceptance_gate.sh</code> and <code>cargo test --release</code>:
     </p>
     <table class="util-table">
       <thead>
@@ -497,26 +497,26 @@
       </thead>
       <tbody>
         <tr>
-          <td><strong>100-Node Rolling Churn Benchmark</strong> (<code>parvault-bench benchmark100-node</code>)</td>
-          <td>100 nodes across 10 ASNs, <code>50 &times; 100 MB</code> (<code>5.0 GB</code>) vaults, <code>30%</code> node reboot churn</td>
-          <td class="mono">Boot: <strong>30.9 ms</strong> | Upload: <strong>5.43 s</strong> | <strong>5,700</strong> PoR audits | <strong>120</strong> shards self-healed (<code>10.7%</code> repair tax)</td>
+          <td><strong>13-Container Docker P2P Regression Gate</strong> (<code>scripts/docker_acceptance_gate.sh</code>)</td>
+          <td>1 <code>parvault-seed</code> + 11 <code>parvault daemon</code> + 1 zero-mount client container on <code>172.28.0.0/24</code>; continuous sync, remote pruning, Lite-Client <code>1.0x</code> syndication + NAS-death failover, <code>parvault leave</code>, bit-rot scrub, 4 hard <code>docker kill</code>s, and zero-state <code>recover-from-seed</code></td>
+          <td class="mono">Initial sync: <strong>2 s</strong> (<code>240</code> mesh shards) | Remote prune: <strong>20</strong> shards | Leave migration: <strong>36</strong> shards | Zero-state 4-kill restore: <strong>7 s</strong></td>
+          <td class="ok">PASS (Stages 1–10 SHA-256 Match)</td>
+        </tr>
+        <tr>
+          <td><strong>Live <code>libp2p</code> TCP Multi-Daemon Regression</strong> (<code>tests/sync_daemon_usability_and_cli_regression_tests.rs</code>)</td>
+          <td>3 live OS-socket <code>libp2p</code> TCP + Noise XX + Yamux daemons; multi-version folder sync, remote <code>DeleteShard</code> pruning, daemon kill, and zero-local-state seed recovery</td>
+          <td class="mono"><strong>67 / 67</strong> automated Rust unit, integration, Stateright &amp; Red-Team tests passing</td>
           <td class="ok">PASS (0 Bytes Lost)</td>
         </tr>
         <tr>
-          <td><strong>10-Node Docker + <code>tc netem</code> Hard-Kill</strong> (<code>parvault-bench benchmark</code>)</td>
-          <td>1 GiB streaming vault, <code>5 ms</code> delay, <code>1%</code> packet loss, simultaneous <code>docker kill</code> of 4/10 nodes</td>
-          <td class="mono">PoR p99.9: <strong>25.09 ms</strong> (&le; 300 ms SLA) | Full 1 GiB GF(2<sup>8</sup>) restore: <strong>52.74 s</strong></td>
-          <td class="ok">PASS (SHA-256 Match)</td>
-        </tr>
-        <tr>
-          <td><strong>8-Profile Degraded Network Matrix</strong> (<code>parvault-bench benchmark-matrix</code>)</td>
+          <td><strong>8-Profile Degraded Network Matrix</strong> (<code>tests/anonymity_and_degraded_net_tests.rs</code>)</td>
           <td>15% packet loss Wi-Fi mesh, 260 ms satellite, 1-core Cortex-A53 gateway, 10% Byzantine poisoners, PQ Hybrid + Onion mode</td>
-          <td class="mono">Hedged parallel <code>N</code>-read speedup: <strong>1.14x – 1.44x</strong> | Peak RAM: <strong>3.52 MiB</strong></td>
+          <td class="mono">Hedged parallel <code>N</code>-read speedup: <strong>1.14x – 1.44x</strong> | Bounded RAM: <strong>&lt; 32 MiB</strong></td>
           <td class="ok">8/8 Profiles PASS</td>
         </tr>
         <tr>
           <td><strong>TLA+ Formal Specifications</strong> (<code>specs/*.tla</code>)</td>
-          <td>6 TLA+ models (Protocol, Confidentiality/Trust, 4-Layer Anonymity, Post-Quantum HNDL, Elastic Bootstrap/Earned Tier, Lite-Client &amp; NAS-Death Failover)</td>
+          <td>6 TLA+ models (Protocol + Adversarial Guards, Confidentiality/Trust, 4-Layer Anonymity, Post-Quantum HNDL, Elastic Bootstrap/Earned Tier, Lite-Client &amp; NAS-Death Failover)</td>
           <td class="mono"><strong>6 / 6</strong> specs model-checked in CI via <code>cargo test</code> + <strong>16,777,216</strong> exhaustive GF(2<sup>8</sup>)<sup>3</sup> triples</td>
           <td class="ok">0 Errors / 0 Counterexamples</td>
         </tr>
@@ -526,7 +526,7 @@
     <footer>
       <div>parvault &bull; Neighborhood Cloud Core Backup Engine &bull; License: AGPL-3.0-only</div>
       <div>
-        <a id="gh-repo-link" href="https://github.com/parvault/parvault">GitHub Source, Releases &amp; TLA+ Specs</a>
+        <a id="gh-repo-link" href="https://github.com/Zbot21/parvault">GitHub Source, Releases &amp; TLA+ Specs</a>
       </div>
     </footer>
   </main>

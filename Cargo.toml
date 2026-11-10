@@ -1,6 +1,6 @@
 [package]
 name = "parvault"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "ParVault — Zero-knowledge post-quantum erasure-coded backup utility and P2P storage daemon with Noise transport, Web-of-Trust, and Proof of Retrievability (PoR) auditing."
@@ -12,10 +12,6 @@ path = "src/main.rs"
 [[bin]]
 name = "parvault-seed"
 path = "src/bin/parvault-seed.rs"
-
-[[bin]]
-name = "parvault-bench"
-path = "src/bin/parvault-bench.rs"
 
 [lib]
 name = "parvault"

@@ -15,8 +15,8 @@ Designed to run identically on multi-terabyte homelab NAS servers and memory-con
 | :--- | :--- | :--- |
 | **[Homelab & Everyday User Quickstart (`QUICKSTART.md`)](QUICKSTART.md)** | **Homelabbers, Self-Hosters & Friend Co-Ops** | Plain-English (ELI15) overview and 5 copy-paste recipes (`identity`, `PersonalDeviceCert` linking, `.parvaultignore`, selective file restore, and 24-word "House Fire" recovery). |
 | **[User & CLI Reference Manual (`docs/USER_AND_CLI_GUIDE.md`)](docs/USER_AND_CLI_GUIDE.md)** | **System Administrators & Power Users** | Complete CLI flag reference for `parvault` and `parvault-seed`, `PARVAULT-CERT-V1:` token workflows, `.parvaultignore` syntax, `config.toml` bandwidth rate limits, and bit-rot scrubbing. |
-| **[Security & Cryptography Proofs (`docs/SECURITY_AND_CRYPTOGRAPHY.md`)](docs/SECURITY_AND_CRYPTOGRAPHY.md)** | **Cryptographers & Security Auditors** | Mathematical proofs, $\ge 2^{224}$ combinatorial anonymity bounds, NIST FIPS 203 `ML-KEM-768` & FIPS 204 `ML-DSA-65` hybrid combiners, 5 TLA+ formal specs, and empirical WAN/churn benchmarks. |
-| **[Architectural Decision Records (`docs/ADR.md`)](docs/ADR.md)** | **Distributed Systems Architects** | Complete engineering rationale across **`ADR-01` through `ADR-16`**. |
+| **[Security & Cryptography Proofs (`docs/SECURITY_AND_CRYPTOGRAPHY.md`)](docs/SECURITY_AND_CRYPTOGRAPHY.md)** | **Cryptographers & Security Auditors** | Mathematical proofs, $\ge 2^{224}$ combinatorial anonymity bounds, NIST FIPS 203 `ML-KEM-768` & FIPS 204 `ML-DSA-65` hybrid combiners, 6 TLA+ formal specs, and live 13-container Docker P2P regression reports. |
+| **[Architectural Decision Records (`docs/ADR.md`)](docs/ADR.md)** | **Distributed Systems Architects** | Complete engineering rationale across **`ADR-01` through `ADR-17`**. |
 | **[AI Agent & Engineer Guide (`AGENTS.md`)](AGENTS.md)** | **Contributors & Coding Agents** | Module-by-module map of `src/`, the **7 Non-Negotiable Zero-Trust & Memory-Safety Rules**, and exact build/test/TLC verification commands. See also [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`SECURITY.md`](SECURITY.md). |
 
 ---
@@ -146,11 +146,14 @@ fn main() -> anyhow::Result<()> {
 ## Build & Verification Commands
 
 ```bash
-# Run all unit, integration, mathematical proof, Stateright, and Red-Team test suites
+# Run all unit, integration, mathematical proof, Stateright, TLA+ TLC, and live libp2p TCP test suites
 cargo test --release
 
 # Execute the built-in end-to-end verification of parvault-seed (homelab-vault + public-bootstrap)
 cargo run --release --bin parvault-seed -- self-test
+
+# Execute the 13-container live Docker P2P regression & disaster recovery gate (Stages 1-10)
+bash scripts/docker_acceptance_gate.sh
 
 # Build zero-dependency static Linux musl binaries (x86_64 and ARM64)
 cargo build --release --target x86_64-unknown-linux-musl

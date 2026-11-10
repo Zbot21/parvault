@@ -6,8 +6,8 @@ use std::collections::{HashMap, VecDeque};
 /// Homelab / Prosumer pool (`16-of-20`, 1.25x expansion factor).
 pub const HOMELAB_SLA_THRESHOLD: f64 = 0.995;
 
-/// Default minimum free OS filesystem space (1 GiB) reserved as a safety guard against disk exhaustion.
-pub const DEFAULT_MIN_FREE_DISK_BYTES: u64 = 1024 * 1024 * 1024;
+/// Default minimum free OS filesystem space (5 GiB) reserved as a safety guard against disk exhaustion.
+pub const DEFAULT_MIN_FREE_DISK_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 /// Dynamic Uptime-Based Trust Levels (ADR-10):
 /// Governs how many shards of a single stripe an ASN/subnet is permitted to host and
@@ -121,6 +121,8 @@ pub struct QuotaManager {
     min_free_disk_bytes: u64,
     #[serde(default)]
     observed_free_disk_bytes: Option<u64>,
+    #[serde(skip)]
+    persistence_path: Option<std::path::PathBuf>,
 }
 
 impl QuotaManager {
@@ -135,6 +137,56 @@ impl QuotaManager {
             lru_queue: VecDeque::new(),
             min_free_disk_bytes: 0,
             observed_free_disk_bytes: None,
+            persistence_path: None,
+        }
+    }
+
+    /// Loads or binds a persistent `QuotaManager` at `data_dir/quota_state.bin`.
+    pub fn with_persistence_dir(
+        max_storage_bytes: u64,
+        bootstrap_grace_bytes: u64,
+        data_dir: &std::path::Path,
+    ) -> Self {
+        let path = data_dir.join("quota_state.bin");
+        if path.exists() {
+            if let Ok(raw) = std::fs::read(&path) {
+                if let Ok(mut loaded) = bincode::deserialize::<Self>(&raw) {
+                    loaded.max_storage_bytes = max_storage_bytes;
+                    loaded.bootstrap_grace_bytes = bootstrap_grace_bytes;
+                    loaded.persistence_path = Some(path);
+                    return loaded;
+                }
+            }
+        }
+        let mut q = Self::new(max_storage_bytes, bootstrap_grace_bytes);
+        q.persistence_path = Some(path);
+        q
+    }
+
+    pub fn bind_persistence_dir(&mut self, data_dir: &std::path::Path) {
+        let path = data_dir.join("quota_state.bin");
+        if self.used_storage_bytes == 0 && self.peer_accounts.is_empty() && path.exists() {
+            if let Ok(raw) = std::fs::read(&path) {
+                if let Ok(mut loaded) = bincode::deserialize::<Self>(&raw) {
+                    loaded.max_storage_bytes = self.max_storage_bytes;
+                    loaded.bootstrap_grace_bytes = self.bootstrap_grace_bytes;
+                    if self.min_free_disk_bytes > 0 {
+                        loaded.min_free_disk_bytes = self.min_free_disk_bytes;
+                    }
+                    loaded.persistence_path = Some(path);
+                    *self = loaded;
+                    return;
+                }
+            }
+        }
+        self.persistence_path = Some(path);
+    }
+
+    fn persist(&self) {
+        if let Some(ref path) = self.persistence_path {
+            if let Ok(bytes) = bincode::serialize(self) {
+                let _ = crate::storage::BlockStore::atomic_write_file(path, &bytes);
+            }
         }
     }
 
@@ -185,6 +237,7 @@ impl QuotaManager {
         acct.bytes_contributed_by_peer = acct
             .bytes_contributed_by_peer
             .saturating_add(contributed_bytes);
+        self.persist();
     }
 
     /// Records a PoR audit outcome for `peer_id`, updating its SLA cohort qualification.
@@ -195,6 +248,7 @@ impl QuotaManager {
         } else {
             acct.por_failures = acct.por_failures.saturating_add(1);
         }
+        self.persist();
     }
 
     /// Checks whether `peer_id` is within both the node's physical disk ceiling and its
@@ -248,6 +302,7 @@ impl QuotaManager {
         acct.bytes_contributed_by_peer = 0;
         acct.is_slashed = true;
         acct.por_failures = acct.por_failures.saturating_add(100);
+        self.persist();
         burned
     }
 
@@ -270,6 +325,7 @@ impl QuotaManager {
             acct.epoch_ingress_bytes_written.saturating_add(shard_bytes);
         self.used_storage_bytes = self.used_storage_bytes.saturating_add(shard_bytes);
         self.touch_shard(&shard_key);
+        self.persist();
     }
 
     /// Updates LRU recency when a shard is read or audited.
@@ -287,6 +343,7 @@ impl QuotaManager {
         if let Some(acct) = self.peer_accounts.get_mut(peer_id) {
             acct.bytes_hosted_for_peer = acct.bytes_hosted_for_peer.saturating_sub(shard_bytes);
         }
+        self.persist();
     }
 
     /// Evicts least-recently-used shard keys until at least `needed_bytes` of free space is available.

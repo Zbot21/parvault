@@ -773,8 +773,10 @@ fn test_persistent_por_repair_grants_dht_store_and_libp2p_keypair_across_restart
     assert_eq!(kp1.public().to_peer_id(), kp2.public().to_peer_id());
 
     // 2. SoftwareTpm2Stub seals/unseals consistently from persisted CSPRNG/passphrase key
-    let tpm1 = SoftwareTpm2Stub::from_passphrase_or_csprng_in_dir(&base, Some("vault-pass")).unwrap();
-    let tpm2 = SoftwareTpm2Stub::from_passphrase_or_csprng_in_dir(&base, Some("vault-pass")).unwrap();
+    let tpm1 =
+        SoftwareTpm2Stub::from_passphrase_or_csprng_in_dir(&base, Some("vault-pass")).unwrap();
+    let tpm2 =
+        SoftwareTpm2Stub::from_passphrase_or_csprng_in_dir(&base, Some("vault-pass")).unwrap();
     let sealed = tpm1.seal_key(&[0xAB; 32]).unwrap();
     let unsealed = tpm2.unseal_key(&sealed).unwrap();
     assert_eq!(unsealed, [0xAB; 32]);
@@ -789,11 +791,8 @@ fn test_persistent_por_repair_grants_dht_store_and_libp2p_keypair_across_restart
         shard_index: 4,
         shard_hash: hash_shard_leaf(4, shard_bytes),
     };
-    let store = BlockStore::new(
-        &base,
-        QuotaManager::new(10 * 1024 * 1024, 10 * 1024 * 1024),
-    )
-    .unwrap();
+    let store =
+        BlockStore::new(&base, QuotaManager::new(10 * 1024 * 1024, 10 * 1024 * 1024)).unwrap();
     store
         .put_shard(&owner.device_peer_id(), &shard_id, shard_bytes)
         .unwrap();
@@ -831,5 +830,254 @@ fn test_persistent_por_repair_grants_dht_store_and_libp2p_keypair_across_restart
     fs::create_dir_all(&dht_dir).unwrap();
     let _dht = ZeroTrustDhtStore::with_persistence_dir(&dht_dir);
 
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn test_live_libp2p_tcp_multi_daemon_network_backup_prune_and_seed_recovery() {
+    struct ChildGuard(Vec<std::process::Child>);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn reserve_free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        listener.local_addr().unwrap().port()
+    }
+
+    let base = unique_temp_dir("live-libp2p-multi-daemon");
+    let parvault_bin = env!("CARGO_BIN_EXE_parvault");
+    let seed_bin = env!("CARGO_BIN_EXE_parvault-seed");
+
+    let seed_port = reserve_free_port();
+    let node_ports = [
+        reserve_free_port(),
+        reserve_free_port(),
+        reserve_free_port(),
+        reserve_free_port(),
+    ];
+    let peers_csv = node_ports
+        .iter()
+        .map(|p| format!("/ip4/127.0.0.1/tcp/{p}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let seed_multiaddr = format!("/ip4/127.0.0.1/tcp/{seed_port}");
+
+    let mut guards = ChildGuard(Vec::new());
+
+    // 1. Spawn parvault-seed + 4 parvault daemon processes on isolated data directories
+    let seed_dir = base.join("seed_node");
+    fs::create_dir_all(&seed_dir).unwrap();
+    let seed_child = std::process::Command::new(seed_bin)
+        .args([
+            "--peers",
+            &peers_csv,
+            "start",
+            "--mode",
+            "homelab-vault",
+            "--listen",
+            &seed_multiaddr,
+            "--data-dir",
+        ])
+        .arg(&seed_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn parvault-seed");
+    guards.0.push(seed_child);
+
+    let mut node_dirs = Vec::new();
+    for (idx, port) in node_ports.iter().enumerate() {
+        let ndir = base.join(format!("daemon_{idx}"));
+        fs::create_dir_all(&ndir).unwrap();
+        node_dirs.push(ndir.clone());
+        let child = std::process::Command::new(parvault_bin)
+            .arg("--data-dir")
+            .arg(&ndir)
+            .args([
+                "--peers",
+                &peers_csv,
+                "--seed-addr",
+                &seed_multiaddr,
+                "daemon",
+                "start",
+                "--listen",
+                &format!("/ip4/127.0.0.1/tcp/{port}"),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn parvault daemon");
+        guards.0.push(child);
+    }
+
+    // Wait until all TCP listeners accept connections
+    for port in std::iter::once(seed_port).chain(node_ports.iter().copied()) {
+        let mut connected = false;
+        for _ in 0..50 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                connected = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(connected, "Daemon on port {port} did not start listening");
+    }
+
+    // 2. From an isolated client directory, run watch-folder --once over libp2p
+    let client_dir = base.join("client_data");
+    let source_dir = base.join("source_vault");
+    let snap_path = base.join("client_snap.manifest.bin");
+    fs::create_dir_all(&client_dir).unwrap();
+    fs::create_dir_all(source_dir.join("docs")).unwrap();
+    fs::write(
+        source_dir.join("docs/architecture.txt"),
+        b"Real libp2p TCP + Noise XX + Yamux P2P backup payload",
+    )
+    .unwrap();
+    fs::write(
+        source_dir.join("ephemeral.txt"),
+        b"Temporary file that will be deleted and pruned across remote peers",
+    )
+    .unwrap();
+
+    let seed_phrase =
+        "abandon ability able about above absent absorb abstract absurd abuse access accident";
+    let out_sync1 = std::process::Command::new(parvault_bin)
+        .arg("--data-dir")
+        .arg(&client_dir)
+        .args([
+            "--peers",
+            &peers_csv,
+            "--seed-addr",
+            &seed_multiaddr,
+            "watch-folder",
+            "--folder",
+        ])
+        .arg(&source_dir)
+        .arg("--snapshot-out")
+        .arg(&snap_path)
+        .args([
+            "--tier",
+            "homelab",
+            "--seed-phrase",
+            seed_phrase,
+            "--vault-namespace",
+            "live-tcp-test",
+            "--once",
+        ])
+        .output()
+        .expect("run watch-folder v1");
+    assert!(
+        out_sync1.status.success(),
+        "watch-folder v1 failed: {}",
+        String::from_utf8_lossy(&out_sync1.stderr)
+    );
+
+    // Count remote .shard files across the 4 storage daemons after v1
+    let count_remote_shards = |dirs: &[std::path::PathBuf]| -> usize {
+        dirs.iter()
+            .map(|d| {
+                fs::read_dir(d.join("shards"))
+                    .ok()
+                    .map(|rd| {
+                        rd.filter_map(Result::ok)
+                            .filter(|e| {
+                                e.path().extension().and_then(|s| s.to_str()) == Some("shard")
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0)
+            })
+            .sum()
+    };
+    let remote_shards_v1 = count_remote_shards(&node_dirs);
+    assert!(
+        remote_shards_v1 >= 40,
+        "Expected remote daemons to hold >= 40 shards for 2 files, found {remote_shards_v1}"
+    );
+
+    // 3. Delete ephemeral.txt and run watch-folder --once --prune-deleted
+    fs::remove_file(source_dir.join("ephemeral.txt")).unwrap();
+    let out_sync2 = std::process::Command::new(parvault_bin)
+        .arg("--data-dir")
+        .arg(&client_dir)
+        .args([
+            "--peers",
+            &peers_csv,
+            "--seed-addr",
+            &seed_multiaddr,
+            "watch-folder",
+            "--folder",
+        ])
+        .arg(&source_dir)
+        .arg("--snapshot-out")
+        .arg(&snap_path)
+        .args([
+            "--tier",
+            "homelab",
+            "--seed-phrase",
+            seed_phrase,
+            "--vault-namespace",
+            "live-tcp-test",
+            "--prune-deleted",
+            "--once",
+        ])
+        .output()
+        .expect("run watch-folder v2 with prune-deleted");
+    assert!(
+        out_sync2.status.success(),
+        "watch-folder v2 failed: {}",
+        String::from_utf8_lossy(&out_sync2.stderr)
+    );
+    let remote_shards_v2 = count_remote_shards(&node_dirs);
+    assert!(
+        remote_shards_v2 < remote_shards_v1,
+        "Remote shard count must decrease after --prune-deleted (before={remote_shards_v1}, after={remote_shards_v2})"
+    );
+
+    // 4. Kill 1 storage daemon (leaving 3 of 4 alive) and recover from seed phrase alone into a clean directory
+    let _ = guards.0[1].kill();
+    let _ = guards.0[1].wait();
+
+    let fresh_client_dir = base.join("fresh_client_after_fire");
+    let recovered_dir = base.join("recovered_vault");
+    fs::create_dir_all(&fresh_client_dir).unwrap();
+
+    let out_recover = std::process::Command::new(parvault_bin)
+        .arg("--data-dir")
+        .arg(&fresh_client_dir)
+        .args([
+            "--peers",
+            &peers_csv,
+            "--seed-addr",
+            &seed_multiaddr,
+            "recover-from-seed",
+            "--seed-phrase",
+            seed_phrase,
+            "--vault-namespace",
+            "live-tcp-test",
+            "--out-dir",
+        ])
+        .arg(&recovered_dir)
+        .output()
+        .expect("run recover-from-seed over libp2p");
+    assert!(
+        out_recover.status.success(),
+        "recover-from-seed failed: {}",
+        String::from_utf8_lossy(&out_recover.stderr)
+    );
+    assert_eq!(
+        fs::read(recovered_dir.join("docs/architecture.txt")).unwrap(),
+        b"Real libp2p TCP + Noise XX + Yamux P2P backup payload"
+    );
+    assert!(!recovered_dir.join("ephemeral.txt").exists());
+
+    drop(guards);
     let _ = fs::remove_dir_all(&base);
 }

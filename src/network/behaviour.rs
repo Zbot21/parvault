@@ -283,6 +283,7 @@ pub enum MeshWireRequest {
     SyndicateLiteStripe {
         cert: PersonalDeviceCert,
         bundle: LiteStripeSyndicationBundle,
+        repair_grant: Option<RepairGrant>,
     },
     /// Phase 2-4: Publish a signed monotonic DHT manifest or disaster-recovery vault catalog envelope.
     PutDhtEnvelope(DhtWireEnvelope),
@@ -290,6 +291,11 @@ pub enum MeshWireRequest {
     GetDhtEnvelope {
         dht_key: [u8; 32],
         kind: DhtEnvelopeKind,
+    },
+    /// Delete an unblinded ciphertext shard using an owner-signed `"parvault-owner-shard-delete-v1:"` token.
+    DeleteShard {
+        shard_id: ShardId,
+        owner_signature: ([u8; 32], Vec<u8>, [u8; 32], [u8; 32]),
     },
 }
 
@@ -332,6 +338,7 @@ pub enum MeshWireResponse {
     },
     SyndicateLiteStripeAck {
         receipt: Option<LiteSyndicationReceipt>,
+        syndicated_peers: Vec<String>,
         error: Option<String>,
     },
     PutDhtEnvelopeAck {
@@ -342,6 +349,10 @@ pub enum MeshWireResponse {
         envelope: Option<DhtWireEnvelope>,
         error: Option<String>,
     },
+    DeleteShardAck {
+        deleted: bool,
+        error: Option<String>,
+    },
 }
 
 /// Composite libp2p `NetworkBehaviour` combining Kademlia DHT, Gossipsub, mDNS, Ping, Identify,
@@ -350,7 +361,7 @@ pub enum MeshWireResponse {
 pub struct MeshNetworkBehaviour {
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
     pub gossipsub: gossipsub::Behaviour,
-    pub mdns: mdns::tokio::Behaviour,
+    pub mdns: libp2p::swarm::behaviour::toggle::Toggle<mdns::tokio::Behaviour>,
     pub ping: ping::Behaviour,
     pub identify: identify::Behaviour,
     pub req_resp: request_response::Behaviour<BincodeWireCodec>,

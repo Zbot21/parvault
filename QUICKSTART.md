@@ -183,12 +183,12 @@ If you have a laptop and a home NAS/Raspberry Pi running `parvault-seed`, your l
 - **If your NAS dies**, your laptop speaks the exact same protocol and automatically fails over to recovering directly from the Neighborhood Cloud mesh — and with `--filter`, you can restore **only the specific folders or files you need on your laptop** without downloading your entire multi-terabyte NAS vault!
 
 ```bash
-# 1. Back up from your laptop in Lite-Client mode via your paired Seed Box
-parvault watch-folder \
+# 1. Back up from your laptop in Lite-Client mode via your paired Seed Box over libp2p
+parvault --peers "/ip4/10.42.1.11/tcp/4001,/ip4/10.42.1.12/tcp/4001" watch-folder \
   --folder ./work-projects \
   --snapshot-out ./work.manifest.bin \
-  --lite-seed-dir /mnt/nas/parvault-seed \
-  --device-cert ~/.parvault-data/laptop.cert.bin \
+  --lite-seed-dir /ip4/10.42.1.10/tcp/4002 \
+  --device-cert ./my-laptop.device-cert.json \
   --once
 
 # 2. Browse everything inside a snapshot with ZERO shard downloads

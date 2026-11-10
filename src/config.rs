@@ -17,6 +17,10 @@ pub const DEFAULT_INTRA_ASN_RATIO: f64 = 0.70;
 /// Default bootstrap grace storage quota (10 GiB) for newly invited Web-of-Trust peers (ADR-07).
 pub const DEFAULT_BOOTSTRAP_GRACE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
+const fn default_min_free_disk_bytes() -> u64 {
+    crate::storage::quota::DEFAULT_MIN_FREE_DISK_BYTES
+}
+
 /// Comparative Erasure Coding Schemes (k-of-n) and Dynamic SLA Pools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 pub enum ErasureTier {
@@ -74,6 +78,10 @@ pub struct Cli {
     /// Path to optional TOML configuration file.
     #[arg(short, long, global = true)]
     pub config: Option<PathBuf>,
+
+    /// Optional local data directory for shards, manifests, and identity keys (overrides `data_dir`).
+    #[arg(long, global = true)]
+    pub data_dir: Option<PathBuf>,
 
     /// Optional comma-separated list of mesh peer Multiaddrs or `host:port` endpoints (overrides `bootstrap_peers` / `PARVAULT_PEERS`).
     #[arg(long, global = true, value_delimiter = ',')]
@@ -238,7 +246,11 @@ pub enum Commands {
         catalog_envelope: Option<PathBuf>,
 
         /// Target output directory where the recovered directory tree will be restored.
-        #[arg(long, visible_alias = "target-dir", default_value = "./recovered_vault")]
+        #[arg(
+            long,
+            visible_alias = "target-dir",
+            default_value = "./recovered_vault"
+        )]
         out_dir: PathBuf,
 
         /// Optional comma-separated glob or directory prefix filter to selectively recover only needed files (ADR-17).
@@ -354,6 +366,15 @@ pub struct NodeConfig {
     /// Optional passphrase for Argon2id hardware enclave key sealing (`PARVAULT_PASSPHRASE`).
     #[serde(default)]
     pub device_sealing_passphrase: Option<String>,
+    /// Minimum free OS filesystem space (default 5 GiB) reserved as a safety guard against disk exhaustion.
+    #[serde(default = "default_min_free_disk_bytes")]
+    pub min_free_disk_bytes: u64,
+    /// Optional upload bandwidth limit in Mbps (`0` = unlimited).
+    #[serde(default)]
+    pub max_upload_mbps: u64,
+    /// Optional download bandwidth limit in Mbps (`0` = unlimited).
+    #[serde(default)]
+    pub max_download_mbps: u64,
 }
 
 impl Default for NodeConfig {
@@ -376,6 +397,9 @@ impl Default for NodeConfig {
             lite_seed_addr: None,
             genesis_root_pubkey_hex: None,
             device_sealing_passphrase: None,
+            min_free_disk_bytes: default_min_free_disk_bytes(),
+            max_upload_mbps: 0,
+            max_download_mbps: 0,
         }
     }
 }

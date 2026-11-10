@@ -200,7 +200,7 @@ impl SlashingEvidence {
 
 /// Stateful Web-of-Trust registry tracking verified delegation trees, failure counters,
 /// and recursive parent branch pruning (`network::wot`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebOfTrustRegistry {
     genesis_pubkey: [u8; 32],
     max_subtree_slashes: u32,
@@ -216,6 +216,8 @@ pub struct WebOfTrustRegistry {
     seen_slashing_nonces: HashSet<([u8; 32], [u8; 32], u64)>,
     /// Bounded FIFO queue ordering `seen_slashing_nonces` so RAM usage never exceeds `MAX_SEEN_SLASHING_NONCES`.
     seen_slashing_fifo: VecDeque<([u8; 32], [u8; 32], u64)>,
+    #[serde(skip)]
+    persistence_path: Option<std::path::PathBuf>,
 }
 
 impl WebOfTrustRegistry {
@@ -229,6 +231,37 @@ impl WebOfTrustRegistry {
             quarantined_keys: HashSet::new(),
             seen_slashing_nonces: HashSet::new(),
             seen_slashing_fifo: VecDeque::new(),
+            persistence_path: None,
+        }
+    }
+
+    /// Loads or initializes a persistent `WebOfTrustRegistry` at `data_dir/wot_state.bin`.
+    pub fn with_persistence_dir(
+        genesis_pubkey: [u8; 32],
+        max_subtree_slashes: u32,
+        data_dir: &std::path::Path,
+    ) -> Self {
+        let path = data_dir.join("wot_state.bin");
+        if path.exists() {
+            if let Ok(raw) = std::fs::read(&path) {
+                if let Ok(mut loaded) = bincode::deserialize::<Self>(&raw) {
+                    if loaded.genesis_pubkey == genesis_pubkey {
+                        loaded.persistence_path = Some(path);
+                        return loaded;
+                    }
+                }
+            }
+        }
+        let mut reg = Self::new(genesis_pubkey, max_subtree_slashes);
+        reg.persistence_path = Some(path);
+        reg
+    }
+
+    fn persist(&self) {
+        if let Some(ref path) = self.persistence_path {
+            if let Ok(bytes) = bincode::serialize(self) {
+                let _ = crate::storage::BlockStore::atomic_write_file(path, &bytes);
+            }
         }
     }
 
@@ -268,6 +301,7 @@ impl WebOfTrustRegistry {
 
         let leaf = chain.leaf_pubkey().expect("checked non-empty");
         self.admitted_chains.insert(leaf, chain.clone());
+        self.persist();
         Ok(leaf)
     }
 
@@ -319,8 +353,10 @@ impl WebOfTrustRegistry {
                     }
                 }
             }
+            self.persist();
             return true;
         }
+        self.persist();
         false
     }
 
@@ -348,6 +384,7 @@ impl WebOfTrustRegistry {
                 }
             }
         }
+        self.persist();
         true
     }
 

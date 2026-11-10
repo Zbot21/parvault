@@ -453,10 +453,16 @@ impl PqVaultMasterKey {
         let hk_lo = Hkdf::<Sha256>::new(Some(normalized_ns.as_bytes()), &root_seed_64[..32]);
         let hk_hi = Hkdf::<Sha256>::new(Some(normalized_ns.as_bytes()), &root_seed_64[32..64]);
         hk_lo
-            .expand(b"parvault-dr-pq512-vault-master-key-lo-v1", &mut pq_bytes[..32])
+            .expand(
+                b"parvault-dr-pq512-vault-master-key-lo-v1",
+                &mut pq_bytes[..32],
+            )
             .expect("32-byte HKDF expansion is always valid");
         hk_hi
-            .expand(b"parvault-dr-pq512-vault-master-key-hi-v1", &mut pq_bytes[32..64])
+            .expand(
+                b"parvault-dr-pq512-vault-master-key-hi-v1",
+                &mut pq_bytes[32..64],
+            )
             .expect("32-byte HKDF expansion is always valid");
         Self(pq_bytes)
     }

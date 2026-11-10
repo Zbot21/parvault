@@ -1199,6 +1199,20 @@ impl ZeroTrustSeedServer {
         bundle: &LiteStripeSyndicationBundle,
         mesh_peer_stores: &[&BlockStore],
     ) -> Result<LiteSyndicationReceipt, BootstrapError> {
+        let (receipt, _) =
+            self.ingest_and_syndicate_lite_stripe_with_grant(cert, bundle, mesh_peer_stores, None)?;
+        Ok(receipt)
+    }
+
+    /// Syndicates a Lite-Client `1.0x` encrypted stripe while forwarding the owner's `RepairGrant`
+    /// to each syndicated mesh peer (`ADR-17`) and returning the assigned peer addresses.
+    pub fn ingest_and_syndicate_lite_stripe_with_grant(
+        &mut self,
+        cert: &PersonalDeviceCert,
+        bundle: &LiteStripeSyndicationBundle,
+        mesh_peer_stores: &[&BlockStore],
+        repair_grant: Option<crate::por::RepairGrant>,
+    ) -> Result<(LiteSyndicationReceipt, Vec<String>), BootstrapError> {
         self.authorize_personal_device(cert)?;
 
         let shard_set = crate::sharding::encode_ciphertext_stripe(
@@ -1216,6 +1230,7 @@ impl ZeroTrustSeedServer {
 
         let total_shards = shard_set.shards.len();
         let mut mesh_peers_populated = 0usize;
+        let mut syndicated_peers = Vec::with_capacity(total_shards);
 
         for (idx, shard_bytes) in shard_set.shards.iter().enumerate() {
             let shard_id = ShardId {
@@ -1231,34 +1246,61 @@ impl ZeroTrustSeedServer {
                 let target_peer_store = mesh_peer_stores[idx % mesh_peer_stores.len()];
                 target_peer_store.put_shard(&self.server_peer_id, &shard_id, shard_bytes)?;
                 mesh_peers_populated += 1;
+                syndicated_peers.push(self.server_peer_id.clone());
             } else if let Some(client) = self.block_store.mesh_client() {
                 let peers = client.peers();
                 if !peers.is_empty() {
-                    let target_addr = &peers[idx % peers.len()];
-                    if client
-                        .put_shard(
-                            target_addr,
-                            &self.server_peer_id,
-                            shard_id,
-                            shard_bytes.clone(),
-                            [0x77u8; 32],
-                            None,
-                        )
-                        .is_ok()
-                    {
-                        mesh_peers_populated += 1;
+                    let num_peers = peers.len();
+                    let replica_shifts = if num_peers < total_shards {
+                        3usize.min(num_peers)
+                    } else {
+                        1usize
+                    };
+                    let session_key = client
+                        .identity()
+                        .derive_stripe_por_session_key(&shard_set.stripe_merkle_root);
+                    let mut primary_target = None;
+                    for shift in 0..replica_shifts {
+                        let target_addr = &peers[(idx + shift) % num_peers];
+                        if client
+                            .put_shard(
+                                target_addr,
+                                &self.server_peer_id,
+                                shard_id,
+                                shard_bytes.clone(),
+                                session_key,
+                                repair_grant.clone(),
+                            )
+                            .is_ok()
+                            && primary_target.is_none()
+                        {
+                            primary_target = Some(target_addr.clone());
+                        }
                     }
+                    if let Some(chosen) = primary_target {
+                        mesh_peers_populated += 1;
+                        syndicated_peers.push(chosen);
+                    } else {
+                        syndicated_peers.push(self.server_peer_id.clone());
+                    }
+                } else {
+                    syndicated_peers.push(self.server_peer_id.clone());
                 }
+            } else {
+                syndicated_peers.push(self.server_peer_id.clone());
             }
         }
 
-        Ok(LiteSyndicationReceipt {
-            stripe_index: bundle.stripe_index,
-            stripe_merkle_root: shard_set.stripe_merkle_root,
-            total_shards_syndicated: total_shards,
-            cached_on_seed_server: true,
-            mesh_peers_populated,
-        })
+        Ok((
+            LiteSyndicationReceipt {
+                stripe_index: bundle.stripe_index,
+                stripe_merkle_root: shard_set.stripe_merkle_root,
+                total_shards_syndicated: total_shards,
+                cached_on_seed_server: true,
+                mesh_peers_populated,
+            },
+            syndicated_peers,
+        ))
     }
 
     /// Returns the reciprocity quota tax charged against `device_peer_id` (always `0` for authorized

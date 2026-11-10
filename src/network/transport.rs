@@ -13,6 +13,22 @@ pub fn build_mesh_swarm(
     keypair: libp2p::identity::Keypair,
     enable_quic: bool,
 ) -> anyhow::Result<Swarm<MeshNetworkBehaviour>> {
+    build_mesh_swarm_with_mdns(keypair, enable_quic, true)
+}
+
+/// Builds a lightweight client `libp2p::Swarm` for outbound RPCs without binding a multicast mDNS listener.
+pub fn build_mesh_client_swarm(
+    keypair: libp2p::identity::Keypair,
+    enable_quic: bool,
+) -> anyhow::Result<Swarm<MeshNetworkBehaviour>> {
+    build_mesh_swarm_with_mdns(keypair, enable_quic, false)
+}
+
+fn build_mesh_swarm_with_mdns(
+    keypair: libp2p::identity::Keypair,
+    enable_quic: bool,
+    enable_mdns: bool,
+) -> anyhow::Result<Swarm<MeshNetworkBehaviour>> {
     let builder = SwarmBuilder::with_existing_identity(keypair).with_tokio();
 
     let builder = builder.with_tcp(
@@ -24,12 +40,12 @@ pub fn build_mesh_swarm(
     let swarm = if enable_quic {
         builder
             .with_quic()
-            .with_behaviour(construct_behaviour)?
+            .with_behaviour(|key| construct_behaviour(key, enable_mdns))?
             .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
             .build()
     } else {
         builder
-            .with_behaviour(construct_behaviour)?
+            .with_behaviour(|key| construct_behaviour(key, enable_mdns))?
             .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
             .build()
     };
@@ -39,6 +55,7 @@ pub fn build_mesh_swarm(
 
 fn construct_behaviour(
     key: &libp2p::identity::Keypair,
+    enable_mdns: bool,
 ) -> Result<MeshNetworkBehaviour, Box<dyn std::error::Error + Send + Sync>> {
     let local_peer_id = key.public().to_peer_id();
 
@@ -58,8 +75,15 @@ fn construct_behaviour(
         gossipsub_config,
     )?;
 
-    // 3. mDNS for sub-millisecond local LAN/WLAN subnet discovery.
-    let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
+    // 3. mDNS for sub-millisecond local LAN/WLAN subnet discovery (enabled for daemons, toggled off for one-shot RPCs).
+    let mdns = if enable_mdns {
+        libp2p::swarm::behaviour::toggle::Toggle::from(Some(mdns::tokio::Behaviour::new(
+            mdns::Config::default(),
+            local_peer_id,
+        )?))
+    } else {
+        libp2p::swarm::behaviour::toggle::Toggle::from(None)
+    };
 
     // 4. Active RTT probing (Ping) & Identify.
     let ping = ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(5)));

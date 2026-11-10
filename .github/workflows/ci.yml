@@ -1,4 +1,4 @@
-name: CI — Rust Test Suites & TLA+ Formal Verification
+name: CI — Rust Test Suites, Multi-Container Docker Gate & TLA+ Formal Verification
 
 on:
   push:
@@ -12,7 +12,7 @@ env:
 
 jobs:
   rust-tests:
-    name: Rust Unit, Integration, Red-Team & TLA+ Integration Suites
+    name: Rust Unit, Integration, Red-Team, TLA+ & Multi-Container Docker Suite
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,12 +31,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Run Clippy lints
+        run: cargo clippy --all-targets -- -D warnings
       - name: Build binaries (parvault + parvault-seed)
         run: cargo build --release --bins
       - name: Run all integration, formal (Stateright + TLA+ TLC) & red-team test suites
         run: cargo test --release
       - name: Run parvault-seed self-test
         run: ./target/release/parvault-seed self-test
+      - name: Run 13-Container Docker P2P Regression & Disaster Recovery Gate
+        run: USE_GLIBC_IMAGE=1 bash scripts/docker_acceptance_gate.sh
 
   tla-model-check:
     name: TLA+ TLC Formal Model Checking (6 Specs)

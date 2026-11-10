@@ -1,4 +1,3 @@
-pub mod bench_matrix;
 pub mod bootstrap;
 pub mod config;
 pub mod crypto;

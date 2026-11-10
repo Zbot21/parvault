@@ -4,7 +4,7 @@ use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 
@@ -146,6 +146,17 @@ impl NodeIdentity {
             signing_key,
             x25519_secret,
         }
+    }
+
+    /// Derives a deterministic owner signing `NodeIdentity` from a `MasterKey` so that
+    /// cross-machine `parvault file store` / `parvault file restore --key-hex` and
+    /// `parvault restore-folder --key-hex` produce identical `RepairGrant` and owner read signatures.
+    pub fn from_master_key(master_key: &MasterKey) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"parvault-master-key-owner-ed25519-v1:");
+        hasher.update(master_key.as_bytes());
+        let seed: [u8; 32] = hasher.finalize().into();
+        Self::from_seed(seed)
     }
 
     /// Loads a persistent 32-byte node identity seed from `data_dir/node_identity.seed`,
@@ -327,6 +338,16 @@ impl NodeIdentity {
             .map_err(|_| CryptoError::KdfFailed)?;
         Ok(session_key)
     }
+
+    /// Derives a deterministic 32-byte per-stripe PoR session key (`K_session`) bound to the owner's
+    /// private signing seed and `merkle_root` via HKDF-SHA256 (`ADR-03`).
+    pub fn derive_stripe_por_session_key(&self, merkle_root: &[u8; 32]) -> [u8; 32] {
+        let hk = Hkdf::<Sha256>::new(Some(merkle_root), &self.signing_key.to_bytes());
+        let mut session_key = [0u8; 32];
+        hk.expand(b"parvault-stripe-por-session-v1", &mut session_key)
+            .expect("32-byte HKDF expand is always valid");
+        session_key
+    }
 }
 
 /// Trait representing TPM 2.0 / hardware secure enclave key sealing on ISP gateways.
@@ -362,8 +383,7 @@ impl SoftwareTpm2Stub {
             .filter(|s| !s.is_empty());
 
         if let Some(pass) = effective_pass {
-            let derived =
-                MasterKey::from_recovery_seed_phrase(pass, "parvault-enclave-sealing-v1");
+            let derived = MasterKey::from_recovery_seed_phrase(pass, "parvault-enclave-sealing-v1");
             return Ok(Self {
                 device_binding_key: derived,
             });

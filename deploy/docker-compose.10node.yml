@@ -1,12 +1,13 @@
-version: "3.9"
-
-# 10-Node Validation Mesh on 10.42.0.0/16 with simulated 5ms latency and 1% packet loss (tc netem)
+# 10-Node + Seed Server Validation Mesh on 10.42.0.0/16 with simulated 5ms latency and 1% packet loss (tc netem)
 x-parvault-node: &parvault-node
   build:
     context: ..
     dockerfile: deploy/Dockerfile.musl
   cap_add:
     - NET_ADMIN
+  environment:
+    PARVAULT_SEED_ADDR: "/ip4/10.42.1.10/tcp/4002"
+    PARVAULT_PEERS: "/ip4/10.42.1.11/tcp/4001,/ip4/10.42.1.12/tcp/4001,/ip4/10.42.1.13/tcp/4001,/ip4/10.42.1.14/tcp/4001,/ip4/10.42.1.15/tcp/4001,/ip4/10.42.1.16/tcp/4001,/ip4/10.42.1.17/tcp/4001,/ip4/10.42.2.18/tcp/4001,/ip4/10.42.2.19/tcp/4001,/ip4/10.42.2.20/tcp/4001"
   entrypoint:
     - /bin/sh
     - -c
@@ -15,6 +16,24 @@ x-parvault-node: &parvault-node
       exec /usr/local/bin/parvault daemon start --listen /ip4/0.0.0.0/tcp/4001
 
 services:
+  seed00:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.musl
+    environment:
+      PARVAULT_PEERS: "/ip4/10.42.1.11/tcp/4001,/ip4/10.42.1.12/tcp/4001,/ip4/10.42.1.13/tcp/4001,/ip4/10.42.1.14/tcp/4001,/ip4/10.42.1.15/tcp/4001,/ip4/10.42.1.16/tcp/4001,/ip4/10.42.1.17/tcp/4001,/ip4/10.42.2.18/tcp/4001,/ip4/10.42.2.19/tcp/4001,/ip4/10.42.2.20/tcp/4001"
+    entrypoint:
+      - /usr/local/bin/parvault-seed
+      - start
+      - --mode
+      - homelab-vault
+      - --listen
+      - /ip4/0.0.0.0/tcp/4002
+      - --data-dir
+      - /var/lib/parvault-seed
+    networks:
+      meshnet:
+        ipv4_address: 10.42.1.10
   node01:
     <<: *parvault-node
     networks:

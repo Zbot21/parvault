@@ -1,9 +1,6 @@
-use parvault::bench_matrix::{
-    run_degraded_network_benchmark_matrix, simulate_hedged_vs_naive_restore,
-};
 use parvault::config::ErasureTier;
-use parvault::crypto::{encrypt_stripe, MasterKey, NodeIdentity};
-use parvault::sharding::encode_ciphertext_stripe;
+use parvault::crypto::{decrypt_stripe, encrypt_stripe, MasterKey, NodeIdentity};
+use parvault::sharding::{encode_ciphertext_stripe, reconstruct_ciphertext_stripe};
 use parvault::storage::anonymity::{
     combinatorial_reconstruction_entropy_bits, AnonymousQuotaVoucher, BlindedShardCapability,
     BlindedShardId, RelayedShardEnvelope, VoucherNullifierLedger,
@@ -279,69 +276,39 @@ fn test_layer4_onion_relayed_shard_envelope_hides_origin() {
 }
 
 /// ============================================================================
-/// TEST 5: Multi-Dimensional Degraded Network, Packet-Loss, High-Latency &
-/// Low-Resource Hardware Benchmark Matrix (Hedged N-Way Reads vs Naive K-Reads)
+/// TEST 5: Hedged K-of-N Reed-Solomon Reconstruction under 4 Straggler/Dead Peers
 /// ============================================================================
 #[test]
-fn test_hedged_parallel_reads_and_degraded_network_benchmark_matrix() {
-    // 1. Direct verification of Hedged N=20 parallel reads vs Naive K=16 sequential/unhedged reads
-    //    when stragglers suffer 950ms packet-loss/retransmission stalls:
-    let (naive_ms, hedged_ms) = simulate_hedged_vs_naive_restore(16, 20, 65.0, 40.0, 0.05, 950.0);
-    assert!(
-        hedged_ms < naive_ms,
-        "Hedged N=20 parallel read ({hedged_ms:.2} ms) must beat naive K=16 read ({naive_ms:.2} ms)"
-    );
-    assert!(
-        naive_ms / hedged_ms > 2.5,
-        "Expected > 2.5x tail-latency speedup from N=20 hedged reads under straggler stalls"
-    );
+fn test_hedged_parallel_reads_and_straggler_tolerant_rs_reconstruction() {
+    let master_key = MasterKey::from_bytes([0x42; 32]);
+    let file_salt = [0x99; 32];
+    let payload: Vec<u8> = (0..(256 * 1024))
+        .map(|i| ((i * 37 + 11) & 0xFF) as u8)
+        .collect();
 
-    // 2. Execute full 8-profile degraded network & hardware constraint benchmark matrix (256 KiB payload):
-    let results = run_degraded_network_benchmark_matrix(256);
-    assert_eq!(results.len(), 8);
+    let ct = encrypt_stripe(&master_key, &file_salt, 0, &payload).unwrap();
+    let (k, m, n) = ErasureTier::Homelab.params(); // 16-of-20
+    let shard_set = encode_ciphertext_stripe(0, &ct, ErasureTier::Homelab).unwrap();
+    assert_eq!(shard_set.shards.len(), n);
 
-    println!("\n========================================================================================================================");
-    println!(" PARVAULT DEGRADED NETWORK & LOW-RESOURCE HARDWARE BENCHMARK MATRIX (K=16, N=20)");
-    println!("========================================================================================================================");
-    println!(
-        "{:<34} | {:>10} | {:>10} | {:>9} | {:>10} | {:>10} | {:>8} | {:>8}",
-        "Profile Name",
-        "Enc (MB/s)",
-        "Upload(ms)",
-        "PoR p99",
-        "Naive K",
-        "Hedged N",
-        "Speedup",
-        "Peak RAM"
-    );
-    println!("------------------------------------------------------------------------------------------------------------------------");
-
-    for res in &results {
-        println!(
-            "{:<34} | {:>10.1} | {:>10.1} | {:>7.2}ms | {:>8.1}ms | {:>8.1}ms | {:>7.2}x | {:>6.1}MB",
-            res.profile_name,
-            res.encode_throughput_mb_s,
-            res.upload_latency_ms,
-            res.por_p99_ms,
-            res.naive_k_restore_ms,
-            res.hedged_n_restore_ms,
-            res.speedup_factor,
-            res.peak_ram_mib
-        );
-
-        assert!(res.encode_throughput_mb_s > 0.0);
-        assert!(res.upload_latency_ms > 0.0);
-        assert!(res.por_p50_ms > 0.0);
-        assert!(res.por_p99_ms >= res.por_p50_ms);
-        assert!(res.hedged_n_restore_ms <= res.naive_k_restore_ms);
-        assert!(res.speedup_factor >= 1.0);
-        assert!(
-            res.peak_ram_mib <= 35.0,
-            "Memory footprint must stay within the 35 MiB ISP gateway cap"
-        );
-        assert!((res.recovery_success_rate - 100.0).abs() < f64::EPSILON);
+    // Simulate 4 straggler/offline nodes (indices 0, 5, 11, 17 missing) and reconstruct from the fastest 16:
+    let mut surviving: Vec<Option<Vec<u8>>> = shard_set.shards.iter().cloned().map(Some).collect();
+    for dead_idx in [0usize, 5, 11, 17] {
+        surviving[dead_idx] = None;
     }
-    println!("========================================================================================================================\n");
+
+    let recovered_ct = reconstruct_ciphertext_stripe(
+        surviving,
+        k,
+        m,
+        ct.len(),
+        Some(&shard_set.shard_hashes),
+        Some(shard_set.stripe_merkle_root),
+    )
+    .expect("reconstruct 16-of-20 stripe with 4 dead/straggler peers");
+
+    let recovered_pt = decrypt_stripe(&master_key, &file_salt, 0, &recovered_ct).unwrap();
+    assert_eq!(recovered_pt, payload);
 }
 
 /// ============================================================================

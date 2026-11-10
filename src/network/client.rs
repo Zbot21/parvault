@@ -2,11 +2,12 @@ use crate::bootstrap::{
     BlindedShardTombstone, LiteStripeSyndicationBundle, LiteSyndicationReceipt, PersonalDeviceCert,
 };
 use crate::config::ErasureTier;
-use crate::crypto::{NodeIdentity, PqRelayedShardEnvelope};
+use crate::crypto::{compute_sha256, NodeIdentity, PqRelayedShardEnvelope};
 use crate::network::behaviour::{
-    DhtEnvelopeKind, DhtWireEnvelope, MeshNetworkBehaviourEvent, MeshWireRequest, MeshWireResponse,
+    classify_ip_asn, DhtEnvelopeKind, DhtWireEnvelope, MeshNetworkBehaviourEvent, MeshWireRequest,
+    MeshWireResponse, PeerTopologyMetrics, PlacementEngine,
 };
-use crate::network::transport::build_mesh_swarm;
+use crate::network::transport::build_mesh_client_swarm;
 use crate::network::wot::DelegationChain;
 use crate::por::{
     MultiSegmentPorChallenge, PorChallenge, PorResponse, PorVerifierEngine, RepairGrant,
@@ -14,8 +15,7 @@ use crate::por::{
 };
 use crate::sharding::StripeShardSet;
 use crate::storage::{
-    AnonymousQuotaVoucher, BlindedShardCapability, BlindedShardId, ShardId,
-    StripeManifestEntry,
+    AnonymousQuotaVoucher, BlindedShardCapability, BlindedShardId, ShardId, StripeManifestEntry,
 };
 use libp2p::{
     futures::StreamExt,
@@ -40,7 +40,9 @@ pub fn parse_peer_multiaddr(raw: &str) -> anyhow::Result<Multiaddr> {
         anyhow::bail!("empty peer address");
     }
 
-    if trimmed.starts_with("/dns4/") || trimmed.starts_with("/dns/") || trimmed.starts_with("/dns6/")
+    if trimmed.starts_with("/dns4/")
+        || trimmed.starts_with("/dns/")
+        || trimmed.starts_with("/dns6/")
     {
         let parts: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
         if parts.len() >= 4 && parts[2] == "tcp" {
@@ -113,11 +115,7 @@ pub struct MeshClient {
 }
 
 impl MeshClient {
-    pub fn new(
-        identity: NodeIdentity,
-        peers: Vec<String>,
-        seed_addr: Option<String>,
-    ) -> Self {
+    pub fn new(identity: NodeIdentity, peers: Vec<String>, seed_addr: Option<String>) -> Self {
         let mut normalized_peers = Vec::new();
         let mut seen = HashSet::new();
         for p in peers {
@@ -231,8 +229,7 @@ impl MeshClient {
         timeout: Duration,
     ) -> anyhow::Result<MeshWireResponse> {
         let keypair = identity.to_libp2p_keypair()?;
-        let mut swarm = build_mesh_swarm(keypair, false)?;
-        swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+        let mut swarm = build_mesh_client_swarm(keypair, false)?;
         swarm.dial(target_maddr.clone())?;
 
         let fut = async {
@@ -310,9 +307,12 @@ impl MeshClient {
             }
         };
 
-        tokio::time::timeout(timeout, fut)
-            .await
-            .map_err(|_| anyhow::anyhow!("wire request timed out after {:?} to {target_maddr}", timeout))?
+        tokio::time::timeout(timeout, fut).await.map_err(|_| {
+            anyhow::anyhow!(
+                "wire request timed out after {:?} to {target_maddr}",
+                timeout
+            )
+        })?
     }
 
     pub fn handshake_wot(
@@ -394,11 +394,10 @@ impl MeshClient {
                 repair_proof,
             },
         )? {
-            MeshWireResponse::CiphertextShardResult { shard_bytes, error } => {
-                shard_bytes.ok_or_else(|| {
+            MeshWireResponse::CiphertextShardResult { shard_bytes, error } => shard_bytes
+                .ok_or_else(|| {
                     anyhow::anyhow!("GetCiphertextShard failed on {peer_addr}: {error:?}")
-                })
-            }
+                }),
             other => anyhow::bail!("unexpected response to GetCiphertextShard: {other:?}"),
         }
     }
@@ -454,11 +453,8 @@ impl MeshClient {
                 read_sig,
             },
         )? {
-            MeshWireResponse::BlindedShardResult { shard_bytes, error } => {
-                shard_bytes.ok_or_else(|| {
-                    anyhow::anyhow!("GetBlindedShard failed on {peer_addr}: {error:?}")
-                })
-            }
+            MeshWireResponse::BlindedShardResult { shard_bytes, error } => shard_bytes
+                .ok_or_else(|| anyhow::anyhow!("GetBlindedShard failed on {peer_addr}: {error:?}")),
             other => anyhow::bail!("unexpected response to GetBlindedShard: {other:?}"),
         }
     }
@@ -506,7 +502,44 @@ impl MeshClient {
         }
     }
 
-    pub fn por_audit(&self, peer_addr: &str, challenge: PorChallenge) -> anyhow::Result<PorResponse> {
+    pub fn delete_shard(
+        &self,
+        peer_addr: &str,
+        shard_id: ShardId,
+        owner: &NodeIdentity,
+    ) -> anyhow::Result<bool> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let (owner_pub, payload, sig) =
+            PorVerifierEngine::sign_owner_shard_delete_token(owner, &shard_id, now_ms);
+        let mut sig_r = [0u8; 32];
+        let mut sig_s = [0u8; 32];
+        sig_r.copy_from_slice(&sig[..32]);
+        sig_s.copy_from_slice(&sig[32..]);
+        match self.send_request(
+            peer_addr,
+            MeshWireRequest::DeleteShard {
+                shard_id,
+                owner_signature: (owner_pub, payload, sig_r, sig_s),
+            },
+        )? {
+            MeshWireResponse::DeleteShardAck { deleted, error } => {
+                if !deleted {
+                    anyhow::bail!("DeleteShard failed on {peer_addr}: {error:?}");
+                }
+                Ok(true)
+            }
+            other => anyhow::bail!("unexpected response to DeleteShard: {other:?}"),
+        }
+    }
+
+    pub fn por_audit(
+        &self,
+        peer_addr: &str,
+        challenge: PorChallenge,
+    ) -> anyhow::Result<PorResponse> {
         match self.send_request(peer_addr, MeshWireRequest::PorAudit(challenge))? {
             MeshWireResponse::PorAuditResult(Some(resp)) => Ok(resp),
             MeshWireResponse::PorAuditResult(None) => {
@@ -570,13 +603,35 @@ impl MeshClient {
         cert: PersonalDeviceCert,
         bundle: LiteStripeSyndicationBundle,
     ) -> anyhow::Result<LiteSyndicationReceipt> {
+        let (receipt, _) = self.syndicate_lite_stripe_with_grant(seed_addr, cert, bundle, None)?;
+        Ok(receipt)
+    }
+
+    pub fn syndicate_lite_stripe_with_grant(
+        &self,
+        seed_addr: &str,
+        cert: PersonalDeviceCert,
+        bundle: LiteStripeSyndicationBundle,
+        repair_grant: Option<RepairGrant>,
+    ) -> anyhow::Result<(LiteSyndicationReceipt, Vec<String>)> {
         match self.send_request(
             seed_addr,
-            MeshWireRequest::SyndicateLiteStripe { cert, bundle },
+            MeshWireRequest::SyndicateLiteStripe {
+                cert,
+                bundle,
+                repair_grant,
+            },
         )? {
-            MeshWireResponse::SyndicateLiteStripeAck { receipt, error } => receipt.ok_or_else(
-                || anyhow::anyhow!("SyndicateLiteStripe rejected by {seed_addr}: {error:?}"),
-            ),
+            MeshWireResponse::SyndicateLiteStripeAck {
+                receipt,
+                syndicated_peers,
+                error,
+            } => {
+                let r = receipt.ok_or_else(|| {
+                    anyhow::anyhow!("SyndicateLiteStripe rejected by {seed_addr}: {error:?}")
+                })?;
+                Ok((r, syndicated_peers))
+            }
             other => anyhow::bail!("unexpected response to SyndicateLiteStripe: {other:?}"),
         }
     }
@@ -599,10 +654,14 @@ impl MeshClient {
                     stored: false,
                     error,
                 }) => {
-                    last_err = Some(anyhow::anyhow!("PutDhtEnvelope rejected by {ep}: {error:?}"));
+                    last_err = Some(anyhow::anyhow!(
+                        "PutDhtEnvelope rejected by {ep}: {error:?}"
+                    ));
                 }
                 Ok(other) => {
-                    last_err = Some(anyhow::anyhow!("unexpected PutDhtEnvelope reply: {other:?}"));
+                    last_err = Some(anyhow::anyhow!(
+                        "unexpected PutDhtEnvelope reply: {other:?}"
+                    ));
                 }
                 Err(e) => {
                     last_err = Some(e);
@@ -610,7 +669,9 @@ impl MeshClient {
             }
         }
         if stored_count == 0 {
-            return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("PutDhtEnvelope failed on all peers")));
+            return Err(
+                last_err.unwrap_or_else(|| anyhow::anyhow!("PutDhtEnvelope failed on all peers"))
+            );
         }
         Ok(stored_count)
     }
@@ -664,7 +725,6 @@ impl MeshClient {
                     if best.as_ref().map_or(true, |(best_v, _)| ver > *best_v) {
                         best = Some((ver, env));
                     }
-                    break;
                 }
             }
         }
@@ -673,6 +733,7 @@ impl MeshClient {
     }
 
     /// Distributes all `N` shards of an encoded stripe across the configured network peers via `PutShard`,
+    /// ordering peers through `PlacementEngine` (70/30 Intra-ASN / Cross-Region placement) and
     /// registering an owner-signed `RepairGrant` with every storage peer so subsequent authenticated
     /// owner reads (`GetCiphertextShard`) and PoR audits succeed across restarts.
     ///
@@ -688,13 +749,65 @@ impl MeshClient {
         tier: ErasureTier,
         session_key: [u8; 32],
     ) -> anyhow::Result<Vec<String>> {
-        let peers = if !self.peers.is_empty() {
+        let raw_peers = if !self.peers.is_empty() {
             self.peers.clone()
         } else {
             self.all_network_endpoints()
         };
-        if peers.is_empty() {
+        if raw_peers.is_empty() {
             anyhow::bail!("no network peers configured for shard distribution");
+        }
+
+        let effective_owner_peer_id =
+            if owner_peer_id.is_empty() || owner_peer_id == "local" || owner_peer_id == "self" {
+                owner_identity.device_peer_id()
+            } else {
+                owner_peer_id.to_string()
+            };
+
+        // Rank candidate peers via PlacementEngine (ADR-06 70/30 Intra-ASN / Cross-Region policy)
+        let topos: Vec<PeerTopologyMetrics> = raw_peers
+            .iter()
+            .map(|addr| {
+                let ip = parse_peer_multiaddr(addr)
+                    .ok()
+                    .and_then(|m| {
+                        let s = m.to_string();
+                        s.split('/').nth(2)?.parse::<std::net::IpAddr>().ok()
+                    })
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+                let asn = classify_ip_asn(ip, None);
+                PeerTopologyMetrics {
+                    peer_id: addr.clone(),
+                    kad_id_hash: compute_sha256(addr.as_bytes()),
+                    ip_addr: ip,
+                    rtt_ms: 2.0,
+                    asn,
+                    region: format!("asn-{asn}"),
+                    sla_score: 0.999,
+                    available_bytes: 10 * 1024 * 1024 * 1024,
+                }
+            })
+            .collect();
+        let local_ip = topos
+            .first()
+            .map(|t| t.ip_addr)
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+        let local_asn = classify_ip_asn(local_ip, None);
+        let placement =
+            PlacementEngine::new(local_ip, local_asn, format!("asn-{local_asn}"), 5.0, 0.70);
+        let plan = placement.select_target_peers(
+            &shard_set.stripe_merkle_root,
+            shard_set.k_data,
+            shard_set.shards.len(),
+            shard_set.shard_len as u64,
+            &topos,
+        );
+        let mut peers: Vec<String> = plan.selected_peers.into_iter().map(|p| p.peer_id).collect();
+        for p in raw_peers {
+            if !peers.contains(&p) {
+                peers.push(p);
+            }
         }
 
         let grant = RepairGrant::issue(
@@ -729,7 +842,7 @@ impl MeshClient {
                 if self
                     .put_shard(
                         peer_addr,
-                        owner_peer_id,
+                        &effective_owner_peer_id,
                         shard_id,
                         shard_bytes.clone(),
                         session_key,
@@ -748,7 +861,7 @@ impl MeshClient {
                     if self
                         .put_shard(
                             peer_addr,
-                            owner_peer_id,
+                            &effective_owner_peer_id,
                             shard_id,
                             shard_bytes.clone(),
                             session_key,
@@ -767,7 +880,7 @@ impl MeshClient {
                 if is_network_peer_addr(seed) {
                     let _ = self.put_shard(
                         seed,
-                        owner_peer_id,
+                        &effective_owner_peer_id,
                         shard_id,
                         shard_bytes.clone(),
                         session_key,

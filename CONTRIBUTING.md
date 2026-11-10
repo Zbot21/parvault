@@ -6,13 +6,14 @@ Thank you for contributing to **Neighborhood Cloud (`parvault`)**! Because `parv
 
 ## 1. Prerequisites
 
-1. **Rust Toolchain:** Rust `1.80+` (`2021` edition) via `rustup`.
+1. **Rust Toolchain:** Rust `1.85+` (`2021` edition) via `rustup`.
 2. **Static `musl` Targets (Optional for local cross-builds):**
    ```bash
    rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
    ```
 3. **Java `17+` & `tla2tools.jar` (When modifying protocol state machines in `specs/`):**
-   Required to run the TLA+ TLC model checker across the 5 formal specifications in [`specs/`](specs/).
+   Required to run the TLA+ TLC model checker across the 6 formal specifications in [`specs/`](specs/).
+4. **Docker Engine:** Required to run the 13-container P2P regression and disaster-recovery acceptance gate (`scripts/docker_acceptance_gate.sh`).
 
 ---
 
@@ -20,7 +21,7 @@ Thank you for contributing to **Neighborhood Cloud (`parvault`)**! Because `parv
 
 Before writing code, please read:
 - **[`AGENTS.md`](AGENTS.md):** Module-by-module source map (`src/`) and the **7 Non-Negotiable Zero-Trust & Memory-Safety Rules**.
-- **[`docs/ADR.md`](docs/ADR.md):** Architectural Decision Records (`ADR-01` through `ADR-16`) documenting why every cryptographic, erasure-coding, and game-theoretic design choice was made.
+- **[`docs/ADR.md`](docs/ADR.md):** Architectural Decision Records (`ADR-01` through `ADR-17`) documenting why every cryptographic, erasure-coding, and game-theoretic design choice was made.
 - **[`docs/SECURITY_AND_CRYPTOGRAPHY.md`](docs/SECURITY_AND_CRYPTOGRAPHY.md):** Mathematical proofs, combinatorial anonymity bounds, post-quantum hybrid combiners, and TLA+ invariants.
 - **[`docs/USER_AND_CLI_GUIDE.md`](docs/USER_AND_CLI_GUIDE.md):** Complete CLI flag reference and operational workflows for `parvault` and `parvault-seed`.
 
@@ -36,20 +37,22 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-### Step 2: Full Release Test Suite & `parvault-seed self-test`
+### Step 2: Full Release Test Suite, `parvault-seed self-test` & Multi-Container Docker Gate
 ```bash
 cargo test --release
 cargo run --release --bin parvault-seed -- self-test
+bash scripts/docker_acceptance_gate.sh
 ```
 
 ### Step 3: TLA+ Formal Specification Check (If Touching Protocol State Machines)
-If your change modifies shard placement, Web-of-Trust slashing, Proof-of-Retrievability (`PoR`) auditing, 4-layer shard anonymization, post-quantum key encapsulation, or elastic bootstrap / earned tier progression, update and re-verify the corresponding `.tla` specification in [`specs/`](specs/):
+If your change modifies shard placement, Web-of-Trust slashing, Proof-of-Retrievability (`PoR`) auditing, 4-layer shard anonymization, post-quantum key encapsulation, elastic bootstrap / earned tier progression, or Lite-Client seed failover, update and re-verify the corresponding `.tla` specification in [`specs/`](specs/):
 ```bash
 java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config specs/ParVaultProtocol.cfg specs/ParVaultProtocol.tla
 java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config specs/ParVaultConfidentialityAndTrust.cfg specs/ParVaultConfidentialityAndTrust.tla
 java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config specs/ParVaultAnonymity.cfg specs/ParVaultAnonymity.tla
 java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config specs/ParVaultPostQuantum.cfg specs/ParVaultPostQuantum.tla
 java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config specs/ParVaultBootstrapAndEarnedTier.cfg specs/ParVaultBootstrapAndEarnedTier.tla
+java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config specs/ParVaultLiteClientAndSeedFailover.cfg specs/ParVaultLiteClientAndSeedFailover.tla
 ```
 
 ---

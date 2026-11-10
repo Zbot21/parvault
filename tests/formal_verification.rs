@@ -244,7 +244,8 @@ impl Model for WoTSubtreeModel {
             } => {
                 // Web-of-Trust admission guard: admit peer iff it carries a valid Genesis->Inviter
                 // signature chain AND its inviter subtree has not been pruned.
-                let admitted = has_genesis_sig && !inviter_branch_pruned && !next.parent_branch_pruned;
+                let admitted =
+                    has_genesis_sig && !inviter_branch_pruned && !next.parent_branch_pruned;
                 if admitted {
                     next.uninvited_sybils_admitted =
                         next.uninvited_sybils_admitted.saturating_add(1);

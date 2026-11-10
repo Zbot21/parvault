@@ -225,8 +225,9 @@ enum SeedCommand {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("parvault_seed=info,parvault=info,warn")
+            }),
         )
         .init();
 
@@ -431,8 +432,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let quota = QuotaManager::new(500 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
             let block_store = BlockStore::new(&data_dir, quota)?;
-            let genesis_pubkey =
-                NodeIdentity::resolve_genesis_root_pubkey_in_dir(&data_dir, None)?;
+            let genesis_pubkey = NodeIdentity::resolve_genesis_root_pubkey_in_dir(&data_dir, None)?;
             let server = ZeroTrustSeedServer::new_public_bootstrapper(
                 "parvault-seed-public-bootstrapper",
                 block_store,
@@ -637,8 +637,14 @@ async fn run_seed_listener_loop(
     let local_peer_id = keypair.public().to_peer_id();
     let genesis_pubkey = NodeIdentity::resolve_genesis_root_pubkey_in_dir(&data_dir, None)?;
 
-    let mut wot = WebOfTrustRegistry::new(genesis_pubkey, DEFAULT_SUBTREE_SLASH_LIMIT);
+    let mut wot = WebOfTrustRegistry::with_persistence_dir(
+        genesis_pubkey,
+        DEFAULT_SUBTREE_SLASH_LIMIT,
+        &data_dir,
+    );
     let mut por_verifier = PorVerifierEngine::with_persistence_dir(300, &data_dir);
+    let mut nullifier_ledger =
+        VoucherNullifierLedger::with_persistence_dir(genesis_pubkey, &data_dir);
     let pq_kem = HybridKemKeypair::load_or_generate_in_dir(&data_dir)?;
 
     let mut swarm = build_mesh_swarm(keypair, false)?;
@@ -683,6 +689,7 @@ async fn run_seed_listener_loop(
                             &mut server,
                             &mut wot,
                             &mut por_verifier,
+                            &mut nullifier_ledger,
                             &pq_kem,
                         );
                         let _ = swarm.behaviour_mut().req_resp.send_response(channel, resp);
@@ -712,6 +719,7 @@ async fn run_seed_listener_loop(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_seed_wire_request(
     remote_peer_id: &str,
     request: MeshWireRequest,
@@ -719,6 +727,7 @@ fn handle_seed_wire_request(
     server: &mut ZeroTrustSeedServer,
     wot: &mut WebOfTrustRegistry,
     por_verifier: &mut PorVerifierEngine,
+    nullifier_ledger: &mut VoucherNullifierLedger,
     pq_kem: &HybridKemKeypair,
 ) -> MeshWireResponse {
     match request {
@@ -743,13 +752,50 @@ fn handle_seed_wire_request(
                 por_verifier.register_repair_grant(grant);
             }
             por_verifier.register_shard_session(&shard_id, session_key_commit);
-            match block_store.put_shard(&owner_peer_id, &shard_id, &shard_bytes) {
+            let effective_owner = if owner_peer_id.is_empty()
+                || owner_peer_id == "local"
+                || owner_peer_id == "self"
+            {
+                remote_peer_id
+            } else {
+                owner_peer_id.as_str()
+            };
+            match block_store.put_shard(effective_owner, &shard_id, &shard_bytes) {
                 Ok(_) => MeshWireResponse::PutShardAck {
                     stored: true,
                     error: None,
                 },
                 Err(e) => MeshWireResponse::PutShardAck {
                     stored: false,
+                    error: Some(e.to_string()),
+                },
+            }
+        }
+        MeshWireRequest::DeleteShard {
+            shard_id,
+            owner_signature: (owner_pub, payload, r, s),
+        } => {
+            let mut sig64 = [0u8; 64];
+            sig64[..32].copy_from_slice(&r);
+            sig64[32..].copy_from_slice(&s);
+            if !por_verifier.authorize_owner_shard_delete(
+                &shard_id,
+                &owner_pub,
+                payload.as_slice(),
+                &sig64,
+            ) {
+                return MeshWireResponse::DeleteShardAck {
+                    deleted: false,
+                    error: Some("unauthorized owner shard delete signature".to_string()),
+                };
+            }
+            match block_store.delete_shard(remote_peer_id, &shard_id) {
+                Ok(deleted) => MeshWireResponse::DeleteShardAck {
+                    deleted,
+                    error: None,
+                },
+                Err(e) => MeshWireResponse::DeleteShardAck {
+                    deleted: false,
                     error: Some(e.to_string()),
                 },
             }
@@ -819,13 +865,13 @@ fn handle_seed_wire_request(
             lease_duration_epochs,
             delete_verifier,
         } => {
-            let mut single_use_ledger = VoucherNullifierLedger::new(voucher.issuer_pubkey);
+            nullifier_ledger.set_trusted_issuer_pubkey(voucher.issuer_pubkey);
             match block_store.put_blinded_shard_with_lease(
                 &blinded_id,
                 &shard_bytes,
                 capability,
                 &voucher,
-                &mut single_use_ledger,
+                nullifier_ledger,
                 current_epoch,
                 lease_duration_epochs,
                 delete_verifier,
@@ -946,14 +992,13 @@ fn handle_seed_wire_request(
             } else {
                 match envelope.open_pq(pq_kem) {
                     Ok((blinded_id, shard_bytes)) => {
-                        let mut single_use_ledger =
-                            VoucherNullifierLedger::new(voucher.issuer_pubkey);
+                        nullifier_ledger.set_trusted_issuer_pubkey(voucher.issuer_pubkey);
                         match block_store.put_blinded_shard_with_lease(
                             &blinded_id,
                             &shard_bytes,
                             capability,
                             &voucher,
-                            &mut single_use_ledger,
+                            nullifier_ledger,
                             current_epoch,
                             lease_duration_epochs,
                             delete_verifier,
@@ -975,15 +1020,28 @@ fn handle_seed_wire_request(
                 }
             }
         }
-        MeshWireRequest::SyndicateLiteStripe { cert, bundle } => {
-            server.set_owner_pq_pubkey(cert.owner_root_pubkey.clone());
-            match server.ingest_and_syndicate_lite_stripe(&cert, &bundle, &[]) {
-                Ok(receipt) => MeshWireResponse::SyndicateLiteStripeAck {
+        MeshWireRequest::SyndicateLiteStripe {
+            cert,
+            bundle,
+            repair_grant,
+        } => {
+            if let Some(ref grant) = repair_grant {
+                por_verifier.register_repair_grant(grant.clone());
+            }
+            match server.ingest_and_syndicate_lite_stripe_with_grant(
+                &cert,
+                &bundle,
+                &[],
+                repair_grant,
+            ) {
+                Ok((receipt, syndicated_peers)) => MeshWireResponse::SyndicateLiteStripeAck {
                     receipt: Some(receipt),
+                    syndicated_peers,
                     error: None,
                 },
                 Err(e) => MeshWireResponse::SyndicateLiteStripeAck {
                     receipt: None,
+                    syndicated_peers: Vec::new(),
                     error: Some(e.to_string()),
                 },
             }

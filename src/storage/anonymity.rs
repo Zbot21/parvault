@@ -5,7 +5,7 @@ use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use x25519_dalek::PublicKey as X25519Public;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -192,11 +192,19 @@ impl AnonymousQuotaVoucher {
     }
 }
 
-/// Anti-double-spend nullifier ledger tracking redeemed `AnonymousQuotaVoucher` nonces.
-#[derive(Debug, Clone)]
+/// Maximum number of spent voucher nullifiers retained in the bounded FIFO replay cache (`ADR-16`).
+pub const MAX_VOUCHER_NULLIFIER_ENTRIES: usize = 65_536;
+
+/// Anti-double-spend nullifier ledger tracking redeemed `AnonymousQuotaVoucher` nonces
+/// with a strict 65,536-entry FIFO ceiling (`ADR-16`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoucherNullifierLedger {
     trusted_issuer_pubkey: [u8; 32],
     spent_nonces: HashSet<[u8; 32]>,
+    #[serde(default)]
+    spent_fifo: VecDeque<[u8; 32]>,
+    #[serde(skip)]
+    persistence_path: Option<std::path::PathBuf>,
 }
 
 impl VoucherNullifierLedger {
@@ -204,6 +212,31 @@ impl VoucherNullifierLedger {
         Self {
             trusted_issuer_pubkey,
             spent_nonces: HashSet::new(),
+            spent_fifo: VecDeque::new(),
+            persistence_path: None,
+        }
+    }
+
+    /// Loads or initializes a persistent `VoucherNullifierLedger` at `data_dir/voucher_nullifiers.bin`.
+    pub fn with_persistence_dir(
+        trusted_issuer_pubkey: [u8; 32],
+        data_dir: &std::path::Path,
+    ) -> Self {
+        let path = data_dir.join("voucher_nullifiers.bin");
+        let spent_fifo: VecDeque<[u8; 32]> = if path.exists() {
+            std::fs::read(&path)
+                .ok()
+                .and_then(|raw| bincode::deserialize::<VecDeque<[u8; 32]>>(&raw).ok())
+                .unwrap_or_default()
+        } else {
+            VecDeque::new()
+        };
+        let spent_nonces: HashSet<[u8; 32]> = spent_fifo.iter().copied().collect();
+        Self {
+            trusted_issuer_pubkey,
+            spent_nonces,
+            spent_fifo,
+            persistence_path: Some(path),
         }
     }
 
@@ -216,7 +249,8 @@ impl VoucherNullifierLedger {
     }
 
     /// Verifies and atomically redeems a single-use `AnonymousQuotaVoucher`.
-    /// Rejects forged, under-sized, or previously spent vouchers.
+    /// Rejects forged, under-sized, or previously spent vouchers, and enforces a bounded
+    /// `MAX_VOUCHER_NULLIFIER_ENTRIES` (65,536) FIFO cache.
     pub fn redeem_voucher(
         &mut self,
         voucher: &AnonymousQuotaVoucher,
@@ -227,10 +261,24 @@ impl VoucherNullifierLedger {
                 "invalid_or_undersized_voucher".into(),
             ));
         }
-        if !self.spent_nonces.insert(voucher.voucher_nonce) {
+        if self.spent_nonces.contains(&voucher.voucher_nonce) {
             return Err(StorageError::QuotaExceeded(
                 "double_spent_voucher_nullifier".into(),
             ));
+        }
+        while self.spent_nonces.len() >= MAX_VOUCHER_NULLIFIER_ENTRIES {
+            if let Some(oldest) = self.spent_fifo.pop_front() {
+                self.spent_nonces.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.spent_nonces.insert(voucher.voucher_nonce);
+        self.spent_fifo.push_back(voucher.voucher_nonce);
+        if let Some(ref path) = self.persistence_path {
+            if let Ok(bytes) = bincode::serialize(&self.spent_fifo) {
+                let _ = crate::storage::BlockStore::atomic_write_file(path, &bytes);
+            }
         }
         Ok(())
     }

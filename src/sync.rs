@@ -570,7 +570,39 @@ impl FolderSyncEngine {
                             shard_index: idx as u32,
                             shard_hash,
                         };
-                        if self.store.delete_shard("local", &shard_id)? {
+                        let mut deleted_any = self
+                            .store
+                            .delete_shard(&self.owner_identity.device_peer_id(), &shard_id)?
+                            || self.store.delete_shard("local", &shard_id)?;
+                        if let Some(client) = self.store.mesh_client() {
+                            let mut target_endpoints = BTreeSet::new();
+                            if let Some(peer_addr) = stripe.assigned_peers.get(idx) {
+                                if crate::network::is_network_peer_addr(peer_addr) {
+                                    target_endpoints.insert(peer_addr.clone());
+                                }
+                            }
+                            if let Some(seed_addr) = client.seed_addr() {
+                                if crate::network::is_network_peer_addr(seed_addr) {
+                                    target_endpoints.insert(seed_addr.to_string());
+                                }
+                            }
+                            if client.peers().len() < stripe.shard_hashes.len() {
+                                for peer_addr in client.peers() {
+                                    if crate::network::is_network_peer_addr(peer_addr) {
+                                        target_endpoints.insert(peer_addr.clone());
+                                    }
+                                }
+                            }
+                            for endpoint in target_endpoints {
+                                if client
+                                    .delete_shard(&endpoint, shard_id, &self.owner_identity)
+                                    .unwrap_or(false)
+                                {
+                                    deleted_any = true;
+                                }
+                            }
+                        }
+                        if deleted_any {
                             pruned_shards += 1;
                         }
                     }
@@ -739,14 +771,21 @@ impl FolderSyncEngine {
 
         // Seal a monotonic SignedDhtManifestEnvelope anchored at the first file's manifest (or synthetic folder root).
         let signed_dht_envelope = if let Some((_, first_entry)) = next_entries.iter().next() {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let monotonic_ver = now_ms
+                .max(1_700_000_000_000)
+                .saturating_add(self.current_version);
             let env = SignedDhtManifestEnvelope::seal(
                 &self.master_key,
                 &self.owner_identity,
                 &first_entry.manifest,
-                self.current_version,
-                1_700_000_000_000 + self.current_version * 1000,
+                monotonic_ver,
+                monotonic_ver,
             )?;
-            self.dht_store.put_manifest_envelope(env.clone())?;
+            let _ = self.dht_store.put_manifest_envelope(env.clone());
             let _ = self.store.put_dht_manifest_envelope(env.clone());
             if let Some(client) = self.store.mesh_client() {
                 if !client.all_network_endpoints().is_empty() {
@@ -874,6 +913,18 @@ impl FolderSyncEngine {
         fs::create_dir_all(target_dir)?;
         let mut restored_count = 0usize;
 
+        for (tomb_key, tomb) in &snapshot.deleted_tombstones {
+            if !snapshot.files.contains_key(tomb_key) {
+                if let Ok(stale_path) =
+                    Self::resolve_safe_restore_path(target_dir, tomb_key, &tomb.relative_path)
+                {
+                    if stale_path.is_file() {
+                        let _ = fs::remove_file(stale_path);
+                    }
+                }
+            }
+        }
+
         for (rel_path, entry) in &snapshot.files {
             let _ = Self::resolve_safe_restore_path(target_dir, rel_path, &entry.relative_path)?;
             self.restore_single_file(snapshot, rel_path, target_dir)?;
@@ -957,8 +1008,19 @@ impl FolderSyncEngine {
             }
         }
 
+        let route_used = if self
+            .store
+            .mesh_client()
+            .and_then(|c| c.seed_addr())
+            .is_some()
+        {
+            LiteRestoreRoute::ViaSeedServerFastPath
+        } else {
+            LiteRestoreRoute::DirectFromMeshPeersFallback
+        };
+
         Ok(SelectiveRestoreReport {
-            route_used: LiteRestoreRoute::ViaSeedServerFastPath,
+            route_used,
             files_restored,
             files_skipped,
             bytes_restored,
@@ -1294,9 +1356,8 @@ impl FolderSyncEngine {
         let _ = self.store.put_dht_vault_catalog_envelope(env.clone());
         if let Some(client) = self.store.mesh_client() {
             if !client.all_network_endpoints().is_empty() {
-                let _ = client.put_dht_envelope(
-                    crate::network::DhtWireEnvelope::VaultCatalog(env.clone()),
-                );
+                let _ = client
+                    .put_dht_envelope(crate::network::DhtWireEnvelope::VaultCatalog(env.clone()));
             }
         }
         Ok(env)
@@ -1330,12 +1391,7 @@ impl FolderSyncEngine {
         if let Some(client) = store_with_owner.mesh_client().cloned() {
             store_with_owner.set_mesh_client(Some(client.with_identity(owner_identity.clone())));
         }
-        let engine = Self::new(
-            store_with_owner,
-            master_key,
-            owner_identity,
-            snapshot.tier,
-        );
+        let engine = Self::new(store_with_owner, master_key, owner_identity, snapshot.tier);
         engine.restore_folder(&snapshot, target_dir)
     }
 
@@ -1353,11 +1409,13 @@ impl FolderSyncEngine {
 
         let catalog_envelope = if let Some(ref client) = store_ref.mesh_client() {
             if !client.all_network_endpoints().is_empty() {
-                match client.get_dht_envelope(&dht_key, crate::network::DhtEnvelopeKind::VaultCatalog) {
+                match client
+                    .get_dht_envelope(&dht_key, crate::network::DhtEnvelopeKind::VaultCatalog)
+                {
                     Ok(crate::network::DhtWireEnvelope::VaultCatalog(env)) => env,
-                    _ => store_ref.get_dht_vault_catalog_envelope(&dht_key).ok_or(
-                        StorageError::DhtManifestPoisonedOrRollback,
-                    )?,
+                    _ => store_ref
+                        .get_dht_vault_catalog_envelope(&dht_key)
+                        .ok_or(StorageError::DhtManifestPoisonedOrRollback)?,
                 }
             } else {
                 store_ref
@@ -1396,7 +1454,7 @@ impl FolderSyncEngine {
         plaintext_sha256: Hash32,
     ) -> Result<SyncedFileEntry, StorageError> {
         let manifest = self.store.store_file_streaming(
-            "local",
+            &self.owner_identity.device_peer_id(),
             abs_path,
             &self.master_key,
             self.tier,

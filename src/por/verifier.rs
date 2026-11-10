@@ -306,6 +306,68 @@ impl PorVerifierEngine {
         true
     }
 
+    /// Retrieves the registered `K_session` and `RepairGrant` for `shard_id` (used during graceful node handoff).
+    pub fn get_shard_session_and_grant(
+        &self,
+        shard_id: &ShardId,
+    ) -> (Option<[u8; 32]>, Option<RepairGrant>) {
+        (
+            self.session_keys_ram.get(&shard_id.file_key()).copied(),
+            self.repair_grants_ram
+                .get(&shard_id.stripe_merkle_root)
+                .cloned(),
+        )
+    }
+
+    /// Constructs and signs a domain-separated owner shard-delete token (`ADR-15`).
+    pub fn sign_owner_shard_delete_token(
+        owner: &NodeIdentity,
+        shard_id: &ShardId,
+        timestamp_ms: u64,
+    ) -> ([u8; 32], Vec<u8>, [u8; 64]) {
+        let owner_pub = owner.public_key_bytes();
+        let mut payload = Vec::with_capacity(74);
+        payload.extend_from_slice(b"parvault-owner-shard-delete-v1:");
+        payload.extend_from_slice(&shard_id.stripe_merkle_root);
+        payload.extend_from_slice(&shard_id.shard_index.to_be_bytes());
+        payload.extend_from_slice(&timestamp_ms.to_be_bytes());
+        let sig = owner.sign(&payload);
+        (owner_pub, payload, sig)
+    }
+
+    /// Verifies an owner-signed unblinded shard deletion request against the stripe's `RepairGrant.owner_pubkey`.
+    pub fn authorize_owner_shard_delete(
+        &mut self,
+        shard_id: &ShardId,
+        owner_pub: &[u8; 32],
+        signed_payload: &[u8],
+        sig: &[u8; 64],
+    ) -> bool {
+        const DOMAIN_PREFIX: &[u8] = b"parvault-owner-shard-delete-v1:";
+        let expected_min_len = DOMAIN_PREFIX.len() + 32 + 4 + 8;
+        if signed_payload.len() < expected_min_len
+            || !signed_payload.starts_with(DOMAIN_PREFIX)
+            || &signed_payload[DOMAIN_PREFIX.len()..DOMAIN_PREFIX.len() + 32]
+                != shard_id.stripe_merkle_root.as_slice()
+            || &signed_payload[DOMAIN_PREFIX.len() + 32..DOMAIN_PREFIX.len() + 36]
+                != shard_id.shard_index.to_be_bytes().as_slice()
+        {
+            return false;
+        }
+        let authorized = match self.repair_grants_ram.get(&shard_id.stripe_merkle_root) {
+            Some(grant) => {
+                grant.owner_pubkey == *owner_pub
+                    && NodeIdentity::verify_with_pubkey(owner_pub, signed_payload, sig)
+            }
+            None => NodeIdentity::verify_with_pubkey(owner_pub, signed_payload, sig),
+        };
+        if authorized {
+            self.session_keys_ram.remove(&shard_id.file_key());
+            self.persist_state_if_configured();
+        }
+        authorized
+    }
+
     /// Handles an incoming `PorChallenge` on the storage host node (`P_x`):
     /// 1. Validates `H_chal` and nonce freshness **strictly in RAM** before any disk access.
     /// 2. If valid, reads the requested byte range from `BlockStore` and returns `SHA-256(Nonce || Data)`.

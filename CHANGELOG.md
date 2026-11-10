@@ -6,6 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [`0.2.0`] - 2026-11-09
+
+### Added
+- **Live `libp2p` Network Client (`MeshClient`) & Full P2P Daemon/Seed Wiring (`src/network/client.rs`, `src/main.rs`, `src/bin/parvault-seed.rs`):**
+  - Replaced local-directory simulation shortcuts with a real `libp2p` `TCP + Noise XX + Yamux` `MeshClient` (using a dedicated client swarm with multicast mDNS disabled to eliminate ephemeral socket overhead).
+  - Wired `parvault file store/restore`, `parvault watch-folder`, `parvault restore-folder`, `parvault recover-from-seed`, and `parvault leave` to dial configured `--peers` / `PARVAULT_PEERS` and `--seed-addr` / `PARVAULT_SEED_ADDR` `Multiaddr`s over the network.
+  - Added all 13 `MeshWireRequest` / `MeshWireResponse` variants (`HandshakeWoT`, `PutShard`, `DeleteShard`, `PorAudit`, `GetCiphertextShard`, `PutBlindedShard`, `GetBlindedShard`, `RenewBlindedLease`, `DeleteBlindedShardTombstone`, `MultiSegmentPorAudit`, `RelayPqOnionEnvelope`, `SyndicateLiteStripe`, `PutDhtEnvelope`, `GetDhtEnvelope`) to both `parvault daemon` and `parvault-seed`.
+- **13-Container Docker P2P Regression & Disaster Recovery Gate (`scripts/docker_acceptance_gate.sh`, `.github/workflows/ci.yml`):**
+  - Automated multi-container regression suite deploying `parvault-seed-0` + 11 `parvault daemon` containers + 1 isolated `parvault-client` container (`Mounts: []`) across an isolated Docker bridge network (`172.28.0.0/24`).
+  - Exercises initial folder sync (`v1`), continuous background `watch-folder --prune-deleted` (`v2`) with remote `DeleteShard` pruning, Lite-Client `1.0x` stripe syndication + `parvault-seed-0` NAS-death failover, graceful node decommission (`parvault leave --handoff-to`), bit-rot injection & `parvault scrub` quarantine, daemon container restarts, 4-container `docker kill` + zero-local-state `recover-from-seed` (full & `--filter` selective restore), and cross-machine `file store` / `file restore`.
+  - Added `test_live_libp2p_tcp_multi_daemon_network_backup_prune_and_seed_recovery` to `tests/sync_daemon_usability_and_cli_regression_tests.rs` spawning real localhost TCP `parvault-seed` and `parvault daemon` child processes during `cargo test`.
+
+### Fixed & Hardened
+- **Memory-Hard `Argon2id` Key Stretching & True Dual-Cipher Cascaded AEAD (`src/crypto/keys.rs`, `src/crypto/pqc.rs`):**
+  - Upgraded `MasterKey::from_recovery_seed_phrase`, `PqVaultMasterKey::from_recovery_seed_phrase`, and `SoftwareTpm2Stub` passphrase sealing to use memory-hard **`Argon2id`** (`m = 64 MiB`, `t = 3`, `p = 4`) + `HKDF-SHA256` (`512-bit` root key material for `PqVaultMasterKey`).
+  - Fixed `PqVaultMasterKey::encrypt_stripe_pq` / `decrypt_stripe_pq` to perform genuine dual-cipher cascaded AEAD: inner **`AES-256-GCM`** under $K_1$ followed by outer **`ChaCha20-Poly1305`** under $K_2$.
+- **Owner Shard Read/Delete Authorization & Full Disk Persistence Across Restarts (`src/por/verifier.rs`, `src/storage/`, `src/network/wot.rs`):**
+  - Fixed `GetCiphertextShard` owner signature verification to pass `owner_pub: [u8; 32]` explicitly and verify against the pinned `RepairGrant.owner_pubkey`.
+  - Added signed owner shard deletion (`DeleteShard` / `authorize_owner_shard_delete`) so `watch-folder --prune-deleted` physically unlinks deleted files' shards on remote mesh peers.
+  - Persisted `node_identity.seed` into `libp2p::identity::Keypair` on daemon/seed startup, and persisted `por_verifier_state.bin`, `wot_state.bin`, `quota_state.bin`, `voucher_nullifiers.bin` (bounded 65,536-entry FIFO), and `dht_*.bin` across restarts.
+  - Fixed `MeshClient::get_dht_envelope` to query all configured peers and return the strictly highest `monotonic_version` record.
+- **Non-Vacuous Adversarial TLA+ & Stateright Models (`specs/*.tla`, `tests/formal_verification.rs`):**
+  - Added explicit adversarial state-mutation actions (`AdversaryStealShard`, `AdversaryAttemptMasterKeyCompromise`, `UninvitedSybilAttemptRouteInsert`, `AdversaryCompromiseSubnetShard`, `AdversaryProbeBlindedLinkage`, `QuantumAdversaryBreakClassicalOnly`, `SybilStandbyFarmAttempt`, `ByzantineCorruptCachedSeedShard`) across all 6 TLA+ specs and Stateright models.
+
+### Removed
+- Removed simulated benchmark artifacts (`src/bin/parvault-bench.rs`, `src/bench_matrix.rs`, and pre-rename `dist/meshos-*` binaries) in favor of real multi-container `libp2p` Docker regression tests.
+
+---
+
 ## [`0.1.0`] - 2026-11-09
 
 ### Added
@@ -23,9 +52,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Zero-Trust Adversarial Hardening & Dynamic Uptime Trust Tiers (`ADR-09`, `ADR-10`):**
   - Pre-decoding SHA-256 + `MerkleProof` quarantine (`reconstruct_zero_trust_with_quarantine`), 8-stratum scatter-gather PoR (`MultiSegmentPorChallenge`), monotonic `SignedDhtManifestEnvelope`, egress-withholding credit slashing, and ISO power-of-two plaintext padding.
   - Dynamic Uptime Trust Ladder (`UntrustedProbationary` $\to$ `VerifiedNeighbor` $\to$ `HighUptimeAnchor` $\to$ `SlashedQuarantined`) with `/24` subnet caps (`1`, `2`, `4`, `0`) and incremental `FolderSyncEngine`.
-- **4-Layer Cryptographic Shard Anonymization & Degraded-Network Hedged Recovery (`ADR-11`):**
+- **4-Layer Cryptographic Shard Anonymization (`ADR-11`):**
   - Unlinkable 256-bit `BlindedShardId` locators ($\Omega_{\text{search}} \ge 2^{224}$), per-shard `BlindedShardCapability` keys ($V_i$), single-use `AnonymousQuotaVoucher`s, and 1-hop onion relay envelopes (`src/storage/anonymity.rs`).
-  - Hedged parallel $K$-of-$N$ shard recovery validated across the 8-profile degradation matrix (`parvault-bench benchmark-matrix`, `src/bench_matrix.rs`).
 - **Post-Quantum Hybrid Cryptography (`ADR-12`):**
   - `HybridKemKeypair` combining classical `X25519` with **NIST FIPS 203 `ML-KEM-768`** via `HKDF-SHA512`.
   - `HybridPqSigningKeypair` combining classical `Ed25519` with **NIST FIPS 204 `ML-DSA-65`**.
@@ -36,8 +64,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Multi-Domain Red-Team Hardening & "House Fire" Seed-Phrase Recovery (`ADR-15`):**
   - Zero-local-state folder recovery from a 24-word recovery seed phrase + `vault_namespace` alone (`MasterKey::from_recovery_seed_phrase`, `EncryptedVaultCatalogEnvelope`, `parvault recover-from-seed`).
   - Capability pubkey pinning, $\pm 30\text{ s}$ NTP skew tolerance, generation-scoped `BlindedShardTombstone`s, `/32` IPv6 + RFC 6598 CGNAT fairness, $\ge 3$-anchor `SignedWeatherAttestation` quorum, bounded `BincodeWireCodec` (`with_limit`), Hashcash PoW + IQR telemetry trimming, crash-safe write-temp-`fsync`-rename, `resolve_safe_restore_path` traversal blocking, and `BlockStore::scrub_all_shards`.
-- **Internet-Grade Sync Usability, Streaming File Hashing & Sharded Documentation (`ADR-16`):**
+- **Internet-Grade Sync Usability, Streaming File Hashing & Sharded Documentation (`ADR-16`, `ADR-17`):**
   - Complete identity and certificate CLI workflow (`parvault identity`, `parvault issue-device-cert`, `parvault verify-device-cert`, `parvault-seed identity`, `parvault-seed issue-device-cert`, `parvault-seed verify-device-cert`, `parvault-seed status`, `parvault-seed drain-plan`, `parvault-seed scrub`) with copy-pasteable `PARVAULT-CERT-V1:...` compact tokens.
-  - `.parvaultignore` exclusion patterns (default ignores for `.git`, `node_modules`, `target`, `.DS_Store`, `Thumbs.db`, `*.tmp`, `*.swp` + custom globs/negations), dry-run folder diffing (`parvault diff-folder` / `watch-folder --dry-run`), deleted-file GC (`--prune-deleted`), and selective single-file restoration (`parvault restore-folder --file <REL_PATH>`).
-  - Constant-memory 64 KiB streaming file hashing (`compute_file_sha256_streaming`) eliminating full-file `fs::read` allocations in `FolderSyncEngine`, bounded 65,536-entry FIFO replay/nullifier caches, token-bucket bandwidth rate limiting (`TokenBucketRateLimiter`), and minimum free disk reserve enforcement (`min_free_disk_bytes`).
-  - Full verbatim `AGPL-3.0-only` `LICENSE` and persona-sharded documentation (`README.md`, `QUICKSTART.md`, `docs/USER_AND_CLI_GUIDE.md`, `docs/SECURITY_AND_CRYPTOGRAPHY.md`, `docs/ADR.md`, `AGENTS.md`, `CONTRIBUTING.md`).
+  - `.parvaultignore` exclusion patterns, dry-run folder diffing (`parvault diff-folder` / `watch-folder --dry-run`), deleted-file GC (`--prune-deleted`), selective single-file restoration (`parvault restore-folder --file <REL_PATH>`), and `--filter` glob/prefix partial restore.
+  - Constant-memory 64 KiB streaming file hashing (`compute_file_sha256_streaming`), bounded 65,536-entry FIFO replay/nullifier caches, token-bucket bandwidth rate limiting (`TokenBucketRateLimiter`), and minimum free disk reserve enforcement (`min_free_disk_bytes`).
