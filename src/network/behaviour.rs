@@ -298,6 +298,8 @@ pub enum MeshWireRequest {
         shard_id: ShardId,
         owner_signature: ([u8; 32], Vec<u8>, [u8; 32], [u8; 32]),
     },
+    /// Query live node topology, available quota, SLA score, and Post-Quantum KEM public key.
+    QueryNodeStatus,
 }
 
 /// Wire-level response messages exchanged over `/parvault/wire/1.0.0`.
@@ -353,6 +355,15 @@ pub enum MeshWireResponse {
     DeleteShardAck {
         deleted: bool,
         error: Option<String>,
+    },
+    NodeStatusResult {
+        peer_id: String,
+        asn: u32,
+        region: String,
+        available_bytes: u64,
+        used_bytes: u64,
+        sla_score: f64,
+        pq_kem_pubkey: Option<crate::crypto::HybridKemPublicKey>,
     },
 }
 

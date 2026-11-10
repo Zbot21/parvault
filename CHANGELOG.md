@@ -9,29 +9,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [`0.2.0`] - 2026-11-09
 
 ### Added
-- **Live `libp2p` Network Client (`MeshClient`) & Full P2P Daemon/Seed Wiring (`src/network/client.rs`, `src/main.rs`, `src/bin/parvault-seed.rs`):**
-  - Replaced local-directory simulation shortcuts with a real `libp2p` `TCP + Noise XX + Yamux` `MeshClient` (using a dedicated client swarm with multicast mDNS disabled to eliminate ephemeral socket overhead).
+- **Empirical Benchmark & Memory Telemetry Binary (`src/bin/parvault-bench.rs`):**
+  - Added `parvault-bench` (`run` / `all` subcommands, `--payload-mib <MIB>`) measuring real wall-clock throughput and latency across `Argon2id (m=64 MiB, t=3, p=4)`, `AES-256-GCM`, dual-cipher `PqVaultMasterKey`, X-Wing `X25519 + ML-KEM-768` (`HKDF-SHA512`), `Ed25519 + ML-DSA-65`, and Reed-Solomon $GF(2^8)$ encoding/reconstruction, plus Linux `/proc/self/status` (`VmRSS`, `VmHWM`) and `getrusage(RUSAGE_SELF)` streaming memory instrumentation.
+- **Live `libp2p` Network Client (`MeshClient`) with Persistent Swarm Pool & Full P2P Daemon/Seed Wiring (`src/network/client.rs`, `src/main.rs`, `src/bin/parvault-seed.rs`):**
+  - Replaced local-directory simulation shortcuts with a persistent background `libp2p` `TCP + Noise XX + Yamux` `Swarm` worker connection pool (`MeshClient`), enforcing `/p2p/<PeerId>` authentication and Trust-On-First-Use (`TOFU`) `PeerId` pinning, dual Kademlia DHT (`put_record` / `get_record`) + `ZeroTrustDhtStore` replication, live RTT & `QueryPeerStatus` placement telemetry, and 2-layer post-quantum onion routing.
   - Wired `parvault file store/restore`, `parvault watch-folder`, `parvault restore-folder`, `parvault recover-from-seed`, and `parvault leave` to dial configured `--peers` / `PARVAULT_PEERS` and `--seed-addr` / `PARVAULT_SEED_ADDR` `Multiaddr`s over the network.
-  - Added all 13 `MeshWireRequest` / `MeshWireResponse` variants (`HandshakeWoT`, `PutShard`, `DeleteShard`, `PorAudit`, `GetCiphertextShard`, `PutBlindedShard`, `GetBlindedShard`, `RenewBlindedLease`, `DeleteBlindedShardTombstone`, `MultiSegmentPorAudit`, `RelayPqOnionEnvelope`, `SyndicateLiteStripe`, `PutDhtEnvelope`, `GetDhtEnvelope`) to both `parvault daemon` and `parvault-seed`.
+  - Added all 14 `MeshWireRequest` / `MeshWireResponse` variants (`HandshakeWoT`, `PutShard`, `DeleteShard`, `PorAudit`, `GetCiphertextShard`, `PutBlindedShard`, `GetBlindedShard`, `RenewBlindedLease`, `DeleteBlindedShardTombstone`, `MultiSegmentPorAudit`, `RelayPqOnionEnvelope`, `SyndicateLiteStripe`, `PutDhtEnvelope`, `GetDhtEnvelope`, `QueryPeerStatus`) to both `parvault daemon` and `parvault-seed`.
 - **13-Container Docker P2P Regression & Disaster Recovery Gate (`scripts/docker_acceptance_gate.sh`, `.github/workflows/ci.yml`):**
   - Automated multi-container regression suite deploying `parvault-seed-0` + 11 `parvault daemon` containers + 1 isolated `parvault-client` container (`Mounts: []`) across an isolated Docker bridge network (`172.28.0.0/24`).
   - Exercises initial folder sync (`v1`), continuous background `watch-folder --prune-deleted` (`v2`) with remote `DeleteShard` pruning, Lite-Client `1.0x` stripe syndication + `parvault-seed-0` NAS-death failover, graceful node decommission (`parvault leave --handoff-to`), bit-rot injection & `parvault scrub` quarantine, daemon container restarts, 4-container `docker kill` + zero-local-state `recover-from-seed` (full & `--filter` selective restore), and cross-machine `file store` / `file restore`.
   - Added `test_live_libp2p_tcp_multi_daemon_network_backup_prune_and_seed_recovery` to `tests/sync_daemon_usability_and_cli_regression_tests.rs` spawning real localhost TCP `parvault-seed` and `parvault daemon` child processes during `cargo test`.
 
 ### Fixed & Hardened
-- **Memory-Hard `Argon2id` Key Stretching & True Dual-Cipher Cascaded AEAD (`src/crypto/keys.rs`, `src/crypto/pqc.rs`):**
-  - Upgraded `MasterKey::from_recovery_seed_phrase`, `PqVaultMasterKey::from_recovery_seed_phrase`, and `SoftwareTpm2Stub` passphrase sealing to use memory-hard **`Argon2id`** (`m = 64 MiB`, `t = 3`, `p = 4`) + `HKDF-SHA256` (`512-bit` root key material for `PqVaultMasterKey`).
-  - Fixed `PqVaultMasterKey::encrypt_stripe_pq` / `decrypt_stripe_pq` to perform genuine dual-cipher cascaded AEAD: inner **`AES-256-GCM`** under $K_1$ followed by outer **`ChaCha20-Poly1305`** under $K_2$.
+- **Memory-Hard `Argon2id` (`64 MiB`), HKDF Subkey Hierarchy, BIP-39 Validation, `zeroize`, `0600` Key Files & X-Wing Hybrid KEM (`src/crypto/`):**
+  - Upgraded `MasterKey::from_recovery_seed_phrase`, `PqVaultMasterKey::from_recovery_seed_phrase`, and `LocalFileKeystore` (`LocalKeystoreSealer`) passphrase sealing to use memory-hard **`Argon2id`** (`m = 64 MiB (65,536 KiB)`, `t = 3`, `p = 4`), full BIP-39 12/24-word English wordlist + SHA-256 checksum + Unicode NFKD normalization, `ZeroizeOnDrop` memory scrubbing, and `0600` atomic key-file permissions (`write_secret_file_atomic_0600`).
+  - Added domain-separated HKDF-SHA256 subkey derivation on `MasterKey` (`stripe_aead_subkey`, `stripe_nonce_subkey`, `manifest_aead_subkey`, `dht_routing_subkey`, `blind_locator_subkey`, `blind_capability_subkey`, `shard_pseudonym_subkey`) and separated `Ed25519` / `X25519` sub-seeds in `NodeIdentity::from_seed`.
+  - Upgraded `HybridKemKeypair::combine_hybrid_secrets` to an X-Wing style `HKDF-SHA512` combiner binding `ephem_x25519_pub || recipient_x25519_pub || SHA-256(ml_kem_ct) || SHA-256(recipient_ml_kem_ek)`.
+  - Upgraded `PqRelayedShardEnvelope` to a 2-layer post-quantum onion construction (`PqInnerStorageEnvelope` + outer relay envelope) and `AnonymousQuotaVoucher::mint_ephemeral` to use unlinkable per-shard ephemeral issuer keys.
 - **Owner Shard Read/Delete Authorization & Full Disk Persistence Across Restarts (`src/por/verifier.rs`, `src/storage/`, `src/network/wot.rs`):**
   - Fixed `GetCiphertextShard` owner signature verification to pass `owner_pub: [u8; 32]` explicitly and verify against the pinned `RepairGrant.owner_pubkey`.
   - Added signed owner shard deletion (`DeleteShard` / `authorize_owner_shard_delete`) so `watch-folder --prune-deleted` physically unlinks deleted files' shards on remote mesh peers.
   - Persisted `node_identity.seed` into `libp2p::identity::Keypair` on daemon/seed startup, and persisted `por_verifier_state.bin`, `wot_state.bin`, `quota_state.bin`, `voucher_nullifiers.bin` (bounded 65,536-entry FIFO), and `dht_*.bin` across restarts.
-  - Fixed `MeshClient::get_dht_envelope` to query all configured peers and return the strictly highest `monotonic_version` record.
+  - Fixed `MeshClient::get_dht_envelope` to query both the `libp2p` Kademlia DHT and all configured peers, returning the strictly highest `monotonic_version` record.
 - **Non-Vacuous Adversarial TLA+ & Stateright Models (`specs/*.tla`, `tests/formal_verification.rs`):**
-  - Added explicit adversarial state-mutation actions (`AdversaryStealShard`, `AdversaryAttemptMasterKeyCompromise`, `UninvitedSybilAttemptRouteInsert`, `AdversaryCompromiseSubnetShard`, `AdversaryProbeBlindedLinkage`, `QuantumAdversaryBreakClassicalOnly`, `SybilStandbyFarmAttempt`, `ByzantineCorruptCachedSeedShard`) across all 6 TLA+ specs and Stateright models.
-
-### Removed
-- Removed simulated benchmark artifacts (`src/bin/parvault-bench.rs`, `src/bench_matrix.rs`, and pre-rename `dist/meshos-*` binaries) in favor of real multi-container `libp2p` Docker regression tests.
+  - Rewrote `specs/ParVaultPostQuantum.tla` into a multi-actor protocol and non-deterministic single-primitive break / public-key substitution state machine (927 distinct states, 0 errors) and updated `specs/ParVaultAnonymity.tla` for 2-layer PQ onion routing and ephemeral-issuer vouchers (861 distinct states, 0 errors).
 
 ---
 

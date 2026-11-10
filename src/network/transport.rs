@@ -60,10 +60,20 @@ fn construct_behaviour(
     let local_peer_id = key.public().to_peer_id();
 
     // 1. Kademlia DHT for peer discovery & encrypted FileManifest storage (ADR-02).
-    let store = kad::store::MemoryStore::new(local_peer_id);
+    let store_config = kad::store::MemoryStoreConfig {
+        max_value_bytes: 2 * 1024 * 1024,
+        ..Default::default()
+    };
+    let store = kad::store::MemoryStore::with_config(local_peer_id, store_config);
     let mut kad_config = kad::Config::new(StreamProtocol::new("/parvault/kad/1.0.0"));
     kad_config.set_query_timeout(Duration::from_secs(10));
-    let kademlia = kad::Behaviour::with_config(local_peer_id, store, kad_config);
+    kad_config.set_max_packet_size(2 * 1024 * 1024);
+    let mut kademlia = kad::Behaviour::with_config(local_peer_id, store, kad_config);
+    kademlia.set_mode(Some(if enable_mdns {
+        kad::Mode::Server
+    } else {
+        kad::Mode::Client
+    }));
 
     // 2. Gossipsub for Web-of-Trust certificate & SlashingEvidence propagation (ADR-05).
     let gossipsub_config = gossipsub::ConfigBuilder::default()

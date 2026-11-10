@@ -99,7 +99,7 @@ if [ "$CLIENT_MOUNTS" != "[]" ] && [ "$CLIENT_MOUNTS" != "null" ]; then
     exit 1
 fi
 
-SEED_PHRASE="abandon ability able about above absent absorb abstract absurd abuse access accident"
+SEED_PHRASE="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
 VAULT_NS="docker-live-acceptance-vault"
 
 echo "=== [4/10] Initial Backup (Snapshot v1): 'parvault watch-folder --once' over libp2p ==="

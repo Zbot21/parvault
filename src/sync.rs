@@ -1345,8 +1345,9 @@ impl FolderSyncEngine {
         vault_namespace: &str,
         snapshot: &FolderSnapshotManifest,
     ) -> Result<EncryptedVaultCatalogEnvelope, StorageError> {
+        let canonical = crate::crypto::validate_recovery_seed_phrase_or_passphrase(seed_phrase)?;
         let pq_master_key =
-            PqVaultMasterKey::from_recovery_seed_phrase(seed_phrase, vault_namespace);
+            PqVaultMasterKey::from_recovery_seed_phrase(&canonical, vault_namespace);
         let env = EncryptedVaultCatalogEnvelope::seal(
             &self.master_key,
             &pq_master_key,
@@ -1375,10 +1376,11 @@ impl FolderSyncEngine {
         catalog_envelope: &EncryptedVaultCatalogEnvelope,
         target_dir: &Path,
     ) -> Result<usize, StorageError> {
-        let master_key = MasterKey::from_recovery_seed_phrase(seed_phrase, vault_namespace);
+        let canonical = crate::crypto::validate_recovery_seed_phrase_or_passphrase(seed_phrase)?;
+        let master_key = MasterKey::from_recovery_seed_phrase(&canonical, vault_namespace);
         let pq_master_key =
-            PqVaultMasterKey::from_recovery_seed_phrase(seed_phrase, vault_namespace);
-        let owner_identity = NodeIdentity::from_recovery_seed_phrase(seed_phrase, vault_namespace);
+            PqVaultMasterKey::from_recovery_seed_phrase(&canonical, vault_namespace);
+        let owner_identity = NodeIdentity::from_recovery_seed_phrase(&canonical, vault_namespace);
 
         let expected_dht_key = master_key.derive_vault_root_dht_key(vault_namespace);
         if catalog_envelope.dht_key != expected_dht_key
@@ -1404,7 +1406,8 @@ impl FolderSyncEngine {
         vault_namespace: &str,
         target_dir: &Path,
     ) -> Result<usize, StorageError> {
-        let master_key = MasterKey::from_recovery_seed_phrase(seed_phrase, vault_namespace);
+        let canonical = crate::crypto::validate_recovery_seed_phrase_or_passphrase(seed_phrase)?;
+        let master_key = MasterKey::from_recovery_seed_phrase(&canonical, vault_namespace);
         let dht_key = master_key.derive_vault_root_dht_key(vault_namespace);
         let store_ref = store.borrow();
 
@@ -1431,7 +1434,7 @@ impl FolderSyncEngine {
 
         Self::recover_folder_from_seed_phrase(
             store_ref,
-            seed_phrase,
+            &canonical,
             vault_namespace,
             &catalog_envelope,
             target_dir,

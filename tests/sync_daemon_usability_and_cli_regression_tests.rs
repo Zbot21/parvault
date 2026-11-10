@@ -427,7 +427,7 @@ fn test_token_bucket_rate_limiter_free_disk_guard_and_pq_dht_catalog_store() {
 
     // Vault Catalog Envelope in ZeroTrustDhtStore
     let seed_phrase =
-        "abandon ability able about above absent absorb abstract absurd abuse access accident";
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
     let store = BlockStore::new(
         &base,
         QuotaManager::new(100 * 1024 * 1024, 10 * 1024 * 1024),
@@ -630,7 +630,7 @@ fn test_cli_end_to_end_parvault_and_parvault_seed_subcommands() {
     let snap_path = base.join("snap.manifest.bin");
     let catalog_path = base.join("catalog.envelope.bin");
     let phrase =
-        "abandon ability able about above absent absorb abstract absurd abuse access accident";
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
     let out_watch = std::process::Command::new(parvault_bin)
         .current_dir(&base)
         .args(["watch-folder", "--folder"])
@@ -947,7 +947,7 @@ fn test_live_libp2p_tcp_multi_daemon_network_backup_prune_and_seed_recovery() {
     .unwrap();
 
     let seed_phrase =
-        "abandon ability able about above absent absorb abstract absurd abuse access accident";
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
     let out_sync1 = std::process::Command::new(parvault_bin)
         .arg("--data-dir")
         .arg(&client_dir)

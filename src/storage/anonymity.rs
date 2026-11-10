@@ -1,14 +1,37 @@
-use crate::crypto::{compute_sha256, decrypt_manifest, encrypt_manifest, MasterKey, NodeIdentity};
+use crate::crypto::aes::deserialize_bounded;
+use crate::crypto::{
+    compute_sha256, decrypt_manifest, encrypt_manifest, pad_plaintext_iso_bucket,
+    unpad_plaintext_iso_bucket, MasterKey, NodeIdentity,
+};
 use crate::storage::StorageError;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
+use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::{HashSet, VecDeque};
 use x25519_dalek::PublicKey as X25519Public;
+use zeroize::Zeroize;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Maximum bounded deserialization size for persisted voucher nullifier FIFO ledgers (4 MiB).
+const MAX_NULLIFIER_LEDGER_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum bounded deserialization size for 1-hop onion inner payloads (32 MiB).
+const MAX_ONION_INNER_BYTES: usize = 32 * 1024 * 1024;
+
+/// Pads a shard payload to a uniform power-of-two bucket size (`>= bucket_bytes`, minimum 64 bytes)
+/// using ISO/IEC 7816-4 (`0x80 0x00*`) sentinel padding (`D4`) so colluding storage nodes cannot
+/// group the 20 shards of an erasure-coded stripe by identical non-bucketed shard byte lengths.
+pub fn pad_shard_uniform_bucket(shard_bytes: &[u8], bucket_bytes: usize) -> Vec<u8> {
+    pad_plaintext_iso_bucket(shard_bytes, bucket_bytes)
+}
+
+/// Strips uniform bucket padding added by `pad_shard_uniform_bucket` (`D4`).
+pub fn unpad_shard_uniform_bucket(padded: &[u8]) -> Result<Vec<u8>, StorageError> {
+    unpad_plaintext_iso_bucket(padded).map_err(StorageError::from)
+}
 
 /// Layer 1 (ADR-11): Opaque Blinded Shard Identifier stored on remote nodes.
 /// Conceals both `stripe_merkle_root` and the Reed-Solomon matrix coordinate `shard_index` (`0..N-1`),
@@ -16,22 +39,25 @@ type HmacSha256 = Hmac<Sha256>;
 /// which Vandermonde/Cauchy evaluation point a shard corresponds to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BlindedShardId {
-    /// `Locator_i = HMAC-SHA256(K_user, "parvault-blind-locator-v1:" || stripe_merkle_root || shard_index_be32)`
+    /// `Locator_i = HMAC-SHA256(K_blind_locator, "parvault-blind-locator-v1:" || stripe_merkle_root || shard_index_be32)`
     pub locator: [u8; 32],
     /// Keyless SHA-256 content digest `SHA-256(shard_bytes)` for disk integrity verification.
     pub content_sha256: [u8; 32],
 }
 
 impl BlindedShardId {
-    /// Derives an unlinkable 256-bit `BlindedShardId` for shard `shard_index` of `stripe_merkle_root`.
+    /// Derives an unlinkable 256-bit `BlindedShardId` for shard `shard_index` of `stripe_merkle_root`
+    /// using the domain-separated `blind_locator_subkey` (`B1`).
     pub fn derive(
         master_key: &MasterKey,
         stripe_merkle_root: &[u8; 32],
         shard_index: u32,
         shard_bytes: &[u8],
     ) -> Self {
-        let mut mac = <HmacSha256 as hmac::digest::KeyInit>::new_from_slice(master_key.as_bytes())
+        let mut locator_subkey = master_key.blind_locator_subkey();
+        let mut mac = <HmacSha256 as hmac::digest::KeyInit>::new_from_slice(&locator_subkey)
             .expect("HMAC accepts 32-byte key");
+        locator_subkey.zeroize();
         mac.update(b"parvault-blind-locator-v1:");
         mac.update(stripe_merkle_root);
         mac.update(&shard_index.to_be_bytes());
@@ -73,14 +99,17 @@ pub const MAX_SINGLE_VOUCHER_BYTES: u64 = 1024 * 1024 * 1024;
 
 impl BlindedShardCapability {
     /// Deterministically derives the shard-specific Ed25519 `NodeIdentity` and public `BlindedShardCapability`
-    /// from `(K_user, Locator_i)` via HKDF-SHA256.
+    /// from `(K_blind_capability, Locator_i)` via HKDF-SHA256 (`B1`).
     pub fn derive_keypair(master_key: &MasterKey, locator: &[u8; 32]) -> (NodeIdentity, Self) {
-        let hk = Hkdf::<Sha256>::new(Some(locator), master_key.as_bytes());
+        let mut cap_subkey = master_key.blind_capability_subkey();
+        let hk = Hkdf::<Sha256>::new(Some(locator), &cap_subkey);
+        cap_subkey.zeroize();
         let mut seed = [0u8; 32];
         hk.expand(b"parvault-blind-capability-ed25519-v1", &mut seed)
             .expect("32-byte HKDF expand is always valid");
 
         let cap_identity = NodeIdentity::from_seed(seed);
+        seed.zeroize();
         let capability = Self {
             locator: *locator,
             capability_pubkey: cap_identity.public_key_bytes(),
@@ -142,10 +171,10 @@ pub struct AnonymousQuotaVoucher {
 }
 
 impl AnonymousQuotaVoucher {
-    /// Mints a fresh single-use bearer storage voucher for up to `max_bytes`.
+    /// Mints a fresh single-use bearer storage voucher for up to `max_bytes` using `OsRng` (`E4`).
     pub fn mint(issuer: &NodeIdentity, max_bytes: u64) -> Self {
         let mut voucher_nonce = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut voucher_nonce);
+        OsRng.fill_bytes(&mut voucher_nonce);
         let issuer_pubkey = issuer.public_key_bytes();
         let msg = Self::canonical_bytes(&voucher_nonce, max_bytes, &issuer_pubkey);
         let sig = issuer.sign(&msg);
@@ -161,6 +190,24 @@ impl AnonymousQuotaVoucher {
             sig_r,
             sig_s,
         }
+    }
+
+    /// Mints a per-shard unlinkable bearer voucher signed by an ephemeral sub-identity derived
+    /// via `HKDF-SHA256` from `(epoch_seed, shard_locator)` (`D4`).
+    /// Prevents colluding storage nodes from linking the 20 shards of a stripe via a static `issuer_pubkey`.
+    pub fn mint_blinded_ephemeral(
+        epoch_seed: &[u8; 32],
+        shard_locator: &[u8; 32],
+        max_bytes: u64,
+    ) -> (NodeIdentity, Self) {
+        let hk = Hkdf::<Sha256>::new(Some(shard_locator), epoch_seed);
+        let mut ephem_seed = [0u8; 32];
+        hk.expand(b"parvault-ephemeral-voucher-issuer-v2", &mut ephem_seed)
+            .expect("32-byte HKDF expansion is always valid");
+        let ephem_issuer = NodeIdentity::from_seed(ephem_seed);
+        ephem_seed.zeroize();
+        let voucher = Self::mint(&ephem_issuer, max_bytes);
+        (ephem_issuer, voucher)
     }
 
     /// Verifies the issuer's Ed25519 signature over the bearer voucher and enforces `MAX_SINGLE_VOUCHER_BYTES`.
@@ -217,7 +264,8 @@ impl VoucherNullifierLedger {
         }
     }
 
-    /// Loads or initializes a persistent `VoucherNullifierLedger` at `data_dir/voucher_nullifiers.bin`.
+    /// Loads or initializes a persistent `VoucherNullifierLedger` at `data_dir/voucher_nullifiers.bin`
+    /// using bounded deserialization (`B12`).
     pub fn with_persistence_dir(
         trusted_issuer_pubkey: [u8; 32],
         data_dir: &std::path::Path,
@@ -226,7 +274,9 @@ impl VoucherNullifierLedger {
         let spent_fifo: VecDeque<[u8; 32]> = if path.exists() {
             std::fs::read(&path)
                 .ok()
-                .and_then(|raw| bincode::deserialize::<VecDeque<[u8; 32]>>(&raw).ok())
+                .and_then(|raw| {
+                    deserialize_bounded::<VecDeque<[u8; 32]>>(&raw, MAX_NULLIFIER_LEDGER_BYTES).ok()
+                })
                 .unwrap_or_default()
         } else {
             VecDeque::new()
@@ -319,9 +369,10 @@ impl RelayedShardEnvelope {
     ) -> Result<Self, StorageError> {
         let ephem = NodeIdentity::generate();
         let target_pub = X25519Public::from(*target_x25519_pub);
-        let shared_key_bytes =
+        let mut shared_key_bytes =
             ephem.derive_por_session_key(&target_pub, &Self::ONION_DOMAIN_TAG)?;
         let shared_key = MasterKey::from_bytes(shared_key_bytes);
+        shared_key_bytes.zeroize();
 
         let inner = OnionInnerPayload {
             blinded_id: *blinded_id,
@@ -338,18 +389,21 @@ impl RelayedShardEnvelope {
         })
     }
 
-    /// Decrypts and authenticates the onion envelope on the destination storage node.
+    /// Decrypts and authenticates the onion envelope on the destination storage node
+    /// with bounded deserialization (`B12`).
     pub fn open_at_target(
         &self,
         target_identity: &NodeIdentity,
     ) -> Result<(BlindedShardId, Vec<u8>), StorageError> {
         let ephem_pub = X25519Public::from(self.ephemeral_x25519_pub);
-        let shared_key_bytes =
+        let mut shared_key_bytes =
             target_identity.derive_por_session_key(&ephem_pub, &Self::ONION_DOMAIN_TAG)?;
         let shared_key = MasterKey::from_bytes(shared_key_bytes);
+        shared_key_bytes.zeroize();
 
         let decrypted = decrypt_manifest(&shared_key, &self.encrypted_payload)?;
-        let inner: OnionInnerPayload = bincode::deserialize(&decrypted)?;
+        let inner: OnionInnerPayload =
+            deserialize_bounded(&decrypted, MAX_ONION_INNER_BYTES).map_err(StorageError::from)?;
         Ok((inner.blinded_id, inner.shard_bytes))
     }
 }
@@ -374,4 +428,33 @@ pub fn combinatorial_reconstruction_entropy_bits(
         bits += (m_term / k_denom).log2() + n_perm.log2();
     }
     bits
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ephemeral_blinded_vouchers_and_uniform_shard_bucket_padding() {
+        let epoch_seed = [0x77u8; 32];
+        let loc_0 = [0x01u8; 32];
+        let loc_1 = [0x02u8; 32];
+
+        let (issuer_0, v0) =
+            AnonymousQuotaVoucher::mint_blinded_ephemeral(&epoch_seed, &loc_0, 8192);
+        let (issuer_1, v1) =
+            AnonymousQuotaVoucher::mint_blinded_ephemeral(&epoch_seed, &loc_1, 8192);
+        assert_ne!(
+            v0.issuer_pubkey, v1.issuer_pubkey,
+            "ephemeral per-shard voucher issuers must be unlinkable across shards of the same stripe"
+        );
+        assert!(v0.verify(&issuer_0.public_key_bytes()));
+        assert!(v1.verify(&issuer_1.public_key_bytes()));
+
+        let raw_shard = vec![0xABu8; 1337];
+        let padded = pad_shard_uniform_bucket(&raw_shard, 4096);
+        assert_eq!(padded.len(), 4096);
+        let unpadded = unpad_shard_uniform_bucket(&padded).expect("unpad");
+        assert_eq!(unpadded, raw_shard);
+    }
 }

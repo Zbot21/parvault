@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "parvault-seed"
 path = "src/bin/parvault-seed.rs"
 
+[[bin]]
+name = "parvault-bench"
+path = "src/bin/parvault-bench.rs"
+
 [lib]
 name = "parvault"
 path = "src/lib.rs"
@@ -43,7 +47,8 @@ reed-solomon-erasure = "6.0"
 aes-gcm = "0.10"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
-ring = "0.17"
+zeroize = { version = "1.8", features = ["derive"] }
+unicode-normalization = "0.1"
 sha2 = "0.10"
 hmac = "0.12"
 hkdf = "0.12"

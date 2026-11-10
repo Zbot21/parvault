@@ -25,7 +25,7 @@ This manual provides the complete command-line reference, step-by-step operation
 
 | Binary | Target Machine | Holds User MasterKey? | Primary Role |
 | :--- | :--- | :---: | :--- |
-| **`parvault`** | Laptops, desktops, workstations, or servers whose own folders are being backed up | **Yes** *(sealed in `<data_dir>/master_key.sealed` or passed via `--key-hex` / `--seed-phrase`)* | Encrypts files (`AES-256-GCM` + 512-bit `PqVaultMasterKey`), splits stripes into Reed-Solomon $GF(2^8)$ shards, watches folders incrementally, and restores backups. |
+| **`parvault`** | Laptops, desktops, workstations, or servers whose own folders are being backed up | **Yes** *(sealed in `<data_dir>/master_key.sealed` via `LocalFileKeystore` with `Argon2id` passphrase / `0600` local key, or passed via `--key-hex` / `--seed-phrase`)* | Encrypts files (`AES-256-GCM` + dual-cipher `PqVaultMasterKey` cascade), splits stripes into Reed-Solomon $GF(2^8)$ shards, watches folders incrementally, and restores backups. |
 | **`parvault-seed`** | Headless 24/7 NAS, Raspberry Pi, Unraid/TrueNAS, mini-PC, or VPS | **No — Never** (`holds_own_plaintext_files == false`) | Stores anonymized `.bshard` / `.shard` ciphertext, verifies `PersonalDeviceCert`s (`homelab-vault` mode), answers PoR audits to earn `16-of-20` `HighUptimeAnchor` standing, or acts as an auto-draining community seed (`public-bootstrap` mode). |
 
 ---
@@ -192,12 +192,12 @@ parvault restore-folder \
 
 What if a house fire, flood, or theft destroys your laptop **and** your local `.manifest.bin` / `master_key.sealed` files?
 
-1. **During normal backups, pass `--seed-phrase` and `--catalog-out`** so `parvault` derives deterministic keys from your 24-word recovery phrase and seals a post-quantum `EncryptedVaultCatalogEnvelope`:
+1. **During normal backups, pass `--seed-phrase` and `--catalog-out`** so `parvault` derives deterministic keys from your 12-word (128-bit) or 24-word (256-bit) checksummed BIP-39 recovery phrase (validated against the 2,048-word English wordlist, SHA-256 checksum, and Unicode NFKD whitespace normalization) and seals a post-quantum `EncryptedVaultCatalogEnvelope`:
    ```bash
    parvault watch-folder \
      --folder ./family-vault \
      --snapshot-out ./family-vault.manifest.bin \
-     --seed-phrase "abandon ability able about above absent absorb abstract absurd abuse access accident" \
+     --seed-phrase "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" \
      --vault-namespace "family-vault-2026" \
      --catalog-out ./family-vault.catalog.bin \
      --once
@@ -205,12 +205,12 @@ What if a house fire, flood, or theft destroys your laptop **and** your local `.
 2. **After a total local hardware loss, install `parvault` on a brand-new machine and run `recover-from-seed`:**
    ```bash
    parvault recover-from-seed \
-     --seed-phrase "abandon ability able about above absent absorb abstract absurd abuse access accident" \
+     --seed-phrase "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" \
      --vault-namespace "family-vault-2026" \
      --catalog-envelope ./family-vault.catalog.bin \
      --out-dir ./restored-family-vault
    ```
-   `recover-from-seed` runs memory-hard `Argon2id` (`m = 64 MiB`, `t = 3`, `p = 4`) + `HKDF-SHA256` to reconstruct your exact `MasterKey`, 512-bit `PqVaultMasterKey`, `NodeIdentity`, and `dht_key`, verifies the catalog's zero-knowledge signature, and restores every file bit-for-bit.
+   `recover-from-seed` runs memory-hard `Argon2id` (`m = 64 MiB (65,536 KiB)`, `t = 3`, `p = 4`) + `HKDF-SHA256` to reconstruct your exact `MasterKey` (and its domain-separated HKDF subkey hierarchy), dual-cipher `PqVaultMasterKey`, `NodeIdentity`, and `dht_key`, verifies the catalog's zero-knowledge signature, and restores every file bit-for-bit.
 
 4. **Selective Partial Restore (`--filter`) & Zero-Download Catalog Browsing (`list-snapshot`):**
    If your home NAS dies and your laptop only has a 512 GiB SSD, you never have to restore your entire multi-terabyte vault at once. First, browse the snapshot catalog (`list-snapshot` downloads **zero** shards), or pass `--filter` (comma-separated path prefixes, exact paths, or `*`/`?` globs) to `restore-folder` or `recover-from-seed`:

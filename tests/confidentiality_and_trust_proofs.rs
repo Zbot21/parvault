@@ -50,8 +50,8 @@ fn compute_shard_bit_flip_ratio(shards_a: &[Vec<u8>], shards_b: &[Vec<u8>]) -> f
 }
 
 /// ============================================================================
-/// PROOF 1: Empirical Shannon Entropy ($H(X) > 7.98$ bits/byte) & Zero Plaintext
-/// Substring Leakage across all 20 Reed-Solomon Shards
+/// SANITY CHECK 1: Empirical Shannon Entropy ($H(X) > 7.98$ bits/byte) & Zero Plaintext
+/// Substring Leakage across all 20 Reed-Solomon Shards (Non-Degeneracy Regression Check)
 /// ============================================================================
 #[test]
 fn test_proof1_shannon_entropy_and_zero_plaintext_leakage_on_shards() {
@@ -126,8 +126,8 @@ fn test_proof1_shannon_entropy_and_zero_plaintext_leakage_on_shards() {
 }
 
 /// ============================================================================
-/// PROOF 2: Strict Avalanche Criterion (~50% Bit Flip) & IND-CPA / INT-CTXT
-/// Non-Malleability even under 20-of-20 Storage Node Collusion
+/// SANITY CHECK 2: Empirical Avalanche Diffusion (~50% Bit Flip) & AEAD Tag
+/// Non-Malleability Regression Check under 20-of-20 Storage Node Collusion
 /// ============================================================================
 #[test]
 fn test_proof2_strict_avalanche_criterion_and_ind_cpa_non_malleability() {

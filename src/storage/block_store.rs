@@ -418,7 +418,7 @@ impl BlockStore {
             fs::create_dir_all(parent)?;
         }
         let mut rnd = [0u8; 8];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut rnd);
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut rnd);
         let file_name = target_path
             .file_name()
             .and_then(|n| n.to_str())

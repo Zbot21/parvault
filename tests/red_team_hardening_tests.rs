@@ -35,7 +35,7 @@ fn test_rt1_zero_local_state_house_fire_recovery_from_seed_phrase_alone() {
     let restored_dir = tempdir().expect("restored dir");
 
     let seed_phrase =
-        "abandon ability able about above absent absorb abstract absurd abuse access accident";
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
     let vault_namespace = "chris-homelab-primary-vault";
 
     // 1. Machine A (before the house fire): derive keys deterministically from (seed_phrase, vault_namespace)
@@ -640,4 +640,186 @@ fn test_rt5_folder_restore_path_traversal_blocked_bitrot_scrubber_and_lru_quota_
     );
     qm.reset_epoch_ingress_counters();
     assert!(qm.can_accept_shard("peer-alpha", 4_000));
+}
+
+// ============================================================================
+// RED-TEAM TEST 6 (Review Remediations A1–A4, B1–B12, C6, D4):
+// - Argon2id 64 MiB parameters (`A1`, `B7`), BIP-39 2,048-word validation + SHA-256 checksum
+//   + Levenshtein typo suggestion + NFKD whitespace normalization (`A4`, `B6`)
+// - Per-purpose HKDF-SHA256 subkeys on `MasterKey` (`B1`) and separated Ed25519/X25519 seeds (`B2`)
+// - Atomic `0600` secret file permissions (`B4`) and `LocalFileKeystore` passphrase sealing (`B5`)
+// - 2-Layer Post-Quantum Onion Routing (`seal_layered_pq` -> `peel_relay_hop_pq` -> `open_final_target_pq`, `C6`),
+//   ephemeral blinded voucher minting, and uniform shard bucket padding (`D4`)
+// ============================================================================
+#[test]
+fn test_rt6_review_remediation_bip39_subkeys_0600_and_2layer_pq_onion() {
+    use parvault::crypto::{
+        generate_bip39_mnemonic, normalize_seed_phrase_nfkd, validate_bip39_mnemonic,
+        validate_recovery_seed_phrase_or_passphrase, HybridKemKeypair, HybridPqSigningKeypair,
+        LocalFileKeystore, LocalKeystoreSealer, PqOnionFinalBundle, PqRelayedShardEnvelope,
+        ARGON2_M_COST_KIB, ARGON2_P_COST, ARGON2_T_COST,
+    };
+    use parvault::storage::{pad_shard_uniform_bucket, unpad_shard_uniform_bucket};
+
+    // 1. [A1 / B7] Verify Argon2id hardening parameters match documentation (64 MiB, t=3, p=4)
+    assert_eq!(ARGON2_M_COST_KIB, 65_536);
+    assert_eq!(ARGON2_T_COST, 3);
+    assert_eq!(ARGON2_P_COST, 4);
+
+    // 2. [A4 / B6] BIP-39 24-word generation, NFKD normalization, checksum & typo detection
+    let m24 = generate_bip39_mnemonic(24).expect("generate 24-word BIP-39 mnemonic");
+    assert_eq!(m24.split(' ').count(), 24);
+    assert_eq!(validate_bip39_mnemonic(&m24).unwrap(), m24);
+
+    let messy =
+        "  ABANDON\t\tabandon\r\nAbandon   abandon abandon abandon abandon abandon abandon abandon abandon ABOUT ";
+    assert_eq!(
+        normalize_seed_phrase_nfkd(messy),
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+    );
+
+    let typo_phrase =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon aboot";
+    let typo_err = validate_recovery_seed_phrase_or_passphrase(typo_phrase)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        typo_err.contains("unknown BIP-39 word 'aboot'") && typo_err.contains("did you mean"),
+        "Expected Levenshtein suggestion on BIP-39 typo, got: {typo_err}"
+    );
+
+    let bad_checksum =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon";
+    let cs_err = validate_recovery_seed_phrase_or_passphrase(bad_checksum)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        cs_err.contains("checksum verification failed"),
+        "Expected BIP-39 checksum error, got: {cs_err}"
+    );
+
+    // 3. [B1 / B2] Per-purpose HKDF-SHA256 subkeys are mutually distinct and distinct from MasterKey
+    let mk = MasterKey::generate();
+    let subkeys = [
+        *mk.as_bytes(),
+        mk.stripe_aead_subkey(),
+        mk.stripe_nonce_subkey(),
+        mk.manifest_aead_subkey(),
+        mk.dht_routing_subkey(),
+        mk.blind_locator_subkey(),
+        mk.blind_capability_subkey(),
+        mk.shard_pseudonym_subkey(),
+    ];
+    for i in 0..subkeys.len() {
+        for j in (i + 1)..subkeys.len() {
+            assert_ne!(
+                subkeys[i], subkeys[j],
+                "Subkeys {i} and {j} must be cryptographically domain-separated"
+            );
+        }
+    }
+
+    // NodeIdentity::from_seed derives independent Ed25519 and X25519 keys
+    let id = NodeIdentity::from_seed([0x42u8; 32]);
+    assert_ne!(
+        id.public_key_bytes(),
+        *id.x25519_public().as_bytes(),
+        "Ed25519 and X25519 public keys must be derived from domain-separated seeds"
+    );
+
+    // 4. [B4 / B5] Secret key files written with 0600 permissions + LocalFileKeystore sealing
+    let key_dir = tempdir().expect("key tempdir");
+    let _loaded_node = NodeIdentity::load_or_generate_in_dir(key_dir.path()).unwrap();
+    let _loaded_genesis =
+        NodeIdentity::resolve_genesis_root_pubkey_in_dir(key_dir.path(), None).unwrap();
+    let _loaded_kem = HybridKemKeypair::load_or_generate_in_dir(key_dir.path()).unwrap();
+    let _loaded_pq = HybridPqSigningKeypair::load_or_generate_in_dir(key_dir.path()).unwrap();
+    let keystore = LocalFileKeystore::from_passphrase_or_csprng_in_dir(
+        key_dir.path(),
+        Some("high-entropy-keystore-passphrase-2026"),
+    )
+    .unwrap();
+    let sealed_blob = keystore.seal_key(mk.as_bytes()).unwrap();
+    let unsealed_mk = keystore.unseal_key(&sealed_blob).unwrap();
+    assert_eq!(&unsealed_mk, mk.as_bytes());
+
+    let local_sealer =
+        LocalFileKeystore::from_passphrase_or_csprng_in_dir(key_dir.path(), None).unwrap();
+    let _ = local_sealer
+        .load_or_create_master_key(&key_dir.path().join("master_key.sealed"))
+        .unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for secret_file in [
+            "node_identity.seed",
+            "genesis_root.seed",
+            "node_pq_kem.bin",
+            "owner_pq_keypair.bin",
+            "enclave_sealing.seed",
+            "master_key.sealed",
+        ] {
+            let p = key_dir.path().join(secret_file);
+            let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "Secret file {secret_file} must have strict 0600 permissions, got {mode:o}"
+            );
+        }
+    }
+
+    // 5. [C6 / D4] 2-Layer PQ Onion Routing, Ephemeral Blinded Vouchers & Uniform Shard Padding
+    let raw_shard = vec![0xABu8; 1337];
+    let padded_shard = pad_shard_uniform_bucket(&raw_shard, 4096);
+    assert_eq!(padded_shard.len(), 4096);
+    let unpadded_shard = unpad_shard_uniform_bucket(&padded_shard).unwrap();
+    assert_eq!(unpadded_shard, raw_shard);
+
+    let relay_kem = HybridKemKeypair::generate().unwrap();
+    let target_kem = HybridKemKeypair::generate().unwrap();
+    let blinded_id = BlindedShardId::derive(&mk, &[0x99u8; 32], 2, &padded_shard);
+    let (_, cap) = BlindedShardCapability::derive_keypair(&mk, &blinded_id.locator);
+    let (_, ephem_voucher_a) =
+        AnonymousQuotaVoucher::mint_blinded_ephemeral(&[0x77u8; 32], &blinded_id.locator, 4096);
+    let (_, ephem_voucher_b) =
+        AnonymousQuotaVoucher::mint_blinded_ephemeral(&[0x77u8; 32], &[0x88u8; 32], 4096);
+    assert_ne!(
+        ephem_voucher_a.issuer_pubkey, ephem_voucher_b.issuer_pubkey,
+        "Per-shard ephemeral vouchers must not share a static linkable issuer_pubkey across locators"
+    );
+
+    let bundle = PqOnionFinalBundle {
+        blinded_id,
+        shard_bytes: padded_shard.clone(),
+        capability: cap,
+        voucher: ephem_voucher_a.clone(),
+        current_epoch: 10,
+        lease_duration_epochs: 30,
+        delete_verifier: [0x55u8; 32],
+    };
+    let outer = PqRelayedShardEnvelope::seal_layered_pq(
+        &relay_kem.public_key(),
+        "relay-hop-1",
+        &target_kem.public_key(),
+        "/ip4/10.0.0.99/tcp/4001",
+        &bundle,
+        15,
+        5,
+    )
+    .unwrap();
+
+    // Relay peels outer hop, learns only next-hop multiaddr, and cannot open inner target payload
+    let hop = outer.peel_relay_hop_pq(&relay_kem).unwrap();
+    assert_eq!(hop.target_peer_addr, "/ip4/10.0.0.99/tcp/4001");
+    assert!(hop.inner_envelope.open_final_target_pq(&relay_kem).is_err());
+
+    // Final target opens inner payload and recovers the full bundle
+    let recovered = hop
+        .inner_envelope
+        .open_final_target_pq(&target_kem)
+        .unwrap();
+    assert_eq!(recovered.blinded_id, blinded_id);
+    assert_eq!(recovered.shard_bytes, padded_shard);
+    assert_eq!(recovered.voucher, ephem_voucher_a);
 }

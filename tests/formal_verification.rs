@@ -374,8 +374,86 @@ fn test_exhaustive_bit_precise_gf256_and_sharding_bounds() {
         }
     }
 
+    // 3. Verify the actual ParVault Reed-Solomon encode/reconstruct/quarantine implementation
+    // (`encode_ciphertext_stripe`, `reconstruct_ciphertext_stripe`, and
+    // `reconstruct_zero_trust_with_quarantine`) across all 4 SLA tiers (`Consumer 10/20`,
+    // `Homelab 16/20`, `Mixed 16/24`, `Relay 20/24`) under maximum M = N - K erasures
+    // and simultaneous Byzantine shard corruption + erasure combinations.
+    use parvault::config::ErasureTier;
+    use parvault::sharding::{
+        encode_ciphertext_stripe, reconstruct_ciphertext_stripe,
+        reconstruct_zero_trust_with_quarantine, MerkleTree,
+    };
+
+    for tier in [
+        ErasureTier::Consumer,
+        ErasureTier::Homelab,
+        ErasureTier::Mixed,
+        ErasureTier::Relay,
+    ] {
+        let (k, m, n) = tier.params();
+        for payload_len in [1usize, 17, 255, 1024, 4099] {
+            let ciphertext: Vec<u8> = (0..payload_len)
+                .map(|i| ((i * 73 + k * 19 + n * 7) & 0xFF) as u8)
+                .collect();
+            let shard_set = encode_ciphertext_stripe(0, &ciphertext, tier).unwrap();
+            assert_eq!(shard_set.shards.len(), n);
+
+            // (a) Drop any M contiguous shards (cyclic window) and verify exact recovery
+            for start_drop in 0..n {
+                let mut slots: Vec<Option<Vec<u8>>> =
+                    shard_set.shards.iter().cloned().map(Some).collect();
+                for offset in 0..m {
+                    slots[(start_drop + offset) % n] = None;
+                }
+                let recovered = reconstruct_ciphertext_stripe(
+                    slots,
+                    k,
+                    m,
+                    shard_set.original_ciphertext_len,
+                    Some(&shard_set.shard_hashes),
+                    Some(shard_set.stripe_merkle_root),
+                )
+                .unwrap();
+                assert_eq!(recovered, ciphertext);
+            }
+
+            // (b) Corrupt 2 shards with Byzantine bit-flips AND drop (M - 2) shards,
+            // verifying that pre-decoding Merkle quarantine isolates the 2 poisoned shards
+            // and reconstructs the exact original shards from the K surviving honest shards.
+            let tree = MerkleTree::from_shards(&shard_set.shards);
+            let proof_opts: Vec<_> = (0..n).map(|idx| tree.generate_proof(idx)).collect();
+            let mut byz_slots: Vec<Option<Vec<u8>>> =
+                shard_set.shards.iter().cloned().map(Some).collect();
+            // Flip bits in shard 0 and shard k-1
+            if let Some(ref mut bytes) = byz_slots[0] {
+                bytes[0] ^= 0xFF;
+            }
+            if let Some(ref mut bytes) = byz_slots[k - 1] {
+                let last = bytes.len() - 1;
+                bytes[last] ^= 0x55;
+            }
+            // Drop M - 2 additional shards
+            for slot in byz_slots.iter_mut().take(m.saturating_sub(2) + 1).skip(1) {
+                *slot = None;
+            }
+            let (reconstructed_shards, quarantined_indices) =
+                reconstruct_zero_trust_with_quarantine(
+                    byz_slots,
+                    Some(&proof_opts),
+                    k,
+                    m,
+                    &shard_set.shard_hashes,
+                    shard_set.stripe_merkle_root,
+                )
+                .unwrap();
+            assert_eq!(reconstructed_shards, shard_set.shards);
+            assert_eq!(quarantined_indices, vec![0, k - 1]);
+        }
+    }
+
     println!(
-        "[EXHAUSTIVE GF(2^8) PROOF PASS] Verified all {} field triples & shard boundary invariants with 0 violations",
+        "[EXHAUSTIVE GF(2^8) & REED-SOLOMON QUARANTINE PASS] Verified all {} field triples & multi-tier RS erasure/Byzantine quarantine bounds",
         verified_triples
     );
 }

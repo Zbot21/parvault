@@ -155,22 +155,22 @@ parvault restore-folder \
   --out-dir ./restored-photos
 ```
 
-**Option C — Zero-Local-State "House Fire" Recovery (24-Word Recovery Phrase):**
+**Option C — Zero-Local-State "House Fire" Recovery (12- or 24-Word BIP-39 Recovery Phrase):**
 What if your house burns down and destroys your laptop **and** your local `.manifest.bin` / `master_key.sealed` files?
-When backing up, pass `--seed-phrase` and `--catalog-out`:
+When backing up, pass `--seed-phrase` (supports standard 12-word or 24-word checksummed BIP-39 mnemonics) and `--catalog-out`:
 ```bash
-# Back up with a deterministic 24-word recovery phrase and export an encrypted root catalog
+# Back up with a deterministic BIP-39 recovery phrase and export an encrypted root catalog
 parvault watch-folder \
   --folder ./my-photos \
   --snapshot-out ./my-photos.manifest.bin \
-  --seed-phrase "abandon ability able about above absent absorb abstract absurd abuse access accident" \
+  --seed-phrase "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" \
   --vault-namespace "family-photos" \
   --catalog-out ./my-photos.catalog.bin \
   --once
 
 # On a brand-new laptop after a disaster: recover everything from your seed phrase + encrypted catalog!
 parvault recover-from-seed \
-  --seed-phrase "abandon ability able about above absent absorb abstract absurd abuse access accident" \
+  --seed-phrase "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" \
   --vault-namespace "family-photos" \
   --catalog-envelope ./my-photos.catalog.bin \
   --out-dir ./recovered-after-fire

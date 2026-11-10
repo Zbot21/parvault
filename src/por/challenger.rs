@@ -1,6 +1,6 @@
 use crate::storage::ShardId;
 use hmac::{Hmac, Mac};
-use rand::{Rng, RngCore};
+use rand::{rngs::OsRng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -72,7 +72,7 @@ pub fn generate_por_challenge(
     shard_total_len: u64,
     issued_at_unix_ms: u64,
 ) -> PorChallenge {
-    let mut rng = rand::thread_rng();
+    let mut rng = OsRng;
     let mut nonce = [0u8; 32];
     rng.fill_bytes(&mut nonce);
 
@@ -183,7 +183,7 @@ pub fn generate_multi_segment_por_challenge(
     max_rtt_ms: u64,
     issued_at_unix_ms: u64,
 ) -> MultiSegmentPorChallenge {
-    let mut rng = rand::thread_rng();
+    let mut rng = OsRng;
     let mut nonce = [0u8; 32];
     rng.fill_bytes(&mut nonce);
 

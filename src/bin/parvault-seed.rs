@@ -989,6 +989,52 @@ fn handle_seed_wire_request(
                         error: Some("no MeshClient available for onion forwarding".to_string()),
                     }
                 }
+            } else if let Ok(hop) = envelope.peel_relay_hop_pq(pq_kem) {
+                if envelope.jitter_delay_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(envelope.jitter_delay_ms.min(250)));
+                }
+                if let Some(client) = block_store.mesh_client() {
+                    match client
+                        .relay_layered_pq_onion_envelope(&hop.target_peer_addr, hop.inner_envelope)
+                    {
+                        Ok(()) => MeshWireResponse::RelayPqOnionAck {
+                            delivered: true,
+                            error: None,
+                        },
+                        Err(e) => MeshWireResponse::RelayPqOnionAck {
+                            delivered: false,
+                            error: Some(e.to_string()),
+                        },
+                    }
+                } else {
+                    MeshWireResponse::RelayPqOnionAck {
+                        delivered: false,
+                        error: Some(
+                            "no MeshClient available for 2-layer onion forwarding".to_string(),
+                        ),
+                    }
+                }
+            } else if let Ok(bundle) = envelope.open_final_target_pq(pq_kem) {
+                nullifier_ledger.set_trusted_issuer_pubkey(bundle.voucher.issuer_pubkey);
+                match block_store.put_blinded_shard_with_lease(
+                    &bundle.blinded_id,
+                    &bundle.shard_bytes,
+                    bundle.capability,
+                    &bundle.voucher,
+                    nullifier_ledger,
+                    bundle.current_epoch,
+                    bundle.lease_duration_epochs,
+                    bundle.delete_verifier,
+                ) {
+                    Ok(_) => MeshWireResponse::RelayPqOnionAck {
+                        delivered: true,
+                        error: None,
+                    },
+                    Err(e) => MeshWireResponse::RelayPqOnionAck {
+                        delivered: false,
+                        error: Some(e.to_string()),
+                    },
+                }
             } else {
                 match envelope.open_pq(pq_kem) {
                     Ok((blinded_id, shard_bytes)) => {
@@ -1087,6 +1133,19 @@ fn handle_seed_wire_request(
                     envelope: None,
                     error: Some("DHT envelope not found".to_string()),
                 }
+            }
+        }
+        MeshWireRequest::QueryNodeStatus => {
+            let rep = server.status_report(1);
+            let available_bytes = rep.max_storage_bytes.saturating_sub(rep.used_storage_bytes);
+            MeshWireResponse::NodeStatusResult {
+                peer_id: server.server_peer_id().to_string(),
+                asn: 64512,
+                region: "seed-anchor".to_string(),
+                available_bytes,
+                used_bytes: rep.used_storage_bytes,
+                sla_score: rep.sla_ratio,
+                pq_kem_pubkey: Some(pq_kem.public_key()),
             }
         }
     }
