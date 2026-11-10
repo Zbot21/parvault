@@ -61,31 +61,27 @@ impl MasterKey {
 
     /// Deterministically derives the 256-bit `MasterKey` from a memorized recovery seed phrase /
     /// 24-word mnemonic and `vault_namespace` ("House Fire" zero-local-state disaster recovery, ADR-15).
-    /// Uses 10,000 rounds of domain-separated SHA-256 key stretching followed by HKDF-SHA256 expansion
+    /// Uses Argon2id memory-hard key derivation followed by HKDF-SHA256 expansion
     /// so no local `.manifest.bin` or OS salt file is needed to recover a destroyed machine.
     pub fn from_recovery_seed_phrase(seed_phrase: &str, vault_namespace: &str) -> Self {
+        use argon2::{Algorithm, Argon2, Params, Version};
         use sha2::Digest;
         let normalized_phrase = seed_phrase.trim();
         let normalized_ns = vault_namespace.trim();
-        let mut state = [0u8; 32];
-        let mut init_hasher = Sha256::new();
-        init_hasher.update(b"parvault-dr-seed-init-v1:");
-        init_hasher.update((normalized_ns.len() as u32).to_be_bytes());
-        init_hasher.update(normalized_ns.as_bytes());
-        init_hasher.update((normalized_phrase.len() as u32).to_be_bytes());
-        init_hasher.update(normalized_phrase.as_bytes());
-        state.copy_from_slice(&init_hasher.finalize());
+        let mut salt_hasher = Sha256::new();
+        salt_hasher.update(b"parvault-dr-argon2id-salt-v1:");
+        salt_hasher.update((normalized_ns.len() as u32).to_be_bytes());
+        salt_hasher.update(normalized_ns.as_bytes());
+        let salt: [u8; 32] = salt_hasher.finalize().into();
 
-        for round in 0..10_000u32 {
-            let mut h = Sha256::new();
-            h.update(b"parvault-dr-stretch-v1:");
-            h.update(round.to_be_bytes());
-            h.update(state);
-            h.update(normalized_ns.as_bytes());
-            state.copy_from_slice(&h.finalize());
-        }
+        let params = Params::new(4096, 2, 1, Some(KEY_LEN)).expect("valid Argon2id parameters");
+        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+        let mut stretched = [0u8; KEY_LEN];
+        argon2
+            .hash_password_into(normalized_phrase.as_bytes(), &salt, &mut stretched)
+            .expect("Argon2id password hashing succeeds");
 
-        let hk = Hkdf::<Sha256>::new(Some(normalized_ns.as_bytes()), &state);
+        let hk = Hkdf::<Sha256>::new(Some(normalized_ns.as_bytes()), &stretched);
         let mut out = [0u8; KEY_LEN];
         hk.expand(b"parvault-dr-master-key-v1", &mut out)
             .expect("32-byte HKDF expansion is always valid");
@@ -121,6 +117,14 @@ impl Drop for MasterKey {
 pub struct NodeIdentity {
     signing_key: SigningKey,
     x25519_secret: X25519Secret,
+}
+
+impl std::fmt::Debug for NodeIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeIdentity")
+            .field("public_key", &self.public_key_bytes())
+            .finish()
+    }
 }
 
 impl NodeIdentity {
@@ -171,6 +175,79 @@ impl NodeIdentity {
         }
     }
 
+    /// Resolves the Web-of-Trust Genesis Root Ed25519 public key from configuration (`configured_pubkey_hex`
+    /// or `PARVAULT_GENESIS_PUBKEY_HEX`), or from `PARVAULT_GENESIS_SEED_HEX` / `data_dir/genesis_root.seed`.
+    pub fn resolve_genesis_root_pubkey_in_dir(
+        data_dir: &Path,
+        configured_pubkey_hex: Option<&str>,
+    ) -> Result<[u8; 32], KeyError> {
+        let env_pub = std::env::var("PARVAULT_GENESIS_PUBKEY_HEX").ok();
+        if let Some(hex_str) = configured_pubkey_hex
+            .or(env_pub.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let raw =
+                hex::decode(hex_str).map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
+            if raw.len() != 32 {
+                return Err(CryptoError::InvalidKeyMaterial(format!(
+                    "expected 32-byte genesis_root_pubkey_hex, got {} bytes",
+                    raw.len()
+                )));
+            }
+            let mut pubkey = [0u8; 32];
+            pubkey.copy_from_slice(&raw);
+            return Ok(pubkey);
+        }
+
+        let genesis_id = Self::load_or_generate_genesis_identity_in_dir(data_dir, None)?;
+        Ok(genesis_id.public_key_bytes())
+    }
+
+    /// Loads or generates the Genesis Authority `NodeIdentity` from `configured_seed_hex`,
+    /// `PARVAULT_GENESIS_SEED_HEX`, or `data_dir/genesis_root.seed` using OS CSPRNG.
+    pub fn load_or_generate_genesis_identity_in_dir(
+        data_dir: &Path,
+        configured_seed_hex: Option<&str>,
+    ) -> Result<Self, KeyError> {
+        let env_seed = std::env::var("PARVAULT_GENESIS_SEED_HEX").ok();
+        if let Some(hex_str) = configured_seed_hex
+            .or(env_seed.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let raw =
+                hex::decode(hex_str).map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
+            if raw.len() != 32 {
+                return Err(CryptoError::InvalidKeyMaterial(format!(
+                    "expected 32-byte genesis seed hex, got {} bytes",
+                    raw.len()
+                )));
+            }
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&raw);
+            return Ok(Self::from_seed(seed));
+        }
+
+        std::fs::create_dir_all(data_dir)
+            .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
+        let seed_path = data_dir.join("genesis_root.seed");
+        if seed_path.exists() {
+            let raw = std::fs::read(&seed_path)
+                .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
+            if raw.len() == 32 {
+                let mut seed = [0u8; 32];
+                seed.copy_from_slice(&raw);
+                return Ok(Self::from_seed(seed));
+            }
+        }
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        std::fs::write(&seed_path, seed)
+            .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
+        Ok(Self::from_seed(seed))
+    }
+
     /// Returns a human-readable deterministic peer identifier derived from the node's Ed25519 public key.
     pub fn device_peer_id(&self) -> String {
         format!(
@@ -182,6 +259,16 @@ impl NodeIdentity {
     /// Returns the raw 32-byte Ed25519 signing seed.
     pub fn signing_seed_bytes(&self) -> [u8; 32] {
         self.signing_key.to_bytes()
+    }
+
+    /// Converts this node's persistent Ed25519 signing seed into a `libp2p::identity::Keypair`
+    /// so `PeerId` and Noise XX static identity remain stable across daemon/seed restarts.
+    pub fn to_libp2p_keypair(&self) -> Result<libp2p::identity::Keypair, KeyError> {
+        let mut seed = self.signing_seed_bytes();
+        let res = libp2p::identity::Keypair::ed25519_from_bytes(&mut seed)
+            .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()));
+        seed.fill(0);
+        res
     }
 
     pub fn signing_key(&self) -> &SigningKey {
@@ -259,6 +346,50 @@ impl SoftwareTpm2Stub {
     pub fn new(device_binding_seed: [u8; 32]) -> Self {
         Self {
             device_binding_key: MasterKey::from_bytes(device_binding_seed),
+        }
+    }
+
+    /// Initializes the enclave sealer from an explicit passphrase (or `PARVAULT_PASSPHRASE` env var)
+    /// using Argon2id, or loads/generates a 32-byte OS CSPRNG device-binding key in `data_dir/enclave_sealing.seed`.
+    pub fn from_passphrase_or_csprng_in_dir(
+        data_dir: &Path,
+        passphrase: Option<&str>,
+    ) -> Result<Self, KeyError> {
+        let env_pass = std::env::var("PARVAULT_PASSPHRASE").ok();
+        let effective_pass = passphrase
+            .or(env_pass.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        if let Some(pass) = effective_pass {
+            let derived =
+                MasterKey::from_recovery_seed_phrase(pass, "parvault-enclave-sealing-v1");
+            return Ok(Self {
+                device_binding_key: derived,
+            });
+        }
+
+        std::fs::create_dir_all(data_dir)
+            .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
+        let seed_path = data_dir.join("enclave_sealing.seed");
+        if seed_path.exists() {
+            let raw = std::fs::read(&seed_path)
+                .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
+            if raw.len() != KEY_LEN {
+                return Err(CryptoError::InvalidKeyMaterial(format!(
+                    "expected 32-byte enclave_sealing.seed, got {} bytes",
+                    raw.len()
+                )));
+            }
+            let mut seed = [0u8; KEY_LEN];
+            seed.copy_from_slice(&raw);
+            Ok(Self::new(seed))
+        } else {
+            let mut seed = [0u8; KEY_LEN];
+            OsRng.fill_bytes(&mut seed);
+            std::fs::write(&seed_path, seed)
+                .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
+            Ok(Self::new(seed))
         }
     }
 

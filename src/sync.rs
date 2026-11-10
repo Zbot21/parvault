@@ -305,7 +305,7 @@ impl ParvaultIgnore {
 /// Encrypted, Monotonically Signed Kademlia Root Superblock Catalog (`ADR-15` "House Fire" Disaster Recovery).
 /// Allows a user whose local disks were completely destroyed to recover their entire directory tree
 /// using ONLY their memorized recovery seed phrase and `vault_namespace` (zero local `.manifest.bin` files).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncryptedVaultCatalogEnvelope {
     pub dht_key: [u8; 32],
     pub owner_pubkey: [u8; 32],
@@ -498,11 +498,15 @@ pub struct FolderSyncEngine {
 
 impl FolderSyncEngine {
     pub fn new(
-        store: BlockStore,
+        mut store: BlockStore,
         master_key: MasterKey,
         owner_identity: NodeIdentity,
         tier: ErasureTier,
     ) -> Self {
+        if let Some(client) = store.mesh_client().cloned() {
+            store.set_mesh_client(Some(client.with_identity(owner_identity.clone())));
+        }
+        let dht_store = ZeroTrustDhtStore::with_persistence_dir(store.root_dir());
         Self {
             store,
             master_key,
@@ -511,7 +515,7 @@ impl FolderSyncEngine {
             current_version: 0,
             cached_entries: BTreeMap::new(),
             deleted_tombstones: BTreeMap::new(),
-            dht_store: ZeroTrustDhtStore::new(),
+            dht_store,
         }
     }
 
@@ -743,6 +747,14 @@ impl FolderSyncEngine {
                 1_700_000_000_000 + self.current_version * 1000,
             )?;
             self.dht_store.put_manifest_envelope(env.clone())?;
+            let _ = self.store.put_dht_manifest_envelope(env.clone());
+            if let Some(client) = self.store.mesh_client() {
+                if !client.all_network_endpoints().is_empty() {
+                    let _ = client.put_dht_envelope(
+                        crate::network::DhtWireEnvelope::ClassicalManifest(env.clone()),
+                    );
+                }
+            }
             Some(env)
         } else {
             None
@@ -1262,6 +1274,8 @@ impl FolderSyncEngine {
     /// Exports an encrypted, post-quantum-protected `EncryptedVaultCatalogEnvelope` (`ADR-15`)
     /// keyed at the deterministic `derive_vault_root_dht_key(vault_namespace)` so the entire
     /// folder snapshot can be discovered and recovered from a memorized seed phrase alone.
+    /// Automatically persists to local `ZeroTrustDhtStore` and publishes to Kademlia DHT peers
+    /// over `libp2p` when a `MeshClient` is configured.
     pub fn export_encrypted_vault_catalog(
         &self,
         seed_phrase: &str,
@@ -1270,13 +1284,22 @@ impl FolderSyncEngine {
     ) -> Result<EncryptedVaultCatalogEnvelope, StorageError> {
         let pq_master_key =
             PqVaultMasterKey::from_recovery_seed_phrase(seed_phrase, vault_namespace);
-        EncryptedVaultCatalogEnvelope::seal(
+        let env = EncryptedVaultCatalogEnvelope::seal(
             &self.master_key,
             &pq_master_key,
             &self.owner_identity,
             vault_namespace,
             snapshot,
-        )
+        )?;
+        let _ = self.store.put_dht_vault_catalog_envelope(env.clone());
+        if let Some(client) = self.store.mesh_client() {
+            if !client.all_network_endpoints().is_empty() {
+                let _ = client.put_dht_envelope(
+                    crate::network::DhtWireEnvelope::VaultCatalog(env.clone()),
+                );
+            }
+        }
+        Ok(env)
     }
 
     /// Zero-Local-State "House Fire" Disaster Recovery (`ADR-15`):
@@ -1303,13 +1326,57 @@ impl FolderSyncEngine {
         }
 
         let snapshot = catalog_envelope.open(&master_key, &pq_master_key)?;
+        let mut store_with_owner = store.borrow().clone();
+        if let Some(client) = store_with_owner.mesh_client().cloned() {
+            store_with_owner.set_mesh_client(Some(client.with_identity(owner_identity.clone())));
+        }
         let engine = Self::new(
-            store.borrow().clone(),
+            store_with_owner,
             master_key,
             owner_identity,
             snapshot.tier,
         );
         engine.restore_folder(&snapshot, target_dir)
+    }
+
+    /// Fetches the `EncryptedVaultCatalogEnvelope` from the mesh Kademlia DHT (or local `ZeroTrustDhtStore`)
+    /// using only `(seed_phrase, vault_namespace)` and restores the entire directory tree into `target_dir`.
+    pub fn recover_folder_from_seed_phrase_via_dht<B: Borrow<BlockStore>>(
+        store: B,
+        seed_phrase: &str,
+        vault_namespace: &str,
+        target_dir: &Path,
+    ) -> Result<usize, StorageError> {
+        let master_key = MasterKey::from_recovery_seed_phrase(seed_phrase, vault_namespace);
+        let dht_key = master_key.derive_vault_root_dht_key(vault_namespace);
+        let store_ref = store.borrow();
+
+        let catalog_envelope = if let Some(ref client) = store_ref.mesh_client() {
+            if !client.all_network_endpoints().is_empty() {
+                match client.get_dht_envelope(&dht_key, crate::network::DhtEnvelopeKind::VaultCatalog) {
+                    Ok(crate::network::DhtWireEnvelope::VaultCatalog(env)) => env,
+                    _ => store_ref.get_dht_vault_catalog_envelope(&dht_key).ok_or(
+                        StorageError::DhtManifestPoisonedOrRollback,
+                    )?,
+                }
+            } else {
+                store_ref
+                    .get_dht_vault_catalog_envelope(&dht_key)
+                    .ok_or(StorageError::DhtManifestPoisonedOrRollback)?
+            }
+        } else {
+            store_ref
+                .get_dht_vault_catalog_envelope(&dht_key)
+                .ok_or(StorageError::DhtManifestPoisonedOrRollback)?
+        };
+
+        Self::recover_folder_from_seed_phrase(
+            store_ref,
+            seed_phrase,
+            vault_namespace,
+            &catalog_envelope,
+            target_dir,
+        )
     }
 
     fn file_modified_unix_ms(meta: &fs::Metadata) -> u64 {

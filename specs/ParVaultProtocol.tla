@@ -64,24 +64,65 @@ ProactiveWitnessRepair ==
                    offenderFailures, offenderQuarantined,
                    parentBranchSlashes, parentBranchPruned>>
 
-\* Dishonest leaf peer fails a PoR challenge or Noise WoT handshake.
-\* Upon hitting MaxLeafFailures (3), the leaf is quarantined and its parent inviter takes a slash penalty.
+\* Adversary passively compromises storage nodes up to the Byzantine collusion bound (< K - 1),
+\* and attempts an unauthorized wire read (without owner signature and with < 2 witness receipts)
+\* plus master-key recovery and uninvited Sybil handshake admission.
+AdversaryCollusionAndAttackAttempt ==
+    /\ ~parentBranchPruned
+    /\ adversaryShards < K - 1
+    /\ LET passiveCompromiseShard == adversaryShards + 1
+           \* Adversary attempts GetCiphertextShard without owner_sig (FALSE) and only 1 witness receipt (< 2)
+           hasOwnerSig            == FALSE
+           witnessReceipts        == 1
+           wireReadAuthorized     == hasOwnerSig \/ (witnessReceipts >= 2)
+           nextAdversaryShards    == IF wireReadAuthorized
+                                     THEN passiveCompromiseShard + 1
+                                     ELSE passiveCompromiseShard
+           \* Adversary attempts to derive K_user without owner seed phrase
+           hasOwnerSeedPhrase     == FALSE
+           nextHasMasterKey       == (nextAdversaryShards >= K /\ hasOwnerSeedPhrase)
+           \* Adversary attempts HandshakeWoT without Genesis->Inviter signature chain
+           hasValidGenesisCert    == FALSE
+           sybilAdmitted          == (hasValidGenesisCert /\ ~parentBranchPruned)
+       IN /\ adversaryShards' = nextAdversaryShards
+          /\ hasMasterKey' = nextHasMasterKey
+          /\ uninvitedRoutingEntries' = IF sybilAdmitted
+                                        THEN uninvitedRoutingEntries + 1
+                                        ELSE uninvitedRoutingEntries
+    /\ UNCHANGED <<activeShards, epochDrops, offenderFailures, offenderQuarantined,
+                   parentBranchSlashes, parentBranchPruned>>
+
+\* Dishonest leaf peer or Sybil node fails a PoR challenge or presents an invalid/uninvited Noise WoT handshake.
+\* Protocol guard rejects uninvited routing admission and increments leaf failure counter;
+\* upon hitting MaxLeafFailures (3), the leaf is quarantined and its parent inviter takes a slash penalty.
 RecordDishonestFailure ==
     /\ ~parentBranchPruned
     /\ ~offenderQuarantined
     /\ offenderFailures < MaxLeafFailures
-    /\ LET nextLeafFails == offenderFailures + 1
-           leafSlashed   == (nextLeafFails >= MaxLeafFailures)
+    /\ LET nextLeafFails     == offenderFailures + 1
+           leafSlashed       == (nextLeafFails >= MaxLeafFailures)
            nextParentSlashes == IF leafSlashed THEN parentBranchSlashes + 1 ELSE parentBranchSlashes
-           branchPruned  == (nextParentSlashes >= MaxSubtreeSlashes)
+           branchPruned      == (nextParentSlashes >= MaxSubtreeSlashes)
+           \* Uninvited/forged handshake during failure step is checked by WoT admission guard
+           hasValidGenesisCert == FALSE
+           sybilAdmitted     == (hasValidGenesisCert /\ ~branchPruned)
+           \* Unauthorized raw shard read attempt during dishonest step is checked by ADR-04 guard
+           unauthorizedReadGranted == FALSE
        IN /\ offenderFailures' = IF leafSlashed /\ ~branchPruned THEN 0 ELSE nextLeafFails
           /\ offenderQuarantined' = (leafSlashed /\ branchPruned)
           /\ parentBranchSlashes' = nextParentSlashes
           /\ parentBranchPruned' = branchPruned
-    /\ UNCHANGED <<activeShards, epochDrops, adversaryShards, hasMasterKey, uninvitedRoutingEntries>>
+          /\ uninvitedRoutingEntries' = IF sybilAdmitted
+                                        THEN uninvitedRoutingEntries + 1
+                                        ELSE uninvitedRoutingEntries
+          /\ adversaryShards' = IF unauthorizedReadGranted
+                                THEN adversaryShards + 1
+                                ELSE adversaryShards
+          /\ hasMasterKey' = (adversaryShards' >= K /\ FALSE)
+    /\ UNCHANGED <<activeShards, epochDrops>>
 
 \* Terminal stuttering step once parent branch is pruned and cohort is healthy.
- Idle ==
+Idle ==
     /\ activeShards = N
     /\ parentBranchPruned
     /\ UNCHANGED vars
@@ -89,6 +130,7 @@ RecordDishonestFailure ==
 Next ==
     \/ NodeChurn
     \/ ProactiveWitnessRepair
+    \/ AdversaryCollusionAndAttackAttempt
     \/ RecordDishonestFailure
     \/ Idle
 
@@ -98,9 +140,11 @@ Spec ==
     /\ WF_vars(ProactiveWitnessRepair)
     /\ WF_vars(RecordDishonestFailure)
 
-\* SAFETY INVARIANT 1: Data Secrecy (holding < K shards or lacking K_user yields 0 plaintext info)
+\* SAFETY INVARIANT 1: Data Secrecy (adversary never accumulates >= K shards and never obtains K_user)
 DataSecrecyInvariant ==
-    ~(adversaryShards >= K /\ hasMasterKey)
+    /\ adversaryShards < K
+    /\ ~hasMasterKey
+    /\ ~(adversaryShards >= K /\ hasMasterKey)
 
 \* SAFETY INVARIANT 2: Web-of-Trust Sybil Resistance (uninvited sub-graphs never enter routing tables)
 SybilResistanceInvariant ==

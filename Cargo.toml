@@ -45,6 +45,8 @@ libp2p = { version = "0.54", features = [
 ] }
 reed-solomon-erasure = "6.0"
 aes-gcm = "0.10"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
 ring = "0.17"
 sha2 = "0.10"
 hmac = "0.12"

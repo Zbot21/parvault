@@ -105,13 +105,15 @@ AttemptVoucherDoubleSpend(v) ==
 AttemptAdversaryPoolGrouping ==
     /\ ~adversaryAttemptedGrouping
     /\ anonymousShardsStored > 0
-    /\ LET canCorrelateLocators == (hasMasterKey \/ (stripeRootKnown /\ shardIndexKnown))
-       IN /\ adversaryGroupedStripe'     = canCorrelateLocators
+    /\ LET masterKeyExportedOverWire == FALSE
+           nextHasMasterKey          == (masterKeyExportedOverWire /\ anonymousShardsStored >= K)
+           canCorrelateLocators      == (nextHasMasterKey \/ (stripeRootKnown /\ shardIndexKnown))
+       IN /\ hasMasterKey'               = nextHasMasterKey
+          /\ adversaryGroupedStripe'     = canCorrelateLocators
           /\ adversaryAttemptedGrouping' = TRUE
     /\ UNCHANGED <<mintedVouchers, spentNullifiers, anonymousShardsStored,
                    relayedUploads, relayModeActive, observedSender,
-                   stripeRootKnown, shardIndexKnown, hasMasterKey,
-                   rejectedDoubleSpends>>
+                   stripeRootKnown, shardIndexKnown, rejectedDoubleSpends>>
 
 \* Terminal stuttering step once all 20 anonymous shards are stored via 1-hop relay,
 \* voucher double-spend defense has been exercised, and pool correlation was attempted.

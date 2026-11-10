@@ -193,6 +193,12 @@ pub struct AuditOutcome {
     pub slash_peer: bool,
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct PersistedPorState {
+    session_keys: HashMap<String, [u8; 32]>,
+    repair_grants: HashMap<Hash32, RepairGrant>,
+}
+
 /// Stateless PoR verification, DDoS pre-filtering, and `RepairGrant` authorization engine (`por::verifier`).
 pub struct PorVerifierEngine {
     /// Latency ceiling in milliseconds (default 300 ms).
@@ -207,6 +213,8 @@ pub struct PorVerifierEngine {
     repair_grants_ram: HashMap<Hash32, RepairGrant>,
     /// Counter of disk reads prevented by RAM-only stateless HMAC/nonce rejection.
     blocked_ddos_challenges: u64,
+    /// Optional path to persist `session_keys_ram` and `repair_grants_ram` across daemon restarts.
+    persistence_path: Option<std::path::PathBuf>,
 }
 
 impl PorVerifierEngine {
@@ -218,6 +226,44 @@ impl PorVerifierEngine {
             seen_nonces_fifo: VecDeque::new(),
             repair_grants_ram: HashMap::new(),
             blocked_ddos_challenges: 0,
+            persistence_path: None,
+        }
+    }
+
+    /// Initializes `PorVerifierEngine` backed by `data_dir/por_verifier_state.bin` so
+    /// `repair_grants` and `session_keys` survive daemon restarts.
+    pub fn with_persistence_dir(max_latency_ms: u64, data_dir: &std::path::Path) -> Self {
+        let _ = std::fs::create_dir_all(data_dir);
+        let path = data_dir.join("por_verifier_state.bin");
+        let (session_keys_ram, repair_grants_ram) = if path.exists() {
+            std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| bincode::deserialize::<PersistedPorState>(&bytes).ok())
+                .map(|s| (s.session_keys, s.repair_grants))
+                .unwrap_or_default()
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
+        Self {
+            max_latency_ms,
+            session_keys_ram,
+            seen_nonces_ram: HashSet::new(),
+            seen_nonces_fifo: VecDeque::new(),
+            repair_grants_ram,
+            blocked_ddos_challenges: 0,
+            persistence_path: Some(path),
+        }
+    }
+
+    fn persist_state_if_configured(&self) {
+        if let Some(ref path) = self.persistence_path {
+            let state = PersistedPorState {
+                session_keys: self.session_keys_ram.clone(),
+                repair_grants: self.repair_grants_ram.clone(),
+            };
+            if let Ok(encoded) = bincode::serialize(&state) {
+                let _ = std::fs::write(path, encoded);
+            }
         }
     }
 
@@ -246,6 +292,7 @@ impl PorVerifierEngine {
     pub fn register_shard_session(&mut self, shard_id: &ShardId, session_key: [u8; 32]) {
         self.session_keys_ram
             .insert(shard_id.file_key(), session_key);
+        self.persist_state_if_configured();
     }
 
     /// Registers an owner-signed `RepairGrant` for a stripe in RAM (ADR-04).
@@ -255,6 +302,7 @@ impl PorVerifierEngine {
         }
         self.repair_grants_ram
             .insert(grant.stripe_merkle_root, grant);
+        self.persist_state_if_configured();
         true
     }
 

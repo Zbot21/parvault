@@ -232,6 +232,9 @@ pub struct BlockStore {
     quota: Arc<Mutex<QuotaManager>>,
     blinded_leases: Arc<Mutex<BlindedShardLeaseManager>>,
     blinded_id_by_locator: Arc<Mutex<HashMap<[u8; 32], BlindedShardId>>>,
+    shard_id_by_file_key: Arc<Mutex<HashMap<String, ShardId>>>,
+    dht_store: Arc<Mutex<ZeroTrustDhtStore>>,
+    mesh_client: Option<crate::network::MeshClient>,
 }
 
 impl BlockStore {
@@ -258,6 +261,18 @@ impl BlockStore {
             (BlindedShardLeaseManager::new(max_bytes, 2), HashMap::new())
         };
 
+        let shard_index_file = root_dir.join("shard_index.bin");
+        let initial_shard_index = if shard_index_file.exists() {
+            fs::read(&shard_index_file)
+                .ok()
+                .and_then(|raw| bincode::deserialize::<HashMap<String, ShardId>>(&raw).ok())
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
+        let dht_store = ZeroTrustDhtStore::with_persistence_dir(&root_dir);
+
         Ok(Self {
             root_dir,
             shards_dir,
@@ -265,7 +280,116 @@ impl BlockStore {
             quota: Arc::new(Mutex::new(quota)),
             blinded_leases: Arc::new(Mutex::new(initial_leases)),
             blinded_id_by_locator: Arc::new(Mutex::new(initial_id_map)),
+            shard_id_by_file_key: Arc::new(Mutex::new(initial_shard_index)),
+            dht_store: Arc::new(Mutex::new(dht_store)),
+            mesh_client: None,
         })
+    }
+
+    pub fn with_mesh_client(mut self, client: crate::network::MeshClient) -> Self {
+        self.mesh_client = Some(client);
+        self
+    }
+
+    pub fn set_mesh_client(&mut self, client: Option<crate::network::MeshClient>) {
+        self.mesh_client = client;
+    }
+
+    pub fn mesh_client(&self) -> Option<&crate::network::MeshClient> {
+        self.mesh_client.as_ref()
+    }
+
+    pub fn root_dir(&self) -> &Path {
+        &self.root_dir
+    }
+
+    fn persist_shard_index(&self) {
+        if let Ok(idx_map) = self.shard_id_by_file_key.lock() {
+            if let Ok(raw) = bincode::serialize(&*idx_map) {
+                let _ = Self::atomic_write_file(&self.root_dir.join("shard_index.bin"), &raw);
+            }
+        }
+    }
+
+    /// Returns all active unblinded `(ShardId, Vec<u8>)` entries stored on disk.
+    pub fn list_stored_shards(&self) -> Result<Vec<(ShardId, Vec<u8>)>, StorageError> {
+        let snapshot: Vec<(String, ShardId)> = {
+            let map = self
+                .shard_id_by_file_key
+                .lock()
+                .expect("shard_id_by_file_key mutex poisoned");
+            map.iter().map(|(k, v)| (k.clone(), *v)).collect()
+        };
+        let mut out = Vec::new();
+        for (_key, shard_id) in snapshot {
+            if let Ok(bytes) = self.get_shard(&shard_id) {
+                out.push((shard_id, bytes));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn put_dht_manifest_envelope(
+        &self,
+        envelope: SignedDhtManifestEnvelope,
+    ) -> Result<(), StorageError> {
+        self.dht_store
+            .lock()
+            .expect("dht_store mutex poisoned")
+            .put_manifest_envelope(envelope)
+    }
+
+    pub fn get_dht_manifest_envelope(
+        &self,
+        dht_key: &[u8; 32],
+    ) -> Option<SignedDhtManifestEnvelope> {
+        self.dht_store
+            .lock()
+            .expect("dht_store mutex poisoned")
+            .get_manifest_envelope(dht_key)
+            .cloned()
+    }
+
+    pub fn put_dht_pq_manifest_envelope(
+        &self,
+        envelope: crate::crypto::PqSignedDhtManifestEnvelope,
+    ) -> Result<(), StorageError> {
+        self.dht_store
+            .lock()
+            .expect("dht_store mutex poisoned")
+            .put_pq_manifest_envelope(envelope)
+    }
+
+    pub fn get_dht_pq_manifest_envelope(
+        &self,
+        dht_key: &[u8; 32],
+    ) -> Option<crate::crypto::PqSignedDhtManifestEnvelope> {
+        self.dht_store
+            .lock()
+            .expect("dht_store mutex poisoned")
+            .get_pq_manifest_envelope(dht_key)
+            .cloned()
+    }
+
+    pub fn put_dht_vault_catalog_envelope(
+        &self,
+        envelope: crate::sync::EncryptedVaultCatalogEnvelope,
+    ) -> Result<(), StorageError> {
+        self.dht_store
+            .lock()
+            .expect("dht_store mutex poisoned")
+            .put_vault_catalog_envelope(envelope)
+    }
+
+    pub fn get_dht_vault_catalog_envelope(
+        &self,
+        dht_key: &[u8; 32],
+    ) -> Option<crate::sync::EncryptedVaultCatalogEnvelope> {
+        self.dht_store
+            .lock()
+            .expect("dht_store mutex poisoned")
+            .get_vault_catalog_envelope(dht_key)
+            .cloned()
     }
 
     /// Crash-safe atomic file persistence (`ADR-15`):
@@ -326,10 +450,6 @@ impl BlockStore {
         }
     }
 
-    pub fn root_dir(&self) -> &Path {
-        &self.root_dir
-    }
-
     pub fn quota(&self) -> Arc<Mutex<QuotaManager>> {
         Arc::clone(&self.quota)
     }
@@ -378,6 +498,10 @@ impl BlockStore {
             let mut q = self.quota.lock().expect("quota mutex poisoned");
             q.record_shard_stored(owner_peer_id, id.file_key(), shard_size);
         }
+        if let Ok(mut idx_map) = self.shard_id_by_file_key.lock() {
+            idx_map.insert(id.file_key(), *id);
+        }
+        self.persist_shard_index();
 
         Ok(path)
     }
@@ -795,10 +919,30 @@ impl BlockStore {
 
         let default_mesh_pool = self.root_dir.join("mesh_evacuated_pool");
         let effective_targets: Vec<PathBuf> = if target_handoff_dirs.is_empty() {
-            vec![default_mesh_pool]
+            if let Some(ref client) = self.mesh_client {
+                let net_eps = client.all_network_endpoints();
+                if !net_eps.is_empty() {
+                    net_eps.into_iter().map(PathBuf::from).collect()
+                } else {
+                    vec![default_mesh_pool]
+                }
+            } else {
+                vec![default_mesh_pool]
+            }
         } else {
             target_handoff_dirs.to_vec()
         };
+
+        let shard_idx_snapshot: HashMap<String, ShardId> = self
+            .shard_id_by_file_key
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        let blinded_idx_snapshot: HashMap<String, BlindedShardId> = self
+            .blinded_id_by_locator
+            .lock()
+            .map(|m| m.values().map(|b| (b.file_key(), *b)).collect())
+            .unwrap_or_default();
 
         for (idx, path) in shard_files.iter().enumerate() {
             let fname = path
@@ -813,10 +957,77 @@ impl BlockStore {
             manifest_entries.extend_from_slice(&content_sha);
 
             let target_root = &effective_targets[idx % effective_targets.len()];
-            let target_shards_dir = target_root.join("shards");
-            fs::create_dir_all(&target_shards_dir)?;
-            let dest_path = target_shards_dir.join(&fname);
-            Self::atomic_write_file(&dest_path, &bytes)?;
+            let target_str = target_root.to_string_lossy().to_string();
+
+            if crate::network::is_network_peer_addr(&target_str) {
+                let client = self.mesh_client.clone().unwrap_or_else(|| {
+                    crate::network::MeshClient::new(
+                        departing_identity.clone(),
+                        vec![target_str.clone()],
+                        None,
+                    )
+                });
+                if let Some(stem) = fname.strip_suffix(".shard") {
+                    let shard_id = shard_idx_snapshot.get(stem).copied().unwrap_or(ShardId {
+                        stripe_merkle_root: content_sha,
+                        shard_index: idx as u32,
+                        shard_hash: crate::sharding::hash_shard_leaf(idx as u32, &bytes),
+                    });
+                    client
+                        .put_shard(
+                            &target_str,
+                            &departing_identity.device_peer_id(),
+                            shard_id,
+                            bytes.clone(),
+                            [0x55u8; 32],
+                            None,
+                        )
+                        .map_err(|e| {
+                            StorageError::Io(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                e.to_string(),
+                            ))
+                        })?;
+                } else if let Some(stem) = fname.strip_suffix(".bshard") {
+                    let blinded_id =
+                        blinded_idx_snapshot
+                            .get(stem)
+                            .copied()
+                            .unwrap_or(BlindedShardId {
+                                locator: content_sha,
+                                content_sha256: content_sha,
+                            });
+                    let mk = MasterKey::from_bytes(departing_identity.signing_seed_bytes());
+                    let (_, capability) =
+                        BlindedShardCapability::derive_keypair(&mk, &blinded_id.locator);
+                    let voucher = AnonymousQuotaVoucher::mint(
+                        departing_identity,
+                        (bytes.len() * 2) as u64,
+                    );
+                    client
+                        .put_blinded_shard(
+                            &target_str,
+                            blinded_id,
+                            bytes.clone(),
+                            capability,
+                            voucher,
+                            1,
+                            30,
+                            [0u8; 32],
+                        )
+                        .map_err(|e| {
+                            StorageError::Io(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                e.to_string(),
+                            ))
+                        })?;
+                }
+            } else {
+                let target_shards_dir = target_root.join("shards");
+                fs::create_dir_all(&target_shards_dir)?;
+                let dest_path = target_shards_dir.join(&fname);
+                Self::atomic_write_file(&dest_path, &bytes)?;
+            }
 
             if fname.ends_with(".bshard") {
                 migrated_blinded_shards_count += 1;
@@ -858,7 +1069,9 @@ impl BlockStore {
         Ok(receipt)
     }
 
-    /// Saves a `FileManifest` to local disk (encrypted under `master_key`).
+    /// Saves a `FileManifest` to local disk (encrypted under `master_key`) and, when a
+    /// `MeshClient` is configured with network peers, publishes a `SignedDhtManifestEnvelope`
+    /// to the Kademlia DHT over `libp2p`.
     pub fn save_manifest(
         &self,
         master_key: &MasterKey,
@@ -867,22 +1080,66 @@ impl BlockStore {
         let (_, encrypted) = manifest.to_encrypted_dht_record(master_key)?;
         let path = self.manifest_path(&manifest.file_merkle_root);
         Self::atomic_write_file(&path, &encrypted)?;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        if let Some(ref client) = self.mesh_client {
+            if !client.all_network_endpoints().is_empty() {
+                if let Ok(env) = SignedDhtManifestEnvelope::seal(
+                    master_key,
+                    client.identity(),
+                    manifest,
+                    now_ms.max(1),
+                    now_ms,
+                ) {
+                    let _ = self.put_dht_manifest_envelope(env.clone());
+                    let _ = client.put_dht_envelope(
+                        crate::network::DhtWireEnvelope::ClassicalManifest(env),
+                    );
+                }
+            }
+        }
         Ok(path)
     }
 
-    /// Loads and decrypts a `FileManifest` by its 32-byte File Merkle Root.
+    /// Loads and decrypts a `FileManifest` by its 32-byte File Merkle Root from local disk
+    /// or over `libp2p` Kademlia DHT when `mesh_client` is configured.
     pub fn load_manifest(
         &self,
         master_key: &MasterKey,
         file_merkle_root: &Hash32,
     ) -> Result<FileManifest, StorageError> {
         let path = self.manifest_path(file_merkle_root);
+        if path.exists() {
+            let encrypted = fs::read(path)?;
+            return FileManifest::from_encrypted_dht_record(master_key, &encrypted);
+        }
+        let root_hex = hex::encode(file_merkle_root);
+        let dht_key = derive_dht_manifest_key(master_key, &root_hex);
+        if let Some(env) = self.get_dht_manifest_envelope(&dht_key) {
+            return env.open(master_key);
+        }
+        if let Some(ref client) = self.mesh_client {
+            if !client.all_network_endpoints().is_empty() {
+                if let Ok(crate::network::DhtWireEnvelope::ClassicalManifest(env)) = client
+                    .get_dht_envelope(
+                        &dht_key,
+                        crate::network::DhtEnvelopeKind::ClassicalManifest,
+                    )
+                {
+                    return env.open(master_key);
+                }
+            }
+        }
         let encrypted = fs::read(path)?;
         FileManifest::from_encrypted_dht_record(master_key, &encrypted)
     }
 
     /// Streams a file from `input_path` in fixed `stripe_size_bytes` segments (16 MiB default per ADR-01),
-    /// encrypts each stripe with AES-256-GCM prior to Reed-Solomon splitting, persists all `N` shards,
+    /// encrypts each stripe with AES-256-GCM prior to Reed-Solomon splitting, distributes all `N` shards
+    /// across `libp2p` peers when `mesh_client` has network endpoints (or persists locally when in local mode),
     /// and writes the encrypted `FileManifest`.
     pub fn store_file_streaming(
         &self,
@@ -900,6 +1157,11 @@ impl BlockStore {
         let mut stripes = Vec::new();
         let mut stripe_roots = Vec::new();
         let mut stripe_index: u64 = 0;
+
+        let use_network = self
+            .mesh_client
+            .as_ref()
+            .map_or(false, |c| !c.all_network_endpoints().is_empty());
 
         loop {
             let mut buf = vec![0u8; stripe_cap];
@@ -923,17 +1185,36 @@ impl BlockStore {
             let shard_set = encode_ciphertext_stripe(stripe_index, &ciphertext, tier)?;
             stripe_roots.push(shard_set.stripe_merkle_root);
 
-            // 3. Persist shards into BlockStore.
-            for (idx, shard_bytes) in shard_set.shards.iter().enumerate() {
-                let shard_id = ShardId {
-                    stripe_merkle_root: shard_set.stripe_merkle_root,
-                    shard_index: idx as u32,
-                    shard_hash: shard_set.shard_hashes[idx],
-                };
-                self.put_shard(owner_peer_id, &shard_id, shard_bytes)?;
-            }
+            // 3. Distribute shards over libp2p via MeshClient if network peers are configured, else local BlockStore.
+            let assigned_peers = if use_network {
+                let client = self.mesh_client.as_ref().expect("checked use_network");
+                client
+                    .distribute_stripe_shards(
+                        client.identity(),
+                        owner_peer_id,
+                        &shard_set,
+                        tier,
+                        [0x77u8; 32],
+                    )
+                    .map_err(|e| {
+                        StorageError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            e.to_string(),
+                        ))
+                    })?
+            } else {
+                for (idx, shard_bytes) in shard_set.shards.iter().enumerate() {
+                    let shard_id = ShardId {
+                        stripe_merkle_root: shard_set.stripe_merkle_root,
+                        shard_index: idx as u32,
+                        shard_hash: shard_set.shard_hashes[idx],
+                    };
+                    self.put_shard(owner_peer_id, &shard_id, shard_bytes)?;
+                }
+                let (_, _, n_total) = tier.params();
+                vec![owner_peer_id.to_string(); n_total]
+            };
 
-            let (_, _, n_total) = tier.params();
             stripes.push(StripeManifestEntry {
                 stripe_index,
                 k_data: shard_set.k_data,
@@ -942,7 +1223,7 @@ impl BlockStore {
                 shard_len: shard_set.shard_len,
                 stripe_merkle_root: shard_set.stripe_merkle_root,
                 shard_hashes: shard_set.shard_hashes,
-                assigned_peers: vec![owner_peer_id.to_string(); n_total],
+                assigned_peers,
             });
 
             stripe_index += 1;
@@ -968,7 +1249,8 @@ impl BlockStore {
     }
 
     /// Reconstructs and decrypts a file from its `FileManifest` using at least `K` surviving
-    /// shards per stripe, writing the verified plaintext to `output_path`.
+    /// shards per stripe (fetched over `libp2p` via `MeshClient` or from local disk),
+    /// writing the verified plaintext to `output_path`.
     pub fn restore_file_streaming(
         &self,
         manifest: &FileManifest,
@@ -985,6 +1267,7 @@ impl BlockStore {
         for stripe in &manifest.stripes {
             let total_shards = stripe.k_data + stripe.m_parity;
             let mut shard_slots: Vec<Option<Vec<u8>>> = Vec::with_capacity(total_shards);
+            let mut local_found = 0usize;
 
             for idx in 0..total_shards {
                 let id = ShardId {
@@ -993,8 +1276,44 @@ impl BlockStore {
                     shard_hash: stripe.shard_hashes[idx],
                 };
                 match self.get_shard(&id) {
-                    Ok(bytes) => shard_slots.push(Some(bytes)),
+                    Ok(bytes) => {
+                        local_found += 1;
+                        shard_slots.push(Some(bytes));
+                    }
                     Err(_) => shard_slots.push(None),
+                }
+            }
+
+            if local_found < stripe.k_data {
+                let has_net_assigned = stripe
+                    .assigned_peers
+                    .iter()
+                    .any(|p| crate::network::is_network_peer_addr(p));
+                let net_client = if let Some(ref c) = self.mesh_client {
+                    if !c.all_network_endpoints().is_empty() || has_net_assigned {
+                        Some(c.clone())
+                    } else {
+                        None
+                    }
+                } else if has_net_assigned {
+                    let id = NodeIdentity::load_or_generate_in_dir(&self.root_dir)
+                        .unwrap_or_else(|_| NodeIdentity::generate());
+                    Some(crate::network::MeshClient::new(
+                        id,
+                        stripe.assigned_peers.clone(),
+                        None,
+                    ))
+                } else {
+                    None
+                };
+
+                if let Some(client) = net_client {
+                    let remote_slots = client.fetch_stripe_shards(stripe, client.identity());
+                    for (slot, rem) in shard_slots.iter_mut().zip(remote_slots.into_iter()) {
+                        if slot.is_none() && rem.is_some() {
+                            *slot = rem;
+                        }
+                    }
                 }
             }
 
@@ -1127,6 +1446,13 @@ impl SignedDhtManifestEnvelope {
     }
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct PersistedZeroTrustDhtState {
+    records: HashMap<[u8; 32], SignedDhtManifestEnvelope>,
+    pq_records: HashMap<[u8; 32], crate::crypto::PqSignedDhtManifestEnvelope>,
+    catalog_records: HashMap<[u8; 32], crate::sync::EncryptedVaultCatalogEnvelope>,
+}
+
 /// Zero-Trust Kademlia DHT Manifest Table enforcing Ed25519 key ownership and strict version
 /// monotonicity (`new.monotonic_version > existing.monotonic_version`) to block poisoning and rollbacks.
 #[derive(Debug, Default, Clone)]
@@ -1134,6 +1460,7 @@ pub struct ZeroTrustDhtStore {
     records: HashMap<[u8; 32], SignedDhtManifestEnvelope>,
     pq_records: HashMap<[u8; 32], crate::crypto::PqSignedDhtManifestEnvelope>,
     catalog_records: HashMap<[u8; 32], crate::sync::EncryptedVaultCatalogEnvelope>,
+    persistence_path: Option<PathBuf>,
 }
 
 impl ZeroTrustDhtStore {
@@ -1142,6 +1469,42 @@ impl ZeroTrustDhtStore {
             records: HashMap::new(),
             pq_records: HashMap::new(),
             catalog_records: HashMap::new(),
+            persistence_path: None,
+        }
+    }
+
+    /// Initializes `ZeroTrustDhtStore` backed by `data_dir/zero_trust_dht_store.bin` so
+    /// DHT manifest and vault catalog envelopes survive process and daemon restarts.
+    pub fn with_persistence_dir(data_dir: &Path) -> Self {
+        let _ = fs::create_dir_all(data_dir);
+        let path = data_dir.join("zero_trust_dht_store.bin");
+        let (records, pq_records, catalog_records) = if path.exists() {
+            fs::read(&path)
+                .ok()
+                .and_then(|bytes| bincode::deserialize::<PersistedZeroTrustDhtState>(&bytes).ok())
+                .map(|s| (s.records, s.pq_records, s.catalog_records))
+                .unwrap_or_default()
+        } else {
+            (HashMap::new(), HashMap::new(), HashMap::new())
+        };
+        Self {
+            records,
+            pq_records,
+            catalog_records,
+            persistence_path: Some(path),
+        }
+    }
+
+    fn persist_if_configured(&self) {
+        if let Some(ref path) = self.persistence_path {
+            let state = PersistedZeroTrustDhtState {
+                records: self.records.clone(),
+                pq_records: self.pq_records.clone(),
+                catalog_records: self.catalog_records.clone(),
+            };
+            if let Ok(raw) = bincode::serialize(&state) {
+                let _ = BlockStore::atomic_write_file(path, &raw);
+            }
         }
     }
 
@@ -1164,6 +1527,7 @@ impl ZeroTrustDhtStore {
             }
         }
         self.records.insert(envelope.dht_key, envelope);
+        self.persist_if_configured();
         Ok(())
     }
 
@@ -1188,6 +1552,7 @@ impl ZeroTrustDhtStore {
             }
         }
         self.pq_records.insert(envelope.dht_key, envelope);
+        self.persist_if_configured();
         Ok(())
     }
 
@@ -1215,6 +1580,7 @@ impl ZeroTrustDhtStore {
             }
         }
         self.catalog_records.insert(envelope.dht_key, envelope);
+        self.persist_if_configured();
         Ok(())
     }
 

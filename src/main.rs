@@ -7,20 +7,26 @@ use libp2p::{
     Multiaddr,
 };
 use parvault::{
-    bootstrap::{EarnedStanding, PersonalDeviceCert},
+    bootstrap::{
+        EarnedStanding, LiteStripeSyndicationBundle, PersonalDeviceCert, ZeroTrustSeedServer,
+    },
     config::{Cli, Commands, DaemonAction, ErasureTier, FileAction, NodeConfig},
     crypto::{
-        compute_sha256,
-        pqc::{HybridPqPublicKey, HybridPqSigningKeypair},
+        compute_sha256, encrypt_stripe,
+        pqc::{HybridKemKeypair, HybridPqPublicKey, HybridPqSigningKeypair},
         MasterKey, NodeIdentity, SoftwareTpm2Stub,
     },
     network::{
-        behaviour::{MeshNetworkBehaviourEvent, MeshWireRequest, MeshWireResponse},
-        build_mesh_swarm, WebOfTrustRegistry, DEFAULT_SUBTREE_SLASH_LIMIT,
+        behaviour::{
+            DhtEnvelopeKind, DhtWireEnvelope, MeshNetworkBehaviourEvent, MeshWireRequest,
+            MeshWireResponse,
+        },
+        build_mesh_swarm, is_network_peer_addr, MeshClient, WebOfTrustRegistry,
+        DEFAULT_SUBTREE_SLASH_LIMIT,
     },
     por::PorVerifierEngine,
     sharding::Hash32,
-    storage::{BlockStore, FileManifest, QuotaManager},
+    storage::{BlockStore, FileManifest, QuotaManager, VoucherNullifierLedger},
     sync::{
         EncryptedVaultCatalogEnvelope, FolderSnapshotManifest, FolderSyncDiff, FolderSyncEngine,
     },
@@ -28,9 +34,6 @@ use parvault::{
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
-
-/// Shared deterministic Genesis Trust Seed for Web-of-Trust handshakes across the mesh.
-const MESH_GENESIS_SEED: [u8; 32] = [0x11; 32];
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -44,8 +47,13 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let mut cfg = NodeConfig::load_or_default(cli.config.as_ref())?;
 
+    let node_identity = NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?;
+    let effective_peers = cfg.effective_peers(&cli.peers);
+    let effective_seed = cfg.effective_seed_addr(cli.seed_addr.as_deref());
+    let mesh_client = MeshClient::new(node_identity.clone(), effective_peers, effective_seed);
+
     let quota = QuotaManager::new(cfg.max_storage_bytes, cfg.bootstrap_grace_bytes);
-    let block_store = BlockStore::new(&cfg.data_dir, quota)?;
+    let block_store = BlockStore::new(&cfg.data_dir, quota)?.with_mesh_client(mesh_client.clone());
 
     match cli.command {
         Commands::Daemon { action } => match action {
@@ -330,20 +338,43 @@ async fn main() -> anyhow::Result<()> {
             lite_seed_dir,
             device_cert,
         } => {
-            let (master_key, owner_identity) = if let Some(phrase) = seed_phrase.as_deref() {
-                (
-                    MasterKey::from_recovery_seed_phrase(phrase, &vault_namespace),
-                    NodeIdentity::from_recovery_seed_phrase(phrase, &vault_namespace),
-                )
-            } else {
-                (
-                    resolve_master_key(&cfg.data_dir, key_hex.as_deref())?,
-                    NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?,
-                )
-            };
+            let effective_seed_phrase = seed_phrase
+                .or_else(|| std::env::var("PARVAULT_SEED_PHRASE").ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
 
-            let mut engine =
-                FolderSyncEngine::new(block_store, master_key.clone(), owner_identity, tier);
+            let (master_key, owner_identity) =
+                if let Some(phrase) = effective_seed_phrase.as_deref() {
+                    (
+                        MasterKey::from_recovery_seed_phrase(phrase, &vault_namespace),
+                        NodeIdentity::from_recovery_seed_phrase(phrase, &vault_namespace),
+                    )
+                } else {
+                    (
+                        resolve_master_key(&cfg.data_dir, key_hex.as_deref())?,
+                        NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?,
+                    )
+                };
+
+            let mut store_for_sync = block_store.clone();
+            if let Some(seed_dir) = &lite_seed_dir {
+                let seed_str = seed_dir.to_string_lossy().to_string();
+                if is_network_peer_addr(&seed_str) {
+                    let net_client = MeshClient::new(
+                        owner_identity.clone(),
+                        cfg.effective_peers(&cli.peers),
+                        Some(seed_str),
+                    );
+                    store_for_sync = store_for_sync.with_mesh_client(net_client);
+                }
+            }
+
+            let mut engine = FolderSyncEngine::new(
+                store_for_sync.clone(),
+                master_key.clone(),
+                owner_identity.clone(),
+                tier,
+            );
 
             if snapshot_out.exists() {
                 if let Ok(raw_prev) = std::fs::read(&snapshot_out) {
@@ -381,19 +412,78 @@ async fn main() -> anyhow::Result<()> {
                             1_700_000_000,
                         )?
                     };
-                    let seed_quota =
-                        QuotaManager::new(cfg.max_storage_bytes, cfg.bootstrap_grace_bytes);
-                    let seed_store = BlockStore::new(seed_dir, seed_quota)?;
-                    let mut seed_server =
-                        parvault::bootstrap::ZeroTrustSeedServer::new_homelab_vault(
+
+                    let seed_str = seed_dir.to_string_lossy().to_string();
+                    if is_network_peer_addr(&seed_str) {
+                        let snap = engine.sync_folder_once(&folder)?;
+                        let net_client = MeshClient::new(
+                            owner_identity.clone(),
+                            cfg.effective_peers(&cli.peers),
+                            Some(seed_str.clone()),
+                        );
+                        let mut receipt_count = 0usize;
+                        for entry in snap.files.values() {
+                            let file_path = folder.join(&entry.relative_path);
+                            if let Ok(plain_bytes) = std::fs::read(&file_path) {
+                                let stripe_cap = entry.manifest.stripe_size_bytes.max(1024);
+                                for stripe_meta in &entry.manifest.stripes {
+                                    let start =
+                                        (stripe_meta.stripe_index as usize) * stripe_cap;
+                                    let end = (start + stripe_cap).min(plain_bytes.len());
+                                    let slice = if start <= plain_bytes.len() {
+                                        &plain_bytes[start..end]
+                                    } else {
+                                        &[][..]
+                                    };
+                                    if let Ok(ciphertext_bytes) = encrypt_stripe(
+                                        &master_key,
+                                        &entry.manifest.file_salt,
+                                        stripe_meta.stripe_index,
+                                        slice,
+                                    ) {
+                                        let bundle = LiteStripeSyndicationBundle {
+                                            stripe_index: stripe_meta.stripe_index,
+                                            tier: snap.tier,
+                                            ciphertext_bytes,
+                                            expected_stripe_merkle_root:
+                                                stripe_meta.stripe_merkle_root,
+                                            expected_shard_hashes: stripe_meta
+                                                .shard_hashes
+                                                .clone(),
+                                        };
+                                        if net_client
+                                            .syndicate_lite_stripe(
+                                                &seed_str,
+                                                cert.clone(),
+                                                bundle,
+                                            )
+                                            .is_ok()
+                                        {
+                                            receipt_count += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        (snap, receipt_count)
+                    } else {
+                        let seed_quota =
+                            QuotaManager::new(cfg.max_storage_bytes, cfg.bootstrap_grace_bytes);
+                        let seed_store = BlockStore::new(seed_dir, seed_quota)?;
+                        let mut seed_server = ZeroTrustSeedServer::new_homelab_vault(
                             "paired-homelab-seed",
                             seed_store,
                             pq_kp.public_key(),
                             2,
                         );
-                    let (snap, receipts) =
-                        engine.sync_folder_lite_via_seed(&folder, &cert, &mut seed_server, &[])?;
-                    (snap, receipts.len())
+                        let (snap, receipts) = engine.sync_folder_lite_via_seed(
+                            &folder,
+                            &cert,
+                            &mut seed_server,
+                            &[],
+                        )?;
+                        (snap, receipts.len())
+                    }
                 } else {
                     (engine.sync_folder_once(&folder)?, 0)
                 };
@@ -428,7 +518,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("Master Key (hex)   : {}", master_key.to_hex());
 
                 if let Some(cat_path) = &catalog_out {
-                    let phrase = seed_phrase
+                    let phrase = effective_seed_phrase
                         .as_deref()
                         .unwrap_or("parvault-default-local-catalog-seed");
                     let envelope = engine.export_encrypted_vault_catalog(
@@ -439,7 +529,7 @@ async fn main() -> anyhow::Result<()> {
                     let raw_env = bincode::serialize(&envelope)?;
                     BlockStore::atomic_write_file(cat_path, &raw_env)?;
                     println!("Catalog Envelope   : {}", cat_path.display());
-                } else if let Some(phrase) = seed_phrase.as_deref() {
+                } else if let Some(phrase) = effective_seed_phrase.as_deref() {
                     let default_cat = snapshot_out.with_extension("catalog.bin");
                     let envelope = engine.export_encrypted_vault_catalog(
                         phrase,
@@ -548,23 +638,53 @@ async fn main() -> anyhow::Result<()> {
             out_dir,
             filter,
         } => {
-            let raw_env = std::fs::read(&catalog_envelope)?;
-            let envelope: EncryptedVaultCatalogEnvelope = bincode::deserialize(&raw_env)
-                .or_else(|_| serde_json::from_slice::<EncryptedVaultCatalogEnvelope>(&raw_env))?;
+            let master_key =
+                MasterKey::from_recovery_seed_phrase(&seed_phrase, &vault_namespace);
+            let pq_master_key = parvault::crypto::PqVaultMasterKey::from_recovery_seed_phrase(
+                &seed_phrase,
+                &vault_namespace,
+            );
+            let owner_identity =
+                NodeIdentity::from_recovery_seed_phrase(&seed_phrase, &vault_namespace);
+
+            let envelope: EncryptedVaultCatalogEnvelope = if let Some(cat_path) = catalog_envelope {
+                let raw_env = std::fs::read(&cat_path)?;
+                bincode::deserialize(&raw_env)
+                    .or_else(|_| serde_json::from_slice::<EncryptedVaultCatalogEnvelope>(&raw_env))?
+            } else {
+                let dht_key = master_key.derive_vault_root_dht_key(&vault_namespace);
+                if let Some(client) = block_store.mesh_client() {
+                    if !client.all_network_endpoints().is_empty() {
+                        match client.get_dht_envelope(&dht_key, DhtEnvelopeKind::VaultCatalog)? {
+                            DhtWireEnvelope::VaultCatalog(env) => env,
+                            _ => anyhow::bail!("unexpected DHT envelope kind for VaultCatalog"),
+                        }
+                    } else {
+                        block_store
+                            .get_dht_vault_catalog_envelope(&dht_key)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "EncryptedVaultCatalogEnvelope not found in local DHT store"
+                                )
+                            })?
+                    }
+                } else {
+                    block_store
+                        .get_dht_vault_catalog_envelope(&dht_key)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "EncryptedVaultCatalogEnvelope not found in local DHT store"
+                            )
+                        })?
+                }
+            };
+
             if let Some(filter_csv) = filter {
                 let filters: Vec<String> = filter_csv
                     .split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
-                let master_key =
-                    MasterKey::from_recovery_seed_phrase(&seed_phrase, &vault_namespace);
-                let pq_master_key = parvault::crypto::PqVaultMasterKey::from_recovery_seed_phrase(
-                    &seed_phrase,
-                    &vault_namespace,
-                );
-                let owner_identity =
-                    NodeIdentity::from_recovery_seed_phrase(&seed_phrase, &vault_namespace);
                 let snapshot = envelope.open(&master_key, &pq_master_key)?;
                 let engine =
                     FolderSyncEngine::new(block_store, master_key, owner_identity, snapshot.tier);
@@ -703,7 +823,7 @@ fn resolve_master_key(data_dir: &Path, key_hex: Option<&str>) -> anyhow::Result<
     if let Some(hex_str) = key_hex {
         Ok(MasterKey::from_hex(hex_str)?)
     } else {
-        let sealer = SoftwareTpm2Stub::new([0x42; 32]);
+        let sealer = SoftwareTpm2Stub::from_passphrase_or_csprng_in_dir(data_dir, None)?;
         let sealed_path = data_dir.join("master_key.sealed");
         sealer.load_or_create_master_key(&sealed_path)
     }
@@ -730,15 +850,26 @@ fn load_manifest_by_arg(
 }
 
 async fn run_daemon(cfg: NodeConfig, block_store: BlockStore) -> anyhow::Result<()> {
-    let keypair = libp2p::identity::Keypair::generate_ed25519();
+    let node_identity = NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?;
+    let keypair = node_identity.to_libp2p_keypair()?;
     let local_peer_id = keypair.public().to_peer_id();
-    let genesis_identity = NodeIdentity::from_seed(MESH_GENESIS_SEED);
+    let genesis_pubkey = NodeIdentity::resolve_genesis_root_pubkey_in_dir(
+        &cfg.data_dir,
+        cfg.genesis_root_pubkey_hex.as_deref(),
+    )?;
 
-    let mut wot = WebOfTrustRegistry::new(
-        genesis_identity.public_key_bytes(),
-        DEFAULT_SUBTREE_SLASH_LIMIT,
+    let mut wot = WebOfTrustRegistry::new(genesis_pubkey, DEFAULT_SUBTREE_SLASH_LIMIT);
+    let mut por_verifier =
+        PorVerifierEngine::with_persistence_dir(cfg.por_timeout_ms, &cfg.data_dir);
+    let mut nullifier_ledger = VoucherNullifierLedger::new(genesis_pubkey);
+    let pq_kem = HybridKemKeypair::load_or_generate_in_dir(&cfg.data_dir)?;
+    let pq_signer = HybridPqSigningKeypair::load_or_generate_in_dir(&cfg.data_dir)?;
+    let mut lite_seed_server = ZeroTrustSeedServer::new_homelab_vault(
+        node_identity.device_peer_id(),
+        block_store.clone(),
+        pq_signer.public_key(),
+        2,
     );
-    let mut por_verifier = PorVerifierEngine::new(cfg.por_timeout_ms);
 
     let mut swarm = build_mesh_swarm(keypair, cfg.enable_quic)?;
     let tcp_addr: Multiaddr = cfg.listen_tcp.parse()?;
@@ -786,6 +917,9 @@ async fn run_daemon(cfg: NodeConfig, block_store: BlockStore) -> anyhow::Result<
                             &block_store,
                             &mut wot,
                             &mut por_verifier,
+                            &mut nullifier_ledger,
+                            &pq_kem,
+                            &mut lite_seed_server,
                         );
                         let _ = swarm.behaviour_mut().req_resp.send_response(channel, response);
                     }
@@ -802,12 +936,16 @@ async fn run_daemon(cfg: NodeConfig, block_store: BlockStore) -> anyhow::Result<
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_wire_request(
     remote_peer_id: &str,
     request: MeshWireRequest,
     block_store: &BlockStore,
     wot: &mut WebOfTrustRegistry,
     por_verifier: &mut PorVerifierEngine,
+    nullifier_ledger: &mut VoucherNullifierLedger,
+    pq_kem: &HybridKemKeypair,
+    lite_seed_server: &mut ZeroTrustSeedServer,
 ) -> MeshWireResponse {
     match request {
         MeshWireRequest::HandshakeWoT { chain, .. } => match wot.verify_and_admit_chain(&chain) {
@@ -867,15 +1005,11 @@ fn handle_wire_request(
             repair_proof,
         } => {
             let owner_sig_storage;
-            let owner_sig_ref = if let Some((payload, r, s)) = &owner_signature {
+            let owner_sig_ref = if let Some((owner_pub, payload, r, s)) = &owner_signature {
                 let mut sig64 = [0u8; 64];
                 sig64[..32].copy_from_slice(r);
                 sig64[32..].copy_from_slice(s);
-                let mut owner_pub = [0u8; 32];
-                if payload.len() >= 32 {
-                    owner_pub.copy_from_slice(&payload[..32]);
-                }
-                owner_sig_storage = (owner_pub, payload.as_slice(), sig64);
+                owner_sig_storage = (*owner_pub, payload.as_slice(), sig64);
                 Some((
                     owner_sig_storage.0,
                     owner_sig_storage.1,
@@ -903,6 +1037,233 @@ fn handle_wire_request(
                     shard_bytes: None,
                     error: Some(e.to_string()),
                 },
+            }
+        }
+        MeshWireRequest::PutBlindedShard {
+            blinded_id,
+            shard_bytes,
+            capability,
+            voucher,
+            current_epoch,
+            lease_duration_epochs,
+            delete_verifier,
+        } => {
+            let mut single_use_ledger = VoucherNullifierLedger::new(voucher.issuer_pubkey);
+            let ledger_ref = if voucher.issuer_pubkey == nullifier_ledger.issuer_pubkey() {
+                &mut *nullifier_ledger
+            } else {
+                &mut single_use_ledger
+            };
+            match block_store.put_blinded_shard_with_lease(
+                &blinded_id,
+                &shard_bytes,
+                capability,
+                &voucher,
+                ledger_ref,
+                current_epoch,
+                lease_duration_epochs,
+                delete_verifier,
+            ) {
+                Ok(_) => MeshWireResponse::PutBlindedShardAck {
+                    stored: true,
+                    error: None,
+                },
+                Err(e) => MeshWireResponse::PutBlindedShardAck {
+                    stored: false,
+                    error: Some(e.to_string()),
+                },
+            }
+        }
+        MeshWireRequest::GetBlindedShard {
+            blinded_id,
+            capability,
+            timestamp_ms,
+            read_sig,
+        } => {
+            if read_sig.len() != 64 {
+                return MeshWireResponse::BlindedShardResult {
+                    shard_bytes: None,
+                    error: Some("invalid 64-byte capability signature length".to_string()),
+                };
+            }
+            let mut sig64 = [0u8; 64];
+            sig64.copy_from_slice(&read_sig);
+            match block_store.get_blinded_shard_authorized(
+                &blinded_id,
+                &capability,
+                timestamp_ms,
+                &sig64,
+            ) {
+                Ok(bytes) => MeshWireResponse::BlindedShardResult {
+                    shard_bytes: Some(bytes),
+                    error: None,
+                },
+                Err(e) => MeshWireResponse::BlindedShardResult {
+                    shard_bytes: None,
+                    error: Some(e.to_string()),
+                },
+            }
+        }
+        MeshWireRequest::RenewBlindedLease {
+            blinded_id,
+            current_epoch,
+            extension_epochs,
+        } => {
+            let renewed = block_store.renew_blinded_shard_lease(
+                &blinded_id,
+                current_epoch,
+                extension_epochs,
+            );
+            MeshWireResponse::RenewBlindedLeaseAck { renewed }
+        }
+        MeshWireRequest::DeleteBlindedShardTombstone {
+            blinded_id,
+            tombstone,
+        } => match block_store.delete_blinded_shard_with_tombstone(&blinded_id, &tombstone) {
+            Ok(deleted) => MeshWireResponse::DeleteBlindedShardAck {
+                deleted,
+                error: None,
+            },
+            Err(e) => MeshWireResponse::DeleteBlindedShardAck {
+                deleted: false,
+                error: Some(e.to_string()),
+            },
+        },
+        MeshWireRequest::MultiSegmentPorAudit(challenge) => {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            match por_verifier.handle_multi_segment_challenge(&challenge, now_ms, block_store) {
+                Ok(resp) => MeshWireResponse::MultiSegmentPorAuditResult(Some(resp)),
+                Err(e) => {
+                    warn!(peer = remote_peer_id, error = %e, "Dropped MultiSegmentPorAudit in RAM pre-check");
+                    MeshWireResponse::MultiSegmentPorAuditResult(None)
+                }
+            }
+        }
+        MeshWireRequest::RelayPqOnionEnvelope {
+            target_peer_addr,
+            envelope,
+            capability,
+            voucher,
+            current_epoch,
+            lease_duration_epochs,
+            delete_verifier,
+        } => {
+            if let Some(next_hop) = target_peer_addr {
+                if let Some(client) = block_store.mesh_client() {
+                    match client.relay_pq_onion_envelope(
+                        &next_hop,
+                        None,
+                        envelope,
+                        capability,
+                        voucher,
+                        current_epoch,
+                        lease_duration_epochs,
+                        delete_verifier,
+                    ) {
+                        Ok(()) => MeshWireResponse::RelayPqOnionAck {
+                            delivered: true,
+                            error: None,
+                        },
+                        Err(e) => MeshWireResponse::RelayPqOnionAck {
+                            delivered: false,
+                            error: Some(e.to_string()),
+                        },
+                    }
+                } else {
+                    MeshWireResponse::RelayPqOnionAck {
+                        delivered: false,
+                        error: Some("no MeshClient available for onion forwarding".to_string()),
+                    }
+                }
+            } else {
+                match envelope.open_pq(pq_kem) {
+                    Ok((blinded_id, shard_bytes)) => {
+                        let mut single_use_ledger =
+                            VoucherNullifierLedger::new(voucher.issuer_pubkey);
+                        match block_store.put_blinded_shard_with_lease(
+                            &blinded_id,
+                            &shard_bytes,
+                            capability,
+                            &voucher,
+                            &mut single_use_ledger,
+                            current_epoch,
+                            lease_duration_epochs,
+                            delete_verifier,
+                        ) {
+                            Ok(_) => MeshWireResponse::RelayPqOnionAck {
+                                delivered: true,
+                                error: None,
+                            },
+                            Err(e) => MeshWireResponse::RelayPqOnionAck {
+                                delivered: false,
+                                error: Some(e.to_string()),
+                            },
+                        }
+                    }
+                    Err(e) => MeshWireResponse::RelayPqOnionAck {
+                        delivered: false,
+                        error: Some(e.to_string()),
+                    },
+                }
+            }
+        }
+        MeshWireRequest::SyndicateLiteStripe { cert, bundle } => {
+            lite_seed_server.set_owner_pq_pubkey(cert.owner_root_pubkey.clone());
+            match lite_seed_server.ingest_and_syndicate_lite_stripe(&cert, &bundle, &[]) {
+                Ok(receipt) => MeshWireResponse::SyndicateLiteStripeAck {
+                    receipt: Some(receipt),
+                    error: None,
+                },
+                Err(e) => MeshWireResponse::SyndicateLiteStripeAck {
+                    receipt: None,
+                    error: Some(e.to_string()),
+                },
+            }
+        }
+        MeshWireRequest::PutDhtEnvelope(env) => {
+            let res = match env {
+                DhtWireEnvelope::ClassicalManifest(m) => block_store.put_dht_manifest_envelope(m),
+                DhtWireEnvelope::PostQuantumManifest(m) => {
+                    block_store.put_dht_pq_manifest_envelope(m)
+                }
+                DhtWireEnvelope::VaultCatalog(m) => block_store.put_dht_vault_catalog_envelope(m),
+            };
+            match res {
+                Ok(()) => MeshWireResponse::PutDhtEnvelopeAck {
+                    stored: true,
+                    error: None,
+                },
+                Err(e) => MeshWireResponse::PutDhtEnvelopeAck {
+                    stored: false,
+                    error: Some(e.to_string()),
+                },
+            }
+        }
+        MeshWireRequest::GetDhtEnvelope { dht_key, kind } => {
+            let found = match kind {
+                DhtEnvelopeKind::ClassicalManifest => block_store
+                    .get_dht_manifest_envelope(&dht_key)
+                    .map(DhtWireEnvelope::ClassicalManifest),
+                DhtEnvelopeKind::PostQuantumManifest => block_store
+                    .get_dht_pq_manifest_envelope(&dht_key)
+                    .map(DhtWireEnvelope::PostQuantumManifest),
+                DhtEnvelopeKind::VaultCatalog => block_store
+                    .get_dht_vault_catalog_envelope(&dht_key)
+                    .map(DhtWireEnvelope::VaultCatalog),
+            };
+            if let Some(env) = found {
+                MeshWireResponse::GetDhtEnvelopeResult {
+                    envelope: Some(env),
+                    error: None,
+                }
+            } else {
+                MeshWireResponse::GetDhtEnvelopeResult {
+                    envelope: None,
+                    error: Some("DHT envelope not found".to_string()),
+                }
             }
         }
     }

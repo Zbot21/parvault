@@ -752,3 +752,84 @@ fn test_cli_end_to_end_parvault_and_parvault_seed_subcommands() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn test_persistent_por_repair_grants_dht_store_and_libp2p_keypair_across_restarts() {
+    use parvault::{
+        config::ErasureTier,
+        crypto::{pqc::PqVaultMasterKey, HardwareEnclaveSealer, NodeIdentity, SoftwareTpm2Stub},
+        por::{PorVerifierEngine, RepairGrant},
+        sharding::merkle::hash_shard_leaf,
+        storage::{BlockStore, QuotaManager, ShardId, ZeroTrustDhtStore},
+    };
+
+    let base = unique_temp_dir("persist-por-dht-keypair");
+
+    // 1. NodeIdentity::load_or_generate_in_dir produces identical libp2p PeerId across restarts
+    let id1 = NodeIdentity::load_or_generate_in_dir(&base).unwrap();
+    let kp1 = id1.to_libp2p_keypair().unwrap();
+    let id2 = NodeIdentity::load_or_generate_in_dir(&base).unwrap();
+    let kp2 = id2.to_libp2p_keypair().unwrap();
+    assert_eq!(kp1.public().to_peer_id(), kp2.public().to_peer_id());
+
+    // 2. SoftwareTpm2Stub seals/unseals consistently from persisted CSPRNG/passphrase key
+    let tpm1 = SoftwareTpm2Stub::from_passphrase_or_csprng_in_dir(&base, Some("vault-pass")).unwrap();
+    let tpm2 = SoftwareTpm2Stub::from_passphrase_or_csprng_in_dir(&base, Some("vault-pass")).unwrap();
+    let sealed = tpm1.seal_key(&[0xAB; 32]).unwrap();
+    let unsealed = tpm2.unseal_key(&sealed).unwrap();
+    assert_eq!(unsealed, [0xAB; 32]);
+
+    // 3. PorVerifierEngine persists repair_grants and session_keys across restarts
+    let owner = NodeIdentity::generate();
+    let w1 = NodeIdentity::generate();
+    let w2 = NodeIdentity::generate();
+    let shard_bytes = b"persisted-owner-shard-read-verification-payload";
+    let shard_id = ShardId {
+        stripe_merkle_root: [0x33; 32],
+        shard_index: 4,
+        shard_hash: hash_shard_leaf(4, shard_bytes),
+    };
+    let store = BlockStore::new(
+        &base,
+        QuotaManager::new(10 * 1024 * 1024, 10 * 1024 * 1024),
+    )
+    .unwrap();
+    store
+        .put_shard(&owner.device_peer_id(), &shard_id, shard_bytes)
+        .unwrap();
+
+    let grant = RepairGrant::issue(
+        &owner,
+        shard_id.stripe_merkle_root,
+        vec![w1.public_key_bytes(), w2.public_key_bytes()],
+        ErasureTier::Consumer,
+    );
+    {
+        let mut por1 = PorVerifierEngine::with_persistence_dir(400, &base);
+        assert!(por1.register_repair_grant(grant));
+        por1.register_shard_session(&shard_id, [0x77; 32]);
+    }
+    {
+        let por2 = PorVerifierEngine::with_persistence_dir(400, &base);
+        let (owner_pub, payload, sig) =
+            PorVerifierEngine::sign_owner_shard_read_token(&owner, &shard_id, 1_700_000_000);
+        let read_back = por2
+            .authorize_raw_shard_read(&shard_id, Some(&(owner_pub, &payload, &sig)), None, &store)
+            .expect("owner read token must verify after PorVerifierEngine reload from disk");
+        assert_eq!(read_back, shard_bytes);
+    }
+
+    // 4. PqVaultMasterKey 64-byte Argon2id root & ChaCha20Poly1305 + Aes256Gcm cascaded AEAD
+    let pq_key = PqVaultMasterKey::from_recovery_seed_phrase("correct horse battery staple", "ns");
+    let ct = pq_key
+        .encrypt_stripe_pq(&[0x55; 32], 7, b"post-quantum-cascaded-stripe")
+        .unwrap();
+    let pt = pq_key.decrypt_stripe_pq(&[0x55; 32], 7, &ct).unwrap();
+    assert_eq!(pt, b"post-quantum-cascaded-stripe");
+
+    let dht_dir = base.join("dht");
+    fs::create_dir_all(&dht_dir).unwrap();
+    let _dht = ZeroTrustDhtStore::with_persistence_dir(&dht_dir);
+
+    let _ = fs::remove_dir_all(&base);
+}

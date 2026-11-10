@@ -75,6 +75,14 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub config: Option<PathBuf>,
 
+    /// Optional comma-separated list of mesh peer Multiaddrs or `host:port` endpoints (overrides `bootstrap_peers` / `PARVAULT_PEERS`).
+    #[arg(long, global = true, value_delimiter = ',')]
+    pub peers: Vec<String>,
+
+    /// Optional `parvault-seed` Multiaddr or `host:port` endpoint (overrides `lite_seed_addr` / `PARVAULT_SEED_ADDR`).
+    #[arg(long, global = true)]
+    pub seed_addr: Option<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -179,8 +187,8 @@ pub enum Commands {
         #[arg(long)]
         catalog_out: Option<PathBuf>,
 
-        /// Optional paired `parvault-seed` data directory or endpoint for Lite-Client 1.0x stripe syndication (ADR-17).
-        #[arg(long)]
+        /// Optional paired `parvault-seed` Multiaddr (e.g. `/ip4/10.42.1.10/tcp/4002`) or local directory for Lite-Client 1.0x stripe syndication (ADR-17).
+        #[arg(long, visible_alias = "lite-seed-addr")]
         lite_seed_dir: Option<PathBuf>,
 
         /// Optional PersonalDeviceCert file or `PARVAULT-CERT-V1:` token for Lite-Client seed authentication (ADR-17).
@@ -200,7 +208,7 @@ pub enum Commands {
         snapshot: PathBuf,
 
         /// Target output directory where the restored folder tree will be written.
-        #[arg(long)]
+        #[arg(long, visible_alias = "target-dir")]
         out_dir: PathBuf,
 
         /// Optional hex-encoded 32-byte master key.
@@ -215,7 +223,7 @@ pub enum Commands {
         #[arg(long)]
         filter: Option<String>,
     },
-    /// Zero-Local-State "House Fire" Disaster Recovery from a memorized seed phrase and EncryptedVaultCatalogEnvelope (ADR-15 / ADR-17).
+    /// Zero-Local-State "House Fire" Disaster Recovery from a memorized seed phrase and network peers or EncryptedVaultCatalogEnvelope (ADR-15 / ADR-17).
     RecoverFromSeed {
         /// Memorized recovery seed phrase.
         #[arg(long)]
@@ -225,12 +233,12 @@ pub enum Commands {
         #[arg(long, default_value = "default")]
         vault_namespace: String,
 
-        /// Path to the `.catalog.bin` (or JSON) EncryptedVaultCatalogEnvelope file.
+        /// Optional path to a local `.catalog.bin` EncryptedVaultCatalogEnvelope file (if omitted, queries Kademlia DHT over `--peers`).
         #[arg(long)]
-        catalog_envelope: PathBuf,
+        catalog_envelope: Option<PathBuf>,
 
         /// Target output directory where the recovered directory tree will be restored.
-        #[arg(long)]
+        #[arg(long, visible_alias = "target-dir", default_value = "./recovered_vault")]
         out_dir: PathBuf,
 
         /// Optional comma-separated glob or directory prefix filter to selectively recover only needed files (ADR-17).
@@ -334,6 +342,18 @@ pub struct NodeConfig {
     pub override_asn: Option<u32>,
     /// Optional region tag for cross-region cohort simulation (ADR-06).
     pub override_region: Option<String>,
+    /// Configured bootstrap/storage peer Multiaddrs (`--peers` / `PARVAULT_PEERS`).
+    #[serde(default)]
+    pub bootstrap_peers: Vec<String>,
+    /// Optional paired `parvault-seed` Multiaddr (`--seed-addr` / `PARVAULT_SEED_ADDR`).
+    #[serde(default)]
+    pub lite_seed_addr: Option<String>,
+    /// Optional hex-encoded 32-byte Web-of-Trust Genesis Root public key (`PARVAULT_GENESIS_PUBKEY_HEX`).
+    #[serde(default)]
+    pub genesis_root_pubkey_hex: Option<String>,
+    /// Optional passphrase for Argon2id hardware enclave key sealing (`PARVAULT_PASSPHRASE`).
+    #[serde(default)]
+    pub device_sealing_passphrase: Option<String>,
 }
 
 impl Default for NodeConfig {
@@ -352,6 +372,10 @@ impl Default for NodeConfig {
             intra_asn_ratio: DEFAULT_INTRA_ASN_RATIO,
             override_asn: None,
             override_region: None,
+            bootstrap_peers: Vec::new(),
+            lite_seed_addr: None,
+            genesis_root_pubkey_hex: None,
+            device_sealing_passphrase: None,
         }
     }
 }
@@ -365,5 +389,35 @@ impl NodeConfig {
         } else {
             Ok(Self::default())
         }
+    }
+
+    pub fn effective_peers(&self, cli_peers: &[String]) -> Vec<String> {
+        if !cli_peers.is_empty() {
+            return cli_peers.to_vec();
+        }
+        if let Ok(env_peers) = std::env::var("PARVAULT_PEERS") {
+            let parsed: Vec<String> = env_peers
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+        self.bootstrap_peers.clone()
+    }
+
+    pub fn effective_seed_addr(&self, cli_seed: Option<&str>) -> Option<String> {
+        if let Some(s) = cli_seed.map(str::trim).filter(|s| !s.is_empty()) {
+            return Some(s.to_string());
+        }
+        if let Ok(env_seed) = std::env::var("PARVAULT_SEED_ADDR") {
+            let trimmed = env_seed.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        self.lite_seed_addr.clone()
     }
 }

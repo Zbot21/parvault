@@ -44,6 +44,13 @@ pub struct HybridKemKeypair {
     ml_kem_dk_bytes: Vec<u8>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct StoredKemKeypair {
+    x25519_seed: [u8; 32],
+    ml_kem_ek_bytes: Vec<u8>,
+    ml_kem_dk_bytes: Vec<u8>,
+}
+
 impl HybridKemKeypair {
     /// Generates a fresh hybrid `X25519 + ML-KEM-768` keypair.
     pub fn generate() -> Result<Self, CryptoError> {
@@ -58,6 +65,53 @@ impl HybridKemKeypair {
             x25519_pub,
             ml_kem_ek_bytes: ek.into_bytes().to_vec(),
             ml_kem_dk_bytes: dk.into_bytes().to_vec(),
+        })
+    }
+
+    /// Loads or generates a persistent `HybridKemKeypair` in `data_dir/node_pq_kem.bin`.
+    pub fn load_or_generate_in_dir(data_dir: &std::path::Path) -> Result<Self, CryptoError> {
+        std::fs::create_dir_all(data_dir)
+            .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
+        let path = data_dir.join("node_pq_kem.bin");
+        if path.exists() {
+            if let Ok(raw) = std::fs::read(&path) {
+                if let Ok(stored) = bincode::deserialize::<StoredKemKeypair>(&raw) {
+                    if stored.ml_kem_ek_bytes.len() == ml_kem_768::EK_LEN
+                        && stored.ml_kem_dk_bytes.len() == ml_kem_768::DK_LEN
+                    {
+                        let x25519_secret = X25519Secret::from(stored.x25519_seed);
+                        let x25519_pub = X25519Public::from(&x25519_secret).to_bytes();
+                        return Ok(Self {
+                            x25519_secret,
+                            x25519_pub,
+                            ml_kem_ek_bytes: stored.ml_kem_ek_bytes,
+                            ml_kem_dk_bytes: stored.ml_kem_dk_bytes,
+                        });
+                    }
+                }
+            }
+        }
+        let mut x25519_seed = [0u8; 32];
+        OsRng.fill_bytes(&mut x25519_seed);
+        let x25519_secret = X25519Secret::from(x25519_seed);
+        let x25519_pub = X25519Public::from(&x25519_secret).to_bytes();
+        let (ek, dk) = ml_kem_768::KG::try_keygen()
+            .map_err(|e| CryptoError::InvalidKeyMaterial(format!("ML-KEM-768 keygen: {e}")))?;
+        let ml_kem_ek_bytes = ek.into_bytes().to_vec();
+        let ml_kem_dk_bytes = dk.into_bytes().to_vec();
+        let stored = StoredKemKeypair {
+            x25519_seed,
+            ml_kem_ek_bytes: ml_kem_ek_bytes.clone(),
+            ml_kem_dk_bytes: ml_kem_dk_bytes.clone(),
+        };
+        if let Ok(encoded) = bincode::serialize(&stored) {
+            let _ = std::fs::write(&path, encoded);
+        }
+        Ok(Self {
+            x25519_secret,
+            x25519_pub,
+            ml_kem_ek_bytes,
+            ml_kem_dk_bytes,
         })
     }
 
@@ -376,66 +430,115 @@ impl PqVaultMasterKey {
 
     /// Deterministically derives a 512-bit Grover-resistant `PqVaultMasterKey` from a memorized
     /// recovery seed phrase and `vault_namespace` (`ADR-15` zero-local-state disaster recovery).
+    /// Directly stretches into a full 64-byte root seed via Argon2id (without bottlenecking through a 32-byte key).
     pub fn from_recovery_seed_phrase(seed_phrase: &str, vault_namespace: &str) -> Self {
-        let mk = MasterKey::from_recovery_seed_phrase(seed_phrase, vault_namespace);
-        let hk = Hkdf::<Sha256>::new(Some(vault_namespace.trim().as_bytes()), mk.as_bytes());
+        use argon2::{Algorithm, Argon2, Params, Version};
+        use sha2::Digest;
+        let normalized_phrase = seed_phrase.trim();
+        let normalized_ns = vault_namespace.trim();
+        let mut salt_hasher = Sha256::new();
+        salt_hasher.update(b"parvault-dr-pq512-argon2id-salt-v1:");
+        salt_hasher.update((normalized_ns.len() as u32).to_be_bytes());
+        salt_hasher.update(normalized_ns.as_bytes());
+        let salt: [u8; 32] = salt_hasher.finalize().into();
+
+        let params = Params::new(4096, 2, 1, Some(64)).expect("valid 64-byte Argon2id parameters");
+        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+        let mut root_seed_64 = [0u8; 64];
+        argon2
+            .hash_password_into(normalized_phrase.as_bytes(), &salt, &mut root_seed_64)
+            .expect("Argon2id 64-byte password hashing succeeds");
+
         let mut pq_bytes = [0u8; 64];
-        hk.expand(b"parvault-dr-pq512-vault-master-key-v1", &mut pq_bytes)
-            .expect("64-byte HKDF expansion is always valid");
+        let hk_lo = Hkdf::<Sha256>::new(Some(normalized_ns.as_bytes()), &root_seed_64[..32]);
+        let hk_hi = Hkdf::<Sha256>::new(Some(normalized_ns.as_bytes()), &root_seed_64[32..64]);
+        hk_lo
+            .expand(b"parvault-dr-pq512-vault-master-key-lo-v1", &mut pq_bytes[..32])
+            .expect("32-byte HKDF expansion is always valid");
+        hk_hi
+            .expand(b"parvault-dr-pq512-vault-master-key-hi-v1", &mut pq_bytes[32..64])
+            .expect("32-byte HKDF expansion is always valid");
         Self(pq_bytes)
     }
 
     fn split_subkeys(&self) -> (MasterKey, MasterKey) {
-        let hk = Hkdf::<Sha256>::new(Some(b"parvault-pq512-key-split-v1"), &self.0);
+        let hk1 = Hkdf::<Sha256>::new(Some(b"parvault-pq512-key-split-k1-v1"), &self.0[..32]);
+        let hk2 = Hkdf::<Sha256>::new(Some(b"parvault-pq512-key-split-k2-v1"), &self.0[32..64]);
         let mut k1 = [0u8; 32];
         let mut k2 = [0u8; 32];
-        hk.expand(b"parvault-pq-layer1-aead", &mut k1)
+        hk1.expand(b"parvault-pq-layer1-aes256gcm", &mut k1)
             .expect("32-byte HKDF");
-        hk.expand(b"parvault-pq-layer2-aead", &mut k2)
+        hk2.expand(b"parvault-pq-layer2-chacha20poly1305", &mut k2)
             .expect("32-byte HKDF");
         (MasterKey::from_bytes(k1), MasterKey::from_bytes(k2))
     }
 
-    /// Dual-layer cascaded authenticated stripe encryption under two independent 256-bit keys
-    /// derived from the 512-bit `PqVaultMasterKey`.
+    fn derive_chacha_nonce_and_aad(
+        k2: &MasterKey,
+        file_salt: &[u8; 32],
+        stripe_index: u64,
+    ) -> ([u8; 12], [u8; 40]) {
+        let mut info = [0u8; 40];
+        info[..32].copy_from_slice(file_salt);
+        info[32..40].copy_from_slice(&stripe_index.to_be_bytes());
+        let hk = Hkdf::<Sha256>::new(Some(&info), k2.as_bytes());
+        let mut nonce = [0u8; 12];
+        hk.expand(b"parvault-pq-layer2-chacha20poly1305-nonce-v1", &mut nonce)
+            .expect("12-byte HKDF");
+        (nonce, info)
+    }
+
+    /// Dual-layer cascaded authenticated stripe encryption (`AES-256-GCM` inner + `ChaCha20-Poly1305` outer)
+    /// under two independent 256-bit keys derived from the 512-bit `PqVaultMasterKey`.
     pub fn encrypt_stripe_pq(
         &self,
         file_salt: &[u8; 32],
         stripe_index: u64,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
+        use chacha20poly1305::{
+            aead::{Aead, KeyInit, Payload},
+            ChaCha20Poly1305, Nonce,
+        };
         let (k1, k2) = self.split_subkeys();
         let inner_ct = encrypt_stripe(&k1, file_salt, stripe_index, plaintext)?;
-        let mut outer_salt = *file_salt;
-        for b in &mut outer_salt {
-            *b ^= 0x5A;
-        }
-        encrypt_stripe(
-            &k2,
-            &outer_salt,
-            stripe_index ^ 0xFFFF_FFFF_FFFF_FFFF,
-            &inner_ct,
-        )
+        let (nonce_bytes, aad) = Self::derive_chacha_nonce_and_aad(&k2, file_salt, stripe_index);
+        let cipher = ChaCha20Poly1305::new(k2.as_bytes().into());
+        cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: &inner_ct,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| CryptoError::EncryptionFailed)
     }
 
-    /// Decrypts and authenticates both layers of a 512-bit cascaded Post-Quantum stripe.
+    /// Decrypts and authenticates both layers (`ChaCha20-Poly1305` outer + `AES-256-GCM` inner)
+    /// of a 512-bit cascaded Post-Quantum stripe.
     pub fn decrypt_stripe_pq(
         &self,
         file_salt: &[u8; 32],
         stripe_index: u64,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
+        use chacha20poly1305::{
+            aead::{Aead, KeyInit, Payload},
+            ChaCha20Poly1305, Nonce,
+        };
         let (k1, k2) = self.split_subkeys();
-        let mut outer_salt = *file_salt;
-        for b in &mut outer_salt {
-            *b ^= 0x5A;
-        }
-        let inner_ct = decrypt_stripe(
-            &k2,
-            &outer_salt,
-            stripe_index ^ 0xFFFF_FFFF_FFFF_FFFF,
-            ciphertext,
-        )?;
+        let (nonce_bytes, aad) = Self::derive_chacha_nonce_and_aad(&k2, file_salt, stripe_index);
+        let cipher = ChaCha20Poly1305::new(k2.as_bytes().into());
+        let inner_ct = cipher
+            .decrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| CryptoError::DecryptionFailed)?;
         decrypt_stripe(&k1, file_salt, stripe_index, &inner_ct)
     }
 }

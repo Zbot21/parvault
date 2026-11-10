@@ -1118,6 +1118,11 @@ impl ZeroTrustSeedServer {
         &self.block_store
     }
 
+    pub fn set_owner_pq_pubkey(&mut self, owner_root_pubkey: HybridPqPublicKey) {
+        self.mode = SeedServerMode::HomelabRedundancyVault;
+        self.owner_root_pubkey = Some(owner_root_pubkey);
+    }
+
     /// Verifies and admits a client device (`"laptop-1"`, `"desktop-1"`) into the homelab owner's
     /// `HomelabRedundancyVault` using its post-quantum `PersonalDeviceCert`.
     pub fn authorize_personal_device(
@@ -1226,6 +1231,24 @@ impl ZeroTrustSeedServer {
                 let target_peer_store = mesh_peer_stores[idx % mesh_peer_stores.len()];
                 target_peer_store.put_shard(&self.server_peer_id, &shard_id, shard_bytes)?;
                 mesh_peers_populated += 1;
+            } else if let Some(client) = self.block_store.mesh_client() {
+                let peers = client.peers();
+                if !peers.is_empty() {
+                    let target_addr = &peers[idx % peers.len()];
+                    if client
+                        .put_shard(
+                            target_addr,
+                            &self.server_peer_id,
+                            shard_id,
+                            shard_bytes.clone(),
+                            [0x77u8; 32],
+                            None,
+                        )
+                        .is_ok()
+                    {
+                        mesh_peers_populated += 1;
+                    }
+                }
             }
         }
 

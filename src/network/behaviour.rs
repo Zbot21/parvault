@@ -1,7 +1,17 @@
+use crate::bootstrap::{
+    BlindedShardTombstone, LiteStripeSyndicationBundle, LiteSyndicationReceipt, PersonalDeviceCert,
+};
+use crate::crypto::{PqRelayedShardEnvelope, PqSignedDhtManifestEnvelope};
 use crate::network::wot::{DelegationChain, SlashingEvidence};
-use crate::por::{PorChallenge, PorResponse, RepairGrant, WitnessFailureReceipt};
+use crate::por::{
+    MultiSegmentPorChallenge, PorChallenge, PorResponse, RepairGrant, WitnessFailureReceipt,
+};
 use crate::sharding::merkle::Hash32;
-use crate::storage::ShardId;
+use crate::storage::{
+    AnonymousQuotaVoucher, BlindedShardCapability, BlindedShardId, ShardId,
+    SignedDhtManifestEnvelope,
+};
+use crate::sync::EncryptedVaultCatalogEnvelope;
 use libp2p::{
     futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     gossipsub, identify, kad, mdns, ping, request_response,
@@ -187,6 +197,22 @@ impl request_response::Codec for BincodeWireCodec {
     }
 }
 
+/// Discriminator for Kademlia DHT envelope queries over `/parvault/wire/1.0.0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DhtEnvelopeKind {
+    ClassicalManifest,
+    PostQuantumManifest,
+    VaultCatalog,
+}
+
+/// Unified zero-knowledge DHT envelope payload exchanged over `PutDhtEnvelope` / `GetDhtEnvelope`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DhtWireEnvelope {
+    ClassicalManifest(SignedDhtManifestEnvelope),
+    PostQuantumManifest(PqSignedDhtManifestEnvelope),
+    VaultCatalog(EncryptedVaultCatalogEnvelope),
+}
+
 /// Wire-level request messages exchanged over `/parvault/wire/1.0.0`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MeshWireRequest {
@@ -207,10 +233,63 @@ pub enum MeshWireRequest {
     /// Issue a stateless Proof of Retrievability (PoR) byte-range challenge (ADR-03).
     PorAudit(PorChallenge),
     /// Fetch a full ciphertext shard for file restore or authenticated witness repair (ADR-04).
+    /// `owner_signature` explicitly carries `(owner_pub, signed_payload, sig_r, sig_s)`.
     GetCiphertextShard {
         shard_id: ShardId,
-        owner_signature: Option<(Vec<u8>, [u8; 32], [u8; 32])>,
+        owner_signature: Option<([u8; 32], Vec<u8>, [u8; 32], [u8; 32])>,
         repair_proof: Option<(RepairGrant, Vec<WitnessFailureReceipt>)>,
+    },
+    /// Phase 2-4: Store an anonymized `BlindedShardId` with a single-use `AnonymousQuotaVoucher` and Byte-Epoch lease.
+    PutBlindedShard {
+        blinded_id: BlindedShardId,
+        shard_bytes: Vec<u8>,
+        capability: BlindedShardCapability,
+        voucher: AnonymousQuotaVoucher,
+        current_epoch: u64,
+        lease_duration_epochs: u64,
+        delete_verifier: [u8; 32],
+    },
+    /// Phase 2-4: Fetch an anonymized `BlindedShardId` using a per-locator capability signature.
+    GetBlindedShard {
+        blinded_id: BlindedShardId,
+        capability: BlindedShardCapability,
+        timestamp_ms: u64,
+        read_sig: Vec<u8>,
+    },
+    /// Phase 2-4: Renew the Byte-Epoch lease on an anonymized `BlindedShardId`.
+    RenewBlindedLease {
+        blinded_id: BlindedShardId,
+        current_epoch: u64,
+        extension_epochs: u64,
+    },
+    /// Phase 2-4: Reclaim disk space immediately via a pre-image `BlindedShardTombstone`.
+    DeleteBlindedShardTombstone {
+        blinded_id: BlindedShardId,
+        tombstone: BlindedShardTombstone,
+    },
+    /// Phase 2-4: Issue a stratified `MultiSegmentPorChallenge` (anti-partial-retention & anti-WAN-proxy).
+    MultiSegmentPorAudit(MultiSegmentPorChallenge),
+    /// Phase 2-4: Relay or deliver a Post-Quantum 1-Hop Onion Envelope (`X25519 + ML-KEM-768`).
+    RelayPqOnionEnvelope {
+        target_peer_addr: Option<String>,
+        envelope: PqRelayedShardEnvelope,
+        capability: BlindedShardCapability,
+        voucher: AnonymousQuotaVoucher,
+        current_epoch: u64,
+        lease_duration_epochs: u64,
+        delete_verifier: [u8; 32],
+    },
+    /// Phase 2-4: Syndicate a Lite-Client stripe bundle through a personal seed using a `PersonalDeviceCert`.
+    SyndicateLiteStripe {
+        cert: PersonalDeviceCert,
+        bundle: LiteStripeSyndicationBundle,
+    },
+    /// Phase 2-4: Publish a signed monotonic DHT manifest or disaster-recovery vault catalog envelope.
+    PutDhtEnvelope(DhtWireEnvelope),
+    /// Phase 2-4: Fetch a signed monotonic DHT manifest or disaster-recovery vault catalog envelope by `dht_key`.
+    GetDhtEnvelope {
+        dht_key: [u8; 32],
+        kind: DhtEnvelopeKind,
     },
 }
 
@@ -231,6 +310,38 @@ pub enum MeshWireResponse {
         error: Option<String>,
     },
     SlashingBroadcast(SlashingEvidence),
+    PutBlindedShardAck {
+        stored: bool,
+        error: Option<String>,
+    },
+    BlindedShardResult {
+        shard_bytes: Option<Vec<u8>>,
+        error: Option<String>,
+    },
+    RenewBlindedLeaseAck {
+        renewed: bool,
+    },
+    DeleteBlindedShardAck {
+        deleted: bool,
+        error: Option<String>,
+    },
+    MultiSegmentPorAuditResult(Option<PorResponse>),
+    RelayPqOnionAck {
+        delivered: bool,
+        error: Option<String>,
+    },
+    SyndicateLiteStripeAck {
+        receipt: Option<LiteSyndicationReceipt>,
+        error: Option<String>,
+    },
+    PutDhtEnvelopeAck {
+        stored: bool,
+        error: Option<String>,
+    },
+    GetDhtEnvelopeResult {
+        envelope: Option<DhtWireEnvelope>,
+        error: Option<String>,
+    },
 }
 
 /// Composite libp2p `NetworkBehaviour` combining Kademlia DHT, Gossipsub, mDNS, Ping, Identify,

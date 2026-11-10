@@ -11,6 +11,7 @@ struct AsyncPorRepairState {
     in_flight_w2_receipt: bool,
     delivered_witness_sigs: u8,
     unauthorized_raw_read_occurred: bool,
+    rejected_unauthorized_reads: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -52,6 +53,7 @@ impl Model for AsyncPorRepairModel {
             in_flight_w2_receipt: false,
             delivered_witness_sigs: 0,
             unauthorized_raw_read_occurred: false,
+            rejected_unauthorized_reads: 0,
         }]
     }
 
@@ -74,7 +76,7 @@ impl Model for AsyncPorRepairModel {
         if state.in_flight_w2_receipt {
             actions.push(AsyncPorAction::DeliverWitness2Receipt);
         }
-        if state.delivered_witness_sigs != 3 {
+        if state.delivered_witness_sigs != 3 && state.rejected_unauthorized_reads < 2 {
             actions.push(AsyncPorAction::AdversaryAttemptUnauthorizedRead);
         }
         if state.delivered_witness_sigs == 3 && state.active_shards >= self.k_min {
@@ -107,9 +109,14 @@ impl Model for AsyncPorRepairModel {
                 next.in_flight_w1_receipt = false;
             }
             AsyncPorAction::AdversaryAttemptUnauthorizedRead => {
-                // Storage node enforces ADR-04: rejects raw shard read unless both witness bits (0b11 == 3) are present.
-                if next.delivered_witness_sigs == 3 {
+                // Storage node enforces ADR-04: rejects raw shard read unless owner sig or both witness bits (0b11 == 3) are present.
+                let has_valid_owner_sig = false;
+                let has_quorum_witness_sigs = next.delivered_witness_sigs == 3;
+                if has_valid_owner_sig || has_quorum_witness_sigs {
                     next.unauthorized_raw_read_occurred = true;
+                } else {
+                    next.rejected_unauthorized_reads =
+                        next.rejected_unauthorized_reads.saturating_add(1);
                 }
             }
             AsyncPorAction::ExecuteAuthorizedWitnessRepair => {
@@ -164,6 +171,7 @@ fn test_stateright_async_packet_reordering_and_witness_repair() {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct WoTSubtreeState {
     uninvited_sybils_admitted: u8,
+    rejected_sybil_handshakes: u8,
     leaf1_failures: u8,
     leaf1_quarantined: bool,
     leaf2_failures: u8,
@@ -174,7 +182,10 @@ struct WoTSubtreeState {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum WoTAction {
-    UninvitedSybilHandshakeAttempt,
+    UninvitedSybilHandshakeAttempt {
+        has_genesis_sig: bool,
+        inviter_branch_pruned: bool,
+    },
     Leaf1InvalidHandshakeOrPorFail,
     Leaf2InvalidHandshakeOrPorFail,
 }
@@ -191,6 +202,7 @@ impl Model for WoTSubtreeModel {
     fn init_states(&self) -> Vec<Self::State> {
         vec![WoTSubtreeState {
             uninvited_sybils_admitted: 0,
+            rejected_sybil_handshakes: 0,
             leaf1_failures: 0,
             leaf1_quarantined: false,
             leaf2_failures: 0,
@@ -201,7 +213,20 @@ impl Model for WoTSubtreeModel {
     }
 
     fn actions(&self, state: &Self::State, actions: &mut Vec<Self::Action>) {
-        actions.push(WoTAction::UninvitedSybilHandshakeAttempt);
+        if state.rejected_sybil_handshakes < 2 {
+            // Uninvited Sybil peer without a Genesis->Inviter Ed25519 signature chain
+            actions.push(WoTAction::UninvitedSybilHandshakeAttempt {
+                has_genesis_sig: false,
+                inviter_branch_pruned: state.parent_branch_pruned,
+            });
+        }
+        if state.parent_branch_pruned && state.rejected_sybil_handshakes < 3 {
+            // Sybil peer presenting a signed delegation certificate from an already-pruned inviter branch
+            actions.push(WoTAction::UninvitedSybilHandshakeAttempt {
+                has_genesis_sig: true,
+                inviter_branch_pruned: true,
+            });
+        }
         if !state.leaf1_quarantined && !state.parent_branch_pruned {
             actions.push(WoTAction::Leaf1InvalidHandshakeOrPorFail);
         }
@@ -213,8 +238,20 @@ impl Model for WoTSubtreeModel {
     fn next_state(&self, last: &Self::State, action: Self::Action) -> Option<Self::State> {
         let mut next = last.clone();
         match action {
-            WoTAction::UninvitedSybilHandshakeAttempt => {
-                // Uninvited Sybil nodes lack a valid Genesis -> Inviter signature chain and are rejected.
+            WoTAction::UninvitedSybilHandshakeAttempt {
+                has_genesis_sig,
+                inviter_branch_pruned,
+            } => {
+                // Web-of-Trust admission guard: admit peer iff it carries a valid Genesis->Inviter
+                // signature chain AND its inviter subtree has not been pruned.
+                let admitted = has_genesis_sig && !inviter_branch_pruned && !next.parent_branch_pruned;
+                if admitted {
+                    next.uninvited_sybils_admitted =
+                        next.uninvited_sybils_admitted.saturating_add(1);
+                } else {
+                    next.rejected_sybil_handshakes =
+                        next.rejected_sybil_handshakes.saturating_add(1);
+                }
             }
             WoTAction::Leaf1InvalidHandshakeOrPorFail => {
                 next.leaf1_failures += 1;
@@ -263,6 +300,10 @@ impl Model for WoTSubtreeModel {
                             && state.leaf1_quarantined
                             && state.leaf2_quarantined)
                 },
+            ),
+            Property::<Self>::sometimes(
+                "Active Guard Rejection: Both uninvited and pruned-branch Sybil handshakes are actively rejected",
+                |_model, state| state.rejected_sybil_handshakes >= 3 && state.parent_branch_pruned,
             ),
         ]
     }

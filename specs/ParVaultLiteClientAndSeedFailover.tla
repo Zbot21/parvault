@@ -42,21 +42,27 @@ Init ==
     /\ selectiveRestoreComplete = FALSE
 
 \* Step 1: LiteClient encrypts a file locally and deposits 1.0x ciphertext to SeedServer.
+\* Client-side AEAD guard strips K_user before wire serialization (seedReceivesMasterKey = FALSE).
 LiteClientDepositEncryptedFile ==
     /\ seedAlive = TRUE
     /\ liteUploadedFiles < TotalVaultFiles
-    /\ liteUploadedFiles' = liteUploadedFiles + 1
+    /\ LET seedReceivesMasterKey == FALSE
+       IN /\ liteUploadedFiles' = liteUploadedFiles + 1
+          /\ seedHasMasterKey'  = (seedHasMasterKey \/ seedReceivesMasterKey)
     /\ UNCHANGED <<syndicatedFiles, seedAlive, meshHealthyShards,
-                   seedHasMasterKey, meshHasMasterKey, selectiveRestoredCount,
+                   meshHasMasterKey, selectiveRestoredCount,
                    stripesDownloaded, restoreRoute, selectiveRestoreComplete>>
 
 \* Step 2: SeedServer encodes ciphertext into N Reed-Solomon shards and syndicates to the mesh.
+\* SeedServer only possesses ciphertext and never transmits K_user (meshReceivesMasterKey = FALSE).
 SeedServerSyndicateToMesh ==
     /\ seedAlive = TRUE
     /\ syndicatedFiles < liteUploadedFiles
-    /\ syndicatedFiles' = syndicatedFiles + 1
+    /\ LET meshReceivesMasterKey == (seedHasMasterKey /\ FALSE)
+       IN /\ syndicatedFiles'  = syndicatedFiles + 1
+          /\ meshHasMasterKey' = (meshHasMasterKey \/ meshReceivesMasterKey)
     /\ UNCHANGED <<liteUploadedFiles, seedAlive, meshHealthyShards,
-                   seedHasMasterKey, meshHasMasterKey, selectiveRestoredCount,
+                   seedHasMasterKey, selectiveRestoredCount,
                    stripesDownloaded, restoreRoute, selectiveRestoreComplete>>
 
 \* Environmental Fault A: The NAS / SeedServer suffers a hardware failure or power outage AFTER syndication.

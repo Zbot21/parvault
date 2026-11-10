@@ -207,6 +207,14 @@ impl VoucherNullifierLedger {
         }
     }
 
+    pub const fn issuer_pubkey(&self) -> [u8; 32] {
+        self.trusted_issuer_pubkey
+    }
+
+    pub fn set_trusted_issuer_pubkey(&mut self, pubkey: [u8; 32]) {
+        self.trusted_issuer_pubkey = pubkey;
+    }
+
     /// Verifies and atomically redeems a single-use `AnonymousQuotaVoucher`.
     /// Rejects forged, under-sized, or previously spent vouchers.
     pub fn redeem_voucher(

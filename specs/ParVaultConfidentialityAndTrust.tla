@@ -100,11 +100,14 @@ AdversaryCollude ==
                         [] adversaryShards = 4  -> 15
                         [] adversaryShards = 15 -> N
                         [] OTHER                -> N
-           canDecrypt == (nextAdv >= K /\ hasMasterKey)
-       IN /\ adversaryShards' = nextAdv
+           keyTransmittedToPeers == FALSE
+           nextHasMasterKey      == (keyTransmittedToPeers /\ nextAdv >= K)
+           canDecrypt            == (nextAdv >= K /\ nextHasMasterKey)
+       IN /\ adversaryShards'  = nextAdv
+          /\ hasMasterKey'     = nextHasMasterKey
           /\ plaintextExposed' = canDecrypt
     /\ UNCHANGED <<subnetTrust, subnetShards, consecutivePasses,
-                   totalPlacedShards, hasMasterKey, adversarySlashed>>
+                   totalPlacedShards, adversarySlashed>>
 
 \* Action 4: ByzantineFaultAndSlash
 \* Immediately demotes a faulting/withholding subnet to "Slashed", revoking its trust

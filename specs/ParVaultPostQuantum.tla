@@ -55,12 +55,15 @@ Init ==
 \* Lattice-based Module-LWE / Module-SIS primitives (ML-KEM-768 & ML-DSA-65) remain unbroken.
 QuantumShorBreaksClassicalAsymmetric ==
     /\ (~x25519Broken \/ ~ed25519Broken)
-    /\ x25519Broken'           = TRUE
-    /\ ed25519Broken'          = TRUE
-    /\ hybridKemCompromised'   = (TRUE /\ mlKem768Broken)
-    /\ quantumForgeryAccepted' = (TRUE /\ mlDsa65Broken)
-    /\ UNCHANGED <<mlKem768Broken, mlDsa65Broken, groverApplied,
-                   effectiveMasterKeyBits, effectiveSymmetricBits,
+    /\ LET shorSolvesModuleLwe == FALSE
+           shorSolvesModuleSis == FALSE
+       IN /\ x25519Broken'           = TRUE
+          /\ ed25519Broken'          = TRUE
+          /\ mlKem768Broken'         = shorSolvesModuleLwe
+          /\ mlDsa65Broken'          = shorSolvesModuleSis
+          /\ hybridKemCompromised'   = (TRUE /\ shorSolvesModuleLwe)
+          /\ quantumForgeryAccepted' = (TRUE /\ shorSolvesModuleSis)
+    /\ UNCHANGED <<groverApplied, effectiveMasterKeyBits, effectiveSymmetricBits,
                    hybridKemEstablished, hybridSigVerified, pqBackupSealed,
                    hndlAttackAttempted, hndlPlaintextExposed>>
 
