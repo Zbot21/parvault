@@ -11,7 +11,7 @@ permissions:
 jobs:
   build-static-musl:
     name: Build Static musl (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         include:
@@ -28,8 +28,8 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Install musl cross-compilation toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          sudo apt-get update -o Acquire::Retries=5
+          sudo apt-get install -y -o Acquire::Retries=5 musl-tools gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
       - name: Build static parvault, parvault-seed, parvault-gateway, and parvault-fuse binaries
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
@@ -52,7 +52,7 @@ jobs:
   publish-release:
     name: Generate SHA256SUMS & Publish GitHub Release
     needs: build-static-musl
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
