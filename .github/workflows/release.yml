@@ -28,8 +28,23 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Install musl cross-compilation toolchain
         run: |
-          sudo apt-get update -o Acquire::Retries=5
-          sudo apt-get install -y -o Acquire::Retries=5 musl-tools gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          for attempt in 1 2 3 4; do
+            if sudo apt-get update -o Acquire::Retries=5 && \
+               sudo apt-get install -y -o Acquire::Retries=5 musl-tools gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu; then
+              break
+            fi
+            if [ "$attempt" -eq 4 ]; then
+              echo "apt-get failed after 4 attempts" >&2
+              exit 1
+            fi
+            echo "apt-get attempt ${attempt} failed; rewriting flaky azure/mirror+file sources to https://archive.ubuntu.com/ubuntu ..."
+            sudo find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) -exec sed -i \
+              -e 's|http://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+              -e 's|https://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+              -e 's|mirror+file:/etc/apt/apt-mirrors\.txt|https://archive.ubuntu.com/ubuntu|g' {} + || true
+            sudo rm -rf /var/lib/apt/lists/*
+            sleep $((attempt * 3))
+          done
       - name: Build static parvault, parvault-seed, parvault-gateway, and parvault-fuse binaries
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then

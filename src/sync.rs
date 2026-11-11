@@ -1273,19 +1273,19 @@ impl FolderSyncEngine {
     /// Partial Stripe / Byte-Range Restore (`ADR-17`):
     ///
     /// Reconstructs and decrypts **only** the 16 MiB stripe(s) overlapping `[offset, offset + length)`
-    /// of `relative_path` (via `seed_server` fast-path or direct `mesh_peer_stores` fallback if the NAS
-    /// is dead), returning the exact requested plaintext slice without downloading the rest of the file!
-    #[allow(clippy::too_many_arguments)]
+    /// (`byte_range = (offset, length)`) of `relative_path` (via `seed_server` fast-path or direct
+    /// `mesh_peer_stores` fallback if the NAS is dead), returning the exact requested plaintext slice
+    /// without downloading the rest of the file!
     pub fn restore_file_byte_range(
         &self,
         snapshot: &FolderSnapshotManifest,
         relative_path: &str,
-        offset: u64,
-        length: u64,
+        byte_range: (u64, u64),
         cert: Option<&PersonalDeviceCert>,
         seed_server: Option<&ZeroTrustSeedServer>,
         mesh_peer_stores: &[&BlockStore],
     ) -> Result<(Vec<u8>, LiteRestoreRoute), StorageError> {
+        let (offset, length) = byte_range;
         let normalized_rel = relative_path.replace('\\', "/");
         let entry = snapshot
             .files

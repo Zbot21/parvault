@@ -136,18 +136,23 @@ pub struct LanBeaconPacket {
     pub pairing_sas_commitment: Option<[u8; 32]>,
 }
 
+/// Optional endpoint & SAS pairing metadata attached when signing a [`LanBeaconPacket`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LanBeaconOptions<'a> {
+    pub explicit_listen_ip: Option<&'a str>,
+    pub owner_pq_fingerprint: Option<&'a str>,
+    pub pairing_sas_commitment: Option<[u8; 32]>,
+}
+
 impl LanBeaconPacket {
-    #[allow(clippy::too_many_arguments)]
     pub fn sign_new(
         identity: &NodeIdentity,
         node_label: &str,
         role: &str,
         tcp_listen_port: u16,
-        explicit_listen_ip: Option<&str>,
         available_bytes: u64,
         timestamp_ms: u64,
-        owner_pq_fingerprint: Option<&str>,
-        pairing_sas_commitment: Option<[u8; 32]>,
+        options: LanBeaconOptions<'_>,
     ) -> anyhow::Result<Self> {
         let ed25519_pubkey = identity.public_key_bytes();
         let peer_id = derive_libp2p_peer_id_from_ed25519_pubkey(&ed25519_pubkey)?;
@@ -157,14 +162,14 @@ impl LanBeaconPacket {
             node_label: node_label.trim().to_string(),
             role: role.trim().to_string(),
             tcp_listen_port,
-            explicit_listen_ip: normalize_explicit_listen_ip(explicit_listen_ip),
+            explicit_listen_ip: normalize_explicit_listen_ip(options.explicit_listen_ip),
             available_bytes,
             timestamp_ms,
             ed25519_pubkey,
             sig_r: [0u8; 32],
             sig_s: [0u8; 32],
-            owner_pq_fingerprint: normalize_optional_str(owner_pq_fingerprint),
-            pairing_sas_commitment,
+            owner_pq_fingerprint: normalize_optional_str(options.owner_pq_fingerprint),
+            pairing_sas_commitment: options.pairing_sas_commitment,
         };
         let preimage = pkt.canonical_signing_bytes();
         let sig = identity.sign(&preimage);
@@ -427,11 +432,13 @@ impl LiveBeaconState {
             &self.node_label,
             &self.role,
             self.tcp_listen_port,
-            self.explicit_listen_ip.as_deref(),
             self.available_bytes,
             current_unix_ms(),
-            self.owner_pq_fingerprint.as_deref(),
-            self.pairing_sas_commitment,
+            LanBeaconOptions {
+                explicit_listen_ip: self.explicit_listen_ip.as_deref(),
+                owner_pq_fingerprint: self.owner_pq_fingerprint.as_deref(),
+                pairing_sas_commitment: self.pairing_sas_commitment,
+            },
         )
     }
 }
@@ -501,93 +508,12 @@ pub fn detect_primary_lan_ipv4() -> Option<Ipv4Addr> {
     None
 }
 
-#[cfg(all(
-    target_os = "linux",
-    any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "arm",
-        target_arch = "riscv64"
-    )
-))]
+#[cfg(unix)]
 fn bind_reusable_udp_v4(port: u16) -> std::io::Result<UdpSocket> {
-    use std::os::fd::FromRawFd;
-
-    #[repr(C)]
-    struct SockAddrIn {
-        sin_family: u16,
-        sin_port: u16,
-        sin_addr: u32,
-        sin_zero: [u8; 8],
-    }
-
-    extern "C" {
-        fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
-        fn setsockopt(
-            sockfd: i32,
-            level: i32,
-            optname: i32,
-            optval: *const std::ffi::c_void,
-            optlen: u32,
-        ) -> i32;
-        fn bind(sockfd: i32, addr: *const SockAddrIn, addrlen: u32) -> i32;
-        fn close(fd: i32) -> i32;
-    }
-
-    const AF_INET: i32 = 2;
-    const SOCK_DGRAM: i32 = 2;
-    const SOCK_CLOEXEC: i32 = 0o2000000;
-    const SOL_SOCKET: i32 = 1;
-    const SO_REUSEADDR: i32 = 2;
-    const SO_REUSEPORT: i32 = 15;
-
-    // SAFETY: Standard Linux socket creation with `SOCK_CLOEXEC`, setting `SO_REUSEADDR` and
-    // `SO_REUSEPORT` before binding `0.0.0.0:port` so multiple co-located ParVault daemons can
-    // share the UDP broadcast/multicast discovery port cleanly without `EADDRINUSE`.
-    unsafe {
-        let fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let one: i32 = 1;
-        let _ = setsockopt(
-            fd,
-            SOL_SOCKET,
-            SO_REUSEADDR,
-            (&one as *const i32).cast(),
-            std::mem::size_of::<i32>() as u32,
-        );
-        let _ = setsockopt(
-            fd,
-            SOL_SOCKET,
-            SO_REUSEPORT,
-            (&one as *const i32).cast(),
-            std::mem::size_of::<i32>() as u32,
-        );
-        let addr = SockAddrIn {
-            sin_family: AF_INET as u16,
-            sin_port: port.to_be(),
-            sin_addr: 0u32.to_be(),
-            sin_zero: [0u8; 8],
-        };
-        if bind(fd, &addr, std::mem::size_of::<SockAddrIn>() as u32) != 0 {
-            let err = std::io::Error::last_os_error();
-            let _ = close(fd);
-            return Err(err);
-        }
-        Ok(UdpSocket::from_raw_fd(fd))
-    }
+    crate::os_sys::bind_reusable_udp_v4(port)
 }
 
-#[cfg(not(all(
-    target_os = "linux",
-    any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "arm",
-        target_arch = "riscv64"
-    )
-)))]
+#[cfg(not(unix))]
 fn bind_reusable_udp_v4(port: u16) -> std::io::Result<UdpSocket> {
     UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
 }
@@ -1575,11 +1501,13 @@ mod tests {
             "living-room-router",
             "router-nas",
             4001,
-            Some("192.168.1.1"),
             64 * 1024 * 1024 * 1024,
             now_ms,
-            Some("pq-fp-abcd1234"),
-            None,
+            LanBeaconOptions {
+                explicit_listen_ip: Some("192.168.1.1"),
+                owner_pq_fingerprint: Some("pq-fp-abcd1234"),
+                pairing_sas_commitment: None,
+            },
         )
         .expect("sign valid beacon");
 
@@ -1605,11 +1533,12 @@ mod tests {
             "evil-spoof",
             "router-nas",
             4001,
-            Some("192.168.1.66"),
             1_000_000,
             now_ms,
-            None,
-            None,
+            LanBeaconOptions {
+                explicit_listen_ip: Some("192.168.1.66"),
+                ..LanBeaconOptions::default()
+            },
         )
         .expect("attacker sign");
         spoofed.libp2p_peer_id = expected_pid.to_string();
@@ -1646,11 +1575,13 @@ mod tests {
             "openwrt-nas",
             "router-nas",
             4001,
-            Some("192.168.1.1"),
             10_000_000,
             current_unix_ms(),
-            pq_fp,
-            Some(sas.commitment),
+            LanBeaconOptions {
+                explicit_listen_ip: Some("192.168.1.1"),
+                owner_pq_fingerprint: pq_fp,
+                pairing_sas_commitment: Some(sas.commitment),
+            },
         )
         .unwrap();
         let discovered =
@@ -1689,11 +1620,12 @@ mod tests {
             "home-nas",
             "router-nas",
             4001,
-            Some("192.168.1.20"),
             50_000_000,
             now_ms,
-            None,
-            None,
+            LanBeaconOptions {
+                explicit_listen_ip: Some("192.168.1.20"),
+                ..LanBeaconOptions::default()
+            },
         )
         .unwrap();
         let peer_old = DiscoveredLanPeer::from_verified_packet(
@@ -1719,11 +1651,12 @@ mod tests {
             "home-nas",
             "router-nas",
             4011,
-            Some("192.168.1.88"),
             49_000_000,
             now_ms + 5_000,
-            None,
-            None,
+            LanBeaconOptions {
+                explicit_listen_ip: Some("192.168.1.88"),
+                ..LanBeaconOptions::default()
+            },
         )
         .unwrap();
         let peer_new = DiscoveredLanPeer::from_verified_packet(
@@ -1775,11 +1708,12 @@ mod tests {
             "node-beta",
             "router-nas",
             14102,
-            Some("127.0.0.1"),
             20 * 1024 * 1024,
             current_unix_ms(),
-            None,
-            None,
+            LanBeaconOptions {
+                explicit_listen_ip: Some("127.0.0.1"),
+                ..LanBeaconOptions::default()
+            },
         )
         .unwrap();
         write_registry_beacon_atomic(reg_dir.path(), &pkt2).expect("write registry beacon");

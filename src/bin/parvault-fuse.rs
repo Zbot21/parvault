@@ -7,6 +7,8 @@
 //!    for locked-down `prplOS` / `RDK-B` LXC containers lacking `/dev/fuse`.
 //! 3. `sync`: Userspace folder push/ingest over `/var/run/parvault.sock` via `memfd` `SCM_RIGHTS`.
 
+#![forbid(unsafe_code)]
+
 use clap::{Parser, Subcommand};
 use parvault::gateway::ipc::DEFAULT_IPC_SOCKET_PATH;
 use std::path::PathBuf;
@@ -83,7 +85,7 @@ fn main() -> anyhow::Result<()> {
             vfs::VirtualVaultFs,
         };
         use std::io::{Seek, SeekFrom, Write};
-        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::fd::AsRawFd;
 
         let cache_bytes = cli.cache_mib.saturating_mul(1024 * 1024);
 
@@ -96,11 +98,11 @@ fn main() -> anyhow::Result<()> {
                 if let Some(dir) = seed_dir {
                     let count = vfs.ingest_local_directory(&dir)?;
                     eprintln!(
-                        "[parvault-fuse] ingested {count} stub file(s) from {}",
+                        "[parvault-fuse] ingested {count} lazy-loaded file inode(s) from {}",
                         dir.display()
                     );
                 }
-                let dev_file = unsafe { std::fs::File::from_raw_fd(fuse_fd) };
+                let dev_file = parvault::os_sys::adopt_fuse_dev_fd(fuse_fd)?;
                 vfs.serve_fuse_fd_blocking(dev_file)?;
             }
             FuseCommand::Webdav { listen, seed_dir } => {

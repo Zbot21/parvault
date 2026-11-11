@@ -10,6 +10,8 @@
 //!    with Byte-Epoch leases, answers PoR challenges, sweeps expired `.bshard` files, and
 //!    automatically drains to 0% as organic peers join the network.
 
+#![forbid(unsafe_code)]
+
 use clap::{Parser, Subcommand, ValueEnum};
 use libp2p::{
     futures::StreamExt,
@@ -609,10 +611,10 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            run_seed_listener_loop(
+            run_seed_listener_loop(SeedListenerConfig {
                 listen,
                 node_identity,
-                ephemeral_pq_fp,
+                precomputed_pq_fp: ephemeral_pq_fp,
                 block_store,
                 server,
                 lan_discovery_port,
@@ -622,7 +624,7 @@ async fn main() -> anyhow::Result<()> {
                 explicit_council_pks,
                 council_quorum,
                 effective_peers,
-            )
+            })
             .await?;
         }
 
@@ -1756,8 +1758,7 @@ fn collect_public_swarm_diversity(
     (active_peers, v4_subnets.len(), v6_subnets.len(), multiaddrs)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_seed_listener_loop(
+struct SeedListenerConfig {
     listen: String,
     node_identity: NodeIdentity,
     precomputed_pq_fp: Option<String>,
@@ -1770,7 +1771,23 @@ async fn run_seed_listener_loop(
     explicit_council_pks: Vec<[u8; 32]>,
     council_quorum: Option<usize>,
     effective_peers: Vec<String>,
-) -> anyhow::Result<()> {
+}
+
+async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
+    let SeedListenerConfig {
+        listen,
+        node_identity,
+        precomputed_pq_fp,
+        block_store,
+        server,
+        lan_discovery_port,
+        no_lan_discovery,
+        admin_rpc_listen,
+        explicit_admin_pks,
+        explicit_council_pks,
+        council_quorum,
+        effective_peers,
+    } = cfg;
     let start_instant = Instant::now();
     let in_memory_mode = block_store.is_in_memory();
     let data_dir = block_store.root_dir().to_path_buf();
@@ -1925,18 +1942,20 @@ async fn run_seed_listener_loop(
             spawn_admin_rpc_listener(bind_addr, node_identity.clone(), allowed_pks, move |req| {
                 handle_seed_admin_rpc_request(
                     req,
-                    &rpc_shared,
-                    &rpc_store,
-                    &rpc_data_dir,
-                    &rpc_node_id,
-                    &rpc_peer_id_str,
-                    seed_mode,
-                    local_tracker_admin_pk,
-                    &rpc_extra_council,
-                    council_quorum,
-                    genesis_pubkey,
-                    &rpc_effective_peers,
-                    start_instant,
+                    SeedAdminRpcCtx {
+                        shared: &rpc_shared,
+                        block_store: &rpc_store,
+                        data_dir: &rpc_data_dir,
+                        node_identity: &rpc_node_id,
+                        local_peer_id_str: &rpc_peer_id_str,
+                        seed_mode,
+                        local_tracker_admin_pk,
+                        extra_council_pks: &rpc_extra_council,
+                        council_quorum,
+                        genesis_pubkey,
+                        effective_peers: &rpc_effective_peers,
+                        start_instant,
+                    },
                 )
             })
             .await?;
@@ -2055,23 +2074,25 @@ async fn run_seed_listener_loop(
                                 &peer_str,
                                 remote_addr,
                                 request,
-                                &data_dir,
-                                &node_identity,
-                                advertised_admin_pk,
-                                local_tracker_admin_pk,
-                                &extra_council_pks,
-                                council_quorum,
-                                max_probationary_lease_bytes,
-                                genesis_pubkey,
-                                &block_store,
-                                server,
-                                wot,
-                                por_verifier,
-                                nullifier_ledger,
-                                &pq_kem,
-                                wan_registry,
-                                eviction,
-                                takedown_queue,
+                                SeedWireHandlerCtx {
+                                    data_dir: &data_dir,
+                                    node_identity: &node_identity,
+                                    advertised_admin_pk,
+                                    local_tracker_admin_pk,
+                                    extra_council_pks: &extra_council_pks,
+                                    council_quorum,
+                                    max_probationary_lease_bytes,
+                                    genesis_pubkey,
+                                    block_store: &block_store,
+                                    server,
+                                    wot,
+                                    por_verifier,
+                                    nullifier_ledger,
+                                    pq_kem: &pq_kem,
+                                    wan_registry,
+                                    eviction,
+                                    takedown_queue,
+                                },
                             )
                         };
                         let _ = swarm.behaviour_mut().req_resp.send_response(channel, resp);
@@ -2116,22 +2137,39 @@ async fn run_seed_listener_loop(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_seed_admin_rpc_request(
-    request: SeedAdminRequest,
-    shared: &Arc<Mutex<SeedSharedState>>,
-    block_store: &BlockStore,
-    data_dir: &Path,
-    node_identity: &NodeIdentity,
-    local_peer_id_str: &str,
+struct SeedAdminRpcCtx<'a> {
+    shared: &'a Arc<Mutex<SeedSharedState>>,
+    block_store: &'a BlockStore,
+    data_dir: &'a Path,
+    node_identity: &'a NodeIdentity,
+    local_peer_id_str: &'a str,
     seed_mode: SeedServerMode,
     local_tracker_admin_pk: Option<[u8; 32]>,
-    extra_council_pks: &[[u8; 32]],
+    extra_council_pks: &'a [[u8; 32]],
     council_quorum: Option<usize>,
     genesis_pubkey: [u8; 32],
-    effective_peers: &[String],
+    effective_peers: &'a [String],
     start_instant: Instant,
+}
+
+fn handle_seed_admin_rpc_request(
+    request: SeedAdminRequest,
+    ctx: SeedAdminRpcCtx<'_>,
 ) -> SeedAdminResponse {
+    let SeedAdminRpcCtx {
+        shared,
+        block_store,
+        data_dir,
+        node_identity,
+        local_peer_id_str,
+        seed_mode,
+        local_tracker_admin_pk,
+        extra_council_pks,
+        council_quorum,
+        genesis_pubkey,
+        effective_peers,
+        start_instant,
+    } = ctx;
     match request {
         SeedAdminRequest::GetSeedTelemetry => {
             let mut st = shared
@@ -2416,29 +2454,51 @@ fn handle_seed_admin_rpc_request(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+struct SeedWireHandlerCtx<'a> {
+    data_dir: &'a Path,
+    node_identity: &'a NodeIdentity,
+    advertised_admin_pk: Option<[u8; 32]>,
+    local_tracker_admin_pk: Option<[u8; 32]>,
+    extra_council_pks: &'a [[u8; 32]],
+    council_quorum: Option<usize>,
+    max_probationary_lease_bytes: u64,
+    genesis_pubkey: [u8; 32],
+    block_store: &'a BlockStore,
+    server: &'a mut ZeroTrustSeedServer,
+    wot: &'a mut WebOfTrustRegistry,
+    por_verifier: &'a mut PorVerifierEngine,
+    nullifier_ledger: &'a mut VoucherNullifierLedger,
+    pq_kem: &'a HybridKemKeypair,
+    wan_registry: &'a mut WanRendezvousRegistry,
+    eviction: &'a mut PrivacyPreservingEvictionEngine,
+    takedown_queue: &'a mut PublicTrackerTakedownQueue,
+}
+
 fn handle_seed_wire_request(
     remote_peer_id: &str,
     remote_addr: Option<&Multiaddr>,
     request: MeshWireRequest,
-    data_dir: &Path,
-    node_identity: &NodeIdentity,
-    advertised_admin_pk: Option<[u8; 32]>,
-    local_tracker_admin_pk: Option<[u8; 32]>,
-    extra_council_pks: &[[u8; 32]],
-    council_quorum: Option<usize>,
-    max_probationary_lease_bytes: u64,
-    genesis_pubkey: [u8; 32],
-    block_store: &BlockStore,
-    server: &mut ZeroTrustSeedServer,
-    wot: &mut WebOfTrustRegistry,
-    por_verifier: &mut PorVerifierEngine,
-    nullifier_ledger: &mut VoucherNullifierLedger,
-    pq_kem: &HybridKemKeypair,
-    wan_registry: &mut WanRendezvousRegistry,
-    eviction: &mut PrivacyPreservingEvictionEngine,
-    takedown_queue: &mut PublicTrackerTakedownQueue,
+    ctx: SeedWireHandlerCtx<'_>,
 ) -> MeshWireResponse {
+    let SeedWireHandlerCtx {
+        data_dir,
+        node_identity,
+        advertised_admin_pk,
+        local_tracker_admin_pk,
+        extra_council_pks,
+        council_quorum,
+        max_probationary_lease_bytes,
+        genesis_pubkey,
+        block_store,
+        server,
+        wot,
+        por_verifier,
+        nullifier_ledger,
+        pq_kem,
+        wan_registry,
+        eviction,
+        takedown_queue,
+    } = ctx;
     let remote_ip = remote_addr.and_then(extract_ip_from_multiaddr);
     let remote_pubkey = NodeConfig::extract_ed25519_pubkey_from_peer_str(remote_peer_id);
 
@@ -2657,9 +2717,11 @@ fn handle_seed_wire_request(
                 capability,
                 &voucher,
                 nullifier_ledger,
-                current_epoch,
-                lease_duration_epochs,
-                delete_verifier,
+                parvault::storage::BlindedLeaseSpec::new(
+                    current_epoch,
+                    lease_duration_epochs,
+                    delete_verifier,
+                ),
             ) {
                 Ok(_) => {
                     let _ = eviction.record_blinded_shard_ingress(
@@ -2790,9 +2852,11 @@ fn handle_seed_wire_request(
                         envelope,
                         capability,
                         voucher,
-                        current_epoch,
-                        lease_duration_epochs,
-                        delete_verifier,
+                        parvault::storage::BlindedLeaseSpec::new(
+                            current_epoch,
+                            lease_duration_epochs,
+                            delete_verifier,
+                        ),
                     ) {
                         Ok(()) => MeshWireResponse::RelayPqOnionAck {
                             delivered: true,
@@ -2868,9 +2932,11 @@ fn handle_seed_wire_request(
                     bundle.capability,
                     &bundle.voucher,
                     nullifier_ledger,
-                    bundle.current_epoch,
-                    bundle.lease_duration_epochs,
-                    bundle.delete_verifier,
+                    parvault::storage::BlindedLeaseSpec::new(
+                        bundle.current_epoch,
+                        bundle.lease_duration_epochs,
+                        bundle.delete_verifier,
+                    ),
                 ) {
                     Ok(_) => {
                         let _ = eviction.record_blinded_shard_ingress(
@@ -2924,9 +2990,11 @@ fn handle_seed_wire_request(
                             capability,
                             &voucher,
                             nullifier_ledger,
-                            current_epoch,
-                            lease_duration_epochs,
-                            delete_verifier,
+                            parvault::storage::BlindedLeaseSpec::new(
+                                current_epoch,
+                                lease_duration_epochs,
+                                delete_verifier,
+                            ),
                         ) {
                             Ok(_) => {
                                 let _ = eviction.record_blinded_shard_ingress(
@@ -3291,9 +3359,7 @@ fn run_builtin_self_test() -> anyhow::Result<()> {
             &payload_expired,
             cap_expired,
             &voucher_1,
-            10,
-            5,
-            verifier_1,
+            parvault::storage::BlindedLeaseSpec::new(10, 5, verifier_1),
         )?;
 
         // Sweep at epoch 17 (10 + 5 + 2 grace = 17) unlinks expired .bshard file
@@ -3318,9 +3384,7 @@ fn run_builtin_self_test() -> anyhow::Result<()> {
             &payload_drain,
             cap_drain,
             &voucher_2,
-            20,
-            30,
-            verifier_2,
+            parvault::storage::BlindedLeaseSpec::new(20, 30, verifier_2),
         )?;
 
         let mut initial_candidates = Vec::new();

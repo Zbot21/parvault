@@ -264,6 +264,10 @@ impl SignedWanRendezvousEntry {
     }
 }
 
+/// Detached Ed25519 owner signature `(owner_pubkey, signed_payload, sig_r, sig_s)` authorizing
+/// direct ciphertext shard reads or deletions (`ADR-04`).
+pub type OwnerShardSignature = ([u8; 32], Vec<u8>, [u8; 32], [u8; 32]);
+
 /// Wire-level request messages exchanged over `/parvault/wire/1.0.0`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MeshWireRequest {
@@ -285,10 +289,9 @@ pub enum MeshWireRequest {
     PorAudit(PorChallenge),
     /// Fetch a full ciphertext shard for file restore or authenticated witness repair (ADR-04).
     /// `owner_signature` explicitly carries `(owner_pub, signed_payload, sig_r, sig_s)`.
-    #[allow(clippy::type_complexity)]
     GetCiphertextShard {
         shard_id: ShardId,
-        owner_signature: Option<([u8; 32], Vec<u8>, [u8; 32], [u8; 32])>,
+        owner_signature: Option<OwnerShardSignature>,
         repair_proof: Option<(RepairGrant, Vec<WitnessFailureReceipt>)>,
     },
     /// Phase 2-4: Store an anonymized `BlindedShardId` with a single-use `AnonymousQuotaVoucher` and Byte-Epoch lease.

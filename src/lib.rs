@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 pub mod admin_rpc;
 pub mod bootstrap;
 pub mod capabilities;
@@ -5,6 +7,8 @@ pub mod config;
 pub mod crypto;
 pub mod gateway;
 pub mod network;
+#[cfg(unix)]
+pub mod os_sys;
 pub mod por;
 pub mod router_nas;
 pub mod sharding;

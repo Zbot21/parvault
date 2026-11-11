@@ -81,22 +81,7 @@ impl GracefulDepartureReceipt {
     ) -> Self {
         let departing_peer_id = identity.device_peer_id();
         let departing_pubkey = identity.public_key_bytes();
-        let msg = Self::canonical_bytes(
-            &departing_peer_id,
-            &departing_pubkey,
-            migrated_shards_count,
-            migrated_blinded_shards_count,
-            total_bytes_handed_off,
-            &handoff_manifest_sha256,
-            true,
-            departure_timestamp_ms,
-        );
-        let sig = identity.sign(&msg);
-        let mut sig_r = [0u8; 32];
-        let mut sig_s = [0u8; 32];
-        sig_r.copy_from_slice(&sig[..32]);
-        sig_s.copy_from_slice(&sig[32..]);
-        Self {
+        let mut receipt = Self {
             departing_peer_id,
             departing_pubkey,
             migrated_shards_count,
@@ -105,54 +90,64 @@ impl GracefulDepartureReceipt {
             handoff_manifest_sha256,
             earned_standing_preserved: true,
             departure_timestamp_ms,
-            sig_r,
-            sig_s,
-        }
+            sig_r: [0u8; 32],
+            sig_s: [0u8; 32],
+        };
+        let msg = receipt.canonical_bytes();
+        let sig = identity.sign(&msg);
+        receipt.sig_r.copy_from_slice(&sig[..32]);
+        receipt.sig_s.copy_from_slice(&sig[32..]);
+        receipt
     }
 
     pub fn verify_signature(&self) -> bool {
-        let msg = Self::canonical_bytes(
-            &self.departing_peer_id,
-            &self.departing_pubkey,
-            self.migrated_shards_count,
-            self.migrated_blinded_shards_count,
-            self.total_bytes_handed_off,
-            &self.handoff_manifest_sha256,
-            self.earned_standing_preserved,
-            self.departure_timestamp_ms,
-        );
+        let msg = self.canonical_bytes();
         let mut sig = [0u8; 64];
         sig[..32].copy_from_slice(&self.sig_r);
         sig[32..].copy_from_slice(&self.sig_s);
         NodeIdentity::verify_with_pubkey(&self.departing_pubkey, &msg, &sig)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn canonical_bytes(
-        departing_peer_id: &str,
-        departing_pubkey: &[u8; 32],
-        migrated_shards_count: usize,
-        migrated_blinded_shards_count: usize,
-        total_bytes_handed_off: u64,
-        handoff_manifest_sha256: &[u8; 32],
-        earned_standing_preserved: bool,
-        departure_timestamp_ms: u64,
-    ) -> Vec<u8> {
+    fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(160);
         buf.extend_from_slice(b"parvault-graceful-departure-v1:");
-        buf.extend_from_slice(departing_peer_id.as_bytes());
-        buf.extend_from_slice(departing_pubkey);
-        buf.extend_from_slice(&(migrated_shards_count as u64).to_be_bytes());
-        buf.extend_from_slice(&(migrated_blinded_shards_count as u64).to_be_bytes());
-        buf.extend_from_slice(&total_bytes_handed_off.to_be_bytes());
-        buf.extend_from_slice(handoff_manifest_sha256);
-        buf.push(u8::from(earned_standing_preserved));
-        buf.extend_from_slice(&departure_timestamp_ms.to_be_bytes());
+        buf.extend_from_slice(self.departing_peer_id.as_bytes());
+        buf.extend_from_slice(&self.departing_pubkey);
+        buf.extend_from_slice(&(self.migrated_shards_count as u64).to_be_bytes());
+        buf.extend_from_slice(&(self.migrated_blinded_shards_count as u64).to_be_bytes());
+        buf.extend_from_slice(&self.total_bytes_handed_off.to_be_bytes());
+        buf.extend_from_slice(&self.handoff_manifest_sha256);
+        buf.push(u8::from(self.earned_standing_preserved));
+        buf.extend_from_slice(&self.departure_timestamp_ms.to_be_bytes());
         buf
     }
 }
 
-/// Unique content-addressed identifier for an individual Reed-Solomon shard.
+/// Byte-Epoch lease and deletion-verifier parameters attached to an anonymized `.bshard` upload
+/// (`ADR-11` + `ADR-13`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlindedLeaseSpec {
+    pub current_epoch: u64,
+    pub lease_duration_epochs: u64,
+    pub delete_verifier: [u8; 32],
+}
+
+impl BlindedLeaseSpec {
+    #[inline]
+    pub const fn new(
+        current_epoch: u64,
+        lease_duration_epochs: u64,
+        delete_verifier: [u8; 32],
+    ) -> Self {
+        Self {
+            current_epoch,
+            lease_duration_epochs,
+            delete_verifier,
+        }
+    }
+}
+
+///Unique content-addressed identifier for an individual Reed-Solomon shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ShardId {
     pub stripe_merkle_root: Hash32,
@@ -933,16 +928,13 @@ impl BlockStore {
             capability,
             voucher,
             nullifier_ledger,
-            1,
-            30,
-            [0u8; 32],
+            BlindedLeaseSpec::new(1, 30, [0u8; 32]),
         )
     }
 
     /// Persists an anonymized `BlindedShardId` to `{locator}.bshard` on disk with an explicit
-    /// Byte-Epoch lease (`current_epoch + lease_duration_epochs`) and `delete_verifier` (`ADR-11` + `ADR-13`).
+    /// Byte-Epoch lease (`lease.current_epoch + lease.lease_duration_epochs`) and `delete_verifier` (`ADR-11` + `ADR-13`).
     /// If disk capacity is reached, automatically evicts and physically unlinks expired `.bshard` files on disk.
-    #[allow(clippy::too_many_arguments)]
     pub fn put_blinded_shard_with_lease(
         &self,
         blinded_id: &BlindedShardId,
@@ -950,10 +942,13 @@ impl BlockStore {
         capability: BlindedShardCapability,
         voucher: &AnonymousQuotaVoucher,
         nullifier_ledger: &mut VoucherNullifierLedger,
-        current_epoch: u64,
-        lease_duration_epochs: u64,
-        delete_verifier: [u8; 32],
+        lease: BlindedLeaseSpec,
     ) -> Result<PathBuf, StorageError> {
+        let BlindedLeaseSpec {
+            current_epoch,
+            lease_duration_epochs,
+            delete_verifier,
+        } = lease;
         if capability.locator != blinded_id.locator {
             return Err(StorageError::QuotaExceeded(
                 "mismatched_blinded_capability_locator".into(),
@@ -1586,9 +1581,7 @@ impl BlockStore {
                             bytes.clone(),
                             capability,
                             voucher,
-                            1,
-                            30,
-                            delete_verifier,
+                            BlindedLeaseSpec::new(1, 30, delete_verifier),
                         )
                         .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
                 }

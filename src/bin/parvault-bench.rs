@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use clap::{Parser, Subcommand};
 use parvault::{
     config::ErasureTier,
@@ -54,23 +56,23 @@ enum BenchCommand {
 struct ProcMemSnapshot {
     vm_rss_kib: u64,
     vm_hwm_kib: u64,
-    ru_maxrss_kib: u64,
+    cpu_time_ns: u64,
 }
 
 impl ProcMemSnapshot {
     fn capture() -> Self {
-        let mut snap = Self::default();
-        if let Ok(status) = fs::read_to_string("/proc/self/status") {
-            for line in status.lines() {
-                if let Some(rest) = line.strip_prefix("VmRSS:") {
-                    snap.vm_rss_kib = parse_kib_field(rest);
-                } else if let Some(rest) = line.strip_prefix("VmHWM:") {
-                    snap.vm_hwm_kib = parse_kib_field(rest);
-                }
+        #[cfg(unix)]
+        {
+            Self {
+                vm_rss_kib: parvault::os_sys::read_self_rss_bytes() / 1024,
+                vm_hwm_kib: parvault::os_sys::read_self_hwm_bytes() / 1024,
+                cpu_time_ns: parvault::os_sys::process_cpu_time_ns(),
             }
         }
-        snap.ru_maxrss_kib = query_rusage_maxrss_kib().max(snap.vm_hwm_kib);
-        snap
+        #[cfg(not(unix))]
+        {
+            Self::default()
+        }
     }
 
     fn rss_mib(self) -> f64 {
@@ -80,78 +82,6 @@ impl ProcMemSnapshot {
     fn hwm_mib(self) -> f64 {
         self.vm_hwm_kib as f64 / 1024.0
     }
-}
-
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn trim_allocs() {
-    extern "C" {
-        fn malloc_trim(pad: usize) -> i32;
-    }
-    // SAFETY: `malloc_trim(0)` releases free glibc heap arenas back to the OS kernel so `VmRSS`
-    // measures live resident allocations rather than unmapped allocator cache pages.
-    unsafe {
-        let _ = malloc_trim(0);
-    }
-}
-
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn trim_allocs() {}
-
-fn parse_kib_field(s: &str) -> u64 {
-    s.split_whitespace()
-        .next()
-        .and_then(|tok| tok.parse::<u64>().ok())
-        .unwrap_or(0)
-}
-
-#[cfg(unix)]
-fn query_rusage_maxrss_kib() -> u64 {
-    #[repr(C)]
-    #[derive(Default)]
-    struct Timeval {
-        tv_sec: i64,
-        tv_usec: i64,
-    }
-
-    #[repr(C)]
-    #[derive(Default)]
-    struct Rusage {
-        ru_utime: Timeval,
-        ru_stime: Timeval,
-        ru_maxrss: i64,
-        ru_ixrss: i64,
-        ru_idrss: i64,
-        ru_isrss: i64,
-        ru_minflt: i64,
-        ru_majflt: i64,
-        ru_nswap: i64,
-        ru_inblock: i64,
-        ru_oublock: i64,
-        ru_msgsnd: i64,
-        ru_msgrcv: i64,
-        ru_nsignals: i64,
-        ru_nvcsw: i64,
-        ru_nivcsw: i64,
-    }
-
-    extern "C" {
-        fn getrusage(who: i32, usage: *mut Rusage) -> i32;
-    }
-
-    const RUSAGE_SELF: i32 = 0;
-    let mut usage = Rusage::default();
-    // SAFETY: `Rusage` matches the Linux LP64 `struct rusage` layout and is zero-initialized.
-    let rc = unsafe { getrusage(RUSAGE_SELF, &mut usage) };
-    if rc == 0 && usage.ru_maxrss > 0 {
-        usage.ru_maxrss as u64
-    } else {
-        0
-    }
-}
-
-#[cfg(not(unix))]
-fn query_rusage_maxrss_kib() -> u64 {
-    0
 }
 
 fn unique_bench_temp_dir() -> PathBuf {
@@ -182,7 +112,6 @@ fn run_streaming_profile(
     stripe_size_bytes: usize,
     payload_mib: usize,
 ) -> anyhow::Result<StreamingRunMetrics> {
-    trim_allocs();
     let mem_baseline = ProcMemSnapshot::capture();
     let bench_dir = unique_bench_temp_dir();
     let safe_label = profile_name.to_lowercase().replace([' ', '/', '-'], "_");
@@ -208,7 +137,6 @@ fn run_streaming_profile(
     }
 
     let input_sha256 = compute_file_sha256_streaming(&input_path)?;
-    trim_allocs();
     let mem_after_input_gen = ProcMemSnapshot::capture();
 
     let quota = QuotaManager::new(10 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
@@ -225,14 +153,12 @@ fn run_streaming_profile(
     )?;
     let store_elapsed = store_start.elapsed();
     let store_mib_s = (payload_mib as f64) / store_elapsed.as_secs_f64();
-    trim_allocs();
     let mem_after_store = ProcMemSnapshot::capture();
 
     let restore_start = Instant::now();
     store.restore_file_streaming(&manifest, &master_key, &output_path)?;
     let restore_elapsed = restore_start.elapsed();
     let restore_mib_s = (payload_mib as f64) / restore_elapsed.as_secs_f64();
-    trim_allocs();
     let mem_after_restore = ProcMemSnapshot::capture();
 
     let restored_sha256 = compute_file_sha256_streaming(&output_path)?;
@@ -271,7 +197,7 @@ fn main() -> anyhow::Result<()> {
     println!(" Streaming Payload : {} MiB", payload_mib);
     println!(" Selected Profile  : {}", cli.profile);
     println!(
-        " Memory Telemetry  : Linux /proc/self/status (VmRSS, VmHWM) + getrusage(RUSAGE_SELF)"
+        " Memory Telemetry  : Linux /proc/self/status (VmRSS, VmHWM) + CLOCK_PROCESS_CPUTIME_ID"
     );
     println!("================================================================================");
     println!();
@@ -542,38 +468,42 @@ fn main() -> anyhow::Result<()> {
             "#### Checkpoint Breakdown: {} (`{}` Stripes)",
             res.profile_name, stripe_label
         );
-        println!("| Measurement Checkpoint | `VmRSS` (Resident) | `VmHWM` / `ru_maxrss` (Peak) | Throughput |");
-        println!("| :--- | :---: | :---: | :---: |");
+        println!("| Measurement Checkpoint | `VmRSS` (Resident) | `VmHWM` (Peak) | CPU Time (`ms`) | Throughput |");
+        println!("| :--- | :---: | :---: | :---: | :---: |");
         println!(
-            "| **Process Baseline (Startup)** | `{:.2} MiB` (`{} KiB`) | `{:.2} MiB` (`{} KiB`) | — |",
+            "| **Process Baseline (Startup)** | `{:.2} MiB` (`{} KiB`) | `{:.2} MiB` (`{} KiB`) | `{:.2} ms` | — |",
             res.mem_baseline.rss_mib(),
             res.mem_baseline.vm_rss_kib,
             res.mem_baseline.hwm_mib(),
-            res.mem_baseline.vm_hwm_kib
+            res.mem_baseline.vm_hwm_kib,
+            res.mem_baseline.cpu_time_ns as f64 / 1_000_000.0
         );
         println!(
-            "| **After `{payload_mib} MiB` Chunked Setup** | `{:.2} MiB` (`{} KiB`) | `{:.2} MiB` (`{} KiB`) | — |",
+            "| **After `{payload_mib} MiB` Chunked Setup** | `{:.2} MiB` (`{} KiB`) | `{:.2} MiB` (`{} KiB`) | `{:.2} ms` | — |",
             res.mem_after_input_gen.rss_mib(),
             res.mem_after_input_gen.vm_rss_kib,
             res.mem_after_input_gen.hwm_mib(),
-            res.mem_after_input_gen.vm_hwm_kib
+            res.mem_after_input_gen.vm_hwm_kib,
+            res.mem_after_input_gen.cpu_time_ns as f64 / 1_000_000.0
         );
         println!(
-            "| **After `store_file_streaming` (`{} x {}`, `16-of-20`)** | `{:.2} MiB` (`{} KiB`) | **`{:.2} MiB`** (`{} KiB`) | **`{:.1} MiB/s`** |",
+            "| **After `store_file_streaming` (`{} x {}`, `16-of-20`)** | `{:.2} MiB` (`{} KiB`) | **`{:.2} MiB`** (`{} KiB`) | `{:.2} ms` | **`{:.1} MiB/s`** |",
             res.num_stripes,
             stripe_label,
             res.mem_after_store.rss_mib(),
             res.mem_after_store.vm_rss_kib,
             res.mem_after_store.hwm_mib(),
             res.mem_after_store.vm_hwm_kib,
+            res.mem_after_store.cpu_time_ns as f64 / 1_000_000.0,
             res.store_mib_s
         );
         println!(
-            "| **After `restore_file_streaming` + SHA-256 Verify** | `{:.2} MiB` (`{} KiB`) | `{:.2} MiB` (`{} KiB`) | **`{:.1} MiB/s`** |",
+            "| **After `restore_file_streaming` + SHA-256 Verify** | `{:.2} MiB` (`{} KiB`) | `{:.2} MiB` (`{} KiB`) | `{:.2} ms` | **`{:.1} MiB/s`** |",
             res.mem_after_restore.rss_mib(),
             res.mem_after_restore.vm_rss_kib,
             res.mem_after_restore.hwm_mib(),
             res.mem_after_restore.vm_hwm_kib,
+            res.mem_after_restore.cpu_time_ns as f64 / 1_000_000.0,
             res.restore_mib_s
         );
         println!();

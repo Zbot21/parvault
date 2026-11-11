@@ -262,8 +262,7 @@ fn test_lite_client_seed_syndication_nas_death_failover_and_selective_partial_re
         .restore_file_byte_range(
             &snapshot,
             "media/archive.bin",
-            100,
-            256,
+            (100, 256),
             Some(&laptop_cert),
             None,
             &surviving_16_mesh_refs,
@@ -303,8 +302,7 @@ fn test_lite_client_seed_syndication_nas_death_failover_and_selective_partial_re
         .restore_file_byte_range(
             &snapshot,
             "src/engine.rs",
-            0,
-            src_bytes.len() as u64,
+            (0, src_bytes.len() as u64),
             Some(&laptop_cert),
             None,
             &post_leave_16_refs,

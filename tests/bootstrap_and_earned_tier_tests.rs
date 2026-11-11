@@ -739,9 +739,7 @@ fn test_mechanism6_blockstore_physical_file_deletion_over_time_on_lease_expiry_a
             cap_x,
             &voucher_x,
             &mut nullifier_ledger,
-            1,
-            5,
-            verifier_x,
+            parvault::storage::BlindedLeaseSpec::new(1, 5, verifier_x),
         )
         .expect("store shard_x at epoch 1");
     assert!(
@@ -765,9 +763,7 @@ fn test_mechanism6_blockstore_physical_file_deletion_over_time_on_lease_expiry_a
             cap_y,
             &voucher_y,
             &mut nullifier_ledger,
-            1,
-            5,
-            verifier_y,
+            parvault::storage::BlindedLeaseSpec::new(1, 5, verifier_y),
         )
         .expect("store shard_y at epoch 1");
     assert!(

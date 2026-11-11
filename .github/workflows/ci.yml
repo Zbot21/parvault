@@ -16,6 +16,24 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Harden apt-get mirrors with retry fallback
+        run: |
+          for attempt in 1 2 3 4; do
+            if sudo apt-get update -o Acquire::Retries=5; then
+              break
+            fi
+            if [ "$attempt" -eq 4 ]; then
+              echo "apt-get update failed after 4 attempts" >&2
+              exit 1
+            fi
+            echo "apt-get update attempt ${attempt} failed; rewriting flaky azure/mirror+file sources to https://archive.ubuntu.com/ubuntu ..."
+            sudo find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) -exec sed -i \
+              -e 's|http://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+              -e 's|https://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+              -e 's|mirror+file:/etc/apt/apt-mirrors\.txt|https://archive.ubuntu.com/ubuntu|g' {} + || true
+            sudo rm -rf /var/lib/apt/lists/*
+            sleep $((attempt * 3))
+          done
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -48,10 +66,28 @@ jobs:
         run: USE_GLIBC_IMAGE=1 bash scripts/docker_acceptance_gate.sh
 
   kani-bounded-model-check:
-    name: Kani Rust Bounded Model Checking (13 Symbolic Harnesses)
+    name: Kani Rust Bounded Model Checking (15 Symbolic Harnesses)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Harden apt-get mirrors before Kani installation
+        run: |
+          for attempt in 1 2 3 4; do
+            if sudo apt-get update -o Acquire::Retries=5; then
+              break
+            fi
+            if [ "$attempt" -eq 4 ]; then
+              echo "apt-get update failed after 4 attempts" >&2
+              exit 1
+            fi
+            echo "apt-get update attempt ${attempt} failed; rewriting flaky azure/mirror+file sources to https://archive.ubuntu.com/ubuntu ..."
+            sudo find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) -exec sed -i \
+              -e 's|http://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+              -e 's|https://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+              -e 's|mirror+file:/etc/apt/apt-mirrors\.txt|https://archive.ubuntu.com/ubuntu|g' {} + || true
+            sudo rm -rf /var/lib/apt/lists/*
+            sleep $((attempt * 3))
+          done
       - uses: model-checking/kani-github-action@v1
 
   tla-model-check:

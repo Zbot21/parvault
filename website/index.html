@@ -264,7 +264,7 @@
     <div class="topbar-inner">
       <div class="brand">
         <strong>parvault(1) / Neighborhood Cloud</strong>
-        <span class="ver">v0.3.0 &bull; static-musl &bull; AGPL-3.0-only</span>
+        <span class="ver">v0.4.0 &bull; static-musl &bull; AGPL-3.0-only</span>
       </div>
       <nav class="topnav">
         <a href="#downloads">[downloads]</a>
@@ -287,7 +287,7 @@
         </p>
         <ul class="spec-list">
           <li><strong>Zero-IP Auto-Discovery &amp; 4-Word Pairing:</strong> Home LAN nodes and routers auto-discover via signed UDP beacons (port <code>4009</code>). Pair devices in seconds with a 4-word BIP-39 code (<code>parvault pair</code> / <code>parvault join</code>)—<strong>zero IP addresses to type</strong>.</li>
-          <li><strong>Router-SoC Profile (1 MiB Stripes):</strong> With <code>--profile router-soc</code>, transient memory peaks at <code>9.4 MiB</code> VmHWM inside a <code>32–48 MiB</code> cgroup, enabling turnkey Cloud-NAS appliances on OpenWrt and prplOS gateway routers.</li>
+          <li><strong>Router-SoC Profile (1 MiB Stripes):</strong> With <code>--profile router-soc</code>, transient memory peaks at <code>9.72 MiB</code> VmHWM inside a <code>32–48 MiB</code> cgroup, enabling turnkey Cloud-NAS appliances on OpenWrt and prplOS gateway routers.</li>
           <li><strong>Encrypt-Before-Shard (Post-Quantum):</strong> Sealed client-side with a <code>512-bit</code> cascaded key (<code>ChaCha20-Poly1305 &rarr; AES-256-GCM</code>) plus <strong>NIST FIPS 203 ML-KEM-768</strong> and <strong>FIPS 204 ML-DSA-65</strong> before erasure coding.</li>
           <li><strong>GF(2<sup>8</sup>) Reed-Solomon Erasure Coding:</strong> Splits ciphertext into <code>N</code> shards where any <code>K</code> reconstruct the file (<code>2-of-3</code> personal ring, <code>10-of-20</code> probationary pool, <code>16-of-20</code> earned high-uptime homelab pool at <code>80%</code> efficiency).</li>
           <li><strong>4-Layer Blinded Shards:</strong> Remote disks store only opaque <code>.bshard</code> files keyed by <code>HMAC-SHA256</code> blinded locators (&ge; <code>2<sup>224.8</sup></code> combinatorial wall).</li>
@@ -304,7 +304,7 @@
             <tr>
               <th>Binary / Target</th>
               <th>Arch</th>
-              <th>SoC / Std</th>
+              <th>Stripped SoC</th>
               <th>Role</th>
             </tr>
           </thead>
@@ -312,26 +312,50 @@
             <tr>
               <td class="mono"><a href="https://github.com/Zbot21/parvault/releases/latest/download/parvault-x86_64-unknown-linux-musl" data-bin="parvault-x86_64-unknown-linux-musl">parvault-linux-x86_64</a></td>
               <td class="mono">x86_64</td>
-              <td class="mono">7.5 / 17 MiB</td>
+              <td class="mono">7.52 MiB</td>
               <td>Client &amp; folder-sync daemon</td>
             </tr>
             <tr>
               <td class="mono"><a href="https://github.com/Zbot21/parvault/releases/latest/download/parvault-aarch64-unknown-linux-musl" data-bin="parvault-aarch64-unknown-linux-musl">parvault-linux-aarch64</a></td>
               <td class="mono">ARM64</td>
-              <td class="mono">5.8 / 16 MiB</td>
+              <td class="mono">5.89 MiB</td>
               <td>Router-SoC &amp; ARM64 daemon</td>
             </tr>
             <tr>
               <td class="mono"><a href="https://github.com/Zbot21/parvault/releases/latest/download/parvault-seed-x86_64-unknown-linux-musl" data-bin="parvault-seed-x86_64-unknown-linux-musl">parvault-seed-x86_64</a></td>
               <td class="mono">x86_64</td>
-              <td class="mono">5.3 / 16 MiB</td>
-              <td>Headless NAS / seed vault server</td>
+              <td class="mono">5.35 MiB</td>
+              <td>Headless NAS / <code>--no-fs</code> seed server</td>
             </tr>
             <tr>
               <td class="mono"><a href="https://github.com/Zbot21/parvault/releases/latest/download/parvault-seed-aarch64-unknown-linux-musl" data-bin="parvault-seed-aarch64-unknown-linux-musl">parvault-seed-aarch64</a></td>
               <td class="mono">ARM64</td>
-              <td class="mono">4.1 / 15 MiB</td>
+              <td class="mono">4.20 MiB</td>
               <td>Headless RPi / gateway seed server</td>
+            </tr>
+            <tr>
+              <td class="mono"><a href="https://github.com/Zbot21/parvault/releases/latest/download/parvault-gateway-x86_64-unknown-linux-musl" data-bin="parvault-gateway-x86_64-unknown-linux-musl">parvault-gateway-x86_64</a></td>
+              <td class="mono">x86_64</td>
+              <td class="mono">3.80 MiB</td>
+              <td>Zero-copy UDS <code>memfd</code> &amp; 40-lane gateway</td>
+            </tr>
+            <tr>
+              <td class="mono"><a href="https://github.com/Zbot21/parvault/releases/latest/download/parvault-gateway-aarch64-unknown-linux-musl" data-bin="parvault-gateway-aarch64-unknown-linux-musl">parvault-gateway-aarch64</a></td>
+              <td class="mono">ARM64</td>
+              <td class="mono">3.07 MiB</td>
+              <td>CPE UDS <code>memfd</code> &amp; 40-lane gateway</td>
+            </tr>
+            <tr>
+              <td class="mono"><a href="https://github.com/Zbot21/parvault/releases/latest/download/parvault-fuse-x86_64-unknown-linux-musl" data-bin="parvault-fuse-x86_64-unknown-linux-musl">parvault-fuse-x86_64</a></td>
+              <td class="mono">x86_64</td>
+              <td class="mono">3.62 MiB</td>
+              <td>Lazy <code>/dev/fuse</code> &amp; WebDAV VFS client</td>
+            </tr>
+            <tr>
+              <td class="mono"><a href="https://github.com/Zbot21/parvault/releases/latest/download/parvault-fuse-aarch64-unknown-linux-musl" data-bin="parvault-fuse-aarch64-unknown-linux-musl">parvault-fuse-aarch64</a></td>
+              <td class="mono">ARM64</td>
+              <td class="mono">2.88 MiB</td>
+              <td>ARM64 lazy <code>/dev/fuse</code> &amp; WebDAV VFS</td>
             </tr>
           </tbody>
         </table>
@@ -357,7 +381,7 @@
       <span class="sec-num">man parvault(1)</span>
     </h2>
     <p>
-      In v0.3.0, you never need to type or look up IP addresses on your home LAN or router NAS. Initialize with a 24-word recovery phrase, turn on appliance mode with <code>parvault up</code>, auto-discover peers via signed beacons, and pair laptops with a 4-word code.
+      In v0.4.0, you never need to type or look up IP addresses on your home LAN or router NAS. Initialize with a 24-word recovery phrase, turn on appliance mode with <code>parvault up</code>, auto-discover peers via signed beacons, and pair laptops with a 4-word code.
     </p>
 
     <div class="two-col">
@@ -510,21 +534,21 @@
           <td class="ok">PASS (Stages 1–12 SHA-256 Match)</td>
         </tr>
         <tr>
-          <td><strong>Automated Rust &amp; Live <code>libp2p</code> Suites</strong> (<code>cargo test --release</code>)</td>
-          <td>Live OS-socket <code>libp2p</code> TCP + Noise XX + Yamux daemons, Zero-Key-On-VPS <code>admin_rpc</code>, 4-word SAS pairing, Router-SoC <code>1 MiB</code> streaming, and Byzantine red-team harnesses</td>
-          <td class="mono"><strong>112 / 112</strong> automated Rust unit, integration, Stateright &amp; Red-Team tests passing</td>
+          <td><strong>Automated Rust, UDS Gateway &amp; Live <code>libp2p</code> Suites</strong> (<code>cargo test --release</code>)</td>
+          <td>Live OS-socket <code>libp2p</code> TCP + Noise XX + Yamux daemons, Zero-Key-On-VPS <code>admin_rpc</code>, zero-copy <code>memfd</code> <code>SCM_RIGHTS</code> IPC, lazy <code>/dev/fuse</code> VFS, 4-word SAS pairing, Router-SoC <code>1 MiB</code> streaming, and Byzantine red-team harnesses</td>
+          <td class="mono"><strong>122 / 122</strong> automated Rust unit, integration, Stateright &amp; Red-Team tests passing</td>
           <td class="ok">PASS (0 Bytes Lost)</td>
         </tr>
         <tr>
-          <td><strong>8-Profile Degraded Network &amp; SoC Matrix</strong> (<code>parvault-bench</code>)</td>
-          <td>64 MiB streaming benchmark across <code>Router-SoC</code> (<code>1 MiB</code> stripes) &amp; <code>Desktop</code> (<code>16 MiB</code> stripes), plus 15% packet loss Wi-Fi mesh &amp; 260 ms satellite profiles</td>
-          <td class="mono">Router-SoC VmHWM: <strong>9.36 MiB</strong> (&lt; 32 MiB) | <strong>81.9 MiB/s</strong> store / <strong>122.4 MiB/s</strong> restore</td>
+          <td><strong>8-Profile Degraded Network &amp; SoC Matrix</strong> (<code>parvault-bench</code> &amp; <code>parvault-gateway</code>)</td>
+          <td>64 MiB streaming benchmark across <code>Router-SoC</code> (<code>1 MiB</code> stripes) &amp; <code>Desktop</code> (<code>16 MiB</code> stripes), 64 MiB UDS <code>memfd</code> zero-copy IPC, plus 15% packet loss Wi-Fi mesh &amp; 260 ms satellite profiles</td>
+          <td class="mono">Router-SoC VmHWM: <strong>9.72 MiB</strong> (&lt; 32 MiB) | Gateway VmHWM: <strong>10.98 MiB</strong> | <strong>82.1 MiB/s</strong> store / <strong>127.4 MiB/s</strong> restore</td>
           <td class="ok">PASS (&lt; 32 MiB Budget)</td>
         </tr>
         <tr>
-          <td><strong>TLA+ Formal Specifications</strong> (<code>specs/*.tla</code>)</td>
-          <td>6 TLA+ models (Protocol + Adversarial Guards, Confidentiality/Trust, 4-Layer Anonymity, Post-Quantum HNDL, Elastic Bootstrap/Earned Tier, Lite-Client &amp; NAS-Death Failover)</td>
-          <td class="mono"><strong>6 / 6</strong> specs model-checked in CI via TLC + <strong>16,777,216</strong> exhaustive GF(2<sup>8</sup>)<sup>3</sup> triples</td>
+          <td><strong>Kani Bounded Model Checking &amp; TLA+ Specifications</strong> (<code>cargo kani</code> + <code>specs/*.tla</code>)</td>
+          <td><strong>15</strong> Kani Rust symbolic harnesses (AES nonce injectivity, GF(2<sup>8</sup>), Macaroon caveats, zero-<code>unsafe</code> FUSE header parser, <code>PinnedRingBudget</code>, quorum &amp; replay bounds) + <strong>7</strong> TLA+ TLC models (<code>4,467</code> distinct states)</td>
+          <td class="mono"><strong>15 / 15</strong> Kani symbolic harnesses + <strong>7 / 7</strong> TLA+ specs model-checked via TLC</td>
           <td class="ok">0 Errors / 0 Counterexamples</td>
         </tr>
       </tbody>

@@ -1,6 +1,6 @@
-# Embedding `parvault` as a Rust Library
+# Embedding `parvault` as a Rust Library (`v0.4.0`)
 
-`parvault` is architected as a dual-purpose crate: every subsystem powering the `parvault` and `parvault-seed` binaries is exposed through a clean, memory-bounded Rust library API (`src/lib.rs`) suitable for embedding inside backup agents, NAS appliances, ISP gateway daemons, and custom control planes.
+`parvault` is architected as a dual-purpose crate: every subsystem powering the `parvault`, `parvault-seed`, `parvault-gateway`, and `parvault-fuse` binaries is exposed through a clean, memory-bounded Rust library API (`src/lib.rs`, `#![deny(unsafe_code)]`) suitable for embedding inside backup agents, NAS appliances, ISP gateway daemons, and zero-key quorum control planes.
 
 ---
 
@@ -8,7 +8,7 @@
 
 ```toml
 [dependencies]
-parvault = { git = "https://github.com/Zbot21/parvault.git", tag = "v0.3.0" }
+parvault = { git = "https://github.com/Zbot21/parvault.git", tag = "v0.4.0" }
 anyhow = "1"
 ```
 
@@ -65,27 +65,81 @@ fn main() -> anyhow::Result<()> {
 
 ## 3. Selecting a Memory Profile (`Router-SoC` vs. `Desktop`)
 
-When embedding `parvault` inside constrained Linux containers, residential routers (`OpenWrt` / `prplOS`), or embedded ARM64 SBCs, select the `RouterSoc` hardware profile (`1 MiB` streaming stripes instead of `16 MiB` desktop stripes) to keep transient heap and `VmHWM` below `16 MiB`:
+When embedding `parvault` inside constrained Linux containers, residential routers (`OpenWrt` / `prplOS`), or embedded ARM64 SBCs, select the `HardwareProfile::RouterSoc` profile (`1 MiB` streaming stripes instead of `16 MiB` desktop stripes) to keep transient heap and `VmHWM` strictly bounded below `16 MiB`:
 
 ```rust
-use parvault::config::{HardwareProfile, SOC_ROUTER_STRIPE_SIZE_BYTES, STREAMING_STRIPE_SIZE_BYTES};
+use parvault::config::{
+    HardwareProfile, DEFAULT_STRIPE_SIZE_BYTES, ROUTER_SOC_STRIPE_SIZE_BYTES,
+};
 
 let profile = HardwareProfile::RouterSoc;
-assert_eq!(profile.stripe_size_bytes(), SOC_ROUTER_STRIPE_SIZE_BYTES); // 1 MiB (1,048,576 bytes)
-assert_eq!(HardwareProfile::Desktop.stripe_size_bytes(), STREAMING_STRIPE_SIZE_BYTES); // 16 MiB
+assert_eq!(profile.stripe_size_bytes(), ROUTER_SOC_STRIPE_SIZE_BYTES); // 1 MiB (1,048,576 bytes)
+assert_eq!(HardwareProfile::Desktop.stripe_size_bytes(), DEFAULT_STRIPE_SIZE_BYTES); // 16 MiB
 ```
 
 ---
 
-## 4. Key Public Modules
+## 4. Zero-Copy Shared-Memory IPC Gateway (`parvault::gateway`)
+
+Multi-tenant services and language-agnostic frontends can embed or speak directly to `parvault-gateway` over Unix Domain Sockets (`SCM_RIGHTS` + Linux `memfd_create`) with attenuated `CapabilityMacaroon` tokens:
+
+```rust
+use parvault::{
+    capabilities::{CapabilityMacaroon, Caveat},
+    gateway::{
+        create_memfd_sized, GatewayIpcClient, RetentionPolicy, DEFAULT_IPC_SOCKET_PATH,
+    },
+    os_sys::pread_full_or_eof,
+};
+use std::{fs::File, os::fd::AsRawFd};
+
+async fn gateway_roundtrip(root_key: &[u8; 32], payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let client = GatewayIpcClient::new(DEFAULT_IPC_SOCKET_PATH);
+    let manifest = client
+        .store_bytes(payload, RetentionPolicy::PermanentVault)
+        .await?;
+
+    let root_token = CapabilityMacaroon::mint(
+        root_key,
+        [0x11; 32],
+        [0x22; 32],
+        vec![Caveat::AllowedManifest(manifest.manifest_root)],
+    )?;
+    let read_token = root_token.attenuate(Caveat::ReadOnly)?;
+
+    let out_fd = create_memfd_sized("parvault-fetch", payload.len() as u64)?;
+    let out_file = File::from(out_fd);
+    client
+        .fetch_range_fd(
+            manifest,
+            0,
+            payload.len() as u64,
+            out_file.as_raw_fd(),
+            Some(read_token),
+        )
+        .await?;
+
+    let mut hydrated = vec![0u8; payload.len()];
+    let n = pread_full_or_eof(&out_file, 0, &mut hydrated)?;
+    hydrated.truncate(n);
+    Ok(hydrated)
+}
+```
+
+---
+
+## 5. Key Public Modules (`src/lib.rs`)
 
 | Module | Purpose |
 | :--- | :--- |
-| `parvault::crypto` | `MasterKey`, BIP-39 deterministic derivation, HKDF subkey isolation, and `NodeIdentity` (`Ed25519`). |
-| `parvault::pq_crypto` | Post-quantum hybrid `HybridKemKeypair` (`X25519 + ML-KEM-768`), `HybridPqSigningKeypair` (`Ed25519 + ML-DSA-65`), and `PqVaultMasterKey` (`AES-256-GCM` + `ChaCha20-Poly1305` cascaded AEAD). |
-| `parvault::erasure` | Streaming `GF(2^8)` Reed-Solomon encoder/reconstructor with pre-decoding Merkle shard quarantine. |
-| `parvault::storage` | Crash-safe `BlockStore` (`fsync` + atomic `rename`), `QuotaManager`, and `.bshard` blinded shard persistence. |
-| `parvault::sync` | `FolderSyncEngine` incremental directory delta scanner, `.parvaultignore` filtering, and encrypted catalog export/recovery. |
-| `parvault::discovery` | Signed LAN UDP beacons (`UDP 4009`), 4-word BIP-39 SAS pairing, and STUN-over-Noise WAN rendezvous. |
-| `parvault::eviction` | 4-vector keyed-HMAC privacy-preserving eviction (`eviction_index.bin`), `M-of-N` quorum verification, and multi-pass `0x00` shard wiping (`ADR-19`). |
+| `parvault::crypto` | `MasterKey`, BIP-39 deterministic derivation, HKDF subkey isolation, `NodeIdentity` (`Ed25519`), and `crypto::pqc` hybrid post-quantum `X-Wing` (`X25519 + ML-KEM-768`), `Ed25519 + ML-DSA-65`, and cascaded `AES-256-GCM + ChaCha20-Poly1305` sealing. |
+| `parvault::sharding` | Streaming `GF(2^8)` Reed-Solomon encoder/reconstructor (`4-of-6`, `16-of-20`, `20-of-40`) with pre-decoding BLAKE3 Merkle shard quarantine. |
+| `parvault::storage` | Crash-safe `BlockStore` (`fsync` + atomic `rename`), `QuotaManager`, `.bshard` blinded shard leases (`BlindedLeaseSpec`), and `storage::eviction` 4-vector keyed-HMAC privacy-preserving quorum takedowns (`ADR-19`). |
+| `parvault::gateway` | Canonical `GatewayEngine` (`40`-lane `128 KiB`-stack single-wave TTFB pool, `PinnedRingBudget<SLOTS>`), `GatewayIpcServer` / `GatewayIpcClient` (`SCM_RIGHTS` + `memfd`), and `EphemeralShardManifest` (`RetentionPolicy`). |
+| `parvault::capabilities` | Stateless `HMAC-SHA256` `CapabilityMacaroon` minting, caveat attenuation (`AllowedManifest`, `ByteRange`, `ExpiresAtUnixMs`, `ReadOnly`), and `< 1 ms` zero-DB RAM verification. |
+| `parvault::vfs` | Pure-Rust Linux FUSE `ABI 7.31` VFS inode table (`VirtualVaultFs`, `VfsStubNode`, `parse_fuse_in_header`, `parse_fuse_read_in`) with zero C `libfuse` dependency and zero `unsafe` blocks. |
+| `parvault::os_sys` | Audited Unix/Linux kernel boundary (`pread_full_or_eof`, `pwrite_all`, `create_memfd`, `sendmsg_scm_rights`, `recvmsg_scm_rights`, `adopt_fuse_dev_fd`, `process_cpu_time_ns`, `bind_reusable_udp_v4`). |
+| `parvault::sync` | `FolderSyncEngine` incremental directory delta scanner, `.parvaultignore` filtering, byte-range hydration, and encrypted catalog export/recovery. |
+| `parvault::network` | `libp2p` `Noise_XX + Yamux` Kademlia/RPC swarm, signed LAN UDP beacons (`UDP 4009`), 4-word BIP-39 SAS pairing, and STUN-over-Noise WAN rendezvous (`WanPeerCard`). |
 | `parvault::admin_rpc` | Forward-secret `X25519 + ChaCha20-Poly1305` + `Ed25519` challenge-authenticated wire protocol for zero-private-key-on-VPS seed administration. |
+| `parvault::telemetry` | Opt-in privacy-preserving `AnonymousTelemetryBeacon` (`ADR-15` coarse region, power-of-two GiB bucketing, epoch nullifiers, and Hashcash PoW). |

@@ -179,6 +179,16 @@ pub const fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
     diff == 0
 }
 
+/// Borrowed zero-allocation view over a [`CapabilityMacaroon`] used by in-RAM slice verifiers
+/// and Kani formal proof harnesses.
+#[derive(Debug, Clone, Copy)]
+pub struct MacaroonSliceView<'a> {
+    pub nonce_id: &'a [u8; 32],
+    pub issuer_fingerprint: &'a [u8; 32],
+    pub caveats: &'a [Caveat],
+    pub tag: &'a [u8; 32],
+}
+
 /// HMAC-SHA256 chained capability token enabling zero-knowledge, `< 1 ms` RAM-only authorization
 /// of constrained manifest and byte-range reads without sharing `MasterKey` or `root_key`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,13 +320,9 @@ impl CapabilityMacaroon {
 
     /// Zero-allocation slice-based Macaroon verifier parameterized by `root_prf` and `chain_prf`
     /// (`verify_in_ram` instantiates this with `HMAC-SHA256`).
-    #[allow(clippy::too_many_arguments)]
     pub fn verify_caveat_slice_in_ram_with<R, C>(
         root_key: &[u8; 32],
-        nonce_id: &[u8; 32],
-        issuer_fingerprint: &[u8; 32],
-        caveats: &[Caveat],
-        tag: &[u8; 32],
+        view: MacaroonSliceView<'_>,
         ctx: &AccessRequestContext,
         root_prf: R,
         chain_prf: C,
@@ -327,18 +333,18 @@ impl CapabilityMacaroon {
     {
         let expected_tag = Self::mint_slice_tag_with(
             root_key,
-            nonce_id,
-            issuer_fingerprint,
-            caveats,
+            view.nonce_id,
+            view.issuer_fingerprint,
+            view.caveats,
             root_prf,
             chain_prf,
         )?;
-        if !ct_eq_32(&expected_tag, tag) {
+        if !ct_eq_32(&expected_tag, view.tag) {
             return Err(CapabilityError::InvalidMacaroonTag);
         }
         let mut cidx = 0;
-        while cidx < caveats.len() {
-            if !caveats[cidx].allows(ctx) {
+        while cidx < view.caveats.len() {
+            if !view.caveats[cidx].allows(ctx) {
                 return Err(CapabilityError::CaveatRejected);
             }
             cidx += 1;
@@ -360,10 +366,12 @@ impl CapabilityMacaroon {
     {
         Self::verify_caveat_slice_in_ram_with(
             root_key,
-            &self.nonce_id,
-            &self.issuer_fingerprint,
-            self.caveats.as_slice(),
-            &self.tag,
+            MacaroonSliceView {
+                nonce_id: &self.nonce_id,
+                issuer_fingerprint: &self.issuer_fingerprint,
+                caveats: self.caveats.as_slice(),
+                tag: &self.tag,
+            },
             ctx,
             root_prf,
             chain_prf,
@@ -613,5 +621,83 @@ mod tests {
         let mut tampered = stmt.clone();
         tampered.noise_static_x25519_pubkey[0] ^= 0xFF;
         assert!(!tampered.verify(25_000));
+    }
+
+    #[test]
+    fn test_macaroon_with_helpers_exact_production_equivalence() {
+        let root_key = [0x5Au8; 32];
+        let nonce_id = [0x12u8; 32];
+        let issuer_fp = [0x34u8; 32];
+        let caveats = vec![
+            Caveat::AllowedManifest([0xAB; 32]),
+            Caveat::ByteRange {
+                offset: 512,
+                length: 8192,
+            },
+            Caveat::ExpiresAtUnixMs(99_000),
+            Caveat::ReadOnly,
+        ];
+
+        let prod = CapabilityMacaroon::mint(&root_key, nonce_id, issuer_fp, caveats.clone())
+            .expect("prod mint");
+        let via_with = CapabilityMacaroon::mint_with(
+            &root_key,
+            nonce_id,
+            issuer_fp,
+            caveats.clone(),
+            compute_root_macaroon_tag,
+            chain_caveat_tag,
+        )
+        .expect("mint_with");
+        assert_eq!(prod, via_with);
+
+        let slice_tag = CapabilityMacaroon::mint_slice_tag_with(
+            &root_key,
+            &nonce_id,
+            &issuer_fp,
+            &caveats,
+            compute_root_macaroon_tag,
+            chain_caveat_tag,
+        )
+        .expect("mint_slice_tag_with");
+        assert_eq!(slice_tag, prod.tag);
+
+        let ok_ctx = AccessRequestContext {
+            manifest_root: [0xAB; 32],
+            offset: 1024,
+            length: 2048,
+            now_unix_ms: 50_000,
+            is_write: false,
+        };
+        let bad_ctx = AccessRequestContext {
+            is_write: true,
+            ..ok_ctx
+        };
+        for ctx in [ok_ctx, bad_ctx] {
+            assert_eq!(
+                prod.verify_in_ram(&root_key, &ctx),
+                prod.verify_in_ram_with_mac(
+                    &root_key,
+                    &ctx,
+                    compute_root_macaroon_tag,
+                    chain_caveat_tag,
+                )
+            );
+            assert_eq!(
+                prod.verify_in_ram(&root_key, &ctx),
+                CapabilityMacaroon::verify_caveat_slice_in_ram_with(
+                    &root_key,
+                    MacaroonSliceView {
+                        nonce_id: &prod.nonce_id,
+                        issuer_fingerprint: &prod.issuer_fingerprint,
+                        caveats: &prod.caveats,
+                        tag: &prod.tag,
+                    },
+                    &ctx,
+                    compute_root_macaroon_tag,
+                    chain_caveat_tag,
+                )
+            );
+        }
     }
 }

@@ -113,6 +113,21 @@ impl TrackerOperatorCosignature {
     }
 }
 
+/// Borrowed zero-allocation slice view over a [`SignedBadActorEvictionOrder`] used by
+/// stack-allocated council quorum verification and Kani formal proof harnesses.
+#[derive(Debug, Clone, Copy)]
+pub struct EvictionOrderSliceView<'a> {
+    pub order_id: &'a [u8; 32],
+    pub target: &'a EvictionTarget,
+    pub reason_bytes: &'a [u8],
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub issuer_pubkey: &'a [u8; 32],
+    pub sig_r: &'a [u8; 32],
+    pub sig_s: &'a [u8; 32],
+    pub cosignatures: &'a [TrackerOperatorCosignature],
+}
+
 /// Cryptographically signed bad-actor or illegal-content eviction order (`ADR-19`)
 /// propagated across `parvault-seed` anchors and `parvault` storage daemons.
 /// Supports `M-of-N` Federated Public Tracker Council co-signatures via `cosignatures`.
@@ -131,6 +146,22 @@ pub struct SignedBadActorEvictionOrder {
 }
 
 impl SignedBadActorEvictionOrder {
+    /// Returns a borrowed zero-allocation [`EvictionOrderSliceView`] over this order.
+    #[inline]
+    pub fn as_slice_view(&self) -> EvictionOrderSliceView<'_> {
+        EvictionOrderSliceView {
+            order_id: &self.order_id,
+            target: &self.target,
+            reason_bytes: self.reason.as_bytes(),
+            issued_at_ms: self.issued_at_ms,
+            expires_at_ms: self.expires_at_ms,
+            issuer_pubkey: &self.issuer_pubkey,
+            sig_r: &self.sig_r,
+            sig_s: &self.sig_s,
+            cosignatures: &self.cosignatures,
+        }
+    }
+
     /// Strict majority `M-of-N` quorum threshold for Federated Public Tracker Councils (`ADR-19`):
     /// `1-of-1`, `2-of-2`, `2-of-3`, `3-of-4`, `3-of-5`, etc.
     pub const fn default_tracker_quorum_threshold(council_size: usize) -> usize {
@@ -280,17 +311,8 @@ impl SignedBadActorEvictionOrder {
 
     /// Zero-allocation stack-capable `M-of-N` quorum tally and expiry evaluator shared by
     /// `valid_council_signer_count_with`, `verify_against_quorum_with`, and Kani symbolic harnesses.
-    #[allow(clippy::too_many_arguments)]
     pub fn tally_and_verify_quorum_raw<F>(
-        order_id: &[u8; 32],
-        target: &EvictionTarget,
-        reason_bytes: &[u8],
-        issued_at_ms: u64,
-        expires_at_ms: u64,
-        issuer_pubkey: &[u8; 32],
-        sig_r: &[u8; 32],
-        sig_s: &[u8; 32],
-        cosignatures: &[TrackerOperatorCosignature],
+        order: EvictionOrderSliceView<'_>,
         trusted_council_pubkeys: &[[u8; 32]],
         min_quorum: usize,
         now_ms: u64,
@@ -299,6 +321,17 @@ impl SignedBadActorEvictionOrder {
     where
         F: Fn(&[u8; 32], &[u8], &[u8; 64]) -> bool,
     {
+        let EvictionOrderSliceView {
+            order_id,
+            target,
+            reason_bytes,
+            issued_at_ms,
+            expires_at_ms,
+            issuer_pubkey,
+            sig_r,
+            sig_s,
+            cosignatures,
+        } = order;
         if trusted_council_pubkeys.is_empty()
             || *issuer_pubkey == [0u8; 32]
             || reason_bytes.len() > MAX_EVICTION_REASON_BYTES
@@ -407,15 +440,7 @@ impl SignedBadActorEvictionOrder {
         F: Fn(&[u8; 32], &[u8], &[u8; 64]) -> bool,
     {
         Self::tally_and_verify_quorum_raw(
-            &self.order_id,
-            &self.target,
-            self.reason.as_bytes(),
-            self.issued_at_ms,
-            self.expires_at_ms,
-            &self.issuer_pubkey,
-            &self.sig_r,
-            &self.sig_s,
-            &self.cosignatures,
+            self.as_slice_view(),
             trusted_council_pubkeys,
             1,
             0,
@@ -460,15 +485,7 @@ impl SignedBadActorEvictionOrder {
             return false;
         }
         Self::tally_and_verify_quorum_raw(
-            &self.order_id,
-            &self.target,
-            self.reason.as_bytes(),
-            self.issued_at_ms,
-            self.expires_at_ms,
-            &self.issuer_pubkey,
-            &self.sig_r,
-            &self.sig_s,
-            &self.cosignatures,
+            self.as_slice_view(),
             trusted_council_pubkeys,
             min_quorum,
             now_ms,
@@ -741,25 +758,7 @@ impl VerifiableAbuseReport {
         let disclosed_master_key_hex = disclosed_master_key_hex.into().trim().to_string();
         let reporter_ed25519_pubkey = reporter_identity.public_key_bytes();
 
-        let msg = Self::encode_signing_payload(
-            &report_id,
-            submitted_at_ms,
-            &reporter_id_or_contact,
-            &legal_allegation,
-            reported_uploader_ip,
-            &manifest,
-            &disclosed_master_key_hex,
-            sample_stripe_index,
-            &sample_shards,
-            &reporter_ed25519_pubkey,
-        );
-        let sig = reporter_identity.sign(&msg);
-        let mut sig_r = [0u8; 32];
-        let mut sig_s = [0u8; 32];
-        sig_r.copy_from_slice(&sig[..32]);
-        sig_s.copy_from_slice(&sig[32..]);
-
-        Self {
+        let mut report = Self {
             report_id,
             submitted_at_ms,
             reporter_id_or_contact,
@@ -770,9 +769,14 @@ impl VerifiableAbuseReport {
             sample_stripe_index,
             sample_shards,
             reporter_ed25519_pubkey,
-            sig_r,
-            sig_s,
-        }
+            sig_r: [0u8; 32],
+            sig_s: [0u8; 32],
+        };
+        let msg = report.encode_signing_payload();
+        let sig = reporter_identity.sign(&msg);
+        report.sig_r.copy_from_slice(&sig[..32]);
+        report.sig_s.copy_from_slice(&sig[32..]);
+        report
     }
 
     /// Verifies the reporter's Ed25519 accountability signature and metadata bounds.
@@ -784,18 +788,7 @@ impl VerifiableAbuseReport {
         {
             return false;
         }
-        let msg = Self::encode_signing_payload(
-            &self.report_id,
-            self.submitted_at_ms,
-            &self.reporter_id_or_contact,
-            &self.legal_allegation,
-            self.reported_uploader_ip,
-            &self.manifest,
-            &self.disclosed_master_key_hex,
-            self.sample_stripe_index,
-            &self.sample_shards,
-            &self.reporter_ed25519_pubkey,
-        );
+        let msg = self.encode_signing_payload();
         let mut sig = [0u8; 64];
         sig[..32].copy_from_slice(&self.sig_r);
         sig[32..].copy_from_slice(&self.sig_s);
@@ -944,41 +937,30 @@ impl VerifiableAbuseReport {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn encode_signing_payload(
-        report_id: &[u8; 32],
-        submitted_at_ms: u64,
-        reporter_id_or_contact: &str,
-        legal_allegation: &str,
-        reported_uploader_ip: Option<IpAddr>,
-        manifest: &FileManifest,
-        disclosed_master_key_hex: &str,
-        sample_stripe_index: u64,
-        sample_shards: &[(u32, Vec<u8>)],
-        reporter_ed25519_pubkey: &[u8; 32],
-    ) -> Vec<u8> {
-        let manifest_digest = bincode::serialize(manifest)
+    fn encode_signing_payload(&self) -> Vec<u8> {
+        let manifest_digest = bincode::serialize(&self.manifest)
             .map(|raw| compute_sha256(&raw))
             .unwrap_or([0u8; 32]);
         let mut shards_hasher = Sha256::new();
-        shards_hasher.update((sample_shards.len() as u32).to_be_bytes());
-        for (idx, bytes) in sample_shards {
+        shards_hasher.update((self.sample_shards.len() as u32).to_be_bytes());
+        for (idx, bytes) in &self.sample_shards {
             shards_hasher.update(idx.to_be_bytes());
             shards_hasher.update((bytes.len() as u32).to_be_bytes());
             shards_hasher.update(bytes);
         }
         let shards_digest: [u8; 32] = shards_hasher.finalize().into();
 
-        let mut buf =
-            Vec::with_capacity(256 + reporter_id_or_contact.len() + legal_allegation.len());
+        let mut buf = Vec::with_capacity(
+            256 + self.reporter_id_or_contact.len() + self.legal_allegation.len(),
+        );
         buf.extend_from_slice(ABUSE_REPORT_DOMAIN);
-        buf.extend_from_slice(report_id);
-        buf.extend_from_slice(&submitted_at_ms.to_be_bytes());
-        buf.extend_from_slice(&(reporter_id_or_contact.len() as u32).to_be_bytes());
-        buf.extend_from_slice(reporter_id_or_contact.as_bytes());
-        buf.extend_from_slice(&(legal_allegation.len() as u32).to_be_bytes());
-        buf.extend_from_slice(legal_allegation.as_bytes());
-        match reported_uploader_ip {
+        buf.extend_from_slice(&self.report_id);
+        buf.extend_from_slice(&self.submitted_at_ms.to_be_bytes());
+        buf.extend_from_slice(&(self.reporter_id_or_contact.len() as u32).to_be_bytes());
+        buf.extend_from_slice(self.reporter_id_or_contact.as_bytes());
+        buf.extend_from_slice(&(self.legal_allegation.len() as u32).to_be_bytes());
+        buf.extend_from_slice(self.legal_allegation.as_bytes());
+        match self.reported_uploader_ip {
             None => buf.push(0x00),
             Some(IpAddr::V4(v4)) => {
                 buf.push(0x04);
@@ -989,13 +971,13 @@ impl VerifiableAbuseReport {
                 buf.extend_from_slice(&v6.octets());
             }
         }
-        buf.extend_from_slice(&manifest.file_merkle_root);
+        buf.extend_from_slice(&self.manifest.file_merkle_root);
         buf.extend_from_slice(&manifest_digest);
-        buf.extend_from_slice(&(disclosed_master_key_hex.len() as u32).to_be_bytes());
-        buf.extend_from_slice(disclosed_master_key_hex.as_bytes());
-        buf.extend_from_slice(&sample_stripe_index.to_be_bytes());
+        buf.extend_from_slice(&(self.disclosed_master_key_hex.len() as u32).to_be_bytes());
+        buf.extend_from_slice(self.disclosed_master_key_hex.as_bytes());
+        buf.extend_from_slice(&self.sample_stripe_index.to_be_bytes());
         buf.extend_from_slice(&shards_digest);
-        buf.extend_from_slice(reporter_ed25519_pubkey);
+        buf.extend_from_slice(&self.reporter_ed25519_pubkey);
         buf
     }
 }
@@ -1149,7 +1131,6 @@ impl PublicTrackerTakedownQueue {
     ///    and installing persistent tombstones, including any derived `BlindedLocator`s under the
     ///    disclosed `MasterKey`).
     /// 3. Marks the entry `TakedownReviewStatus::Approved` and persists `admin_takedown_queue.bin`.
-    #[allow(clippy::too_many_arguments)]
     pub fn approve_takedown(
         &mut self,
         report_id: &[u8; 32],
@@ -1355,7 +1336,6 @@ impl PublicTrackerTakedownQueue {
     /// 3. Executes `eviction_engine.apply_signed_eviction_order` locally (`0x00`-wiping shards and
     ///    installing HMAC firewall rules without writing plaintext IPs into `eviction_index.bin`)
     ///    and appends an `EmergencyAdminActionRecord` to `<data_dir>/admin_takedown_queue.bin`.
-    #[allow(clippy::too_many_arguments)]
     pub fn issue_emergency_admin_eviction(
         &mut self,
         admin_identity: &NodeIdentity,
@@ -3736,5 +3716,48 @@ mod tests {
         assert_eq!(local_purge.purged_regular_shards, 1);
         assert!(!store.has_shard(&local_sid));
         assert!(store.has_shard(&honest_sid));
+    }
+
+    #[test]
+    fn test_quorum_with_helpers_exact_production_equivalence() {
+        let c1 = NodeIdentity::generate();
+        let c2 = NodeIdentity::generate();
+        let c3 = NodeIdentity::generate();
+        let council = [
+            c1.public_key_bytes(),
+            c2.public_key_bytes(),
+            c3.public_key_bytes(),
+        ];
+
+        let mut order = SignedBadActorEvictionOrder::issue(
+            &c1,
+            EvictionTarget::StripeMerkleRoot([0x77; 32]),
+            "equivalence check",
+            10_000,
+            20_000,
+        );
+        assert!(order.add_cosignature(&c2));
+
+        let prod_count = order.valid_council_signer_count(&council);
+        let with_count =
+            order.valid_council_signer_count_with(&council, NodeIdentity::verify_with_pubkey);
+        let (raw_count, raw_ok_live) = SignedBadActorEvictionOrder::tally_and_verify_quorum_raw(
+            order.as_slice_view(),
+            &council,
+            2,
+            15_000,
+            NodeIdentity::verify_with_pubkey,
+        );
+        assert_eq!(prod_count, 2);
+        assert_eq!(prod_count, with_count);
+        assert_eq!(prod_count, raw_count);
+        assert_eq!(
+            order.verify_against_quorum(&council, 2, 15_000),
+            raw_ok_live
+        );
+        assert_eq!(
+            order.verify_against_quorum(&council, 2, 25_000),
+            order.verify_against_quorum_with(&council, 2, 25_000, NodeIdentity::verify_with_pubkey)
+        );
     }
 }

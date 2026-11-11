@@ -349,11 +349,10 @@ pub struct CachedNodeStatus {
     pub pq_kem_pubkey: Option<HybridKemPublicKey>,
 }
 
-#[allow(clippy::large_enum_variant)]
 enum SwarmCommand {
     SendRequest {
         peer_addr: String,
-        request: MeshWireRequest,
+        request: Box<MeshWireRequest>,
         timeout: Duration,
         reply_tx: mpsc::SyncSender<Result<MeshWireResponse, MeshClientError>>,
     },
@@ -397,9 +396,7 @@ struct PendingKadGet {
     reply_tx: mpsc::SyncSender<Vec<Vec<u8>>>,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn dispatch_rpc_on_established_peer(
-    swarm: &mut Swarm<MeshNetworkBehaviour>,
+struct OutboundRpcContext {
     peer_id: PeerId,
     peer_addr_raw: String,
     base_maddr: Multiaddr,
@@ -409,8 +406,24 @@ fn dispatch_rpc_on_established_peer(
     started_at: Instant,
     timeout: Duration,
     reply_tx: mpsc::SyncSender<Result<MeshWireResponse, MeshClientError>>,
+}
+
+fn dispatch_rpc_on_established_peer(
+    swarm: &mut Swarm<MeshNetworkBehaviour>,
+    ctx: OutboundRpcContext,
     inflight_requests: &mut HashMap<OutboundRequestId, InflightRpc>,
 ) {
+    let OutboundRpcContext {
+        peer_id,
+        peer_addr_raw,
+        base_maddr,
+        expected_peer_id,
+        request,
+        was_warm_reuse,
+        started_at,
+        timeout,
+        reply_tx,
+    } = ctx;
     if let MeshWireRequest::PutDhtEnvelope(ref env) = request {
         let dht_key = match env {
             DhtWireEnvelope::ClassicalManifest(m) => m.dht_key,
@@ -559,6 +572,7 @@ fn spawn_swarm_worker(
                                     timeout,
                                     reply_tx,
                                 } => {
+                                    let request = *request;
                                     let started_at = Instant::now();
                                     let (maddr, expected_peer_id) = match resolve_peer_multiaddr_async(&peer_addr).await {
                                         Ok(v) => v,
@@ -592,15 +606,17 @@ fn spawn_swarm_worker(
                                         if swarm.is_connected(&peer_id) {
                                             dispatch_rpc_on_established_peer(
                                                 &mut swarm,
-                                                peer_id,
-                                                peer_addr,
-                                                base_maddr,
-                                                expected_peer_id,
-                                                request,
-                                                true,
-                                                started_at,
-                                                timeout,
-                                                reply_tx,
+                                                OutboundRpcContext {
+                                                    peer_id,
+                                                    peer_addr_raw: peer_addr,
+                                                    base_maddr,
+                                                    expected_peer_id,
+                                                    request,
+                                                    was_warm_reuse: true,
+                                                    started_at,
+                                                    timeout,
+                                                    reply_tx,
+                                                },
                                                 &mut inflight_requests,
                                             );
                                             continue;
@@ -687,15 +703,17 @@ fn spawn_swarm_worker(
                                                     if pending.started_at.elapsed() <= pending.timeout {
                                                         dispatch_rpc_on_established_peer(
                                                             &mut swarm,
-                                                            peer_id,
-                                                            pending.peer_addr_raw,
-                                                            pending.base_maddr,
-                                                            pending.expected_peer_id,
-                                                            pending.request,
-                                                            false,
-                                                            pending.started_at,
-                                                            pending.timeout,
-                                                            pending.reply_tx,
+                                                            OutboundRpcContext {
+                                                                peer_id,
+                                                                peer_addr_raw: pending.peer_addr_raw,
+                                                                base_maddr: pending.base_maddr,
+                                                                expected_peer_id: pending.expected_peer_id,
+                                                                request: pending.request,
+                                                                was_warm_reuse: false,
+                                                                started_at: pending.started_at,
+                                                                timeout: pending.timeout,
+                                                                reply_tx: pending.reply_tx,
+                                                            },
                                                             &mut inflight_requests,
                                                         );
                                                     }
@@ -1293,7 +1311,7 @@ impl MeshClient {
         cmd_tx
             .send(SwarmCommand::SendRequest {
                 peer_addr: trimmed.to_string(),
-                request,
+                request: Box::new(request),
                 timeout,
                 reply_tx,
             })
@@ -1966,7 +1984,6 @@ impl MeshClient {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn put_blinded_shard(
         &self,
         peer_addr: &str,
@@ -1974,9 +1991,7 @@ impl MeshClient {
         shard_bytes: Vec<u8>,
         capability: BlindedShardCapability,
         voucher: AnonymousQuotaVoucher,
-        current_epoch: u64,
-        lease_duration_epochs: u64,
-        delete_verifier: [u8; 32],
+        lease: crate::storage::BlindedLeaseSpec,
     ) -> anyhow::Result<()> {
         match self.send_request(
             peer_addr,
@@ -1985,9 +2000,9 @@ impl MeshClient {
                 shard_bytes,
                 capability,
                 voucher,
-                current_epoch,
-                lease_duration_epochs,
-                delete_verifier,
+                current_epoch: lease.current_epoch,
+                lease_duration_epochs: lease.lease_duration_epochs,
+                delete_verifier: lease.delete_verifier,
             },
         )? {
             MeshWireResponse::PutBlindedShardAck { stored, error } => {
@@ -2170,7 +2185,6 @@ impl MeshClient {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn relay_pq_onion_envelope(
         &self,
         relay_peer_addr: &str,
@@ -2178,9 +2192,7 @@ impl MeshClient {
         envelope: PqRelayedShardEnvelope,
         capability: BlindedShardCapability,
         voucher: AnonymousQuotaVoucher,
-        current_epoch: u64,
-        lease_duration_epochs: u64,
-        delete_verifier: [u8; 32],
+        lease: crate::storage::BlindedLeaseSpec,
     ) -> anyhow::Result<()> {
         match self.send_request(
             relay_peer_addr,
@@ -2189,9 +2201,9 @@ impl MeshClient {
                 envelope,
                 capability,
                 voucher,
-                current_epoch,
-                lease_duration_epochs,
-                delete_verifier,
+                current_epoch: lease.current_epoch,
+                lease_duration_epochs: lease.lease_duration_epochs,
+                delete_verifier: lease.delete_verifier,
             },
         )? {
             MeshWireResponse::RelayPqOnionAck { delivered, error } => {
@@ -2238,9 +2250,7 @@ impl MeshClient {
             outer_envelope,
             dummy_capability,
             dummy_voucher,
-            0,
-            0,
-            [0u8; 32],
+            crate::storage::BlindedLeaseSpec::new(0, 0, [0u8; 32]),
         )
     }
 

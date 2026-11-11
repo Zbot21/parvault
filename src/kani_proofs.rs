@@ -17,12 +17,15 @@ use crate::admin_rpc::{
     validate_admin_rpc_frame_header, validate_admin_rpc_slice_replay_and_auth_meta,
     MAX_ADMIN_RPC_CLOCK_SKEW_MS, MAX_ADMIN_RPC_FRAME_BYTES, MAX_ADMIN_RPC_INITIAL_ALLOC_BYTES,
 };
-use crate::capabilities::{AccessRequestContext, CapabilityError, CapabilityMacaroon, Caveat};
+use crate::capabilities::{
+    AccessRequestContext, CapabilityError, CapabilityMacaroon, Caveat, MacaroonSliceView,
+};
 use crate::config::{
     compute_stripe_layout_for_size, ErasureTier, HardwareProfile, AES_GCM_TAG_OVERHEAD_BYTES,
     DEFAULT_STRIPE_SIZE_BYTES, MAX_FILE_BYTES, MIN_STRIPE_SIZE_BYTES,
     ROUTER_SOC_MAX_STRIPE_MEMORY_BYTES, ROUTER_SOC_STRIPE_SIZE_BYTES,
 };
+use crate::gateway::engine::PinnedRingBudget;
 use crate::gateway::ipc::{
     validate_ipc_frame_header, MAX_IPC_FRAME_BYTES, MAX_IPC_INITIAL_ALLOC_BYTES,
 };
@@ -30,11 +33,14 @@ use crate::sharding::reed_solomon::{
     compute_reed_solomon_shard_len, compute_stripe_memory_footprint_bytes,
 };
 use crate::storage::eviction::{
-    EvictionTarget, PrivacyPreservingEvictionEngine, SignedBadActorEvictionOrder,
-    TrackerOperatorCosignature,
+    EvictionOrderSliceView, EvictionTarget, PrivacyPreservingEvictionEngine,
+    SignedBadActorEvictionOrder, TrackerOperatorCosignature,
 };
 #[cfg(feature = "vfs")]
-use crate::vfs::compute_vfs_block_window;
+use crate::vfs::{
+    compute_vfs_block_window, parse_fuse_in_header, parse_fuse_read_in, FuseInHeader, FuseReadIn,
+    FUSE_IN_HEADER_BYTES, FUSE_READ_IN_BYTES,
+};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 fn symbolic_eviction_target_fixed() -> EvictionTarget {
@@ -173,15 +179,17 @@ fn proof_eviction_quorum_sub_threshold_and_duplicate_signer_rejected() {
 
     let now_ms: u64 = kani::any();
     let (tally, quorum_ok) = SignedBadActorEvictionOrder::tally_and_verify_quorum_raw(
-        &order_id,
-        &target,
-        b"k",
-        issued_at_ms,
-        expires_at_ms,
-        &issuer_pubkey,
-        &sig_r,
-        &sig_s,
-        &cosigs,
+        EvictionOrderSliceView {
+            order_id: &order_id,
+            target: &target,
+            reason_bytes: b"k",
+            issued_at_ms,
+            expires_at_ms,
+            issuer_pubkey: &issuer_pubkey,
+            sig_r: &sig_r,
+            sig_s: &sig_s,
+            cosignatures: &cosigs,
+        },
         &council,
         min_quorum,
         now_ms,
@@ -256,15 +264,17 @@ fn proof_eviction_quorum_authorized_distinct_signers_and_expiry() {
     let now_ms: u64 = kani::any();
     let is_expired = expires_at_ms != 0 && now_ms > expires_at_ms;
     let (tally, quorum_ok) = SignedBadActorEvictionOrder::tally_and_verify_quorum_raw(
-        &order_id,
-        &target,
-        &reason_a,
-        issued_at_ms,
-        expires_at_ms,
-        &issuer_pubkey,
-        &sig_r,
-        &sig_s,
-        &cosigs,
+        EvictionOrderSliceView {
+            order_id: &order_id,
+            target: &target,
+            reason_bytes: &reason_a,
+            issued_at_ms,
+            expires_at_ms,
+            issuer_pubkey: &issuer_pubkey,
+            sig_r: &sig_r,
+            sig_s: &sig_s,
+            cosignatures: &cosigs,
+        },
         &council,
         min_quorum,
         now_ms,
@@ -276,15 +286,17 @@ fn proof_eviction_quorum_authorized_distinct_signers_and_expiry() {
     let mut_order_id: [u8; 32] = kani::any();
     kani::assume(mut_order_id != order_id);
     let (_mut_tally, mut_quorum_ok) = SignedBadActorEvictionOrder::tally_and_verify_quorum_raw(
-        &mut_order_id,
-        &target,
-        &reason_a,
-        issued_at_ms,
-        expires_at_ms,
-        &issuer_pubkey,
-        &sig_r,
-        &sig_s,
-        &cosigs,
+        EvictionOrderSliceView {
+            order_id: &mut_order_id,
+            target: &target,
+            reason_bytes: &reason_a,
+            issued_at_ms,
+            expires_at_ms,
+            issuer_pubkey: &issuer_pubkey,
+            sig_r: &sig_r,
+            sig_s: &sig_s,
+            cosignatures: &cosigs,
+        },
         &council,
         min_quorum,
         0,
@@ -781,10 +793,12 @@ fn proof_macaroon_caveat_attenuation_monotonic_and_zero_key_rejected() {
     assert_eq!(
         CapabilityMacaroon::verify_caveat_slice_in_ram_with(
             &[0u8; 32],
-            &nonce_id,
-            &issuer_fp,
-            &child_caveats,
-            &child_tag,
+            MacaroonSliceView {
+                nonce_id: &nonce_id,
+                issuer_fingerprint: &issuer_fp,
+                caveats: &child_caveats,
+                tag: &child_tag,
+            },
             &ctx,
             ideal_root_prf,
             ideal_chain_prf,
@@ -794,10 +808,12 @@ fn proof_macaroon_caveat_attenuation_monotonic_and_zero_key_rejected() {
 
     assert!(CapabilityMacaroon::verify_caveat_slice_in_ram_with(
         &root_key,
-        &nonce_id,
-        &issuer_fp,
-        &empty_caveats,
-        &root_tag,
+        MacaroonSliceView {
+            nonce_id: &nonce_id,
+            issuer_fingerprint: &issuer_fp,
+            caveats: &empty_caveats,
+            tag: &root_tag,
+        },
         &ctx,
         ideal_root_prf,
         ideal_chain_prf,
@@ -806,10 +822,12 @@ fn proof_macaroon_caveat_attenuation_monotonic_and_zero_key_rejected() {
 
     let parent_ok = CapabilityMacaroon::verify_caveat_slice_in_ram_with(
         &root_key,
-        &nonce_id,
-        &issuer_fp,
-        &parent_caveats,
-        &parent_tag,
+        MacaroonSliceView {
+            nonce_id: &nonce_id,
+            issuer_fingerprint: &issuer_fp,
+            caveats: &parent_caveats,
+            tag: &parent_tag,
+        },
         &ctx,
         ideal_root_prf,
         ideal_chain_prf,
@@ -819,10 +837,12 @@ fn proof_macaroon_caveat_attenuation_monotonic_and_zero_key_rejected() {
 
     let child_ok = CapabilityMacaroon::verify_caveat_slice_in_ram_with(
         &root_key,
-        &nonce_id,
-        &issuer_fp,
-        &child_caveats,
-        &child_tag,
+        MacaroonSliceView {
+            nonce_id: &nonce_id,
+            issuer_fingerprint: &issuer_fp,
+            caveats: &child_caveats,
+            tag: &child_tag,
+        },
         &ctx,
         ideal_root_prf,
         ideal_chain_prf,
@@ -844,10 +864,12 @@ fn proof_macaroon_caveat_attenuation_monotonic_and_zero_key_rejected() {
     assert_eq!(
         CapabilityMacaroon::verify_caveat_slice_in_ram_with(
             &root_key,
-            &nonce_id,
-            &issuer_fp,
-            &child_caveats,
-            &forged_tag,
+            MacaroonSliceView {
+                nonce_id: &nonce_id,
+                issuer_fingerprint: &issuer_fp,
+                caveats: &child_caveats,
+                tag: &forged_tag,
+            },
             &ctx,
             ideal_root_prf,
             ideal_chain_prf,
@@ -911,4 +933,129 @@ fn proof_vfs_block_window_power_of_two_and_zero_bounds() {
             assert!(((last_blk as u128) + 1) << shift >= (end as u128));
         }
     }
+}
+
+/// Proves `PinnedRingBudget<SLOTS>` (`src/gateway/engine.rs`) strictly preserves:
+/// 1. `ring.used_bytes() <= ring.max_bytes()` and `ring.len() <= SLOTS` after every admission.
+/// 2. Zero-slot (`SLOTS == 0`) or oversized (`size_bytes > max_bytes`) admissions return `false`
+///    without mutating `used_bytes` or `len` or firing spurious evictions.
+/// 3. Exact byte conservation in `u128`: `used_bytes + total_evicted_bytes == total_admitted_bytes`
+///    across an arbitrary symbolic multi-step admission & FIFO eviction sequence.
+#[kani::proof]
+#[kani::unwind(5)]
+fn proof_pinned_ring_capacity_invariant() {
+    let max_bytes: u64 = kani::any();
+
+    // Zero-slot ring unconditionally rejects without mutation.
+    let mut zero_ring = PinnedRingBudget::<0>::new(max_bytes);
+    let mut zero_evicted = false;
+    assert!(!zero_ring.admit([0xAA; 32], 0, |_, _| zero_evicted = true));
+    assert!(!zero_evicted && zero_ring.is_empty() && zero_ring.used_bytes() == 0);
+
+    let mut ring = PinnedRingBudget::<3>::new(max_bytes);
+    let mut admitted_sum: u128 = 0;
+    let mut evicted_sum: u128 = 0;
+
+    let mut step = 0usize;
+    while step < 4 {
+        let root: [u8; 32] = [step as u8; 32];
+        let sz: u64 = kani::any();
+        let prev_used = ring.used_bytes();
+        let prev_len = ring.len();
+
+        let mut step_evicted: u128 = 0;
+        let accepted = ring.admit(root, sz, |_ev_root, ev_sz| {
+            step_evicted += ev_sz as u128;
+        });
+
+        if sz > max_bytes {
+            assert!(!accepted);
+            assert_eq!(step_evicted, 0);
+            assert_eq!(ring.used_bytes(), prev_used);
+            assert_eq!(ring.len(), prev_len);
+        } else {
+            assert!(accepted);
+            admitted_sum += sz as u128;
+            evicted_sum += step_evicted;
+            assert!(ring.len() >= 1 && ring.len() <= 3);
+            assert!(ring.used_bytes() >= sz && ring.used_bytes() <= ring.max_bytes());
+        }
+
+        assert_eq!(ring.max_bytes(), max_bytes);
+        assert!(ring.used_bytes() <= max_bytes);
+        assert!(ring.len() <= 3);
+        assert_eq!((ring.used_bytes() as u128) + evicted_sum, admitted_sum);
+        step += 1;
+    }
+}
+
+/// Proves the `0`-`unsafe` Linux FUSE ABI `7.31` byte-slice parsers `parse_fuse_in_header` and
+/// `parse_fuse_read_in` (`src/vfs.rs`) never panic, out-of-bounds index, or misparse across
+/// arbitrary symbolic byte buffers of any length `0..=96`, and satisfy exact bijective round-trip
+/// fidelity with `FuseInHeader::to_ne_bytes` and `FuseReadIn::to_ne_bytes`.
+#[cfg(feature = "vfs")]
+#[kani::proof]
+fn proof_fuse_header_parser_no_panic() {
+    let buf: [u8; 96] = kani::any();
+    let slice_len: usize = kani::any();
+    kani::assume(slice_len <= buf.len());
+    let slice = &buf[..slice_len];
+
+    match parse_fuse_in_header(slice) {
+        None => {
+            if slice_len >= FUSE_IN_HEADER_BYTES {
+                let declared =
+                    u32::from_ne_bytes([slice[0], slice[1], slice[2], slice[3]]) as usize;
+                assert!(declared < FUSE_IN_HEADER_BYTES || declared > slice_len);
+            }
+        }
+        Some(hdr) => {
+            assert!(slice_len >= FUSE_IN_HEADER_BYTES);
+            assert!((hdr.len as usize) >= FUSE_IN_HEADER_BYTES);
+            assert!((hdr.len as usize) <= slice_len);
+            let encoded = hdr.to_ne_bytes();
+            assert!(slice_eq_bounded::<FUSE_IN_HEADER_BYTES>(
+                &encoded,
+                &slice[..FUSE_IN_HEADER_BYTES]
+            ));
+        }
+    }
+
+    match parse_fuse_read_in(slice) {
+        None => {
+            assert!(slice_len < FUSE_READ_IN_BYTES);
+        }
+        Some(rd) => {
+            assert!(slice_len >= FUSE_READ_IN_BYTES);
+            let encoded = rd.to_ne_bytes();
+            assert!(slice_eq_bounded::<FUSE_READ_IN_BYTES>(
+                &encoded,
+                &slice[..FUSE_READ_IN_BYTES]
+            ));
+        }
+    }
+
+    // Also prove exact round-trip reconstruction for any valid symbolic FuseInHeader & FuseReadIn:
+    let sym_hdr = FuseInHeader {
+        len: FUSE_IN_HEADER_BYTES as u32,
+        opcode: kani::any(),
+        unique: kani::any(),
+        nodeid: kani::any(),
+        uid: kani::any(),
+        gid: kani::any(),
+        pid: kani::any(),
+        padding: kani::any(),
+    };
+    assert_eq!(parse_fuse_in_header(&sym_hdr.to_ne_bytes()), Some(sym_hdr));
+
+    let sym_rd = FuseReadIn {
+        fh: kani::any(),
+        offset: kani::any(),
+        size: kani::any(),
+        read_flags: kani::any(),
+        lock_owner: kani::any(),
+        flags: kani::any(),
+        padding: kani::any(),
+    };
+    assert_eq!(parse_fuse_read_in(&sym_rd.to_ne_bytes()), Some(sym_rd));
 }

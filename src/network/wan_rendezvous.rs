@@ -165,45 +165,33 @@ pub struct WanPeerCard {
 
 impl WanPeerCard {
     /// Formats the domain-separated signing payload binding `libp2p_peer_id` to `ed25519_pubkey`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn signing_payload(
-        libp2p_peer_id: &str,
-        device_peer_id: &str,
-        node_label: &str,
-        role: &str,
-        wan_multiaddrs: &[String],
-        relay_seed_addr: Option<&str>,
-        owner_pq_fingerprint: Option<&str>,
-        timestamp_ms: u64,
-        ttl_secs: u64,
-        ed25519_pubkey: &[u8; 32],
-    ) -> Vec<u8> {
+    pub fn signing_payload(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(b"parvault-wan-peercard-v1:");
-        out.extend_from_slice(libp2p_peer_id.as_bytes());
+        out.extend_from_slice(self.libp2p_peer_id.as_bytes());
         out.extend_from_slice(b":");
-        out.extend_from_slice(device_peer_id.as_bytes());
+        out.extend_from_slice(self.device_peer_id.as_bytes());
         out.extend_from_slice(b":");
-        out.extend_from_slice(node_label.as_bytes());
+        out.extend_from_slice(self.node_label.as_bytes());
         out.extend_from_slice(b":");
-        out.extend_from_slice(role.as_bytes());
+        out.extend_from_slice(self.role.as_bytes());
         out.extend_from_slice(b":");
-        for addr in wan_multiaddrs {
+        for addr in &self.wan_multiaddrs {
             out.extend_from_slice(addr.as_bytes());
             out.extend_from_slice(b",");
         }
         out.extend_from_slice(b":");
-        if let Some(relay) = relay_seed_addr {
+        if let Some(ref relay) = self.relay_seed_addr {
             out.extend_from_slice(relay.as_bytes());
         }
         out.extend_from_slice(b":");
-        if let Some(pq) = owner_pq_fingerprint {
+        if let Some(ref pq) = self.owner_pq_fingerprint {
             out.extend_from_slice(pq.as_bytes());
         }
         out.extend_from_slice(b":");
-        out.extend_from_slice(&timestamp_ms.to_be_bytes());
-        out.extend_from_slice(&ttl_secs.to_be_bytes());
-        out.extend_from_slice(ed25519_pubkey);
+        out.extend_from_slice(&self.timestamp_ms.to_be_bytes());
+        out.extend_from_slice(&self.ttl_secs.to_be_bytes());
+        out.extend_from_slice(&self.ed25519_pubkey);
         out
     }
 
@@ -226,26 +214,7 @@ impl WanPeerCard {
         let node_label = node_label.into();
         let role = role.into();
 
-        let payload = Self::signing_payload(
-            &libp2p_peer_id,
-            &device_peer_id,
-            &node_label,
-            &role,
-            &wan_multiaddrs,
-            relay_seed_addr.as_deref(),
-            owner_pq_fingerprint.as_deref(),
-            timestamp_ms,
-            ttl_secs,
-            &pubkey_bytes,
-        );
-
-        let sig = node_id.sign(&payload);
-        let mut sig_r = [0u8; 32];
-        let mut sig_s = [0u8; 32];
-        sig_r.copy_from_slice(&sig[..32]);
-        sig_s.copy_from_slice(&sig[32..]);
-
-        Ok(Self {
+        let mut card = Self {
             libp2p_peer_id,
             device_peer_id,
             node_label,
@@ -256,9 +225,15 @@ impl WanPeerCard {
             timestamp_ms,
             ttl_secs,
             ed25519_pubkey: pubkey_bytes,
-            sig_r,
-            sig_s,
-        })
+            sig_r: [0u8; 32],
+            sig_s: [0u8; 32],
+        };
+        let payload = card.signing_payload();
+        let sig = node_id.sign(&payload);
+        card.sig_r.copy_from_slice(&sig[..32]);
+        card.sig_s.copy_from_slice(&sig[32..]);
+
+        Ok(card)
     }
 
     /// Verifies that:
@@ -272,18 +247,7 @@ impl WanPeerCard {
             return false;
         }
 
-        let payload = Self::signing_payload(
-            &self.libp2p_peer_id,
-            &self.device_peer_id,
-            &self.node_label,
-            &self.role,
-            &self.wan_multiaddrs,
-            self.relay_seed_addr.as_deref(),
-            self.owner_pq_fingerprint.as_deref(),
-            self.timestamp_ms,
-            self.ttl_secs,
-            &self.ed25519_pubkey,
-        );
+        let payload = self.signing_payload();
 
         let mut sig_bytes = [0u8; 64];
         sig_bytes[..32].copy_from_slice(&self.sig_r);

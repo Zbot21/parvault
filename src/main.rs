@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use clap::Parser;
 use libp2p::{
     futures::StreamExt,
@@ -130,19 +132,32 @@ fn normalize_pairing_code_words(raw: &str) -> String {
         .join("-")
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_wan_card_with_stun_port(
-    mesh_client: &MeshClient,
-    anchor_addr: &str,
+struct StunWanCardParams<'a> {
+    mesh_client: &'a MeshClient,
+    anchor_addr: &'a str,
     probe_slot: [u8; 32],
-    identity: &NodeIdentity,
-    label: &str,
-    role: &str,
-    explicit_external_addrs: &[String],
+    identity: &'a NodeIdentity,
+    label: &'a str,
+    role: &'a str,
+    explicit_external_addrs: &'a [String],
     local_tcp_port: u16,
-    local_peer_id: &str,
+    local_peer_id: &'a str,
     pq_fp: Option<String>,
-) -> anyhow::Result<WanPeerCard> {
+}
+
+fn build_wan_card_with_stun_port(params: StunWanCardParams<'_>) -> anyhow::Result<WanPeerCard> {
+    let StunWanCardParams {
+        mesh_client,
+        anchor_addr,
+        probe_slot,
+        identity,
+        label,
+        role,
+        explicit_external_addrs,
+        local_tcp_port,
+        local_peer_id,
+        pq_fp,
+    } = params;
     let mut wan_addrs: Vec<String> = explicit_external_addrs
         .iter()
         .map(|s| {
@@ -539,18 +554,18 @@ async fn main() -> anyhow::Result<()> {
             if wan || !wan_seeds.is_empty() {
                 let slot_key = derive_slot_key_from_code(&sas.code);
                 for anchor in &wan_seeds {
-                    if let Ok(card) = build_wan_card_with_stun_port(
-                        &mesh_client,
-                        anchor,
-                        slot_key,
-                        &node_identity,
-                        &node_label,
+                    if let Ok(card) = build_wan_card_with_stun_port(StunWanCardParams {
+                        mesh_client: &mesh_client,
+                        anchor_addr: anchor,
+                        probe_slot: slot_key,
+                        identity: &node_identity,
+                        label: &node_label,
                         role,
-                        &external_addrs,
-                        tcp_port,
-                        &local_pid,
-                        Some(pq_fp.clone()),
-                    ) {
+                        explicit_external_addrs: &external_addrs,
+                        local_tcp_port: tcp_port,
+                        local_peer_id: &local_pid,
+                        pq_fp: Some(pq_fp.clone()),
+                    }) {
                         match mesh_client.publish_wan_pairing_card(anchor, &sas.code, &card) {
                             Ok(obs) => {
                                 println!(
@@ -2342,22 +2357,22 @@ async fn run_daemon(
                                 || (opts.wan_announce && !opts.wan_seeds.is_empty()))
                         {
                             announced_wan_once = true;
-                            spawn_wan_and_tracker_announce(
-                                block_store.mesh_client().cloned(),
-                                node_identity.clone(),
-                                node_label.clone(),
-                                beacon_role.to_string(),
-                                opts.external_addrs.clone(),
+                            spawn_wan_and_tracker_announce(WanAnnounceTaskConfig {
+                                mesh_client_opt: block_store.mesh_client().cloned(),
+                                identity: node_identity.clone(),
+                                label: node_label.clone(),
+                                role: beacon_role.to_string(),
+                                external_addrs: opts.external_addrs.clone(),
                                 bound_tcp_port,
-                                local_pid_str.clone(),
-                                pq_fp.clone(),
-                                sas.code.clone(),
-                                opts.print_pairing_banner,
-                                opts.public_mode,
-                                opts.public_trackers.clone(),
-                                opts.wan_announce,
-                                opts.wan_seeds.clone(),
-                            );
+                                local_pid: local_pid_str.clone(),
+                                pq_fp: pq_fp.clone(),
+                                sas_code: sas.code.clone(),
+                                publish_pair_code: opts.print_pairing_banner,
+                                public_mode: opts.public_mode,
+                                public_trackers: opts.public_trackers.clone(),
+                                wan_announce: opts.wan_announce,
+                                wan_seeds: opts.wan_seeds.clone(),
+                            });
                         }
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
@@ -2405,19 +2420,21 @@ async fn run_daemon(
                             &peer_str,
                             remote_addr,
                             request,
-                            &cfg,
-                            &node_identity,
-                            genesis_pubkey,
-                            opts.public_mode,
-                            &block_store,
-                            &mut wot,
-                            &mut por_verifier,
-                            &mut nullifier_ledger,
-                            &pq_kem,
-                            &mut lite_seed_server,
-                            &mut wan_registry,
-                            &mut eviction,
-                            &mut takedown_queue,
+                            DaemonWireHandlerCtx {
+                                cfg: &cfg,
+                                node_identity: &node_identity,
+                                genesis_pubkey,
+                                public_mode: opts.public_mode,
+                                block_store: &block_store,
+                                wot: &mut wot,
+                                por_verifier: &mut por_verifier,
+                                nullifier_ledger: &mut nullifier_ledger,
+                                pq_kem: &pq_kem,
+                                lite_seed_server: &mut lite_seed_server,
+                                wan_registry: &mut wan_registry,
+                                eviction: &mut eviction,
+                                takedown_queue: &mut takedown_queue,
+                            },
                         );
                         let _ = swarm.behaviour_mut().req_resp.send_response(channel, response);
                     }
@@ -2464,22 +2481,22 @@ async fn run_daemon(
                 if (opts.public_mode && !opts.public_trackers.is_empty())
                     || (opts.wan_announce && !opts.wan_seeds.is_empty())
                 {
-                    spawn_wan_and_tracker_announce(
-                        block_store.mesh_client().cloned(),
-                        node_identity.clone(),
-                        node_label.clone(),
-                        beacon_role.to_string(),
-                        opts.external_addrs.clone(),
+                    spawn_wan_and_tracker_announce(WanAnnounceTaskConfig {
+                        mesh_client_opt: block_store.mesh_client().cloned(),
+                        identity: node_identity.clone(),
+                        label: node_label.clone(),
+                        role: beacon_role.to_string(),
+                        external_addrs: opts.external_addrs.clone(),
                         bound_tcp_port,
-                        local_pid_str.clone(),
-                        pq_fp.clone(),
-                        sas.code.clone(),
-                        opts.print_pairing_banner,
-                        opts.public_mode,
-                        opts.public_trackers.clone(),
-                        opts.wan_announce,
-                        opts.wan_seeds.clone(),
-                    );
+                        local_pid: local_pid_str.clone(),
+                        pq_fp: pq_fp.clone(),
+                        sas_code: sas.code.clone(),
+                        publish_pair_code: opts.print_pairing_banner,
+                        public_mode: opts.public_mode,
+                        public_trackers: opts.public_trackers.clone(),
+                        wan_announce: opts.wan_announce,
+                        wan_seeds: opts.wan_seeds.clone(),
+                    });
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -2503,8 +2520,7 @@ async fn run_daemon(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_wan_and_tracker_announce(
+struct WanAnnounceTaskConfig {
     mesh_client_opt: Option<MeshClient>,
     identity: NodeIdentity,
     label: String,
@@ -2519,25 +2535,43 @@ fn spawn_wan_and_tracker_announce(
     public_trackers: Vec<String>,
     wan_announce: bool,
     wan_seeds: Vec<String>,
-) {
+}
+
+fn spawn_wan_and_tracker_announce(task_cfg: WanAnnounceTaskConfig) {
+    let WanAnnounceTaskConfig {
+        mesh_client_opt,
+        identity,
+        label,
+        role,
+        external_addrs,
+        bound_tcp_port,
+        local_pid,
+        pq_fp,
+        sas_code,
+        publish_pair_code,
+        public_mode,
+        public_trackers,
+        wan_announce,
+        wan_seeds,
+    } = task_cfg;
     let Some(mc) = mesh_client_opt else {
         return;
     };
     tokio::task::spawn_blocking(move || {
         if public_mode {
             for tracker in &public_trackers {
-                if let Ok(card) = build_wan_card_with_stun_port(
-                    &mc,
-                    tracker,
-                    PUBLIC_COMMONS_SWARM_SLOT,
-                    &identity,
-                    &label,
-                    &role,
-                    &external_addrs,
-                    bound_tcp_port,
-                    &local_pid,
-                    Some(pq_fp.clone()),
-                ) {
+                if let Ok(card) = build_wan_card_with_stun_port(StunWanCardParams {
+                    mesh_client: &mc,
+                    anchor_addr: tracker,
+                    probe_slot: PUBLIC_COMMONS_SWARM_SLOT,
+                    identity: &identity,
+                    label: &label,
+                    role: &role,
+                    explicit_external_addrs: &external_addrs,
+                    local_tcp_port: bound_tcp_port,
+                    local_peer_id: &local_pid,
+                    pq_fp: Some(pq_fp.clone()),
+                }) {
                     let _ = mc.announce_and_discover_public_tracker(tracker, Some(&card));
                 }
             }
@@ -2545,18 +2579,18 @@ fn spawn_wan_and_tracker_announce(
         if wan_announce {
             let slot_probe = derive_slot_key_from_code(&sas_code);
             for anchor in &wan_seeds {
-                if let Ok(card) = build_wan_card_with_stun_port(
-                    &mc,
-                    anchor,
-                    slot_probe,
-                    &identity,
-                    &label,
-                    &role,
-                    &external_addrs,
-                    bound_tcp_port,
-                    &local_pid,
-                    Some(pq_fp.clone()),
-                ) {
+                if let Ok(card) = build_wan_card_with_stun_port(StunWanCardParams {
+                    mesh_client: &mc,
+                    anchor_addr: anchor,
+                    probe_slot: slot_probe,
+                    identity: &identity,
+                    label: &label,
+                    role: &role,
+                    explicit_external_addrs: &external_addrs,
+                    local_tcp_port: bound_tcp_port,
+                    local_peer_id: &local_pid,
+                    pq_fp: Some(pq_fp.clone()),
+                }) {
                     let _ = mc.publish_wan_ddns_heartbeat(anchor, &pq_fp, &card);
                     if publish_pair_code {
                         let _ = mc.publish_wan_pairing_card(anchor, &sas_code, &card);
@@ -2567,25 +2601,43 @@ fn spawn_wan_and_tracker_announce(
     });
 }
 
-#[allow(clippy::too_many_arguments)]
+struct DaemonWireHandlerCtx<'a> {
+    cfg: &'a NodeConfig,
+    node_identity: &'a NodeIdentity,
+    genesis_pubkey: [u8; 32],
+    public_mode: bool,
+    block_store: &'a BlockStore,
+    wot: &'a mut WebOfTrustRegistry,
+    por_verifier: &'a mut PorVerifierEngine,
+    nullifier_ledger: &'a mut VoucherNullifierLedger,
+    pq_kem: &'a HybridKemKeypair,
+    lite_seed_server: &'a mut ZeroTrustSeedServer,
+    wan_registry: &'a mut WanRendezvousRegistry,
+    eviction: &'a mut PrivacyPreservingEvictionEngine,
+    takedown_queue: &'a mut PublicTrackerTakedownQueue,
+}
+
 fn handle_wire_request(
     remote_peer_id: &str,
     remote_addr: Option<&Multiaddr>,
     request: MeshWireRequest,
-    cfg: &NodeConfig,
-    node_identity: &NodeIdentity,
-    genesis_pubkey: [u8; 32],
-    public_mode: bool,
-    block_store: &BlockStore,
-    wot: &mut WebOfTrustRegistry,
-    por_verifier: &mut PorVerifierEngine,
-    nullifier_ledger: &mut VoucherNullifierLedger,
-    pq_kem: &HybridKemKeypair,
-    lite_seed_server: &mut ZeroTrustSeedServer,
-    wan_registry: &mut WanRendezvousRegistry,
-    eviction: &mut PrivacyPreservingEvictionEngine,
-    takedown_queue: &mut PublicTrackerTakedownQueue,
+    ctx: DaemonWireHandlerCtx<'_>,
 ) -> MeshWireResponse {
+    let DaemonWireHandlerCtx {
+        cfg,
+        node_identity,
+        genesis_pubkey,
+        public_mode,
+        block_store,
+        wot,
+        por_verifier,
+        nullifier_ledger,
+        pq_kem,
+        lite_seed_server,
+        wan_registry,
+        eviction,
+        takedown_queue,
+    } = ctx;
     let remote_ip = remote_addr.and_then(extract_ip_from_multiaddr);
     let remote_pubkey = NodeConfig::extract_ed25519_pubkey_from_peer_str(remote_peer_id);
 
@@ -2787,9 +2839,11 @@ fn handle_wire_request(
                 capability,
                 &voucher,
                 nullifier_ledger,
-                current_epoch,
-                lease_duration_epochs,
-                delete_verifier,
+                parvault::storage::BlindedLeaseSpec::new(
+                    current_epoch,
+                    lease_duration_epochs,
+                    delete_verifier,
+                ),
             ) {
                 Ok(_) => {
                     let _ = eviction.record_blinded_shard_ingress(
@@ -2915,9 +2969,11 @@ fn handle_wire_request(
                         envelope,
                         capability,
                         voucher,
-                        current_epoch,
-                        lease_duration_epochs,
-                        delete_verifier,
+                        parvault::storage::BlindedLeaseSpec::new(
+                            current_epoch,
+                            lease_duration_epochs,
+                            delete_verifier,
+                        ),
                     ) {
                         Ok(()) => MeshWireResponse::RelayPqOnionAck {
                             delivered: true,
@@ -2981,9 +3037,11 @@ fn handle_wire_request(
                     bundle.capability,
                     &bundle.voucher,
                     nullifier_ledger,
-                    bundle.current_epoch,
-                    bundle.lease_duration_epochs,
-                    bundle.delete_verifier,
+                    parvault::storage::BlindedLeaseSpec::new(
+                        bundle.current_epoch,
+                        bundle.lease_duration_epochs,
+                        bundle.delete_verifier,
+                    ),
                 ) {
                     Ok(_) => {
                         let _ = eviction.record_blinded_shard_ingress(
@@ -3025,9 +3083,11 @@ fn handle_wire_request(
                             capability,
                             &voucher,
                             nullifier_ledger,
-                            current_epoch,
-                            lease_duration_epochs,
-                            delete_verifier,
+                            parvault::storage::BlindedLeaseSpec::new(
+                                current_epoch,
+                                lease_duration_epochs,
+                                delete_verifier,
+                            ),
                         ) {
                             Ok(_) => {
                                 let _ = eviction.record_blinded_shard_ingress(

@@ -85,7 +85,7 @@ fn test_gateway_zero_copy_ipc_streaming() {
     let expected_digest: [u8; 32] = expected_sha.finalize().into();
 
     // Warm up allocator / thread stack once with a health check before measuring streaming RSS delta.
-    let (_iops, _peers, sla) = client.query_health().expect("query health");
+    let (_iops, _peers, sla) = client.query_health_sync().expect("query health");
     assert!((sla - 1.0).abs() < f32::EPSILON);
 
     let rss_baseline = read_self_rss_bytes();
@@ -323,9 +323,7 @@ fn test_parvault_seed_no_fs_zero_disk_and_ram_cap_enforcement() {
                 &shard,
                 cap,
                 &voucher,
-                1 + u64::from(i),
-                30,
-                [0xAA; 32],
+                parvault::storage::BlindedLeaseSpec::new(1 + u64::from(i), 30, [0xAA; 32]),
             )
             .expect("ingest blinded shard into bounded RAM store");
         eviction

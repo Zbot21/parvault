@@ -10,7 +10,7 @@ pub use anonymity::{
     MAX_SINGLE_VOUCHER_BYTES,
 };
 pub use block_store::{
-    BlockStore, FileManifest, GracefulDepartureReceipt, ScrubReport, ShardId,
+    BlindedLeaseSpec, BlockStore, FileManifest, GracefulDepartureReceipt, ScrubReport, ShardId,
     SignedDhtManifestEnvelope, StorageError, StripeManifestEntry, ZeroTrustDhtStore,
 };
 pub use eviction::*;

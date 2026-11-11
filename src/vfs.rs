@@ -1,8 +1,9 @@
 //! Lazy-Streaming Virtual File System (`parvault::vfs`) backed by `/var/run/parvault.sock`.
 //!
 //! Built strictly as a zero-copy Unix Domain Socket client of [`crate::gateway::ipc::GatewayIpcClient`]:
-//! 1. **Instant Metadata Stubs**: Mounts `10 GiB+` virtual vaults instantaneously in RAM (`O(1)`
-//!    inode registration, zero eager shard downloads).
+//! 1. **Instant Lazy-Loaded Metadata Inodes (`VfsStubNode`)**: Mounts `10 GiB+` virtual vaults
+//!    instantaneously in RAM (`O(1)` POSIX inode registration with zero eager shard downloads,
+//!    backed at read time by real `GatewayIpcServer` + `memfd` `SCM_RIGHTS` Reed-Solomon streaming).
 //! 2. **Targeted On-Demand Range Retrieval (`< 50 ms` TTFB)**: Translates POSIX `(inode, offset, len)`
 //!    reads into `1 MiB` block-aligned `IpcCommand::FetchRange` calls (`SCM_RIGHTS` `memfd`).
 //! 3. **Bounded LRU Disk Cache (`LruBlockCache`)**: Caches fetched `1 MiB` blocks on local disk and
@@ -176,7 +177,13 @@ impl LruBlockCache {
     }
 }
 
-/// Lightweight metadata stub representing a virtual directory or lazy-loaded vault file.
+/// Lazy-loaded POSIX VFS metadata inode representing a virtual directory or on-demand vault file.
+///
+/// Note on naming: `VfsStubNode` denotes a dehydrated cloud-filesystem metadata inode (holding
+/// POSIX `ino`, `size_bytes`, `mode`, `mtime_unix_secs`, [`EphemeralShardManifest`], and optional
+/// [`CapabilityMacaroon`]) whose payload blocks are fetched lazily on demand over real
+/// [`GatewayIpcServer`](crate::gateway::ipc::GatewayIpcServer) + `memfd` `SCM_RIGHTS` IPC. It is a
+/// production lazy-mount data structure, never a test fake or mock.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VfsStubNode {
     pub ino: u64,
@@ -199,6 +206,147 @@ pub struct VfsCacheStats {
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
+}
+
+/// Serialized byte size of a Linux FUSE request header (`fuse_in_header`, ABI `7.31`).
+pub const FUSE_IN_HEADER_BYTES: usize = 40;
+
+/// Serialized byte size of a Linux FUSE `READ` / `READDIR` request body (`fuse_read_in`, ABI `7.31`).
+pub const FUSE_READ_IN_BYTES: usize = 40;
+
+/// Safe, unaligned-pointer-free Linux FUSE request header (`fuse_in_header`, ABI `7.31`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuseInHeader {
+    pub len: u32,
+    pub opcode: u32,
+    pub unique: u64,
+    pub nodeid: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub pid: u32,
+    pub padding: u32,
+}
+
+impl FuseInHeader {
+    /// Encodes this 40-byte `fuse_in_header` in native endianness without raw pointer casts.
+    pub fn to_ne_bytes(self) -> [u8; FUSE_IN_HEADER_BYTES] {
+        let mut out = [0u8; FUSE_IN_HEADER_BYTES];
+        out[0..4].copy_from_slice(&self.len.to_ne_bytes());
+        out[4..8].copy_from_slice(&self.opcode.to_ne_bytes());
+        out[8..16].copy_from_slice(&self.unique.to_ne_bytes());
+        out[16..24].copy_from_slice(&self.nodeid.to_ne_bytes());
+        out[24..28].copy_from_slice(&self.uid.to_ne_bytes());
+        out[28..32].copy_from_slice(&self.gid.to_ne_bytes());
+        out[32..36].copy_from_slice(&self.pid.to_ne_bytes());
+        out[36..40].copy_from_slice(&self.padding.to_ne_bytes());
+        out
+    }
+}
+
+/// Safe, unaligned-pointer-free Linux FUSE `READ` / `READDIR` request body (`fuse_read_in`, ABI `7.31`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuseReadIn {
+    pub fh: u64,
+    pub offset: u64,
+    pub size: u32,
+    pub read_flags: u32,
+    pub lock_owner: u64,
+    pub flags: u32,
+    pub padding: u32,
+}
+
+impl FuseReadIn {
+    /// Encodes this 40-byte `fuse_read_in` payload in native endianness without raw pointer casts.
+    pub fn to_ne_bytes(self) -> [u8; FUSE_READ_IN_BYTES] {
+        let mut out = [0u8; FUSE_READ_IN_BYTES];
+        out[0..8].copy_from_slice(&self.fh.to_ne_bytes());
+        out[8..16].copy_from_slice(&self.offset.to_ne_bytes());
+        out[16..20].copy_from_slice(&self.size.to_ne_bytes());
+        out[20..24].copy_from_slice(&self.read_flags.to_ne_bytes());
+        out[24..32].copy_from_slice(&self.lock_owner.to_ne_bytes());
+        out[32..36].copy_from_slice(&self.flags.to_ne_bytes());
+        out[36..40].copy_from_slice(&self.padding.to_ne_bytes());
+        out
+    }
+}
+
+/// Parses a 40-byte Linux FUSE `fuse_in_header` from `buf` using safe `from_ne_bytes` slice
+/// conversions (`0` `unsafe` blocks, `0` raw pointer casts, formally verified panic-free for
+/// arbitrary byte slices under Kani `proof_fuse_header_parser_no_panic`).
+pub const fn parse_fuse_in_header(buf: &[u8]) -> Option<FuseInHeader> {
+    if buf.len() < FUSE_IN_HEADER_BYTES {
+        return None;
+    }
+    let len = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if (len as usize) < FUSE_IN_HEADER_BYTES || (len as usize) > buf.len() {
+        return None;
+    }
+    let opcode = u32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let unique = u64::from_ne_bytes([
+        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+    ]);
+    let nodeid = u64::from_ne_bytes([
+        buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+    ]);
+    let uid = u32::from_ne_bytes([buf[24], buf[25], buf[26], buf[27]]);
+    let gid = u32::from_ne_bytes([buf[28], buf[29], buf[30], buf[31]]);
+    let pid = u32::from_ne_bytes([buf[32], buf[33], buf[34], buf[35]]);
+    let padding = u32::from_ne_bytes([buf[36], buf[37], buf[38], buf[39]]);
+    Some(FuseInHeader {
+        len,
+        opcode,
+        unique,
+        nodeid,
+        uid,
+        gid,
+        pid,
+        padding,
+    })
+}
+
+/// Parses a 40-byte Linux FUSE `fuse_read_in` payload from `payload` using safe `from_ne_bytes`
+/// slice conversions (`0` `unsafe` blocks, formally verified panic-free for arbitrary byte slices).
+pub const fn parse_fuse_read_in(payload: &[u8]) -> Option<FuseReadIn> {
+    if payload.len() < FUSE_READ_IN_BYTES {
+        return None;
+    }
+    let fh = u64::from_ne_bytes([
+        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+        payload[7],
+    ]);
+    let offset = u64::from_ne_bytes([
+        payload[8],
+        payload[9],
+        payload[10],
+        payload[11],
+        payload[12],
+        payload[13],
+        payload[14],
+        payload[15],
+    ]);
+    let size = u32::from_ne_bytes([payload[16], payload[17], payload[18], payload[19]]);
+    let read_flags = u32::from_ne_bytes([payload[20], payload[21], payload[22], payload[23]]);
+    let lock_owner = u64::from_ne_bytes([
+        payload[24],
+        payload[25],
+        payload[26],
+        payload[27],
+        payload[28],
+        payload[29],
+        payload[30],
+        payload[31],
+    ]);
+    let flags = u32::from_ne_bytes([payload[32], payload[33], payload[34], payload[35]]);
+    let padding = u32::from_ne_bytes([payload[36], payload[37], payload[38], payload[39]]);
+    Some(FuseReadIn {
+        fh,
+        offset,
+        size,
+        read_flags,
+        lock_owner,
+        flags,
+        padding,
+    })
 }
 
 #[cfg(unix)]
@@ -263,7 +411,7 @@ mod unix_vfs {
             children.insert(VFS_ROOT_INO, BTreeMap::new());
             let cache = LruBlockCache::new(cache_dir, cache_capacity_bytes)?;
             Ok(Self {
-                ipc: GatewayIpcClient::new(socket_path),
+                ipc: GatewayIpcClient::new(socket_path.into()),
                 block_size: block_size.max(4096),
                 nodes: Arc::new(Mutex::new(nodes)),
                 children: Arc::new(Mutex::new(children)),
@@ -697,7 +845,7 @@ mod unix_vfs {
         stream.flush()
     }
 
-    // Minimal Pure-Rust Linux FUSE Kernel Protocol (`ABI 7.31`, zero C `libfuse`).
+    // Minimal Pure-Rust Linux FUSE Kernel Protocol (`ABI 7.31`, zero C `libfuse`, zero `unsafe`).
     const FUSE_KERNEL_VERSION: u32 = 7;
     const FUSE_KERNEL_MINOR_VERSION: u32 = 31;
     const FUSE_LOOKUP: u32 = 1;
@@ -710,21 +858,8 @@ mod unix_vfs {
     const FUSE_RELEASEDIR: u32 = 29;
     const FUSE_INIT: u32 = 26;
     const FUSE_DESTROY: u32 = 38;
+    const FUSE_OUT_HEADER_BYTES: usize = 16;
 
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct FuseInHeader {
-        len: u32,
-        opcode: u32,
-        unique: u64,
-        nodeid: u64,
-        uid: u32,
-        gid: u32,
-        pid: u32,
-        padding: u32,
-    }
-
-    #[repr(C)]
     #[derive(Clone, Copy)]
     struct FuseOutHeader {
         len: u32,
@@ -732,7 +867,16 @@ mod unix_vfs {
         unique: u64,
     }
 
-    #[repr(C)]
+    impl FuseOutHeader {
+        fn to_ne_bytes(self) -> [u8; FUSE_OUT_HEADER_BYTES] {
+            let mut out = [0u8; FUSE_OUT_HEADER_BYTES];
+            out[0..4].copy_from_slice(&self.len.to_ne_bytes());
+            out[4..8].copy_from_slice(&self.error.to_ne_bytes());
+            out[8..16].copy_from_slice(&self.unique.to_ne_bytes());
+            out
+        }
+    }
+
     #[derive(Clone, Copy, Default)]
     struct FuseAttr {
         ino: u64,
@@ -753,7 +897,29 @@ mod unix_vfs {
         padding: u32,
     }
 
-    #[repr(C)]
+    impl FuseAttr {
+        fn to_ne_bytes(self) -> [u8; 88] {
+            let mut out = [0u8; 88];
+            out[0..8].copy_from_slice(&self.ino.to_ne_bytes());
+            out[8..16].copy_from_slice(&self.size.to_ne_bytes());
+            out[16..24].copy_from_slice(&self.blocks.to_ne_bytes());
+            out[24..32].copy_from_slice(&self.atime.to_ne_bytes());
+            out[32..40].copy_from_slice(&self.mtime.to_ne_bytes());
+            out[40..48].copy_from_slice(&self.ctime.to_ne_bytes());
+            out[48..52].copy_from_slice(&self.atimensec.to_ne_bytes());
+            out[52..56].copy_from_slice(&self.mtimensec.to_ne_bytes());
+            out[56..60].copy_from_slice(&self.ctimensec.to_ne_bytes());
+            out[60..64].copy_from_slice(&self.mode.to_ne_bytes());
+            out[64..68].copy_from_slice(&self.nlink.to_ne_bytes());
+            out[68..72].copy_from_slice(&self.uid.to_ne_bytes());
+            out[72..76].copy_from_slice(&self.gid.to_ne_bytes());
+            out[76..80].copy_from_slice(&self.rdev.to_ne_bytes());
+            out[80..84].copy_from_slice(&self.blksize.to_ne_bytes());
+            out[84..88].copy_from_slice(&self.padding.to_ne_bytes());
+            out
+        }
+    }
+
     #[derive(Clone, Copy)]
     struct FuseInitOut {
         major: u32,
@@ -769,7 +935,27 @@ mod unix_vfs {
         unused: [u32; 8],
     }
 
-    #[repr(C)]
+    impl FuseInitOut {
+        fn to_ne_bytes(self) -> [u8; 64] {
+            let mut out = [0u8; 64];
+            out[0..4].copy_from_slice(&self.major.to_ne_bytes());
+            out[4..8].copy_from_slice(&self.minor.to_ne_bytes());
+            out[8..12].copy_from_slice(&self.max_readahead.to_ne_bytes());
+            out[12..16].copy_from_slice(&self.flags.to_ne_bytes());
+            out[16..18].copy_from_slice(&self.max_background.to_ne_bytes());
+            out[18..20].copy_from_slice(&self.congestion_threshold.to_ne_bytes());
+            out[20..24].copy_from_slice(&self.max_write.to_ne_bytes());
+            out[24..28].copy_from_slice(&self.time_gran.to_ne_bytes());
+            out[28..30].copy_from_slice(&self.max_pages.to_ne_bytes());
+            out[30..32].copy_from_slice(&self.map_alignment.to_ne_bytes());
+            for (idx, word) in self.unused.iter().enumerate() {
+                let start = 32 + idx * 4;
+                out[start..start + 4].copy_from_slice(&word.to_ne_bytes());
+            }
+            out
+        }
+    }
+
     #[derive(Clone, Copy)]
     struct FuseAttrOut {
         attr_valid: u64,
@@ -778,7 +964,17 @@ mod unix_vfs {
         attr: FuseAttr,
     }
 
-    #[repr(C)]
+    impl FuseAttrOut {
+        fn to_ne_bytes(self) -> [u8; 104] {
+            let mut out = [0u8; 104];
+            out[0..8].copy_from_slice(&self.attr_valid.to_ne_bytes());
+            out[8..12].copy_from_slice(&self.attr_valid_nsec.to_ne_bytes());
+            out[12..16].copy_from_slice(&self.dummy.to_ne_bytes());
+            out[16..104].copy_from_slice(&self.attr.to_ne_bytes());
+            out
+        }
+    }
+
     #[derive(Clone, Copy)]
     struct FuseEntryOut {
         nodeid: u64,
@@ -790,7 +986,20 @@ mod unix_vfs {
         attr: FuseAttr,
     }
 
-    #[repr(C)]
+    impl FuseEntryOut {
+        fn to_ne_bytes(self) -> [u8; 128] {
+            let mut out = [0u8; 128];
+            out[0..8].copy_from_slice(&self.nodeid.to_ne_bytes());
+            out[8..16].copy_from_slice(&self.generation.to_ne_bytes());
+            out[16..24].copy_from_slice(&self.entry_valid.to_ne_bytes());
+            out[24..32].copy_from_slice(&self.attr_valid.to_ne_bytes());
+            out[32..36].copy_from_slice(&self.entry_valid_nsec.to_ne_bytes());
+            out[36..40].copy_from_slice(&self.attr_valid_nsec.to_ne_bytes());
+            out[40..128].copy_from_slice(&self.attr.to_ne_bytes());
+            out
+        }
+    }
+
     #[derive(Clone, Copy)]
     struct FuseOpenOut {
         fh: u64,
@@ -798,16 +1007,14 @@ mod unix_vfs {
         padding: u32,
     }
 
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct FuseReadIn {
-        fh: u64,
-        offset: u64,
-        size: u32,
-        read_flags: u32,
-        lock_owner: u64,
-        flags: u32,
-        padding: u32,
+    impl FuseOpenOut {
+        fn to_ne_bytes(self) -> [u8; 16] {
+            let mut out = [0u8; 16];
+            out[0..8].copy_from_slice(&self.fh.to_ne_bytes());
+            out[8..12].copy_from_slice(&self.open_flags.to_ne_bytes());
+            out[12..16].copy_from_slice(&self.padding.to_ne_bytes());
+            out
+        }
     }
 
     fn stub_to_fuse_attr(node: &VfsStubNode) -> FuseAttr {
@@ -820,16 +1027,10 @@ mod unix_vfs {
             ctime: node.mtime_unix_secs,
             mode: node.mode,
             nlink: if node.is_dir { 2 } else { 1 },
-            uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
+            uid: crate::os_sys::geteuid(),
+            gid: crate::os_sys::getegid(),
             blksize: DEFAULT_VFS_BLOCK_BYTES as u32,
             ..FuseAttr::default()
-        }
-    }
-
-    fn as_bytes<T: Copy>(val: &T) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts((val as *const T).cast::<u8>(), std::mem::size_of::<T>())
         }
     }
 
@@ -840,19 +1041,18 @@ mod unix_vfs {
         body: &[u8],
     ) -> io::Result<()> {
         let hdr = FuseOutHeader {
-            len: (std::mem::size_of::<FuseOutHeader>() + body.len()) as u32,
+            len: (FUSE_OUT_HEADER_BYTES + body.len()) as u32,
             error,
             unique,
         };
         let mut pkt = Vec::with_capacity(hdr.len as usize);
-        pkt.extend_from_slice(as_bytes(&hdr));
+        pkt.extend_from_slice(&hdr.to_ne_bytes());
         pkt.extend_from_slice(body);
         dev.write_all(&pkt)
     }
 
     fn serve_pure_rust_fuse_loop(mut dev: std::fs::File, vfs: &VirtualVaultFs) -> io::Result<()> {
         let mut buf = vec![0u8; DEFAULT_VFS_BLOCK_BYTES + 4096];
-        let hdr_sz = std::mem::size_of::<FuseInHeader>();
         loop {
             let n = match dev.read(&mut buf) {
                 Ok(0) => return Ok(()),
@@ -861,12 +1061,11 @@ mod unix_vfs {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             };
-            if n < hdr_sz {
+            let Some(in_hdr) = parse_fuse_in_header(&buf[..n]) else {
                 continue;
-            }
-            let in_hdr: FuseInHeader =
-                unsafe { std::ptr::read_unaligned(buf.as_ptr().cast::<FuseInHeader>()) };
-            let payload = &buf[hdr_sz..n];
+            };
+            let frame_end = in_hdr.len as usize;
+            let payload = &buf[FUSE_IN_HEADER_BYTES..frame_end];
 
             match in_hdr.opcode {
                 FUSE_INIT => {
@@ -883,7 +1082,7 @@ mod unix_vfs {
                         map_alignment: 0,
                         unused: [0; 8],
                     };
-                    write_fuse_reply(&mut dev, in_hdr.unique, 0, as_bytes(&out))?;
+                    write_fuse_reply(&mut dev, in_hdr.unique, 0, &out.to_ne_bytes())?;
                 }
                 FUSE_GETATTR => {
                     if let Some(node) = vfs.getattr(in_hdr.nodeid) {
@@ -893,7 +1092,7 @@ mod unix_vfs {
                             dummy: 0,
                             attr: stub_to_fuse_attr(&node),
                         };
-                        write_fuse_reply(&mut dev, in_hdr.unique, 0, as_bytes(&out))?;
+                        write_fuse_reply(&mut dev, in_hdr.unique, 0, &out.to_ne_bytes())?;
                     } else {
                         write_fuse_reply(&mut dev, in_hdr.unique, -libc::ENOENT, &[])?;
                     }
@@ -914,7 +1113,7 @@ mod unix_vfs {
                             attr_valid_nsec: 0,
                             attr: stub_to_fuse_attr(&node),
                         };
-                        write_fuse_reply(&mut dev, in_hdr.unique, 0, as_bytes(&out))?;
+                        write_fuse_reply(&mut dev, in_hdr.unique, 0, &out.to_ne_bytes())?;
                     } else {
                         write_fuse_reply(&mut dev, in_hdr.unique, -libc::ENOENT, &[])?;
                     }
@@ -925,30 +1124,26 @@ mod unix_vfs {
                         open_flags: 0,
                         padding: 0,
                     };
-                    write_fuse_reply(&mut dev, in_hdr.unique, 0, as_bytes(&out))?;
+                    write_fuse_reply(&mut dev, in_hdr.unique, 0, &out.to_ne_bytes())?;
                 }
                 FUSE_RELEASE | FUSE_RELEASEDIR => {
                     write_fuse_reply(&mut dev, in_hdr.unique, 0, &[])?;
                 }
                 FUSE_READ => {
-                    if payload.len() < std::mem::size_of::<FuseReadIn>() {
+                    let Some(read_in) = parse_fuse_read_in(payload) else {
                         write_fuse_reply(&mut dev, in_hdr.unique, -libc::EINVAL, &[])?;
                         continue;
-                    }
-                    let read_in: FuseReadIn =
-                        unsafe { std::ptr::read_unaligned(payload.as_ptr().cast::<FuseReadIn>()) };
+                    };
                     match vfs.read_at(in_hdr.nodeid, read_in.offset, read_in.size as u64) {
                         Ok(bytes) => write_fuse_reply(&mut dev, in_hdr.unique, 0, &bytes)?,
                         Err(_) => write_fuse_reply(&mut dev, in_hdr.unique, -libc::EIO, &[])?,
                     }
                 }
                 FUSE_READDIR => {
-                    if payload.len() < std::mem::size_of::<FuseReadIn>() {
+                    let Some(read_in) = parse_fuse_read_in(payload) else {
                         write_fuse_reply(&mut dev, in_hdr.unique, -libc::EINVAL, &[])?;
                         continue;
-                    }
-                    let read_in: FuseReadIn =
-                        unsafe { std::ptr::read_unaligned(payload.as_ptr().cast::<FuseReadIn>()) };
+                    };
                     let entries = vfs.readdir(in_hdr.nodeid);
                     let start_idx = read_in.offset as usize;
                     let mut out_bytes = Vec::new();

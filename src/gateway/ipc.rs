@@ -1,30 +1,26 @@
-//! Zero-Copy Local Unix Domain Socket IPC Bridge (`parvault::gateway::ipc`).
+//! Canonical Zero-Copy Local Unix Domain Socket IPC Bridge (`parvault::gateway::ipc`).
 //!
 //! Decouples the `parvault` core P2P Reed-Solomon / Post-Quantum storage engine from local
 //! consumer & ISP CPE modules (`parvault-fuse`, `parvault-auth-broker`, `parvault-media-daemon`,
 //! `parvault-isp-agent`) over `/var/run/parvault.sock` using `Serde-Bincode` control frames and
 //! kernel `memfd_create(2)` file descriptors passed via `SCM_RIGHTS` ancillary messages.
 //!
-//! ### Memory Invariant (`< 16 MiB` RSS)
-//! Payloads are never `mmap`ed as monolithic buffers nor copied through socket data frames; instead,
-//! `GatewayIpcServer` streams `1 MiB` (`ROUTER_SOC_STRIPE_SIZE_BYTES`) stripes directly out of /
-//! into kernel `memfd` descriptors using a single reusable buffer.
+//! ### Memory & Safety Invariants
+//! - **Zero `unsafe` in `gateway`**: All `memfd_create` / `SCM_RIGHTS` syscalls delegate to minimal
+//!   audited wrappers in [`crate::os_sys`].
+//! - **`< 16 MiB` RSS**: Payloads are never `mmap`ed as monolithic buffers nor copied through
+//!   userspace socket frames; [`super::engine::GatewayEngine`] streams `1 MiB` stripes directly via
+//!   safe `pread`/`pwrite` (`FileExt::{read_at, write_at}`).
 
-use crate::capabilities::{AccessRequestContext, CapabilityMacaroon};
-use crate::config::{ErasureTier, HardwareProfile, ROUTER_SOC_STRIPE_SIZE_BYTES};
-use crate::crypto::{compute_sha256, MasterKey};
-use crate::storage::{BlockStore, FileManifest};
+use crate::capabilities::CapabilityMacaroon;
+use crate::storage::FileManifest;
 use bincode::Options;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::RawFd;
 #[cfg(not(unix))]
 pub type RawFd = i32;
 
@@ -75,7 +71,7 @@ pub const fn validate_ipc_frame_header(
     Ok((len, init_cap))
 }
 
-/// Storage lifecycle policy attached to `IpcCommand::StorePayload`.
+/// Storage lifecycle policy attached to [`IpcCommand::StorePayload`].
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetentionPolicy {
     Ephemeral,
@@ -93,7 +89,7 @@ pub struct EphemeralShardManifest {
 }
 
 impl EphemeralShardManifest {
-    /// Builds an `EphemeralShardManifest` from a `FileManifest`.
+    /// Builds an `EphemeralShardManifest` from a [`FileManifest`].
     /// For massive sparse/virtual files (`> 256` stripes), stores stripe Merkle roots so the
     /// IPC control descriptor stays compact (`<= 320 KiB` even for a `10 GiB` vault).
     pub fn from_file_manifest(fm: &FileManifest) -> Self {
@@ -142,7 +138,7 @@ pub enum IpcCommand {
     QueryHealthStatus,
 }
 
-/// Control responses returned by `GatewayIpcServer` over `/var/run/parvault.sock`.
+/// Control responses returned by [`GatewayIpcServer`] over `/var/run/parvault.sock`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum IpcResponse {
     StoreSuccess {
@@ -161,15 +157,9 @@ pub enum IpcResponse {
     },
 }
 
-fn ipc_bincode() -> impl Options {
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .allow_trailing_bytes()
-        .with_limit(MAX_IPC_FRAME_BYTES as u64)
-}
-
-fn hash_shard_id_vector(ids: &[[u8; 32]]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
+/// Domain-separated SHA-256 digest of a vector of 32-byte shard/stripe identifiers used to index
+/// [`EphemeralShardManifest`] entries in RAM for `FetchPayload`.
+pub fn hash_shard_id_vector(ids: &[[u8; 32]]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"parvault-ipc-shard-vec-v1:");
     h.update((ids.len() as u64).to_be_bytes());
@@ -182,92 +172,48 @@ fn hash_shard_id_vector(ids: &[[u8; 32]]) -> [u8; 32] {
     out
 }
 
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+pub(crate) fn ipc_bincode() -> impl Options {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(MAX_IPC_FRAME_BYTES as u64)
 }
 
 #[cfg(unix)]
 mod unix_impl {
     use super::*;
-    use std::ffi::CString;
+    use crate::config::{ErasureTier, HardwareProfile};
+    use crate::crypto::MasterKey;
+    use crate::gateway::engine::GatewayEngine;
+    use crate::gateway::shm::{pwrite_all, recv_frame_with_fd, send_frame_with_fd};
+    use crate::os_sys::{recvmsg_scm_rights, sendmsg_scm_rights};
+    use crate::storage::BlockStore;
     use std::fs::File;
     use std::io::{self, Read, Seek, SeekFrom, Write};
+    use std::os::fd::{AsFd, AsRawFd, OwnedFd};
     use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::net::{UnixListener as TokioUnixListener, UnixStream as TokioUnixStream};
+    use tokio::sync::watch;
 
-    const CMSG_FD_SPACE: usize =
-        unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as usize };
+    pub use crate::os_sys::{read_self_anon_rss_bytes, read_self_rss_bytes};
 
-    #[repr(C)]
-    union AlignedCmsgBuf {
-        bytes: [u8; CMSG_FD_SPACE],
-        _align: libc::cmsghdr,
-    }
-
-    /// Allocates an anonymous in-RAM kernel file descriptor via `memfd_create(2)` with `MFD_CLOEXEC`.
-    /// Writing/reading via `read(2)`/`write(2)` avoids mapping `RssShmem` PTEs into userspace,
-    /// keeping process `VmRSS` strictly bounded regardless of `memfd` size.
+    /// Allocates an anonymous in-RAM kernel file descriptor via `memfd_create(2)` (`MFD_CLOEXEC`).
+    /// Reading/writing via `pread`/`pwrite` avoids mapping `RssShmem` PTEs into userspace, keeping
+    /// process `VmRSS` strictly bounded (`< 16 MiB`) regardless of `memfd` size.
     pub fn create_memfd(name: &str) -> io::Result<OwnedFd> {
-        let sanitized: String = name
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-            .take(64)
-            .collect();
-        let c_name = CString::new(if sanitized.is_empty() {
-            "parvault"
-        } else {
-            &sanitized
-        })
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-
-        #[cfg(target_os = "linux")]
-        let fd = unsafe {
-            libc::syscall(
-                libc::SYS_memfd_create,
-                c_name.as_ptr(),
-                libc::MFD_CLOEXEC as libc::c_uint,
-            ) as libc::c_int
-        };
-
-        #[cfg(not(target_os = "linux"))]
-        let fd = -1i32;
-
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        crate::os_sys::create_memfd(name, 0)
     }
 
-    /// Reads total `VmRSS` (in bytes) from `/proc/self/status` on Linux (`0` if unavailable).
-    pub fn read_self_rss_bytes() -> u64 {
-        read_proc_status_kib_field("VmRSS:").saturating_mul(1024)
+    /// Allocates an anonymous kernel `memfd` pre-sized to `initial_size` bytes.
+    pub fn create_memfd_sized(name: &str, initial_size: u64) -> io::Result<OwnedFd> {
+        crate::os_sys::create_memfd(name, initial_size)
     }
 
-    /// Reads anonymous heap `RssAnon` (in bytes) from `/proc/self/status` on Linux (`0` if unavailable).
-    pub fn read_self_anon_rss_bytes() -> u64 {
-        read_proc_status_kib_field("RssAnon:").saturating_mul(1024)
-    }
-
-    fn read_proc_status_kib_field(prefix: &str) -> u64 {
-        let Ok(contents) = std::fs::read_to_string("/proc/self/status") else {
-            return 0;
-        };
-        for line in contents.lines() {
-            if let Some(rest) = line.strip_prefix(prefix) {
-                if let Some(num_tok) = rest.split_whitespace().next() {
-                    if let Ok(kib) = num_tok.parse::<u64>() {
-                        return kib;
-                    }
-                }
-            }
-        }
-        0
-    }
-
-    /// Sends a length-prefixed `bincode` frame over `sock_fd`, attaching `attached_fd` via
-    /// `SCM_RIGHTS` on the 4-byte header `sendmsg(2)` call when present.
+    /// Sends a length-prefixed `bincode` frame over synchronous `stream`, attaching `attached_fd`
+    /// via `SCM_RIGHTS` on the 4-byte header `sendmsg(2)` call when present.
     pub fn send_frame_with_optional_fd(
         stream: &mut StdUnixStream,
         payload: &[u8],
@@ -279,40 +225,16 @@ mod unix_impl {
                 format!("invalid IPC frame size {}", payload.len()),
             ));
         }
-        let mut len_be = (payload.len() as u32).to_be_bytes();
-        let mut iov = libc::iovec {
-            iov_base: len_be.as_mut_ptr().cast(),
-            iov_len: len_be.len(),
-        };
-
-        let mut cmsg_storage = AlignedCmsgBuf {
-            bytes: [0u8; CMSG_FD_SPACE],
-        };
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1 as _;
-
-        if let Some(fd_to_pass) = attached_fd {
-            unsafe {
-                msg.msg_control = cmsg_storage.bytes.as_mut_ptr().cast();
-                msg.msg_controllen = CMSG_FD_SPACE as _;
-                let cmsg = libc::CMSG_FIRSTHDR(&msg);
-                if cmsg.is_null() {
-                    return Err(io::Error::other("CMSG_FIRSTHDR returned null"));
-                }
-                (*cmsg).cmsg_level = libc::SOL_SOCKET;
-                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-                (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
-                std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>(), fd_to_pass);
-            }
+        let len_be = (payload.len() as u32).to_be_bytes();
+        let sent_hdr = sendmsg_scm_rights(stream.as_fd(), &len_be, attached_fd)?;
+        if sent_hdr == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "Unix socket closed during SCM_RIGHTS header send",
+            ));
         }
-
-        let sent_hdr = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
-        if sent_hdr < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if (sent_hdr as usize) < len_be.len() {
-            stream.write_all(&len_be[sent_hdr as usize..])?;
+        if sent_hdr < len_be.len() {
+            stream.write_all(&len_be[sent_hdr..])?;
         }
         stream.write_all(payload)?;
         stream.flush()?;
@@ -320,61 +242,21 @@ mod unix_impl {
     }
 
     /// Receives a length-prefixed `bincode` frame and at most one `SCM_RIGHTS` file descriptor
-    /// (`MSG_CMSG_CLOEXEC`) from `stream`. Any unexpected extra descriptors are closed immediately.
+    /// (`MSG_CMSG_CLOEXEC`) from synchronous `stream`.
     pub fn recv_frame_with_optional_fd(
         stream: &mut StdUnixStream,
     ) -> io::Result<(Vec<u8>, Option<OwnedFd>)> {
         let mut len_be = [0u8; 4];
-        let mut iov = libc::iovec {
-            iov_base: len_be.as_mut_ptr().cast(),
-            iov_len: len_be.len(),
-        };
-        let mut cmsg_storage = AlignedCmsgBuf {
-            bytes: [0u8; CMSG_FD_SPACE],
-        };
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1 as _;
-        msg.msg_control = unsafe { cmsg_storage.bytes.as_mut_ptr().cast() };
-        msg.msg_controllen = CMSG_FD_SPACE as _;
-
-        let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let (n, received_fd) = recvmsg_scm_rights(stream.as_fd(), &mut len_be)?;
         if n == 0 {
+            drop(received_fd);
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "IPC peer closed socket",
             ));
         }
-
-        let mut received_fd: Option<OwnedFd> = None;
-        unsafe {
-            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-            while !cmsg.is_null() {
-                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                    let data_ptr = libc::CMSG_DATA(cmsg) as *const u8;
-                    let cmsg_end = (cmsg as *const u8).add((*cmsg).cmsg_len as usize);
-                    let mut cur = data_ptr;
-                    while cur.add(std::mem::size_of::<RawFd>()) <= cmsg_end {
-                        let raw_fd = std::ptr::read_unaligned(cur.cast::<RawFd>());
-                        if raw_fd >= 0 {
-                            let owned = OwnedFd::from_raw_fd(raw_fd);
-                            if received_fd.is_none() {
-                                received_fd = Some(owned);
-                            }
-                            // Any extra unexpected FDs drop & close immediately here.
-                        }
-                        cur = cur.add(std::mem::size_of::<RawFd>());
-                    }
-                }
-                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
-            }
-        }
-
-        if (n as usize) < len_be.len() {
-            stream.read_exact(&mut len_be[n as usize..])?;
+        if n < len_be.len() {
+            stream.read_exact(&mut len_be[n..])?;
         }
 
         let (frame_len, init_cap) = validate_ipc_frame_header(len_be, MAX_IPC_FRAME_BYTES)
@@ -391,69 +273,24 @@ mod unix_impl {
         Ok((payload, received_fd))
     }
 
-    struct GatewaySharedState {
-        block_store: BlockStore,
-        master_key: MasterKey,
-        macaroon_root_key: Option<[u8; 32]>,
-        default_tier: ErasureTier,
-        stripe_size_bytes: usize,
-        manifests_by_root: RwLock<HashMap<[u8; 32], FileManifest>>,
-        manifests_by_vec_hash: RwLock<HashMap<[u8; 32], FileManifest>>,
-        iops_counter: AtomicU64,
+    fn bind_clean_std_listener(path: &Path) -> io::Result<StdUnixListener> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+        let listener = StdUnixListener::bind(path)?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(listener)
     }
 
-    impl GatewaySharedState {
-        fn index_manifest(&self, fm: FileManifest) -> EphemeralShardManifest {
-            let eph = EphemeralShardManifest::from_file_manifest(&fm);
-            let vec_hash = hash_shard_id_vector(&eph.shard_hashes);
-            if let Ok(mut by_root) = self.manifests_by_root.write() {
-                by_root.insert(fm.file_merkle_root, fm.clone());
-            }
-            if let Ok(mut by_vec) = self.manifests_by_vec_hash.write() {
-                by_vec.insert(vec_hash, fm);
-            }
-            eph
-        }
-
-        fn resolve_manifest_by_root(&self, root: &[u8; 32]) -> Option<FileManifest> {
-            if let Ok(by_root) = self.manifests_by_root.read() {
-                if let Some(found) = by_root.get(root) {
-                    return Some(found.clone());
-                }
-            }
-            if let Ok(loaded) = self.block_store.load_manifest(&self.master_key, root) {
-                let _ = self.index_manifest(loaded.clone());
-                return Some(loaded);
-            }
-            None
-        }
-
-        fn resolve_manifest_by_shard_ids(&self, shard_ids: &[[u8; 32]]) -> Option<FileManifest> {
-            if shard_ids.len() == 1 {
-                if let Some(fm) = self.resolve_manifest_by_root(&shard_ids[0]) {
-                    return Some(fm);
-                }
-            }
-            let vec_hash = hash_shard_id_vector(shard_ids);
-            if let Ok(by_vec) = self.manifests_by_vec_hash.read() {
-                if let Some(found) = by_vec.get(&vec_hash) {
-                    return Some(found.clone());
-                }
-            }
-            // Fallback: check if single-stripe shard_hashes match any indexed manifest.
-            if let Ok(by_root) = self.manifests_by_root.read() {
-                for fm in by_root.values() {
-                    let eph = EphemeralShardManifest::from_file_manifest(fm);
-                    if eph.shard_hashes == shard_ids {
-                        return Some(fm.clone());
-                    }
-                }
-            }
-            None
-        }
-    }
-
-    /// Handle controlling a running [`GatewayIpcServer`].
+    /// Handle controlling a background thread-spawned [`GatewayIpcServer`].
     pub struct GatewayIpcServerHandle {
         socket_path: PathBuf,
         shutdown_flag: Arc<AtomicBool>,
@@ -481,82 +318,81 @@ mod unix_impl {
         }
     }
 
-    /// High-throughput zero-copy Unix Domain Socket IPC Server (`/var/run/parvault.sock`).
+    /// Canonical zero-copy Unix Domain Socket IPC Server (`/var/run/parvault.sock`) backed by
+    /// [`GatewayEngine`]. Supports both synchronous background thread spawning (`new(..).spawn()`)
+    /// and asynchronous Tokio accept loops (`bind(..).serve(shutdown_rx)`).
     pub struct GatewayIpcServer {
         socket_path: PathBuf,
-        block_store: BlockStore,
-        master_key: MasterKey,
-        macaroon_root_key: Option<[u8; 32]>,
-        default_tier: ErasureTier,
-        stripe_size_bytes: usize,
+        bound_listener: Option<StdUnixListener>,
+        engine: Arc<GatewayEngine>,
     }
 
     impl GatewayIpcServer {
+        /// Constructs an embedded `GatewayIpcServer` wrapping `block_store` and `master_key`.
         pub fn new(
-            socket_path: impl Into<PathBuf>,
+            socket_path: impl AsRef<Path>,
             block_store: BlockStore,
             master_key: MasterKey,
         ) -> Self {
             Self {
-                socket_path: socket_path.into(),
-                block_store,
-                master_key,
-                macaroon_root_key: None,
-                default_tier: ErasureTier::Consumer,
-                stripe_size_bytes: ROUTER_SOC_STRIPE_SIZE_BYTES,
+                socket_path: socket_path.as_ref().to_path_buf(),
+                bound_listener: None,
+                engine: Arc::new(GatewayEngine::from_local_block_store(
+                    block_store,
+                    master_key,
+                )),
             }
         }
 
-        pub fn with_profile(mut self, profile: HardwareProfile) -> Self {
-            self.stripe_size_bytes = profile.stripe_size_bytes();
+        /// Binds `socket_path` immediately against an existing `Arc<GatewayEngine>` (ready for
+        /// [`Self::serve`] or [`Self::spawn`]).
+        pub fn bind(socket_path: impl AsRef<Path>, engine: Arc<GatewayEngine>) -> io::Result<Self> {
+            let path = socket_path.as_ref().to_path_buf();
+            let std_listener = bind_clean_std_listener(&path)?;
+            Ok(Self {
+                socket_path: path,
+                bound_listener: Some(std_listener),
+                engine,
+            })
+        }
+
+        pub fn socket_path(&self) -> &Path {
+            &self.socket_path
+        }
+
+        pub fn engine(&self) -> &Arc<GatewayEngine> {
+            &self.engine
+        }
+
+        pub fn with_profile(self, profile: HardwareProfile) -> Self {
+            self.engine
+                .set_stripe_size_bytes(profile.stripe_size_bytes());
             self
         }
 
-        pub fn with_tier(mut self, tier: ErasureTier) -> Self {
-            self.default_tier = tier;
+        pub fn with_tier(self, tier: ErasureTier) -> Self {
+            self.engine.set_tier(tier);
             self
         }
 
-        pub fn with_macaroon_root_key(mut self, root_key: [u8; 32]) -> Self {
-            self.macaroon_root_key = Some(root_key);
+        pub fn with_macaroon_root_key(self, root_key: [u8; 32]) -> Self {
+            self.engine.set_macaroon_root_key(Some(root_key));
             self
         }
 
-        /// Binds `socket_path` and spawns the background `SCM_RIGHTS` worker listener.
-        pub fn spawn(self) -> io::Result<GatewayIpcServerHandle> {
-            if let Some(parent) = self.socket_path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent)?;
-                }
-            }
-            if self.socket_path.exists() {
-                let _ = std::fs::remove_file(&self.socket_path);
-            }
-            let listener = StdUnixListener::bind(&self.socket_path)?;
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &self.socket_path,
-                    std::fs::Permissions::from_mode(0o600),
-                );
-            }
+        /// Binds (if not already bound) and spawns a background worker accept loop, returning an
+        /// RAII [`GatewayIpcServerHandle`].
+        pub fn spawn(mut self) -> io::Result<GatewayIpcServerHandle> {
+            let listener = match self.bound_listener.take() {
+                Some(l) => l,
+                None => bind_clean_std_listener(&self.socket_path)?,
+            };
+            listener.set_nonblocking(false)?;
 
             let shutdown_flag = Arc::new(AtomicBool::new(false));
             let shutdown_cl = Arc::clone(&shutdown_flag);
             let sock_path = self.socket_path.clone();
-
-            let shared = Arc::new(GatewaySharedState {
-                block_store: self
-                    .block_store
-                    .with_stripe_size_bytes(self.stripe_size_bytes),
-                master_key: self.master_key,
-                macaroon_root_key: self.macaroon_root_key,
-                default_tier: self.default_tier,
-                stripe_size_bytes: self.stripe_size_bytes,
-                manifests_by_root: RwLock::new(HashMap::new()),
-                manifests_by_vec_hash: RwLock::new(HashMap::new()),
-                iops_counter: AtomicU64::new(0),
-            });
+            let engine = Arc::clone(&self.engine);
 
             let join_handle = std::thread::Builder::new()
                 .name("parvault-ipc-accept".into())
@@ -568,12 +404,12 @@ mod unix_impl {
                         let Ok(stream) = incoming else {
                             continue;
                         };
-                        let state = Arc::clone(&shared);
+                        let eng = Arc::clone(&engine);
                         std::thread::Builder::new()
                             .name("parvault-ipc-conn".into())
                             .stack_size(256 * 1024)
                             .spawn(move || {
-                                let _ = serve_client_stream(stream, &state);
+                                let _ = serve_client_stream_sync(stream, &eng);
                             })
                             .ok();
                     }
@@ -585,11 +421,119 @@ mod unix_impl {
                 join_handle: Some(join_handle),
             })
         }
+
+        /// Runs an asynchronous Tokio accept loop until `shutdown_rx` signals `true`.
+        pub async fn serve(mut self, mut shutdown_rx: watch::Receiver<bool>) -> io::Result<()> {
+            let std_listener = match self.bound_listener.take() {
+                Some(l) => l,
+                None => bind_clean_std_listener(&self.socket_path)?,
+            };
+            std_listener.set_nonblocking(true)?;
+            let listener = TokioUnixListener::from_std(std_listener)?;
+
+            loop {
+                tokio::select! {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    accept_res = listener.accept() => {
+                        let (stream, _) = accept_res?;
+                        let engine = Arc::clone(&self.engine);
+                        tokio::spawn(async move {
+                            let _ = serve_client_stream_async(stream, engine).await;
+                        });
+                    }
+                }
+            }
+            let _ = std::fs::remove_file(&self.socket_path);
+            Ok(())
+        }
     }
 
-    fn serve_client_stream(
+    fn execute_engine_command(
+        engine: &GatewayEngine,
+        cmd: IpcCommand,
+        maybe_fd: Option<OwnedFd>,
+    ) -> IpcResponse {
+        match cmd {
+            IpcCommand::StorePayload {
+                bytes_len,
+                retention_policy,
+                ..
+            } => {
+                let Some(owned_fd) = maybe_fd else {
+                    return IpcResponse::Error {
+                        message: "StorePayload missing SCM_RIGHTS payload_fd".into(),
+                    };
+                };
+                match engine.store_from_owned_fd(owned_fd, bytes_len, retention_policy) {
+                    Ok(manifest) => IpcResponse::StoreSuccess { manifest },
+                    Err(e) => IpcResponse::Error {
+                        message: format!("StorePayload failed: {e}"),
+                    },
+                }
+            }
+            IpcCommand::FetchPayload {
+                ephemeral_shard_ids,
+                ..
+            } => {
+                let Some(owned_fd) = maybe_fd else {
+                    return IpcResponse::Error {
+                        message: "FetchPayload missing SCM_RIGHTS output_fd".into(),
+                    };
+                };
+                match engine.fetch_by_shard_ids_to_owned_fd(&ephemeral_shard_ids, owned_fd) {
+                    Ok(bytes_streamed) => IpcResponse::FetchSuccess { bytes_streamed },
+                    Err(e) => IpcResponse::Error {
+                        message: format!("FetchPayload failed: {e}"),
+                    },
+                }
+            }
+            IpcCommand::FetchRange {
+                manifest,
+                offset,
+                len,
+                macaroon,
+                ..
+            } => {
+                let Some(owned_fd) = maybe_fd else {
+                    return IpcResponse::Error {
+                        message: "FetchRange missing SCM_RIGHTS output_fd".into(),
+                    };
+                };
+                match engine.fetch_range_to_owned_fd(
+                    &manifest,
+                    offset,
+                    len,
+                    macaroon.as_ref(),
+                    owned_fd,
+                ) {
+                    Ok(bytes_streamed) => IpcResponse::FetchSuccess { bytes_streamed },
+                    Err(e) => IpcResponse::Error {
+                        message: format!("FetchRange failed: {e}"),
+                    },
+                }
+            }
+            IpcCommand::RegisterManifest { file_manifest } => {
+                let manifest = engine.register_manifest(file_manifest);
+                IpcResponse::StoreSuccess { manifest }
+            }
+            IpcCommand::QueryHealthStatus => {
+                let (iops, peer_count, por_sla_score) = engine.health_snapshot();
+                IpcResponse::HealthStatus {
+                    iops,
+                    peer_count,
+                    por_sla_score,
+                }
+            }
+        }
+    }
+
+    fn serve_client_stream_sync(
         mut stream: StdUnixStream,
-        state: &GatewaySharedState,
+        engine: &GatewayEngine,
     ) -> io::Result<()> {
         loop {
             let (raw_cmd, maybe_fd) = match recv_frame_with_optional_fd(&mut stream) {
@@ -601,6 +545,7 @@ mod unix_impl {
             let cmd: IpcCommand = match ipc_bincode().deserialize(&raw_cmd) {
                 Ok(c) => c,
                 Err(e) => {
+                    drop(maybe_fd);
                     let resp = IpcResponse::Error {
                         message: format!("invalid IPC command bincode: {e}"),
                     };
@@ -612,8 +557,7 @@ mod unix_impl {
                 }
             };
 
-            state.iops_counter.fetch_add(1, Ordering::Relaxed);
-            let resp = dispatch_command(cmd, maybe_fd, state);
+            let resp = execute_engine_command(engine, cmd, maybe_fd);
             let resp_bytes = ipc_bincode()
                 .serialize(&resp)
                 .map_err(|se| io::Error::other(se.to_string()))?;
@@ -621,194 +565,60 @@ mod unix_impl {
         }
     }
 
-    fn dispatch_command(
-        cmd: IpcCommand,
-        maybe_fd: Option<OwnedFd>,
-        state: &GatewaySharedState,
-    ) -> IpcResponse {
-        match cmd {
-            IpcCommand::StorePayload {
-                payload_fd: _,
-                bytes_len,
-                retention_policy,
-            } => {
-                let Some(owned_fd) = maybe_fd else {
-                    return IpcResponse::Error {
-                        message: "StorePayload missing SCM_RIGHTS payload_fd".into(),
-                    };
-                };
-                let mut reader_file = File::from(owned_fd);
-                if let Err(e) = reader_file.seek(SeekFrom::Start(0)) {
-                    return IpcResponse::Error {
-                        message: format!("failed seeking payload_fd: {e}"),
-                    };
-                }
-                let owner_tag = match retention_policy {
-                    RetentionPolicy::Ephemeral => "local",
-                    RetentionPolicy::Persistent | RetentionPolicy::PinnedRing => "self",
-                };
-                let tier = match retention_policy {
-                    RetentionPolicy::PinnedRing => ErasureTier::Homelab,
-                    _ => state.default_tier,
-                };
-                match state.block_store.store_reader_streaming(
-                    owner_tag,
-                    &mut reader_file,
-                    bytes_len,
-                    &state.master_key,
-                    tier,
-                    state.stripe_size_bytes,
-                ) {
-                    Ok(fm) => {
-                        let manifest = state.index_manifest(fm);
-                        IpcResponse::StoreSuccess { manifest }
-                    }
-                    Err(e) => IpcResponse::Error {
-                        message: format!("StorePayload failed: {e}"),
-                    },
-                }
-            }
-            IpcCommand::FetchPayload {
-                ephemeral_shard_ids,
-                output_fd: _,
-            } => {
-                let Some(owned_fd) = maybe_fd else {
-                    return IpcResponse::Error {
-                        message: "FetchPayload missing SCM_RIGHTS output_fd".into(),
-                    };
-                };
-                let Some(fm) = state.resolve_manifest_by_shard_ids(&ephemeral_shard_ids) else {
-                    return IpcResponse::Error {
-                        message: "manifest not found for ephemeral_shard_ids".into(),
-                    };
-                };
-                let mut out_file = File::from(owned_fd);
-                let _ = out_file.set_len(0);
-                let _ = out_file.seek(SeekFrom::Start(0));
-                match state.block_store.restore_to_writer_streaming(
-                    &fm,
-                    &state.master_key,
-                    &mut out_file,
-                ) {
-                    Ok(bytes_streamed) => {
-                        let _ = out_file.seek(SeekFrom::Start(0));
-                        IpcResponse::FetchSuccess { bytes_streamed }
-                    }
-                    Err(e) => IpcResponse::Error {
-                        message: format!("FetchPayload failed: {e}"),
-                    },
-                }
-            }
-            IpcCommand::FetchRange {
-                manifest,
-                offset,
-                len,
-                output_fd: _,
-                macaroon,
-            } => {
-                let Some(owned_fd) = maybe_fd else {
-                    return IpcResponse::Error {
-                        message: "FetchRange missing SCM_RIGHTS output_fd".into(),
-                    };
-                };
-                if let Some(ref root_key) = state.macaroon_root_key {
-                    let Some(ref token) = macaroon else {
-                        return IpcResponse::Error {
-                            message: "FetchRange requires a CapabilityMacaroon".into(),
-                        };
-                    };
-                    let ctx = AccessRequestContext {
-                        manifest_root: manifest.file_merkle_root,
-                        offset,
-                        length: len,
-                        is_write: false,
-                        now_unix_ms: now_unix_ms(),
-                    };
-                    if let Err(e) = token.verify_in_ram(root_key, &ctx) {
-                        return IpcResponse::Error {
-                            message: format!("Macaroon capability rejected: {e}"),
-                        };
-                    }
-                } else if let Some(ref token) = macaroon {
-                    let ctx = AccessRequestContext {
-                        manifest_root: manifest.file_merkle_root,
-                        offset,
-                        length: len,
-                        is_write: false,
-                        now_unix_ms: now_unix_ms(),
-                    };
-                    if !token.evaluate_caveats(&ctx) {
-                        return IpcResponse::Error {
-                            message: "Macaroon caveat rejected".into(),
-                        };
-                    }
-                }
+    async fn serve_client_stream_async(
+        mut stream: TokioUnixStream,
+        engine: Arc<GatewayEngine>,
+    ) -> anyhow::Result<()> {
+        loop {
+            let (frame_bytes, received_fd) = match recv_frame_with_fd(&mut stream).await {
+                Ok(pair) => pair,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
 
-                let Some(fm) = state
-                    .resolve_manifest_by_root(&manifest.file_merkle_root)
-                    .or_else(|| state.resolve_manifest_by_shard_ids(&manifest.shard_hashes))
-                else {
-                    return IpcResponse::Error {
-                        message: "manifest not found for FetchRange".into(),
+            let cmd: IpcCommand = match ipc_bincode().deserialize(&frame_bytes) {
+                Ok(c) => c,
+                Err(e) => {
+                    drop(received_fd);
+                    let resp = IpcResponse::Error {
+                        message: format!("invalid IPC command frame: {e}"),
                     };
-                };
+                    let enc = ipc_bincode().serialize(&resp)?;
+                    send_frame_with_fd(&mut stream, &enc, None).await?;
+                    continue;
+                }
+            };
 
-                let mut out_file = File::from(owned_fd);
-                let _ = out_file.set_len(0);
-                let _ = out_file.seek(SeekFrom::Start(0));
-                match state.block_store.read_plaintext_range(
-                    &fm,
-                    &state.master_key,
-                    offset,
-                    len,
-                    &mut out_file,
-                ) {
-                    Ok(bytes_streamed) => {
-                        let _ = out_file.seek(SeekFrom::Start(0));
-                        IpcResponse::FetchSuccess { bytes_streamed }
-                    }
-                    Err(e) => IpcResponse::Error {
-                        message: format!("FetchRange failed: {e}"),
-                    },
-                }
-            }
-            IpcCommand::RegisterManifest { file_manifest } => {
-                if let Err(e) = state
-                    .block_store
-                    .save_manifest(&state.master_key, &file_manifest)
-                {
-                    return IpcResponse::Error {
-                        message: format!("RegisterManifest save failed: {e}"),
-                    };
-                }
-                let manifest = state.index_manifest(file_manifest);
-                IpcResponse::StoreSuccess { manifest }
-            }
-            IpcCommand::QueryHealthStatus => {
-                let peer_count = state
-                    .block_store
-                    .mesh_client()
-                    .map(|c| c.all_network_endpoints().len())
-                    .unwrap_or(0);
-                IpcResponse::HealthStatus {
-                    iops: state.iops_counter.load(Ordering::Relaxed),
-                    peer_count,
-                    por_sla_score: 1.0,
-                }
-            }
+            let eng = Arc::clone(&engine);
+            let response = match tokio::task::spawn_blocking(move || {
+                execute_engine_command(&eng, cmd, received_fd)
+            })
+            .await
+            {
+                Ok(resp) => resp,
+                Err(e) => IpcResponse::Error {
+                    message: format!("gateway worker join error: {e}"),
+                },
+            };
+            let enc = ipc_bincode().serialize(&response)?;
+            send_frame_with_fd(&mut stream, &enc, None).await?;
         }
     }
 
-    /// Zero-copy IPC client connecting to `/var/run/parvault.sock` (`parvault-gateway`).
+    /// Zero-copy Unix Domain Socket IPC client connecting to `/var/run/parvault.sock`
+    /// (`parvault-gateway`). Provides both asynchronous Tokio methods (`store_payload_fd`,
+    /// `fetch_payload_to_fd`, `fetch_range_to_fd`, `store_bytes`, `query_health`, `send_command`)
+    /// and synchronous blocking methods (`store_memfd`, `fetch_into_memfd`,
+    /// `fetch_range_into_memfd`, `fetch_range_bytes`, `register_manifest`, `query_health_sync`).
     #[derive(Debug, Clone)]
     pub struct GatewayIpcClient {
         socket_path: PathBuf,
     }
 
     impl GatewayIpcClient {
-        pub fn new(socket_path: impl Into<PathBuf>) -> Self {
+        pub fn new(socket_path: impl AsRef<Path>) -> Self {
             Self {
-                socket_path: socket_path.into(),
+                socket_path: socket_path.as_ref().to_path_buf(),
             }
         }
 
@@ -816,7 +626,121 @@ mod unix_impl {
             &self.socket_path
         }
 
-        fn send_request(
+        // --- Asynchronous Tokio Client Surface ---
+
+        /// Sends a raw [`IpcCommand`] with an optional `SCM_RIGHTS` file descriptor over Tokio `UnixStream`.
+        pub async fn send_command(
+            &self,
+            cmd: &IpcCommand,
+            attached_fd: Option<RawFd>,
+        ) -> anyhow::Result<IpcResponse> {
+            let mut stream = TokioUnixStream::connect(&self.socket_path).await?;
+            let encoded = ipc_bincode().serialize(cmd)?;
+            send_frame_with_fd(&mut stream, &encoded, attached_fd).await?;
+            let (resp_bytes, extra_fd) = recv_frame_with_fd(&mut stream).await?;
+            drop(extra_fd);
+            let resp: IpcResponse = ipc_bincode().deserialize(&resp_bytes)?;
+            Ok(resp)
+        }
+
+        /// Passes `payload_fd` (`memfd` or file) zero-copy via `SCM_RIGHTS` for streaming encryption & sharding.
+        pub async fn store_payload_fd(
+            &self,
+            payload_fd: RawFd,
+            bytes_len: u64,
+            retention_policy: RetentionPolicy,
+        ) -> anyhow::Result<EphemeralShardManifest> {
+            let cmd = IpcCommand::StorePayload {
+                payload_fd,
+                bytes_len,
+                retention_policy,
+            };
+            match self.send_command(&cmd, Some(payload_fd)).await? {
+                IpcResponse::StoreSuccess { manifest } => Ok(manifest),
+                IpcResponse::Error { message } => {
+                    anyhow::bail!("gateway StorePayload error: {message}")
+                }
+                other => anyhow::bail!("unexpected StorePayload response: {other:?}"),
+            }
+        }
+
+        /// Reconstructs the full payload identified by `ephemeral_shard_ids` directly into `output_fd` via `SCM_RIGHTS`.
+        pub async fn fetch_payload_to_fd(
+            &self,
+            ephemeral_shard_ids: Vec<[u8; 32]>,
+            output_fd: RawFd,
+        ) -> anyhow::Result<u64> {
+            let cmd = IpcCommand::FetchPayload {
+                ephemeral_shard_ids,
+                output_fd,
+            };
+            match self.send_command(&cmd, Some(output_fd)).await? {
+                IpcResponse::FetchSuccess { bytes_streamed } => Ok(bytes_streamed),
+                IpcResponse::Error { message } => {
+                    anyhow::bail!("gateway FetchPayload error: {message}")
+                }
+                other => anyhow::bail!("unexpected FetchPayload response: {other:?}"),
+            }
+        }
+
+        /// Fetches a targeted byte-range (`[offset .. offset + len]`) into `output_fd` via `SCM_RIGHTS`,
+        /// optionally enforcing an attached [`CapabilityMacaroon`] in RAM (`< 1 ms`).
+        pub async fn fetch_range_to_fd(
+            &self,
+            manifest: EphemeralShardManifest,
+            offset: u64,
+            len: u64,
+            output_fd: RawFd,
+            macaroon: Option<CapabilityMacaroon>,
+        ) -> anyhow::Result<u64> {
+            let cmd = IpcCommand::FetchRange {
+                manifest,
+                offset,
+                len,
+                output_fd,
+                macaroon,
+            };
+            match self.send_command(&cmd, Some(output_fd)).await? {
+                IpcResponse::FetchSuccess { bytes_streamed } => Ok(bytes_streamed),
+                IpcResponse::Error { message } => {
+                    anyhow::bail!("gateway FetchRange error: {message}")
+                }
+                other => anyhow::bail!("unexpected FetchRange response: {other:?}"),
+            }
+        }
+
+        /// Allocates an anonymous `memfd`, writes `bytes` via safe `pwrite_all`, and stores via `SCM_RIGHTS`.
+        pub async fn store_bytes(
+            &self,
+            bytes: &[u8],
+            retention_policy: RetentionPolicy,
+        ) -> anyhow::Result<EphemeralShardManifest> {
+            let mfd = create_memfd_sized("parvault-store", bytes.len() as u64)?;
+            let file = File::from(mfd);
+            pwrite_all(&file, 0, bytes)?;
+            self.store_payload_fd(file.as_raw_fd(), bytes.len() as u64, retention_policy)
+                .await
+        }
+
+        /// Queries real-time gateway IOPS, connected peer count, and PoR SLA compliance score asynchronously.
+        pub async fn query_health(&self) -> anyhow::Result<(u64, usize, f32)> {
+            match self
+                .send_command(&IpcCommand::QueryHealthStatus, None)
+                .await?
+            {
+                IpcResponse::HealthStatus {
+                    iops,
+                    peer_count,
+                    por_sla_score,
+                } => Ok((iops, peer_count, por_sla_score)),
+                IpcResponse::Error { message } => anyhow::bail!("gateway health error: {message}"),
+                other => anyhow::bail!("unexpected QueryHealthStatus response: {other:?}"),
+            }
+        }
+
+        // --- Synchronous Blocking Client Surface (FUSE / Sync CLI / Benchmarks) ---
+
+        fn send_request_sync(
             &self,
             cmd: &IpcCommand,
             attached_fd: Option<RawFd>,
@@ -826,7 +750,8 @@ mod unix_impl {
                 .serialize(cmd)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
             send_frame_with_optional_fd(&mut stream, &encoded, attached_fd)?;
-            let (resp_bytes, _fd) = recv_frame_with_optional_fd(&mut stream)?;
+            let (resp_bytes, extra_fd) = recv_frame_with_optional_fd(&mut stream)?;
+            drop(extra_fd);
             ipc_bincode()
                 .deserialize(&resp_bytes)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
@@ -844,7 +769,7 @@ mod unix_impl {
                 bytes_len,
                 retention_policy,
             };
-            match self.send_request(&cmd, Some(payload_fd))? {
+            match self.send_request_sync(&cmd, Some(payload_fd))? {
                 IpcResponse::StoreSuccess { manifest } => Ok(manifest),
                 IpcResponse::Error { message } => Err(io::Error::other(message)),
                 other => Err(io::Error::other(format!(
@@ -863,7 +788,7 @@ mod unix_impl {
                 ephemeral_shard_ids,
                 output_fd,
             };
-            match self.send_request(&cmd, Some(output_fd))? {
+            match self.send_request_sync(&cmd, Some(output_fd))? {
                 IpcResponse::FetchSuccess { bytes_streamed } => Ok(bytes_streamed),
                 IpcResponse::Error { message } => Err(io::Error::other(message)),
                 other => Err(io::Error::other(format!(
@@ -888,7 +813,7 @@ mod unix_impl {
                 output_fd,
                 macaroon,
             };
-            match self.send_request(&cmd, Some(output_fd))? {
+            match self.send_request_sync(&cmd, Some(output_fd))? {
                 IpcResponse::FetchSuccess { bytes_streamed } => Ok(bytes_streamed),
                 IpcResponse::Error { message } => Err(io::Error::other(message)),
                 other => Err(io::Error::other(format!(
@@ -922,7 +847,7 @@ mod unix_impl {
             file_manifest: FileManifest,
         ) -> io::Result<EphemeralShardManifest> {
             let cmd = IpcCommand::RegisterManifest { file_manifest };
-            match self.send_request(&cmd, None)? {
+            match self.send_request_sync(&cmd, None)? {
                 IpcResponse::StoreSuccess { manifest } => Ok(manifest),
                 IpcResponse::Error { message } => Err(io::Error::other(message)),
                 other => Err(io::Error::other(format!(
@@ -931,9 +856,9 @@ mod unix_impl {
             }
         }
 
-        /// Queries live gateway IOPS, peer count, and PoR SLA compliance score.
-        pub fn query_health(&self) -> io::Result<(u64, usize, f32)> {
-            match self.send_request(&IpcCommand::QueryHealthStatus, None)? {
+        /// Queries live gateway IOPS, peer count, and PoR SLA compliance score synchronously.
+        pub fn query_health_sync(&self) -> io::Result<(u64, usize, f32)> {
+            match self.send_request_sync(&IpcCommand::QueryHealthStatus, None)? {
                 IpcResponse::HealthStatus {
                     iops,
                     peer_count,
@@ -950,11 +875,7 @@ mod unix_impl {
 
 #[cfg(unix)]
 pub use unix_impl::{
-    create_memfd, read_self_anon_rss_bytes, read_self_rss_bytes, recv_frame_with_optional_fd,
-    send_frame_with_optional_fd, GatewayIpcClient, GatewayIpcServer, GatewayIpcServerHandle,
+    create_memfd, create_memfd_sized, read_self_anon_rss_bytes, read_self_rss_bytes,
+    recv_frame_with_optional_fd, send_frame_with_optional_fd, GatewayIpcClient, GatewayIpcServer,
+    GatewayIpcServerHandle,
 };
-
-#[allow(dead_code)]
-fn _keep_sha256_import() {
-    let _ = compute_sha256(b"");
-}

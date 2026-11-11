@@ -217,18 +217,7 @@ impl AnonymousTelemetryBeacon {
         let committed_capacity_bucket_gib = round_to_pow2_gib(raw_committed_bytes);
         let used_storage_bucket_gib = round_to_pow2_gib(raw_used_bytes);
 
-        let beacon_mac = Self::compute_beacon_mac(
-            epoch_id,
-            &epoch_nullifier,
-            &sanitized_region,
-            role,
-            earned_standing,
-            committed_capacity_bucket_gib,
-            used_storage_bucket_gib,
-            observed_dht_routing_peers,
-        );
-
-        Ok(Self {
+        let mut beacon = Self {
             epoch_id,
             epoch_nullifier,
             coarse_region: sanitized_region,
@@ -237,10 +226,12 @@ impl AnonymousTelemetryBeacon {
             committed_capacity_bucket_gib,
             used_storage_bucket_gib,
             observed_dht_routing_peers,
-            beacon_mac,
+            beacon_mac: [0u8; 32],
             pow_nonce: 0,
             pow_difficulty_bits: 0,
-        })
+        };
+        beacon.beacon_mac = beacon.compute_beacon_mac();
+        Ok(beacon)
     }
 
     /// Constructs a new `AnonymousTelemetryBeacon` and solves a zero-knowledge Hashcash Proof-of-Work
@@ -302,16 +293,7 @@ impl AnonymousTelemetryBeacon {
                 used: self.used_storage_bucket_gib,
             });
         }
-        let expected_mac = Self::compute_beacon_mac(
-            self.epoch_id,
-            &self.epoch_nullifier,
-            &self.coarse_region,
-            self.role,
-            self.earned_standing,
-            self.committed_capacity_bucket_gib,
-            self.used_storage_bucket_gib,
-            self.observed_dht_routing_peers,
-        );
+        let expected_mac = self.compute_beacon_mac();
         if expected_mac != self.beacon_mac {
             return Err(TelemetryError::InvalidBeaconMac);
         }
@@ -359,33 +341,23 @@ impl AnonymousTelemetryBeacon {
         .map_err(TelemetryError::PqEnvelope)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn compute_beacon_mac(
-        epoch_id: u64,
-        epoch_nullifier: &[u8; 32],
-        coarse_region: &str,
-        role: PeerRole,
-        earned_standing: EarnedStanding,
-        committed_capacity_bucket_gib: u64,
-        used_storage_bucket_gib: u64,
-        observed_dht_routing_peers: u32,
-    ) -> [u8; 32] {
-        let mut mac = <HmacSha256 as hmac::digest::KeyInit>::new_from_slice(epoch_nullifier)
+    fn compute_beacon_mac(&self) -> [u8; 32] {
+        let mut mac = <HmacSha256 as hmac::digest::KeyInit>::new_from_slice(&self.epoch_nullifier)
             .expect("32-byte HMAC key is always valid");
         mac.update(b"PARVAULT-TELEMETRY-BEACON-MAC-V1:");
-        mac.update(&epoch_id.to_le_bytes());
-        mac.update(coarse_region.as_bytes());
+        mac.update(&self.epoch_id.to_le_bytes());
+        mac.update(self.coarse_region.as_bytes());
         mac.update(b":");
-        let role_tag: u8 = match role {
+        let role_tag: u8 = match self.role {
             PeerRole::PersonalDevice => 1,
             PeerRole::OrganicCommunityPeer => 2,
             PeerRole::FoundationSeedAnchor => 3,
         };
         mac.update(&[role_tag]);
-        mac.update(earned_standing_label(earned_standing).as_bytes());
-        mac.update(&committed_capacity_bucket_gib.to_le_bytes());
-        mac.update(&used_storage_bucket_gib.to_le_bytes());
-        mac.update(&observed_dht_routing_peers.to_le_bytes());
+        mac.update(earned_standing_label(self.earned_standing).as_bytes());
+        mac.update(&self.committed_capacity_bucket_gib.to_le_bytes());
+        mac.update(&self.used_storage_bucket_gib.to_le_bytes());
+        mac.update(&self.observed_dht_routing_peers.to_le_bytes());
         let bytes = mac.finalize().into_bytes();
         let mut out = [0u8; 32];
         out.copy_from_slice(&bytes);

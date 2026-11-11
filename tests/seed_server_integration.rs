@@ -202,9 +202,7 @@ fn test_seed_server_public_bootstrapper_mode_blinded_storage_and_auto_drain() {
                 &shard_bytes,
                 capability,
                 &voucher,
-                1,
-                30,
-                delete_verifier,
+                parvault::storage::BlindedLeaseSpec::new(1, 30, delete_verifier),
             )
             .expect("ingest blinded bootstrap shard");
 
@@ -317,9 +315,7 @@ fn test_seed_server_time_based_eviction_sweep_deletes_abandoned_bshard_files() {
             &bytes_abandoned,
             cap_abandoned,
             &voucher_a,
-            10,
-            5,
-            verifier_a,
+            parvault::storage::BlindedLeaseSpec::new(10, 5, verifier_a),
         )
         .expect("store abandoned shard");
     server
@@ -328,9 +324,7 @@ fn test_seed_server_time_based_eviction_sweep_deletes_abandoned_bshard_files() {
             &bytes_renewed,
             cap_renewed,
             &voucher_b,
-            10,
-            5,
-            verifier_b,
+            parvault::storage::BlindedLeaseSpec::new(10, 5, verifier_b),
         )
         .expect("store renewed shard");
 

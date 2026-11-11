@@ -96,7 +96,7 @@ fn test_layer1_blinded_shard_locators_and_224bit_combinatorial_wall() {
 fn test_layer2_per_shard_blinded_capabilities_zero_linkage() {
     let master_key = MasterKey::from_bytes([0x44; 32]);
     let owner_identity = NodeIdentity::generate();
-    let fake_merkle_root = [0xAB; 32];
+    let stripe_merkle_root = [0xAB; 32];
 
     let mut capability_pubkeys = HashSet::new();
     let mut capabilities = Vec::new();
@@ -105,7 +105,7 @@ fn test_layer2_per_shard_blinded_capabilities_zero_linkage() {
     for shard_idx in 0..20u32 {
         let dummy_shard = vec![shard_idx as u8; 1024];
         let blinded_id =
-            BlindedShardId::derive(&master_key, &fake_merkle_root, shard_idx, &dummy_shard);
+            BlindedShardId::derive(&master_key, &stripe_merkle_root, shard_idx, &dummy_shard);
         let (cap_id, capability) =
             BlindedShardCapability::derive_keypair(&master_key, &blinded_id.locator);
 

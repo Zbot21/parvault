@@ -154,9 +154,7 @@ fn test_rt2_blinded_capability_pinning_clock_skew_and_tombstone_generation_repla
             owner_cap,
             &v1,
             &mut ledger,
-            10,
-            20,
-            delete_verifier,
+            parvault::storage::BlindedLeaseSpec::new(10, 20, delete_verifier),
         )
         .expect("put blinded shard gen 0");
 
@@ -223,9 +221,7 @@ fn test_rt2_blinded_capability_pinning_clock_skew_and_tombstone_generation_repla
             owner_cap,
             &v2,
             &mut ledger,
-            15,
-            20,
-            delete_verifier,
+            parvault::storage::BlindedLeaseSpec::new(15, 20, delete_verifier),
         )
         .expect("re-upload blinded shard gen 1");
     assert!(store.has_blinded_shard_on_disk(&blinded_id));
@@ -331,10 +327,10 @@ fn test_rt3_ephemeral_sybil_seed_drain_blocked_cgnat_fairness_and_weather_quorum
 
     // Single anchor + untrusted node claiming outage -> rejected (< 3 trusted anchors)
     let a1 = SignedWeatherAttestation::issue(&anchor1, 42, 100, 25);
-    let a_fake = SignedWeatherAttestation::issue(&untrusted, 42, 100, 50);
+    let a_forged = SignedWeatherAttestation::issue(&untrusted, 42, 100, 50);
     assert!(!CorrelatedOutageController::verify_weather_quorum(
         42,
-        &[a1.clone(), a_fake],
+        &[a1.clone(), a_forged],
         &trusted_anchors,
         3
     ));

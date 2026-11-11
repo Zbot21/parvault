@@ -1405,16 +1405,13 @@ impl ZeroTrustSeedServer {
 
     /// Ingests an anonymized `BlindedShardId` with an explicit Byte-Epoch lease and `delete_verifier`
     /// (`PublicNetworkBootstrapper` mode).
-    #[allow(clippy::too_many_arguments)]
     pub fn ingest_blinded_shard_with_lease(
         &mut self,
         blinded_id: &BlindedShardId,
         shard_bytes: &[u8],
         capability: BlindedShardCapability,
         voucher: &AnonymousQuotaVoucher,
-        current_epoch: u64,
-        lease_duration_epochs: u64,
-        delete_verifier: [u8; 32],
+        lease: crate::storage::BlindedLeaseSpec,
     ) -> Result<PathBuf, BootstrapError> {
         let path = self.block_store.put_blinded_shard_with_lease(
             blinded_id,
@@ -1422,9 +1419,7 @@ impl ZeroTrustSeedServer {
             capability,
             voucher,
             &mut self.voucher_ledger,
-            current_epoch,
-            lease_duration_epochs,
-            delete_verifier,
+            lease,
         )?;
         Ok(path)
     }
