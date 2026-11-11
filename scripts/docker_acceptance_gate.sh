@@ -377,7 +377,13 @@ if [ "$SOC_DAEMON_OOM" != "false" ] || [ "$SOC_DAEMON_RUNNING" != "true" ]; then
 fi
 
 # Verify embedded RouterNasStatusServer HTTP telemetry on 172.28.0.60:4080
-SOC_HEALTH_JSON="$(docker exec parvault-client wget -qO- http://172.28.0.60:4080/api/v1/health || true)"
+SOC_HEALTH_JSON="$(docker exec parvault-client sh -c '
+    if command -v wget >/dev/null 2>&1; then
+        wget -qO- http://172.28.0.60:4080/api/v1/health
+    else
+        bash -c '\''exec 3<>/dev/tcp/172.28.0.60/4080 && printf "GET /api/v1/health HTTP/1.0\r\nHost: 172.28.0.60\r\nConnection: close\r\n\r\n" >&3 && cat <&3'\'' | sed "1,/^\r\{0,1\}$/d"
+    fi
+' || true)"
 echo "parvault-router-soc /api/v1/health: $SOC_HEALTH_JSON"
 echo "$SOC_HEALTH_JSON" | grep -Eq '"hardware_profile"[[:space:]]*:[[:space:]]*"router-soc"'
 
