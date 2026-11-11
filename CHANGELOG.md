@@ -1,8 +1,28 @@
 # Changelog
 
-All notable architectural decisions, security hardenings, and user-facing features for `parvault` (`parvault` & `parvault-seed`) are documented in this file.
+All notable architectural decisions, security hardenings, and user-facing features for `parvault` (`parvault`, `parvault-seed`, `parvault-gateway`, `parvault-fuse`, and `parvault-bench`) are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+---
+
+## [`0.4.0`] - 2026-11-11
+
+### Added
+- **Canonical Zero-Copy UDS Data-Plane Gateway (`parvault-gateway`, `src/gateway/`, [`ADR-27`](docs/adr/ADR-27-zero-copy-uds-gateway-and-hedged-pool.md)):**
+  - Unified `GatewayEngine`, `GatewayIpcServer`, `GatewayIpcClient`, `PinnedRingBudget<SLOTS>`, and `SharedPayloadFd` over `/var/run/parvault.sock` (`0600`) passing Linux `memfd_create` descriptors via `SCM_RIGHTS` (`730.88–957.01 MiB/s` `Store`, `1,724.51–2,213.86 MiB/s` `FetchRange`, `0.49 ms` local TTFB, `10.98 MiB` peak `VmHWM` `< 16 MiB`).
+  - Provisioned a `40`-lane (`MESH_POOL_CONCURRENCY = 40`, `128 KiB` stack per worker thread) single-wave `libp2p` shard pool so all `N <= 40` shards fire concurrently at `t = 0` (`< 60 ms` degraded-WAN TTFB).
+  - Added CLI subcommands `serve` (`--peers`, `--tier`, `--stripe-bytes`, `--macaroon-root-key-hex`), `ipc-roundtrip` (`--size-mib`, `--net-iface`), `health`, and `self-test`.
+- **Stateless `HMAC-SHA256` `CapabilityMacaroon` Attenuation (`src/capabilities.rs`, [`ADR-28`](docs/adr/ADR-28-stateless-macaroon-capability-attenuation.md)):**
+  - Implemented offline monotonic caveat attenuation (`AllowedManifest`, `ByteRange`, `ExpiresAtUnixMs`, `ReadOnly`), `< 1 ms` zero-DB constant-time RAM verification (`ct_eq_32`), and composite post-quantum `GatewayIdentityStatement` (`Ed25519 + ML-DSA-65`).
+- **Pure-Rust Userspace `/dev/fuse` (`ABI 7.31`) & WebDAV Lazy Virtual Filesystem (`parvault-fuse`, `src/vfs.rs`, [`ADR-29`](docs/adr/ADR-29-pure-rust-fuse-and-webdav-lazy-vfs.md)):**
+  - Implemented feature-gated (`--features vfs`) zero-`unsafe` Linux `/dev/fuse` (`parse_fuse_in_header`, `parse_fuse_read_in`), `VirtualVaultFs`, `VfsStubNode` lazy metadata inodes, `LruBlockCache`, and unprivileged HTTP `206 Partial Content` / WebDAV `PROPFIND` (`14.59 ms` TTFB `< 50 ms` on `10 GiB` sparse vaults).
+- **Filesystem-Free Bounded-RAM Ephemeral Seed Mode (`parvault-seed --no-fs --in-memory-mb`, [`ADR-30`](docs/adr/ADR-30-filesystem-free-in-memory-seed-mode.md)):**
+  - Added `--no-fs --in-memory-mb <MiB>` (`--identity-env` / `--identity-file`) creating zero persistent directories or files on disk and scrubbing evicted/dropped buffers with `0x00` via `zeroize::Zeroize`.
+- **Crate-Wide `#![deny/forbid(unsafe_code)]`, `src/os_sys.rs` Isolation & Formal Verification Expansion ([`ADR-31`](docs/adr/ADR-31-unsafe-remediation-and-os-sys-ffi-boundary.md), [`docs/SAFETY_AND_LINT_AUDIT.md`](docs/SAFETY_AND_LINT_AUDIT.md)):**
+  - Enforced `#![deny(unsafe_code)]` on `src/lib.rs` and `#![forbid(unsafe_code)]` across `src/main.rs` and all 4 binaries (`parvault-seed`, `parvault-gateway`, `parvault-fuse`, `parvault-bench`); isolated all `9` POSIX syscalls inside `src/os_sys.rs` and implemented `pread_full_or_eof` / `pwrite_all` using 100% safe `FileExt::{read_at, write_at}`.
+  - Expanded formal verification to **`15/15` Kani symbolic harnesses** (adding `proof_pinned_ring_capacity_invariant`, `proof_fuse_header_parser_no_panic`, `proof_gateway_ipc_frame_header_bounds`, `proof_vfs_block_window_power_of_two_and_zero_bounds`, `proof_macaroon_caveat_attenuation_monotonic_and_zero_key_rejected`) + **`7/7` TLA+ TLC specifications** (`ParVaultZeroKeyAdminAndQuorum.tla`) and **`122/122` release tests**.
+  - Sharded `docs/ADR.md` into **31 strictly single-concern ADR files** under [`docs/adr/`](docs/adr/) with a complete `AES-256-GCM` vs. Post-Quantum Cryptography suite guide and a standalone GitHub Flavored Markdown math/currency CI gate.
 
 ---
 

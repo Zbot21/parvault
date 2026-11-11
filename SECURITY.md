@@ -2,16 +2,16 @@
 
 ## Supported Versions
 
-| Version | Supported | Cryptographic Suite |
+| Version | Supported | Cryptographic & Memory-Safety Suite |
 | :--- | :---: | :--- |
-| `0.2.x` | Yes | Classical (`AES-256-GCM`, `ChaCha20-Poly1305`, `Argon2id`, `Ed25519`, `X25519`) + Post-Quantum Hybrid (`ML-KEM-768`, `ML-DSA-65`, 512-bit Cascaded AEAD) |
-| `0.1.x` | No (Superseded by `0.2.0`) | Initial release |
+| `0.4.x` | Yes | Classical (`AES-256-GCM`, `ChaCha20-Poly1305`, `Argon2id`, `Ed25519`, `X25519`) + Post-Quantum Hybrid (`ML-KEM-768`, `ML-DSA-65`, Dual-Cipher `PqVaultMasterKey`) + `#![deny/forbid(unsafe_code)]` (`15` Kani + `7` TLA+ proofs) |
+| `< 0.4.0` | No (Superseded by `0.4.0`) | Prior releases |
 
-## Zero-Trust & Adversarial Security Guarantees (`ADR-01` – `ADR-17`)
+## Zero-Trust & Adversarial Security Guarantees ([`ADR-01` – `ADR-31`](docs/ADR.md))
 
-1. **Zero-Knowledge Storage Hosts (`ADR-01`, `ADR-10`, `ADR-12`):**
-   - Plaintext files are padded to ISO/IEC 7816-4 buckets and encrypted client-side using 256-bit `MasterKey` (`AES-256-GCM`) or 512-bit Grover-resistant `PqVaultMasterKey` (inner `AES-256-GCM` $\to$ outer `ChaCha20-Poly1305`) **before** Reed-Solomon erasure coding over $GF(2^8)$.
-   - Storage peers and `parvault-seed` nodes hold only high-entropy ciphertext shards ($H(X) > 7.98$ bits/byte) and never possess decryption keys.
+1. **Zero-Knowledge Storage Hosts (`ADR-01`, `ADR-10`, `ADR-12`, `ADR-13`):**
+   - Plaintext files are padded to ISO/IEC 7816-4 buckets and encrypted client-side using 256-bit `MasterKey` (`AES-256-GCM`, 128-bit post-quantum Grover floor) or 512-bit dual-cipher `PqVaultMasterKey` (inner `AES-256-GCM` $\to$ outer `ChaCha20-Poly1305`) **before** Reed-Solomon erasure coding over $GF(2^8)$.
+   - Storage peers and `parvault-seed` nodes hold only high-entropy ciphertext shards (`H(X) > 7.98 bits/byte`) and never possess decryption keys.
 2. **4-Layer Shard Anonymization (`ADR-11`):**
    - Remote shards use `BlindedShardId` (`HMAC-SHA256`), per-shard `BlindedShardCapability` keys, single-use `AnonymousQuotaVoucher`s (bounded 65,536-entry FIFO nullifier ledger), and 1-hop `PqRelayedShardEnvelope` (`X25519 + ML-KEM-768`) onion routing.
 3. **Multi-Domain Red-Team Hardening (`ADR-15` – `ADR-17`):**

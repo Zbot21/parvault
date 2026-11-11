@@ -16,6 +16,132 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: GitHub Markdown Math & Currency Hazard Gate
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess, sys
+
+          TEXT_MACROS_RE = re.compile(r"\\(?:text|texttt|mathrm|mathbf)\s*\{([^{}]*)\}")
+
+          def strip_inline_code(line: str) -> str:
+              out, i, n = [], 0, len(line)
+              while i < n:
+                  if line[i] == "`":
+                      j = i
+                      while j < n and line[j] == "`":
+                          j += 1
+                      ticks = j - i
+                      close = line.find("`" * ticks, j)
+                      if close != -1:
+                          end = close + ticks
+                          out.append(" " * (end - i))
+                          i = end
+                          continue
+                  out.append(line[i])
+                  i += 1
+              return "".join(out)
+
+          def check_math_body(expr: str, path: str, line_no: int, is_display: bool, errors: list[str]) -> None:
+              kind = "display $$" if is_display else "inline $"
+              for m in TEXT_MACROS_RE.finditer(expr):
+                  if "_" in m.group(1):
+                      errors.append(f"{path}:{line_no}: [{kind}] underscore inside {m.group(0)!r}")
+              if '"' in expr:
+                  errors.append(f"{path}:{line_no}: [{kind}] double quote inside math: {expr.strip()!r}")
+              if "`" in expr:
+                  errors.append(f"{path}:{line_no}: [{kind}] backtick inside math: {expr.strip()!r}")
+              if "&lt;" in expr or "&gt;" in expr:
+                  errors.append(f"{path}:{line_no}: [{kind}] HTML entity &lt;/&gt; inside math: {expr.strip()!r}")
+              if r"\!" in expr:
+                  errors.append(f"{path}:{line_no}: [{kind}] '\\!' inside math: {expr.strip()!r}")
+              if not is_display and ("<" in expr or ">" in expr):
+                  errors.append(f"{path}:{line_no}: [inline $] raw '<' or '>' inside inline math: {expr.strip()!r}")
+
+          def scan_file(path: str) -> list[str]:
+              errors = []
+              lines = open(path, encoding="utf-8").read().splitlines()
+              in_fence, fence_char, fence_len = False, "", 0
+              in_display, disp_start, disp_lines = False, 0, []
+              n = len(lines)
+              for idx, raw in enumerate(lines):
+                  lno = idx + 1
+                  lead = raw.lstrip(" >\t")
+                  if not in_display:
+                      mf = re.match(r"^(`{3,}|~{3,})(.*)$", lead)
+                      if mf:
+                          ch, rest = mf.group(1), mf.group(2)
+                          if not in_fence and (ch[0] == "~" or "`" not in rest):
+                              in_fence, fence_char, fence_len = True, ch[0], len(ch)
+                              continue
+                          elif in_fence and ch[0] == fence_char and len(ch) >= fence_len and rest.strip() == "":
+                              in_fence, fence_char, fence_len = False, "", 0
+                              continue
+                  if in_fence:
+                      continue
+                  if in_display:
+                      if re.match(r"^\$\$\s*$", raw):
+                          if idx + 1 < n and lines[idx + 1].strip() != "":
+                              errors.append(f"{path}:{lno}: [display $$] closing '$$' must be followed by blank line")
+                          check_math_body("\n".join(disp_lines), path, disp_start, True, errors)
+                          in_display, disp_lines = False, []
+                      elif "$$" in raw:
+                          errors.append(f"{path}:{lno}: [display $$] non-standalone '$$': {raw!r}")
+                          in_display, disp_lines = False, []
+                      else:
+                          disp_lines.append(raw)
+                      continue
+                  if re.match(r"^\$\$\s*$", raw):
+                      if idx > 0 and lines[idx - 1].strip() != "":
+                          errors.append(f"{path}:{lno}: [display $$] opening '$$' must be preceded by blank line")
+                      in_display, disp_start, disp_lines = True, lno, []
+                      continue
+                  masked = strip_inline_code(raw)
+                  j, has_bad_dd = 0, False
+                  while j < len(masked) - 1:
+                      if masked[j] == "\\":
+                          j += 2
+                          continue
+                      if masked[j] == "$" and masked[j + 1] == "$":
+                          errors.append(f"{path}:{lno}: [display $$] single-line or indented '$$' forbidden: {raw.strip()!r}")
+                          has_bad_dd = True
+                          break
+                      j += 1
+                  if has_bad_dd:
+                      continue
+                  pos, j = [], 0
+                  while j < len(masked):
+                      if masked[j] == "\\":
+                          j += 2
+                          continue
+                      if masked[j] == "$":
+                          pos.append(j)
+                      j += 1
+                  if not pos:
+                      continue
+                  if len(pos) % 2 != 0:
+                      errors.append(f"{path}:{lno}: [currency/math $] unbalanced '$' ({len(pos)} on line): {raw.strip()!r}")
+                      continue
+                  for k in range(0, len(pos), 2):
+                      op, cp = pos[k], pos[k + 1]
+                      inner = raw[op + 1 : cp]
+                      if not inner or inner[0].isspace() or inner[-1].isspace():
+                          errors.append(f"{path}:{lno}: [inline $] empty or space-padded '$...$': ${inner}$")
+                          continue
+                      if (op > 0 and masked[op - 1] == "~") or re.match(r"^\d[\d,.]*(?:/mo|/yr|\s*USD\b)|\d+\.\d+\s*[MBKk]\b", inner):
+                          errors.append(f"{path}:{lno}: [currency $] unescaped currency '$': {raw.strip()!r}")
+                      check_math_body(inner, path, lno, False, errors)
+              if in_display:
+                  errors.append(f"{path}:{disp_start}: [display $$] unclosed '$$' block")
+              return errors
+
+          out = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard", "*.md"], text=True)
+          md_files = sorted(p for p in out.splitlines() if p.strip() and os.path.isfile(p))
+          errs = [e for p in md_files for e in scan_file(p)]
+          if errs:
+              print("\n".join(errs), file=sys.stderr)
+              sys.exit(f"[GFM-MATH-FAIL] {len(errs)} hazard(s) across {len(md_files)} Markdown file(s).")
+          print(f"[GFM-MATH-PASS] Checked {len(md_files)} Markdown file(s): 0 GFM math/currency hazards.")
+          PY
       - name: Harden apt-get mirrors with retry fallback
         run: |
           for attempt in 1 2 3 4; do

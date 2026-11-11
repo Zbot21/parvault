@@ -1,6 +1,6 @@
 # Security Architecture, Cryptographic Proofs & Formal Verification (`SECURITY_AND_CRYPTOGRAPHY.md`)
 
-This document details the mathematical, cryptographic, game-theoretic, and formal-verification foundations of **`parvault`** (`parvault`, `parvault-seed`, `parvault-gateway`, and `parvault-fuse`), covering `ADR-01` through `ADR-19` and `v0.4.0` formal verification (`15` Kani Rust Bounded Model Checking symbolic harnesses + `7` TLA+ TLC specifications).
+This document details the mathematical, cryptographic, game-theoretic, and formal-verification foundations of **`parvault`** (`parvault`, `parvault-seed`, `parvault-gateway`, and `parvault-fuse`), covering the single-concern Architectural Decision Records [`ADR-01` through `ADR-31`](ADR.md) in [`docs/adr/`](adr/) and `v0.4.0` formal verification (`15` Kani Rust Bounded Model Checking symbolic harnesses + `7` TLA+ TLC specifications).
 
 ---
 
@@ -58,7 +58,7 @@ Rather than trusting static peer claims, `parvault` enforces a cryptographically
 | **`SlashedQuarantined`** | Any cryptographic fault (poisoned Merkle shard, forged WoT hop, or confirmed egress withholding) | **0 shards** | **$0.0\times$ (100% Credit Burn)** | Immediate Gossipsub quarantine + parent inviter slash penalty |
 
 ### Proof of Zero-Knowledge Confidentiality Under Subnet Collusion ($4 \ll K = 16$)
-1. **Bounded Algebraic Concentration:** Even if an adversary controls an entire `HighUptimeAnchor` `/24` subnet and all nodes on that subnet collude, the placement engine caps the subnet at **at most 4 shards** per stripe. Under $16\text{-of-}20$ (or $10\text{-of-}20$) Reed-Solomon erasure coding over $GF(2^8)$, any subset of $< K$ shards leaves the remaining $K - 4$ polynomial coefficients underdetermined.
+1. **Bounded Algebraic Concentration:** Even if an adversary controls an entire `HighUptimeAnchor` `/24` subnet and all nodes on that subnet collude, the placement engine caps the subnet at **at most 4 shards** per stripe. Under $16\text{-of-}20$ (or $10\text{-of-}20$) Reed-Solomon erasure coding over $GF(2^8)$, any subset of fewer than $K$ shards (`< K`) leaves the remaining $K - 4$ polynomial coefficients underdetermined.
 2. **Encrypt-Then-Shard Ordering:** Reed-Solomon encoding operates strictly on **authenticated AES-256-GCM ciphertext**. Even a global passive adversary who intercepts all $N = 20$ shards on the wire (`adversaryShards = 20`) possesses zero knowledge of the client master key $K_{\text{user}}$ (`hasMasterKey = FALSE`), which never leaves the user's device.
 
 ---
@@ -69,7 +69,7 @@ To prevent even a global coalition of storage nodes from grouping shards into a 
 
 | Anonymization Layer | Cryptographic Mechanism | Correlation Vector Eliminated | Formal / Combinatorial Guarantee |
 | :--- | :--- | :--- | :--- |
-| **Layer 1: Blinded Shard Locators (`BlindedShardId`)** | $\text{Locator}_i = \text{HMAC-SHA256}(K_{\text{blind\_loc}}, \text{"parvault-blinded-locator-v1:"} \parallel \text{StripeRoot} \parallel \text{ShardIdx} \parallel \text{PayloadHash}_i)$ | Removes `stripe_merkle_root`, `shard_index` ($0..19$), and sibling Merkle hashes from stored `.bshard` files | Static disk combinatorial grouping wall: $\binom{M}{K} \frac{N!}{(N-K)!} \approx 2^{224}$ across a neighborhood pool ($M \ge 8,000$ shards, $K=16, N=20$) |
+| **Layer 1: Blinded Shard Locators (`BlindedShardId`)** | `Locator_i = HMAC-SHA256(K_blind_loc, "parvault-blinded-locator-v1:" \|\| StripeRoot \|\| ShardIdx \|\| PayloadHash_i)` | Removes `stripe_merkle_root`, `shard_index` ($0..19$), and sibling Merkle hashes from stored `.bshard` files | Static disk combinatorial grouping wall: $\binom{M}{K} \frac{N!}{(N-K)!} \approx 2^{224}$ across a neighborhood pool ($M \ge 8{,}000$ shards, $K=16, N=20$) |
 | **Layer 2: Per-Shard PoR Capability Keys ($V_i$)** | `BlindedShardCapability::derive_keypair(&master_key, &locator)` using `blind_capability_subkey` | Eliminates shared stripe-wide $K_{\text{session}}$ across storage peers; pins `capability_pubkey` at upload time (`ADR-15`) | Storage node $i$ holds only $(\text{Locator}_i, \text{PubKey}_i, \text{Ciphertext}_i)$; zero cross-shard PoR key linkability |
 | **Layer 3: Ephemeral-Issuer Bearer Quota Vouchers (`AnonymousQuotaVoucher`)** | One-time bearer token signed by a fresh per-shard ephemeral `Ed25519` keypair (`AnonymousQuotaVoucher::mint_ephemeral`) redeemed into disk-persisted, bounded `VoucherNullifierLedger` | Decouples byte-hour quota authorization from static `uploader_peer_id` and prevents cross-shard voucher issuer correlation | Strict 1-to-1 voucher conservation (`Cardinality(spentNullifiers) = anonymousShardsStored`) with zero double-spend |
 | **Layer 4: 2-Layer PQ Onion Relay Dispatch (`PqRelayedShardEnvelope` & `PqInnerStorageEnvelope`)** | Inner layer (`blinded_id`, `capability`, `voucher`, `shard_bytes`) sealed to storage node's `HybridKemPublicKey`; outer layer (`target_peer_addr`, `inner_envelope`, `jitter_delay_ms`) sealed to relay node's `HybridKemPublicKey` | Hides the vault owner's IP/`PeerId` from the storage node AND hides `blinded_id`, `capability`, `voucher`, and `shard_bytes` from the relay node | Storage node strictly observes `observedSender = "RelayNode"` and relay node observes `relayPlaintextCapExposed = FALSE` |
@@ -77,7 +77,9 @@ To prevent even a global coalition of storage nodes from grouping shards into a 
 ### Combinatorial Hardness of Static Blinded Pool Reconstruction
 Without the client-only master key $K_{\text{user}}$, every 256-bit $\text{Locator}_i$ is computationally indistinguishable from a uniform random bitstring. Even if an adversary colludes across every storage node's static disk pool holding $M$ total blinded shards, identifying which $K = 16$ shards belong to a single stripe and ordering them into positions $0 \dots K-1$ requires searching:
 
-$$\Omega_{\text{search}} = \binom{M}{K} \times \frac{N!}{(N - K)!} \approx 2^{224} \quad (\text{for } M \ge 8,000,\; K = 16,\; N = 20)$$
+$$
+\Omega_{\mathrm{search}} = \binom{M}{K} \times \frac{N!}{(N - K)!} \approx 2^{224} \quad (\text{for } M \ge 8{,}000,\; K = 16,\; N = 20)
+$$
 
 ### Side-Channel & Traffic-Analysis Threat Model (`D4`)
 It is important to distinguish **at-rest disk unlinkability** from **active network traffic analysis**:
@@ -87,16 +89,21 @@ It is important to distinguish **at-rest disk unlinkability** from **active netw
 
 ---
 
-## 4. Post-Quantum Hybrid Cryptography (`ADR-12` — Harvest-Now, Decrypt-Later Immunity)
+## 4. Post-Quantum Hybrid Cryptography (`ADR-12` & `ADR-13` — Harvest-Now, Decrypt-Later Immunity)
 
-To protect long-lived backup shards and P2P envelopes against **Harvest-Now, Decrypt-Later (HNDL)** adversaries equipped with a future **Cryptographically Relevant Quantum Computer (CRQC)** running **Shor's Algorithm** and **Grover's Algorithm**, `src/crypto/pqc.rs` implements a **Post-Quantum Hybrid Cryptography Suite** (model-checked in [`specs/ParVaultPostQuantum.tla`](../specs/ParVaultPostQuantum.tla)):
+To protect long-lived backup shards and P2P envelopes against **Harvest-Now, Decrypt-Later (HNDL)** adversaries equipped with a future **Cryptographically Relevant Quantum Computer (CRQC)** running **Shor's Algorithm** and **Grover's Algorithm**, `src/crypto/pqc.rs` and `src/crypto/aes.rs` separate asymmetric lattice hybrids ([`ADR-12`](adr/ADR-12-asymmetric-post-quantum-hybrids.md)) from symmetric Grover-resilient AEAD ([`ADR-13`](adr/ADR-13-symmetric-pq-grover-baseline-and-cascaded-aead.md)), model-checked in [`specs/ParVaultPostQuantum.tla`](../specs/ParVaultPostQuantum.tla):
 
 | Cryptographic Subsystem | Classical Primitive | Post-Quantum NIST Standard | Hybrid Combiner & Construction | Quantum & Cryptanalytic Threat Mitigated |
 | :--- | :--- | :--- | :--- | :--- |
-| **X-Wing Style Hybrid KEM (`HybridKemKeypair`)** | **X25519** ECDH (`32 B` public key) | **ML-KEM-768** (`NIST FIPS 203`, Module-LWE, `1,184 B` ek, `1,088 B` ct) | $K_{\text{hybrid}} = \text{HKDF-SHA512}(\text{salt} = \text{pk}_{\text{ephem}} \parallel H(\text{ct}_{\text{PQ}}),\; \text{ikm} = \text{ss}_{\text{X25519}} \parallel \text{ss}_{\text{PQ}},\; \text{info} = \text{ctx} \parallel \text{pk}_{\text{recip,X25519}} \parallel H(\text{ek}_{\text{recip,PQ}}))$ | **Shor's Algorithm** on ECDLP & multi-target PK substitution (`A2`, `B10`); session key remains IND-CCA2 secure unless *both* X25519 and ML-KEM-768 are broken |
-| **Hybrid Digital Signatures (`HybridPqSigningKeypair`)** | **Ed25519** (`32 B` vk, `64 B` sig) | **ML-DSA-65** (`NIST FIPS 204`, Module-LWE/SIS, `1,952 B` vk, `3,309 B` sig) | Composite dual verification (`Ed25519::verify` $\wedge$ `ML-DSA-65::verify` over `ML_DSA_65_CONTEXT`) | **Shor's Algorithm** signature forgery on `PersonalDeviceCert`s and `PqSignedDhtManifestEnvelope`s |
-| **Dual-Cipher Cascaded Vault Encryption (`PqVaultMasterKey`)** | **AES-256-GCM** (`256-bit` inner) + **ChaCha20-Poly1305** (`256-bit` outer) | **NIST Category 5 Grover Floor (`128-bit PQ`)** + **Cipher Diversity** | Cascaded dual-cipher AEAD encryption (inner `AES-256-GCM` pass under $K_1$, outer `ChaCha20-Poly1305` pass under $K_2$) with independent HKDF nonces | **Grover's Algorithm** ($\text{AES-256} \rightarrow 128\text{-bit}$ PQ security floor) + **Cipher-Diversity Defense-in-Depth** (`B8`: secure unless *both* AES-GCM and ChaCha20-Poly1305 are broken) |
-| **2-Layer Post-Quantum Onion Envelopes (`PqRelayedShardEnvelope`)** | **X25519** ephemeral ECDH (2 hops) | **ML-KEM-768** (`1,088 B` ct per hop) + `AES-256-GCM` | Outer relay layer + inner storage layer (`PqInnerStorageEnvelope`) each sealed under recipient's `HybridKemPublicKey` | Prevents HNDL quantum decryption of relay hops, capabilities, vouchers, and telemetry beacons |
+| **X-Wing Style Hybrid KEM (`HybridKemKeypair`)** | **X25519** ECDH (`32 B` public key) | **ML-KEM-768** (`NIST FIPS 203`, Module-LWE, `1,184 B` ek, `1,088 B` ct) | `K_hybrid = HKDF-SHA512(salt = pk_ephem \|\| SHA256(ct_PQ), ikm = ss_X25519 \|\| ss_PQ, info = "parvault-hybrid-x25519-mlkem768-v2:" \|\| pk_recip \|\| SHA256(ek_recip))` | **Shor's Algorithm** on ECDLP & multi-target PK substitution (`A2`, `B10`); session key remains IND-CCA2 secure unless *both* X25519 and ML-KEM-768 are broken |
+| **Hybrid Digital Signatures (`HybridPqSigningKeypair`)** | **Ed25519** (`32 B` vk, `64 B` sig) | **ML-DSA-65** (`NIST FIPS 204`, Module-LWE/SIS, `1,952 B` vk, `3,309 B` sig) | Composite dual verification (`Ed25519::verify` $\wedge$ `ML-DSA-65::verify` over `ML_DSA_65_CONTEXT`) | **Shor's Algorithm** signature forgery on `PersonalDeviceCert`s, `PqSignedDhtManifestEnvelope`s, and `GatewayIdentityStatement`s |
+| **Standard Streaming Stripe AEAD (`MasterKey`)** | **AES-256-GCM** (`256-bit` HKDF subkeys) | **NIST Category 5 Grover Floor (`128-bit PQ`)** | Single-pass `AES-256-GCM` (`encrypt_stripe` / `encrypt_manifest`) | **Grover's Algorithm** quadratic bound ($\mathcal{O}(2^{n/2})$) leaves full `128-bit` post-quantum security at `496.5–589.2 MiB/s` |
+| **Dual-Cipher Cascaded Vault Encryption (`PqVaultMasterKey`)** | **AES-256-GCM** (`256-bit` inner) + **ChaCha20-Poly1305** (`256-bit` outer) | **NIST Category 5 Grover Floor (`128-bit PQ`)** + **Cipher Diversity** | Cascaded dual-cipher AEAD encryption (inner `AES-256-GCM` pass under $K_1$, outer `ChaCha20-Poly1305` pass under $K_2$) with independent HKDF nonces | **Grover's Algorithm** (`128-bit` PQ security floor) + **Algebraic Cipher Diversity** (`B8`: SPN/$GF(2^{128})$ + ARX/$2^{130}-5$; secure unless *both* ciphers break) |
+| **2-Layer Post-Quantum Onion Envelopes (`PqRelayedShardEnvelope`)** | **X25519** ephemeral ECDH (2 hops) | **ML-KEM-768** (`1,088 B` ct per hop) + `AES-256-GCM` | Outer relay layer + inner storage layer (`PqInnerStorageEnvelope`) each sealed under recipient's `HybridKemPublicKey` | Prevents HNDL quantum decryption of relay hops, capabilities, vouchers, and telemetry beacons even over classical `libp2p` `Noise XX` TCP sessions |
+
+### 4.1 Why `AES-256-GCM` Coexists with Post-Quantum Lattices (`ADR-12` vs. `ADR-13`)
+- **Shor vs. Grover Asymmetry:** Shor's algorithm breaks elliptic curves (`X25519`, `Ed25519`) in polynomial time, necessitating `ML-KEM-768` and `ML-DSA-65` hybrids ([`ADR-12`](adr/ADR-12-asymmetric-post-quantum-hybrids.md)). Unstructured symmetric ciphers and PRFs (`AES-256-GCM`, `HMAC-SHA256`) face only Grover's $\mathcal{O}(2^{n/2})$ search, so 256-bit keys already deliver **128-bit post-quantum security (NIST PQ Category 5)** ([`ADR-13`](adr/ADR-13-symmetric-pq-grover-baseline-and-cascaded-aead.md)).
+- **Cipher Diversity vs. Quantum Necessity:** `PqVaultMasterKey` cascades `AES-256-GCM` ($K_1$) and `ChaCha20-Poly1305` ($K_2$) to eliminate single-algorithm cryptanalytic risk on root superblocks (`EncryptedVaultCatalogEnvelope`), not because single-pass `AES-256-GCM` is quantum-vulnerable. Likewise, outer `libp2p` `TCP + Noise_XX_25519_ChaChaPoly_SHA256` sessions authenticate point-to-point transport peers while end-to-end HNDL confidentiality is enforced on client-encrypted payloads and `X25519 + ML-KEM-768` onion envelopes ([`ADR-08`](adr/ADR-08-noise-xx-transport-and-bounded-wire-framing.md)).
 
 > [!NOTE]
 > **Implementation Pedigree & Hybrid Defense-in-Depth (`B9`):** The crates `fips203` (`0.5.0`) and `fips204` (`0.5.0`) are pure-Rust implementations of the final **NIST FIPS 203 (`ML-KEM-768`)** and **NIST FIPS 204 (`ML-DSA-65`)** specifications, rather than CMVP FIPS 140-3 validated hardware/software modules. Combining them in mandatory hybrid constructions with battle-tested `x25519-dalek` and `ed25519-dalek` guarantees that any implementation defect or future algebraic advance against one primitive family never compromises confidentiality or authenticity.
@@ -110,7 +117,7 @@ To protect long-lived backup shards and P2P envelopes against **Harvest-Now, Dec
 | Earned Standing (`EarnedStanding`) | Reachable Topology & PoR SLA Requirement | Reed-Solomon $(K, M, N)$ | Reciprocity Expansion Tax | `/24` Fault-Domain Cap ($\le N - K$) |
 | :--- | :--- | :---: | :---: | :---: |
 | **`SoloPersonalVault` / `PersonalDeviceRing`** | Day 1 (`0` external peers; `1` or $\ge 2$ devices with `PersonalDeviceCert`) | **`2-of-3`** (`K=2, M=1`) | **`0.00x`** (Self-hosted ring) | `1 shard` |
-| **`BuddyMicroCluster`** | Small friend/neighborhood co-op ($1 \le P_{\text{external}} < 6$) | **`3-of-5`** (`K=3, M=2`) | **`1.67x`** (`60.0%` efficiency) | `2 shards` |
+| **`BuddyMicroCluster`** | Small friend/neighborhood co-op (`1 <= P_external < 6`) | **`3-of-5`** (`K=3, M=2`) | **`1.67x`** (`60.0%` efficiency) | `2 shards` |
 | **`ProbationaryConsumerPool`** | Mandatory entry pool for unproven nodes ($P_{\text{external}} \ge 6$, `< 50` PoR passes) | **`10-of-20`** (`K=10, M=10`) | **`2.00x`** (`50.0%` efficiency) | `4 shards` |
 | **`EarnedVerifiedMixedPool`** | Earned `VerifiedNeighbor` ($\ge 50$ PoR passes, $\ge 98.0\%$ SLA, $P \ge 24$) | **`16-of-24`** (`K=16, M=8`) | **`1.50x`** (`66.7%` efficiency) | `4 shards` |
 | **`EarnedHomelabAnchorPool`** | Earned `HighUptimeAnchor` ($\ge 200$ PoR passes, $\ge 99.8\%$ SLA, $P \ge 20$) | **`16-of-20`** (`K=16, M=4`) | **`1.25x`** (`80.0%` efficiency) | `4 shards` |
@@ -163,16 +170,16 @@ All 15 harnesses exercise real production code with symbolic `kani::any()` input
 
 | Kani Proof Harness | Target Production Module / Function | Symbolic Property Verified (`kani::any()`) | CBMC Result |
 | :--- | :--- | :--- | :---: |
-| `proof_eviction_quorum_sub_threshold_and_duplicate_signer_rejected` | `SignedBadActorEvictionOrder::tally_and_verify_quorum_raw` | $< M$ council signers NEVER satisfy quorum, `[0u8; 32]` keys and untrusted outsider keys contribute `0` votes, and duplicate signatures from the same compromised council key NEVER count twice to reach $M$ | **`SUCCESSFUL`** |
-| `proof_eviction_quorum_authorized_distinct_signers_and_expiry` | `SignedBadActorEvictionOrder::{default_tracker_quorum_threshold, tally_and_verify_quorum_raw}` | Strict majority $2M > N$ holds for all $N \ge 1$; $\ge M$ (`2-of-3`) distinct council signers succeed iff unexpired; mutating `order_id` invalidates quorum | **`SUCCESSFUL`** |
+| `proof_eviction_quorum_sub_threshold_and_duplicate_signer_rejected` | `SignedBadActorEvictionOrder::tally_and_verify_quorum_raw` | `< M` council signers NEVER satisfy quorum, `[0u8; 32]` keys and untrusted outsider keys contribute `0` votes, and duplicate signatures from the same compromised council key NEVER count twice to reach $M$ | **`SUCCESSFUL`** |
+| `proof_eviction_quorum_authorized_distinct_signers_and_expiry` | `SignedBadActorEvictionOrder::{default_tracker_quorum_threshold, tally_and_verify_quorum_raw}` | Strict majority `2M > N` holds for all $N \ge 1$; $\ge M$ (`2-of-3`) distinct council signers succeed iff unexpired; mutating `order_id` invalidates quorum | **`SUCCESSFUL`** |
 | `proof_eviction_signing_payload_collision_free_across_all_fields` | `SignedBadActorEvictionOrder::encode_signing_payload_stack` | Canonical signing preimage is collision-free across symbolic mutations to `order_id`, `target` (all variants), `reason` (content & length), `issued_at_ms`, `expires_at_ms`, and `issuer_pubkey` | **`SUCCESSFUL`** |
 | `proof_eviction_hmac_dual_stack_normalization_and_domain_isolation` | `PrivacyPreservingEvictionEngine::{normalize_ip, encode_ip_hmac_preimage, encode_subnet_hmac_preimage_stack, encode_peer_id_hmac_preimage_stack}` | Dual-stack `::ffff:a.b.c.d` normalizes identically to `IpAddr::V4(a.b.c.d)` across all $2^{32}$ IPv4 addresses; IP preimage encoding is bijective modulo normalization across all IPv4/IPv6; `IP`, `Subnet`, and `PeerId` preimages are strictly disjoint across all inputs | **`SUCCESSFUL`** |
 | `proof_admin_rpc_wire_frame_header_no_panic_or_unbounded_alloc` | `admin_rpc::validate_admin_rpc_frame_header` | Arbitrary symbolic `[u8; 4]` big-endian wire headers and `max_len` never panic, integer-overflow, or pre-allocate above `MAX_ADMIN_RPC_INITIAL_ALLOC_BYTES` (`64 KiB`) or `MAX_ADMIN_RPC_FRAME_BYTES + 64` | **`SUCCESSFUL`** |
 | `proof_admin_rpc_replay_window_challenge_and_zero_key_rejection` | `admin_rpc::validate_admin_rpc_slice_replay_and_auth_meta` | `[0u8; 32]` zero keys fail closed even if allowlisted; unauthorized keys and mismatched/replayed 32-byte `challenge_nonce` values fail; timestamps skewed beyond `MAX_ADMIN_RPC_CLOCK_SKEW_MS` (`±60,000 ms`) fail without `u64` overflow across `0..=u64::MAX` | **`SUCCESSFUL`** |
 | `proof_streaming_stripe_layout_all_u64_file_sizes_and_profiles` | `HardwareProfile::compute_streaming_stripe_layout` & `config::compute_stripe_layout_for_size` | Across all symbolic `file_size: u64` (`0..=u64::MAX`) and all `HardwareProfile`s (`RouterSoc` `1 MiB`, `HomelabNas` `4 MiB`, `Desktop` `16 MiB`), stripe decomposition never overflows or divides by zero and conserves exact byte count in `u128` | **`SUCCESSFUL`** |
-| `proof_router_soc_and_desktop_reed_solomon_memory_ceiling` | `reed_solomon::{compute_reed_solomon_shard_len, compute_stripe_memory_footprint_bytes}` | Rejects `k_data == 0`; across all `0..=u64::MAX` file sizes and all 4 `ErasureTier`s, `RouterSoc` peak concurrent stripe RAM (`plaintext + ciphertext + N * shard`) is strictly $< 32\text{ MiB}$ (`<= 5 MiB`) | **`SUCCESSFUL`** |
+| `proof_router_soc_and_desktop_reed_solomon_memory_ceiling` | `reed_solomon::{compute_reed_solomon_shard_len, compute_stripe_memory_footprint_bytes}` | Rejects `k_data == 0`; across all `0..=u64::MAX` file sizes and all 4 `ErasureTier`s, `RouterSoc` peak concurrent stripe RAM (`plaintext + ciphertext + N * shard`) is strictly `< 32 MiB` (`<= 5 MiB`) | **`SUCCESSFUL`** |
 | `proof_macaroon_caveat_attenuation_monotonic_and_zero_key_rejected` | `capabilities::{CapabilityMacaroon::mint_slice_tag_with, verify_caveat_slice_in_ram_with, Caveat::encode_stack, Caveat::allows, ct_eq_32}` | `[0u8; 32]` zero root keys fail closed; `Caveat::encode_stack` is injective across all 4 caveat variants; caveat attenuation is strictly monotonic ($\text{Allowed}(\text{Child}) \implies \text{Allowed}(\text{Parent})$); any non-zero tag bit flip fails `ct_eq_32` | **`SUCCESSFUL`** |
-| `proof_gateway_ipc_frame_header_bounds` | `gateway::ipc::validate_ipc_frame_header` | Arbitrary symbolic `[u8; 4]` UDS headers reject `0` and $> \text{MAX\_IPC\_FRAME\_BYTES}$ (`16 MiB`) and cap initial buffer pre-allocation at `MAX_IPC_INITIAL_ALLOC_BYTES` (`64 KiB`) | **`SUCCESSFUL`** |
+| `proof_gateway_ipc_frame_header_bounds` | `gateway::ipc::validate_ipc_frame_header` | Arbitrary symbolic `[u8; 4]` UDS headers reject `0` and `> MAX_IPC_FRAME_BYTES` (`16 MiB`) and cap initial buffer pre-allocation at `MAX_IPC_INITIAL_ALLOC_BYTES` (`64 KiB`) | **`SUCCESSFUL`** |
 | `proof_vfs_block_window_power_of_two_and_zero_bounds` | `vfs::compute_vfs_block_window` | Rejects `block_size == 0` without division by zero; across all power-of-two block sizes (`1 B ..= 1 GiB`, including `1 MiB` default) and all `(file_size, offset, length)` in `0..=u64::MAX`, block window boundaries never panic or overflow | **`SUCCESSFUL`** |
 | `proof_pinned_ring_capacity_invariant` | `gateway::engine::PinnedRingBudget::admit` | Across arbitrary symbolic `max_bytes: u64` (`0..=u64::MAX`) and multi-step admission/eviction sequences, `used_bytes <= max_bytes`, `len <= SLOTS`, oversized/zero-slot admissions fail without mutation, and exact byte conservation holds in `u128` | **`SUCCESSFUL`** |
 | `proof_fuse_header_parser_no_panic` | `vfs::{parse_fuse_in_header, parse_fuse_read_in, FuseInHeader::to_ne_bytes, FuseReadIn::to_ne_bytes}` | Zero-`unsafe` Linux FUSE `ABI 7.31` byte-slice parsers never panic or out-of-bounds index across arbitrary symbolic byte slices (`0..=96 B`) and satisfy exact bijective round-trip fidelity | **`SUCCESSFUL`** |
@@ -195,11 +202,11 @@ Every invariant of `parvault` is model-checked and tested across **7 TLA+ TLC pr
 | **Zero-Copy `100 MiB` `memfd` UDS Gateway, `< 1 ms` Macaroons & `--no-fs` Seed Gate** | [`tests/gateway_ipc_benchmark.rs`](../tests/gateway_ipc_benchmark.rs) | `100 MiB` `memfd_create` + `SCM_RIGHTS` UDS streaming round-trip (`VmRSS` delta `< 16 MiB`), sub-millisecond RAM `CapabilityMacaroon` enforcement, and `parvault-seed --no-fs --in-memory-mb` zero-disk + `0x00` RAM-wipe verification | **100% PASS** |
 | **Lazy-Streaming `10 GiB` Sparse VFS & `LruBlockCache` Eviction Gate** | [`tests/vfs_lazy_stream.rs`](../tests/vfs_lazy_stream.rs) | `10 GiB` (`10,240` stripes) virtual vault stub mount, `5 MiB` read at `4.5 GiB` offset with `10` missing shards reconstructed over $GF(2^8)$, `TTFB < 50 ms`, `4 MiB` `LruBlockCache` eviction, and HTTP `206` / WebDAV `PROPFIND` | **100% PASS** |
 | **Stateright Async Actor Model & Exhaustive $GF(2^8)^3$ Field Axioms** | [`tests/formal_verification.rs`](../tests/formal_verification.rs)<br>[`tests/tla_formal_proofs_integration.rs`](../tests/tla_formal_proofs_integration.rs) | Stateright BFS model checking of non-vacuous Sybil/slashing state machine + exhaustive verification of all $256^3 = 16,777,216$ triples $(a, b, c) \in GF(2^8)^3$ + automated TLC runner for all 7 `.tla` specs | **0 Invariant Violations**; **16,777,216 / 16,777,216 field triples verified** |
-| **Empirical Ciphertext Sanity & Non-Degeneracy Checks (`D3`) & Dynamic Trust Proofs** | [`tests/confidentiality_and_trust_proofs.rs`](../tests/confidentiality_and_trust_proofs.rs) | Empirical byte-level Shannon entropy $H(X) = -\sum p_i \log_2 p_i$ and Strict Avalanche Criterion (SAC) bit-flip sanity checks verifying absence of unencrypted header/padding leakage, plus dynamic trust subnet cap enforcement | **Shannon Entropy $> 7.98\text{ bits/byte}$**; **SAC $\approx 50.0\%$ bit-flip ratio** |
+| **Empirical Ciphertext Sanity & Non-Degeneracy Checks (`D3`) & Dynamic Trust Proofs** | [`tests/confidentiality_and_trust_proofs.rs`](../tests/confidentiality_and_trust_proofs.rs) | Empirical byte-level Shannon entropy $H(X) = -\sum p_i \log_2 p_i$ and Strict Avalanche Criterion (SAC) bit-flip sanity checks verifying absence of unencrypted header/padding leakage, plus dynamic trust subnet cap enforcement | **Shannon Entropy** `> 7.98 bits/byte`; **SAC $\approx 50.0\%$ bit-flip ratio** |
 | **Byzantine Quarantine, Multi-Stratum PoR & Egress Slashing (`ADR-09`)** | [`tests/zero_trust_adversarial.rs`](../tests/zero_trust_adversarial.rs) | Pre-decoding Merkle quarantine of poisoned shards, 8-stratum scatter-gather PoR + RTT ceiling, monotonic DHT envelopes, and egress-withholding credit burn | **All Byzantine & selfish attacks defeated** |
-| **4-Layer Anonymity & 8-Profile Degraded Network Recovery (`ADR-11`)** | [`tests/anonymity_and_degraded_net_tests.rs`](../tests/anonymity_and_degraded_net_tests.rs) | Verification of $>224$-bit combinatorial locator wall, per-shard capabilities, voucher nullifiers, 1-hop onion routing, and hedged $K$-of-$N$ recovery across 8 degraded profiles | **100% PASS (`0 bytes` lost across all 8 profiles)** |
+| **4-Layer Anonymity & 8-Profile Degraded Network Recovery (`ADR-11`)** | [`tests/anonymity_and_degraded_net_tests.rs`](../tests/anonymity_and_degraded_net_tests.rs) | Verification of `> 224-bit` combinatorial locator wall, per-shard capabilities, voucher nullifiers, 1-hop onion routing, and hedged $K$-of-$N$ recovery across 8 degraded profiles | **100% PASS (`0 bytes` lost across all 8 profiles)** |
 | **Post-Quantum Hybrid Cryptography Proofs (`ADR-12`)** | [`tests/post_quantum_security_proofs.rs`](../tests/post_quantum_security_proofs.rs) | NIST FIPS 203 `ML-KEM-768` + `X25519` Shor resilience, FIPS 204 `ML-DSA-65` + `Ed25519` unforgeability, and 512-bit `PqVaultMasterKey` (`AES-256-GCM` + `ChaCha20-Poly1305`) Grover resistance | **100% PASS** |
-| **Elastic Bootstrap, Seed Server, Lite-Client & Anonymous Telemetry (`ADR-13`–`ADR-17`)** | [`tests/bootstrap_and_earned_tier_tests.rs`](../tests/bootstrap_and_earned_tier_tests.rs)<br>[`tests/seed_server_integration.rs`](../tests/seed_server_integration.rs)<br>[`tests/lite_client_seed_failover_and_selective_restore_tests.rs`](../tests/lite_client_seed_failover_and_selective_restore_tests.rs)<br>[`tests/anonymous_telemetry_tests.rs`](../tests/anonymous_telemetry_tests.rs) | Day-1 Personal Ring, Foundation Seed Anchor auto-drain, zero-knowledge elastic re-sharding, `ZeroTrustSeedServer`, Lite-Client `1.0x` syndication & NAS-death failover, and rotating-nullifier census beacons | **100% PASS** |
+| **Elastic Bootstrap, Seed Server, Lite-Client & Anonymous Telemetry (`ADR-13`–`ADR-17`)** | [`tests/bootstrap_and_earned_tier_tests.rs`](../tests/bootstrap_and_earned_tier_tests.rs)<br>[`tests/seed_server_integration.rs`](../tests/seed_server_integration.rs)<br>[`tests/sync_daemon_usability_and_cli_regression_tests.rs`](../tests/sync_daemon_usability_and_cli_regression_tests.rs)<br>[`tests/anonymous_telemetry_tests.rs`](../tests/anonymous_telemetry_tests.rs) | Day-1 Personal Ring, Foundation Seed Anchor auto-drain, zero-knowledge elastic re-sharding, `ZeroTrustSeedServer`, Lite-Client `1.0x` syndication & NAS-death failover, and rotating-nullifier census beacons | **100% PASS** |
 | **5-Domain Red-Team Suite (`ADR-15`) & Live `libp2p` TCP Multi-Daemon Regression (`ADR-16`–`ADR-17`)** | [`tests/red_team_hardening_tests.rs`](../tests/red_team_hardening_tests.rs)<br>[`tests/sync_daemon_usability_and_cli_regression_tests.rs`](../tests/sync_daemon_usability_and_cli_regression_tests.rs)<br>[`tests/phase1_to_4_integration.rs`](../tests/phase1_to_4_integration.rs) | House-fire seed recovery, capability pinning, NTP skew, generation-scoped tombstones, `with_limit` OOM defense, Hashcash PoW + IQR trimming, path-traversal blocking, and live `libp2p` TCP multi-daemon sync/prune/recovery | **100% PASS (122 / 122 total tests)** |
 
 ---
@@ -320,17 +327,21 @@ flowchart TD
 To enable peering across cities and residential ISPs without requiring static IPs or third-party dynamic DNS:
 
 1. **Zero-Knowledge Blinded Slot Derivation:**
-   - From a 4-word pairing phrase $W$, nodes derive:
-     $$\text{slot\_key} = \text{HKDF-SHA256}(W, \text{"parvault-wan-rendezvous-slot-v1"})$$
-     $$\text{wrap\_key} = \text{HKDF-SHA256}(W, \text{"parvault-wan-rendezvous-wrap-v1"})$$
-   - Rendezvous servers index slots strictly by 32-byte `slot_key`, possessing zero knowledge of the pairing phrase $W$ or inner node details.
+   - From a 4-word pairing phrase `W`, nodes derive:
+
+```text
+slot_key = HKDF-SHA256(W, "parvault-wan-rendezvous-slot-v1")
+wrap_key = HKDF-SHA256(W, "parvault-wan-rendezvous-wrap-v1")
+```
+
+   - Rendezvous servers index slots strictly by 32-byte `slot_key`, possessing zero knowledge of the pairing phrase `W` or inner node details.
 2. **Authenticated AEAD Peer Card Sealing:**
    - Nodes serialize their `WanPeerCard` (including `libp2p_peer_id`, public endpoints, relay seed fallbacks, and Ed25519 public key signed over `"parvault-wan-peercard-v1:"`).
    - The card is encrypted using `wrap_key` via `AES-256-GCM` before submission to the rendezvous mailbox.
 3. **STUN-over-Noise External Address Reflection:**
    - Seed anchors inspect the transport-level socket address during authenticated Noise XX handshakes and return `observed_external_addr` in `RegisterWanRendezvousAck`. Nodes discover their public WAN endpoints with zero external STUN dependencies.
 4. **Dynamic-IP DDNS Heartbeat:**
-   - Paired clusters maintain an encrypted presence mailbox under $\text{HKDF}(\text{ring\_secret}, \text{"parvault-wan-ddns-v1"})$. When an ISP rotates a home router's WAN IP, the new endpoint is published to the slot, allowing remote peers to resolve the change automatically.
+   - Paired clusters maintain an encrypted presence mailbox under `HKDF-SHA256(ring_secret, "parvault-wan-ddns-v1")`. When an ISP rotates a home router's WAN IP, the new endpoint is published to the slot, allowing remote peers to resolve the change automatically.
 5. **Anti-Spam Bounded Registry:**
    - Rendezvous anchors enforce strict bounds: maximum 16,384 slots, maximum 8 entries per slot, maximum 4 KiB per entry, and mandatory 3600-second TTL expiration. Outer envelopes are signed with Ed25519 to prevent unauthorized slot overwrites.
 
@@ -363,20 +374,24 @@ flowchart TD
 
 ### Cryptographic Guarantees & Invariants:
 1. **Zero-Plaintext-IP Disk Privacy Invariant:**
-   Neither `eviction_index.bin` nor any block store index records plaintext IP addresses or unblinded network identities. All ingress mappings and blocklist rules are indexed strictly by pseudo-random 32-byte HMAC tags keyed under $K_{\text{node\_evict}}$. Even if an adversary seizes physical storage or inspects disk images forensically, they cannot recover the IP addresses or peer identities of past uploaders.
+   Neither `eviction_index.bin` nor any block store index records plaintext IP addresses or unblinded network identities. All ingress mappings and blocklist rules are indexed strictly by pseudo-random 32-byte HMAC tags keyed under `K_node_evict`. Even if an adversary seizes physical storage or inspects disk images forensically, they cannot recover the IP addresses or peer identities of past uploaders.
 2. **Cross-Node Unlinkability ($H_A(\text{IP}) \neq H_B(\text{IP})$):**
-   Because $K_{\text{node\_evict}}$ is generated independently per node from hardware entropy (`OsRng`), the HMAC tags computed by Node $A$ and Node $B$ for the identical IP address are computationally indistinguishable from independent uniform random strings ($\Pr[H_A(\text{IP}) = H_B(\text{IP})] = 2^{-256}$). Seizing multiple nodes provides zero capability to cross-reference or join IP access databases.
+   Because `K_node_evict` is generated independently per node from hardware entropy (`OsRng`), the HMAC tags computed by Node $A$ and Node $B$ for the identical IP address are computationally indistinguishable from independent uniform random strings ($\Pr[H_A(\text{IP}) = H_B(\text{IP})] = 2^{-256}$). Seizing multiple nodes provides zero capability to cross-reference or join IP access databases.
 3. **Multi-Pass Zero-Wipe File Shredding Invariant:**
    When an eviction occurs, target shard files are not simply removed via standard filesystem unlinking. `PrivacyPreservingEvictionEngine::shred_and_unlink_file` opens the file, overwrites 100% of its allocation with `0x00` zero bytes in 64 KiB chunks, executes `File::sync_all()` to flush drive controller write buffers, and only then calls `fs::remove_file()`. This prevents recovery of evicted data via low-level forensic disk recovery tools.
 4. **Authorized Signed Eviction Orders (`SignedBadActorEvictionOrder`):**
    Mesh-wide eviction propagation is cryptographically authenticated under domain `"parvault-bad-actor-eviction-order-v1:"`. Orders must carry a valid Ed25519 signature from an authority listed in `NodeConfig::eviction_authorities`. Orders with reasons exceeding 256 bytes or expired timestamps are rejected, preventing denial-of-service spam via unauthorized eviction broadcasts.
 5. **Public Swarm Anti-Griefing & Tracker Admin Governance Invariant:**
-   In `--public` (\"Public Commons\") swarms, nodes reject `BroadcastEvictionOrder` requests from arbitrary peers (`accepted: false`). Public nodes accept eviction directives exclusively from configured `eviction_authorities` (such as the Public Tracker Operator's `tracker_admin.seed` public key, pinned during tracker discovery, or local node identity).
+   In `--public` ("Public Commons") swarms, nodes reject `BroadcastEvictionOrder` requests from arbitrary peers (`accepted: false`). Public nodes accept eviction directives exclusively from configured `eviction_authorities` (such as the Public Tracker Operator's `tracker_admin.seed` public key, pinned during tracker discovery, or local node identity).
 6. **Cryptographic Reporter Burden-of-Proof (`VerifiableAbuseReport`):**
    Because ParVault storage nodes and tracker operators are zero-knowledge and store only ciphertext shards, the burden of proof rests entirely on the reporting entity. A valid abuse report must contain:
-   $$\text{Report} = (\text{FileManifest}, K_{\text{disclosed}}, i_{\text{stripe}}, \{\text{shard}_k\}_{k=1}^K, \text{allegation}, \text{reporter\_contact}, \text{uploader\_ip})$$
-   Verification executes three sequential cryptographic checks:
-   1. *Merkle Tree Verification:* Each sample shard's leaf hash $\text{SHA-256}(\text{shard}_k)$ must match the corresponding leaf in $\text{stripe.shard\_hashes}$ and root to $\text{stripe.stripe\_merkle\_root}$.
+
+```text
+Report = (FileManifest, K_disclosed, stripe_index, {shard_k}_{k=1..K}, allegation, reporter_contact, uploader_ip)
+```
+
+   Verification executes four sequential cryptographic steps:
+   1. *Merkle Tree Verification:* Each sample shard's leaf hash `SHA-256(shard_k)` must match the corresponding leaf in `stripe.shard_hashes` and root to `stripe.stripe_merkle_root`.
    2. *Reed-Solomon Stripe Reconstruction:* Minimum $K$ data shards reconstruct the exact stripe ciphertext block in $GF(2^8)$.
    3. *Authenticated Decryption & Plaintext Digest:* `decrypt_stripe` under $K_{\text{disclosed}}$ and `manifest.file_salt` validates the 128-bit `AES-256-GCM` authentication tag and derives `verified_plaintext_sha256`.
    4. *Volatile Memory Zeroization:* The plaintext buffer is immediately cleared using `zeroize::Zeroize`, guaranteeing decrypted contraband bytes never touch physical disks or remain in RAM.
@@ -392,23 +407,32 @@ flowchart TD
    - In `TrustPoolMode::PublicCommons` / `Hybrid`, nodes trust their pinned `tracker_admin_pubkey` for swarm-wide governance while rejecting all arbitrary public peers.
 11. **`M-of-N` Federated Public Tracker Council Quorum Invariant (`TrackerOperatorCosignature`):**
    In public federations with multiple independent tracker operators, a single-signer eviction model introduces single-point-of-failure and capacity theft risks. ParVault enforces threshold multi-signature verification via `TrackerOperatorCosignature`:
-   $$\text{ValidSigners}(\text{Order}) = \Big(\{\text{issuer\_pubkey}\} \cup \{\text{cosigner}_k\}\Big) \cap \text{TrustedCouncilPubkeys}$$
-   An external eviction order is valid if and only if $\text{ValidSigners}(\text{Order}) \ge M$ where $M = \lfloor N/2 \rfloor + 1$ (strict majority: $2$-of-$2$, $2$-of-$3$, $3$-of-$5$, etc., or custom `tracker_eviction_quorum`):
+
+```text
+ValidSigners(Order) = ({issuer_pubkey} union {cosigner_k}) intersect TrustedCouncilPubkeys
+```
+
+   An external eviction order is valid if and only if $|\text{ValidSigners}(\text{Order})| \ge M$ where $M = \lfloor N/2 \rfloor + 1$ (strict majority: $2$-of-$2$, $2$-of-$3$, $3$-of-$5$, etc., or custom `tracker_eviction_quorum`):
    - **Rogue Tracker Defense:** Unvetted rogue tracker hosts have 0 votes and cannot evict any shards.
    - **Single-Signer Barrier:** A single rogue or compromised council member ($1$-of-$N$) cannot unilaterally wipe honest peers' shards to steal capacity.
    - **Hardware Owner Sovereignty:** A local hardware node owner issuing `parvault evict` on their own device is always honored ($1$-of-$1$).
 
 ---
 
-## 13. Zero-Copy `SCM_RIGHTS` UDS Gateway, `CapabilityMacaroon` Attenuation & `--no-fs` Seed Architecture (`v0.4.0`)
+## 13. Zero-Copy `SCM_RIGHTS` UDS Gateway, `CapabilityMacaroon` Attenuation & `--no-fs` Seed Architecture (`v0.4.0`, `ADR-27` – `ADR-31`)
 
-1. **Zero-Copy Unix Domain Socket Gateway (`src/gateway/ipc.rs`, `parvault-gateway`):**
+1. **Zero-Copy Unix Domain Socket Gateway (`src/gateway/`, `parvault-gateway`, [`ADR-27`](adr/ADR-27-zero-copy-uds-gateway-and-hedged-pool.md)):**
    - Local companion daemons communicate with `parvault-gateway` over `/var/run/parvault.sock` (`0600` POSIX permissions) using length-bounded `bincode` control headers (`MAX_IPC_FRAME_BYTES = 16 MiB`) paired with Linux `memfd_create` file descriptors passed via `sendmsg` / `recvmsg` `SCM_RIGHTS`.
-   - `StorePayload`, `FetchPayload`, and `FetchRange` stream through fixed `1 MiB` (`RouterSoc`) stripes directly over the shared kernel `shmem` descriptor without `mmap`-pinning the full object into userland RSS — keeping `parvault-gateway` resident RAM delta `< 16 MiB` even while encrypting, erasure-coding, and reconstructing `100+ MiB` streams.
-2. **Stateless HMAC-Chained `CapabilityMacaroon` Attenuation (`src/capabilities.rs`):**
-   - Root capability tokens are minted via $\text{tag}_0 = \text{HMAC-SHA256}(K_{\text{root}}, \text{"parvault-macaroon-root-v1:"} \parallel \text{nonce} \parallel \text{gateway\_id})$ (rejecting all-zero root keys).
-   - Holders attenuate tokens offline without contacting the gateway by chaining $\text{tag}_{i} = \text{HMAC-SHA256}(\text{tag}_{i-1}, \text{"parvault-macaroon-caveat-v1:"} \parallel \text{canonical}(\text{caveat}_i))$ over `AllowedManifest`, `ByteRange { offset, length }`, `ExpiresAtUnixMs`, and `ReadOnly`.
+   - `StorePayload`, `FetchPayload`, and `FetchRange` stream through fixed `1 MiB` (`RouterSoc`) stripes directly over the shared kernel `shmem` descriptor backed by a `40`-lane (`128 KiB`-stack) single-wave shard worker pool and `PinnedRingBudget<SLOTS>` — keeping `parvault-gateway` peak `VmHWM` at `10.98 MiB` (`< 16 MiB`) even while streaming `64–100+ MiB` payloads.
+2. **Stateless HMAC-Chained `CapabilityMacaroon` Attenuation (`src/capabilities.rs`, [`ADR-28`](adr/ADR-28-stateless-macaroon-capability-attenuation.md)):**
+   - Root capability tokens and offline caveat attenuations (`AllowedManifest`, `ByteRange { offset, length }`, `ExpiresAtUnixMs`, `ReadOnly`) chain via domain-separated `HMAC-SHA256` (rejecting all-zero root keys):
+
+```text
+tag_0 = HMAC-SHA256(K_root,    "parvault-macaroon-root-v1:"   || nonce || gateway_id)
+tag_i = HMAC-SHA256(tag_{i-1}, "parvault-macaroon-caveat-v1:" || canonical(caveat_i))
+```
+
    - Verification executes in `< 1 ms` purely in RAM using constant-time `ct_eq_32` bitwise tag comparison prior to any `BlockStore` shard lookup. Gateway identity is anchored to composite post-quantum `Ed25519 + ML-DSA-65` (`GatewayIdentityStatement`).
-3. **Zero-Filesystem Bounded RAM Mode (`parvault-seed --no-fs --in-memory-mb <MiB>`):**
+3. **Zero-Filesystem Bounded RAM Mode (`parvault-seed --no-fs --in-memory-mb <MiB>`, [`ADR-30`](adr/ADR-30-filesystem-free-in-memory-seed-mode.md)):**
    - In `--no-fs` mode, `parvault-seed` creates **zero persistent directories or files** on disk (`BlockStore::new_in_memory`, `PrivacyPreservingEvictionEngine::new_in_memory`, `PublicTrackerTakedownQueue::new_in_memory`), generating ephemeral in-RAM `NodeIdentity` + `HybridKemKeypair` keys (or loading identity seeds strictly from `--identity-env` / read-only `--identity-file`).
    - Total in-RAM shard storage is hard-capped at `--in-memory-mb`, evicting expired/oldest leases first and scrubbing every evicted or dropped buffer with `0x00` via `zeroize::Zeroize`.

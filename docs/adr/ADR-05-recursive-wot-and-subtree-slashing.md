@@ -1,0 +1,24 @@
+# ADR-05: Recursive Ed25519 Web-of-Trust Delegation & Subtree Slashing
+
+- **Status:** Accepted — Extended by [ADR-12](ADR-12-asymmetric-post-quantum-hybrids.md) and [ADR-24](ADR-24-public-commons-pow-swarm-mode.md)
+- **Subsystem:** `network::wot`
+- **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
+
+> **[Historical Evolution Note (`v0.4.0`)]:** Originally designed for closed Ed25519 invitation rings in `v0.1`. Extended in [ADR-12](ADR-12-asymmetric-post-quantum-hybrids.md) with composite post-quantum device/delegation signatures (`Ed25519 + ML-DSA-65`) and in [ADR-24](ADR-24-public-commons-pow-swarm-mode.md) with optional `TrustPoolMode::{PublicCommons, Hybrid}` Hashcash PoW tickets while preserving strict `PrivateRing` isolation by default.
+
+---
+
+## Context
+
+In private neighborhood and co-op rings, uninvited Sybil nodes must be rejected before consuming storage or routing table slots, and an inviter who vouches for malicious or chronically failing nodes must face bounded accountability so Sybil subtrees are pruned automatically.
+
+## Decision
+
+1. **Bounded-Depth Delegation Chains (`DelegationChain`):** Peers in `TrustPoolMode::PrivateRing` authenticate with a signed chain (`Genesis -> ... -> Inviter -> Invitee`, `InvitationHop`) verified against pinned genesis roots and persisted at `wot_state.bin`.
+2. **Gossipsub Slashing & Ancestor Propagation (`SlashingEvidence`):** Any cryptographic fault (poisoned shard Merkle proof or confirmed egress withholding) triggers immediate 1-strike leaf quarantine (`slash_immediately`), while `≥ 3` unexcused PoR audit failures quarantine the leaf and increment its parent inviter's fault counter—pruning compromised invitation branches in finite steps (`≤ M`) with anti-replay `(reporter_pubkey, offender_pubkey, nonce)` tracking.
+3. **Unauthenticated Framing Immunity:** Unverified wire handshakes never increment failure counters against a claimed `leaf_pubkey`, preventing attackers from framing honest peers with bit-flipped packets.
+
+## Consequences & Verification
+
+- **Consequences:** Sybil branches are isolated within `≤ 3` faults without a central certificate authority, and honest nodes cannot be framed by spoofed handshakes.
+- **Verification:** `specs/ParVaultProtocol.tla` (`SybilResistanceInvariant`, `EventuallyBranchPruned`), `tests/formal_verification.rs` (Stateright BFS), and `tests/red_team_hardening_tests.rs`.

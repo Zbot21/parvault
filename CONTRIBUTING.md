@@ -11,9 +11,9 @@ Thank you for contributing to **Neighborhood Cloud (`parvault`)**! Because `parv
    ```bash
    rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
    ```
-3. **Java `17+` & `tla2tools.jar` (When modifying protocol state machines in `specs/`):**
-   Required to run the TLA+ TLC model checker across the 6 formal specifications in [`specs/`](specs/).
-4. **Docker Engine:** Required to run the 13-container P2P regression and disaster-recovery acceptance gate (`scripts/docker_acceptance_gate.sh`).
+3. **Java `17+` & `tla2tools.jar` + Kani Rust Verifier (When modifying protocol state machines or wire parsers):**
+   Required to run the TLA+ TLC model checker across the **7** formal specifications in [`specs/`](specs/) and `cargo kani` across the **15** symbolic harnesses (`bash scripts/verify_formal_proofs.sh`).
+4. **Docker Engine:** Required to run the 14-container P2P regression and `48m` Router-SoC acceptance gate (`scripts/docker_acceptance_gate.sh`).
 
 ---
 
@@ -21,8 +21,9 @@ Thank you for contributing to **Neighborhood Cloud (`parvault`)**! Because `parv
 
 Before writing code, please read:
 - **[`AGENTS.md`](AGENTS.md):** Module-by-module source map (`src/`) and the **7 Non-Negotiable Zero-Trust & Memory-Safety Rules**.
-- **[`docs/ADR.md`](docs/ADR.md):** Architectural Decision Records (`ADR-01` through `ADR-17`) documenting why every cryptographic, erasure-coding, and game-theoretic design choice was made.
-- **[`docs/SECURITY_AND_CRYPTOGRAPHY.md`](docs/SECURITY_AND_CRYPTOGRAPHY.md):** Mathematical proofs, combinatorial anonymity bounds, post-quantum hybrid combiners, and TLA+ invariants.
+- **[`docs/ADR.md`](docs/ADR.md) & [`docs/adr/`](docs/adr/):** Master Architectural Decision Record Index, Active `v0.4.0` Cryptographic Suite Guide, and **31 strictly single-concern ADRs (`ADR-01` through `ADR-31`)**.
+- **[`docs/SAFETY_AND_LINT_AUDIT.md`](docs/SAFETY_AND_LINT_AUDIT.md):** `#![deny/forbid(unsafe_code)]` posture, `src/os_sys.rs` POSIX syscall `SAFETY` proofs, and full `#[allow(...)]` lint audit.
+- **[`docs/SECURITY_AND_CRYPTOGRAPHY.md`](docs/SECURITY_AND_CRYPTOGRAPHY.md):** Mathematical proofs, combinatorial anonymity bounds, post-quantum hybrid combiners, and Kani/TLA+ invariants.
 - **[`docs/USER_AND_CLI_GUIDE.md`](docs/USER_AND_CLI_GUIDE.md):** Complete CLI flag reference and operational workflows for `parvault` and `parvault-seed`.
 
 ---
@@ -59,10 +60,10 @@ java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config specs/ParVaultLiteCli
 
 ## 4. Proposing Protocol Changes (`ADR` Workflow)
 
-Any non-trivial change to wire framing, cryptographic primitives, erasure-coding parameters, or storage formats requires an **Architectural Decision Record (`ADR`)** entry in [`docs/ADR.md`](docs/ADR.md):
-1. State the **Context** (what threat vector, hardware constraint, or usability gap is being addressed).
-2. State the **Decision** with explicit domain-separation tags, data structures, and error bounds.
-3. Add a dedicated integration or adversarial regression test in [`tests/`](tests/).
+Any non-trivial change to wire framing, cryptographic primitives, erasure-coding parameters, or storage formats requires a **strictly single-concern Architectural Decision Record (`ADR`)** file under [`docs/adr/ADR-XX-<slug>.md`](docs/adr/) indexed in [`docs/ADR.md`](docs/ADR.md):
+1. State the **Status**, **Subsystem**, and single-problem **Context** (zero multi-topic grab-bags).
+2. State the **Decision** with explicit domain-separation tags, data structures, and error bounds (using fenced ```` ```text ```` blocks for KDF/HMAC/wire constructions so GitHub Flavored Markdown renders cleanly).
+3. State **Consequences & Verification** linking dedicated Kani symbolic harnesses, TLA+ invariants, and regression tests in [`tests/`](tests/).
 
 ---
 

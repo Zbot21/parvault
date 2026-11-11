@@ -1,0 +1,35 @@
+# ADR-11: 4-Layer Cryptographic Shard Anonymization & 2-Layer Onion Relaying
+
+- **Status:** Accepted
+- **Subsystem:** `storage::anonymity` / `crypto::pqc` / `network::client`
+- **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
+
+---
+
+## Context
+
+Even when shard payloads are encrypted, naive metadata (shared `stripe_merkle_root`, shard index `0..19`, shared stripe-level `K_session` PoR keys, static `uploader_peer_id` quota debits, or direct TCP source IPs) would allow a global coalition of storage peers to group shards belonging to the same file or link them to an uploader's IP address.
+
+## Decision
+
+1. **Layer 1 — Blinded Shard Locators (`BlindedShardId`):** Stored `.bshard` files omit `stripe_merkle_root`, `shard_index`, and sibling hashes, addressing shards solely via a 256-bit keyed PRF locator:
+
+```text
+K_blind_loc = HKDF-SHA256(ikm = K_user, info = "parvault-subkey-blind-locator-v1")
+Locator_i   = HMAC-SHA256(K_blind_loc, "parvault-blinded-locator-v1:" || StripeRoot || u32_be(ShardIdx) || PayloadHash_i)
+```
+
+   Across a neighborhood pool of $M$ blinded shards, an unguided coalition faces a static combinatorial grouping search wall of:
+
+$$
+\Omega_{\mathrm{search}} = \binom{M}{K} \times \frac{N!}{(N - K)!} \approx 2^{224} \quad (M \ge 8{,}000,\; K = 16,\; N = 20)
+$$
+
+2. **Layer 2 — Per-Shard PoR Capability Keys (`BlindedShardCapability`):** Derives an unlinkable per-shard Ed25519 capability keypair $V_i$ from `(blind_capability_subkey, Locator_i)` pinned at upload time (`±30 s` NTP skew window).
+3. **Layer 3 — Ephemeral-Issuer Bearer Quota Vouchers (`AnonymousQuotaVoucher`):** Mints single-use bearer tokens signed by fresh per-shard ephemeral Ed25519 keys (`mint_ephemeral`) redeemed into a disk-persisted `65,536`-entry `VoucherNullifierLedger` (`1-to-1` conservation with zero `PeerId` linkage).
+4. **Layer 4 — 2-Layer Post-Quantum Onion Relay Dispatch (`PqRelayedShardEnvelope`):** Wraps `PqInnerStorageEnvelope` (sealed to destination storage peer's `HybridKemPublicKey`) inside an outer relay envelope (sealed to an intermediate relay peer's `HybridKemPublicKey` with `jitter_delay_ms`) so the relay never sees `Locator_i` or `voucher` and the storage peer never sees the uploader's IP/`PeerId`.
+
+## Consequences & Verification
+
+- **Consequences:** Eliminates static disk grouping, PoR key correlation, quota ledger linkage, and single-hop IP exposure; paired with hedged parallel $N$-shard reads across degraded WANs.
+- **Verification:** `specs/ParVaultAnonymity.tla` (`861` distinct states, `0` errors) and `tests/anonymity_and_degraded_net_tests.rs` (`8/8` degraded network profiles).
