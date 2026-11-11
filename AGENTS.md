@@ -1,24 +1,28 @@
 # AI Agent & Systems Engineer Guide (`AGENTS.md`)
 
-This document is the authoritative architectural, security, and verification manual for AI coding agents and human systems engineers working on **`parvault`** (library crate `parvault`, binaries `parvault`, `parvault-seed`, and `parvault-bench`).
+This document is the authoritative architectural, security, and verification manual for AI coding agents and human systems engineers working on **`parvault`** (`v0.4.0`, library crate `parvault`, binaries `parvault`, `parvault-seed`, `parvault-gateway`, `parvault-fuse`, and `parvault-bench`).
 
 ---
 
 ## 1. System Architecture & Binary Topology
 
-`parvault` is a zero-knowledge, post-quantum hybrid, Byzantine-resilient P2P backup and continuous folder-synchronization engine designed to run identically on high-capacity homelab servers and memory-constrained residential gateways (`prplOS` / `OpenWrt` LXC containers with a strict **`< 32 MiB` active RAM ceiling**).
+`parvault` is a zero-knowledge, post-quantum hybrid, Byzantine-resilient P2P backup, zero-copy Unix Domain Socket gateway, and lazy-streaming virtual filesystem engine designed to run identically on high-capacity homelab servers and memory-constrained residential gateways (`prplOS` / `OpenWrt` LXC containers with a strict **`< 32 MiB` active RAM ceiling**).
 
 ### Binaries & Library Targets (`Cargo.toml`)
-1. **Library Crate (`parvault` — `src/lib.rs`):**
-   Embeddable Rust API exposing streaming encryption, Reed-Solomon erasure coding over $GF(2^8)$, incremental folder synchronization (`FolderSyncEngine`), `libp2p` P2P client/daemon networking (`MeshClient`), Web-of-Trust admission, Proof-of-Retrievability (`PoR`), and elastic bootstrap state machines.
-2. **Client & Peer Daemon (`parvault` — `src/main.rs`):**
-   Runs on user workstations, laptops, desktops, or homelab nodes that own plaintext folders (`watch-folder`, `diff-folder`, `list-snapshot`, `restore-folder`, `recover-from-seed`, `file store`, `file restore`, `identity`, `issue-device-cert`, `verify-device-cert`, `scrub`, `leave`, `status`, `daemon start`). Holds the user's client-side `MasterKey` / `PqVaultMasterKey`.
-3. **Standalone Zero-Trust Seed & Redundancy Server (`parvault-seed` — `src/bin/parvault-seed.rs`):**
-   Runs on headless 24/7 hardware (NAS, Raspberry Pi, Unraid/TrueNAS, VPS) in two strictly zero-plaintext modes (`holds_own_plaintext_files == false`):
+1. **Library Crate (`parvault` — `src/lib.rs`, `#![deny(unsafe_code)]`):**
+   Embeddable Rust API exposing streaming encryption, Reed-Solomon erasure coding over $GF(2^8)$, incremental folder synchronization (`FolderSyncEngine`), `libp2p` P2P client/daemon networking (`MeshClient`), zero-copy `memfd` `SCM_RIGHTS` UDS IPC (`gateway`), stateless `CapabilityMacaroon` attenuation (`capabilities`), pure-Rust `/dev/fuse` lazy VFS (`vfs`), audited Unix kernel wrappers (`os_sys`), Web-of-Trust admission, Proof-of-Retrievability (`PoR`), and elastic bootstrap state machines.
+2. **Client & Peer Daemon (`parvault` — `src/main.rs`, `#![forbid(unsafe_code)]`):**
+   Runs on user workstations, laptops, desktops, or homelab nodes that own plaintext folders (`init`, `up`, `discover`, `pair`, `join`, `watch-folder`, `diff-folder`, `list-snapshot`, `restore-folder`, `recover-from-seed`, `file store`, `file restore`, `evict`, `report-abuse`, `cosign-eviction`, `identity`, `issue-device-cert`, `verify-device-cert`, `scrub`, `leave`, `status`, `daemon start`). Holds the user's client-side `MasterKey` / `PqVaultMasterKey`.
+3. **Standalone Zero-Trust Seed & Redundancy Server (`parvault-seed` — `src/bin/parvault-seed.rs`, `#![forbid(unsafe_code)]`):**
+   Runs on headless 24/7 hardware (NAS, Raspberry Pi, Unraid/TrueNAS, VPS, or pure RAM `--no-fs --in-memory-mb <MiB>`) in two strictly zero-plaintext modes (`holds_own_plaintext_files == false`):
    - `--mode homelab-vault` (`SeedServerMode::HomelabRedundancyVault`): Authenticates the owner's personal devices via post-quantum `PersonalDeviceCert`s (`0.0x` self-quota tax), syndicates Lite-Client `1.0x` stripes across mesh peers, and answers network PoR audits 24/7 to earn `TrustLevel::HighUptimeAnchor` (`16-of-20` `EarnedHomelabAnchorPool`, `5.0x` reciprocity multiplier).
-   - `--mode public-bootstrap` (`SeedServerMode::PublicNetworkBootstrapper`): Stateless `FoundationSeedAnchor` that ingests only anonymized `.bshard` leases during cold-start (`1..19` peers) and automatically drains to `0` shards as verified organic community peers join.
-4. **Empirical Benchmark & Memory Telemetry Runner (`parvault-bench` — `src/bin/parvault-bench.rs`):**
-   Executes real wall-clock benchmarks (`Argon2id`, `AES-256-GCM`, `PqVaultMasterKey`, `X25519 + ML-KEM-768`, `Ed25519 + ML-DSA-65`, Reed-Solomon $GF(2^8)$) and Linux `/proc/self/status` (`VmRSS`, `VmHWM`) + `getrusage(RUSAGE_SELF)` streaming memory measurements.
+   - `--mode public-bootstrap` (`SeedServerMode::PublicNetworkBootstrapper`): Stateless `FoundationSeedAnchor` (supporting `--no-fs` zero-filesystem mode and zero-private-key-on-VPS `admin_rpc` governance) that ingests only anonymized `.bshard` leases during cold-start (`1..19` peers) and automatically drains to `0` shards as verified organic community peers join.
+4. **Canonical Zero-Copy UDS Gateway (`parvault-gateway` — `src/bin/parvault-gateway.rs`, `#![forbid(unsafe_code)]`):**
+   Exposes `/var/run/parvault.sock` (`serve`, `health`, `ipc-roundtrip`, `self-test`) passing Linux `memfd_create` descriptors via `SCM_RIGHTS` backed by `GatewayEngine`'s `40`-lane (`128 KiB`-stack) single-wave `libp2p` shard pool (`< 16 MiB` `VmHWM` while streaming `64+ MiB` payloads).
+5. **Lazy-Streaming Virtual File System (`parvault-fuse` — `src/bin/parvault-fuse.rs`, `#![forbid(unsafe_code)]`):**
+   Feature-gated (`--features vfs`) pure-Rust Linux `/dev/fuse` (`ABI 7.31`, zero C `libfuse`, zero `unsafe`) + unprivileged HTTP `Range` (`206 Partial Content`) / WebDAV (`PROPFIND`) + folder `sync` client over `/var/run/parvault.sock` with bounded `LruBlockCache` eviction (`< 50 ms` TTFB).
+6. **Empirical Benchmark & Memory Telemetry Runner (`parvault-bench` — `src/bin/parvault-bench.rs`, `#![forbid(unsafe_code)]`):**
+   Executes real wall-clock benchmarks (`Argon2id`, `AES-256-GCM`, `PqVaultMasterKey`, `X25519 + ML-KEM-768`, `Ed25519 + ML-DSA-65`, Reed-Solomon $GF(2^8)$) and Linux `/proc/self/status` (`VmRSS`, `VmHWM`) + `CLOCK_PROCESS_CPUTIME_ID` (`parvault::os_sys::process_cpu_time_ns`) streaming memory measurements.
 
 ---
 
@@ -41,10 +45,16 @@ This document is the authoritative architectural, security, and verification man
 | `src/network/behaviour.rs` | `MeshNetworkBehaviour` (`Kademlia`, `Gossipsub`, `Toggle<mDNS>`, `Identify`, `Ping`, `RequestResponse`), 16-variant `MeshWireRequest` / `MeshWireResponse` (`RegisterWanRendezvous`, `LookupWanRendezvous`, `QueryPeerStatus` + 13 storage/DHT/relay RPCs), `BincodeWireCodec` (bounded `MAX_WIRE_FRAME_BYTES = 32 MiB`, 64 KiB initial reservation, `with_limit` pre-auth framing), `PlacementEngine` (70% Intra-ASN / 30% Cross-Region split), and `TokenBucketRateLimiter`. | `ADR-06`, `ADR-08`, `ADR-15`, `ADR-16`, `ADR-18` |
 | `src/network/client.rs` | `MeshClient`, `parse_peer_multiaddr`, `is_network_peer_addr`, `resolve_zero_config_peers`, `register_wan_rendezvous`, `lookup_wan_rendezvous`. Maintains a persistent background `Swarm` worker connection pool, enforces `/p2p/<PeerId>` verification & TOFU `PeerId` pinning, dual Kademlia DHT + `ZeroTrustDhtStore` replication, live RTT & `QueryPeerStatus` telemetry in `PlacementEngine`, and 2-layer PQ onion relay routing. | `ADR-06`, `ADR-08`, `ADR-15`, `ADR-17`, `ADR-18` |
 | `src/network/wot.rs` | `WebOfTrustRegistry` (persisted at `wot_state.bin`), `TrustPoolMode` (`PrivateRing`, `PublicCommons`, `Hybrid`), `PublicCommonsTicket` (self-signed Hashcash PoW ticket, `DEFAULT_PUBLIC_WOT_POW_BITS = 12`), `DelegationChain`, `InvitationHop`, `SlashingEvidence`, `SlashingReason`. Enforces bounded-depth Ed25519 admission, open public tracker admission, and 3-strike subtree slashing. | `ADR-05`, `ADR-09`, `ADR-15`, `ADR-18` |
-| `src/storage/block_store.rs` | `BlockStore`, `FileManifest`, `StripeManifestEntry`, `SignedDhtManifestEnvelope`, `ZeroTrustDhtStore` (`dht_*.bin`), `BlindedShardLeaseManager` (`blinded_leases.bin`). Configurable streaming stripe size (`SOC_ROUTER_STRIPE_SIZE_BYTES = 1 MiB`, `NAS_BALANCED_STRIPE_SIZE_BYTES = 4 MiB`, `DEFAULT_STRIPE_SIZE_BYTES = 16 MiB`), network shard distribution/restoration via `MeshClient`, crash-safe atomic writes (`sync_all` + `rename`), lease sweeps, `graceful_leave_and_redistribute`, and `scrub_all_shards`. | `ADR-01`, `ADR-02`, `ADR-09`, `ADR-13`, `ADR-15`, `ADR-16`, `ADR-18` |
+| `src/storage/block_store.rs` | `BlockStore`, `FileManifest`, `StripeManifestEntry`, `SignedDhtManifestEnvelope`, `ZeroTrustDhtStore` (`dht_*.bin`), `BlindedShardLeaseManager` (`blinded_leases.bin`), `BlindedLeaseSpec`. Configurable streaming stripe size (`ROUTER_SOC_STRIPE_SIZE_BYTES = 1 MiB`, `HOMELAB_NAS_STRIPE_SIZE_BYTES = 4 MiB`, `DEFAULT_STRIPE_SIZE_BYTES = 16 MiB`), `--no-fs` in-memory mode (`BlockStore::new_in_memory`), network shard distribution/restoration via `MeshClient`, crash-safe atomic writes (`sync_all` + `rename`), lease sweeps, `graceful_leave_and_redistribute`, and `scrub_all_shards`. | `ADR-01`, `ADR-02`, `ADR-09`, `ADR-13`, `ADR-15`, `ADR-16`, `ADR-18`, `v0.4.0` |
 | `src/storage/quota.rs` | `QuotaManager` (persisted at `quota_state.bin`), `PeerCreditAccount`, `TrustLevel` (`UntrustedProbationary`, `VerifiedNeighbor`, `HighUptimeAnchor`, `SlashedQuarantined`), tiered `/24` subnet caps (`1`, `2`, `4`, `0`), LRU eviction quota release, and `4x` write-amplification cap. | `ADR-07`, `ADR-09`, `ADR-10`, `ADR-15` |
-| `src/storage/eviction.rs` | `PrivacyPreservingEvictionEngine`, `EvictionTarget` (IP, subnet, PeerId, pubkey, Merkle root, locator), `SignedBadActorEvictionOrder`, `EvictionPurgeReport`, `shred_and_unlink_file` (`0x00` wipe). Keyed HMAC-SHA256 indexing with ZERO plaintext IPs stored on disk. | `ADR-19` |
+| `src/storage/eviction.rs` | `PrivacyPreservingEvictionEngine`, `EvictionTarget` (IP, subnet, PeerId, pubkey, Merkle root, locator), `SignedBadActorEvictionOrder`, `EvictionOrderSliceView`, `EvictionPurgeReport`, `shred_and_unlink_file` (`0x00` wipe). Keyed HMAC-SHA256 indexing with ZERO plaintext IPs stored on disk. | `ADR-19` |
 | `src/storage/anonymity.rs` | 4-Layer Shard Anonymization: `BlindedShardId` (256-bit keyed HMAC locator under `blind_locator_subkey`), `BlindedShardCapability` ($V_i$ per-shard PoR/read key under `blind_capability_subkey` with $\pm 30\text{ s}$ NTP skew tolerance), `AnonymousQuotaVoucher` (ephemeral per-shard issuer via `mint_ephemeral`), `VoucherNullifierLedger` (bounded 65,536-entry FIFO persisted at `voucher_nullifiers.bin`), and `RelayedShardEnvelope`. | `ADR-11`, `ADR-15`, `ADR-16` |
+| `src/os_sys.rs` | Audited Unix/Linux kernel boundary (`#[cfg(unix)]`): 100% safe `pread_full_or_eof` & `pwrite_all` (`FileExt`), `/proc/self/status` RSS/HWM & `/proc/net/dev` readers, and all 9 narrowly scoped `#[allow(unsafe_code)]` POSIX syscall wrappers (`clock_gettime`, `geteuid`/`getegid`, `memfd_create`, `adopt_fuse_dev_fd`, `SCM_RIGHTS` `sendmsg`/`recvmsg`, `bind_reusable_udp_v4`). | `v0.4.0` |
+| `src/gateway/` | `engine.rs` (`GatewayEngine` `40`-lane `128 KiB`-stack single-wave mesh pool, `PinnedRingBudget<SLOTS>`, `GatewayConfig`, `GATEWAY_STRIPE_BYTES`), `ipc.rs` (`GatewayIpcServer`, `GatewayIpcClient`, `EphemeralShardManifest`, `RetentionPolicy`, `/var/run/parvault.sock` `SCM_RIGHTS` framing), and `shm.rs` (`SharedPayloadFd`, `0` `unsafe`). | `v0.4.0` |
+| `src/capabilities.rs` | Stateless `HMAC-SHA256` `CapabilityMacaroon` minting, offline caveat attenuation (`AllowedManifest`, `ByteRange`, `ExpiresAtUnixMs`, `ReadOnly`), `MacaroonSliceView`, and `< 1 ms` zero-DB RAM verification (`ct_eq_32`). | `v0.4.0` |
+| `src/vfs.rs` | Feature-gated (`--features vfs`) pure-Rust Linux `/dev/fuse` (`ABI 7.31`, `0` `unsafe` `parse_fuse_in_header` / `parse_fuse_read_in`), `VirtualVaultFs`, `VfsStubNode`, `LruBlockCache`, and unprivileged HTTP `206` / WebDAV `PROPFIND` server. | `v0.4.0` |
+| `src/admin_rpc.rs` | Forward-secret `X25519 + ChaCha20-Poly1305` + `Ed25519` challenge-authenticated TCP control channel for zero-private-key-on-VPS seed administration (`MAX_ADMIN_RPC_FRAME_BYTES`, `±60s` anti-replay window). | `ADR-19`, `v0.4.0` |
+| `src/kani_proofs.rs` | `13` Kani Rust Bounded Model Checking symbolic harnesses (`#[cfg(kani)]`; `15` total across the crate including `crypto::aes` and `sharding::reed_solomon`). | `ADR-09`–`ADR-19`, `v0.4.0` |
 | `src/bootstrap.rs` | `EarnedStanding`, `ElasticBootstrapEngine`, `PersonalDeviceCert` (including compact `PARVAULT-CERT-V1:` token encoding), `BlindedShardTombstone` (generation-scoped), `ZeroTrustSeedServer`, `CorrelatedOutageController`, and `/32` IPv6 + RFC 6598 CGNAT Sybil subnet normalization. | `ADR-13`, `ADR-14`, `ADR-15`, `ADR-16`, `ADR-17` |
 | `src/sync.rs` | `FolderSyncEngine`, `FolderSnapshotManifest`, `EncryptedVaultCatalogEnvelope`, `.parvaultignore` matcher (`ParvaultIgnore`), `FolderSyncDiff` (`diff_folder`), `prune_deleted_file_shards` (local + remote `DeleteShard` GC), selective restore (`restore_single_file`, `restore_selective_subset`), and zero-local-state seed recovery (`recover_folder_from_seed_phrase`). | `ADR-10`, `ADR-15`, `ADR-16`, `ADR-17` |
 | `src/telemetry.rs` | `AnonymousTelemetryBeacon` (rotating epoch nullifier + Hashcash PoW + power-of-two GiB bucketing capped at 64 TiB) and `NetworkCensusAggregator` (Tukey IQR outlier trimming + capture-recapture population estimate). | `ADR-14`, `ADR-15` |
@@ -58,7 +68,7 @@ Every code change or PR **must** preserve these 7 invariants:
 1. **Encrypt-Before-Shard Ordering (`ADR-01` / `ADR-12`):**
    Plaintext must always be padded (`pad_plaintext_iso_bucket`) and encrypted client-side with `AES-256-GCM` (`MasterKey::stripe_aead_subkey`) or dual-cipher cascaded `PqVaultMasterKey` (`AES-256-GCM` + `ChaCha20-Poly1305`) **before** Reed-Solomon encoding over $GF(2^8)$. Never pass unencrypted bytes into `sharding::reed_solomon`.
 2. **Bounded `< 32 MiB` Streaming I/O & Tiny-SoC 1 MiB Profile (`ADR-01`, `ADR-16`, `ADR-18`):**
-   Never call `std::fs::read` on user backup files or restored staging files. Always use `compute_file_sha256_streaming` (64 KiB buffer) and `store_file_streaming` / `restore_file_streaming`. With `--profile router-soc` (`1 MiB` stripes), peak working set `VmHWM` is guaranteed `< 16 MiB` (`9.39 MiB` measured) inside a 32–48 MiB cgroup. All stripe profiles (`1 MiB`, `4 MiB`, `16 MiB`) are 100% wire- and manifest-interoperable.
+   Never call `std::fs::read` on user backup files or restored staging files. Always use `compute_file_sha256_streaming` (64 KiB buffer) and `store_file_streaming` / `restore_file_streaming`. With `--profile router-soc` (`1 MiB` stripes), peak working set `VmHWM` is guaranteed `< 16 MiB` (`9.72–9.74 MiB` measured) inside a 32–48 MiB cgroup. All stripe profiles (`1 MiB`, `4 MiB`, `16 MiB`) are 100% wire- and manifest-interoperable.
 3. **Pre-Authentication Wire Allocation Bounds (`ADR-15` / `ADR-16`):**
    All network deserialization in `BincodeWireCodec` must use `bincode::DefaultOptions::new().with_fixint_encoding().allow_trailing_bytes().with_limit(buf.len() as u64)` after enforcing `MAX_WIRE_FRAME_BYTES` (`32 MiB`, with 64 KiB initial read reservation against Slowloris attacks), and all replay/nullifier caches (`PorVerifierEngine`, `VoucherNullifierLedger`) must remain strictly bounded in capacity (`65,536` entries) with FIFO eviction.
 4. **Crash-Safe Atomic Persistence (`ADR-15`):**
@@ -80,37 +90,45 @@ Every code change or PR **must** preserve these 7 invariants:
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 
-# Run all 67 unit, integration, Stateright, TLA+ TLC, and live localhost TCP P2P tests
-cargo test --release
+# Run all 122 unit, integration, Stateright, TLA+ TLC, UDS zero-copy IPC, VFS, and live localhost TCP P2P tests
+TLA2TOOLS_JAR=/root/tla2tools.jar cargo test --release
 
-# Run the standalone Zero-Trust Seed Server built-in self-test
+# Run built-in self-tests for seed, zero-copy IPC gateway, and lazy VFS daemons
 cargo run --release --bin parvault-seed -- self-test
+cargo run --release --bin parvault-gateway -- self-test
+cargo run --release --bin parvault-fuse -- self-test
 
 # Run the empirical cryptography, Reed-Solomon, and /proc/self/status memory benchmark binary
 cargo run --release --bin parvault-bench -- run --payload-mib 64
 
-# Run the 13-container Docker P2P regression & disaster recovery acceptance gate
+# Run the 14-container Docker P2P & 48 MiB Router-SoC regression acceptance gate
 bash scripts/docker_acceptance_gate.sh
 ```
 
-### Static `musl` Cross-Compilation (`x86_64` & `aarch64`)
+### Static `musl` Cross-Compilation (`x86_64` & `aarch64`, `--profile soc`)
 ```bash
-# x86_64 static musl build (Homelab / NAS / VPS)
-cargo build --release --target x86_64-unknown-linux-musl --bin parvault --bin parvault-seed
+# x86_64 static musl build (3.62-7.52 MiB stripped)
+cargo build --profile soc --target x86_64-unknown-linux-musl \
+  --bin parvault --bin parvault-seed --bin parvault-gateway --bin parvault-fuse
 
-# ARM64 static musl build (Raspberry Pi / OpenWrt / prplOS LXC gateway)
+# ARM64 static musl build (2.88-5.89 MiB stripped: OpenWrt / prplOS LXC / RPi)
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
-  cargo build --release --target aarch64-unknown-linux-musl --bin parvault --bin parvault-seed
+  cargo build --profile soc --target aarch64-unknown-linux-musl \
+  --bin parvault --bin parvault-seed --bin parvault-gateway --bin parvault-fuse
 ```
 
-### TLA+ TLC Formal Model Checking (`specs/`)
-All 6 TLA+ specifications in `specs/` must complete with **0 errors**:
+### Kani Bounded Model Checking (`15` Harnesses) & TLA+ TLC Formal Model Checking (`7` Specs)
+All **15** Kani symbolic harnesses (`cargo kani`) and all **7** TLA+ specifications in `specs/` must complete with **0 errors** (see [`docs/SAFETY_AND_LINT_AUDIT.md`](docs/SAFETY_AND_LINT_AUDIT.md)):
 ```bash
+bash scripts/verify_formal_proofs.sh
+
+# Individual TLA+ TLC runs:
 java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config specs/ParVaultProtocol.cfg specs/ParVaultProtocol.tla
 java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config specs/ParVaultConfidentialityAndTrust.cfg specs/ParVaultConfidentialityAndTrust.tla
 java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config specs/ParVaultAnonymity.cfg specs/ParVaultAnonymity.tla
 java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config specs/ParVaultPostQuantum.cfg specs/ParVaultPostQuantum.tla
 java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config specs/ParVaultBootstrapAndEarnedTier.cfg specs/ParVaultBootstrapAndEarnedTier.tla
 java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config specs/ParVaultLiteClientAndSeedFailover.cfg specs/ParVaultLiteClientAndSeedFailover.tla
+java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config specs/ParVaultZeroKeyAdminAndQuorum.cfg specs/ParVaultZeroKeyAdminAndQuorum.tla
 ```
-- **Automatic TLA+ Execution in `cargo test` (`tests/tla_formal_proofs_integration.rs`):** Setting `TLA2TOOLS_JAR=/path/to/tla2tools.jar` (configured automatically in `.github/workflows/ci.yml`) runs all **6** TLA+ formal specifications directly inside `cargo test --release`.
+- **Automatic TLA+ Execution in `cargo test` (`tests/tla_formal_proofs_integration.rs`):** Setting `TLA2TOOLS_JAR=/path/to/tla2tools.jar` (configured automatically in `.github/workflows/ci.yml`) runs all **7** TLA+ formal specifications directly inside `cargo test --release`.

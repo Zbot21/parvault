@@ -16,9 +16,9 @@ However, embedding modern distributed storage on consumer and enterprise router 
 2. **Flash Storage Constraints:** Embedded NOR/NAND or eMMC partitions for router operating systems require ultra-compact static binaries (`< 15 MiB`) with zero external dynamic runtime dependencies (glibc, libssl, Python, or node.js).
 3. **Zero-IP Consumer Usability:** Homeowners and non-technical users cannot be expected to look up DHCP leases, configure static IPv4 subnets, or type `/ip4/192.168.1.142/tcp/4001/p2p/...` addresses.
 
-`parvault` v0.3.0 solves all three constraints:
-- **`--profile router-soc`:** Enforces **1 MiB streaming Reed-Solomon stripes** (`SOC_ROUTER_STRIPE_SIZE_BYTES = 1,048,576`), dropping transient peak heap allocations (`VmHWM`) from ~`74.6 MiB` to **`< 16 MiB`**, operating safely inside a `32–48 MiB` container or cgroup ceiling while retaining 100% wire and manifest compatibility with desktop and NAS nodes.
-- **Static Zero-Dependency `musl` & `FROM scratch` Containers:** Stripped standalone binaries under 12 MiB and minimal `FROM scratch` Docker/OCI images under 20 MiB.
+`parvault` v0.4.0 solves all three constraints:
+- **`--profile router-soc`:** Enforces **1 MiB streaming Reed-Solomon stripes** (`ROUTER_SOC_STRIPE_SIZE_BYTES = 1,048,576`), dropping transient peak heap allocations (`VmHWM`) from `57.91 MiB` to **`9.72–9.74 MiB`** (`< 16 MiB`), operating safely inside a `32–48 MiB` container or cgroup ceiling while retaining 100% wire and manifest compatibility with desktop and NAS nodes.
+- **Static Zero-Dependency `musl` & `FROM scratch` Containers:** Stripped standalone binaries (`2.88–5.89 MiB` ARM64, `3.62–7.52 MiB` x86_64 across `parvault`, `parvault-seed`, `parvault-gateway`, and `parvault-fuse`) and minimal `FROM scratch` Docker/OCI images under 20 MiB.
 - **Cryptographic Zero-IP LAN Discovery & 4-Word SAS Pairing:** Fully automated LAN beaconing over UDP port `4009` with Ed25519-signed identity binding, 4-word BIP-39 pairing codes, and DHCP self-healing.
 - **Turnkey Appliance Mode (`parvault up`):** Launches P2P daemon, signed discovery beacon, embedded status webserver, and background folder sync with a single command.
 
@@ -55,9 +55,12 @@ flowchart TD
 ## 3. Flash & Memory Budget
 
 ### Flash / Disk Footprint
-- **Static `musl` stripped binary (`soc` profile `opt-level = "z"`, `lto = "fat"`):** **`5.83 MiB`** (`aarch64`) / **`7.45 MiB`** (`x86_64`) for `parvault`; **`4.14 MiB`** (`aarch64`) / **`5.32 MiB`** (`x86_64`) for `parvault-seed`.
-- **Static `musl` stripped binary (`release` profile):** **`7.64 MiB`** (`aarch64`) / **`9.14 MiB`** (`x86_64`) for `parvault`.
-- **OCI / Docker `FROM scratch` container image (`parvault:router-soc`):** **`19.6 MB`** total uncompressed disk usage (**`6.13 MB`** compressed content size, both stripped binaries + `router.toml` configuration, 0 OS overhead).
+- **Static `musl` stripped binaries (`soc` profile `opt-level = "z"`, `lto = "fat"`):**
+  - `parvault`: **`5.89 MiB`** (`6,179,072 B` `aarch64`) / **`7.52 MiB`** (`7,887,656 B` `x86_64`)
+  - `parvault-seed`: **`4.20 MiB`** (`4,404,584 B` `aarch64`) / **`5.35 MiB`** (`5,613,480 B` `x86_64`)
+  - `parvault-gateway`: **`3.07 MiB`** (`3,215,952 B` `aarch64`) / **`3.80 MiB`** (`3,986,536 B` `x86_64`)
+  - `parvault-fuse`: **`2.88 MiB`** (`3,019,280 B` `aarch64`) / **`3.62 MiB`** (`3,793,960 B` `x86_64`)
+- **OCI / Docker `FROM scratch` container image (`parvault:router-soc`):** **`19.6 MB`** total uncompressed disk usage (**`6.13 MB`** compressed content size, stripped binaries + `router.toml` configuration, 0 OS overhead).
 - **Minimum Free Disk Reserve (`min_free_disk_bytes`):**
   - `--profile router-soc`: `64 MiB` (`67,108,864` bytes), allowing deployment on small USB flash drives or flash partitions.
   - `--profile homelab-nas`: `1 GiB` (`1,073,741,824` bytes).
@@ -69,15 +72,15 @@ Measured on real Linux 6.x kernels via `/proc/self/status` during 64 MiB multi-s
 
 | Execution Checkpoint | Desktop Profile (`16 MiB` Stripes) | Router-SoC Profile (`1 MiB` Stripes) |
 | :--- | :---: | :---: |
-| **Process Startup & Baseline** | `5.44 MiB` VmRSS | `4.12 MiB` VmRSS |
-| **After 64 MiB Chunked Setup** | `5.44 MiB` VmRSS | `4.30 MiB` VmRSS |
-| **Active 64 MiB File Streaming Store** | `5.45 MiB` VmRSS / **`57.30 MiB` VmHWM** (`118.1 MiB/s`) | **`6.11 MiB` VmRSS / `9.39 MiB` VmHWM** (`78.8 MiB/s`) |
-| **Active 64 MiB File Streaming Restore**| `5.45 MiB` VmRSS / **`57.30 MiB` VmHWM** (`104.8 MiB/s`) | **`6.12 MiB` VmRSS / `9.39 MiB` VmHWM** (`117.8 MiB/s`) |
-| **Peak Working Set Margin in 32 MiB cgroup**| **Exceeds limit (OOM kill risk)** | **Ideal (`22.61 MiB` headroom, > 70% free!)** |
-| **Peak Working Set Margin in 48 MiB cgroup**| Exceeds limit | **Bulletproof (`38.61 MiB` headroom, > 80% free!)** |
+| **Process Startup & Baseline** | `9.80 MiB` VmRSS | `4.15 MiB` VmRSS |
+| **After 64 MiB Chunked Setup** | `9.80 MiB` VmRSS | `4.28 MiB` VmRSS |
+| **Active 64 MiB File Streaming Store** | `25.26 MiB` VmRSS / **`57.91 MiB` VmHWM** (`121.7 MiB/s`) | **`9.72 MiB` VmRSS / `9.72 MiB` VmHWM** (`75.9–82.1 MiB/s`) |
+| **Active 64 MiB File Streaming Restore**| `9.26 MiB` VmRSS / **`57.91 MiB` VmHWM** (`117.3 MiB/s`) | **`9.74 MiB` VmRSS / `9.74 MiB` VmHWM** (`127.1–127.4 MiB/s`) |
+| **Peak Working Set Margin in 32 MiB cgroup**| **Exceeds limit (OOM kill risk)** | **Ideal (`22.26 MiB` headroom, ~70% free!)** |
+| **Peak Working Set Margin in 48 MiB cgroup**| Exceeds limit | **Bulletproof (`38.26 MiB` headroom, ~80% free!)** |
 
 > [!IMPORTANT]
-> The `router-soc` profile reduces transient peak memory allocations (`VmHWM`) during Reed-Solomon $GF(2^8)$ matrix encoding and reconstruction from `57.30 MiB` down to **`9.39 MiB`** (a **6.1x reduction**), well inside even the tightest 32 MiB router container limit without sacrificing encryption strength, erasure resilience, or wire compatibility.
+> The `router-soc` profile reduces transient peak memory allocations (`VmHWM`) during Reed-Solomon $GF(2^8)$ matrix encoding and reconstruction from `57.91 MiB` down to **`9.72–9.74 MiB`** (a **5.9x reduction**), well inside even the tightest 32 MiB router container limit without sacrificing encryption strength, erasure resilience, or wire compatibility.
 
 ---
 
@@ -184,7 +187,7 @@ parvault file restore <SHARD_ID_OR_MANIFEST> --out ./family-records.pdf
 
 In addition to local home LAN discovery, router appliances frequently need to peer with friend routers, family NAS units, or cloud seed anchors across different cities and ISPs.
 
-Traditional solutions require setting up dynamic DNS accounts (e.g. DuckDNS, No-IP), opening port forwards, or managing VPN tunnels. ParVault v0.3.0 replaces this entire operational burden with **Zero-IP Online WAN Peering**:
+Traditional solutions require setting up dynamic DNS accounts (e.g. DuckDNS, No-IP), opening port forwards, or managing VPN tunnels. ParVault v0.4.0 replaces this entire operational burden with **Zero-IP Online WAN Peering**:
 
 ```mermaid
 sequenceDiagram
@@ -221,7 +224,7 @@ sequenceDiagram
 
 ## 6. Zero-Pairing BitTorrent-Style Public Commons Mode (`--public --tracker ...`)
 
-For users and router operators who do not wish to manage private join codes, device certificates, or invitation lists, `parvault` v0.3.0 introduces **Public Commons Mode** (`--public`), analogous to joining a public BitTorrent swarm:
+For users and router operators who do not wish to manage private join codes, device certificates, or invitation lists, `parvault` v0.4.0 supports **Public Commons Mode** (`--public`), analogous to joining a public BitTorrent swarm:
 
 ```bash
 # Launch Router Cloud-NAS connecting directly to the Public Commons tracker:
@@ -248,7 +251,7 @@ parvault up \
 ### Binary Installation
 ```bash
 # 1. Download static aarch64 or x86_64 musl binary
-wget -O /usr/bin/parvault https://github.com/Zbot21/parvault/releases/download/v0.3.0/parvault-aarch64-unknown-linux-musl
+wget -O /usr/bin/parvault https://github.com/Zbot21/parvault/releases/download/v0.4.0/parvault-aarch64-unknown-linux-musl
 chmod +x /usr/bin/parvault
 
 # 2. Create runtime directories
@@ -258,7 +261,7 @@ mkdir -p /etc/parvault /mnt/nas/.parvault-data /mnt/nas/shared
 ### Configuration File (`/etc/parvault/router.toml`)
 Copy `deploy/router-soc/parvault-router.toml`:
 ```toml
-# ParVault v0.3.0 Turnkey Router Cloud-NAS Configuration (ADR-18)
+# ParVault v0.4.0 Turnkey Router Cloud-NAS Configuration (ADR-18)
 # Designed for OpenWrt / prplOS / ARM64 & x86_64 Gateway SoCs (<= 32-48 MiB cgroup RAM)
 
 hardware_profile = "router-soc"
@@ -370,7 +373,7 @@ For carrier and broadband gateway environments running `prplOS`, deploy `parvaul
   "schema_version": "1.0",
   "container_name": "parvault-router-nas",
   "vendor": "Neighborhood Cloud / Project ParVault",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "license": "AGPL-3.0-only",
   "target_platforms": [
     "aarch64-unknown-linux-musl",
@@ -439,7 +442,7 @@ prplos-lxc-ctl start parvault-router-nas
 - **`GET /api/v1/health`:** Returns real-time health, RAM telemetry, storage quotas, uptime, and SAS pairing code in JSON:
   ```json
   {
-    "version": "0.3.0",
+    "version": "0.4.0",
     "node_label": "OpenWrt-CloudNAS",
     "hardware_profile": "router-soc",
     "device_peer_id": "12D3KooWSDu7w4v...",

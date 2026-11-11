@@ -96,21 +96,21 @@ use std::{fs::File, os::fd::AsRawFd};
 async fn gateway_roundtrip(root_key: &[u8; 32], payload: &[u8]) -> anyhow::Result<Vec<u8>> {
     let client = GatewayIpcClient::new(DEFAULT_IPC_SOCKET_PATH);
     let manifest = client
-        .store_bytes(payload, RetentionPolicy::PermanentVault)
+        .store_bytes(payload, RetentionPolicy::Persistent)
         .await?;
 
     let root_token = CapabilityMacaroon::mint(
         root_key,
         [0x11; 32],
         [0x22; 32],
-        vec![Caveat::AllowedManifest(manifest.manifest_root)],
+        vec![Caveat::AllowedManifest(manifest.file_merkle_root)],
     )?;
     let read_token = root_token.attenuate(Caveat::ReadOnly)?;
 
     let out_fd = create_memfd_sized("parvault-fetch", payload.len() as u64)?;
     let out_file = File::from(out_fd);
     client
-        .fetch_range_fd(
+        .fetch_range_to_fd(
             manifest,
             0,
             payload.len() as u64,
