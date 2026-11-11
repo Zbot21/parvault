@@ -995,6 +995,7 @@ mod unix_impl {
         ) -> anyhow::Result<EphemeralShardManifest> {
             match self {
                 Self::InProcess(engine) => {
+                    Self::ensure_in_process_peer_uid(engine)?;
                     let dup = crate::os_sys::dup_fd_cloexec(payload_fd)?;
                     let eng = Arc::clone(engine);
                     tokio::task::spawn_blocking(move || {
@@ -1021,6 +1022,7 @@ mod unix_impl {
         ) -> anyhow::Result<EphemeralShardManifest> {
             match self {
                 Self::InProcess(engine) => {
+                    Self::ensure_in_process_peer_uid(engine)?;
                     let dup = crate::os_sys::dup_fd_cloexec(fd)?;
                     if !crate::os_sys::has_immutable_memfd_seals(dup.as_fd())? {
                         crate::os_sys::seal_memfd_immutable(dup.as_fd())?;
@@ -1048,6 +1050,7 @@ mod unix_impl {
         ) -> anyhow::Result<u64> {
             match self {
                 Self::InProcess(engine) => {
+                    Self::ensure_in_process_peer_uid(engine)?;
                     let dup = crate::os_sys::dup_fd_cloexec(output_fd)?;
                     let eng = Arc::clone(engine);
                     tokio::task::spawn_blocking(move || {
@@ -1076,6 +1079,7 @@ mod unix_impl {
         ) -> anyhow::Result<u64> {
             match self {
                 Self::InProcess(engine) => {
+                    Self::ensure_in_process_peer_uid(engine)?;
                     let dup = crate::os_sys::dup_fd_cloexec(output_fd)?;
                     let eng = Arc::clone(engine);
                     tokio::task::spawn_blocking(move || {
@@ -1098,7 +1102,10 @@ mod unix_impl {
             file_manifest: FileManifest,
         ) -> anyhow::Result<EphemeralShardManifest> {
             match self {
-                Self::InProcess(engine) => Ok(engine.register_manifest(file_manifest)),
+                Self::InProcess(engine) => {
+                    Self::ensure_in_process_peer_uid(engine)?;
+                    Ok(engine.register_manifest(file_manifest))
+                }
                 Self::UnixSocket(client) => client.register_manifest_async(file_manifest).await,
             }
         }
@@ -1106,7 +1113,10 @@ mod unix_impl {
         /// Queries `(iops, peer_count, por_sla_score)` telemetry from the gateway.
         pub async fn query_health(&self) -> anyhow::Result<(u64, usize, f32)> {
             match self {
-                Self::InProcess(engine) => Ok(engine.health_snapshot()),
+                Self::InProcess(engine) => {
+                    Self::ensure_in_process_peer_uid(engine)?;
+                    Ok(engine.health_snapshot())
+                }
                 Self::UnixSocket(client) => client.query_health().await,
             }
         }

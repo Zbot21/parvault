@@ -189,6 +189,138 @@ fn test_gateway_bus_sync_surface_parity_and_sealed_memfd_enforcement() {
         assert!(sla > 0.0);
     }
 
+    // 6. Disallowed `strict_allowed_peer_uids` on `GatewayBus::InProcess` MUST reject BOTH
+    //    synchronous (`*_sync`) and asynchronous methods identically to `UnixSocket` `SO_PEERCRED`:
+    let denied_engine = Arc::new(
+        GatewayEngine::new(
+            tmp.path().join("denied_uid_store"),
+            MasterKey::from_bytes([0x22; 32]),
+            GatewayConfig {
+                stripe_size_bytes: HardwareProfile::RouterSoc.stripe_size_bytes(),
+                tier: ErasureTier::Consumer,
+                peers: Vec::new(),
+                macaroon_root_key: None,
+                strict_allowed_peer_uids: Some(vec![uid.wrapping_add(1)]),
+                require_sealed_ingest_memfd: false,
+            },
+        )
+        .expect("denied GatewayEngine"),
+    );
+    let denied_bus = GatewayBus::in_process(Arc::clone(&denied_engine));
+    let denied_mfd = File::from(create_memfd_sized("denied-m3", 64).unwrap());
+    pwrite_all(&denied_mfd, 0, &[0xAB; 64]).unwrap();
+    let denied_fm = FileManifest {
+        version: 1,
+        file_merkle_root: [0x77; 32],
+        file_salt: [0x88; 32],
+        original_file_size: 0,
+        stripe_size_bytes: 1_048_576,
+        tier: ErasureTier::Consumer,
+        stripes: Vec::new(),
+        witness_peers: Vec::new(),
+    };
+    let dummy_ephem = EphemeralShardManifest {
+        file_merkle_root: [0x77; 32],
+        shard_hashes: Vec::new(),
+        total_size: 0,
+        stripe_size_bytes: 1_048_576,
+    };
+
+    assert_eq!(
+        denied_bus
+            .store_memfd_sync(denied_mfd.as_raw_fd(), 64, RetentionPolicy::Ephemeral)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        denied_bus
+            .store_sealed_memfd_sync(denied_mfd.as_raw_fd(), 64, RetentionPolicy::Ephemeral)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        denied_bus
+            .fetch_into_memfd_sync(Vec::new(), denied_mfd.as_raw_fd())
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        denied_bus
+            .fetch_range_into_memfd_sync(&dummy_ephem, 0, 0, denied_mfd.as_raw_fd(), None)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        denied_bus
+            .fetch_range_bytes_sync(&dummy_ephem, 0, 0, None)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        denied_bus
+            .register_manifest_sync(denied_fm.clone())
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        denied_bus.query_health_sync().unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio current_thread runtime");
+    rt.block_on(async {
+        assert!(denied_bus
+            .store_payload_fd(denied_mfd.as_raw_fd(), 64, RetentionPolicy::Ephemeral)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("strict_allowed_peer_uids"));
+        assert!(denied_bus
+            .store_sealed_payload_fd(denied_mfd.as_raw_fd(), 64, RetentionPolicy::Ephemeral)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("strict_allowed_peer_uids"));
+        assert!(denied_bus
+            .fetch_payload_to_fd(Vec::new(), denied_mfd.as_raw_fd())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("strict_allowed_peer_uids"));
+        assert!(denied_bus
+            .fetch_range_to_fd(dummy_ephem, 0, 0, denied_mfd.as_raw_fd(), None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("strict_allowed_peer_uids"));
+        assert!(denied_bus
+            .register_manifest(denied_fm)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("strict_allowed_peer_uids"));
+        assert!(denied_bus
+            .query_health()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("strict_allowed_peer_uids"));
+    });
+    assert_eq!(
+        denied_engine.traffic_counters().0,
+        0,
+        "disallowed peer UID must never ingest bytes in-process"
+    );
+
     assert_eq!(
         count_socket_files_recursive(&tmp.path().join("inproc_store")),
         0,
@@ -198,9 +330,47 @@ fn test_gateway_bus_sync_surface_parity_and_sealed_memfd_enforcement() {
 }
 
 #[cfg(feature = "vfs")]
+fn verify_embedding_doc_snippet(root_key: &[u8; 32]) -> anyhow::Result<()> {
+    use parvault::{
+        capabilities::{CapabilityMacaroon, Caveat},
+        gateway::{GatewayBus, RetentionPolicy, DEFAULT_IPC_SOCKET_PATH},
+        sync::{sanitize_sync_relative_path, GatewayFolderSync},
+        vfs::VirtualVaultFs,
+    };
+    use std::path::Path;
+
+    let bus = GatewayBus::unix_socket(DEFAULT_IPC_SOCKET_PATH);
+    assert_eq!(
+        sanitize_sync_relative_path("docs\\guide//intro.md").as_deref(),
+        Some("docs/guide/intro.md")
+    );
+
+    let mut sync = GatewayFolderSync::new(bus.clone());
+    let catalog = sync.sync_folder_once(Path::new("./my-folder"), RetentionPolicy::Persistent)?;
+    catalog.save_to_file(Path::new("./.parvault_gateway_catalog.bin"))?;
+
+    let read_token =
+        CapabilityMacaroon::mint(root_key, [0x11; 32], [0x22; 32], vec![Caveat::ReadOnly])?;
+    let reader = GatewayFolderSync::with_catalog(bus.clone(), catalog)
+        .with_default_macaroon(Some(read_token.clone()));
+    reader.restore_to_folder(Path::new("./restored-docs"), &["docs/*".to_string()])?;
+
+    let vfs = VirtualVaultFs::with_bus(bus, Path::new("/tmp/pv-vfs-cache"), 64 * 1024 * 1024)?
+        .with_default_macaroon(Some(read_token));
+    let mut webdav = vfs.spawn_webdav_server("127.0.0.1:0")?;
+    let _addr = webdav.local_addr();
+    webdav.shutdown();
+    Ok(())
+}
+
+#[cfg(feature = "vfs")]
 #[test]
 fn test_dual_mode_vfs_no_socket_inprocess_vs_unix_socket_webdav_range_and_lru() {
     use parvault::vfs::VirtualVaultFs;
+
+    if std::hint::black_box(false) {
+        let _ = verify_embedding_doc_snippet(&[0x42; 32]);
+    }
 
     let tmp = tempdir().expect("tempdir");
 

@@ -107,8 +107,8 @@ fn plugin_sync_and_vfs(root_key: &[u8; 32]) -> anyhow::Result<()> {
 
     // 3. Attenuate a read-only macaroon and selectively pull docs/* with streaming SHA-256 verification
     let read_token = CapabilityMacaroon::mint(root_key, [0x11; 32], [0x22; 32], vec![Caveat::ReadOnly])?;
-    let mut reader = GatewayFolderSync::with_macaroon(bus.clone(), Some(read_token.clone()));
-    reader.load_catalog(catalog);
+    let reader = GatewayFolderSync::with_catalog(bus.clone(), catalog)
+        .with_default_macaroon(Some(read_token.clone()));
     reader.restore_to_folder(Path::new("./restored-docs"), &["docs/*".to_string()])?;
 
     // 4. Spawn an RAII background HTTP Range / WebDAV lazy VFS server over the same GatewayBus
