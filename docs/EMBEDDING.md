@@ -1,6 +1,6 @@
-# Embedding `parvault` as a Rust Library (`v0.4.0`)
+# Embedding `parvault` as a Rust Library (`v0.5.0`)
 
-`parvault` is architected as a dual-purpose crate: every subsystem powering the `parvault`, `parvault-seed`, `parvault-gateway`, and `parvault-fuse` binaries is exposed through a clean, memory-bounded Rust library API (`src/lib.rs`, `#![deny(unsafe_code)]`) suitable for embedding inside backup agents, NAS appliances, ISP gateway daemons, and zero-key quorum control planes.
+`parvault` is architected as a dual-purpose crate: every subsystem powering the `parvault`, `parvault-seed`, and `parvault-fuse` binaries is exposed through a clean, memory-bounded Rust library API (`src/lib.rs`, `#![deny(unsafe_code)]`) suitable for embedding inside backup agents, NAS appliances, ISP gateway daemons, and zero-key quorum control planes.
 
 ---
 
@@ -79,9 +79,9 @@ assert_eq!(HardwareProfile::Desktop.stripe_size_bytes(), DEFAULT_STRIPE_SIZE_BYT
 
 ---
 
-## 4. Zero-Copy Shared-Memory IPC Gateway (`parvault::gateway`)
+## 4. Zero-Copy Shared-Memory IPC & `GatewayBus` (`parvault::gateway`)
 
-Multi-tenant services and language-agnostic frontends can embed or speak directly to `parvault-gateway` over Unix Domain Sockets (`SCM_RIGHTS` + Linux `memfd_create`) with attenuated `CapabilityMacaroon` tokens:
+Multi-tenant services and language-agnostic frontends can embed `GatewayBus::InProcess` directly (`--no-socket`) or speak to `parvault up --ipc-socket /var/run/parvault.sock` via `GatewayBus::UnixSocket` (`SCM_RIGHTS` + sealed Linux `memfd_create` + `SO_PEERCRED` UID binding) with attenuated `CapabilityMacaroon` (`PARVAULT-MAC-V1:`) tokens (see [`GATEWAY_SOCKET_PROTOCOL.md`](GATEWAY_SOCKET_PROTOCOL.md)):
 
 ```rust
 use parvault::{
@@ -135,10 +135,10 @@ async fn gateway_roundtrip(root_key: &[u8; 32], payload: &[u8]) -> anyhow::Resul
 | `parvault::crypto` | `MasterKey`, BIP-39 deterministic derivation, HKDF subkey isolation, `NodeIdentity` (`Ed25519`), and `crypto::pqc` hybrid post-quantum `X-Wing` (`X25519 + ML-KEM-768`), `Ed25519 + ML-DSA-65`, and cascaded `AES-256-GCM + ChaCha20-Poly1305` sealing. |
 | `parvault::sharding` | Streaming `GF(2^8)` Reed-Solomon encoder/reconstructor (`4-of-6`, `16-of-20`, `20-of-40`) with pre-decoding BLAKE3 Merkle shard quarantine. |
 | `parvault::storage` | Crash-safe `BlockStore` (`fsync` + atomic `rename`), `QuotaManager`, `.bshard` blinded shard leases (`BlindedLeaseSpec`), and `storage::eviction` 4-vector keyed-HMAC privacy-preserving quorum takedowns (`ADR-19`). |
-| `parvault::gateway` | Canonical `GatewayEngine` (`40`-lane `128 KiB`-stack single-wave TTFB pool, `PinnedRingBudget<SLOTS>`), `GatewayIpcServer` / `GatewayIpcClient` (`SCM_RIGHTS` + `memfd`), and `EphemeralShardManifest` (`RetentionPolicy`). |
-| `parvault::capabilities` | Stateless `HMAC-SHA256` `CapabilityMacaroon` minting, caveat attenuation (`AllowedManifest`, `ByteRange`, `ExpiresAtUnixMs`, `ReadOnly`), and `< 1 ms` zero-DB RAM verification. |
+| `parvault::gateway` | Canonical `GatewayEngine` (`40`-lane `128 KiB`-stack single-wave TTFB pool, `PinnedRingBudget<SLOTS>`), unified `GatewayBus` (`InProcess` & `UnixSocket`), `GatewayIpcServer` / `GatewayIpcClient` (`SCM_RIGHTS` + sealed `memfd` + `SO_PEERCRED`), and `EphemeralShardManifest` (`RetentionPolicy`). |
+| `parvault::capabilities` | Stateless `HMAC-SHA256` `CapabilityMacaroon` (`PARVAULT-MAC-V1:`) minting, caveat attenuation (`AllowedManifest`, `ByteRange`, `ExpiresAtUnixMs`, `ReadOnly`, `AllowedPeerUid`), and `< 1 ms` zero-DB RAM verification. |
 | `parvault::vfs` | Pure-Rust Linux FUSE `ABI 7.31` VFS inode table (`VirtualVaultFs`, `VfsStubNode`, `parse_fuse_in_header`, `parse_fuse_read_in`) with zero C `libfuse` dependency and zero `unsafe` blocks. |
-| `parvault::os_sys` | Audited Unix/Linux kernel boundary (`pread_full_or_eof`, `pwrite_all`, `create_memfd`, `sendmsg_scm_rights`, `recvmsg_scm_rights`, `adopt_fuse_dev_fd`, `process_cpu_time_ns`, `bind_reusable_udp_v4`). |
+| `parvault::os_sys` | Audited Unix/Linux kernel boundary (`pread_full_or_eof`, `pwrite_all`, `create_memfd`, `seal_memfd_immutable`, `has_immutable_memfd_seals`, `peer_socket_ucred`, `dup_fd_cloexec`, `sendmsg_scm_rights`, `recvmsg_scm_rights`, `adopt_fuse_dev_fd`, `process_cpu_time_ns`, `bind_reusable_udp_v4`). |
 | `parvault::sync` | `FolderSyncEngine` incremental directory delta scanner, `.parvaultignore` filtering, byte-range hydration, and encrypted catalog export/recovery. |
 | `parvault::network` | `libp2p` `Noise_XX + Yamux` Kademlia/RPC swarm, signed LAN UDP beacons (`UDP 4009`), 4-word BIP-39 SAS pairing, and STUN-over-Noise WAN rendezvous (`WanPeerCard`). |
 | `parvault::admin_rpc` | Forward-secret `X25519 + ChaCha20-Poly1305` + `Ed25519` challenge-authenticated wire protocol for zero-private-key-on-VPS seed administration. |

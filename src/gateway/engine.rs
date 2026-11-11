@@ -105,6 +105,8 @@ pub struct GatewayConfig {
     pub tier: ErasureTier,
     pub peers: Vec<String>,
     pub macaroon_root_key: Option<[u8; 32]>,
+    pub strict_allowed_peer_uids: Option<Vec<u32>>,
+    pub require_sealed_ingest_memfd: bool,
 }
 
 impl Default for GatewayConfig {
@@ -114,6 +116,8 @@ impl Default for GatewayConfig {
             tier: ErasureTier::Consumer,
             peers: Vec::new(),
             macaroon_root_key: None,
+            strict_allowed_peer_uids: None,
+            require_sealed_ingest_memfd: false,
         }
     }
 }
@@ -137,9 +141,9 @@ mod unix_engine {
     use crate::storage::{BlockStore, FileManifest, QuotaManager, ShardId, StripeManifestEntry};
     use std::collections::HashMap;
     use std::fs::File;
-    use std::os::fd::OwnedFd;
+    use std::os::fd::{AsFd, OwnedFd};
     use std::path::Path;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, RwLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -262,6 +266,8 @@ mod unix_engine {
         peers: Arc<Vec<String>>,
         lane_workers: Vec<mpsc::Sender<MeshLaneJob>>,
         macaroon_root_key: RwLock<Option<[u8; 32]>>,
+        strict_allowed_peer_uids: RwLock<Option<Vec<u32>>>,
+        require_sealed_ingest_memfd: AtomicBool,
         by_merkle_root: RwLock<HashMap<[u8; 32], FileManifest>>,
         by_shard_vec_hash: RwLock<HashMap<[u8; 32], FileManifest>>,
         pinned_ring: RwLock<PinnedRingBudget<256>>,
@@ -305,6 +311,8 @@ mod unix_engine {
                 peers: Arc::new(Vec::new()),
                 lane_workers: Vec::new(),
                 macaroon_root_key: RwLock::new(None),
+                strict_allowed_peer_uids: RwLock::new(None),
+                require_sealed_ingest_memfd: AtomicBool::new(false),
                 by_merkle_root: RwLock::new(HashMap::new()),
                 by_shard_vec_hash: RwLock::new(HashMap::new()),
                 pinned_ring: RwLock::new(PinnedRingBudget::new(DEFAULT_PINNED_RING_MAX_BYTES)),
@@ -363,6 +371,8 @@ mod unix_engine {
                 peers: Arc::new(normalized_peers),
                 lane_workers,
                 macaroon_root_key: RwLock::new(cfg.macaroon_root_key),
+                strict_allowed_peer_uids: RwLock::new(cfg.strict_allowed_peer_uids),
+                require_sealed_ingest_memfd: AtomicBool::new(cfg.require_sealed_ingest_memfd),
                 by_merkle_root: RwLock::new(HashMap::new()),
                 by_shard_vec_hash: RwLock::new(HashMap::new()),
                 pinned_ring: RwLock::new(PinnedRingBudget::new(DEFAULT_PINNED_RING_MAX_BYTES)),
@@ -406,6 +416,56 @@ mod unix_engine {
             if let Ok(mut guard) = self.macaroon_root_key.write() {
                 *guard = key;
             }
+        }
+
+        /// Builder-style configuration restricting socket/bus access to explicit POSIX UIDs (`--strict-plugins`).
+        pub fn with_strict_allowed_peer_uids(self, uids: Vec<u32>) -> Self {
+            self.set_strict_allowed_peer_uids(Some(uids));
+            self
+        }
+
+        /// Updates or clears the strict POSIX peer UID allowlist (`None` disables UID allowlist enforcement).
+        pub fn set_strict_allowed_peer_uids(&self, uids: Option<Vec<u32>>) {
+            if let Ok(mut guard) = self.strict_allowed_peer_uids.write() {
+                *guard = uids;
+            }
+        }
+
+        /// Returns a snapshot of the configured strict POSIX peer UID allowlist, if enabled.
+        pub fn strict_allowed_peer_uids(&self) -> Option<Vec<u32>> {
+            self.strict_allowed_peer_uids
+                .read()
+                .ok()
+                .and_then(|g| g.clone())
+        }
+
+        /// Evaluates whether `peer_uid` satisfies any active `strict_allowed_peer_uids` policy.
+        pub fn is_peer_uid_allowed(&self, peer_uid: Option<u32>) -> bool {
+            let Ok(guard) = self.strict_allowed_peer_uids.read() else {
+                return false;
+            };
+            match guard.as_ref() {
+                None => true,
+                Some(allowed) => peer_uid.map(|uid| allowed.contains(&uid)).unwrap_or(false),
+            }
+        }
+
+        /// Builder-style configuration requiring immutable Linux `memfd` seals (`F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW`)
+        /// on every ingested `StorePayload` descriptor before hashing or encrypting a single byte.
+        pub fn with_require_sealed_ingest_memfd(self, required: bool) -> Self {
+            self.set_require_sealed_ingest_memfd(required);
+            self
+        }
+
+        /// Enables or disables mandatory `memfd` seal verification on `StorePayload`.
+        pub fn set_require_sealed_ingest_memfd(&self, required: bool) {
+            self.require_sealed_ingest_memfd
+                .store(required, Ordering::Release);
+        }
+
+        /// Returns `true` iff `StorePayload` requires `F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW` seals.
+        pub fn require_sealed_ingest_memfd(&self) -> bool {
+            self.require_sealed_ingest_memfd.load(Ordering::Acquire)
         }
 
         /// Updates the default Reed-Solomon [`ErasureTier`] used for subsequent `StorePayload` calls.
@@ -475,6 +535,13 @@ mod unix_engine {
             bytes_len: u64,
             retention: RetentionPolicy,
         ) -> anyhow::Result<EphemeralShardManifest> {
+            if self.require_sealed_ingest_memfd()
+                && !crate::os_sys::has_immutable_memfd_seals(payload_fd.as_fd()).unwrap_or(false)
+            {
+                anyhow::bail!(
+                    "unsealed ingest memfd rejected (F_SEAL_WRITE|F_SEAL_SHRINK|F_SEAL_GROW required)"
+                );
+            }
             let mut file = File::from(payload_fd);
             let total_size = if bytes_len > 0 {
                 bytes_len
@@ -639,7 +706,8 @@ mod unix_engine {
         }
 
         /// Verifies any configured [`CapabilityMacaroon`] purely in RAM (`< 1 ms`, zero disk I/O)
-        /// and streams the requested `[offset .. offset + len]` byte slice into `output_fd`.
+        /// using the local process effective UID (`Some(geteuid())`) and streams the requested
+        /// `[offset .. offset + len]` byte slice into `output_fd`.
         pub fn fetch_range_to_owned_fd(
             &self,
             manifest: &EphemeralShardManifest,
@@ -648,6 +716,34 @@ mod unix_engine {
             macaroon: Option<&CapabilityMacaroon>,
             output_fd: OwnedFd,
         ) -> anyhow::Result<u64> {
+            self.fetch_range_to_owned_fd_with_peer_uid(
+                manifest,
+                offset,
+                len,
+                macaroon,
+                Some(crate::os_sys::geteuid()),
+                output_fd,
+            )
+        }
+
+        /// Verifies any configured [`CapabilityMacaroon`] purely in RAM (`< 1 ms`, zero disk I/O)
+        /// against explicit `peer_uid` (extracted via kernel `SO_PEERCRED` on Unix Domain Sockets or
+        /// `Some(geteuid())` on in-process calls) and streams `[offset .. offset + len]` into `output_fd`.
+        pub fn fetch_range_to_owned_fd_with_peer_uid(
+            &self,
+            manifest: &EphemeralShardManifest,
+            offset: u64,
+            len: u64,
+            macaroon: Option<&CapabilityMacaroon>,
+            peer_uid: Option<u32>,
+            output_fd: OwnedFd,
+        ) -> anyhow::Result<u64> {
+            if !self.is_peer_uid_allowed(peer_uid) {
+                anyhow::bail!(
+                    "peer UID {:?} rejected by strict_allowed_peer_uids policy",
+                    peer_uid
+                );
+            }
             let required_key = self.macaroon_root_key.read().ok().and_then(|guard| *guard);
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -659,6 +755,7 @@ mod unix_engine {
                 length: len,
                 is_write: false,
                 now_unix_ms: now_ms,
+                peer_uid,
             };
 
             if let Some(root_key) = required_key {

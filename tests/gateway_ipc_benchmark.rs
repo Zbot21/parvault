@@ -206,6 +206,7 @@ fn test_gateway_macaroon_sub_millisecond_ram_enforcement() {
                     length: 256 * 1024,
                     now_unix_ms: 1_700_000_000_000,
                     is_write: false,
+                    peer_uid: None,
                 },
             )
             .expect("valid attenuated macaroon");

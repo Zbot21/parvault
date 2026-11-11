@@ -14,10 +14,6 @@ name = "parvault-seed"
 path = "src/bin/parvault-seed.rs"
 
 [[bin]]
-name = "parvault-gateway"
-path = "src/bin/parvault-gateway.rs"
-
-[[bin]]
 name = "parvault-fuse"
 path = "src/bin/parvault-fuse.rs"
 required-features = ["vfs"]

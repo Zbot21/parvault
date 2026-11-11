@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Reproducible Formal Verification Runner for ParVault v0.4.0:
-# 1. Runs all 15 Kani Rust Bounded Model Checking symbolic harnesses (`cargo kani`)
+# Reproducible Formal Verification Runner for ParVault v0.5.0:
+# 1. Runs all 16 Kani Rust Bounded Model Checking symbolic harnesses (`cargo kani`)
 # 2. Runs all 7 TLA+ TLC protocol state-machine specifications (`specs/*.tla`)
 set -euo pipefail
 
@@ -8,7 +8,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 echo "================================================================================"
-echo "  [1/2] Kani Rust Bounded Model Checking (15 Symbolic Harnesses)"
+echo "  [1/2] Kani Rust Bounded Model Checking (16 Symbolic Harnesses)"
 echo "================================================================================"
 if ! command -v cargo-kani >/dev/null 2>&1; then
   echo "ERROR: cargo-kani not found. Install via: cargo install --locked kani-verifier && cargo kani setup" >&2
@@ -49,5 +49,5 @@ done
 
 echo ""
 echo "================================================================================"
-echo "  ALL 15 KANI BOUNDED MODEL CHECKING HARNESSES & 7 TLA+ SPECS VERIFIED (0 ERRORS)"
+echo "  ALL 16 KANI BOUNDED MODEL CHECKING HARNESSES & 7 TLA+ SPECS VERIFIED (0 ERRORS)"
 echo "================================================================================"

@@ -1,6 +1,6 @@
-# Empirical Benchmarks, Memory Telemetry & Verification (`parvault` v0.4.0)
+# Empirical Benchmarks, Memory Telemetry & Verification (`parvault` v0.5.0-M2)
 
-All measurements below are produced directly by the repository's reproducible harnesses (`parvault-bench`, `parvault-gateway`, `parvault-fuse`, `parvault-seed`, and `scripts/docker_acceptance_gate.sh`) with zero simulated sleeps or synthetic numbers, reading live Linux kernel `/proc/self/status` (`VmRSS` & `VmHWM`), `CLOCK_PROCESS_CPUTIME_ID`, and cgroup memory counters alongside wall-clock throughput.
+All measurements below are produced directly by the repository's reproducible harnesses (`parvault-bench`, `parvault gateway`, `parvault-fuse`, `parvault-seed`, and `scripts/docker_acceptance_gate.sh`) with zero simulated sleeps or synthetic numbers, reading live Linux kernel `/proc/self/status` (`VmRSS` & `VmHWM`), `CLOCK_PROCESS_CPUTIME_ID`, and cgroup memory counters alongside wall-clock throughput.
 
 ---
 
@@ -15,15 +15,15 @@ Measured via `cargo run --release --bin parvault-bench -- --profile router-soc r
 
 ---
 
-## 2. Zero-Copy `parvault-gateway` (`SCM_RIGHTS` `memfd`) & `parvault-fuse` Telemetry
+## 2. Zero-Copy `parvault` Socket Gateway (`SCM_RIGHTS` Sealed `memfd` + `SO_PEERCRED`) & `parvault-fuse` Telemetry
 
-Measured against a live `parvault-gateway` Unix Domain Socket listener and `parvault-fuse` lazy VFS client:
+Measured against a live `parvault` Unix Domain Socket listener (`/var/run/parvault.sock`) and `parvault-fuse` lazy VFS client:
 
 | Harness / Pipeline | Payload / Configuration | Latency / Throughput | Measured RSS / `VmHWM` |
 | :--- | :--- | :---: | :---: |
-| **`parvault-gateway ipc-roundtrip`** (`64 MiB`) | `1,280` shards via `memfd_create` + `SCM_RIGHTS` (`512 KiB` gateway stripes, `40`-lane `128 KiB`-stack pool) | **`12.13 ms` TTFB** (`64 KiB` range)<br/>`1,141.21 ms` upload (`56.08 MiB/s`)<br/>`736.03 ms` restore (`86.95 MiB/s`) | Gateway `VmHWM`: **`10.98 MiB`** (`11,240 KiB`)<br/>Client `VmRSS`: **`6.59 MiB`** (`6,905,856 B`) |
-| **`parvault-gateway self-test`** (`static-musl`) | `2 MiB` zero-copy `memfd` `SCM_RIGHTS` round-trip | Bit-for-bit SHA-256 verified | **`7.31 MiB`** RSS (`10.50 MiB` glibc) |
-| **`parvault-fuse self-test`** | Lazy byte-range hydration over UDS + `2 MiB` bounded LRU block cache (`1` eviction) | **`14.59 ms` TTFB** (`19.04 ms` `musl`, `< 50 ms`) | Bounded `2,097,152 B` cache |
+| **`parvault gateway ipc-roundtrip`** (`64 MiB`) | `1,280` shards via `memfd_create` + `SCM_RIGHTS` (`512 KiB` gateway stripes, `40`-lane `128 KiB`-stack pool) | **`12.13 ms` TTFB** (`64 KiB` range)<br/>`1,141.21 ms` upload (`56.08 MiB/s`)<br/>`736.03 ms` restore (`86.95 MiB/s`) | Gateway `VmHWM`: **`10.98 MiB`** (`11,240 KiB`)<br/>Client `VmRSS`: **`6.59 MiB`** (`6,905,856 B`) |
+| **`parvault gateway self-test`** (`static-musl`) | `2 MiB` zero-copy sealed `memfd` (`F_ADD_SEALS`) + `SCM_RIGHTS` + `SO_PEERCRED` round-trip | Bit-for-bit SHA-256 verified | **`8.98 MiB`** RSS (`12.93 MiB` glibc) |
+| **`parvault-fuse self-test`** | Lazy byte-range hydration over UDS + `2 MiB` bounded LRU block cache (`1` eviction) | **`13.06 ms` TTFB** (`20.14 ms` `musl`, `< 50 ms`) | Bounded `2,097,152 B` cache |
 | **`parvault-seed start --no-fs`** | `--mode public-bootstrap --no-fs --in-memory-mb 16` | Live `Noise_XX + Yamux` TCP listener | **`0` files / `0` dirs** created on disk |
 
 ---
@@ -47,29 +47,27 @@ Measured against a live `parvault-gateway` Unix Domain Socket listener and `parv
 
 ---
 
-## 4. Static `musl` Binary & Container Footprint (`v0.4.0`)
+## 4. Static `musl` Binary & Container Footprint (`v0.5.0-M2` Single-Daemon Gateway)
 
-Built with `--profile soc` (`opt-level = "z"`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`) and stripped via `strip` / `aarch64-linux-gnu-strip`:
+Built with `--profile soc` (`opt-level = "z"`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`). Folding `parvault-gateway` + `parvault token` + `SO_PEERCRED` + `F_ADD_SEALS` directly into `parvault` added only `+131 KiB` on ARM64 while eliminating the separate `3.07 MiB` (`3,215,952 B`) `parvault-gateway` binary:
 
 | Artifact / Target | Profile | Exact Bytes | Stripped Size | Notes |
 | :--- | :---: | :---: | :---: | :--- |
-| `parvault` (`aarch64-unknown-linux-musl`) | `--profile soc` | `6,179,072 B` | **`5.89 MiB`** | Zero dynamic library dependencies; full ARM64 daemon & CLI |
+| `parvault` (`aarch64-unknown-linux-musl`) | `--profile soc` | `6,310,768 B` | **`6.02 MiB`** | Zero dynamic deps; full ARM64 P2P daemon, UDS gateway & `token` CLI |
 | `parvault-seed` (`aarch64-unknown-linux-musl`) | `--profile soc` | `4,404,584 B` | **`4.20 MiB`** | Headless ARM64 gateway / RPi seed server (supports `--no-fs`) |
-| `parvault-gateway` (`aarch64-unknown-linux-musl`) | `--profile soc` | `3,215,952 B` | **`3.07 MiB`** | Canonical ARM64 UDS `SCM_RIGHTS` + 40-lane `libp2p` CPE gateway |
-| `parvault-fuse` (`aarch64-unknown-linux-musl`) | `--profile soc` | `3,019,280 B` | **`2.88 MiB`** | Pure-Rust ARM64 `/dev/fuse` (`ABI 7.31`) + WebDAV lazy VFS client |
-| `parvault` (`x86_64-unknown-linux-musl`) | `--profile soc` | `7,887,656 B` | **`7.52 MiB`** | Static `x86_64` client & folder-sync daemon |
-| `parvault-seed` (`x86_64-unknown-linux-musl`) | `--profile soc` | `5,613,480 B` | **`5.35 MiB`** | Static `x86_64` headless seed & bootstrap server |
-| `parvault-gateway` (`x86_64-unknown-linux-musl`) | `--profile soc` | `3,986,536 B` | **`3.80 MiB`** | Static `x86_64` UDS `SCM_RIGHTS` + 40-lane `libp2p` gateway |
-| `parvault-fuse` (`x86_64-unknown-linux-musl`) | `--profile soc` | `3,793,960 B` | **`3.62 MiB`** | Static `x86_64` `/dev/fuse` + HTTP `Range` / WebDAV lazy VFS client |
+| `parvault-fuse` (`aarch64-unknown-linux-musl`) | `--profile soc` | `3,084,816 B` | **`2.94 MiB`** | Pure-Rust ARM64 `/dev/fuse` (`ABI 7.31`) + WebDAV reference plugin |
+| `parvault` (`x86_64-unknown-linux-musl`) | `--profile soc` | `8,064,424 B` | **`7.69 MiB`** | Static `x86_64` P2P daemon, UDS gateway, `token` CLI & folder sync |
+| `parvault-seed` (`x86_64-unknown-linux-musl`) | `--profile soc` | `5,609,384 B` | **`5.35 MiB`** | Static `x86_64` headless seed & bootstrap server |
+| `parvault-fuse` (`x86_64-unknown-linux-musl`) | `--profile soc` | `3,802,152 B` | **`3.63 MiB`** | Static `x86_64` `/dev/fuse` + HTTP `Range` / WebDAV reference plugin |
 | `parvault:router-soc` (`deploy/Dockerfile.router-soc`) | `FROM scratch` | — | **`6.13 MB` compressed** (`19.6 MB` unpacked) | Verified inside `--memory=48m --memory-swap=48m` cgroup at **`8.63 MiB`** live RSS (`0` OOM kills) |
 
 ---
 
-## 5. Formal Verification & Automated Test Summary (`v0.4.0`)
+## 5. Formal Verification & Automated Test Summary (`v0.5.0-M2`)
 
-- **Kani Rust Bounded Model Checking (`cargo kani`)**: **`15 / 15` symbolic harnesses verified (`0` failures)** across `src/kani_proofs.rs` (`13` harnesses including `proof_pinned_ring_capacity_invariant` and `proof_fuse_header_parser_no_panic`), `src/crypto/aes.rs` (`1`), and `src/sharding/reed_solomon.rs` (`1`).
+- **Kani Rust Bounded Model Checking (`cargo kani`)**: **`16 / 16` symbolic harnesses verified (`0` failures)** across `src/kani_proofs.rs` (`13` harnesses including `proof_pinned_ring_capacity_invariant` and `proof_fuse_header_parser_no_panic`), `src/capabilities.rs` (`1`: `proof_macaroon_peer_uid_and_compact_roundtrip`), `src/crypto/aes.rs` (`1`), and `src/sharding/reed_solomon.rs` (`1`).
 - **TLA+ TLC Model Checking (`specs/*.tla`)**: **`7 / 7` protocol specifications verified (`0` errors)** across `17,054` generated states (`4,467` distinct states: `ParVaultProtocol` `800`, `ParVaultConfidentialityAndTrust` `944`, `ParVaultAnonymity` `861`, `ParVaultPostQuantum` `927`, `ParVaultBootstrapAndEarnedTier` `360`, `ParVaultLiteClientAndSeedFailover` `95`, `ParVaultZeroKeyAdminAndQuorum` `480`).
-- **Automated Release Test Suite (`cargo test --release`)**: **`122 / 122` tests passing (`0` failures)** across `45` unit tests and `77` integration, live `libp2p`, Stateright, TLA+ TLC, zero-copy `memfd` IPC, VFS, and Byzantine red-team tests.
+- **Automated Release Test Suite (`cargo test --release`)**: **`128 / 128` tests passing (`0` failures)** across `47` unit tests and `81` integration, live `libp2p`, Stateright, TLA+ TLC, `GatewayBus` (`InProcess` & `UnixSocket`), sealed `memfd` IPC, `SO_PEERCRED` UID enforcement, VFS, and Byzantine red-team tests.
 
 ---
 
@@ -82,11 +80,11 @@ cargo run --release --bin parvault-bench -- --profile router-soc run --payload-m
 # 2. Run the full multi-profile streaming + PQC + Reed-Solomon benchmark suite
 cargo run --release --bin parvault-bench -- run --payload-mib 64
 
-# 3. Run zero-copy UDS memfd gateway and lazy VFS self-tests
-cargo run --release --bin parvault-gateway -- self-test
+# 3. Run zero-copy UDS sealed memfd gateway and lazy VFS self-tests
+cargo run --release --bin parvault -- gateway self-test
 cargo run --release --bin parvault-fuse -- self-test
 
-# 4. Run all 15 Kani symbolic harnesses + all 7 TLA+ TLC formal specifications
+# 4. Run all 16 Kani symbolic harnesses + all 7 TLA+ TLC formal specifications
 bash scripts/verify_formal_proofs.sh
 
 # 5. Run the 8-profile degraded network & Byzantine poisoner matrix

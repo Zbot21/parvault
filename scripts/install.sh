@@ -1,11 +1,11 @@
 #!/usr/bin/env sh
-# ParVault (parvault, parvault-seed, parvault-gateway, parvault-fuse) Static Binary Installer
+# ParVault (parvault, parvault-seed, parvault-fuse) Static Binary Installer
 set -eu
 
 REPO="${PARVAULT_REPO:-Zbot21/parvault}"
 INSTALL_DIR="${PARVAULT_INSTALL_DIR:-/usr/local/bin}"
 VERSION="${PARVAULT_VERSION:-latest}"
-BINS="${PARVAULT_BINS:-parvault parvault-seed parvault-gateway parvault-fuse}"
+BINS="${PARVAULT_BINS:-parvault parvault-seed parvault-fuse}"
 
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -48,7 +48,10 @@ echo "==> Verifying SHA256SUMS ..."
 echo "==> Running built-in cryptographic, IPC & VFS self-tests ..."
 for bin in $BINS; do
   case "$bin" in
-    parvault-seed|parvault-gateway|parvault-fuse)
+    parvault)
+      "${TMP_DIR}/${bin}" gateway self-test
+      ;;
+    parvault-seed|parvault-fuse)
       "${TMP_DIR}/${bin}" self-test
       ;;
   esac

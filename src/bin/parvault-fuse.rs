@@ -1,15 +1,20 @@
-//! `parvault-fuse` — Lazy-Streaming Virtual File System Client for `parvault-gateway`
-//! (`/var/run/parvault.sock`).
+//! `parvault-fuse` — Canonical Open-Source Reference Plugin & Lazy-Streaming Virtual File System
+//! Client for `parvault` (`/var/run/parvault.sock`, `docs/GATEWAY_SOCKET_PROTOCOL.md`).
+//!
+//! Packaged as a standalone static-`musl` plugin binary (zero C `libfuse3` dependency) so it can
+//! run under a dedicated unprivileged UID (`parvault up --strict-plugins --allow-peer-uid <UID>`)
+//! while isolating `/dev/fuse`, `fusermount3`, and LAN HTTP/WebDAV ports from `MasterKey` memory.
 //!
 //! Supports three operational modes over the exact same lazy `FetchRange` + LRU block cache engine:
 //! 1. `mount-fd`: Pure-Rust Linux `/dev/fuse` kernel VFS loop (`ABI 7.31`, zero C `libfuse` dependency).
 //! 2. `webdav`: Unprivileged HTTP `Range` (`206 Partial Content`) + WebDAV (`PROPFIND`) LAN drive
 //!    for locked-down `prplOS` / `RDK-B` LXC containers lacking `/dev/fuse`.
-//! 3. `sync`: Userspace folder push/ingest over `/var/run/parvault.sock` via `memfd` `SCM_RIGHTS`.
+//! 3. `sync`: Userspace folder push/ingest over `/var/run/parvault.sock` via sealed `memfd` `SCM_RIGHTS`.
 
 #![forbid(unsafe_code)]
 
 use clap::{Parser, Subcommand};
+use parvault::capabilities::CapabilityMacaroon;
 use parvault::gateway::ipc::DEFAULT_IPC_SOCKET_PATH;
 use std::path::PathBuf;
 
@@ -17,10 +22,10 @@ use std::path::PathBuf;
 #[command(
     name = "parvault-fuse",
     version,
-    about = "ParVault Lazy-Streaming Virtual File System (/dev/fuse, HTTP-Range/WebDAV & Userspace Sync over /var/run/parvault.sock)"
+    about = "ParVault Canonical Reference Plugin: Lazy-Streaming VFS (/dev/fuse, HTTP-Range/WebDAV & Userspace Sync over /var/run/parvault.sock)"
 )]
 struct FuseCli {
-    /// Path to the `parvault-gateway` Unix Domain Socket.
+    /// Path to the `parvault` Unix Domain Socket (`parvault up --ipc-socket ...`).
     #[arg(long, default_value = DEFAULT_IPC_SOCKET_PATH, global = true)]
     socket: PathBuf,
 
@@ -31,6 +36,10 @@ struct FuseCli {
     /// Maximum local LRU disk cache capacity in MiB.
     #[arg(long, default_value_t = 64, global = true)]
     cache_mib: u64,
+
+    /// Optional `PARVAULT-MAC-V1:` attenuated capability macaroon presented on lazy `FetchRange` reads.
+    #[arg(long, global = true, value_name = "PARVAULT-MAC-V1:...")]
+    macaroon: Option<String>,
 
     #[command(subcommand)]
     command: FuseCommand,
@@ -52,11 +61,11 @@ enum FuseCommand {
         /// TCP address to bind (e.g. `127.0.0.1:4918` or `0.0.0.0:4918`).
         #[arg(long, default_value = "127.0.0.1:4918")]
         listen: String,
-        /// Optional local directory to ingest into `parvault-gateway` and expose lazily.
+        /// Optional local directory to ingest into `parvault` and expose lazily.
         #[arg(long)]
         seed_dir: Option<PathBuf>,
     },
-    /// Ingest a local folder into `parvault-gateway` via zero-copy `memfd` `SCM_RIGHTS`.
+    /// Ingest a local folder into `parvault` via sealed zero-copy `memfd` `SCM_RIGHTS`.
     Sync {
         /// Local directory to ingest.
         #[arg(long)]
@@ -68,10 +77,22 @@ enum FuseCommand {
 
 fn main() -> anyhow::Result<()> {
     let cli = FuseCli::parse();
+    let default_macaroon = match cli
+        .macaroon
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => Some(
+            CapabilityMacaroon::from_compact_token(raw)
+                .map_err(|e| anyhow::anyhow!("invalid --macaroon token: {e}"))?,
+        ),
+        None => None,
+    };
 
     #[cfg(not(unix))]
     {
-        let _ = &cli;
+        let _ = (&cli, &default_macaroon);
         anyhow::bail!("parvault-fuse requires Unix Domain Sockets (Linux / Unix)");
     }
 
@@ -94,7 +115,8 @@ fn main() -> anyhow::Result<()> {
                 if fuse_fd < 0 {
                     anyhow::bail!("invalid --fuse-fd {fuse_fd}");
                 }
-                let vfs = VirtualVaultFs::new(&cli.socket, &cli.cache_dir, cache_bytes)?;
+                let vfs = VirtualVaultFs::new(&cli.socket, &cli.cache_dir, cache_bytes)?
+                    .with_default_macaroon(default_macaroon);
                 if let Some(dir) = seed_dir {
                     let count = vfs.ingest_local_directory(&dir)?;
                     eprintln!(
@@ -106,7 +128,8 @@ fn main() -> anyhow::Result<()> {
                 vfs.serve_fuse_fd_blocking(dev_file)?;
             }
             FuseCommand::Webdav { listen, seed_dir } => {
-                let vfs = VirtualVaultFs::new(&cli.socket, &cli.cache_dir, cache_bytes)?;
+                let vfs = VirtualVaultFs::new(&cli.socket, &cli.cache_dir, cache_bytes)?
+                    .with_default_macaroon(default_macaroon);
                 if let Some(dir) = seed_dir {
                     let count = vfs.ingest_local_directory(&dir)?;
                     println!(
@@ -121,7 +144,8 @@ fn main() -> anyhow::Result<()> {
                 vfs.serve_webdav_blocking(&listen)?;
             }
             FuseCommand::Sync { folder } => {
-                let vfs = VirtualVaultFs::new(&cli.socket, &cli.cache_dir, cache_bytes)?;
+                let vfs = VirtualVaultFs::new(&cli.socket, &cli.cache_dir, cache_bytes)?
+                    .with_default_macaroon(default_macaroon);
                 let count = vfs.ingest_local_directory(&folder)?;
                 println!(
                     "[parvault-fuse] synced {count} file(s) from {} over {}",
@@ -152,6 +176,7 @@ fn main() -> anyhow::Result<()> {
                 )?;
                 let mut srv = GatewayIpcServer::new(&sock, store, MasterKey::generate())
                     .with_profile(HardwareProfile::RouterSoc)
+                    .with_require_sealed_ingest_memfd(true)
                     .spawn()?;
 
                 let client = GatewayIpcClient::new(&sock);
@@ -160,7 +185,7 @@ fn main() -> anyhow::Result<()> {
                 let payload: Vec<u8> = (0..(4 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
                 f.write_all(&payload)?;
                 f.seek(SeekFrom::Start(0))?;
-                let manifest = client.store_memfd(
+                let manifest = client.store_sealed_memfd(
                     f.as_raw_fd(),
                     payload.len() as u64,
                     RetentionPolicy::Persistent,

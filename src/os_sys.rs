@@ -451,6 +451,142 @@ pub fn bind_reusable_udp_v4(port: u16) -> io::Result<UdpSocket> {
     }
 }
 
+/// Verified peer process credentials extracted from a connected Unix Domain Socket via
+/// Linux `SO_PEERCRED` (`getsockopt(2)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerUcred {
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// Queries kernel-verified peer credentials (`pid`, `uid`, `gid`) of a connected Unix Domain
+/// Socket via `getsockopt(SOL_SOCKET, SO_PEERCRED)` on Linux.
+#[allow(unsafe_code)]
+pub fn peer_socket_ucred(sock_fd: BorrowedFd<'_>) -> io::Result<PeerUcred> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut ucred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut optlen = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY:
+        // 1. `sock_fd` is a live `BorrowedFd<'_>` valid across the synchronous `getsockopt` call.
+        // 2. `ucred` is stack-allocated and fully initialized, and `optlen` is initialized to
+        //    `size_of::<libc::ucred>()`.
+        // 3. Both `rc == 0` and `optlen == size_of::<libc::ucred>()` are checked before reading
+        //    kernel-populated credential fields.
+        let rc = unsafe {
+            libc::getsockopt(
+                sock_fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut ucred as *mut libc::ucred).cast(),
+                &mut optlen,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if (optlen as usize) != std::mem::size_of::<libc::ucred>() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected SO_PEERCRED optlen {optlen}"),
+            ));
+        }
+        Ok(PeerUcred {
+            pid: ucred.pid.max(0) as u32,
+            uid: ucred.uid,
+            gid: ucred.gid,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = sock_fd;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "SO_PEERCRED is only supported on Linux",
+        ))
+    }
+}
+
+/// Permanently seals an anonymous Linux `memfd` (`MFD_ALLOW_SEALING`) with
+/// `F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE` so neither the sender nor any other
+/// holder can mutate or resize the shared-memory payload after ingestion (anti-TOCTOU guarantee).
+#[allow(unsafe_code)]
+pub fn seal_memfd_immutable(fd: BorrowedFd<'_>) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let seals: libc::c_int =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        // SAFETY: `fd` is a live `BorrowedFd<'_>` valid for the duration of `fcntl(F_ADD_SEALS)`.
+        // `F_ADD_SEALS` consumes a scalar `c_int` seal mask and dereferences no pointers.
+        let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, seals) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = fd;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "memfd sealing is only supported on Linux",
+        ))
+    }
+}
+
+/// Returns `true` iff `fd` is a Linux `memfd` carrying at least `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE`.
+#[allow(unsafe_code)]
+pub fn has_immutable_memfd_seals(fd: BorrowedFd<'_>) -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let required: libc::c_int = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        // SAFETY: `fd` is a live `BorrowedFd<'_>` valid for the duration of `fcntl(F_GET_SEALS)`.
+        // `F_GET_SEALS` takes no additional arguments and dereferences no pointers.
+        let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
+        if seals < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((seals & required) == required)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = fd;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "memfd sealing inspection is only supported on Linux",
+        ))
+    }
+}
+
+/// Safely validates and duplicates an open file descriptor via `fcntl(F_DUPFD_CLOEXEC, 0)` into a
+/// fresh [`OwnedFd`] sharing the same underlying kernel open file description (mirroring
+/// `SCM_RIGHTS` descriptor duplication for `GatewayBus::InProcess` without closing the caller's FD).
+#[allow(unsafe_code)]
+pub fn dup_fd_cloexec(raw_fd: RawFd) -> io::Result<OwnedFd> {
+    if raw_fd < 0 {
+        return Err(io::Error::from_raw_os_error(libc::EBADF));
+    }
+    // SAFETY: `fcntl(raw_fd, F_DUPFD_CLOEXEC, 0)` atomically validates that `raw_fd` is currently
+    // open in this process's descriptor table (`EBADF` if closed/invalid) and allocates a fresh,
+    // unaliased file descriptor with `FD_CLOEXEC` set. On return `>= 0`, `OwnedFd::from_raw_fd`
+    // takes exclusive ownership of the newly created duplicate descriptor.
+    unsafe {
+        let dup_fd = libc::fcntl(raw_fd, libc::F_DUPFD_CLOEXEC, 0);
+        if dup_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(OwnedFd::from_raw_fd(dup_fd))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,6 +635,7 @@ mod tests {
 
         // Negative FD must fail cleanly with EBADF:
         assert!(sendmsg_scm_rights(s1.as_fd(), &[0; 4], Some(-1)).is_err());
+        assert!(dup_fd_cloexec(-1).is_err());
         // Non-char-device / invalid FD rejected by adopt_fuse_dev_fd:
         assert!(adopt_fuse_dev_fd(-1).is_err());
         assert!(adopt_fuse_dev_fd(f_out.as_raw_fd()).is_err());
@@ -506,5 +643,58 @@ mod tests {
         // Reusable UDP port 0 bind succeeds:
         let sock = bind_reusable_udp_v4(0).expect("bind_reusable_udp_v4");
         assert!(sock.local_addr().unwrap().port() > 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_memfd_immutable_seals_and_peer_socket_ucred() {
+        // (a) Verify memfd sealing: false before seal, true after seal, and subsequent writes/resizes fail with EPERM.
+        let mfd = create_memfd("seal-test", 32).expect("create_memfd");
+        let file = File::from(mfd);
+        pwrite_all(&file, 0, b"immutable-zero-copy-payload-0001").expect("initial pwrite");
+        assert!(
+            !has_immutable_memfd_seals(file.as_fd()).expect("has_immutable_memfd_seals pre"),
+            "fresh memfd must not report immutable seals before seal_memfd_immutable"
+        );
+
+        let dup = dup_fd_cloexec(file.as_raw_fd()).expect("dup_fd_cloexec");
+        seal_memfd_immutable(dup.as_fd()).expect("seal_memfd_immutable");
+        drop(dup);
+
+        assert!(
+            has_immutable_memfd_seals(file.as_fd()).expect("has_immutable_memfd_seals post"),
+            "sealed memfd must report immutable seals across shared open file description"
+        );
+
+        let write_err =
+            pwrite_all(&file, 0, b"tamper").expect_err("pwrite after F_SEAL_WRITE must fail");
+        assert_eq!(write_err.raw_os_error(), Some(libc::EPERM));
+
+        let grow_err = file
+            .set_len(64)
+            .expect_err("set_len grow after F_SEAL_GROW must fail");
+        assert_eq!(grow_err.raw_os_error(), Some(libc::EPERM));
+
+        let shrink_err = file
+            .set_len(8)
+            .expect_err("set_len shrink after F_SEAL_SHRINK must fail");
+        assert_eq!(shrink_err.raw_os_error(), Some(libc::EPERM));
+
+        // Reads still succeed cleanly after immutable sealing:
+        let mut verify_buf = [0u8; 32];
+        assert_eq!(
+            pread_full_or_eof(&file, 0, &mut verify_buf).expect("pread sealed"),
+            32
+        );
+        assert_eq!(&verify_buf, b"immutable-zero-copy-payload-0001");
+
+        // (b) Verify SO_PEERCRED over a real UnixStream::pair() matches geteuid() / getegid() / pid.
+        let (a, b) = StdUnixStream::pair().expect("UnixStream::pair");
+        let cred_a = peer_socket_ucred(a.as_fd()).expect("peer_socket_ucred a");
+        let cred_b = peer_socket_ucred(b.as_fd()).expect("peer_socket_ucred b");
+        assert_eq!(cred_a.uid, geteuid());
+        assert_eq!(cred_a.gid, getegid());
+        assert_eq!(cred_a.pid, std::process::id());
+        assert_eq!(cred_a, cred_b);
     }
 }

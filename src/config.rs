@@ -417,6 +417,26 @@ pub enum Commands {
         /// Optional Unix Domain Socket path for the Zero-Copy IPC Gateway (e.g. `/var/run/parvault.sock`).
         #[arg(long, value_name = "SOCK_PATH")]
         ipc_socket: Option<PathBuf>,
+
+        /// Explicitly disable binding any Unix Domain Socket (`GatewayBus::InProcess` only; incompatible with `--ipc-socket`).
+        #[arg(long, default_value_t = false)]
+        no_socket: bool,
+
+        /// Reject any Unix socket plugin client whose kernel `SO_PEERCRED` UID is not in `--allow-peer-uid`.
+        #[arg(long, default_value_t = false)]
+        strict_plugins: bool,
+
+        /// Comma-delimited list of POSIX UIDs authorized to connect when `--strict-plugins` is active.
+        #[arg(long, value_delimiter = ',', value_name = "UID")]
+        allow_peer_uid: Vec<u32>,
+
+        /// Require immutable Linux `memfd` seals (`F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW`) on all `StorePayload` calls.
+        #[arg(long, default_value_t = false)]
+        require_sealed_memfd: bool,
+
+        /// Optional 64-character hex 32-byte `K_macaroon_root` key enforcing `< 1 ms` in-RAM capability verification.
+        #[arg(long, value_name = "64-HEX")]
+        macaroon_root_key_hex: Option<String>,
     },
     /// Evict a bad actor or illegal content (0x00 zero-wipe + unlink + keyed HMAC ingress firewall, zero plaintext IPs on disk — ADR-19).
     Evict {
@@ -650,6 +670,19 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         keep_local: bool,
     },
+    /// Mint, offline-attenuate, and inspect `PARVAULT-MAC-V1:` capability macaroons (`ADR-32`).
+    Token {
+        #[command(subcommand)]
+        action: crate::gateway::TokenAction,
+    },
+    /// Zero-copy Unix Domain Socket IPC gateway & 40-lane outbound mesh router (`serve`, `health`, `ipc-roundtrip`, `self-test`).
+    Gateway {
+        #[command(flatten)]
+        opts: crate::gateway::GatewayCommonOpts,
+
+        #[command(subcommand)]
+        action: Option<crate::gateway::GatewayAction>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -671,6 +704,26 @@ pub enum DaemonAction {
         /// Optional Unix Domain Socket path for the Zero-Copy IPC Gateway (e.g. `/var/run/parvault.sock`).
         #[arg(long, value_name = "SOCK_PATH")]
         ipc_socket: Option<PathBuf>,
+
+        /// Explicitly disable binding any Unix Domain Socket (`GatewayBus::InProcess` only; incompatible with `--ipc-socket`).
+        #[arg(long, default_value_t = false)]
+        no_socket: bool,
+
+        /// Reject any Unix socket plugin client whose kernel `SO_PEERCRED` UID is not in `--allow-peer-uid`.
+        #[arg(long, default_value_t = false)]
+        strict_plugins: bool,
+
+        /// Comma-delimited list of POSIX UIDs authorized to connect when `--strict-plugins` is active.
+        #[arg(long, value_delimiter = ',', value_name = "UID")]
+        allow_peer_uid: Vec<u32>,
+
+        /// Require immutable Linux `memfd` seals (`F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW`) on all `StorePayload` calls.
+        #[arg(long, default_value_t = false)]
+        require_sealed_memfd: bool,
+
+        /// Optional 64-character hex 32-byte `K_macaroon_root` key enforcing `< 1 ms` in-RAM capability verification.
+        #[arg(long, value_name = "64-HEX")]
+        macaroon_root_key_hex: Option<String>,
     },
 }
 
@@ -1437,5 +1490,34 @@ mod tests {
             NodeConfig::extract_ed25519_pubkey_from_peer_str(&maddr),
             Some(id.public_key_bytes())
         );
+
+        let tok_cli = Cli::try_parse_from([
+            "parvault",
+            "token",
+            "mint",
+            "--key-id",
+            "dvr-ring",
+            "--byte-range",
+            "0:65536",
+            "--read-only",
+            "--allow-peer-uid",
+            "1000",
+        ])
+        .expect("parse token mint");
+        assert!(matches!(tok_cli.command, Commands::Token { .. }));
+
+        let gw_cli = Cli::try_parse_from([
+            "parvault",
+            "--profile",
+            "router-soc",
+            "gateway",
+            "--strict-plugins",
+            "--allow-peer-uid",
+            "1000,1001",
+            "--require-sealed-memfd",
+            "serve",
+        ])
+        .expect("parse gateway serve");
+        assert!(matches!(gw_cli.command, Commands::Gateway { .. }));
     }
 }

@@ -18,7 +18,7 @@ However, embedding modern distributed storage on consumer and enterprise router 
 
 `parvault` v0.4.0 solves all three constraints:
 - **`--profile router-soc`:** Enforces **1 MiB streaming Reed-Solomon stripes** (`ROUTER_SOC_STRIPE_SIZE_BYTES = 1,048,576`), dropping transient peak heap allocations (`VmHWM`) from `57.91 MiB` to **`9.72–9.74 MiB`** (`< 16 MiB`), operating safely inside a `32–48 MiB` container or cgroup ceiling while retaining 100% wire and manifest compatibility with desktop and NAS nodes.
-- **Static Zero-Dependency `musl` & `FROM scratch` Containers:** Stripped standalone binaries (`2.88–5.89 MiB` ARM64, `3.62–7.52 MiB` x86_64 across `parvault`, `parvault-seed`, `parvault-gateway`, and `parvault-fuse`) and minimal `FROM scratch` Docker/OCI images under 20 MiB.
+- **Static Zero-Dependency `musl` & `FROM scratch` Containers:** Stripped standalone binaries (`2.94–6.02 MiB` ARM64, `3.63–7.69 MiB` x86_64 across `parvault`, `parvault-seed`, and `parvault-fuse` — with the zero-copy Unix socket gateway folded directly into `parvault`) and minimal `FROM scratch` Docker/OCI images under 20 MiB.
 - **Cryptographic Zero-IP LAN Discovery & 4-Word SAS Pairing:** Fully automated LAN beaconing over UDP port `4009` with Ed25519-signed identity binding, 4-word BIP-39 pairing codes, and DHCP self-healing.
 - **Turnkey Appliance Mode (`parvault up`):** Launches P2P daemon, signed discovery beacon, embedded status webserver, and background folder sync with a single command.
 
@@ -56,10 +56,9 @@ flowchart TD
 
 ### Flash / Disk Footprint
 - **Static `musl` stripped binaries (`soc` profile `opt-level = "z"`, `lto = "fat"`):**
-  - `parvault`: **`5.89 MiB`** (`6,179,072 B` `aarch64`) / **`7.52 MiB`** (`7,887,656 B` `x86_64`)
-  - `parvault-seed`: **`4.20 MiB`** (`4,404,584 B` `aarch64`) / **`5.35 MiB`** (`5,613,480 B` `x86_64`)
-  - `parvault-gateway`: **`3.07 MiB`** (`3,215,952 B` `aarch64`) / **`3.80 MiB`** (`3,986,536 B` `x86_64`)
-  - `parvault-fuse`: **`2.88 MiB`** (`3,019,280 B` `aarch64`) / **`3.62 MiB`** (`3,793,960 B` `x86_64`)
+  - `parvault`: **`6.02 MiB`** (`6,310,768 B` `aarch64`) / **`7.69 MiB`** (`8,064,424 B` `x86_64`) — includes built-in `parvault up --ipc-socket`, `parvault gateway`, and `parvault token`
+  - `parvault-seed`: **`4.20 MiB`** (`4,404,584 B` `aarch64`) / **`5.35 MiB`** (`5,609,384 B` `x86_64`)
+  - `parvault-fuse`: **`2.94 MiB`** (`3,084,816 B` `aarch64`) / **`3.63 MiB`** (`3,802,152 B` `x86_64`)
 - **OCI / Docker `FROM scratch` container image (`parvault:router-soc`):** **`19.6 MB`** total uncompressed disk usage (**`6.13 MB`** compressed content size, stripped binaries + `router.toml` configuration, 0 OS overhead).
 - **Minimum Free Disk Reserve (`min_free_disk_bytes`):**
   - `--profile router-soc`: `64 MiB` (`67,108,864` bytes), allowing deployment on small USB flash drives or flash partitions.

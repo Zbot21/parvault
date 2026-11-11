@@ -1,6 +1,6 @@
 # Security Architecture, Cryptographic Proofs & Formal Verification (`SECURITY_AND_CRYPTOGRAPHY.md`)
 
-This document details the mathematical, cryptographic, game-theoretic, and formal-verification foundations of **`parvault`** (`parvault`, `parvault-seed`, `parvault-gateway`, and `parvault-fuse`), covering the single-concern Architectural Decision Records [`ADR-01` through `ADR-31`](ADR.md) in [`docs/adr/`](adr/) and `v0.4.0` formal verification (`15` Kani Rust Bounded Model Checking symbolic harnesses + `7` TLA+ TLC specifications).
+This document details the mathematical, cryptographic, game-theoretic, and formal-verification foundations of **`parvault`** (`parvault`, `parvault-seed`, and `parvault-fuse`), covering the single-concern Architectural Decision Records [`ADR-01` through `ADR-32`](ADR.md) in [`docs/adr/`](adr/) and `v0.5.0` formal verification (`16` Kani Rust Bounded Model Checking symbolic harnesses + `7` TLA+ TLC specifications).
 
 ---
 
@@ -419,13 +419,14 @@ ValidSigners(Order) = ({issuer_pubkey} union {cosigner_k}) intersect TrustedCoun
 
 ---
 
-## 13. Zero-Copy `SCM_RIGHTS` UDS Gateway, `CapabilityMacaroon` Attenuation & `--no-fs` Seed Architecture (`v0.4.0`, `ADR-27` – `ADR-31`)
+## 13. Zero-Copy `SCM_RIGHTS` UDS `GatewayBus`, `memfd` Sealing, `SO_PEERCRED` `CapabilityMacaroon` Attenuation & `--no-fs` Seed Architecture (`ADR-27` – `ADR-32`)
 
-1. **Zero-Copy Unix Domain Socket Gateway (`src/gateway/`, `parvault-gateway`, [`ADR-27`](adr/ADR-27-zero-copy-uds-gateway-and-hedged-pool.md)):**
-   - Local companion daemons communicate with `parvault-gateway` over `/var/run/parvault.sock` (`0600` POSIX permissions) using length-bounded `bincode` control headers (`MAX_IPC_FRAME_BYTES = 16 MiB`) paired with Linux `memfd_create` file descriptors passed via `sendmsg` / `recvmsg` `SCM_RIGHTS`.
-   - `StorePayload`, `FetchPayload`, and `FetchRange` stream through fixed `1 MiB` (`RouterSoc`) stripes directly over the shared kernel `shmem` descriptor backed by a `40`-lane (`128 KiB`-stack) single-wave shard worker pool and `PinnedRingBudget<SLOTS>` — keeping `parvault-gateway` peak `VmHWM` at `10.98 MiB` (`< 16 MiB`) even while streaming `64–100+ MiB` payloads.
-2. **Stateless HMAC-Chained `CapabilityMacaroon` Attenuation (`src/capabilities.rs`, [`ADR-28`](adr/ADR-28-stateless-macaroon-capability-attenuation.md)):**
-   - Root capability tokens and offline caveat attenuations (`AllowedManifest`, `ByteRange { offset, length }`, `ExpiresAtUnixMs`, `ReadOnly`) chain via domain-separated `HMAC-SHA256` (rejecting all-zero root keys):
+1. **Single-Daemon Zero-Copy Unix Domain Socket & `GatewayBus` (`src/gateway/`, `parvault up --ipc-socket`, [`ADR-27`](adr/ADR-27-zero-copy-uds-gateway-and-hedged-pool.md), [`ADR-32`](adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md)):**
+   - Out-of-process plugins (`parvault-fuse`, `parvault-suite` daemons) communicate with `parvault up --ipc-socket /var/run/parvault.sock` (`0600` POSIX permissions) via `GatewayBus::UnixSocket` using length-bounded `bincode` control headers (`MAX_IPC_FRAME_BYTES = 16 MiB`) paired with Linux `memfd_create` file descriptors passed via `sendmsg` / `recvmsg` `SCM_RIGHTS`, while built-in callers use `GatewayBus::InProcess` (`--no-socket`).
+   - With `--require-sealed-memfd`, `StorePayload` verifies `F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW` (`fcntl(F_GET_SEALS)`) before hashing or encrypting a single byte, defeating shared-memory TOCTOU races. With `--strict-plugins --allow-peer-uid <UID>`, `GatewayIpcServer` inspects kernel `getsockopt(SO_PEERCRED)` at `accept()` time and drops unauthorized OS UIDs before deserializing any frame.
+   - `StorePayload`, `FetchPayload`, and `FetchRange` stream through fixed `1 MiB` (`RouterSoc`) stripes directly over the shared kernel `shmem` descriptor backed by a `40`-lane (`128 KiB`-stack) single-wave shard worker pool and `PinnedRingBudget<SLOTS>` — keeping gateway peak `VmHWM` at `10.98 MiB` (`< 16 MiB`) even while streaming `64–100+ MiB` payloads.
+2. **Stateless HMAC-Chained `CapabilityMacaroon` Attenuation (`src/capabilities.rs`, `parvault token`, [`ADR-28`](adr/ADR-28-stateless-macaroon-capability-attenuation.md), [`ADR-32`](adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md)):**
+   - Root capability tokens (`PARVAULT-MAC-V1:`) and offline caveat attenuations (`AllowedManifest`, `ByteRange { offset, length }`, `ExpiresAtUnixMs`, `ReadOnly`, `AllowedPeerUid(u32)`) chain via domain-separated `HMAC-SHA256` (rejecting all-zero root keys):
 
 ```text
 tag_0 = HMAC-SHA256(K_root,    "parvault-macaroon-root-v1:"   || nonce || gateway_id)

@@ -45,15 +45,15 @@ jobs:
             sudo rm -rf /var/lib/apt/lists/*
             sleep $((attempt * 3))
           done
-      - name: Build static parvault, parvault-seed, parvault-gateway, and parvault-fuse binaries
+      - name: Build static parvault, parvault-seed, and parvault-fuse binaries
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
           fi
           cargo build --profile soc --target ${{ matrix.target }} \
-            --bin parvault --bin parvault-seed --bin parvault-gateway --bin parvault-fuse
+            --bin parvault --bin parvault-seed --bin parvault-fuse
           mkdir -p release-dist
-          for bin in parvault parvault-seed parvault-gateway parvault-fuse; do
+          for bin in parvault parvault-seed parvault-fuse; do
             cp "target/${{ matrix.target }}/soc/${bin}" "release-dist/${bin}-${{ matrix.target }}"
             ${{ matrix.strip }} "release-dist/${bin}-${{ matrix.target }}"
           done
@@ -78,16 +78,15 @@ jobs:
         run: |
           tar -czvf artifacts/parvault-router-soc-bundle.tar.gz -C deploy/router-soc parvault-router.toml parvault-nas.procd -C ../ prplos-lxc-manifest.json
           cd artifacts
-          chmod +x parvault-x86_64-* parvault-aarch64-* parvault-seed-* parvault-gateway-* parvault-fuse-*
+          chmod +x parvault-x86_64-* parvault-aarch64-* parvault-seed-* parvault-fuse-*
           echo "=== Measured Stripped Binary Sizes ==="
-          ls -lh parvault-x86_64-* parvault-aarch64-* parvault-seed-* parvault-gateway-* parvault-fuse-*
+          ls -lh parvault-x86_64-* parvault-aarch64-* parvault-seed-* parvault-fuse-*
           ./parvault-seed-x86_64-unknown-linux-musl self-test
-          ./parvault-gateway-x86_64-unknown-linux-musl self-test
+          ./parvault-x86_64-unknown-linux-musl gateway self-test
           ./parvault-fuse-x86_64-unknown-linux-musl self-test
           sha256sum \
             parvault-x86_64-unknown-linux-musl parvault-aarch64-unknown-linux-musl \
             parvault-seed-x86_64-unknown-linux-musl parvault-seed-aarch64-unknown-linux-musl \
-            parvault-gateway-x86_64-unknown-linux-musl parvault-gateway-aarch64-unknown-linux-musl \
             parvault-fuse-x86_64-unknown-linux-musl parvault-fuse-aarch64-unknown-linux-musl \
             parvault-router-soc-bundle.tar.gz > SHA256SUMS
           cat SHA256SUMS
@@ -98,7 +97,6 @@ jobs:
             artifacts/parvault-x86_64-unknown-linux-musl
             artifacts/parvault-aarch64-unknown-linux-musl
             artifacts/parvault-seed-*
-            artifacts/parvault-gateway-*
             artifacts/parvault-fuse-*
             artifacts/parvault-router-soc-bundle.tar.gz
             artifacts/SHA256SUMS

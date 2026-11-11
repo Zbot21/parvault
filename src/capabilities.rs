@@ -35,6 +35,20 @@ pub const MACAROON_CAVEAT_DOMAIN: &[u8] = b"parvault-macaroon-caveat-v1:";
 /// Domain separator for composite `Ed25519 + ML-DSA-65` [`GatewayIdentityStatement`] signatures.
 pub const GATEWAY_STATEMENT_DOMAIN: &[u8] = b"parvault-gateway-identity-statement-v1:";
 
+/// Compact shareable ASCII prefix for `CapabilityMacaroon` tokens (`ADR-28` / `ADR-32`).
+pub const COMPACT_MACAROON_PREFIX: &str = "PARVAULT-MAC-V1:";
+
+/// Binary wire format version byte inside `PARVAULT-MAC-V1:<hex>` compact tokens.
+pub const COMPACT_MACAROON_VERSION: u8 = 0x01;
+
+/// Minimum binary payload size of a compact `CapabilityMacaroon` (`0` caveats: `1 + 32 + 32 + 1 + 32`).
+pub const MIN_COMPACT_MACAROON_BYTES: usize = 98;
+
+/// Hard upper bound on binary payload bytes for a compact `CapabilityMacaroon`
+/// (`32` caveats × `33` max bytes + `98` fixed header/tag bytes = `1,154` bytes).
+pub const MAX_COMPACT_MACAROON_BYTES: usize =
+    MIN_COMPACT_MACAROON_BYTES + (MAX_MACAROON_CAVEATS * 33);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum CapabilityError {
     #[error("all-zero root Macaroon key is forbidden")]
@@ -45,10 +59,12 @@ pub enum CapabilityError {
     InvalidMacaroonTag,
     #[error("request rejected by Macaroon caveat policy")]
     CaveatRejected,
+    #[error("malformed compact Macaroon token encoding")]
+    MalformedCompactToken,
 }
 
 /// First-party zero-knowledge attenuation caveat chained onto a [`CapabilityMacaroon`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, Serialize, Deserialize)]
 pub enum Caveat {
     /// Restricts access exclusively to the specified 32-byte manifest Merkle root.
     AllowedManifest([u8; 32]),
@@ -58,6 +74,31 @@ pub enum Caveat {
     ExpiresAtUnixMs(u64),
     /// Prohibits write/mutation operations (`ctx.is_write` must be `false`).
     ReadOnly,
+    /// Restricts token presentation to a specific Linux `SO_PEERCRED` peer effective UID.
+    AllowedPeerUid(u32),
+}
+
+impl PartialEq for Caveat {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::AllowedManifest(a), Self::AllowedManifest(b)) => ct_eq_32(a, b),
+            (
+                Self::ByteRange {
+                    offset: o1,
+                    length: l1,
+                },
+                Self::ByteRange {
+                    offset: o2,
+                    length: l2,
+                },
+            ) => o1 == o2 && l1 == l2,
+            (Self::ExpiresAtUnixMs(a), Self::ExpiresAtUnixMs(b)) => a == b,
+            (Self::ReadOnly, Self::ReadOnly) => true,
+            (Self::AllowedPeerUid(a), Self::AllowedPeerUid(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// Zero-allocation request descriptor evaluated in RAM against a [`CapabilityMacaroon`].
@@ -68,6 +109,7 @@ pub struct AccessRequestContext {
     pub length: u64,
     pub is_write: bool,
     pub now_unix_ms: u64,
+    pub peer_uid: Option<u32>,
 }
 
 impl Caveat {
@@ -76,56 +118,126 @@ impl Caveat {
     pub const fn encode_stack(&self) -> ([u8; 33], usize) {
         let mut buf = [0u8; 33];
         match self {
-            Self::AllowedManifest(root) => {
-                buf[0] = 0x01;
-                let mut i = 0;
-                while i < 32 {
-                    buf[1 + i] = root[i];
-                    i += 1;
-                }
-                (buf, 33)
+            Self::AllowedManifest(r) => {
+                let [r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16, r17, r18, r19, r20, r21, r22, r23, r24, r25, r26, r27, r28, r29, r30, r31] =
+                    *r;
+                (
+                    [
+                        0x01, r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15,
+                        r16, r17, r18, r19, r20, r21, r22, r23, r24, r25, r26, r27, r28, r29, r30,
+                        r31,
+                    ],
+                    33,
+                )
             }
             Self::ByteRange { offset, length } => {
+                let [o0, o1, o2, o3, o4, o5, o6, o7] = offset.to_be_bytes();
+                let [l0, l1, l2, l3, l4, l5, l6, l7] = length.to_be_bytes();
                 buf[0] = 0x02;
-                let off_be = offset.to_be_bytes();
-                let len_be = length.to_be_bytes();
-                let mut i = 0;
-                while i < 8 {
-                    buf[1 + i] = off_be[i];
-                    buf[9 + i] = len_be[i];
-                    i += 1;
-                }
+                buf[1] = o0;
+                buf[2] = o1;
+                buf[3] = o2;
+                buf[4] = o3;
+                buf[5] = o4;
+                buf[6] = o5;
+                buf[7] = o6;
+                buf[8] = o7;
+                buf[9] = l0;
+                buf[10] = l1;
+                buf[11] = l2;
+                buf[12] = l3;
+                buf[13] = l4;
+                buf[14] = l5;
+                buf[15] = l6;
+                buf[16] = l7;
                 (buf, 17)
             }
             Self::ExpiresAtUnixMs(exp) => {
+                let [e0, e1, e2, e3, e4, e5, e6, e7] = exp.to_be_bytes();
                 buf[0] = 0x03;
-                let exp_be = exp.to_be_bytes();
-                let mut i = 0;
-                while i < 8 {
-                    buf[1 + i] = exp_be[i];
-                    i += 1;
-                }
+                buf[1] = e0;
+                buf[2] = e1;
+                buf[3] = e2;
+                buf[4] = e3;
+                buf[5] = e4;
+                buf[6] = e5;
+                buf[7] = e6;
+                buf[8] = e7;
                 (buf, 9)
             }
             Self::ReadOnly => {
                 buf[0] = 0x04;
                 (buf, 1)
             }
+            Self::AllowedPeerUid(uid) => {
+                let [u0, u1, u2, u3] = uid.to_be_bytes();
+                buf[0] = 0x05;
+                buf[1] = u0;
+                buf[2] = u1;
+                buf[3] = u2;
+                buf[4] = u3;
+                (buf, 5)
+            }
+        }
+    }
+
+    /// Decodes a single canonical [`Caveat`] from the front of `bytes`, returning `(caveat, consumed_bytes)`.
+    pub const fn decode_one(bytes: &[u8]) -> Result<(Self, usize), CapabilityError> {
+        let Some(&tag) = bytes.first() else {
+            return Err(CapabilityError::MalformedCompactToken);
+        };
+        match tag {
+            0x01 => {
+                if bytes.len() < 33 {
+                    return Err(CapabilityError::MalformedCompactToken);
+                }
+                let root = [
+                    bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8],
+                    bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+                    bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22],
+                    bytes[23], bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29],
+                    bytes[30], bytes[31], bytes[32],
+                ];
+                Ok((Self::AllowedManifest(root), 33))
+            }
+            0x02 => {
+                if bytes.len() < 17 {
+                    return Err(CapabilityError::MalformedCompactToken);
+                }
+                let offset = u64::from_be_bytes([
+                    bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8],
+                ]);
+                let length = u64::from_be_bytes([
+                    bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+                    bytes[16],
+                ]);
+                Ok((Self::ByteRange { offset, length }, 17))
+            }
+            0x03 => {
+                if bytes.len() < 9 {
+                    return Err(CapabilityError::MalformedCompactToken);
+                }
+                let exp = u64::from_be_bytes([
+                    bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8],
+                ]);
+                Ok((Self::ExpiresAtUnixMs(exp), 9))
+            }
+            0x04 => Ok((Self::ReadOnly, 1)),
+            0x05 => {
+                if bytes.len() < 5 {
+                    return Err(CapabilityError::MalformedCompactToken);
+                }
+                let uid = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+                Ok((Self::AllowedPeerUid(uid), 5))
+            }
+            _ => Err(CapabilityError::MalformedCompactToken),
         }
     }
 
     /// Evaluates whether `ctx` satisfies this caveat using overflow-free `u128` range bounds.
     pub const fn allows(&self, ctx: &AccessRequestContext) -> bool {
         match self {
-            Self::AllowedManifest(allowed) => {
-                let mut diff = 0u8;
-                let mut i = 0;
-                while i < 32 {
-                    diff |= allowed[i] ^ ctx.manifest_root[i];
-                    i += 1;
-                }
-                diff == 0
-            }
+            Self::AllowedManifest(allowed) => ct_eq_32(allowed, &ctx.manifest_root),
             Self::ByteRange { offset, length } => {
                 let req_start = ctx.offset as u128;
                 let req_end = req_start + (ctx.length as u128);
@@ -135,6 +247,10 @@ impl Caveat {
             }
             Self::ExpiresAtUnixMs(expires_at_ms) => ctx.now_unix_ms <= *expires_at_ms,
             Self::ReadOnly => !ctx.is_write,
+            Self::AllowedPeerUid(expected) => match ctx.peer_uid {
+                Some(actual) => actual == *expected,
+                None => false,
+            },
         }
     }
 }
@@ -170,11 +286,32 @@ fn chain_caveat_tag(prev_tag: &[u8; 32], caveat: &Caveat) -> [u8; 32] {
 /// Constant-time 32-byte tag equality check (zero early-exit timing side channels).
 #[inline]
 pub const fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    let mut diff = 0u8;
-    let mut i = 0;
-    while i < 32 {
-        diff |= a[i] ^ b[i];
-        i += 1;
+    let mut diff = 0u64;
+    let mut chunk = 0usize;
+    while chunk < 4 {
+        let base = chunk * 8;
+        let wa = u64::from_le_bytes([
+            a[base],
+            a[base + 1],
+            a[base + 2],
+            a[base + 3],
+            a[base + 4],
+            a[base + 5],
+            a[base + 6],
+            a[base + 7],
+        ]);
+        let wb = u64::from_le_bytes([
+            b[base],
+            b[base + 1],
+            b[base + 2],
+            b[base + 3],
+            b[base + 4],
+            b[base + 5],
+            b[base + 6],
+            b[base + 7],
+        ]);
+        diff |= wa ^ wb;
+        chunk += 1;
     }
     diff == 0
 }
@@ -188,6 +325,11 @@ pub struct MacaroonSliceView<'a> {
     pub caveats: &'a [Caveat],
     pub tag: &'a [u8; 32],
 }
+
+/// Stack-decoded representation of a compact [`CapabilityMacaroon`] binary payload
+/// `(nonce_id, issuer_fingerprint, caveats_array, caveat_count, tag)` with zero heap allocations.
+pub type DecodedCompactMacaroon<const MAX_C: usize> =
+    ([u8; 32], [u8; 32], [Caveat; MAX_C], usize, [u8; 32]);
 
 /// HMAC-SHA256 chained capability token enabling zero-knowledge, `< 1 ms` RAM-only authorization
 /// of constrained manifest and byte-range reads without sharing `MasterKey` or `root_key`.
@@ -388,6 +530,151 @@ impl CapabilityMacaroon {
     ) -> Result<(), CapabilityError> {
         self.verify_in_ram_with_mac(root_key, ctx, compute_root_macaroon_tag, chain_caveat_tag)
     }
+
+    /// Zero-heap-allocation binary encoder writing the canonical compact layout
+    /// `[version = 0x01][nonce_id: 32B][issuer_fingerprint: 32B][caveat_count: u8][caveats...][tag: 32B]`
+    /// into caller-supplied slice `out`, returning total written byte length.
+    pub fn encode_compact_slice_into(
+        view: MacaroonSliceView<'_>,
+        out: &mut [u8],
+    ) -> Result<usize, CapabilityError> {
+        let count = view.caveats.len();
+        if count > MAX_MACAROON_CAVEATS {
+            return Err(CapabilityError::TooManyCaveats(count));
+        }
+        if out.len() < MIN_COMPACT_MACAROON_BYTES {
+            return Err(CapabilityError::MalformedCompactToken);
+        }
+        out[0] = COMPACT_MACAROON_VERSION;
+        out[1..33].copy_from_slice(view.nonce_id);
+        out[33..65].copy_from_slice(view.issuer_fingerprint);
+        out[65] = count as u8;
+
+        let mut cursor = 66usize;
+        let mut idx = 0usize;
+        while idx < count {
+            let (enc, used) = view.caveats[idx].encode_stack();
+            if cursor + used + 32 > out.len() {
+                return Err(CapabilityError::MalformedCompactToken);
+            }
+            out[cursor..cursor + used].copy_from_slice(&enc[..used]);
+            cursor += used;
+            idx += 1;
+        }
+        if cursor + 32 > out.len() {
+            return Err(CapabilityError::MalformedCompactToken);
+        }
+        out[cursor..cursor + 32].copy_from_slice(view.tag);
+        Ok(cursor + 32)
+    }
+
+    /// Zero-heap-allocation binary decoder parsing a canonical compact `CapabilityMacaroon` payload
+    /// into fixed stack arrays (`MAX_C <= MAX_MACAROON_CAVEATS`), enforcing strict length bounds,
+    /// version check, caveat cap, and zero trailing bytes.
+    pub fn decode_compact_into<const MAX_C: usize>(
+        raw: &[u8],
+    ) -> Result<DecodedCompactMacaroon<MAX_C>, CapabilityError> {
+        if raw.len() < MIN_COMPACT_MACAROON_BYTES || raw.len() > MAX_COMPACT_MACAROON_BYTES {
+            return Err(CapabilityError::MalformedCompactToken);
+        }
+        if raw[0] != COMPACT_MACAROON_VERSION {
+            return Err(CapabilityError::MalformedCompactToken);
+        }
+        let count = raw[65] as usize;
+        if count > MAX_MACAROON_CAVEATS {
+            return Err(CapabilityError::TooManyCaveats(count));
+        }
+        if count > MAX_C {
+            return Err(CapabilityError::TooManyCaveats(count));
+        }
+        let caveats_end = raw.len() - 32;
+        if count > caveats_end - 66 {
+            return Err(CapabilityError::MalformedCompactToken);
+        }
+        let mut nonce_id = [0u8; 32];
+        nonce_id.copy_from_slice(&raw[1..33]);
+        let mut issuer_fingerprint = [0u8; 32];
+        issuer_fingerprint.copy_from_slice(&raw[33..65]);
+
+        let mut caveats = [Caveat::ReadOnly; MAX_C];
+        let mut cursor = 66usize;
+        let mut idx = 0usize;
+        while idx < count {
+            if cursor >= caveats_end {
+                return Err(CapabilityError::MalformedCompactToken);
+            }
+            let (cav, used) = Caveat::decode_one(&raw[cursor..caveats_end])?;
+            caveats[idx] = cav;
+            cursor += used;
+            idx += 1;
+        }
+        if cursor != caveats_end {
+            return Err(CapabilityError::MalformedCompactToken);
+        }
+        let mut tag = [0u8; 32];
+        tag.copy_from_slice(&raw[caveats_end..raw.len()]);
+        Ok((nonce_id, issuer_fingerprint, caveats, count, tag))
+    }
+
+    /// Serializes this `CapabilityMacaroon` into its canonical deterministic binary layout:
+    /// `[version = 0x01][nonce_id: 32B][issuer_fingerprint: 32B][caveat_count: u8][caveats...][tag: 32B]`.
+    pub fn to_compact_bytes(&self) -> Vec<u8> {
+        let mut stack_buf = [0u8; MAX_COMPACT_MACAROON_BYTES];
+        let encode_n = self.caveats.len().min(MAX_MACAROON_CAVEATS);
+        let used = Self::encode_compact_slice_into(
+            MacaroonSliceView {
+                nonce_id: &self.nonce_id,
+                issuer_fingerprint: &self.issuer_fingerprint,
+                caveats: &self.caveats[..encode_n],
+                tag: &self.tag,
+            },
+            &mut stack_buf,
+        )
+        .expect("MAX_COMPACT_MACAROON_BYTES fits MAX_MACAROON_CAVEATS");
+        if self.caveats.len() > MAX_MACAROON_CAVEATS {
+            stack_buf[65] = self.caveats.len().min(u8::MAX as usize) as u8;
+        }
+        stack_buf[..used].to_vec()
+    }
+
+    /// Parses a `CapabilityMacaroon` from its canonical compact binary layout, enforcing strict
+    /// length bounds (`MIN_COMPACT_MACAROON_BYTES ..= MAX_COMPACT_MACAROON_BYTES`), `MAX_MACAROON_CAVEATS`,
+    /// and zero trailing bytes.
+    pub fn from_compact_bytes(raw: &[u8]) -> Result<Self, CapabilityError> {
+        let (nonce_id, issuer_fingerprint, caveats_arr, count, tag) =
+            Self::decode_compact_into::<MAX_MACAROON_CAVEATS>(raw)?;
+        Ok(Self {
+            nonce_id,
+            issuer_fingerprint,
+            caveats: caveats_arr[..count].to_vec(),
+            tag,
+        })
+    }
+
+    /// Encodes this `CapabilityMacaroon` into a shareable `PARVAULT-MAC-V1:<hex>` ASCII token.
+    pub fn to_compact_token(&self) -> String {
+        let raw = self.to_compact_bytes();
+        let mut out = String::with_capacity(COMPACT_MACAROON_PREFIX.len() + raw.len() * 2);
+        out.push_str(COMPACT_MACAROON_PREFIX);
+        out.push_str(&hex::encode(raw));
+        out
+    }
+
+    /// Decodes a `PARVAULT-MAC-V1:<hex>` compact token with pre-allocation length bounds (`0` `unsafe`).
+    pub fn from_compact_token(token: &str) -> Result<Self, CapabilityError> {
+        let trimmed = token.trim();
+        let hex_body = trimmed
+            .strip_prefix(COMPACT_MACAROON_PREFIX)
+            .ok_or(CapabilityError::MalformedCompactToken)?;
+        let min_hex = MIN_COMPACT_MACAROON_BYTES * 2;
+        let max_hex = MAX_COMPACT_MACAROON_BYTES * 2;
+        if hex_body.len() < min_hex || hex_body.len() > max_hex || !hex_body.len().is_multiple_of(2)
+        {
+            return Err(CapabilityError::MalformedCompactToken);
+        }
+        let raw = hex::decode(hex_body).map_err(|_| CapabilityError::MalformedCompactToken)?;
+        Self::from_compact_bytes(&raw)
+    }
 }
 
 /// Post-Quantum Master Gateway Identity Statement (`Ed25519 + NIST FIPS 204 ML-DSA-65`) binding a
@@ -521,6 +808,8 @@ mod tests {
             })
             .unwrap()
             .attenuate(Caveat::ExpiresAtUnixMs(50_000))
+            .unwrap()
+            .attenuate(Caveat::AllowedPeerUid(1000))
             .unwrap();
 
         let valid_ctx = AccessRequestContext {
@@ -529,6 +818,7 @@ mod tests {
             length: 1024,
             is_write: false,
             now_unix_ms: 40_000,
+            peer_uid: Some(1000),
         };
 
         let t0 = Instant::now();
@@ -668,6 +958,7 @@ mod tests {
             length: 2048,
             now_unix_ms: 50_000,
             is_write: false,
+            peer_uid: Some(1000),
         };
         let bad_ctx = AccessRequestContext {
             is_write: true,
@@ -699,5 +990,284 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn test_compact_macaroon_token_roundtrip_and_peer_uid_caveat() {
+        let root_key = [0x77u8; 32];
+        let manifest = [0xCDu8; 32];
+        let base = CapabilityMacaroon::mint(
+            &root_key,
+            [0x01; 32],
+            [0x02; 32],
+            vec![
+                Caveat::AllowedManifest(manifest),
+                Caveat::AllowedPeerUid(1001),
+            ],
+        )
+        .expect("mint");
+        let child = base
+            .attenuate(Caveat::ByteRange {
+                offset: 4096,
+                length: 8192,
+            })
+            .unwrap()
+            .attenuate(Caveat::ExpiresAtUnixMs(120_000))
+            .unwrap()
+            .attenuate(Caveat::ReadOnly)
+            .unwrap();
+
+        let token = child.to_compact_token();
+        assert!(token.starts_with(COMPACT_MACAROON_PREFIX));
+        let parsed = CapabilityMacaroon::from_compact_token(&token).expect("from_compact_token");
+        assert_eq!(parsed, child);
+
+        let ctx_ok = AccessRequestContext {
+            manifest_root: manifest,
+            offset: 4096,
+            length: 1024,
+            is_write: false,
+            now_unix_ms: 100_000,
+            peer_uid: Some(1001),
+        };
+        parsed
+            .verify_in_ram(&root_key, &ctx_ok)
+            .expect("peer_uid=1001 authorized");
+
+        // Mismatched peer_uid or missing peer_uid rejected:
+        assert_eq!(
+            parsed.verify_in_ram(
+                &root_key,
+                &AccessRequestContext {
+                    peer_uid: Some(1002),
+                    ..ctx_ok
+                }
+            ),
+            Err(CapabilityError::CaveatRejected)
+        );
+        assert_eq!(
+            parsed.verify_in_ram(
+                &root_key,
+                &AccessRequestContext {
+                    peer_uid: None,
+                    ..ctx_ok
+                }
+            ),
+            Err(CapabilityError::CaveatRejected)
+        );
+
+        // Malformed prefix, truncated hex, trailing byte, and > MAX_MACAROON_CAVEATS rejected:
+        assert_eq!(
+            CapabilityMacaroon::from_compact_token("BAD-PREFIX:00"),
+            Err(CapabilityError::MalformedCompactToken)
+        );
+        assert_eq!(
+            CapabilityMacaroon::from_compact_token("PARVAULT-MAC-V1:0102"),
+            Err(CapabilityError::MalformedCompactToken)
+        );
+        let mut raw = child.to_compact_bytes();
+        raw.push(0xFF);
+        assert_eq!(
+            CapabilityMacaroon::from_compact_bytes(&raw),
+            Err(CapabilityError::MalformedCompactToken)
+        );
+        let mut too_many = base.to_compact_bytes();
+        too_many[65] = (MAX_MACAROON_CAVEATS as u8) + 1;
+        assert_eq!(
+            CapabilityMacaroon::from_compact_bytes(&too_many),
+            Err(CapabilityError::TooManyCaveats(MAX_MACAROON_CAVEATS + 1))
+        );
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    fn symbolic_caveat_all_5() -> Caveat {
+        let kind: u8 = kani::any();
+        kani::assume(kind < 5);
+        match kind {
+            0 => Caveat::AllowedManifest(kani::any()),
+            1 => Caveat::ByteRange {
+                offset: kani::any(),
+                length: kani::any(),
+            },
+            2 => Caveat::ExpiresAtUnixMs(kani::any()),
+            3 => Caveat::ReadOnly,
+            _ => Caveat::AllowedPeerUid(kani::any()),
+        }
+    }
+
+    /// Proves with **zero heap (`Vec`) allocations**:
+    /// 1. `Caveat::AllowedPeerUid(expected)` strictly rejects every symbolic `actual_uid != Some(expected)`
+    ///    (both `None` and `Some(other)` across `0..=u32::MAX`) and accepts iff `actual_uid == Some(expected)`
+    ///    inside `CapabilityMacaroon::verify_caveat_slice_in_ram_with`.
+    /// 2. `Caveat::encode_stack` <-> `Caveat::decode_one` is bijective across all 5 symbolic `Caveat`
+    ///    variants on stack `[u8; 34]` slices and rejects unknown discriminant tags and truncated slices.
+    /// 3. The production wire codec `CapabilityMacaroon::encode_compact_slice_into` <->
+    ///    `CapabilityMacaroon::decode_compact_into::<2>` round-trips losslessly across arbitrary symbolic
+    ///    `nonce_id`, `issuer_fingerprint`, `tag`, and `0..=2` symbolic caveats spanning all 5 variants,
+    ///    while rejecting invalid version tags, truncated buffers, and `caveat_count > MAX_MACAROON_CAVEATS`.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn proof_macaroon_peer_uid_and_compact_roundtrip() {
+        let root_key: [u8; 32] = kani::any();
+        kani::assume(!ct_eq_32(&root_key, &[0u8; 32]));
+        let nonce_id: [u8; 32] = kani::any();
+        let issuer_fp: [u8; 32] = kani::any();
+
+        // (1) Exhaustive symbolic proof of `Caveat::AllowedPeerUid(expected)` across `None` & `0..=u32::MAX`:
+        let expected_uid: u32 = kani::any();
+        let actual_uid: Option<u32> = if kani::any() { Some(kani::any()) } else { None };
+        let peer_cav = [Caveat::AllowedPeerUid(expected_uid)];
+
+        let ideal_root_prf = |rk: &[u8; 32], nid: &[u8; 32], ifp: &[u8; 32]| -> [u8; 32] {
+            let mut out = *rk;
+            out[0] ^= nid[0];
+            out[1] ^= ifp[1];
+            out
+        };
+        let ideal_chain_prf = |prev: &[u8; 32], cav: &Caveat| -> [u8; 32] {
+            let (enc, clen) = cav.encode_stack();
+            let mut out = *prev;
+            out[0] ^= clen as u8;
+            out[1] = out[1].wrapping_add(enc[0]);
+            out[2] ^= enc[1];
+            out[3] ^= enc[2];
+            out[4] ^= enc[3];
+            out[5] ^= enc[4];
+            out
+        };
+
+        let tag = CapabilityMacaroon::mint_slice_tag_with(
+            &root_key,
+            &nonce_id,
+            &issuer_fp,
+            &peer_cav,
+            ideal_root_prf,
+            ideal_chain_prf,
+        )
+        .expect("mint tag");
+
+        let ctx = AccessRequestContext {
+            manifest_root: kani::any(),
+            offset: kani::any(),
+            length: kani::any(),
+            is_write: kani::any(),
+            now_unix_ms: kani::any(),
+            peer_uid: actual_uid,
+        };
+        let verify_res = CapabilityMacaroon::verify_caveat_slice_in_ram_with(
+            &root_key,
+            MacaroonSliceView {
+                nonce_id: &nonce_id,
+                issuer_fingerprint: &issuer_fp,
+                caveats: &peer_cav,
+                tag: &tag,
+            },
+            &ctx,
+            ideal_root_prf,
+            ideal_chain_prf,
+        );
+        if actual_uid == Some(expected_uid) {
+            assert_eq!(verify_res, Ok(()));
+        } else {
+            assert_eq!(verify_res, Err(CapabilityError::CaveatRejected));
+        }
+
+        // (2) Single-caveat `encode_stack` <-> `decode_one` bijection + malformed prefix/truncation rejection:
+        let single_cav = symbolic_caveat_all_5();
+        let (enc_one, used_one) = single_cav.encode_stack();
+        let mut padded_one = [0u8; 34];
+        padded_one[..33].copy_from_slice(&enc_one);
+        padded_one[33] = kani::any();
+        let (dec_one, consumed_one) =
+            Caveat::decode_one(&padded_one[..used_one + 1]).expect("decode_one valid caveat");
+        assert_eq!(dec_one, single_cav);
+        assert_eq!(consumed_one, used_one);
+        if used_one > 1 {
+            assert_eq!(
+                Caveat::decode_one(&enc_one[..used_one - 1]),
+                Err(CapabilityError::MalformedCompactToken)
+            );
+        }
+        let bad_tag: u8 = kani::any();
+        kani::assume(bad_tag == 0 || bad_tag > 0x05);
+        let bad_slice = [bad_tag, 0, 0, 0, 0];
+        assert_eq!(
+            Caveat::decode_one(&bad_slice),
+            Err(CapabilityError::MalformedCompactToken)
+        );
+
+        // (3) Zero-heap production wire codec round-trip:
+        //     (a) `0` caveats (empty caveat chain), and
+        //     (b) `2` chained symbolic caveats (`AllowedPeerUid` + `ExpiresAtUnixMs`, proving multi-caveat
+        //         cursor advancement, zero trailing bytes, version check, and caveat-cap enforcement).
+        let empty_slice: [Caveat; 0] = [];
+        let mut wire_zero = [0u8; MIN_COMPACT_MACAROON_BYTES];
+        let used_zero = CapabilityMacaroon::encode_compact_slice_into(
+            MacaroonSliceView {
+                nonce_id: &nonce_id,
+                issuer_fingerprint: &issuer_fp,
+                caveats: &empty_slice,
+                tag: &tag,
+            },
+            &mut wire_zero,
+        )
+        .expect("encode 0 caveats");
+        assert_eq!(used_zero, MIN_COMPACT_MACAROON_BYTES);
+        let (d0_nid, d0_ifp, _d0_cavs, d0_cnt, d0_tag) =
+            CapabilityMacaroon::decode_compact_into::<2>(&wire_zero[..used_zero])
+                .expect("decode 0 caveats");
+        assert!(ct_eq_32(&d0_nid, &nonce_id));
+        assert!(ct_eq_32(&d0_ifp, &issuer_fp));
+        assert!(ct_eq_32(&d0_tag, &tag));
+        assert_eq!(d0_cnt, 0);
+
+        let two_slice = [
+            Caveat::AllowedPeerUid(expected_uid),
+            Caveat::ExpiresAtUnixMs(kani::any()),
+        ];
+        let mut wire_two = [0u8; MIN_COMPACT_MACAROON_BYTES + 5 + 9];
+        let used_two = CapabilityMacaroon::encode_compact_slice_into(
+            MacaroonSliceView {
+                nonce_id: &nonce_id,
+                issuer_fingerprint: &issuer_fp,
+                caveats: &two_slice,
+                tag: &tag,
+            },
+            &mut wire_two,
+        )
+        .expect("encode 2 symbolic caveats");
+        assert_eq!(used_two, wire_two.len());
+
+        let (dec_nid, dec_ifp, dec_cavs, dec_cnt, dec_tag) =
+            CapabilityMacaroon::decode_compact_into::<2>(&wire_two[..used_two])
+                .expect("decode_compact_into round-trip succeeds");
+        assert!(ct_eq_32(&dec_nid, &nonce_id));
+        assert!(ct_eq_32(&dec_ifp, &issuer_fp));
+        assert!(ct_eq_32(&dec_tag, &tag));
+        assert_eq!(dec_cnt, 2);
+        assert_eq!(dec_cavs[0], two_slice[0]);
+        assert_eq!(dec_cavs[1], two_slice[1]);
+
+        // Reject truncated slice, invalid version byte, and `caveat_count > MAX_MACAROON_CAVEATS`:
+        assert!(CapabilityMacaroon::decode_compact_into::<2>(&wire_two[..used_two - 1]).is_err());
+
+        wire_two[0] = 0x00;
+        assert_eq!(
+            CapabilityMacaroon::decode_compact_into::<2>(&wire_two[..used_two]).err(),
+            Some(CapabilityError::MalformedCompactToken)
+        );
+        wire_two[0] = COMPACT_MACAROON_VERSION;
+
+        let over: u8 = kani::any();
+        kani::assume((over as usize) > MAX_MACAROON_CAVEATS);
+        wire_two[65] = over;
+        assert_eq!(
+            CapabilityMacaroon::decode_compact_into::<2>(&wire_two[..used_two]).err(),
+            Some(CapabilityError::TooManyCaveats(over as usize))
+        );
     }
 }

@@ -70,6 +70,9 @@ struct DaemonLaunchOptions {
     print_pairing_banner: bool,
     status_http_bind: Option<String>,
     ipc_socket: Option<PathBuf>,
+    strict_allowed_peer_uids: Option<Vec<u32>>,
+    require_sealed_ingest_memfd: bool,
+    macaroon_root_key: Option<[u8; 32]>,
     watch_folder: Option<PathBuf>,
     sync_interval_secs: u64,
     sync_tier: ErasureTier,
@@ -94,6 +97,8 @@ fn command_needs_network_discovery(cmd: &Commands) -> bool {
             | Commands::DiffFolder { .. }
             | Commands::ListSnapshot { .. }
             | Commands::Scrub
+            | Commands::Token { .. }
+            | Commands::Gateway { .. }
     )
 }
 
@@ -320,6 +325,15 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if let Commands::Token { action } = cli.command {
+        return parvault::gateway::execute_token_cli(action, &cfg.data_dir);
+    }
+
+    if let Commands::Gateway { opts, action } = cli.command {
+        return parvault::gateway::execute_gateway_cli(opts, action, &cfg, cli.profile, &cli.peers)
+            .await;
+    }
+
     let node_identity = NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?;
     let explicit_peers = cfg.effective_peers(&cli.peers);
     let effective_seed = cfg.effective_seed_addr(cli.seed_addr.as_deref());
@@ -369,7 +383,9 @@ async fn main() -> anyhow::Result<()> {
         .with_mesh_client(mesh_client.clone());
 
     match cli.command {
-        Commands::Init { .. } => unreachable!("handled above"),
+        Commands::Init { .. } | Commands::Token { .. } | Commands::Gateway { .. } => {
+            unreachable!("handled above")
+        }
 
         Commands::Discover {
             timeout_ms,
@@ -714,7 +730,22 @@ async fn main() -> anyhow::Result<()> {
             listen,
             tier,
             ipc_socket,
+            no_socket,
+            strict_plugins,
+            allow_peer_uid,
+            require_sealed_memfd,
+            macaroon_root_key_hex,
         } => {
+            let strict_allowed_peer_uids = parvault::gateway::validate_plugin_security_flags(
+                ipc_socket.is_some(),
+                no_socket,
+                strict_plugins,
+                &allow_peer_uid,
+            )?;
+            let macaroon_root_key = parvault::gateway::resolve_optional_macaroon_root_key(
+                &cfg.data_dir,
+                macaroon_root_key_hex.as_deref(),
+            )?;
             if let Some(listen_override) = listen {
                 cfg.listen_tcp = listen_override;
             }
@@ -730,7 +761,10 @@ async fn main() -> anyhow::Result<()> {
                 lan_discovery_port: lan_port,
                 print_pairing_banner: pair,
                 status_http_bind: effective_status_http,
-                ipc_socket,
+                ipc_socket: if no_socket { None } else { ipc_socket },
+                strict_allowed_peer_uids,
+                require_sealed_ingest_memfd: require_sealed_memfd,
+                macaroon_root_key,
                 watch_folder: effective_folder,
                 sync_interval_secs: interval_secs.max(1),
                 sync_tier: effective_tier,
@@ -985,7 +1019,22 @@ async fn main() -> anyhow::Result<()> {
                 enable_quic,
                 status_http,
                 ipc_socket,
+                no_socket,
+                strict_plugins,
+                allow_peer_uid,
+                require_sealed_memfd,
+                macaroon_root_key_hex,
             } => {
+                let strict_allowed_peer_uids = parvault::gateway::validate_plugin_security_flags(
+                    ipc_socket.is_some(),
+                    no_socket,
+                    strict_plugins,
+                    &allow_peer_uid,
+                )?;
+                let macaroon_root_key = parvault::gateway::resolve_optional_macaroon_root_key(
+                    &cfg.data_dir,
+                    macaroon_root_key_hex.as_deref(),
+                )?;
                 cfg.listen_tcp = listen;
                 cfg.enable_quic = enable_quic;
                 let opts = DaemonLaunchOptions {
@@ -993,7 +1042,10 @@ async fn main() -> anyhow::Result<()> {
                     lan_discovery_port: lan_port,
                     print_pairing_banner: false,
                     status_http_bind: status_http.or_else(|| cfg.status_http_bind.clone()),
-                    ipc_socket,
+                    ipc_socket: if no_socket { None } else { ipc_socket },
+                    strict_allowed_peer_uids,
+                    require_sealed_ingest_memfd: require_sealed_memfd,
+                    macaroon_root_key,
                     watch_folder: None,
                     sync_interval_secs: 5,
                     sync_tier: cfg.default_tier,
@@ -2246,17 +2298,26 @@ async fn run_daemon(
             None,
             cfg.device_sealing_passphrase.as_deref(),
         )?;
-        let handle = parvault::gateway::ipc::GatewayIpcServer::new(
+        let mut ipc_srv = parvault::gateway::ipc::GatewayIpcServer::new(
             sock_path.clone(),
             block_store.clone(),
             mk,
         )
         .with_profile(cfg.hardware_profile)
         .with_tier(opts.sync_tier)
-        .spawn()?;
+        .with_require_sealed_ingest_memfd(opts.require_sealed_ingest_memfd);
+        if let Some(root_key) = opts.macaroon_root_key {
+            ipc_srv = ipc_srv.with_macaroon_root_key(root_key);
+        }
+        if let Some(ref uids) = opts.strict_allowed_peer_uids {
+            ipc_srv = ipc_srv.with_strict_allowed_peer_uids(uids.clone());
+        }
+        let handle = ipc_srv.spawn()?;
         println!(
-            "[parvault] Zero-Copy IPC Gateway listening on unix://{}",
-            sock_path.display()
+            "[parvault] Zero-Copy IPC Gateway listening on unix://{} (strict_plugins={}, sealed_memfd={})",
+            sock_path.display(),
+            opts.strict_allowed_peer_uids.is_some(),
+            opts.require_sealed_ingest_memfd,
         );
         info!(socket = %sock_path.display(), "GatewayIpcServer active");
         Some(handle)
@@ -2264,8 +2325,17 @@ async fn run_daemon(
         None
     };
     #[cfg(not(unix))]
-    if opts.ipc_socket.is_some() {
-        anyhow::bail!("--ipc-socket Unix Domain Socket gateway is only supported on Unix targets");
+    {
+        let _ = (
+            &opts.strict_allowed_peer_uids,
+            opts.require_sealed_ingest_memfd,
+            &opts.macaroon_root_key,
+        );
+        if opts.ipc_socket.is_some() {
+            anyhow::bail!(
+                "--ipc-socket Unix Domain Socket gateway is only supported on Unix targets"
+            );
+        }
     }
 
     if let Some(ref folder_path) = opts.watch_folder {

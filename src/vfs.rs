@@ -356,12 +356,13 @@ mod unix_vfs {
     use std::net::TcpListener;
     use std::os::fd::AsRawFd;
 
-    /// Lazy-streaming Virtual File System client communicating with `parvault-gateway` over
+    /// Lazy-streaming Virtual File System client communicating with `parvault` over
     /// `/var/run/parvault.sock`.
     #[derive(Clone)]
     pub struct VirtualVaultFs {
         ipc: GatewayIpcClient,
         block_size: usize,
+        default_macaroon: Option<CapabilityMacaroon>,
         nodes: Arc<Mutex<BTreeMap<u64, VfsStubNode>>>,
         children: Arc<Mutex<HashMap<u64, BTreeMap<String, u64>>>>,
         next_ino: Arc<Mutex<u64>>,
@@ -413,11 +414,19 @@ mod unix_vfs {
             Ok(Self {
                 ipc: GatewayIpcClient::new(socket_path.into()),
                 block_size: block_size.max(4096),
+                default_macaroon: None,
                 nodes: Arc::new(Mutex::new(nodes)),
                 children: Arc::new(Mutex::new(children)),
                 next_ino: Arc::new(Mutex::new(2)),
                 cache: Arc::new(Mutex::new(cache)),
             })
+        }
+
+        /// Attaches a default [`CapabilityMacaroon`] presented on lazy `FetchRange` calls when an
+        /// individual inode does not carry its own per-file token.
+        pub fn with_default_macaroon(mut self, macaroon: Option<CapabilityMacaroon>) -> Self {
+            self.default_macaroon = macaroon;
+            self
         }
 
         /// Registers a virtual file path (e.g. `"/movies/archive_10gb.bin"` or `"backup.tar"`)
@@ -608,11 +617,15 @@ mod unix_vfs {
                 let blk_bytes = match cached {
                     Some(hit_bytes) => hit_bytes,
                     None => {
+                        let effective_mac = stub
+                            .macaroon
+                            .clone()
+                            .or_else(|| self.default_macaroon.clone());
                         let fetched = self.ipc.fetch_range_bytes(
                             &manifest,
                             blk_start,
                             blk_len,
-                            stub.macaroon.clone(),
+                            effective_mac,
                         )?;
                         self.cache.lock().unwrap().insert(ino, blk_idx, &fetched)?;
                         fetched
@@ -639,7 +652,7 @@ mod unix_vfs {
             Ok(bytes)
         }
 
-        /// Synchronizes all regular files in `local_dir` into `parvault-gateway` via zero-copy
+        /// Synchronizes all regular files in `local_dir` into `parvault` via sealed zero-copy
         /// `memfd` `SCM_RIGHTS` (`StorePayload`) and mounts them as lazy VFS stubs.
         pub fn ingest_local_directory(&self, local_dir: &Path) -> io::Result<usize> {
             let mut count = 0usize;
@@ -670,7 +683,7 @@ mod unix_vfs {
                     let mut src = std::fs::File::open(&path)?;
                     let copied = io::copy(&mut src, &mut mfd_file)?;
                     mfd_file.seek(SeekFrom::Start(0))?;
-                    let manifest = self.ipc.store_memfd(
+                    let manifest = self.ipc.store_sealed_memfd(
                         mfd_file.as_raw_fd(),
                         copied,
                         RetentionPolicy::Persistent,

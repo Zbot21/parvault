@@ -380,6 +380,16 @@ mod unix_impl {
             self
         }
 
+        pub fn with_strict_allowed_peer_uids(self, uids: Vec<u32>) -> Self {
+            self.engine.set_strict_allowed_peer_uids(Some(uids));
+            self
+        }
+
+        pub fn with_require_sealed_ingest_memfd(self, required: bool) -> Self {
+            self.engine.set_require_sealed_ingest_memfd(required);
+            self
+        }
+
         /// Binds (if not already bound) and spawns a background worker accept loop, returning an
         /// RAII [`GatewayIpcServerHandle`].
         pub fn spawn(mut self) -> io::Result<GatewayIpcServerHandle> {
@@ -404,12 +414,19 @@ mod unix_impl {
                         let Ok(stream) = incoming else {
                             continue;
                         };
+                        let peer_uid = crate::os_sys::peer_socket_ucred(stream.as_fd())
+                            .ok()
+                            .map(|u| u.uid);
+                        if !engine.is_peer_uid_allowed(peer_uid) {
+                            drop(stream);
+                            continue;
+                        }
                         let eng = Arc::clone(&engine);
                         std::thread::Builder::new()
                             .name("parvault-ipc-conn".into())
                             .stack_size(256 * 1024)
                             .spawn(move || {
-                                let _ = serve_client_stream_sync(stream, &eng);
+                                let _ = serve_client_stream_sync(stream, &eng, peer_uid);
                             })
                             .ok();
                     }
@@ -440,9 +457,16 @@ mod unix_impl {
                     }
                     accept_res = listener.accept() => {
                         let (stream, _) = accept_res?;
+                        let peer_uid = crate::os_sys::peer_socket_ucred(stream.as_fd())
+                            .ok()
+                            .map(|u| u.uid);
+                        if !self.engine.is_peer_uid_allowed(peer_uid) {
+                            drop(stream);
+                            continue;
+                        }
                         let engine = Arc::clone(&self.engine);
                         tokio::spawn(async move {
-                            let _ = serve_client_stream_async(stream, engine).await;
+                            let _ = serve_client_stream_async(stream, engine, peer_uid).await;
                         });
                     }
                 }
@@ -456,6 +480,7 @@ mod unix_impl {
         engine: &GatewayEngine,
         cmd: IpcCommand,
         maybe_fd: Option<OwnedFd>,
+        peer_uid: Option<u32>,
     ) -> IpcResponse {
         match cmd {
             IpcCommand::StorePayload {
@@ -468,6 +493,13 @@ mod unix_impl {
                         message: "StorePayload missing SCM_RIGHTS payload_fd".into(),
                     };
                 };
+                if engine.require_sealed_ingest_memfd()
+                    && !crate::os_sys::has_immutable_memfd_seals(owned_fd.as_fd()).unwrap_or(false)
+                {
+                    return IpcResponse::Error {
+                        message: "unsealed ingest memfd rejected (F_SEAL_WRITE|F_SEAL_SHRINK|F_SEAL_GROW required)".into(),
+                    };
+                }
                 match engine.store_from_owned_fd(owned_fd, bytes_len, retention_policy) {
                     Ok(manifest) => IpcResponse::StoreSuccess { manifest },
                     Err(e) => IpcResponse::Error {
@@ -503,11 +535,12 @@ mod unix_impl {
                         message: "FetchRange missing SCM_RIGHTS output_fd".into(),
                     };
                 };
-                match engine.fetch_range_to_owned_fd(
+                match engine.fetch_range_to_owned_fd_with_peer_uid(
                     &manifest,
                     offset,
                     len,
                     macaroon.as_ref(),
+                    peer_uid,
                     owned_fd,
                 ) {
                     Ok(bytes_streamed) => IpcResponse::FetchSuccess { bytes_streamed },
@@ -534,6 +567,7 @@ mod unix_impl {
     fn serve_client_stream_sync(
         mut stream: StdUnixStream,
         engine: &GatewayEngine,
+        peer_uid: Option<u32>,
     ) -> io::Result<()> {
         loop {
             let (raw_cmd, maybe_fd) = match recv_frame_with_optional_fd(&mut stream) {
@@ -557,7 +591,7 @@ mod unix_impl {
                 }
             };
 
-            let resp = execute_engine_command(engine, cmd, maybe_fd);
+            let resp = execute_engine_command(engine, cmd, maybe_fd, peer_uid);
             let resp_bytes = ipc_bincode()
                 .serialize(&resp)
                 .map_err(|se| io::Error::other(se.to_string()))?;
@@ -568,6 +602,7 @@ mod unix_impl {
     async fn serve_client_stream_async(
         mut stream: TokioUnixStream,
         engine: Arc<GatewayEngine>,
+        peer_uid: Option<u32>,
     ) -> anyhow::Result<()> {
         loop {
             let (frame_bytes, received_fd) = match recv_frame_with_fd(&mut stream).await {
@@ -591,7 +626,7 @@ mod unix_impl {
 
             let eng = Arc::clone(&engine);
             let response = match tokio::task::spawn_blocking(move || {
-                execute_engine_command(&eng, cmd, received_fd)
+                execute_engine_command(&eng, cmd, received_fd, peer_uid)
             })
             .await
             {
@@ -664,6 +699,22 @@ mod unix_impl {
             }
         }
 
+        /// Seals `fd` with `F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE` (unless already
+        /// immutably sealed) and passes it zero-copy via `SCM_RIGHTS` (`StorePayload`).
+        pub async fn store_sealed_payload_fd(
+            &self,
+            fd: RawFd,
+            bytes_len: u64,
+            retention: RetentionPolicy,
+        ) -> anyhow::Result<EphemeralShardManifest> {
+            let dup = crate::os_sys::dup_fd_cloexec(fd)?;
+            if !crate::os_sys::has_immutable_memfd_seals(dup.as_fd())? {
+                crate::os_sys::seal_memfd_immutable(dup.as_fd())?;
+            }
+            drop(dup);
+            self.store_payload_fd(fd, bytes_len, retention).await
+        }
+
         /// Reconstructs the full payload identified by `ephemeral_shard_ids` directly into `output_fd` via `SCM_RIGHTS`.
         pub async fn fetch_payload_to_fd(
             &self,
@@ -709,7 +760,8 @@ mod unix_impl {
             }
         }
 
-        /// Allocates an anonymous `memfd`, writes `bytes` via safe `pwrite_all`, and stores via `SCM_RIGHTS`.
+        /// Allocates an anonymous `memfd`, writes `bytes` via safe `pwrite_all`, applies immutable
+        /// seals (`F_ADD_SEALS`), and stores via `SCM_RIGHTS`.
         pub async fn store_bytes(
             &self,
             bytes: &[u8],
@@ -718,8 +770,24 @@ mod unix_impl {
             let mfd = create_memfd_sized("parvault-store", bytes.len() as u64)?;
             let file = File::from(mfd);
             pwrite_all(&file, 0, bytes)?;
+            let _ = crate::os_sys::seal_memfd_immutable(file.as_fd());
             self.store_payload_fd(file.as_raw_fd(), bytes.len() as u64, retention_policy)
                 .await
+        }
+
+        /// Registers an existing or sparse virtual `FileManifest` asynchronously over `/var/run/parvault.sock`.
+        pub async fn register_manifest_async(
+            &self,
+            file_manifest: FileManifest,
+        ) -> anyhow::Result<EphemeralShardManifest> {
+            let cmd = IpcCommand::RegisterManifest { file_manifest };
+            match self.send_command(&cmd, None).await? {
+                IpcResponse::StoreSuccess { manifest } => Ok(manifest),
+                IpcResponse::Error { message } => {
+                    anyhow::bail!("gateway RegisterManifest error: {message}")
+                }
+                other => anyhow::bail!("unexpected RegisterManifest response: {other:?}"),
+            }
         }
 
         /// Queries real-time gateway IOPS, connected peer count, and PoR SLA compliance score asynchronously.
@@ -757,7 +825,7 @@ mod unix_impl {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
         }
 
-        /// Passes `payload_fd` zero-copy via `SCM_RIGHTS` to `parvault-gateway` (`StorePayload`).
+        /// Passes `payload_fd` zero-copy via `SCM_RIGHTS` to `parvault` (`StorePayload`).
         pub fn store_memfd(
             &self,
             payload_fd: RawFd,
@@ -776,6 +844,22 @@ mod unix_impl {
                     "unexpected IPC response: {other:?}"
                 ))),
             }
+        }
+
+        /// Seals `payload_fd` with `F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE`
+        /// (unless already immutably sealed) and passes it zero-copy via `SCM_RIGHTS` (`StorePayload`).
+        pub fn store_sealed_memfd(
+            &self,
+            payload_fd: RawFd,
+            bytes_len: u64,
+            retention_policy: RetentionPolicy,
+        ) -> io::Result<EphemeralShardManifest> {
+            let dup = crate::os_sys::dup_fd_cloexec(payload_fd)?;
+            if !crate::os_sys::has_immutable_memfd_seals(dup.as_fd())? {
+                crate::os_sys::seal_memfd_immutable(dup.as_fd())?;
+            }
+            drop(dup);
+            self.store_memfd(payload_fd, bytes_len, retention_policy)
         }
 
         /// Passes `output_fd` zero-copy via `SCM_RIGHTS` to receive a reconstructed payload (`FetchPayload`).
@@ -871,11 +955,167 @@ mod unix_impl {
             }
         }
     }
+
+    /// Unified transport-agnostic gateway bus (`ADR-32`) allowing embedded callers and plugins to
+    /// switch between zero-socket in-process execution (`--no-socket`) and hardened Unix Domain
+    /// Socket IPC (`/var/run/parvault.sock`) with bit-for-bit identical semantics.
+    #[derive(Clone)]
+    pub enum GatewayBus {
+        InProcess(Arc<GatewayEngine>),
+        UnixSocket(GatewayIpcClient),
+    }
+
+    impl std::fmt::Debug for GatewayBus {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::InProcess(_) => f.write_str("GatewayBus::InProcess(..)"),
+                Self::UnixSocket(client) => f
+                    .debug_tuple("GatewayBus::UnixSocket")
+                    .field(&client.socket_path())
+                    .finish(),
+            }
+        }
+    }
+
+    impl GatewayBus {
+        pub fn in_process(engine: Arc<GatewayEngine>) -> Self {
+            Self::InProcess(engine)
+        }
+
+        pub fn unix_socket(socket_path: impl AsRef<Path>) -> Self {
+            Self::UnixSocket(GatewayIpcClient::new(socket_path))
+        }
+
+        /// Streams `bytes_len` bytes from `payload_fd` into the gateway (`StorePayload`).
+        pub async fn store_payload_fd(
+            &self,
+            payload_fd: RawFd,
+            bytes_len: u64,
+            retention: RetentionPolicy,
+        ) -> anyhow::Result<EphemeralShardManifest> {
+            match self {
+                Self::InProcess(engine) => {
+                    let dup = crate::os_sys::dup_fd_cloexec(payload_fd)?;
+                    let eng = Arc::clone(engine);
+                    tokio::task::spawn_blocking(move || {
+                        eng.store_from_owned_fd(dup, bytes_len, retention)
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("in-process StorePayload join error: {e}"))?
+                }
+                Self::UnixSocket(client) => {
+                    client
+                        .store_payload_fd(payload_fd, bytes_len, retention)
+                        .await
+                }
+            }
+        }
+
+        /// Seals `fd` with `F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE` (unless
+        /// already immutably sealed) and streams `bytes_len` bytes into the gateway (`StorePayload`).
+        pub async fn store_sealed_payload_fd(
+            &self,
+            fd: RawFd,
+            bytes_len: u64,
+            retention: RetentionPolicy,
+        ) -> anyhow::Result<EphemeralShardManifest> {
+            match self {
+                Self::InProcess(engine) => {
+                    let dup = crate::os_sys::dup_fd_cloexec(fd)?;
+                    if !crate::os_sys::has_immutable_memfd_seals(dup.as_fd())? {
+                        crate::os_sys::seal_memfd_immutable(dup.as_fd())?;
+                    }
+                    let eng = Arc::clone(engine);
+                    tokio::task::spawn_blocking(move || {
+                        eng.store_from_owned_fd(dup, bytes_len, retention)
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("in-process StorePayload join error: {e}"))?
+                }
+                Self::UnixSocket(client) => {
+                    client
+                        .store_sealed_payload_fd(fd, bytes_len, retention)
+                        .await
+                }
+            }
+        }
+
+        /// Reconstructs the full payload identified by `ephemeral_shard_ids` directly into `output_fd`.
+        pub async fn fetch_payload_to_fd(
+            &self,
+            ephemeral_shard_ids: Vec<[u8; 32]>,
+            output_fd: RawFd,
+        ) -> anyhow::Result<u64> {
+            match self {
+                Self::InProcess(engine) => {
+                    let dup = crate::os_sys::dup_fd_cloexec(output_fd)?;
+                    let eng = Arc::clone(engine);
+                    tokio::task::spawn_blocking(move || {
+                        eng.fetch_by_shard_ids_to_owned_fd(&ephemeral_shard_ids, dup)
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("in-process FetchPayload join error: {e}"))?
+                }
+                Self::UnixSocket(client) => {
+                    client
+                        .fetch_payload_to_fd(ephemeral_shard_ids, output_fd)
+                        .await
+                }
+            }
+        }
+
+        /// Fetches `[offset .. offset + len]` into `output_fd`, enforcing `macaroon` in RAM (`< 1 ms`).
+        /// Both `InProcess` (`Some(geteuid())`) and `UnixSocket` (`SO_PEERCRED`) bind `peer_uid` identically.
+        pub async fn fetch_range_to_fd(
+            &self,
+            manifest: EphemeralShardManifest,
+            offset: u64,
+            len: u64,
+            output_fd: RawFd,
+            macaroon: Option<CapabilityMacaroon>,
+        ) -> anyhow::Result<u64> {
+            match self {
+                Self::InProcess(engine) => {
+                    let dup = crate::os_sys::dup_fd_cloexec(output_fd)?;
+                    let eng = Arc::clone(engine);
+                    tokio::task::spawn_blocking(move || {
+                        eng.fetch_range_to_owned_fd(&manifest, offset, len, macaroon.as_ref(), dup)
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("in-process FetchRange join error: {e}"))?
+                }
+                Self::UnixSocket(client) => {
+                    client
+                        .fetch_range_to_fd(manifest, offset, len, output_fd, macaroon)
+                        .await
+                }
+            }
+        }
+
+        /// Registers an existing or sparse virtual `FileManifest` into the gateway.
+        pub async fn register_manifest(
+            &self,
+            file_manifest: FileManifest,
+        ) -> anyhow::Result<EphemeralShardManifest> {
+            match self {
+                Self::InProcess(engine) => Ok(engine.register_manifest(file_manifest)),
+                Self::UnixSocket(client) => client.register_manifest_async(file_manifest).await,
+            }
+        }
+
+        /// Queries `(iops, peer_count, por_sla_score)` telemetry from the gateway.
+        pub async fn query_health(&self) -> anyhow::Result<(u64, usize, f32)> {
+            match self {
+                Self::InProcess(engine) => Ok(engine.health_snapshot()),
+                Self::UnixSocket(client) => client.query_health().await,
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
 pub use unix_impl::{
     create_memfd, create_memfd_sized, read_self_anon_rss_bytes, read_self_rss_bytes,
-    recv_frame_with_optional_fd, send_frame_with_optional_fd, GatewayIpcClient, GatewayIpcServer,
-    GatewayIpcServerHandle,
+    recv_frame_with_optional_fd, send_frame_with_optional_fd, GatewayBus, GatewayIpcClient,
+    GatewayIpcServer, GatewayIpcServerHandle,
 };

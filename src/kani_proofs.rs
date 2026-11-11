@@ -683,7 +683,7 @@ fn proof_router_soc_and_desktop_reed_solomon_memory_ceiling() {
 
 fn symbolic_caveat() -> Caveat {
     let kind: u8 = kani::any();
-    kani::assume(kind < 4);
+    kani::assume(kind < 5);
     match kind {
         0 => Caveat::AllowedManifest(kani::any()),
         1 => Caveat::ByteRange {
@@ -691,7 +691,8 @@ fn symbolic_caveat() -> Caveat {
             length: kani::any(),
         },
         2 => Caveat::ExpiresAtUnixMs(kani::any()),
-        _ => Caveat::ReadOnly,
+        3 => Caveat::ReadOnly,
+        _ => Caveat::AllowedPeerUid(kani::any()),
     }
 }
 
@@ -787,6 +788,7 @@ fn proof_macaroon_caveat_attenuation_monotonic_and_zero_key_rejected() {
         length: kani::any(),
         now_unix_ms: kani::any(),
         is_write: kani::any(),
+        peer_uid: if kani::any() { Some(kani::any()) } else { None },
     };
 
     // Zero root key unconditionally rejected at verify time:
