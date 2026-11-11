@@ -1,5 +1,6 @@
 target/
 .git/
+website/
 **/.parvault-data/
 **/.parvault-seed-data/
 *.manifest.bin

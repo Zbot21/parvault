@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   deploy-pages:
-    name: Publish Static Landing Page (deploy/control-plane/website)
+    name: Publish Static Landing Page (website)
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -29,7 +29,7 @@ jobs:
       - name: Upload static website artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: "deploy/control-plane/website"
+          path: "website"
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
