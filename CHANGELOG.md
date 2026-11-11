@@ -6,6 +6,52 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [`0.3.0`] - 2026-11-11
+
+### Added
+- **Zero-IP Home LAN Auto-Discovery, Persistent Peer Registry & 4-Word SAS Pairing (`ADR-18`, `src/network/discovery.rs`):**
+  - Added cryptographically signed `LanBeaconPacket` broadcasting on UDP port `4009` (multicast group `239.255.80.86`, broadcast `255.255.255.255`, and ephemeral localhost fallback) signed under domain `"parvault-lan-beacon-v1:"`.
+  - Enforced strict cryptographic binding between `ed25519_pubkey` and `libp2p_peer_id` so rogue clients on Wi-Fi cannot spoof peer identities.
+  - Implemented 4-word BIP-39 SAS pairing code derivation (`derive_4word_pairing_sas`, `verify_lan_pairing_code`) allowing devices to mutually authenticate and pair with zero IP configuration.
+  - Added DHCP-resilient persistent peer store `KnownPeersStore` (`known_peers.json`) updating socket addresses dynamically when home routers renegotiate DHCP leases without invalidating pinned `PeerId`s.
+  - Added automatic zero-IP fallback across all high-level CLI commands (`watch-folder`, `restore-folder`, `file store`, `file restore`, `leave`, `status`) via `resolve_zero_config_peers`.
+- **Tiny-SoC 1 MiB Streaming Stripe Profile, Allocation Diet & Turnkey Router Packaging (`ADR-18`, `src/storage/block_store.rs`, `Cargo.toml`, `deploy/`):**
+  - Introduced configurable streaming stripe sizes in `BlockStore` (`BlockStore::with_stripe_size_bytes`) and `HardwareProfile` (`RouterSoc` `1 MiB`, `HomelabNas` `4 MiB`, `Desktop` `16 MiB`).
+  - Reduced transient peak working set memory (`VmHWM`) during Reed-Solomon $GF(2^8)$ encoding/reconstruction from `57.30 MiB` down to **`9.39 MiB`** (6.1x reduction), enabling safe execution within a strict 32–48 MiB cgroup.
+  - Authored `deploy/Dockerfile.router-soc` (`FROM scratch` container image), OpenWrt `/etc/init.d/parvault-nas` `procd` service script, and updated `deploy/prplos-lxc-manifest.json` for prplOS gateway integration.
+  - Authored comprehensive integration manual [`docs/ROUTER_SOC_HARDWARE_GUIDE.md`](docs/ROUTER_SOC_HARDWARE_GUIDE.md).
+- **Embedded Zero-Dependency Router Cloud-NAS Status HTTP Server (`ADR-18`, `src/router_nas.rs`):**
+  - Implemented lightweight HTTP server using `tokio::net::TcpListener` serving `GET /api/v1/health` (live `VmRSS`/`VmHWM`, uptime, quotas, pairing code), `GET /api/v1/peers` (LAN peers), and `GET /` (embedded HTML5 dashboard `< 6 KiB`).
+  - Added turnkey single-command appliance mode `parvault up` combining P2P storage daemon, UDP discovery responder, embedded web status server, and background folder synchronization.
+- **Zero-IP Online WAN Rendezvous, STUN-over-Noise Reflection & Dynamic-IP Presence (`ADR-18`, `src/network/wan_rendezvous.rs`, `src/network/behaviour.rs`):**
+  - Added `RegisterWanRendezvous` and `LookupWanRendezvous` wire RPCs to `MeshWireRequest` / `MeshWireResponse`.
+  - Implemented blinded WAN rendezvous mailbox deriving `slot_key = HKDF(code, "slot-v1")` and AEAD wrapping key `wrap_key = HKDF(code, "wrap-v1")` for zero-knowledge 4-word pairing across cities.
+  - Implemented STUN-over-Noise external address reflection extracting observed socket addresses from authenticated `libp2p` Noise XX connection metadata.
+  - Added zero-knowledge dynamic-IP presence publishing encrypted endpoint heartbeats to blinded DDNS slots, surviving residential ISP address rotations.
+- **Open Public Commons / BitTorrent-Style Public Swarm Mode (`ADR-18`, `src/network/wot.rs`, `src/network/wan_rendezvous.rs`):**
+  - Added `TrustPoolMode` (`PrivateRing`, `PublicCommons`, `Hybrid`) in `WebOfTrustRegistry`.
+  - Added self-signed Hashcash Proof-of-Work admission ticket `PublicCommonsTicket` (`DEFAULT_PUBLIC_WOT_POW_BITS = 12`) allowing stranger nodes to join public swarms without invitations.
+  - Enabled zero-pairing public swarms (`--public --tracker <MULTIADDR>`) where `parvault-seed --mode public-bootstrap` serves as a public tracker anchor indexing active swarm peers under `PUBLIC_COMMONS_SWARM_SLOT`.
+- **4-Vector Privacy-Preserving Bad-Actor & Content Eviction Engine (`ADR-19`, `src/storage/eviction.rs`):**
+  - Implemented `PrivacyPreservingEvictionEngine` supporting 4 eviction vectors: IP address / CIDR subnet (`/24`, `/48`), `libp2p` `PeerId`, peer/voucher-issuer public key cohorts (purging associated anonymous `.bshard` blinded shards), and content identifiers (`stripe_merkle_root`, `BlindedLocator`).
+  - Enforced zero-plaintext-IP disk privacy: all ingress records and blocklist rules in `eviction_index.bin` are stored as keyed HMAC-SHA256 tags under a local random `0600` secret key (`eviction_hmac.seed`), ensuring zero IP addresses or cross-node correlatable identifiers exist on disk.
+  - Implemented multi-pass `0x00` zero-wipe file shredding in 64 KiB chunks (`shred_and_unlink_file`) with explicit `sync_all()` flushes prior to unlinking.
+  - Added cryptographically authenticated eviction orders (`SignedBadActorEvictionOrder`) domain-separated under `"parvault-bad-actor-eviction-order-v1:"` with mesh-wide propagation (`BroadcastEvictionOrder` / `EvictionOrderAck`).
+  - Added Public Swarm Anti-Griefing Governance: nodes in `--public` swarms reject unauthenticated peer eviction orders, accepting orders exclusively from configured `eviction_authorities` (including the Public Tracker Operator's `tracker_admin.seed` authority, advertised in tracker discovery responses).
+  - Implemented Cryptographic Reporter Burden-of-Proof (`VerifiableAbuseReport`): reporters alleging illegal distribution must submit the leaked `FileManifest` and `MasterKey`; nodes verify shard Merkle proofs, Reed-Solomon stripe reconstruction, and `AES-256-GCM` authentication tags, computing `verified_plaintext_sha256` and zeroizing the plaintext memory buffer immediately.
+  - Added Mathematical Anti-Framing: private backups cannot be framed because guessing or forging a 256-bit `MasterKey` results in `AES-256-GCM` authentication tag failure ($2^{-128}$).
+  - Added Human-in-the-Loop Admin Takedown Queue (`PublicTrackerTakedownQueue`, `<data_dir>/admin_takedown_queue.bin` `0600`): reports remain in `PendingAdminReview` with zero automatic deletion until the Public Tracker Admin approves them.
+  - Implemented 2-Lane Public Swarm Governance: Lane 1 reviews reporter cryptographic proofs (`approve-takedown`), while Lane 2 enables unilateral emergency law-enforcement / warrant evictions (`emergency-evict --warrant-ref <TEXT>`) for private contraband, recording `EmergencyAdminActionRecord`s and purging voucher cohorts without compromising disk IP privacy.
+  - Enforced Strict Ring-of-Trust vs. Public Commons Isolation: `PrivateRing` nodes unconditionally reject external `tracker_admin_pubkey` orders, guaranteeing tracker admin powers cannot reach private homelab or family vaults.
+  - Added `M-of-N` Federated Public Tracker Council Quorum (`TrackerOperatorCosignature`): prevents rogue public tracker operators from unilaterally broadcasting fraudulent eviction orders or stealing storage capacity; requires strict majority co-signatures (`default_tracker_quorum_threshold(N)`) across trusted council operators via `parvault-seed admin cosign-eviction`.
+  - Added new commands: `parvault report-abuse`, `parvault evict`, `parvault-seed evict`, and `parvault-seed admin {show-authority, list-takedowns, inspect-takedown, approve-takedown, reject-takedown, emergency-evict, cosign-eviction}`.
+- **New User-Friendly Subcommands & CLI Flags (`src/config.rs`, `src/main.rs`, `src/bin/parvault-seed.rs`):**
+  - Added `parvault init`, `parvault discover`, `parvault pair`, `parvault join`, `parvault up`, `parvault evict`, `parvault report-abuse`, `parvault-seed evict`, and `parvault-seed admin`.
+  - Added global `--profile <router-soc|homelab-nas|desktop>`, `--lan-discovery-port <PORT>`, `--no-lan-discovery`, `--public`, and `--tracker <MULTIADDR>` flags on `parvault`.
+  - Added opt-in `--admin-rpc-listen <SOCKET_ADDR>` and `--admin-rpc-pubkey <HEX>` on `parvault-seed` for forward-secret multi-tracker fleet management via `parvault-control` (`src/admin_rpc.rs`).
+
+---
+
 ## [`0.2.0`] - 2026-11-09
 
 ### Added

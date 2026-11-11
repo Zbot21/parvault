@@ -4,20 +4,31 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-CONTAINERS=(parvault-seed-0 parvault-client)
+CONTAINERS=(
+    parvault-seed-0
+    parvault-client
+    parvault-router-soc
+    parvault-soc-store
+    parvault-soc-restore
+    parvault-soc-extract
+)
 for i in $(seq 1 11); do
     CONTAINERS+=("parvault-node-$i")
 done
 
+SOC_VOL_NAME="parvault-soc-nas-vol"
+
 cleanup() {
     if [ "${KEEP_CONTAINERS:-0}" != "1" ]; then
         docker rm -f "${CONTAINERS[@]}" >/dev/null 2>&1 || true
+        docker volume rm -f "$SOC_VOL_NAME" >/dev/null 2>&1 || true
         docker network rm parvault-acceptance-net >/dev/null 2>&1 || true
+        rm -rf /tmp/parvault-soc-bin >/dev/null 2>&1 || true
     fi
 }
 trap cleanup EXIT
 
-echo "=== [1/10] Building ParVault binaries & parvault:acceptance container image ==="
+echo "=== [1/12] Building ParVault binaries & parvault:acceptance container image ==="
 BUILD_CTX="/tmp/parvault-acceptance-image"
 rm -rf "$BUILD_CTX"
 mkdir -p "$BUILD_CTX"
@@ -41,12 +52,12 @@ cat > "$BUILD_CTX/Dockerfile" <<EOF
 FROM ${BASE_IMAGE}
 COPY parvault /usr/local/bin/parvault
 COPY parvault-seed /usr/local/bin/parvault-seed
-EXPOSE 4001/tcp 4002/tcp
+EXPOSE 4001/tcp 4002/tcp 4009/udp 4080/tcp
 EOF
 
 docker build -t parvault:acceptance "$BUILD_CTX"
 
-echo "=== [2/10] Creating isolated Docker bridge network (172.28.0.0/24) ==="
+echo "=== [2/12] Creating isolated Docker bridge network (172.28.0.0/24) ==="
 docker rm -f "${CONTAINERS[@]}" >/dev/null 2>&1 || true
 docker network rm parvault-acceptance-net >/dev/null 2>&1 || true
 docker network create --subnet=172.28.0.0/24 parvault-acceptance-net
@@ -60,7 +71,7 @@ PEERS_CSV="$(IFS=,; echo "${PEERS_LIST[*]}")"
 SEED_MULTIADDR="/ip4/172.28.0.10/tcp/4002"
 NODE11_MULTIADDR="/ip4/172.28.0.21/tcp/4001"
 
-echo "=== [3/10] Starting parvault-seed-0 + 11 parvault daemon containers + 1 isolated client container ==="
+echo "=== [3/12] Starting parvault-seed-0 + 11 parvault daemon containers + 1 isolated client container ==="
 docker run -d --name parvault-seed-0 \
     --network parvault-acceptance-net --ip 172.28.0.10 \
     parvault:acceptance \
@@ -99,10 +110,36 @@ if [ "$CLIENT_MOUNTS" != "[]" ] && [ "$CLIENT_MOUNTS" != "null" ]; then
     exit 1
 fi
 
+echo "=== [4/12] Zero-IP Home LAN Auto-Discovery ('parvault discover') over 172.28.0.0/24 Bridge ==="
+DISCOVER_TABLE="$(docker exec parvault-client /usr/local/bin/parvault --data-dir /tmp/zero-ip-discover discover --timeout-ms 1200)"
+echo "$DISCOVER_TABLE"
+DISCOVER_JSON="$(docker exec parvault-client /usr/local/bin/parvault --data-dir /tmp/zero-ip-discover discover --json --timeout-ms 1200)"
+DISCOVERED_COUNT="$(echo "$DISCOVER_JSON" | grep -c '"peer_id"' || true)"
+echo "Zero-IP discovered verified LAN peers on 172.28.0.0/24: $DISCOVERED_COUNT"
+if [ "$DISCOVERED_COUNT" -lt 10 ]; then
+    echo "ERROR: Expected parvault discover (with zero IP arguments) to find >= 10 LAN daemons, found $DISCOVERED_COUNT"
+    echo "$DISCOVER_JSON"
+    exit 1
+fi
+
+# Also prove zero-`--peers` file store & restore over Docker bridge auto-discovery
+docker exec parvault-client sh -cex '
+    mkdir -p /tmp/zero-ip-store /tmp/zero-ip-restore
+    echo "Zero-IP LAN discovery file store/restore over 172.28.0.0/24 bridge" > /tmp/zero-ip-store/lan_zero_ip.txt
+    sha256sum /tmp/zero-ip-store/lan_zero_ip.txt > /tmp/lan_zero_ip.sha256
+    ZOUT=$(/usr/local/bin/parvault --data-dir /tmp/zero-ip-store/data file store --path /tmp/zero-ip-store/lan_zero_ip.txt)
+    echo "$ZOUT"
+    ZROOT=$(echo "$ZOUT" | awk "/File Merkle Root/ {print \$5}")
+    ZKEY=$(echo "$ZOUT" | awk "/Master Key/ {print \$5}")
+    rm -rf /tmp/zero-ip-store
+    /usr/local/bin/parvault --data-dir /tmp/zero-ip-restore/data file restore "$ZROOT" --output /tmp/zero-ip-store/lan_zero_ip.txt --key-hex "$ZKEY"
+    sha256sum -c /tmp/lan_zero_ip.sha256
+'
+
 SEED_PHRASE="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
 VAULT_NS="docker-live-acceptance-vault"
 
-echo "=== [4/10] Initial Backup (Snapshot v1): 'parvault watch-folder --once' over libp2p ==="
+echo "=== [5/12] Initial Backup (Snapshot v1): 'parvault watch-folder --once' over libp2p ==="
 docker exec parvault-client sh -cex '
     mkdir -p /tmp/client-upload-state /workspace/source_vault/docs /workspace/source_vault/src /workspace/source_vault/data
     echo "# ParVault Live Multi-Container Network Proof (v1)" > /workspace/source_vault/docs/readme.md
@@ -136,7 +173,7 @@ done
 SEED_SHARD_COUNT_V1="$(docker exec parvault-seed-0 sh -c 'ls -1 /var/lib/parvault-seed/shards/*.shard 2>/dev/null | wc -l')"
 echo "Total remote node shards (v1): $TOTAL_SHARDS_V1 | Seed shards (v1): $SEED_SHARD_COUNT_V1 | Elapsed: ${SYNC_V1_SECS}s"
 
-echo "=== [5/10] Continuous Background Backup Daemon ('watch-folder --interval-secs 1 --prune-deleted') ==="
+echo "=== [6/12] Continuous Background Backup Daemon ('watch-folder --interval-secs 1 --prune-deleted') ==="
 docker exec -w /tmp/client-upload-state parvault-client sh -c "
     nohup /usr/local/bin/parvault \
         --peers '$PEERS_CSV' \
@@ -155,16 +192,16 @@ sleep 2
 # Mutate watched directory while continuous daemon is running: modify readme.md, add changelog.md, delete ephemeral.rs
 docker exec parvault-client sh -cex '
     echo "# ParVault Live Multi-Container Network Proof (v2 - Continuous Sync Updated)" > /workspace/source_vault/docs/readme.md
-    echo "## v0.2.0 Live Multi-Container Regression Verified" > /workspace/source_vault/docs/changelog.md
+    echo "## v0.3.0 Live Multi-Container Regression Verified" > /workspace/source_vault/docs/changelog.md
     rm -f /workspace/source_vault/src/ephemeral.rs
     cd /workspace/source_vault
     sha256sum docs/readme.md docs/changelog.md src/kernel.rs data/blob.bin > /tmp/expected_v2.sha256
     cat /tmp/expected_v2.sha256
 '
 
-# Wait for continuous watch-folder daemon to complete pass v2 and stop it cleanly
-for attempt in $(seq 1 20); do
-    if docker exec parvault-client grep -q "Deleted Tombstones : 1" /tmp/watch-daemon.log 2>/dev/null; then
+# Wait for continuous watch-folder daemon to complete pass v2 (including Catalog Envelope DHT publish!) and stop it cleanly
+for attempt in $(seq 1 25); do
+    if docker exec parvault-client awk '/Deleted Tombstones : 1/{found=1} found && /Catalog Envelope/{ok=1} END{exit !ok}' /tmp/watch-daemon.log 2>/dev/null; then
         break
     fi
     sleep 1
@@ -177,7 +214,7 @@ docker exec parvault-client sh -cex '
     grep -q "Deleted Tombstones : 1" /tmp/watch-daemon.log
 '
 
-echo "=== [6/10] Lite-Client 1.0x Stripe Syndication via parvault-seed-0 & NAS-Death Mesh Failover ==="
+echo "=== [7/12] Lite-Client 1.0x Stripe Syndication via parvault-seed-0 & NAS-Death Mesh Failover ==="
 docker exec parvault-client sh -cex '
     mkdir -p /tmp/lite-client-state /workspace/lite_source /workspace/lite_restored_after_nas_death
     echo "Lite-Client 1.0x stripe syndicated through parvault-seed-0 to 10 mesh peers" > /workspace/lite_source/laptop_note.txt
@@ -210,9 +247,14 @@ docker exec parvault-client sh -cex '
     sha256sum -c /tmp/expected_lite.sha256
 '
 docker start parvault-seed-0
-sleep 1
+for attempt in $(seq 1 30); do
+    if docker exec parvault-client nc -z 172.28.0.10 4002 >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
 
-echo "=== [7/10] Graceful Node Decommission: parvault-node-5 -> parvault-node-11 ('parvault leave --handoff-to') ==="
+echo "=== [8/12] Graceful Node Decommission: parvault-node-5 -> parvault-node-11 ('parvault leave --handoff-to') ==="
 NODE11_BEFORE="$(docker exec parvault-node-11 sh -c 'ls -1 /var/lib/parvault/.parvault-data/shards/*.shard 2>/dev/null | wc -l')"
 docker exec -w /var/lib/parvault parvault-node-5 /usr/local/bin/parvault \
     leave --handoff-to "$NODE11_MULTIADDR"
@@ -224,7 +266,7 @@ if [ "$NODE11_AFTER" -le "$NODE11_BEFORE" ]; then
 fi
 docker stop parvault-node-5
 
-echo "=== [8/10] Bit-Rot Injection ('parvault scrub'), Daemon Restart Persistence, and 4-Container Kill ==="
+echo "=== [9/12] Bit-Rot Injection ('parvault scrub'), Daemon Restart Persistence, and 4-Container Kill ==="
 # Inject 1-byte bit-rot into a single shard on parvault-node-6 and verify 'parvault scrub' quarantines it
 docker exec parvault-node-6 sh -cex '
     VICTIM=$(ls -1 /var/lib/parvault/.parvault-data/shards/*.shard | head -n 1)
@@ -236,7 +278,14 @@ echo "$SCRUB_OUT" | grep -q "corrupted_quarantined_shards : 1"
 
 # Restart parvault-node-6 and parvault-node-7 to prove persistent disk state across daemon restarts
 docker restart parvault-node-6 parvault-node-7
-sleep 2
+for ip in 172.28.0.16 172.28.0.17; do
+    for attempt in $(seq 1 30); do
+        if docker exec parvault-client nc -z "$ip" 4001 >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+done
 
 # Kill 4 storage daemon containers (parvault-node-1..4)
 docker kill parvault-node-1 parvault-node-2 parvault-node-3 parvault-node-4
@@ -249,7 +298,7 @@ docker exec parvault-client sh -cex '
 
 SURVIVING_PEERS="/ip4/172.28.0.16/tcp/4001,/ip4/172.28.0.17/tcp/4001,/ip4/172.28.0.18/tcp/4001,/ip4/172.28.0.19/tcp/4001,/ip4/172.28.0.20/tcp/4001,/ip4/172.28.0.21/tcp/4001"
 
-echo "=== [9/10] Zero-Local-State 'recover-from-seed' (Full & Selective '--filter') after 4 Kills + 1 Decommission + 1 Bit-Rot ==="
+echo "=== [10/12] Zero-Local-State 'recover-from-seed' (Full & Selective '--filter') after 4 Kills + 1 Decommission + 1 Bit-Rot ==="
 T_REC0_S=$(date +%s)
 docker exec -w /tmp/client-fresh-recovery-state parvault-client /usr/local/bin/parvault \
     --peers "$SURVIVING_PEERS" \
@@ -284,10 +333,10 @@ docker exec parvault-client sh -cex '
     test ! -e /workspace/selective_vault/data/blob.bin
 '
 
-echo "=== [10/10] Cross-Machine 'parvault file store' -> 'parvault file restore --key-hex' with Wiped Local State ==="
+echo "=== [11/12] Cross-Machine 'parvault file store' -> 'parvault file restore --key-hex' with Wiped Local State ==="
 docker exec -e SURVIVING_PEERS="$SURVIVING_PEERS" parvault-client sh -cex '
     mkdir -p /tmp/machine-a /tmp/machine-b
-    echo "cross-machine file store and restore verified on v0.2.0" > /tmp/machine-a/secret.txt
+    echo "cross-machine file store and restore verified on v0.3.0" > /tmp/machine-a/secret.txt
     sha256sum /tmp/machine-a/secret.txt > /tmp/secret.sha256
     OUT=$(/usr/local/bin/parvault --data-dir /tmp/machine-a/data --peers "$SURVIVING_PEERS" file store --path /tmp/machine-a/secret.txt)
     echo "$OUT"
@@ -298,12 +347,111 @@ docker exec -e SURVIVING_PEERS="$SURVIVING_PEERS" parvault-client sh -cex '
     sha256sum -c /tmp/secret.sha256
 '
 
+echo "=== [12/12] Building deploy/Dockerfile.router-soc (FROM scratch) & Live 48 MiB Cgroup SoC Proof ==="
+docker build -f deploy/Dockerfile.router-soc -t parvault:router-soc .
+docker images parvault:router-soc
+ROUTER_SOC_IMAGE_SIZE="$(docker images parvault:router-soc --format '{{.Size}}')"
+
+docker rm -f parvault-soc-extract >/dev/null 2>&1 || true
+docker create --name parvault-soc-extract parvault:router-soc >/dev/null
+docker cp parvault-soc-extract:/parvault /tmp/parvault-soc-bin
+docker rm -f parvault-soc-extract >/dev/null
+SOC_BIN_BYTES="$(stat -c%s /tmp/parvault-soc-bin)"
+SOC_BIN_MIB="$(awk "BEGIN {printf \"%.2f MiB\", ${SOC_BIN_BYTES}/1048576}")"
+echo "Stripped parvault (--profile soc, musl) binary size: ${SOC_BIN_MIB} (${SOC_BIN_BYTES} bytes)"
+echo "Total parvault:router-soc (FROM scratch) image size : ${ROUTER_SOC_IMAGE_SIZE}"
+
+# Start a live `parvault:router-soc` appliance container constrained to --memory=48m --memory-swap=48m
+docker run -d --name parvault-router-soc \
+    --network parvault-acceptance-net --ip 172.28.0.60 \
+    --memory=48m --memory-swap=48m \
+    parvault:router-soc
+sleep 2
+
+SOC_DAEMON_OOM="$(docker inspect -f '{{.State.OOMKilled}}' parvault-router-soc)"
+SOC_DAEMON_RUNNING="$(docker inspect -f '{{.State.Running}}' parvault-router-soc)"
+if [ "$SOC_DAEMON_OOM" != "false" ] || [ "$SOC_DAEMON_RUNNING" != "true" ]; then
+    echo "ERROR: parvault-router-soc daemon failed inside 48m cgroup (OOMKilled=$SOC_DAEMON_OOM, Running=$SOC_DAEMON_RUNNING)"
+    docker logs parvault-router-soc || true
+    exit 1
+fi
+
+# Verify embedded RouterNasStatusServer HTTP telemetry on 172.28.0.60:4080
+SOC_HEALTH_JSON="$(docker exec parvault-client wget -qO- http://172.28.0.60:4080/api/v1/health || true)"
+echo "parvault-router-soc /api/v1/health: $SOC_HEALTH_JSON"
+echo "$SOC_HEALTH_JSON" | grep -Eq '"hardware_profile"[[:space:]]*:[[:space:]]*"router-soc"'
+
+# Store and restore a multi-stripe (5 MiB = 5 x 1 MiB stripes) payload inside a 48 MiB cgroup container!
+docker volume rm -f "$SOC_VOL_NAME" >/dev/null 2>&1 || true
+docker volume create "$SOC_VOL_NAME" >/dev/null
+SOC_EXPECTED_SHA256="$(docker run --rm -v "$SOC_VOL_NAME:/mnt/nas" parvault:acceptance sh -ce '
+    mkdir -p /mnt/nas/store-data /mnt/nas/restore-data
+    dd if=/dev/urandom of=/mnt/nas/router_soc_5mib.bin bs=1048576 count=5 status=none
+    sha256sum /mnt/nas/router_soc_5mib.bin | awk "{print \$1}"
+')"
+
+SOC_STORE_OUT="$(docker run --name parvault-soc-store \
+    --network parvault-acceptance-net \
+    --memory=48m --memory-swap=48m \
+    -v "$SOC_VOL_NAME:/mnt/nas" \
+    parvault:router-soc \
+    --profile router-soc \
+    --data-dir /mnt/nas/store-data \
+    file store --path /mnt/nas/router_soc_5mib.bin)"
+echo "$SOC_STORE_OUT"
+
+SOC_STORE_OOM="$(docker inspect -f '{{.State.OOMKilled}}' parvault-soc-store)"
+SOC_STORE_EXIT="$(docker inspect -f '{{.State.ExitCode}}' parvault-soc-store)"
+docker rm -f parvault-soc-store >/dev/null
+if [ "$SOC_STORE_OOM" != "false" ] || [ "$SOC_STORE_EXIT" != "0" ]; then
+    echo "ERROR: parvault-soc-store hit OOM or failed in 48m cgroup (OOMKilled=$SOC_STORE_OOM, Exit=$SOC_STORE_EXIT)"
+    exit 1
+fi
+echo "$SOC_STORE_OUT" | grep -Eq "Total Stripes[[:space:]]*:[[:space:]]*5"
+
+SOC_ROOT="$(echo "$SOC_STORE_OUT" | awk '/File Merkle Root/ {print $5}')"
+SOC_KEY="$(echo "$SOC_STORE_OUT" | awk '/Master Key/ {print $5}')"
+
+# Wipe local store-data so restore pulls all 5 stripes over libp2p inside another 48 MiB cgroup container!
+docker run --rm -v "$SOC_VOL_NAME:/mnt/nas" parvault:acceptance rm -rf /mnt/nas/store-data
+
+SOC_RESTORE_OUT="$(docker run --name parvault-soc-restore \
+    --network parvault-acceptance-net \
+    --memory=48m --memory-swap=48m \
+    -v "$SOC_VOL_NAME:/mnt/nas" \
+    parvault:router-soc \
+    --profile router-soc \
+    --data-dir /mnt/nas/restore-data \
+    file restore "$SOC_ROOT" --output /mnt/nas/restored_5mib.bin --key-hex "$SOC_KEY")"
+echo "$SOC_RESTORE_OUT"
+
+SOC_RESTORE_OOM="$(docker inspect -f '{{.State.OOMKilled}}' parvault-soc-restore)"
+SOC_RESTORE_EXIT="$(docker inspect -f '{{.State.ExitCode}}' parvault-soc-restore)"
+docker rm -f parvault-soc-restore >/dev/null
+if [ "$SOC_RESTORE_OOM" != "false" ] || [ "$SOC_RESTORE_EXIT" != "0" ]; then
+    echo "ERROR: parvault-soc-restore hit OOM or failed in 48m cgroup (OOMKilled=$SOC_RESTORE_OOM, Exit=$SOC_RESTORE_EXIT)"
+    exit 1
+fi
+
+SOC_ACTUAL_SHA256="$(docker run --rm -v "$SOC_VOL_NAME:/mnt/nas" parvault:acceptance sh -ce 'sha256sum /mnt/nas/restored_5mib.bin | awk "{print \$1}"')"
+if [ "$SOC_ACTUAL_SHA256" != "$SOC_EXPECTED_SHA256" ]; then
+    echo "ERROR: SHA-256 mismatch after 48m cgroup Router-SoC restore ($SOC_ACTUAL_SHA256 != $SOC_EXPECTED_SHA256)"
+    exit 1
+fi
+
+SOC_DAEMON_OOM_AFTER="$(docker inspect -f '{{.State.OOMKilled}}' parvault-router-soc)"
+if [ "$SOC_DAEMON_OOM_AFTER" != "false" ]; then
+    echo "ERROR: parvault-router-soc daemon OOMKilled during multi-stripe transfer!"
+    exit 1
+fi
+
 echo "================================================================================"
-echo " PARVAULT v0.2.0 MULTI-CONTAINER DOCKER REGRESSION SUMMARY"
+echo " PARVAULT v0.3.0 MULTI-CONTAINER & ROUTER-SOC DOCKER ACCEPTANCE SUMMARY"
 echo "================================================================================"
 echo " Base Image             : ${BASE_IMAGE}"
-echo " Containers Deployed    : 13 (1 parvault-seed + 11 parvault daemon + 1 client)"
+echo " Containers Deployed    : 14 (1 parvault-seed + 11 daemon + 1 router-soc + 1 client)"
 echo " Client Shared Volumes  : ${CLIENT_MOUNTS} (strictly isolated)"
+echo " Zero-IP LAN Discovery  : PASS (${DISCOVERED_COUNT} daemons auto-discovered with 0 IPs)"
 echo " Initial Sync (v1)      : ${TOTAL_SHARDS_V1} shards across 10 nodes (${SYNC_V1_SECS}s)"
 echo " Continuous Watch (v2)  : PASS (live update + tombstone pruning over libp2p)"
 echo " Lite-Client Failover   : PASS (1.0x seed syndication + NAS-death mesh recovery)"
@@ -311,5 +459,8 @@ echo " Graceful Node Leave    : PASS (parvault-node-5 -> parvault-node-11: ${NOD
 echo " Bit-Rot Scrubbing      : PASS (1 corrupted shard detected & quarantined)"
 echo " Disaster Recovery      : PASS (4 killed + 1 left + 2 restarted, ${RECOVER_SECS}s)"
 echo " Cross-Machine File CLI : PASS (file store -> wipe -> file restore verified)"
+echo " Router-SoC Binary      : ${SOC_BIN_MIB} stripped static musl (--profile soc)"
+echo " Router-SoC Image       : ${ROUTER_SOC_IMAGE_SIZE} (FROM scratch)"
+echo " 48 MiB Cgroup SoC Gate : PASS (5 x 1 MiB stripes store+restore, 0 OOM kills)"
 echo "================================================================================"
 echo "=== ACCEPTANCE GATE PASSED ==="

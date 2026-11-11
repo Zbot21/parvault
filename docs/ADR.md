@@ -253,3 +253,123 @@
   4. **TLA+ Formal Proof & `cargo test` Integration (`specs/ParVaultLiteClientAndSeedFailover.tla` & `tests/tla_formal_proofs_integration.rs`):**
      - Authored `specs/ParVaultLiteClientAndSeedFailover.tla` verifying `ZeroKnowledgeSeedAndMeshInvariant`, `NasDeathSurvivableInvariant`, `SelectiveBandwidthSavingInvariant`, and `EventuallySelectiveRestoreComplete` across all reachable states (`0` errors).
      - Added `tests/tla_formal_proofs_integration.rs` which invokes `tlc2.TLC` on all 6 `.tla` specifications during `cargo test --release` and updated `.github/workflows/ci.yml` to provision Java 21 + `tla2tools.jar` in `rust-tests`.
+
+---
+
+## ADR-18: Zero-IP Signed LAN Discovery, 4-Word SAS Pairing, Online WAN Rendezvous, and Tiny-SoC 1 MiB Streaming Profile
+
+- **Status:** Accepted & Implemented (`v0.3.0`)
+- **Context:**
+  1. **Zero-Configuration Usability on Home Networks:** In `v0.2.0`, linking peers required users to discover each other's IP addresses and manually pass `/ip4/<ip>/tcp/<port>/p2p/<PeerId>` flags to CLI commands or populate `config.toml`. Non-technical household users and homelabbers deploying across laptops, phones, and home router Cloud-NAS boxes cannot be expected to inspect router DHCP lease tables or type 60-character multiaddr strings.
+  2. **DHCP IP Churn & Self-Healing:** Residential routers routinely reassign internal IPv4 addresses when devices reconnect to Wi-Fi. Static IP multiaddr configurations break upon DHCP lease renegotiation unless nodes can dynamically advertise and re-verify their cryptographic `PeerId` on the LAN.
+  3. **Router SoC Memory Constraints & 1 MiB Streaming Profile:** With `16 MiB` Reed-Solomon stripes, transient memory during erasure coding and reconstruction peaks at `~74.6 MiB` (`VmHWM`). Residential gateway routers (OpenWrt, prplOS) running on MediaTek Filogic or Rockchip SoCs with 512 MiB–1 GiB total system RAM impose strict `< 32 MiB` active resident set (`VmRSS`) and `< 48 MiB` peak memory cgroup ceilings. To operate safely as a background appliance without OOM risk, the streaming stripe size must be configurable down to `1 MiB` (`SOC_ROUTER_STRIPE_SIZE_BYTES = 1,048,576`), reducing peak `VmHWM` below `16 MiB` while retaining 100% wire and manifest interoperability with desktop nodes.
+  4. **Zero-IP Online WAN Peering & ISP Dynamic-IP Resiliency:** Beyond local LANs, peers need to connect across cities and ISPs without public static IPs, third-party DynDNS subscriptions, or manual port forwarding. Nodes need STUN-over-Noise external address reflection to discover their public WAN endpoints and a zero-knowledge rendezvous mailbox on seed anchors to trade encrypted `WanPeerCard`s via human-friendly 4-word codes.
+  5. **Zero-Pairing Public Commons ("Public BitTorrent Tracker" WoT Mode):** Private join codes and invitation chains provide high isolation for closed friend rings, but create initial onboarding friction for users trying `parvault` on the open internet. Because `parvault` already enforces end-to-end client-side post-quantum AEAD encryption, `10-of-20` Reed-Solomon erasure coding, pre-decoding Byzantine Merkle quarantine, and `/24` subnet caps, an open **Public Commons Mode** (`--public --tracker <MULTIADDR>`) can safely admit stranger peers without manual pairing codes while using Hashcash Proof-of-Work (`PublicCommonsTicket`) to deter Sybil flood attacks.
+- **Decision:**
+  1. **Cryptographically Signed Zero-IP LAN Discovery (`LanBeaconPacket` & `LanBeaconResponder`):**
+     - Nodes broadcast periodic signed UDP beacons (default UDP port `4009`, multicast group `239.255.80.86`, broadcast `255.255.255.255`, and localhost fallback).
+     - Each `LanBeaconPacket` contains `libp2p_peer_id`, `device_peer_id`, `node_label`, `role`, `tcp_listen_port`, `available_bytes`, `timestamp_ms`, `ed25519_pubkey`, and an Ed25519 signature over domain `"parvault-lan-beacon-v1:"`.
+     - Recipients strictly verify the signature and ensure that `libp2p_peer_id` matches `ed25519_pubkey` to prevent rogue Wi-Fi clients from spoofing peer identities. Beacons older than 15 seconds are discarded.
+  2. **DHCP-Resilient Persistent Peer Registry (`KnownPeersStore` at `known_peers.json`):**
+     - Peer addresses are indexed by cryptographic `libp2p_peer_id`.
+     - When a node's IP address changes due to DHCP lease renewal, `KnownPeersStore::upsert_discovered` dynamically updates the node's `/ip4/.../tcp/...` Multiaddr while keeping its trusted identity pinned.
+     - All high-level CLI commands (`watch-folder`, `restore-folder`, `file store`, `file restore`, `leave`, `status`) automatically call `resolve_zero_config_peers` when no `--peers` flags are specified.
+  3. **4-Word BIP-39 SAS Pairing (`parvault pair` / `parvault join`):**
+     - A human-friendly 4-word Short Authentication String (SAS) code (e.g., `shield-copper-alpine-matrix`) is deterministically derived from `(libp2p_peer_id, owner_pq_fingerprint, pairing_nonce)` using `BIP39_ENGLISH_WORDLIST`.
+     - The hosting node broadcasts a commitment in its beacon; the joining node verifies the SAS match and pins the trusted peer in `known_peers.json` without passwords or manual key exchanges.
+  4. **Configurable Streaming Stripe Sizing (`HardwareProfile` & `BlockStore`):**
+     - Introduced `HardwareProfile`:
+       - `RouterSoc`: `1 MiB` stripe size (`1,048,576` bytes), `64 MiB` minimum disk reserve, `max_connections = 24`.
+       - `HomelabNas`: `4 MiB` stripe size (`4,194,304` bytes), `1 GiB` minimum disk reserve.
+       - `Desktop`: `16 MiB` stripe size (`16,777,216` bytes), `5 GiB` minimum disk reserve.
+     - `FileManifest` structures record stripe counts and boundaries independently of node stripe profiles; a file stored with `1 MiB` stripes by a router can be restored by a `16 MiB` desktop node, and vice-versa.
+  5. **Turnkey Appliance Mode (`parvault up`):**
+     - Combines P2P storage daemon, signed UDP beacon responder, embedded `RouterNasStatusServer` (`:4080`), and background folder sync into a single command for OpenWrt `procd` and prplOS LXC container deployments.
+  6. **Zero-Knowledge Online WAN Rendezvous & STUN-over-Noise Reflection:**
+     - Added `RegisterWanRendezvous` and `LookupWanRendezvous` to `MeshWireRequest` / `MeshWireResponse`.
+     - 4-word WAN codes derive a blinded rendezvous slot key `slot_key = HKDF(code, "parvault-wan-rendezvous-slot-v1")` and AEAD wrapping key `wrap_key = HKDF(code, "parvault-wan-rendezvous-wrap-v1")`. Seed anchors store opaque encrypted `WanPeerCard`s without learning pairing codes or metadata.
+     - Noise handshake metadata reflects the observed public WAN socket address back to nodes (`observed_external_addr`), eliminating external STUN dependencies.
+     - Dynamic-IP presence publishes encrypted endpoint updates to a blinded DDNS slot, surviving residential ISP address rotations without manual intervention.
+  7. **Open Public WoT & Zero-Pairing BitTorrent-Style Public Swarm Mode (`--public --tracker`):**
+     - Added `TrustPoolMode` (`PrivateRing`, `PublicCommons`, `Hybrid`) in `WebOfTrustRegistry` (`src/network/wot.rs`).
+     - Added self-signed Hashcash Proof-of-Work ticket `PublicCommonsTicket` (`DEFAULT_PUBLIC_WOT_POW_BITS = 12`) allowing stranger nodes to join public swarms without invitations.
+     - `parvault-seed --mode public-bootstrap` serves as a public tracker anchor indexing active swarm peers under `PUBLIC_COMMONS_SWARM_SLOT`.
+     - Nodes in `--public` mode enforce mandatory `10-of-20` `Consumer` Reed-Solomon redundancy and pre-decoding Merkle quarantine, surviving 10 offline or malicious peers out of 20 with zero data loss.
+- **Consequences:**
+  - Zero IP addresses required for home LAN onboarding or remote 4-word WAN pairing.
+  - Zero-friction public swarm onboarding (`--public --tracker ...`) with zero join codes or pairing setup.
+  - Full DHCP and ISP dynamic IP self-healing.
+  - Peak memory usage during erasure coding drops from `74.6 MiB` to `< 16 MiB` under `--profile router-soc`, guaranteeing safe operation inside a 32–48 MiB cgroup.
+  - Backward compatible: all v0.2.0 configs, tests, and CLI flags continue to work unchanged.
+
+---
+
+## ADR-19: 4-Vector Privacy-Preserving Bad-Actor & Illegal-Content Shard Eviction Engine
+
+- **Status:** Accepted & Implemented (`v0.3.0`)
+- **Context:**
+  1. **Legal Compliance & Node Sovereignty on Public Networks:** As `parvault` enables residential router Cloud-NAS appliances and open Public Commons swarms (`ADR-18`), home users and seed operators require unambiguous administrative mechanisms to evict abusive peers, spam flooders, or known illegal content stripes from their physical storage.
+  2. **The Forensic Privacy Dilemma:** In traditional storage systems, administrators maintain server logs containing plaintext IP addresses, file paths, and user account IDs. In ParVault, storing plaintext IP addresses or cross-node correlatable identifiers on disk would destroy the system's core zero-knowledge privacy guarantees: anyone gaining physical access to a confiscated disk, stolen NAS drive, or filesystem backup could correlate and deanonymize innocent uploaders.
+  3. **Multi-Vector Eviction Needs:** Eviction must function across four distinct vectors:
+     - *Vector 1 (Network Origin):* Eviction by IP address or canonical CIDR subnet (`/24` IPv4, `/48` IPv6).
+     - *Vector 2 (Transport Identity):* Eviction by `libp2p` `PeerId`.
+     - *Vector 3 (Cryptographic Public Key Cohort):* Eviction by peer or voucher-issuer `ed25519_pubkey`, allowing seed anchors to purge all anonymous `.bshard` blinded shards uploaded by that bad actor's tickets or vouchers.
+     - *Vector 4 (Content Hash):* Eviction by `stripe_merkle_root` or `BlindedLocator`, permanently blocking illegal content stripes regardless of which peer or IP uploads them.
+  4. **Forensic File Shredding vs. Metadata-Only Deletion:** Simply unlinking a file from a filesystem leaves data blocks intact on flash or magnetic media until overwritten. To ensure complete legal purge, evicted shards must be overwritten with `0x00` zero bytes across their entire allocation prior to unlinking.
+- **Decision:**
+  1. **Zero-Plaintext-IP Disk Privacy Architecture (`PrivacyPreservingEvictionEngine`):**
+     - Each node generates a local random 32-byte secret seed `K_node_evict` persisted at `<data_dir>/eviction_hmac.seed` with strict `0600` permissions (`write_secret_file_atomic`), held in memory with `ZeroizeOnDrop`, and never transmitted over the wire or stored in data indices.
+     - The persistent index `<data_dir>/eviction_index.bin` stores **ZERO plaintext IP addresses and ZERO plaintext PeerIds**:
+       $$\text{tag}_{\text{ip}} = \text{HMAC-SHA256}(K_{\text{node\_evict}}, \text{"parvault-evict-ip-v1:"} \parallel \text{canonical\_ip\_bytes})$$
+       $$\text{tag}_{\text{subnet}} = \text{HMAC-SHA256}(K_{\text{node\_evict}}, \text{"parvault-evict-subnet-v1:"} \parallel \text{canonical\_cidr})$$
+       $$\text{tag}_{\text{peer\_id}} = \text{HMAC-SHA256}(K_{\text{node\_evict}}, \text{"parvault-evict-peerid-v1:"} \parallel \text{peer\_id})$$
+     - Because $K_{\text{node\_evict}}$ is unique per node, two honest nodes compute completely uncorrelated HMAC tags for the same IP ($H_A(\text{IP}) \neq H_B(\text{IP})$), preventing cross-node database joining attacks on seized media.
+  2. **4 Eviction Vectors (`EvictionTarget`):**
+     - `IpAddress(IpAddr)` & `IpSubnet(String)`: Purges all shards stored during sessions from that IP/subnet and installs an ingress blocklist rule.
+     - `Libp2pPeerId(String)`: Purges regular shards associated with that transport identity and blocks future connections.
+     - `PeerOrIssuerPubkey([u8; 32])`: Queries peer admission and voucher issuance mappings on seed anchors to identify and shred all associated anonymous `.bshard` blinded shards across the storage pool.
+     - `StripeMerkleRoot([u8; 32])` & `BlindedLocator([u8; 32])`: Locates matching `.shard` or `.bshard` files by content root or locator, shreds them immediately, and records a permanent tombstone blocking re-upload.
+  3. **Cryptographically Signed Eviction Orders (`SignedBadActorEvictionOrder`):**
+     - Eviction orders are signed by authorized entities under domain `"parvault-bad-actor-eviction-order-v1:"` binding `(order_id, target, reason, issued_at_ms, expires_at_ms)`.
+     - Nodes verify signatures against `NodeConfig::eviction_authorities` (defaulting to local node identity, Genesis Root, and configured seed/tracker anchors).
+     - Propagated across the mesh via `MeshWireRequest::BroadcastEvictionOrder` and `MeshWireResponse::EvictionOrderAck`.
+  4. **Multi-Pass Zero-Wipe File Shredding (`shred_and_unlink_file`):**
+     - Before calling `fs::remove_file`, the engine overwrites every byte of the target `.shard` or `.bshard` file with `0x00` zero bytes in 64 KiB chunks, invokes `File::sync_all()` to flush controller write buffers, and only then unlinks the path. The purged byte count is returned in `EvictionPurgeReport::zero_wiped_bytes`.
+  5. **Persistent Ingress Firewall:**
+     - `is_ingress_blocked(remote_ip, remote_peer_id)` is evaluated in memory prior to accepting `PutShard`, `PutBlindedShard`, `RenewBlindedLease`, `RelayPqOnionEnvelope`, or public ticket admission, terminating abusive requests with zero disk allocation.
+  6. **Public Tracker Anti-Griefing Governance & Pinned Authority:**
+     - In `--public` (\"Public Commons / Public Tracker\") mode, random public peers MUST NEVER be able to evict anyone else's shards.
+     - Public nodes reject `BroadcastEvictionOrder` from arbitrary peers (`accepted: false`). They enforce external eviction orders **only** when signed by a pinned/configured `eviction_authorities` public key (such as their public tracker's official `tracker_admin_pubkey` or their own local `NodeIdentity`).
+     - Trackers maintain an isolated `tracker_admin.seed` (`0600`) as the sovereign authority for public swarm governance.
+  7. **Cryptographic Reporter Burden-of-Proof (`VerifiableAbuseReport`):**
+     - Because storage nodes and tracker operators are zero-knowledge and cannot inspect encrypted shards, the legal and cryptographic burden of proof is strictly on the reporter.
+     - Anyone alleging illegal distribution of content must submit a `VerifiableAbuseReport` containing `(FileManifest, disclosed_master_key_hex, sample_stripe_index, sample_shards, legal_allegation, reporter_id_or_contact, reported_uploader_ip)`.
+     - The tracker operator / node cryptographically verifies:
+       1. Shard hashes match `stripe.shard_hashes` and `stripe.stripe_merkle_root` in the manifest.
+       2. Reed-Solomon reconstructs the stripe ciphertext.
+       3. `decrypt_stripe` under `disclosed_master_key` and `manifest.file_salt` passes 128-bit `AES-256-GCM` authentication tag verification.
+       4. The verified plaintext buffer is immediately zeroized in RAM via `zeroize::Zeroize`, ensuring decrypted illegal bytes never touch disk or persist in memory.
+     - **Mathematical Anti-Framing:** Malicious actors cannot frame honest users' private backups because guessing or forging a 256-bit `MasterKey` results in `AES-256-GCM` authentication failure with probability $1 - 2^{-128}$.
+  8. **Human-in-the-Loop Admin Takedown Queue & 2-Lane Public Tracker Governance (`PublicTrackerTakedownQueue`):**
+     - Even when cryptographic proof passes, submission **ONLY queues the report (`PendingAdminReview`)** at `<data_dir>/admin_takedown_queue.bin` (`0600`).
+     - Shards are **NEVER auto-evicted** without human Public Tracker Admin review, eliminating algorithmic censorship and false positives.
+     - **Lane 1 (Reporter Proof Review):** The Public Tracker Admin reviews proofs via `parvault-seed admin {list-takedowns, inspect-takedown}`. Upon approval (`parvault-seed admin approve-takedown`), the tracker signs `SignedBadActorEvictionOrder` under `tracker_admin.seed` and broadcasts to the swarm with `--propagate`.
+     - **Lane 2 (Emergency Law-Enforcement / Warrant Eviction):** If an offender stores illegal content privately without sharing keys, and law enforcement or legal authorities issue a formal warrant against a specific uploader IP or CIDR, the Public Tracker Admin invokes `parvault-seed admin emergency-evict --warrant-ref <REF> --ip <IP> --propagate`. The tracker records an `EmergencyAdminActionRecord`, signs orders under `tracker_admin.seed`, resolves and evicts associated `PeerOrIssuerPubkey` voucher cohorts, purges local shards with multi-pass `0x00` shredding, and broadcasts to public swarm nodes. Raw IP strings are still **never** written into `eviction_index.bin`!
+  9. **Strict Mode Isolation (Private Ring-of-Trust vs. Public Commons):**
+     - In `TrustPoolMode::PrivateRing` (default private/family/co-op mode), external `tracker_admin_pubkey` authorities are **unconditionally ignored and rejected**. Private rings answer exclusively to the local node operator (`node_identity`) or explicit ring `genesis_pubkey`. Unilateral tracker admin powers cannot reach into private vaults.
+     - In `TrustPoolMode::PublicCommons` / `Hybrid` (`--public --tracker <ADDR>`), storage nodes trust their pinned `tracker_admin_pubkey` (plus local operator) and **reject 100% of non-admin public peers**, preventing griefing while maintaining central public swarm governance.
+  10. **`M-of-N` Federated Public Tracker Operator Council Quorum (`TrackerOperatorCosignature`):**
+     - In federations with multiple independent `parvault-seed` public tracker operators, a single-signer model would allow one rogue or compromised tracker operator to broadcast unilateral eviction orders to wipe honest shards and steal storage capacity.
+     - ParVault implements threshold co-signing: `SignedBadActorEvictionOrder` carries `cosignatures: Vec<TrackerOperatorCosignature>` where each cosigner signs the identical canonical order payload.
+     - **Majority Quorum Threshold:** `default_tracker_quorum_threshold(N)` enforces strict majority: $1$-of-$1$, $2$-of-$2$, $2$-of-$3$, $3$-of-$5$, etc. Configurable via `tracker_eviction_quorum`.
+     - **Anti-Rogue Invariant:** An unvetted rogue tracker host has 0 votes and is rejected immediately. Even an admitted council operator cannot unilaterally purge shards when $N \ge 2$ until $M$-of-$N$ distinct council operators co-sign via `parvault-seed admin cosign-eviction`.
+     - **Local Sovereignty Guarantee:** A node operator running `parvault evict` on their own local hardware is always honored ($1$-of-$1$).
+  11. **CLI Subcommands:**
+     - Reporters submit abuse via `parvault report-abuse --tracker <MULTIADDR> --manifest <PATH> --disclosed-key-hex <HEX> --allegation <TEXT>`.
+     - Tracker admins manage takedowns via `parvault-seed admin {show-authority, list-takedowns, inspect-takedown, approve-takedown, reject-takedown, emergency-evict, cosign-eviction}` with optional `--export-order <PATH>` and `--propagate`.
+     - Direct local operator purges via `parvault evict` and `parvault-seed evict`.
+- **Consequences:**
+  - Complete operational sovereignty: node operators and tracker administrators can legally comply with abuse takedown requests and repel network attacks.
+  - Zero degradation of uploader privacy: forensic inspection of disk images reveals no uploader IP addresses or cross-node correlatable identifiers.
+  - Cryptographically ironclad anti-griefing: honest backups cannot be taken down or framed without possession of the owner's 256-bit MasterKey ($2^{-128}$ security), and rogue public trackers cannot unilaterally wipe data without $M$-of-$N$ council quorum.
+  - High-performance non-blocking ingress filtering using in-memory HMAC tag lookups.

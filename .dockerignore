@@ -1,0 +1,6 @@
+target/
+.git/
+**/.parvault-data/
+**/.parvault-seed-data/
+*.manifest.bin
+*.catalog.bin

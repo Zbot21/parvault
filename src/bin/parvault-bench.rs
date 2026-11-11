@@ -18,7 +18,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const STRIPE_SIZE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB per ADR-01
+const SOC_STRIPE_SIZE_BYTES: usize = BlockStore::SOC_ROUTER_STRIPE_SIZE_BYTES; // 1 MiB for Router SoC
+const DESKTOP_STRIPE_SIZE_BYTES: usize = BlockStore::DEFAULT_STRIPE_SIZE_BYTES; // 16 MiB per ADR-01
 const VALID_BIP39_SEED: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
@@ -29,9 +30,13 @@ const VALID_BIP39_SEED: &str =
     about = "Empirical wall-clock and /proc/self/status memory benchmark suite for ParVault"
 )]
 struct BenchCli {
-    /// Total streaming file payload size in MiB (must be a multiple of 16 MiB; default: 64 MiB = 4 stripes).
+    /// Total streaming file payload size in MiB (default: 64 MiB).
     #[arg(long, global = true, default_value_t = 64)]
     payload_mib: usize,
+
+    /// Target hardware profile to benchmark: 'router-soc' (1 MiB stripes), 'desktop' (16 MiB stripes), or 'all' (measures both).
+    #[arg(long, global = true, default_value = "all")]
+    profile: String,
 
     #[command(subcommand)]
     command: Option<BenchCommand>,
@@ -77,7 +82,7 @@ impl ProcMemSnapshot {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn trim_allocs() {
     extern "C" {
         fn malloc_trim(pad: usize) -> i32;
@@ -89,7 +94,7 @@ fn trim_allocs() {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn trim_allocs() {}
 
 fn parse_kib_field(s: &str) -> u64 {
@@ -159,35 +164,34 @@ fn unique_bench_temp_dir() -> PathBuf {
     dir
 }
 
-fn main() -> anyhow::Result<()> {
-    let cli = BenchCli::parse();
-    let _cmd = cli.command.unwrap_or(BenchCommand::Run);
-    let payload_mib = cli.payload_mib.max(16);
-    let payload_bytes = payload_mib * 1024 * 1024;
-    let num_stripes = payload_bytes.div_ceil(STRIPE_SIZE_BYTES);
+#[derive(Debug, Clone)]
+struct StreamingRunMetrics {
+    profile_name: String,
+    stripe_size_bytes: usize,
+    num_stripes: usize,
+    mem_baseline: ProcMemSnapshot,
+    mem_after_input_gen: ProcMemSnapshot,
+    mem_after_store: ProcMemSnapshot,
+    mem_after_restore: ProcMemSnapshot,
+    store_mib_s: f64,
+    restore_mib_s: f64,
+}
 
-    println!("================================================================================");
-    println!(
-        " ParVault Empirical Cryptography, Reed-Solomon & Memory Benchmark (`parvault-bench`)"
-    );
-    println!("================================================================================");
-    println!(
-        " Streaming Payload : {} MiB ({} x 16 MiB stripes)",
-        payload_mib, num_stripes
-    );
-    println!(
-        " Memory Telemetry  : Linux /proc/self/status (VmRSS, VmHWM) + getrusage(RUSAGE_SELF)"
-    );
-    println!();
-
-    // -------------------------------------------------------------------------
-    // Phase 1: Streaming Multi-Stripe Store & Restore with Process Memory Proof
-    // -------------------------------------------------------------------------
+fn run_streaming_profile(
+    profile_name: &str,
+    stripe_size_bytes: usize,
+    payload_mib: usize,
+) -> anyhow::Result<StreamingRunMetrics> {
+    trim_allocs();
     let mem_baseline = ProcMemSnapshot::capture();
     let bench_dir = unique_bench_temp_dir();
-    let input_path = bench_dir.join("streaming_payload.bin");
-    let output_path = bench_dir.join("restored_payload.bin");
+    let safe_label = profile_name.to_lowercase().replace([' ', '/', '-'], "_");
+    let input_path = bench_dir.join(format!("payload_{safe_label}.bin"));
+    let output_path = bench_dir.join(format!("restored_{safe_label}.bin"));
     let store_dir = bench_dir.join("block_store");
+
+    let payload_bytes = payload_mib * 1024 * 1024;
+    let num_stripes = payload_bytes.div_ceil(stripe_size_bytes);
 
     // Stream-generate input file on disk in 64 KiB chunks so test setup never allocates the full payload in RAM.
     {
@@ -204,10 +208,11 @@ fn main() -> anyhow::Result<()> {
     }
 
     let input_sha256 = compute_file_sha256_streaming(&input_path)?;
+    trim_allocs();
     let mem_after_input_gen = ProcMemSnapshot::capture();
 
     let quota = QuotaManager::new(10 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
-    let store = BlockStore::new(&store_dir, quota)?;
+    let store = BlockStore::new(&store_dir, quota)?.with_stripe_size_bytes(stripe_size_bytes);
     let master_key = MasterKey::generate();
 
     let store_start = Instant::now();
@@ -216,7 +221,7 @@ fn main() -> anyhow::Result<()> {
         &input_path,
         &master_key,
         ErasureTier::Homelab,
-        STRIPE_SIZE_BYTES,
+        stripe_size_bytes,
     )?;
     let store_elapsed = store_start.elapsed();
     let store_mib_s = (payload_mib as f64) / store_elapsed.as_secs_f64();
@@ -233,10 +238,70 @@ fn main() -> anyhow::Result<()> {
     let restored_sha256 = compute_file_sha256_streaming(&output_path)?;
     assert_eq!(
         input_sha256, restored_sha256,
-        "Restored streaming payload SHA-256 must match original input"
+        "Restored streaming payload SHA-256 must match original input for profile {}",
+        profile_name
     );
 
     let _ = fs::remove_dir_all(&bench_dir);
+
+    Ok(StreamingRunMetrics {
+        profile_name: profile_name.to_string(),
+        stripe_size_bytes,
+        num_stripes,
+        mem_baseline,
+        mem_after_input_gen,
+        mem_after_store,
+        mem_after_restore,
+        store_mib_s,
+        restore_mib_s,
+    })
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = BenchCli::parse();
+    let _cmd = cli.command.unwrap_or(BenchCommand::Run);
+    let payload_mib = cli.payload_mib.max(16);
+    let profile_req = cli.profile.to_lowercase();
+
+    println!("================================================================================");
+    println!(
+        " ParVault Empirical Cryptography, Reed-Solomon & Memory Benchmark (`parvault-bench`)"
+    );
+    println!("================================================================================");
+    println!(" Streaming Payload : {} MiB", payload_mib);
+    println!(" Selected Profile  : {}", cli.profile);
+    println!(
+        " Memory Telemetry  : Linux /proc/self/status (VmRSS, VmHWM) + getrusage(RUSAGE_SELF)"
+    );
+    println!("================================================================================");
+    println!();
+
+    // -------------------------------------------------------------------------
+    // Phase 1: Streaming Multi-Stripe Store & Restore with Process Memory Proof
+    // -------------------------------------------------------------------------
+    let mut streaming_results = Vec::new();
+
+    let run_soc = profile_req == "router-soc" || profile_req == "all";
+    let run_desktop =
+        profile_req == "desktop" || profile_req == "homelab-nas" || profile_req == "all";
+
+    // Run Router-SoC profile FIRST when requested, ensuring its peak VmHWM is measured
+    // from a fresh process baseline before any large 16 MiB desktop buffers are allocated.
+    if run_soc {
+        println!(">>> Running Profile: Router-SoC (1 MiB stripes, target < 32 MiB RAM)...");
+        let soc_res = run_streaming_profile("Router-SoC", SOC_STRIPE_SIZE_BYTES, payload_mib)?;
+        streaming_results.push(soc_res);
+    }
+
+    if run_desktop {
+        println!(">>> Running Profile: Desktop / Homelab-NAS (16 MiB stripes, high throughput)...");
+        let desk_res = run_streaming_profile(
+            "Desktop / Homelab-NAS",
+            DESKTOP_STRIPE_SIZE_BYTES,
+            payload_mib,
+        )?;
+        streaming_results.push(desk_res);
+    }
 
     // -------------------------------------------------------------------------
     // Phase 2: Cryptographic Primitive & Subkey Benchmarks
@@ -247,30 +312,48 @@ fn main() -> anyhow::Result<()> {
     let argon_ms = argon_start.elapsed().as_secs_f64() * 1000.0;
     std::hint::black_box(&derived_mk);
 
-    // Allocate a single 16 MiB stripe buffer for symmetric & Reed-Solomon throughput measurements
-    let mut stripe_buf = vec![0u8; STRIPE_SIZE_BYTES];
-    for (i, b) in stripe_buf.iter_mut().enumerate() {
+    // Single 1 MiB stripe for tiny SoC primitive measurement
+    let mut stripe_buf_1m = vec![0u8; SOC_STRIPE_SIZE_BYTES];
+    for (i, b) in stripe_buf_1m.iter_mut().enumerate() {
         *b = ((i.wrapping_mul(73).wrapping_add(19)) & 0xFF) as u8;
     }
     let file_salt = generate_file_salt();
 
-    // 2b. AES-256-GCM 16 MiB stripe encryption & decryption
-    let aes_enc_start = Instant::now();
-    let aes_ct = encrypt_stripe(&derived_mk, &file_salt, 0, &stripe_buf)?;
-    let aes_enc_elapsed = aes_enc_start.elapsed();
-    let aes_enc_mib_s = 16.0 / aes_enc_elapsed.as_secs_f64();
+    // 2b. AES-256-GCM 1 MiB & 16 MiB stripe encryption & decryption
+    let aes_enc_1m_start = Instant::now();
+    let aes_ct_1m = encrypt_stripe(&derived_mk, &file_salt, 0, &stripe_buf_1m)?;
+    let aes_enc_1m_elapsed = aes_enc_1m_start.elapsed();
+    let aes_enc_1m_mib_s = 1.0 / aes_enc_1m_elapsed.as_secs_f64();
 
-    let aes_dec_start = Instant::now();
-    let aes_pt = decrypt_stripe(&derived_mk, &file_salt, 0, &aes_ct)?;
-    let aes_dec_elapsed = aes_dec_start.elapsed();
-    let aes_dec_mib_s = 16.0 / aes_dec_elapsed.as_secs_f64();
-    assert_eq!(aes_pt.len(), stripe_buf.len());
-    drop(aes_pt);
+    let aes_dec_1m_start = Instant::now();
+    let aes_pt_1m = decrypt_stripe(&derived_mk, &file_salt, 0, &aes_ct_1m)?;
+    let aes_dec_1m_elapsed = aes_dec_1m_start.elapsed();
+    let aes_dec_1m_mib_s = 1.0 / aes_dec_1m_elapsed.as_secs_f64();
+    assert_eq!(aes_pt_1m.len(), stripe_buf_1m.len());
+    drop(aes_pt_1m);
+
+    // 16 MiB stripe buffer for desktop symmetric & Reed-Solomon throughput measurements
+    let mut stripe_buf_16m = vec![0u8; DESKTOP_STRIPE_SIZE_BYTES];
+    for (i, b) in stripe_buf_16m.iter_mut().enumerate() {
+        *b = ((i.wrapping_mul(73).wrapping_add(19)) & 0xFF) as u8;
+    }
+
+    let aes_enc_16m_start = Instant::now();
+    let aes_ct_16m = encrypt_stripe(&derived_mk, &file_salt, 0, &stripe_buf_16m)?;
+    let aes_enc_16m_elapsed = aes_enc_16m_start.elapsed();
+    let aes_enc_16m_mib_s = 16.0 / aes_enc_16m_elapsed.as_secs_f64();
+
+    let aes_dec_16m_start = Instant::now();
+    let aes_pt_16m = decrypt_stripe(&derived_mk, &file_salt, 0, &aes_ct_16m)?;
+    let aes_dec_16m_elapsed = aes_dec_16m_start.elapsed();
+    let aes_dec_16m_mib_s = 16.0 / aes_dec_16m_elapsed.as_secs_f64();
+    assert_eq!(aes_pt_16m.len(), stripe_buf_16m.len());
+    drop(aes_pt_16m);
 
     // 2c. PqVaultMasterKey (AES-256-GCM + ChaCha20-Poly1305 dual-cipher) 16 MiB stripe
     let pq_mk = PqVaultMasterKey::generate();
     let pq_enc_start = Instant::now();
-    let pq_ct = pq_mk.encrypt_stripe_pq(&file_salt, 0, &stripe_buf)?;
+    let pq_ct = pq_mk.encrypt_stripe_pq(&file_salt, 0, &stripe_buf_16m)?;
     let pq_enc_elapsed = pq_enc_start.elapsed();
     let pq_enc_mib_s = 16.0 / pq_enc_elapsed.as_secs_f64();
 
@@ -278,7 +361,7 @@ fn main() -> anyhow::Result<()> {
     let pq_pt = pq_mk.decrypt_stripe_pq(&file_salt, 0, &pq_ct)?;
     let pq_dec_elapsed = pq_dec_start.elapsed();
     let pq_dec_mib_s = 16.0 / pq_dec_elapsed.as_secs_f64();
-    assert_eq!(pq_pt.len(), stripe_buf.len());
+    assert_eq!(pq_pt.len(), stripe_buf_16m.len());
     drop(pq_pt);
     drop(pq_ct);
 
@@ -324,9 +407,36 @@ fn main() -> anyhow::Result<()> {
     // -------------------------------------------------------------------------
     // Phase 3: Reed-Solomon GF(2^8) Encoding & 4-Erasure Merkle Quarantine Reconstruction
     // -------------------------------------------------------------------------
-    // 3a. Consumer Tier (10-of-20)
+    // 3a. Router-SoC 1 MiB Stripe Reed-Solomon (Homelab 16-of-20)
+    let rs_soc_enc_start = Instant::now();
+    let soc_set = encode_ciphertext_stripe(0, &aes_ct_1m, ErasureTier::Homelab)?;
+    let rs_soc_enc_mib_s = 1.0 / rs_soc_enc_start.elapsed().as_secs_f64();
+
+    let soc_tree = MerkleTree::from_shards(&soc_set.shards);
+    let soc_proofs: Vec<Option<_>> = (0..soc_set.shards.len())
+        .map(|i| soc_tree.generate_proof(i))
+        .collect();
+    let mut soc_slots: Vec<Option<Vec<u8>>> = soc_set.shards.into_iter().map(Some).collect();
+    for slot in soc_slots.iter_mut().take(4) {
+        *slot = None; // Drop 4 shards
+    }
+    let rs_soc_rec_start = Instant::now();
+    let (soc_reconstructed, soc_poisoned) = reconstruct_zero_trust_with_quarantine(
+        soc_slots,
+        Some(&soc_proofs),
+        soc_set.k_data,
+        soc_set.m_parity,
+        &soc_set.shard_hashes,
+        soc_set.stripe_merkle_root,
+    )?;
+    let rs_soc_rec_mib_s = 1.0 / rs_soc_rec_start.elapsed().as_secs_f64();
+    assert!(soc_poisoned.is_empty());
+    assert_eq!(soc_reconstructed.len(), 20);
+    drop(soc_reconstructed);
+
+    // 3b. Consumer Tier (10-of-20) on 16 MiB Stripe
     let rs_cons_enc_start = Instant::now();
-    let cons_set = encode_ciphertext_stripe(0, &aes_ct, ErasureTier::Consumer)?;
+    let cons_set = encode_ciphertext_stripe(0, &aes_ct_16m, ErasureTier::Consumer)?;
     let rs_cons_enc_mib_s = 16.0 / rs_cons_enc_start.elapsed().as_secs_f64();
 
     let cons_tree = MerkleTree::from_shards(&cons_set.shards);
@@ -351,9 +461,9 @@ fn main() -> anyhow::Result<()> {
     assert_eq!(cons_reconstructed.len(), 20);
     drop(cons_reconstructed);
 
-    // 3b. Homelab Tier (16-of-20)
+    // 3c. Homelab Tier (16-of-20) on 16 MiB Stripe
     let rs_home_enc_start = Instant::now();
-    let home_set = encode_ciphertext_stripe(0, &aes_ct, ErasureTier::Homelab)?;
+    let home_set = encode_ciphertext_stripe(0, &aes_ct_16m, ErasureTier::Homelab)?;
     let rs_home_enc_mib_s = 16.0 / rs_home_enc_start.elapsed().as_secs_f64();
 
     let home_tree = MerkleTree::from_shards(&home_set.shards);
@@ -377,46 +487,97 @@ fn main() -> anyhow::Result<()> {
     assert!(home_poisoned.is_empty());
     assert_eq!(home_reconstructed.len(), 20);
     drop(home_reconstructed);
-    drop(aes_ct);
-    drop(stripe_buf);
+    drop(aes_ct_1m);
+    drop(aes_ct_16m);
+    drop(stripe_buf_1m);
+    drop(stripe_buf_16m);
 
     // -------------------------------------------------------------------------
     // Output Markdown Tables
     // -------------------------------------------------------------------------
-    println!("### 1. Streaming Memory Footprint (`{payload_mib} MiB` File in `16 MiB` Stripes)");
-    println!("| Measurement Checkpoint | `VmRSS` (Current Resident) | `VmHWM` / `ru_maxrss` (Peak Resident) | Streaming Throughput |");
-    println!("| :--- | :---: | :---: | :---: |");
     println!(
-        "| **Process Baseline (Startup)** | `{:.2} MiB` (`{} KiB`) | `{:.2} MiB` (`{} KiB`) | — |",
-        mem_baseline.rss_mib(),
-        mem_baseline.vm_rss_kib,
-        mem_baseline.hwm_mib(),
-        mem_baseline.vm_hwm_kib
-    );
-    println!(
-        "| **After `{payload_mib} MiB` 64 KiB-Chunked File Setup** | `{:.2} MiB` (`{} KiB`) | `{:.2} MiB` (`{} KiB`) | — |",
-        mem_after_input_gen.rss_mib(),
-        mem_after_input_gen.vm_rss_kib,
-        mem_after_input_gen.hwm_mib(),
-        mem_after_input_gen.vm_hwm_kib
-    );
-    println!(
-        "| **After `store_file_streaming` (`{num_stripes} x 16 MiB`, `16-of-20`)** | `{:.2} MiB` (`{} KiB`) | `{:.2} MiB` (`{} KiB`) | **`{:.1} MiB/s`** |",
-        mem_after_store.rss_mib(),
-        mem_after_store.vm_rss_kib,
-        mem_after_store.hwm_mib(),
-        mem_after_store.vm_hwm_kib,
-        store_mib_s
-    );
-    println!(
-        "| **After `restore_file_streaming` + SHA-256 Verify** | `{:.2} MiB` (`{} KiB`) | `{:.2} MiB` (`{} KiB`) | **`{:.1} MiB/s`** |",
-        mem_after_restore.rss_mib(),
-        mem_after_restore.vm_rss_kib,
-        mem_after_restore.hwm_mib(),
-        mem_after_restore.vm_hwm_kib,
-        restore_mib_s
+        "### 1. Empirical Streaming Memory Footprint & Throughput (`{payload_mib} MiB` Payload)"
     );
     println!();
+    println!("#### Comparative Overview");
+    println!("| Profile | Stripe Size | Stripes | Baseline RSS | Peak VmHWM | SoC < 32 MiB Gate | Store Speed | Restore Speed |");
+    println!("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |");
+    for res in &streaming_results {
+        let stripe_label = if res.stripe_size_bytes >= 1024 * 1024 {
+            format!("{} MiB", res.stripe_size_bytes / (1024 * 1024))
+        } else {
+            format!("{} KiB", res.stripe_size_bytes / 1024)
+        };
+        let gate_status = if res.stripe_size_bytes == SOC_STRIPE_SIZE_BYTES {
+            if res.mem_after_store.hwm_mib() <= 32.0 {
+                "**PASS (< 32 MiB)**"
+            } else {
+                "FAIL (> 32 MiB)"
+            }
+        } else {
+            "Desktop Target"
+        };
+        println!(
+            "| **{}** | `{}` | `{}` | `{:.2} MiB` | **`{:.2} MiB`** (`{} KiB`) | {} | **`{:.1} MiB/s`** | **`{:.1} MiB/s`** |",
+            res.profile_name,
+            stripe_label,
+            res.num_stripes,
+            res.mem_baseline.rss_mib(),
+            res.mem_after_store.hwm_mib(),
+            res.mem_after_store.vm_hwm_kib,
+            gate_status,
+            res.store_mib_s,
+            res.restore_mib_s
+        );
+    }
+    println!();
+
+    for res in &streaming_results {
+        let stripe_label = if res.stripe_size_bytes >= 1024 * 1024 {
+            format!("{} MiB", res.stripe_size_bytes / (1024 * 1024))
+        } else {
+            format!("{} KiB", res.stripe_size_bytes / 1024)
+        };
+        println!(
+            "#### Checkpoint Breakdown: {} (`{}` Stripes)",
+            res.profile_name, stripe_label
+        );
+        println!("| Measurement Checkpoint | `VmRSS` (Resident) | `VmHWM` / `ru_maxrss` (Peak) | Throughput |");
+        println!("| :--- | :---: | :---: | :---: |");
+        println!(
+            "| **Process Baseline (Startup)** | `{:.2} MiB` (`{} KiB`) | `{:.2} MiB` (`{} KiB`) | — |",
+            res.mem_baseline.rss_mib(),
+            res.mem_baseline.vm_rss_kib,
+            res.mem_baseline.hwm_mib(),
+            res.mem_baseline.vm_hwm_kib
+        );
+        println!(
+            "| **After `{payload_mib} MiB` Chunked Setup** | `{:.2} MiB` (`{} KiB`) | `{:.2} MiB` (`{} KiB`) | — |",
+            res.mem_after_input_gen.rss_mib(),
+            res.mem_after_input_gen.vm_rss_kib,
+            res.mem_after_input_gen.hwm_mib(),
+            res.mem_after_input_gen.vm_hwm_kib
+        );
+        println!(
+            "| **After `store_file_streaming` (`{} x {}`, `16-of-20`)** | `{:.2} MiB` (`{} KiB`) | **`{:.2} MiB`** (`{} KiB`) | **`{:.1} MiB/s`** |",
+            res.num_stripes,
+            stripe_label,
+            res.mem_after_store.rss_mib(),
+            res.mem_after_store.vm_rss_kib,
+            res.mem_after_store.hwm_mib(),
+            res.mem_after_store.vm_hwm_kib,
+            res.store_mib_s
+        );
+        println!(
+            "| **After `restore_file_streaming` + SHA-256 Verify** | `{:.2} MiB` (`{} KiB`) | `{:.2} MiB` (`{} KiB`) | **`{:.1} MiB/s`** |",
+            res.mem_after_restore.rss_mib(),
+            res.mem_after_restore.vm_rss_kib,
+            res.mem_after_restore.hwm_mib(),
+            res.mem_after_restore.vm_hwm_kib,
+            res.restore_mib_s
+        );
+        println!();
+    }
 
     println!("### 2. Cryptographic & Reed-Solomon Primitive Benchmarks (Empirical Wall-Clock)");
     println!(
@@ -428,12 +589,20 @@ fn main() -> anyhow::Result<()> {
         argon_ms
     );
     println!(
-        "| **`AES-256-GCM` Stripe Encryption** | `16 MiB` stripe + HKDF per-purpose subkey/nonce | **`{:.1} MiB/s`** |",
-        aes_enc_mib_s
+        "| **`AES-256-GCM` Stripe Encryption (Router-SoC)** | `1 MiB` stripe + HKDF per-purpose subkey/nonce | **`{:.1} MiB/s`** |",
+        aes_enc_1m_mib_s
     );
     println!(
-        "| **`AES-256-GCM` Stripe Decryption** | `16 MiB` stripe + tag verification | **`{:.1} MiB/s`** |",
-        aes_dec_mib_s
+        "| **`AES-256-GCM` Stripe Decryption (Router-SoC)** | `1 MiB` stripe + tag verification | **`{:.1} MiB/s`** |",
+        aes_dec_1m_mib_s
+    );
+    println!(
+        "| **`AES-256-GCM` Stripe Encryption (Desktop)** | `16 MiB` stripe + HKDF per-purpose subkey/nonce | **`{:.1} MiB/s`** |",
+        aes_enc_16m_mib_s
+    );
+    println!(
+        "| **`AES-256-GCM` Stripe Decryption (Desktop)** | `16 MiB` stripe + tag verification | **`{:.1} MiB/s`** |",
+        aes_dec_16m_mib_s
     );
     println!(
         "| **`PqVaultMasterKey` Dual-Cipher Encryption** | `16 MiB` (`AES-256-GCM` inner + `ChaCha20-Poly1305` outer) | **`{:.1} MiB/s`** |",
@@ -458,6 +627,14 @@ fn main() -> anyhow::Result<()> {
     println!(
         "| **`HybridPqSigningKeypair::verify`** | `Ed25519 + NIST FIPS 204 ML-DSA-65` | **`{:.1} us`** |",
         sig_verify_us
+    );
+    println!(
+        "| **Reed-Solomon $GF(2^8)$ Encode (`Router-SoC 16-of-20`)** | `1 MiB` stripe -> `20 x 64 KiB` shards + Merkle tree | **`{:.1} MiB/s`** |",
+        rs_soc_enc_mib_s
+    );
+    println!(
+        "| **Reed-Solomon $GF(2^8)$ Reconstruct (`Router-SoC 16-of-20`)** | 4 erasures + pre-decoding Merkle quarantine | **`{:.1} MiB/s`** |",
+        rs_soc_rec_mib_s
     );
     println!(
         "| **Reed-Solomon $GF(2^8)$ Encode (`Consumer 10-of-20`)** | `16 MiB` stripe -> `20 x 1.6 MiB` shards + Merkle tree | **`{:.1} MiB/s`** |",

@@ -1,7 +1,7 @@
 use crate::bootstrap::{
     BlindedShardTombstone, LiteStripeSyndicationBundle, LiteSyndicationReceipt, PersonalDeviceCert,
 };
-use crate::crypto::{PqRelayedShardEnvelope, PqSignedDhtManifestEnvelope};
+use crate::crypto::{NodeIdentity, PqRelayedShardEnvelope, PqSignedDhtManifestEnvelope};
 use crate::network::wot::{DelegationChain, SlashingEvidence};
 use crate::por::{
     MultiSegmentPorChallenge, PorChallenge, PorResponse, RepairGrant, WitnessFailureReceipt,
@@ -213,6 +213,57 @@ pub enum DhtWireEnvelope {
     VaultCatalog(EncryptedVaultCatalogEnvelope),
 }
 
+/// Signed WAN rendezvous entry stored under a blinded 32-byte slot key (ADR-18).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedWanRendezvousEntry {
+    pub slot_key: [u8; 32],
+    pub encrypted_peer_card: Vec<u8>,
+    pub timestamp_ms: u64,
+    pub ttl_secs: u64,
+    pub ed25519_pubkey: [u8; 32],
+    pub sig_r: [u8; 32],
+    pub sig_s: [u8; 32],
+}
+
+impl SignedWanRendezvousEntry {
+    /// Formats the canonical domain-separated byte payload for outer anti-spam signature:
+    /// `"parvault-wan-entry-v1:" || slot_key || timestamp_ms_be64 || ttl_secs_be64 || encrypted_peer_card`.
+    pub fn signing_payload(
+        slot_key: &[u8; 32],
+        timestamp_ms: u64,
+        ttl_secs: u64,
+        encrypted_peer_card: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + 8 + 8 + encrypted_peer_card.len() + 24);
+        out.extend_from_slice(b"parvault-wan-entry-v1:");
+        out.extend_from_slice(slot_key);
+        out.extend_from_slice(&timestamp_ms.to_be_bytes());
+        out.extend_from_slice(&ttl_secs.to_be_bytes());
+        out.extend_from_slice(encrypted_peer_card);
+        out
+    }
+
+    /// Verifies the outer Ed25519 anti-spam signature against `self.ed25519_pubkey`.
+    pub fn verify_signature(&self) -> bool {
+        let payload = Self::signing_payload(
+            &self.slot_key,
+            self.timestamp_ms,
+            self.ttl_secs,
+            &self.encrypted_peer_card,
+        );
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[..32].copy_from_slice(&self.sig_r);
+        sig_bytes[32..].copy_from_slice(&self.sig_s);
+        NodeIdentity::verify_with_pubkey(&self.ed25519_pubkey, &payload, &sig_bytes)
+    }
+
+    /// Checks whether this entry has expired relative to `now_ms`.
+    pub fn is_expired(&self, now_ms: u64) -> bool {
+        let ttl_ms = self.ttl_secs.saturating_mul(1000);
+        now_ms.saturating_sub(self.timestamp_ms) > ttl_ms
+    }
+}
+
 /// Wire-level request messages exchanged over `/parvault/wire/1.0.0`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MeshWireRequest {
@@ -300,6 +351,17 @@ pub enum MeshWireRequest {
     },
     /// Query live node topology, available quota, SLA score, and Post-Quantum KEM public key.
     QueryNodeStatus,
+    /// Register a signed WAN rendezvous entry under a blinded slot key.
+    RegisterWanRendezvous {
+        slot_key: [u8; 32],
+        entry: SignedWanRendezvousEntry,
+    },
+    /// Look up all fresh WAN rendezvous entries stored under a blinded slot key.
+    LookupWanRendezvous { slot_key: [u8; 32] },
+    /// Submit a cryptographically verifiable abuse takedown report against illegal content (ADR-19).
+    SubmitAbuseTakedownReport(crate::storage::VerifiableAbuseReport),
+    /// Broadcast a signed bad-actor or illegal-content eviction order across peers (ADR-19).
+    BroadcastEvictionOrder(crate::storage::SignedBadActorEvictionOrder),
 }
 
 /// Wire-level response messages exchanged over `/parvault/wire/1.0.0`.
@@ -364,6 +426,36 @@ pub enum MeshWireResponse {
         used_bytes: u64,
         sla_score: f64,
         pq_kem_pubkey: Option<crate::crypto::HybridKemPublicKey>,
+    },
+    /// Acknowledgment of a WAN rendezvous registration with observed external address reflection.
+    RegisterWanRendezvousAck {
+        stored: bool,
+        observed_external_addr: Option<String>,
+        error: Option<String>,
+        #[serde(default)]
+        tracker_admin_pubkey: Option<[u8; 32]>,
+    },
+    /// Result of looking up WAN rendezvous entries under a slot key with observed external address reflection.
+    LookupWanRendezvousResult {
+        entries: Vec<SignedWanRendezvousEntry>,
+        observed_external_addr: Option<String>,
+        #[serde(default)]
+        tracker_admin_pubkey: Option<[u8; 32]>,
+    },
+    /// Acknowledgment of a submitted abuse takedown report.
+    SubmitAbuseTakedownAck {
+        queued_for_admin_review: bool,
+        report_id: [u8; 32],
+        verified_plaintext_sha256: Option<[u8; 32]>,
+        error: Option<String>,
+    },
+    /// Acknowledgment of an applied or rejected broadcast eviction order.
+    EvictionOrderAck {
+        accepted: bool,
+        purged_regular_shards: usize,
+        purged_blinded_shards: usize,
+        zero_wiped_bytes: u64,
+        error: Option<String>,
     },
 }
 

@@ -56,174 +56,196 @@ Neighborhood Cloud builds **two small, self-contained binaries** so you never ha
 
 ---
 
-## 3. Five Step-by-Step Copy-Paste Recipes
+## 3. Zero-IP Home Network Quickstart (No IP Addresses Needed!)
 
-### Step 1: Inspect Your Node Identity (`parvault identity`)
-Before linking your laptop and your NAS, run `parvault identity` to view your machine's unique **`Device Peer ID`** and your **`Owner PQ Public Key Hex`**:
+In `v0.3.0`, you **never have to look up or type IP addresses**. Nodes auto-discover each other on your home network via cryptographically signed beacons, pair in seconds with a 4-word code, and auto-heal if your router assigns a new DHCP address.
 
-```bash
-# View (or automatically create) your persistent node identity and post-quantum owner key
-parvault identity
+```mermaid
+flowchart LR
+    A["1. Router or NAS\nparvault init\nparvault up --pair"] -->|Broadcasts 4-Word Code\n'shield-copper-alpine-matrix'| B["2. Home Wi-Fi / LAN\nUDP 4009 Auto-Discovery"]
+    B --> C["3. Laptop or PC\nparvault discover\nparvault join --code ..."]
+    C -->|Auto-Pinned in known_peers.json| D["4. Zero-IP Sync & Restore\nparvault watch-folder\nparvault restore-folder"]
 ```
 
-You will see output like:
+### Step 1: Initialize Your Vault (`parvault init`)
+On your computer, home server, or router, generate cryptographic keys and a 24-word recovery phrase:
+```bash
+parvault init --profile router-soc --watch /mnt/usb-nas/shared --label "Home-NAS"
+```
+Output:
 ```text
-=== ParVault Node & Post-Quantum Identity ===
-Data Directory          : .parvault-data
-Device Peer ID          : parvault-peer-8f3a9c12e4b07d11
-Ed25519 Public Key (hex): 8f3a9c12e4b07d11...
-Owner PQ Public Key Hex : 20000000... (copy this for your NAS!)
-Master Key Fingerprint  : sha256:4b19e8f021a7c6d4
+[parvault] Initialized node identity in .parvault-data
+[parvault] Persistent Device Peer ID: parvault-peer-8f3a9c12e4b07d11
+[parvault] ----------------------------------------------------------------------
+[parvault] 24-Word Recovery Mnemonic (Write this down!):
+[parvault] velvet orbit oak anchor matrix copper alpine shield
+[parvault] beacon crystal meadow timber galaxy canyon breeze horizon
+[parvault] river summit forest harbor ripple valley shadow summit
+[parvault] ----------------------------------------------------------------------
+[parvault] Created configuration file at .parvault-data/config.toml
 ```
 
 ---
 
-### Step 2: Link Your Laptop & Closet NAS for Unlimited Free Self-Backup (`issue-device-cert` & `verify-device-cert`)
-Because you own both your laptop and your home server (`parvault-seed`), you don't need to pay reciprocity storage quota to back up to yourself! Issue a post-quantum **Personal Device Certificate** (`PARVAULT-CERT-V1:...`) using your `Device Peer ID` from Step 1:
-
+### Step 2: Turn on Turnkey Cloud-NAS Appliance Mode (`parvault up`)
+On your router, closet NAS, or Raspberry Pi, launch everything with one command:
 ```bash
-# 1. On your laptop: Issue a certificate for your Device Peer ID (saves JSON + prints a PARVAULT-CERT-V1: token)
-parvault issue-device-cert \
-  --device-peer-id "parvault-peer-8f3a9c12e4b07d11" \
-  --device-label "My-Laptop" \
-  --cert-out ./my-laptop.device-cert.json
-
-# 2. On your NAS: Verify the certificate using either the .json file OR the copy-pasteable PARVAULT-CERT-V1:... token
-parvault-seed verify-device-cert \
-  --data-dir /mnt/nas/parvault-seed \
-  --cert ./my-laptop.device-cert.json \
-  --owner-pq-pubkey-hex "<YOUR_OWNER_PQ_PUBKEY_HEX_FROM_STEP_1>"
-
-# 3. Start your 24/7 NAS vault server locked to your Owner PQ Public Key
-parvault-seed start \
-  --mode homelab-vault \
-  --data-dir /mnt/nas/parvault-seed \
-  --max-gb 500 \
-  --owner-pq-pubkey-hex "<YOUR_OWNER_PQ_PUBKEY_HEX_FROM_STEP_1>" \
-  --listen /ip4/0.0.0.0/tcp/4002
+parvault up \
+  --profile router-soc \
+  --folder /mnt/usb-nas/shared \
+  --status-http 0.0.0.0:4080 \
+  --pair
 ```
-
-- **On Day 1 (even with 0 friends connected):** Your laptop, desktop, and `parvault-seed` NAS immediately form a **`2-of-3` Personal Device Ring** with **unlimited self-quota (`0.00x` tax)**.
-- **As your `parvault-seed` NAS stays online 24/7:** It automatically passes background Proof-of-Retrievability (PoR) health checks and earns **`HighUptimeAnchor`** status—unlocking the **`16-of-20` Homelab Tier (`80%` storage efficiency)** and a **`5.0x` storage quota multiplier** across the neighborhood mesh!
+This automatically starts:
+1. The **P2P storage daemon** (using 1 MiB stripes so RAM stays `< 16 MiB`),
+2. The **Signed LAN Beacon Responder** on UDP `4009`,
+3. The **Embedded Status Dashboard** on `http://localhost:4080`,
+4. An active **4-word pairing code** (e.g. `shield-copper-alpine-matrix`).
 
 ---
 
-### Step 3: Filter Junk with `.parvaultignore`, Preview with `diff-folder`, and Sync with `watch-folder`
-By default, `parvault` automatically ignores noisy junk folders (`.git`, `node_modules`, `target`, `.DS_Store`, `Thumbs.db`, `*.tmp`, `*.swp`). You can also drop a **`.parvaultignore`** file inside any folder you back up:
+### Step 3: Auto-Discover & Pair with 4 Words (`parvault discover` & `join`)
+On your laptop or workstation (connected to the same home Wi-Fi/LAN):
 
 ```bash
-# 1. Create a folder with an important file and a .parvaultignore rule
-mkdir -p ./my-photos
-echo "Irreplaceable family memories and homelab configs" > ./my-photos/notes.txt
-echo "*.iso" > ./my-photos/.parvaultignore
+# 1. Scan your home network (zero IP addresses required!)
+parvault discover
+```
+Output:
+```text
+DISCOVERED HOME LAN PEERS (Zero-IP Configuration)
+------------------------------------------------------------------------------------------------------
+Label           Role        Multiaddr (Pinned Peer ID)                           Available    Status
+------------------------------------------------------------------------------------------------------
+Home-NAS        router-nas  /ip4/192.168.1.1/tcp/4001/p2p/12D3KooWSDu...        476.2 GiB    Online
+------------------------------------------------------------------------------------------------------
+```
 
-# 2. Preview what will be backed up (dry-run diff without writing any shards yet)
-parvault diff-folder --folder ./my-photos
+```bash
+# 2. Pair permanently using the 4-word code shown on your router
+parvault join --code shield-copper-alpine-matrix
+```
+Output:
+```text
+[parvault] Verified signed beacon from 'Home-NAS' (12D3KooWSDu...)!
+[parvault] Successfully paired and pinned in known_peers.json! Zero-IP config ready.
+```
 
-# 3. Encrypt, chop into puzzle pieces, and save a signed snapshot manifest (--once runs a single pass)
+---
+
+### Step 4: Back Up and Sync Folders (Zero IP Flags!)
+Now all backup and restore commands find your paired storage nodes automatically:
+
+```bash
+# Back up personal documents incrementally (filters .git, node_modules automatically)
 parvault watch-folder \
-  --folder ./my-photos \
-  --snapshot-out ./my-photos.manifest.bin \
+  --folder ~/Documents \
+  --snapshot-out ./documents.manifest.bin \
   --prune-deleted \
   --once
-```
 
-Want `parvault` to continuously watch `./my-photos` in the background every 5 seconds? Just omit `--once`:
-```bash
-parvault watch-folder \
-  --folder ./my-photos \
-  --snapshot-out ./my-photos.manifest.bin \
-  --interval-secs 5
+# Restore a single file or the whole directory tree on another machine
+parvault restore-folder \
+  --snapshot ./documents.manifest.bin \
+  --out-dir ./restored-docs \
+  --file "tax-return.pdf"
 ```
 
 ---
 
-### Step 4: Restore One File, a Whole Folder, or Recover After a House Fire (`restore-folder` & `recover-from-seed`)
+### Step 5: Zero-Pairing Public Commons Quickstart (`--public`)
+Want to back up files without pairing with anyone? You can connect to the open Public Commons swarm (analogous to a public BitTorrent tracker):
 
-**Option A — Restore a Single Accidentally Deleted File (`--file`):**
 ```bash
-parvault restore-folder \
-  --snapshot ./my-photos.manifest.bin \
-  --out-dir ./restored-single \
-  --file "notes.txt"
-```
-
-**Option B — Restore the Entire Folder Tree:**
-```bash
-parvault restore-folder \
-  --snapshot ./my-photos.manifest.bin \
-  --out-dir ./restored-photos
-```
-
-**Option C — Zero-Local-State "House Fire" Recovery (12- or 24-Word BIP-39 Recovery Phrase):**
-What if your house burns down and destroys your laptop **and** your local `.manifest.bin` / `master_key.sealed` files?
-When backing up, pass `--seed-phrase` (supports standard 12-word or 24-word checksummed BIP-39 mnemonics) and `--catalog-out`:
-```bash
-# Back up with a deterministic BIP-39 recovery phrase and export an encrypted root catalog
 parvault watch-folder \
-  --folder ./my-photos \
-  --snapshot-out ./my-photos.manifest.bin \
-  --seed-phrase "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" \
-  --vault-namespace "family-photos" \
-  --catalog-out ./my-photos.catalog.bin \
+  --folder ~/Documents \
+  --public \
+  --tracker /dns4/tracker.neighborhoodcloud.org/tcp/4002/p2p/12D3KooW... \
   --once
+```
+- **Zero pairing or join codes:** Anyone can join immediately with a lightweight Hashcash Proof-of-Work ticket.
+- **Client-Side Quantum-Safe Encryption:** Your files are locked with `AES-256-GCM` + Post-Quantum keys *before* leaving your machine. Stranger nodes only ever see encrypted shards.
+- **10-of-20 Reed-Solomon:** Reconstructs your files even if 10 out of 20 stranger machines abruptly power off!
 
-# On a brand-new laptop after a disaster: recover everything from your seed phrase + encrypted catalog!
+---
+
+## 4. Advanced Homelab Recipes
+
+### Recipe A: Zero-Local-State "House Fire" Recovery (24-Word Recovery Phrase)
+What if your house burns down, destroying your laptop, your router, and all local files?
+When running `parvault init` or `watch-folder`, you received a 24-word recovery phrase. On a brand-new machine anywhere in the world:
+
+```bash
 parvault recover-from-seed \
-  --seed-phrase "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" \
-  --vault-namespace "family-photos" \
-  --catalog-envelope ./my-photos.catalog.bin \
+  --seed-phrase "velvet orbit oak anchor matrix copper alpine shield beacon crystal meadow timber galaxy canyon breeze horizon river summit forest harbor ripple valley shadow summit" \
+  --vault-namespace "default" \
   --out-dir ./recovered-after-fire
 ```
+`parvault` deterministically re-derives your root Master Key, locates your encrypted vault catalog on the network DHT, downloads the surviving puzzle pieces, and reconstructs every file!
 
-**Option D — Laptop "Lite Client" Mode + NAS-Death Mesh Failover & Selective Partial Restore (`--lite-seed-dir` & `--filter`):**
-If you have a laptop and a home NAS/Raspberry Pi running `parvault-seed`, your laptop can run in **Lite Client Mode**:
-- Your laptop encrypts files locally (`K_user` never leaves your laptop) and sends `1.0x` encrypted ciphertext to your `parvault-seed` box.
-- Your `parvault-seed` box caches the shards for fast **"Cloud Away From Home"** access AND syndicates `16-of-20` Reed-Solomon shards to the Neighborhood Cloud mesh on your behalf.
-- **If your NAS dies**, your laptop speaks the exact same protocol and automatically fails over to recovering directly from the Neighborhood Cloud mesh — and with `--filter`, you can restore **only the specific folders or files you need on your laptop** without downloading your entire multi-terabyte NAS vault!
+---
 
+### Recipe B: Link Personal Devices with Zero Reciprocity Tax (`issue-device-cert`)
+To link machines into a private Day-1 Personal Ring with **zero storage quota tax (`0.00x`)**:
 ```bash
-# 1. Back up from your laptop in Lite-Client mode via your paired Seed Box over libp2p
-parvault --peers "/ip4/10.42.1.11/tcp/4001,/ip4/10.42.1.12/tcp/4001" watch-folder \
-  --folder ./work-projects \
-  --snapshot-out ./work.manifest.bin \
-  --lite-seed-dir /ip4/10.42.1.10/tcp/4002 \
-  --device-cert ./my-laptop.device-cert.json \
-  --once
+# 1. On your laptop, issue a certificate for your desktop or NAS:
+parvault issue-device-cert \
+  --device-peer-id "parvault-peer-8f3a9c12e4b07d11" \
+  --device-label "Work-Laptop"
 
-# 2. Browse everything inside a snapshot with ZERO shard downloads
-parvault list-snapshot --snapshot ./work.manifest.bin
-
-# 3. Selective Partial Restore: restore ONLY the urgent files/folders your laptop needs!
-parvault restore-folder \
-  --snapshot ./work.manifest.bin \
-  --out-dir ./restored-urgent-docs \
-  --filter "contracts/*,tax-2026.pdf"
+# 2. Verify and pin on the destination machine:
+parvault-seed verify-device-cert \
+  --cert "PARVAULT-CERT-V1:<hex>"
 ```
 
 ---
 
-### Step 5: Check Your Earned Standing (`status`) & Scrub for Disk Bit-Rot (`scrub`)
-
-Check your node's storage quota, minimum free disk reserve, and **Earned Uptime Standing** at any time, or run the built-in bit-rot scrubber to verify every shard on your hard drive:
-
+### Recipe C: Scrub for Silent Disk Bit-Rot & Check Uptime Status
 ```bash
-# Inspect your node configuration, storage quota, and Earned Standing ladder
+# Check node storage quota, resident RAM, and Earned Standing ladder:
 parvault status
-parvault-seed status --data-dir /mnt/nas/parvault-seed
 
-# Proactively verify every local .shard and .bshard file against silent disk bit-rot
+# Verify every local shard against silent disk corruption:
 parvault scrub
-parvault-seed scrub --data-dir /mnt/nas/parvault-seed
-
-# Gracefully exit the network and automatically redistribute hosted shards to mesh peers at 1.0x bandwidth
-parvault leave
-parvault-seed leave --data-dir /mnt/nas/parvault-seed
 ```
 
 ---
 
-## 4. How the Automatic "Trust & Storage Ladder" Works
+### Recipe D: Evict a Bad Actor or Content Takedown (`parvault evict`, `ADR-19`)
+If a spammer or illegal content is detected, administrators can purge matching shards with zero-wipe `0x00` disk shredding and block future ingress without storing any plaintext IPs on disk:
+
+```bash
+# Evict an abusive IP address and purge all associated shards:
+parvault evict --ip 203.0.113.42 --reason "Spam flood"
+
+# Purge and permanently block an illegal content stripe across mesh peers:
+parvault evict --merkle-root <MERKLE_ROOT_HEX> --propagate
+```
+
+---
+
+### Recipe E: Report Abusive Content & Public Tracker Administration (`ADR-19`)
+On Public Commons swarms (`--public`), random users cannot grief or evict honest users. To report illegal content, submit a cryptographic burden-of-proof report (`parvault report-abuse`). The Public Tracker Operator reviews cryptographic proofs and issues official eviction orders:
+
+```bash
+# 1. Reporter: submit leaked manifest and key proving illegal content distribution:
+parvault report-abuse \
+  --tracker /dns4/tracker.neighborhoodcloud.org/tcp/4002/p2p/... \
+  --manifest ./contraband.manifest.bin \
+  --disclosed-key-hex <DISCLOSED_KEY_HEX> \
+  --allegation "CSAM / DMCA takedown violation"
+
+# 2. Tracker Operator: review queue and approve mesh-wide shredding:
+parvault-seed admin list-takedowns --data-dir /mnt/nas/parvault-seed
+parvault-seed admin approve-takedown --report-id <REPORT_ID> --note "Confirmed violation" --propagate
+
+# 3. Tracker Operator: emergency unilateral eviction on formal legal/police warrant:
+parvault-seed admin emergency-evict --data-dir /mnt/nas/parvault-seed --ip 203.0.113.66 --warrant-ref "WARRANT-1234" --propagate
+```
+
+---
+
+## 5. How the Automatic "Trust & Storage Ladder" Works
 
 Your node automatically climbs the **Earned Uptime Ladder** based on how many peers are around and how reliably your machine stays online:
 
@@ -237,6 +259,7 @@ Your node automatically climbs the **Earned Uptime Ladder** based on how many pe
 
 ---
 
-## 5. Where to Go Next
+## 6. Where to Go Next
+- **[Router SoC Hardware & Firmware Integration Guide (`docs/ROUTER_SOC_HARDWARE_GUIDE.md`)](docs/ROUTER_SOC_HARDWARE_GUIDE.md):** Turnkey OpenWrt `procd`, prplOS LXC containers, MediaTek Filogic / Rockchip RAM budgeting (`< 16 MiB`), and embedded status dashboards.
 - **[User & CLI Reference Manual (`docs/USER_AND_CLI_GUIDE.md`)](docs/USER_AND_CLI_GUIDE.md):** Every CLI flag for `parvault` and `parvault-seed`, `config.toml` rate limiting, and `.parvaultignore` rules.
 - **[Security & Cryptography Architecture (`docs/SECURITY_AND_CRYPTOGRAPHY.md`)](docs/SECURITY_AND_CRYPTOGRAPHY.md):** Mathematical proofs, post-quantum `ML-KEM-768` / `ML-DSA-65` combiners, and TLA+ formal verification results.

@@ -1,5 +1,6 @@
 pub mod anonymity;
 pub mod block_store;
+pub mod eviction;
 pub mod quota;
 
 pub use anonymity::{
@@ -12,4 +13,5 @@ pub use block_store::{
     BlockStore, FileManifest, GracefulDepartureReceipt, ScrubReport, ShardId,
     SignedDhtManifestEnvelope, StorageError, StripeManifestEntry, ZeroTrustDhtStore,
 };
+pub use eviction::*;
 pub use quota::{PeerCreditAccount, QuotaManager, TrustLevel};

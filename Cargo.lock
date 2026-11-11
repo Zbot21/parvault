@@ -361,15 +361,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
-name = "cbor4ii"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "472931dd4dfcc785075b09be910147f9c6258883fc4591d0dac6116392b2daa6"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "cc"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1808,7 +1799,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1356c9e376a94a75ae830c42cdaea3d4fe1290ba409a22c809033d1b7dcab0a6"
 dependencies = [
  "async-trait",
- "cbor4ii",
  "futures",
  "futures-bounded",
  "futures-timer",
@@ -1816,7 +1806,6 @@ dependencies = [
  "libp2p-identity",
  "libp2p-swarm",
  "rand 0.8.8",
- "serde",
  "smallvec",
  "tracing",
  "void",
@@ -2293,7 +2282,7 @@ dependencies = [
 
 [[package]]
 name = "parvault"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3351,7 +3340,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot 0.12.5",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2 0.6.5",

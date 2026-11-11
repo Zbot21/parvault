@@ -1,6 +1,6 @@
 [package]
 name = "parvault"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "ParVault — Zero-knowledge post-quantum erasure-coded backup utility and P2P storage daemon with Noise transport, Web-of-Trust, and Proof of Retrievability (PoR) auditing."
@@ -26,7 +26,7 @@ default = []
 simd-accel = ["reed-solomon-erasure/simd-accel"]
 
 [dependencies]
-tokio = { version = "1.40", features = ["full"] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "rt", "net", "io-util", "time", "sync", "macros", "fs", "signal"] }
 libp2p = { version = "0.54", features = [
     "tokio",
     "gossipsub",
@@ -40,7 +40,6 @@ libp2p = { version = "0.54", features = [
     "identify",
     "request-response",
     "macros",
-    "cbor",
     "ed25519",
 ] }
 reed-solomon-erasure = "6.0"
@@ -75,3 +74,15 @@ stateright = "0.30"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.soc]
+inherits = "release"
+opt-level = "z"
+lto = "fat"

@@ -3,7 +3,7 @@ name: Release — Static musl Binaries & SHA256SUMS
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "v*"
 
 permissions:
   contents: write
@@ -17,8 +17,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             linker: x86_64-linux-musl-gcc
+            strip: strip
           - target: aarch64-unknown-linux-musl
             linker: aarch64-linux-gnu-gcc
+            strip: aarch64-linux-gnu-strip
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -27,7 +29,7 @@ jobs:
       - name: Install musl cross-compilation toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
       - name: Build static parvault and parvault-seed binaries
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
@@ -37,6 +39,9 @@ jobs:
           mkdir -p release-dist
           cp target/${{ matrix.target }}/release/parvault release-dist/parvault-${{ matrix.target }}
           cp target/${{ matrix.target }}/release/parvault-seed release-dist/parvault-seed-${{ matrix.target }}
+          ${{ matrix.strip }} release-dist/parvault-${{ matrix.target }} release-dist/parvault-seed-${{ matrix.target }}
+          echo "### Binary sizes for ${{ matrix.target }}:"
+          ls -lh release-dist/
       - uses: actions/upload-artifact@v4
         with:
           name: binaries-${{ matrix.target }}
@@ -47,16 +52,20 @@ jobs:
     needs: build-static-musl
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
-      - name: Generate SHA256SUMS
+      - name: Bundle Router-SoC configuration and generate checksums
         run: |
+          tar -czvf artifacts/parvault-router-soc-bundle.tar.gz -C deploy/router-soc parvault-router.toml parvault-nas.procd -C ../ prplos-lxc-manifest.json
           cd artifacts
           chmod +x parvault-* parvault-seed-*
+          echo "=== Measured Stripped Binary Sizes ==="
+          ls -lh parvault-* parvault-seed-*
           ./parvault-seed-x86_64-unknown-linux-musl self-test
-          sha256sum parvault-* parvault-seed-* > SHA256SUMS
+          sha256sum parvault-* parvault-seed-* parvault-router-soc-bundle.tar.gz > SHA256SUMS
           cat SHA256SUMS
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -64,5 +73,6 @@ jobs:
           files: |
             artifacts/parvault-*
             artifacts/parvault-seed-*
+            artifacts/parvault-router-soc-bundle.tar.gz
             artifacts/SHA256SUMS
           generate_release_notes: true

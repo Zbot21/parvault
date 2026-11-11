@@ -3,7 +3,7 @@
 
 **[License: `AGPL-3.0-only`](LICENSE)** &bull; **Rust `2021` Edition** &bull; **[Targets: `x86_64` | `aarch64` static `musl`](#build--verification-commands)** &bull; **[Model-Checked: `6 TLA+ Protocol Specs & Stateright`](docs/SECURITY_AND_CRYPTOGRAPHY.md)**
 
-`parvault` (library crate `parvault`, binaries `parvault`, `parvault-seed`, and `parvault-bench`) is a **zero-knowledge, post-quantum hybrid, Byzantine-resilient P2P backup and continuous folder-synchronization engine**.
+`parvault` (library crate `parvault`, binaries `parvault`, `parvault-seed`, and `parvault-bench`) is a **zero-knowledge, post-quantum hybrid, Byzantine-resilient P2P backup and continuous folder-synchronization engine** — essentially **"Filecoin without the coin"**, preserving the genuine distributed storage systems engineering (erasure coding, stateless Proof-of-Retrievability, symmetric Byte-Epoch reciprocity, zero-knowledge encryption) while eliminating 100% of cryptocurrency tokens, wallets, gas fees, and blockchain bloat so it runs inside **`9.39 MiB` RAM on a home router**.
 
 Designed to run identically on multi-terabyte homelab NAS servers and memory-constrained residential gateways (`prplOS` / `OpenWrt` LXC containers with a strict **`< 32 MiB` active RAM ceiling**), `parvault` combines **16 MiB streaming `AES-256-GCM` + dual-cipher `PqVaultMasterKey` (`AES-256-GCM` + `ChaCha20-Poly1305`) cascaded encryption**, **Reed-Solomon erasure coding over $GF(2^8)$**, **4-layer shard anonymization ($\Omega_{\text{search}} \ge 2^{224}$)**, **Stateless Stratified Proof-of-Retrievability (PoR)**, and **Cryptographically Earned Uptime Tiers** so that **no storage peer, witness node, or DHT router is ever trusted with plaintext, metadata correlation, or unchecked shard concentration.**
 
@@ -13,50 +13,39 @@ Designed to run identically on multi-terabyte homelab NAS servers and memory-con
 
 | Guide | Audience | What's Inside |
 | :--- | :--- | :--- |
-| **[Homelab & Everyday User Quickstart (`QUICKSTART.md`)](QUICKSTART.md)** | **Homelabbers, Self-Hosters & Friend Co-Ops** | Plain-English (ELI15) overview and 5 copy-paste recipes (`identity`, `PersonalDeviceCert` linking, `.parvaultignore`, selective file restore, and 24-word "House Fire" recovery). |
+| **[Homelab & Everyday User Quickstart (`QUICKSTART.md`)](QUICKSTART.md)** | **Homelabbers, Self-Hosters & Friend Co-Ops** | Plain-English (ELI15) overview and 5 copy-paste recipes (`parvault init`, `parvault up`, zero-IP `discover`, 4-word `join`, and 24-word "House Fire" recovery). |
+| **[Router SoC Hardware & Firmware Integration Guide (`docs/ROUTER_SOC_HARDWARE_GUIDE.md`)](docs/ROUTER_SOC_HARDWARE_GUIDE.md)** | **Router Vendors, OpenWrt & prplOS Integrators** | Turnkey integration for MediaTek Filogic / Rockchip / x86_64 routers: memory/flash budgets, `procd` init scripts, LXC manifests, and embedded status dashboards. |
 | **[User & CLI Reference Manual (`docs/USER_AND_CLI_GUIDE.md`)](docs/USER_AND_CLI_GUIDE.md)** | **System Administrators & Power Users** | Complete CLI flag reference for `parvault` and `parvault-seed`, `PARVAULT-CERT-V1:` token workflows, `.parvaultignore` syntax, `config.toml` bandwidth rate limits, and bit-rot scrubbing. |
 | **[Security & Cryptography Proofs (`docs/SECURITY_AND_CRYPTOGRAPHY.md`)](docs/SECURITY_AND_CRYPTOGRAPHY.md)** | **Cryptographers & Security Auditors** | Mathematical proofs, $\ge 2^{224}$ combinatorial anonymity bounds, NIST FIPS 203 `ML-KEM-768` & FIPS 204 `ML-DSA-65` hybrid combiners, 6 TLA+ formal specs, and live 13-container Docker P2P regression reports. |
-| **[Architectural Decision Records (`docs/ADR.md`)](docs/ADR.md)** | **Distributed Systems Architects** | Complete engineering rationale across **`ADR-01` through `ADR-17`**. |
+| **[Architectural Decision Records (`docs/ADR.md`)](docs/ADR.md)** | **Distributed Systems Architects** | Complete engineering rationale across **`ADR-01` through `ADR-19`**. |
 | **[AI Agent & Engineer Guide (`AGENTS.md`)](AGENTS.md)** | **Contributors & Coding Agents** | Module-by-module map of `src/`, the **7 Non-Negotiable Zero-Trust & Memory-Safety Rules**, and exact build/test/TLC verification commands. See also [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`SECURITY.md`](SECURITY.md). |
 
 ---
 
-## 60-Second Quickstart (`parvault` & `parvault-seed`)
+## 60-Second Quickstart (Zero-IP Home Network & Cloud-NAS)
 
 ```bash
-# 1. Inspect your persistent node identity and Post-Quantum Owner Public Key
-parvault identity
+# 1. Initialize your vault with a 24-word BIP-39 recovery mnemonic
+parvault init --profile router-soc --watch /mnt/usb-nas/shared --label "Router-NAS"
 
-# 2. Preview and incrementally back up a folder (automatically honors .parvaultignore)
-parvault diff-folder --folder ./documents
-parvault watch-folder \
-  --folder ./documents \
-  --snapshot-out ./documents.manifest.bin \
-  --seed-phrase "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" \
-  --vault-namespace "homelab-docs" \
-  --catalog-out ./documents.catalog.bin \
-  --prune-deleted \
-  --once
+# 2. Launch turnkey Cloud-NAS appliance mode on your router or home server
+parvault up \
+  --profile router-soc \
+  --folder /mnt/usb-nas/shared \
+  --status-http 0.0.0.0:4080 \
+  --pair
 
-# 3. Restore a single file (--file) or the entire directory tree
-parvault restore-folder \
-  --snapshot ./documents.manifest.bin \
-  --out-dir ./restored-documents \
-  --file "notes.txt"
+# 3. On your laptop: auto-discover home LAN storage (Zero IP addresses to type!)
+parvault discover
 
-# 4. Zero-Local-State "House Fire" Recovery (from 12/24-word BIP-39 seed phrase + encrypted catalog alone)
-parvault recover-from-seed \
-  --seed-phrase "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" \
-  --vault-namespace "homelab-docs" \
-  --catalog-envelope ./documents.catalog.bin \
-  --out-dir ./recovered-from-fire
+# 4. Pair permanently with the 4-word code displayed on your router
+parvault join --code shield-copper-alpine-matrix
 
-# 5. Run a dedicated 24/7 Zero-Trust Homelab Seed Server on your NAS / Raspberry Pi
-parvault-seed start \
-  --mode homelab-vault \
-  --data-dir /mnt/nas/parvault-seed \
-  --max-gb 500 \
-  --listen /ip4/0.0.0.0/tcp/4002
+# 5. Incrementally back up files (auto-finds paired router storage with zero --peers flags!)
+parvault watch-folder --folder ~/Documents --once
+
+# 6. Or join the open Public Commons swarm with zero pairing (BitTorrent-style public tracker):
+parvault watch-folder --folder ~/Documents --public --tracker /dns4/tracker.neighborhoodcloud.org/tcp/4002/p2p/... --once
 ```
 
 ---
@@ -87,10 +76,15 @@ flowchart LR
 | Capability | Cryptographic / Systems Mechanism | Governing ADR |
 | :--- | :--- | :--- |
 | **Bounded `< 32 MiB` Gateway RAM** | 64 KiB streaming SHA-256 delta checks + fixed 16 MiB streaming encryption & Reed-Solomon stripes | `ADR-01`, `ADR-16` |
+| **Router-SoC 1 MiB Profile** | Configurable 1 MiB stripes (`SOC_ROUTER_STRIPE_SIZE_BYTES`), `5.83–7.45 MiB` stripped static `musl` binary (`soc` profile), `19.6 MB` (`6.13 MB` compressed) `FROM scratch` container, `9.36–9.39 MiB` peak `VmHWM` inside a 32–48 MiB cgroup | `ADR-18` |
+| **Zero-IP Home LAN & 4-Word Pairing** | Signed UDP beacons (port `4009`), 4-word BIP-39 SAS pairing, DHCP auto-healing in `known_peers.json` | `ADR-18` |
+| **Online WAN Rendezvous & DDNS** | STUN-over-Noise address reflection, blinded rendezvous mailbox, dynamic-IP presence across ISP rotations | `ADR-18` |
+| **Public Commons Swarm Mode** | Zero-pairing BitTorrent-style public tracker (`--public`), self-signed Hashcash PoW (`PublicCommonsTicket`) | `ADR-18` |
 | **Post-Quantum HNDL Immunity** | X-Wing `X25519 + ML-KEM-768` (FIPS 203), `Ed25519 + ML-DSA-65` (FIPS 204), and dual-cipher `PqVaultMasterKey` (`AES-256-GCM` + `ChaCha20-Poly1305`) | `ADR-12` |
 | **4-Layer Shard Anonymization** | Keyed 256-bit `BlindedShardId` ($\Omega \ge 2^{224}$), per-shard capability keys $V_i$, ephemeral-issuer bearer quota vouchers, 2-layer PQ onion relay | `ADR-11` |
 | **Elastic Day-1-to-10,000-User Scaling** | `PersonalDeviceCert` Day-1 ring (`2-of-3`), auto-draining `FoundationSeedAnchor`s, and earned `16-of-20` `HighUptimeAnchor` standing | `ADR-13`, `ADR-14` |
 | **Byzantine & Red-Team Hardening** | Pre-decoding Merkle quarantine, bounded `with_limit` wire framing (`32 MiB`), atomic `fsync`+`rename`, path-traversal blocking, and BIP-39 12/24-word seed recovery | `ADR-09`, `ADR-15` |
+| **Privacy-Preserving Eviction Engine** | 4-vector bad-actor/content eviction (`parvault evict`), zero plaintext IPs on disk (`eviction_index.bin` HMAC tags), multi-pass `0x00` shredding, $M$-of-$N$ Public Tracker Council quorum (`cosign-eviction`), cryptographic reporter burden-of-proof (`parvault report-abuse`) | `ADR-19` |
 
 ---
 
@@ -147,22 +141,27 @@ fn main() -> anyhow::Result<()> {
 
 Measured via `cargo run --release --bin parvault-bench -- run --payload-mib 64` (zero simulated sleeps or fabricated numbers; Linux `/proc/self/status` `VmRSS` & `VmHWM` + wall-clock timing):
 
-| Measurement Checkpoint (`64 MiB` File = `4 x 16 MiB` Stripes) | `VmRSS` (Active Resident) | `VmHWM` (Peak Working Set) | Streaming Throughput |
-| :--- | :---: | :---: | :---: |
-| **Process Baseline (Startup)** | `4.16 MiB` (`4,256 KiB`) | `4.16 MiB` (`4,256 KiB`) | — |
-| **After `64 MiB` 64 KiB-Chunked File Setup** | `4.34 MiB` (`4,448 KiB`) | `4.34 MiB` (`4,448 KiB`) | — |
-| **After `store_file_streaming` (`4 x 16 MiB`, `16-of-20`)** | **`5.74 MiB` (`+1.58 MiB` delta)** | `74.63 MiB` ($\mathcal{O}(1)$ 1-stripe buffers) | **`248.9 MiB/s`** |
-| **After `restore_file_streaming` + SHA-256 Verify** | **`5.80 MiB` (`+1.64 MiB` delta)** | `74.63 MiB` ($\mathcal{O}(1)$ 1-stripe buffers) | **`317.1 MiB/s`** |
+### Streaming Memory Footprint & Throughput (Dual Profile Comparison)
+
+| Profile | Stripe Size | Stripes | Baseline RSS | Peak VmHWM | SoC < 32 MiB Gate | Store Speed | Restore Speed |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Router-SoC** | `1 MiB` | `64` | `4.12 MiB` | **`9.39 MiB`** (`9,616 KiB`) | **PASS (< 32 MiB)** | **`78.8 MiB/s`** | **`117.8 MiB/s`** |
+| **Desktop / Homelab-NAS** | `16 MiB` | `4` | `5.44 MiB` | **`57.30 MiB`** (`58,676 KiB`) | Desktop Target | **`118.1 MiB/s`** | **`104.8 MiB/s`** |
 
 | Subsystem / Operation | Parameters / Construction | Measured Throughput / Latency |
 | :--- | :--- | :---: |
-| **`Argon2id` + `HKDF-SHA256` Seed Derivation** | `m = 64 MiB (65,536 KiB), t = 3, p = 4` (BIP-39 12-word) | **`98.45 ms`** |
-| **`AES-256-GCM` Stripe Encryption / Decryption** | `16 MiB` stripe + HKDF per-purpose subkey/nonce | **`1,181.9 MiB/s` / `1,153.3 MiB/s`** |
-| **`PqVaultMasterKey` Dual-Cipher Encrypt / Decrypt** | `16 MiB` (`AES-256-GCM` inner + `ChaCha20-Poly1305` outer) | **`602.4 MiB/s` / `636.0 MiB/s`** |
-| **`HybridKemKeypair` Encapsulate / Decapsulate (X-Wing)** | `X25519 + NIST FIPS 203 ML-KEM-768` (`HKDF-SHA512`) | **`86.6 us` / `89.3 us`** |
-| **`HybridPqSigningKeypair` Sign / Verify** | `Ed25519 + NIST FIPS 204 ML-DSA-65` | **`408.4 us` / `140.7 us`** |
-| **Reed-Solomon $GF(2^8)$ `Consumer (10-of-20)` Encode / 4-Erasure Reconstruct** | `16 MiB` stripe $\to$ `20 x 1.6 MiB` shards + Merkle quarantine | **`302.5 MiB/s` / `242.7 MiB/s`** |
-| **Reed-Solomon $GF(2^8)$ `Homelab (16-of-20)` Encode / 4-Erasure Reconstruct** | `16 MiB` stripe $\to$ `20 x 1.0 MiB` shards + Merkle quarantine | **`616.2 MiB/s` / `359.0 MiB/s`** |
+| **`Argon2id` + `HKDF-SHA256` Seed Derivation** | `m = 64 MiB (65,536 KiB), t = 3, p = 4` (BIP-39 12-word) | **`156.44 ms`** |
+| **`AES-256-GCM` Stripe Encryption (Router-SoC)** | `1 MiB` stripe + HKDF per-purpose subkey/nonce | **`522.1 MiB/s`** |
+| **`AES-256-GCM` Stripe Decryption (Router-SoC)** | `1 MiB` stripe + tag verification | **`535.0 MiB/s`** |
+| **`AES-256-GCM` Stripe Encryption (Desktop)** | `16 MiB` stripe + HKDF per-purpose subkey/nonce | **`465.9 MiB/s`** |
+| **`AES-256-GCM` Stripe Decryption (Desktop)** | `16 MiB` stripe + tag verification | **`459.0 MiB/s`** |
+| **`PqVaultMasterKey` Dual-Cipher Encryption** | `16 MiB` (`AES-256-GCM` inner + `ChaCha20-Poly1305` outer) | **`247.5 MiB/s`** |
+| **`PqVaultMasterKey` Dual-Cipher Decryption** | `16 MiB` (`ChaCha20-Poly1305` outer + `AES-256-GCM` inner) | **`250.4 MiB/s`** |
+| **`HybridKemKeypair` Encapsulate / Decapsulate (X-Wing)** | `X25519 + NIST FIPS 203 ML-KEM-768` (`HKDF-SHA512`) | **`100.2 us` / `108.2 us`** |
+| **`HybridPqSigningKeypair` Sign / Verify** | `Ed25519 + NIST FIPS 204 ML-DSA-65` | **`515.3 us` / `167.9 us`** |
+| **Reed-Solomon $GF(2^8)$ `Router-SoC (16-of-20)` Encode / Reconstruct** | `1 MiB` stripe $\to$ `20 x 64 KiB` shards + Merkle quarantine | **`311.9 MiB/s` / `140.4 MiB/s`** |
+| **Reed-Solomon $GF(2^8)$ `Consumer (10-of-20)` Encode / Reconstruct** | `16 MiB` stripe $\to$ `20 x 1.6 MiB` shards + Merkle quarantine | **`142.7 MiB/s` / `83.6 MiB/s`** |
+| **Reed-Solomon $GF(2^8)$ `Homelab (16-of-20)` Encode / Reconstruct** | `16 MiB` stripe $\to$ `20 x 1.0 MiB` shards + Merkle quarantine | **`258.5 MiB/s` / `132.2 MiB/s`** |
 
 ---
 

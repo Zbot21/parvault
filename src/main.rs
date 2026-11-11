@@ -12,7 +12,7 @@ use parvault::{
     },
     config::{Cli, Commands, DaemonAction, ErasureTier, FileAction, NodeConfig},
     crypto::{
-        compute_sha256, encrypt_stripe,
+        compute_sha256, encrypt_stripe, generate_bip39_mnemonic,
         pqc::{HybridKemKeypair, HybridPqPublicKey, HybridPqSigningKeypair},
         MasterKey, NodeIdentity, SoftwareTpm2Stub,
     },
@@ -21,19 +21,167 @@ use parvault::{
             DhtEnvelopeKind, DhtWireEnvelope, MeshNetworkBehaviourEvent, MeshWireRequest,
             MeshWireResponse,
         },
-        build_mesh_swarm, is_network_peer_addr, MeshClient, WebOfTrustRegistry,
-        DEFAULT_SUBTREE_SLASH_LIMIT,
+        build_mesh_swarm, derive_4word_pairing_sas, derive_slot_key_from_code, discover_lan_peers,
+        extract_listen_port_and_ip, is_network_peer_addr, node_identity_libp2p_peer_id,
+        reflect_observed_wan_multiaddr, resolve_zero_config_peers_with_wan,
+        verify_lan_pairing_code, DiscoveredLanPeer, KnownPeersStore, LanBeaconConfig,
+        LanBeaconResponder, MeshClient, TrustPoolMode, WanPeerCard, WanRendezvousRegistry,
+        WebOfTrustRegistry, DEFAULT_LAN_PAIRING_NONCE, DEFAULT_PUBLIC_WOT_POW_BITS,
+        DEFAULT_SUBTREE_SLASH_LIMIT, DEFAULT_WAN_TTL_SECS, PUBLIC_COMMONS_SWARM_SLOT,
     },
     por::{PorVerifierEngine, RepairGrant},
-    sharding::Hash32,
-    storage::{BlockStore, FileManifest, QuotaManager, ShardId, VoucherNullifierLedger},
+    router_nas::{RouterNasLiveSnapshot, RouterNasPeerEntry, RouterNasStatusServer},
+    sharding::{merkle::hash_shard_leaf, Hash32},
+    storage::{
+        BlockStore, EvictionPurgeReport, EvictionTarget, FileManifest,
+        PrivacyPreservingEvictionEngine, PublicTrackerTakedownQueue, QuotaManager, ShardId,
+        SignedBadActorEvictionOrder, VerifiableAbuseReport, VoucherNullifierLedger,
+    },
     sync::{
         EncryptedVaultCatalogEnvelope, FolderSnapshotManifest, FolderSyncDiff, FolderSyncEngine,
     },
 };
-use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use serde::Serialize;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
 use tracing::{info, warn};
+
+#[derive(Debug, Clone, Serialize)]
+struct DiscoverOutputEntry {
+    peer_id: String,
+    device_peer_id: String,
+    label: String,
+    role: String,
+    multiaddr: String,
+    available_bytes: u64,
+    source: String,
+}
+
+#[derive(Debug, Clone)]
+struct DaemonLaunchOptions {
+    lan_discovery_enabled: bool,
+    lan_discovery_port: u16,
+    print_pairing_banner: bool,
+    status_http_bind: Option<String>,
+    watch_folder: Option<PathBuf>,
+    sync_interval_secs: u64,
+    sync_tier: ErasureTier,
+    wan_announce: bool,
+    wan_seeds: Vec<String>,
+    public_mode: bool,
+    public_trackers: Vec<String>,
+    external_addrs: Vec<String>,
+    trust_mode: TrustPoolMode,
+}
+
+fn command_needs_network_discovery(cmd: &Commands) -> bool {
+    !matches!(
+        cmd,
+        Commands::Init { .. }
+            | Commands::Discover { .. }
+            | Commands::Pair { .. }
+            | Commands::Join { .. }
+            | Commands::Identity
+            | Commands::IssueDeviceCert { .. }
+            | Commands::VerifyDeviceCert { .. }
+            | Commands::DiffFolder { .. }
+            | Commands::ListSnapshot { .. }
+            | Commands::Scrub
+    )
+}
+
+fn format_bytes_human(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes as f64 >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB)
+    } else if bytes > 0 {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    } else {
+        "0 B".to_string()
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn normalize_pairing_code_words(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("pvpair1:") {
+        let parts: Vec<&str> = rest.split(':').collect();
+        if parts.len() == 3 {
+            return parts[2].trim().to_ascii_lowercase();
+        }
+    }
+    trimmed
+        .split(|c: char| c == '-' || c.is_whitespace())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_wan_card_with_stun_port(
+    mesh_client: &MeshClient,
+    anchor_addr: &str,
+    probe_slot: [u8; 32],
+    identity: &NodeIdentity,
+    label: &str,
+    role: &str,
+    explicit_external_addrs: &[String],
+    local_tcp_port: u16,
+    local_peer_id: &str,
+    pq_fp: Option<String>,
+) -> anyhow::Result<WanPeerCard> {
+    let mut wan_addrs: Vec<String> = explicit_external_addrs
+        .iter()
+        .map(|s| {
+            let trimmed = s.trim();
+            if trimmed.contains("/p2p/") || local_peer_id.is_empty() {
+                trimmed.to_string()
+            } else {
+                format!("{trimmed}/p2p/{local_peer_id}")
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if wan_addrs.is_empty() {
+        if let Ok((_, Some(obs))) = mesh_client.lookup_wan_rendezvous(anchor_addr, probe_slot) {
+            if let Ok(obs_maddr) = obs.parse::<Multiaddr>() {
+                if let Some(rewritten) =
+                    reflect_observed_wan_multiaddr(&obs_maddr, local_tcp_port, local_peer_id)
+                {
+                    wan_addrs.push(rewritten);
+                } else {
+                    wan_addrs.push(obs);
+                }
+            } else {
+                wan_addrs.push(obs);
+            }
+        }
+    }
+
+    WanPeerCard::new(
+        identity,
+        label.to_string(),
+        role.to_string(),
+        wan_addrs,
+        Some(anchor_addr.to_string()),
+        pq_fp,
+        DEFAULT_WAN_TTL_SECS,
+        now_unix_ms(),
+    )
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -45,31 +193,801 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let mut cfg = NodeConfig::load_or_default(cli.config.as_ref())?;
-    if let Some(ref override_dir) = cli.data_dir {
-        cfg.data_dir = override_dir.clone();
+    let mut cfg =
+        NodeConfig::load_for_cli(cli.config.as_ref(), cli.data_dir.as_deref(), cli.profile)?;
+
+    let lan_port = cfg.effective_lan_discovery_port(cli.lan_discovery_port);
+    let lan_enabled = cfg.effective_lan_discovery_enabled(cli.no_lan_discovery);
+    let trust_mode = cfg.effective_trust_mode(cli.public, &cli.trackers);
+    let public_mode = trust_mode.allows_public_commons();
+    let public_trackers =
+        cfg.effective_public_trackers(&cli.trackers, cli.seed_addr.as_deref(), public_mode);
+    let wan_seeds = cfg.effective_wan_rendezvous_seeds(cli.seed_addr.as_deref());
+    let external_addrs = cfg.effective_external_addrs(&cli.external_addrs);
+
+    // Handle `parvault init` first before pre-creating default keys so we can print initialization cleanly
+    if let Commands::Init {
+        watch,
+        label,
+        max_storage_gib,
+    } = cli.command
+    {
+        let profile = cli.profile.unwrap_or(cfg.hardware_profile);
+        cfg.apply_hardware_profile(profile);
+        let storage_gib = max_storage_gib.unwrap_or_else(|| profile.default_max_storage_gib());
+        cfg.max_storage_bytes = storage_gib.saturating_mul(1024 * 1024 * 1024);
+        if let Some(lbl) = label
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            cfg.node_label = Some(lbl);
+        }
+        if let Some(ref watch_dir) = watch {
+            std::fs::create_dir_all(watch_dir)?;
+            cfg.watched_folder = Some(watch_dir.clone());
+        }
+        if !cli.trackers.is_empty() {
+            cfg.public_trackers = cli.trackers.clone();
+        }
+        if cli.public {
+            cfg.trust_mode = TrustPoolMode::PublicCommons;
+        }
+        if let Some(ref seed) = cli.seed_addr {
+            cfg.lite_seed_addr = Some(seed.clone());
+            if !cfg.wan_rendezvous_seeds.contains(seed) {
+                cfg.wan_rendezvous_seeds.push(seed.clone());
+            }
+        }
+        if !external_addrs.is_empty() {
+            cfg.external_addrs = external_addrs;
+        }
+        if let Some(port_override) = cli.lan_discovery_port {
+            cfg.lan_discovery_port = port_override;
+        }
+        if cli.no_lan_discovery {
+            cfg.lan_discovery_enabled = false;
+        }
+
+        std::fs::create_dir_all(&cfg.data_dir)?;
+        let node_id = NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?;
+        let libp2p_pid = node_identity_libp2p_peer_id(&node_id)?;
+        let pq_kp = HybridPqSigningKeypair::load_or_generate_in_dir(&cfg.data_dir)?;
+        let _pq_kem = HybridKemKeypair::load_or_generate_in_dir(&cfg.data_dir)?;
+        let _mk = resolve_master_key(
+            &cfg.data_dir,
+            None,
+            cfg.device_sealing_passphrase.as_deref(),
+        )?;
+        let mnemonic = generate_bip39_mnemonic(24)?;
+
+        let cfg_out_path = cli
+            .config
+            .clone()
+            .unwrap_or_else(|| cfg.data_dir.join("config.toml"));
+        let toml_body = toml::to_string_pretty(&cfg)?;
+        BlockStore::atomic_write_file(&cfg_out_path, toml_body.as_bytes())?;
+
+        let display_label = cfg.effective_node_label(&libp2p_pid.to_string());
+        println!(
+            "=== ParVault Node Initialized (v{}) ===",
+            env!("CARGO_PKG_VERSION")
+        );
+        println!("Data Directory          : {}", cfg.data_dir.display());
+        println!("Configuration File      : {}", cfg_out_path.display());
+        println!("Node Label              : {}", display_label);
+        println!(
+            "Hardware Profile        : {} (stripe={} MiB, min_free_disk={})",
+            profile,
+            cfg.stripe_size_bytes / (1024 * 1024),
+            format_bytes_human(cfg.min_free_disk_bytes)
+        );
+        println!("Max Storage Allocation  : {} GiB", storage_gib);
+        println!("Device Peer ID          : {}", node_id.device_peer_id());
+        println!("libp2p Peer ID          : {}", libp2p_pid);
+        println!(
+            "Owner PQ Fingerprint    : {}",
+            pq_kp.public_key().fingerprint_hex()
+        );
+        if let Some(ref wdir) = cfg.watched_folder {
+            println!("Watched Folder          : {}", wdir.display());
+        }
+        println!("----------------------------------------------------------------------");
+        println!("24-Word BIP-39 Recovery Mnemonic (Write this down offline!):");
+        println!("  {}", mnemonic);
+        println!("----------------------------------------------------------------------");
+        println!("Next Steps (Zero-IP Quickstart):");
+        println!(
+            "  1. Start appliance : parvault --data-dir {} up --pair",
+            cfg.data_dir.display()
+        );
+        println!("  2. Pair any laptop : parvault join --code <4-word-code>");
+        return Ok(());
     }
 
     let node_identity = NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?;
-    let effective_peers = cfg.effective_peers(&cli.peers);
+    let explicit_peers = cfg.effective_peers(&cli.peers);
     let effective_seed = cfg.effective_seed_addr(cli.seed_addr.as_deref());
-    let mesh_client = MeshClient::new(node_identity.clone(), effective_peers, effective_seed);
+
+    let resolved_peers = if !explicit_peers.is_empty() {
+        explicit_peers.clone()
+    } else if command_needs_network_discovery(&cli.command) {
+        let anchors: &[String] = if public_mode && !public_trackers.is_empty() {
+            &public_trackers
+        } else {
+            &wan_seeds
+        };
+        let scan_timeout = if lan_enabled {
+            Duration::from_millis(300)
+        } else {
+            Duration::ZERO
+        };
+        resolve_zero_config_peers_with_wan(
+            &cfg.data_dir,
+            &[],
+            lan_port,
+            scan_timeout,
+            &node_identity,
+            anchors,
+            public_mode,
+        )
+    } else {
+        Vec::new()
+    };
+
+    let mesh_client = MeshClient::new(node_identity.clone(), resolved_peers, effective_seed)
+        .with_data_dir_discovery(cfg.data_dir.clone(), lan_port);
+
+    if public_mode && command_needs_network_discovery(&cli.command) {
+        for tracker in &public_trackers {
+            let _ = mesh_client.announce_and_discover_public_tracker(tracker, None);
+        }
+        for pk in mesh_client.pinned_tracker_admin_pubkeys() {
+            cfg.persist_pinned_tracker_admin(pk);
+        }
+    }
 
     let mut quota = QuotaManager::new(cfg.max_storage_bytes, cfg.bootstrap_grace_bytes);
     quota.set_min_free_disk_bytes(cfg.min_free_disk_bytes);
-    let block_store = BlockStore::new(&cfg.data_dir, quota)?.with_mesh_client(mesh_client.clone());
+    let block_store = BlockStore::new(&cfg.data_dir, quota)?
+        .with_stripe_size_bytes(cfg.stripe_size_bytes)
+        .with_mesh_client(mesh_client.clone());
 
     match cli.command {
+        Commands::Init { .. } => unreachable!("handled above"),
+
+        Commands::Discover {
+            timeout_ms,
+            port,
+            json,
+            wan,
+        } => {
+            let disc_port = port
+                .or(cli.lan_discovery_port)
+                .unwrap_or_else(|| cfg.effective_lan_discovery_port(None));
+            let local_pid = node_identity_libp2p_peer_id(&node_identity)?.to_string();
+            let lan_found: Vec<DiscoveredLanPeer> = if lan_enabled {
+                discover_lan_peers(Duration::from_millis(timeout_ms), disc_port)
+                    .into_iter()
+                    .filter(|p| p.libp2p_peer_id != local_pid)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            let mut known_store = KnownPeersStore::load(&cfg.data_dir);
+            known_store.upsert_discovered(&lan_found);
+
+            let mut entries: Vec<DiscoverOutputEntry> = lan_found
+                .iter()
+                .map(|p| DiscoverOutputEntry {
+                    peer_id: p.libp2p_peer_id.clone(),
+                    device_peer_id: p.device_peer_id.clone(),
+                    label: p.node_label.clone(),
+                    role: p.role.clone(),
+                    multiaddr: p.multiaddr.clone(),
+                    available_bytes: p.available_bytes,
+                    source: "lan".to_string(),
+                })
+                .collect();
+
+            if public_mode || !public_trackers.is_empty() {
+                for tracker in &public_trackers {
+                    if let Ok(cards) =
+                        mesh_client.announce_and_discover_public_tracker(tracker, None)
+                    {
+                        for card in cards {
+                            if card.libp2p_peer_id == local_pid
+                                || entries.iter().any(|e| e.peer_id == card.libp2p_peer_id)
+                            {
+                                continue;
+                            }
+                            if let Some(raw_maddr) = card.wan_multiaddrs.first() {
+                                let pinned = if raw_maddr.contains("/p2p/") {
+                                    raw_maddr.clone()
+                                } else {
+                                    format!("{raw_maddr}/p2p/{}", card.libp2p_peer_id)
+                                };
+                                known_store.upsert_pinned_multiaddr(
+                                    &card.libp2p_peer_id,
+                                    &pinned,
+                                    Some(&card.node_label),
+                                    Some(&card.role),
+                                );
+                                entries.push(DiscoverOutputEntry {
+                                    peer_id: card.libp2p_peer_id,
+                                    device_peer_id: card.device_peer_id,
+                                    label: card.node_label,
+                                    role: card.role,
+                                    multiaddr: pinned,
+                                    available_bytes: 0,
+                                    source: "public-tracker".to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            if wan && !wan_seeds.is_empty() {
+                let pq_fp = HybridPqSigningKeypair::load_or_generate_in_dir(&cfg.data_dir)
+                    .ok()
+                    .map(|kp| kp.public_key().fingerprint_hex());
+                for anchor in &wan_seeds {
+                    if let Some(ref fp) = pq_fp {
+                        if let Ok(cards) = mesh_client.lookup_wan_ddns_cards(anchor, fp) {
+                            for card in cards {
+                                if card.libp2p_peer_id == local_pid
+                                    || entries.iter().any(|e| e.peer_id == card.libp2p_peer_id)
+                                {
+                                    continue;
+                                }
+                                if let Some(raw_maddr) = card.wan_multiaddrs.first() {
+                                    let pinned = if raw_maddr.contains("/p2p/") {
+                                        raw_maddr.clone()
+                                    } else {
+                                        format!("{raw_maddr}/p2p/{}", card.libp2p_peer_id)
+                                    };
+                                    known_store.upsert_pinned_multiaddr(
+                                        &card.libp2p_peer_id,
+                                        &pinned,
+                                        Some(&card.node_label),
+                                        Some(&card.role),
+                                    );
+                                    entries.push(DiscoverOutputEntry {
+                                        peer_id: card.libp2p_peer_id,
+                                        device_peer_id: card.device_peer_id,
+                                        label: card.node_label,
+                                        role: card.role,
+                                        multiaddr: pinned,
+                                        available_bytes: 0,
+                                        source: "wan-ddns".to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let _ = known_store.save(&cfg.data_dir);
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else {
+                println!("DISCOVERED PARVAULT PEERS (Zero-IP Configuration)");
+                println!("{:-<106}", "");
+                println!(
+                    "{:<18} | {:<12} | {:<54} | {:<12}",
+                    "Label", "Role", "Multiaddr (Pinned PeerId)", "Free Space"
+                );
+                println!("{:-<106}", "");
+                if entries.is_empty() {
+                    println!(
+                        "(No active LAN/WAN beacons detected within {} ms)",
+                        timeout_ms
+                    );
+                } else {
+                    for e in &entries {
+                        println!(
+                            "{:<18} | {:<12} | {:<54} | {:<12}",
+                            e.label,
+                            e.role,
+                            e.multiaddr,
+                            format_bytes_human(e.available_bytes)
+                        );
+                    }
+                }
+                println!("{:-<106}", "");
+                println!(
+                    "Discovered {} verified peer(s). Pinned in {}.",
+                    entries.len(),
+                    cfg.data_dir.join("known_peers.json").display()
+                );
+            }
+        }
+
+        Commands::Pair {
+            port,
+            duration_secs,
+            once,
+            wan,
+            listen,
+        } => {
+            let disc_port = port
+                .or(cli.lan_discovery_port)
+                .unwrap_or_else(|| cfg.effective_lan_discovery_port(None));
+            let listen_str = listen.unwrap_or_else(|| cfg.listen_tcp.clone());
+            let listen_maddr: Multiaddr = listen_str.parse()?;
+            let (tcp_port, explicit_ip) =
+                extract_listen_port_and_ip(&listen_maddr).unwrap_or((4001, None));
+            let local_pid = node_identity_libp2p_peer_id(&node_identity)?.to_string();
+            let pq_fp = HybridPqSigningKeypair::load_or_generate_in_dir(&cfg.data_dir)?
+                .public_key()
+                .fingerprint_hex();
+            let sas = derive_4word_pairing_sas(&local_pid, Some(&pq_fp), DEFAULT_LAN_PAIRING_NONCE);
+            let node_label = cfg.effective_node_label(&local_pid);
+            let role = cfg.hardware_profile.beacon_role();
+
+            println!("========================================================");
+            println!("Home LAN Pairing Code: {}", sas.code);
+            println!("Compact Pairing Token: {}", sas.compact_token);
+            println!("Node Label / Peer ID : {} ({})", node_label, local_pid);
+            println!("Run on client        : parvault join --code {}", sas.code);
+            println!("========================================================");
+
+            if wan || !wan_seeds.is_empty() {
+                let slot_key = derive_slot_key_from_code(&sas.code);
+                for anchor in &wan_seeds {
+                    if let Ok(card) = build_wan_card_with_stun_port(
+                        &mesh_client,
+                        anchor,
+                        slot_key,
+                        &node_identity,
+                        &node_label,
+                        role,
+                        &external_addrs,
+                        tcp_port,
+                        &local_pid,
+                        Some(pq_fp.clone()),
+                    ) {
+                        match mesh_client.publish_wan_pairing_card(anchor, &sas.code, &card) {
+                            Ok(obs) => {
+                                println!(
+                                    "[parvault] Published encrypted WAN pairing card to {} (observed={})",
+                                    anchor,
+                                    obs.as_deref().unwrap_or("n/a")
+                                );
+                            }
+                            Err(e) => {
+                                warn!(anchor = %anchor, error = %e, "Failed to publish WAN pairing card");
+                            }
+                        }
+                    }
+                }
+            }
+
+            let avail = {
+                let q = block_store.quota();
+                let g = q.lock().expect("quota lock");
+                g.max_storage_bytes().saturating_sub(g.used_storage_bytes())
+            };
+            let beacon_cfg = LanBeaconConfig::new(node_label, role, tcp_port)
+                .with_discovery_port(disc_port)
+                .with_explicit_listen_ip(explicit_ip)
+                .with_available_bytes(avail)
+                .with_owner_pq_fingerprint(Some(pq_fp))
+                .with_pairing_sas_commitment(Some(sas.commitment));
+
+            let _beacon = if lan_enabled {
+                LanBeaconResponder::spawn(node_identity, beacon_cfg).ok()
+            } else {
+                None
+            };
+
+            if once {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                return Ok(());
+            }
+
+            println!(
+                "Broadcasting signed pairing beacon for {}s (press Ctrl-C to stop)...",
+                duration_secs
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(duration_secs)) => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        }
+
+        Commands::Join {
+            code,
+            timeout_ms,
+            port,
+            wan,
+        } => {
+            let disc_port = port
+                .or(cli.lan_discovery_port)
+                .unwrap_or_else(|| cfg.effective_lan_discovery_port(None));
+            let local_pid = node_identity_libp2p_peer_id(&node_identity)?.to_string();
+
+            let mut matched: Option<(String, String, String, String)> = None;
+
+            if lan_enabled {
+                let lan_peers = discover_lan_peers(Duration::from_millis(timeout_ms), disc_port);
+                if let Some(found) = lan_peers
+                    .into_iter()
+                    .find(|p| p.libp2p_peer_id != local_pid && verify_lan_pairing_code(p, &code))
+                {
+                    matched = Some((
+                        found.libp2p_peer_id,
+                        found.node_label,
+                        found.role,
+                        found.multiaddr,
+                    ));
+                }
+            }
+
+            if matched.is_none() && (wan || !wan_seeds.is_empty()) {
+                let normalized_words = normalize_pairing_code_words(&code);
+                for anchor in &wan_seeds {
+                    for candidate_code in [code.trim(), normalized_words.as_str()] {
+                        if let Ok((cards, _)) =
+                            mesh_client.lookup_wan_pairing_cards(anchor, candidate_code)
+                        {
+                            if let Some(card) =
+                                cards.into_iter().find(|c| c.libp2p_peer_id != local_pid)
+                            {
+                                let raw_maddr = card
+                                    .wan_multiaddrs
+                                    .first()
+                                    .cloned()
+                                    .or_else(|| card.relay_seed_addr.clone())
+                                    .unwrap_or_else(|| anchor.clone());
+                                let pinned = if raw_maddr.contains("/p2p/") {
+                                    raw_maddr
+                                } else {
+                                    format!("{raw_maddr}/p2p/{}", card.libp2p_peer_id)
+                                };
+                                matched =
+                                    Some((card.libp2p_peer_id, card.node_label, card.role, pinned));
+                                break;
+                            }
+                        }
+                    }
+                    if matched.is_some() {
+                        break;
+                    }
+                }
+            }
+
+            let Some((peer_id, label, role, multiaddr)) = matched else {
+                anyhow::bail!(
+                    "Pairing verification failed: no LAN or WAN peer matched code '{}'",
+                    code.trim()
+                );
+            };
+
+            let mut store = KnownPeersStore::load(&cfg.data_dir);
+            store.upsert_pinned_multiaddr(&peer_id, &multiaddr, Some(&label), Some(&role));
+            store.save(&cfg.data_dir)?;
+
+            let cfg_file = cli
+                .config
+                .clone()
+                .unwrap_or_else(|| cfg.data_dir.join("config.toml"));
+            if cfg_file.is_file() && !cfg.bootstrap_peers.iter().any(|p| p == &multiaddr) {
+                cfg.bootstrap_peers.push(multiaddr.clone());
+                if let Ok(toml_str) = toml::to_string_pretty(&cfg) {
+                    let _ = BlockStore::atomic_write_file(&cfg_file, toml_str.as_bytes());
+                }
+            }
+
+            println!(
+                "Paired with {} ({}) — zero IP config ready!",
+                label, peer_id
+            );
+            println!("Pinned Multiaddr: {}", multiaddr);
+        }
+
+        Commands::Up {
+            folder,
+            interval_secs,
+            status_http,
+            pair,
+            wan,
+            listen,
+            tier,
+        } => {
+            if let Some(listen_override) = listen {
+                cfg.listen_tcp = listen_override;
+            }
+            let effective_folder = folder.or_else(|| cfg.watched_folder.clone());
+            let effective_status_http = status_http.or_else(|| cfg.status_http_bind.clone());
+            let effective_tier = if public_mode {
+                ErasureTier::Consumer
+            } else {
+                tier.unwrap_or(cfg.default_tier)
+            };
+            let opts = DaemonLaunchOptions {
+                lan_discovery_enabled: lan_enabled,
+                lan_discovery_port: lan_port,
+                print_pairing_banner: pair,
+                status_http_bind: effective_status_http,
+                watch_folder: effective_folder,
+                sync_interval_secs: interval_secs.max(1),
+                sync_tier: effective_tier,
+                wan_announce: wan || !wan_seeds.is_empty(),
+                wan_seeds,
+                public_mode,
+                public_trackers,
+                external_addrs,
+                trust_mode,
+            };
+            run_daemon(cfg, block_store, opts).await?;
+        }
+
+        Commands::Evict {
+            ip,
+            subnet,
+            peer_id,
+            pubkey_hex,
+            merkle_root,
+            locator,
+            reason,
+            propagate,
+        } => {
+            let target =
+                parse_cli_eviction_target(ip, subnet, peer_id, pubkey_hex, merkle_root, locator)?;
+            let mut eviction = PrivacyPreservingEvictionEngine::load_or_init(&cfg.data_dir)?;
+            let local_report = eviction.evict_target(&target, &block_store)?;
+
+            let mut remote_report = EvictionPurgeReport::default();
+            let mut propagated_orders = 0usize;
+            if propagate {
+                let now_ms = now_unix_ms();
+                let mut orders = vec![SignedBadActorEvictionOrder::issue(
+                    &node_identity,
+                    target.clone(),
+                    reason.clone(),
+                    now_ms,
+                    0,
+                )];
+                match &target {
+                    EvictionTarget::IpAddress(bad_ip) => {
+                        for pk in eviction.resolve_pubkeys_for_ip(*bad_ip) {
+                            orders.push(SignedBadActorEvictionOrder::issue(
+                                &node_identity,
+                                EvictionTarget::PeerOrIssuerPubkey(pk),
+                                reason.clone(),
+                                now_ms,
+                                0,
+                            ));
+                        }
+                    }
+                    EvictionTarget::IpSubnet(cidr) => {
+                        for pk in eviction.resolve_pubkeys_for_subnet(cidr) {
+                            orders.push(SignedBadActorEvictionOrder::issue(
+                                &node_identity,
+                                EvictionTarget::PeerOrIssuerPubkey(pk),
+                                reason.clone(),
+                                now_ms,
+                                0,
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+                propagated_orders = orders.len();
+                for order in &orders {
+                    let rep = mesh_client.propagate_eviction_order_to_peers(&[], order);
+                    remote_report.merge(&rep);
+                }
+            }
+
+            println!("=== ParVault Privacy-Preserving Eviction Complete (ADR-19) ===");
+            println!("Data Directory           : {}", cfg.data_dir.display());
+            println!(
+                "Local Regular Shards     : {} zero-shredded (0x00)",
+                local_report.purged_regular_shards
+            );
+            println!(
+                "Local Blinded Shards     : {} zero-shredded (0x00)",
+                local_report.purged_blinded_shards
+            );
+            println!(
+                "Local Zero-Wiped Bytes   : {} bytes",
+                local_report.zero_wiped_bytes
+            );
+            println!(
+                "HMAC Firewall Installed  : {} (zero plaintext IPs on disk)",
+                local_report.firewall_rule_installed
+            );
+            if propagate {
+                println!(
+                    "Mesh Propagation         : {} signed order(s) broadcast (remote purged: {} regular, {} blinded, {} bytes)",
+                    propagated_orders,
+                    remote_report.purged_regular_shards,
+                    remote_report.purged_blinded_shards,
+                    remote_report.zero_wiped_bytes
+                );
+            }
+        }
+
+        Commands::ReportAbuse {
+            manifest,
+            disclosed_key_hex,
+            allegation,
+            contact,
+            bad_actor_ip,
+            stripe_index,
+        } => {
+            let target_tracker = public_trackers
+                .first()
+                .cloned()
+                .or_else(|| cli.seed_addr.clone())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Missing Public Tracker Multiaddr: pass `--tracker <MULTIADDR>`"
+                    )
+                })?;
+            let disclosed_mk = MasterKey::from_hex(disclosed_key_hex.trim())?;
+            let owner_identity = NodeIdentity::from_master_key(&disclosed_mk);
+            let file_manifest =
+                load_manifest_for_abuse_report(&block_store, &disclosed_mk, &manifest)?;
+            let stripe = file_manifest
+                .stripes
+                .iter()
+                .find(|s| s.stripe_index == stripe_index)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Stripe index {} not present in reported FileManifest ({} stripes)",
+                        stripe_index,
+                        file_manifest.stripes.len()
+                    )
+                })?;
+
+            let total_shards = stripe.k_data + stripe.m_parity;
+            let mut sample_shards: Vec<(u32, Vec<u8>)> = Vec::new();
+            for idx in 0..total_shards {
+                if sample_shards.len() >= stripe.k_data {
+                    break;
+                }
+                let sid = ShardId {
+                    stripe_merkle_root: stripe.stripe_merkle_root,
+                    shard_index: idx as u32,
+                    shard_hash: stripe.shard_hashes[idx],
+                };
+                if let Ok(bytes) = block_store.get_shard(&sid) {
+                    if hash_shard_leaf(idx as u32, &bytes) == stripe.shard_hashes[idx] {
+                        sample_shards.push((idx as u32, bytes));
+                    }
+                }
+            }
+
+            if sample_shards.len() < stripe.k_data {
+                let client_for_fetch = mesh_client.with_identity(owner_identity.clone());
+                let _ =
+                    client_for_fetch.announce_and_discover_public_tracker(&target_tracker, None);
+                let fetched_slots = client_for_fetch.fetch_stripe_shards(stripe, &owner_identity);
+                for (idx, slot) in fetched_slots.into_iter().enumerate() {
+                    if sample_shards.len() >= stripe.k_data {
+                        break;
+                    }
+                    if sample_shards
+                        .iter()
+                        .any(|(existing, _)| *existing == idx as u32)
+                    {
+                        continue;
+                    }
+                    if let Some(bytes) = slot {
+                        if hash_shard_leaf(idx as u32, &bytes) == stripe.shard_hashes[idx] {
+                            sample_shards.push((idx as u32, bytes));
+                        }
+                    }
+                }
+                if sample_shards.len() < stripe.k_data {
+                    for idx in 0..total_shards {
+                        if sample_shards.len() >= stripe.k_data {
+                            break;
+                        }
+                        if sample_shards
+                            .iter()
+                            .any(|(existing, _)| *existing == idx as u32)
+                        {
+                            continue;
+                        }
+                        let sid = ShardId {
+                            stripe_merkle_root: stripe.stripe_merkle_root,
+                            shard_index: idx as u32,
+                            shard_hash: stripe.shard_hashes[idx],
+                        };
+                        if let Ok(bytes) = client_for_fetch.get_ciphertext_shard(
+                            &target_tracker,
+                            sid,
+                            Some(&owner_identity),
+                            None,
+                        ) {
+                            if hash_shard_leaf(idx as u32, &bytes) == stripe.shard_hashes[idx] {
+                                sample_shards.push((idx as u32, bytes));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if sample_shards.len() < stripe.k_data {
+                anyhow::bail!(
+                    "Unable to collect k_data={} verified sample shards for stripe {} (found {})",
+                    stripe.k_data,
+                    stripe_index,
+                    sample_shards.len()
+                );
+            }
+
+            let report = VerifiableAbuseReport::submit_signed(
+                &node_identity,
+                &contact,
+                &allegation,
+                bad_actor_ip,
+                file_manifest,
+                disclosed_key_hex.trim(),
+                stripe_index,
+                sample_shards,
+                now_unix_ms(),
+            );
+            let local_proof = report
+                .verify_cryptographic_burden_of_proof()
+                .map_err(|e| anyhow::anyhow!("Cryptographic burden-of-proof check failed: {e}"))?;
+
+            let (ack_report_id, ack_sha) =
+                mesh_client.submit_abuse_takedown_report_detailed(&target_tracker, report)?;
+            for pk in mesh_client.pinned_tracker_admin_pubkeys() {
+                cfg.persist_pinned_tracker_admin(pk);
+            }
+            let verified_sha = ack_sha.unwrap_or(local_proof.verified_plaintext_sha256);
+
+            println!("=== ParVault Verifiable Abuse Report Submitted (ADR-19) ===");
+            println!("Public Tracker           : {}", target_tracker);
+            println!("Report ID                : {}", hex::encode(ack_report_id));
+            println!(
+                "File Merkle Root         : {}",
+                hex::encode(local_proof.file_merkle_root)
+            );
+            println!(
+                "Verified Plaintext SHA256: {} ({} bytes; zeroized in RAM)",
+                hex::encode(verified_sha),
+                local_proof.verified_plaintext_len
+            );
+            println!("Governance Queue Status  : PendingAdminReview (awaiting Public Tracker Admin review)");
+        }
+
         Commands::Daemon { action } => match action {
             DaemonAction::Start {
                 listen,
                 enable_quic,
+                status_http,
             } => {
                 cfg.listen_tcp = listen;
                 cfg.enable_quic = enable_quic;
-                run_daemon(cfg, block_store).await?;
+                let opts = DaemonLaunchOptions {
+                    lan_discovery_enabled: lan_enabled,
+                    lan_discovery_port: lan_port,
+                    print_pairing_banner: false,
+                    status_http_bind: status_http.or_else(|| cfg.status_http_bind.clone()),
+                    watch_folder: None,
+                    sync_interval_secs: 5,
+                    sync_tier: cfg.default_tier,
+                    wan_announce: !wan_seeds.is_empty(),
+                    wan_seeds,
+                    public_mode,
+                    public_trackers,
+                    external_addrs,
+                    trust_mode,
+                };
+                run_daemon(cfg, block_store, opts).await?;
             }
         },
+
         Commands::File { action } => match action {
             FileAction::Store {
                 path,
@@ -80,6 +998,14 @@ async fn main() -> anyhow::Result<()> {
                 let path = path
                     .or(path_flag)
                     .ok_or_else(|| anyhow::anyhow!("Missing input file path"))?;
+                let effective_tier = if public_mode {
+                    println!(
+                        "[parvault] Public Commons mode active: zero-knowledge AES-256-GCM encryption + 10-of-20 Reed-Solomon sharding."
+                    );
+                    ErasureTier::Consumer
+                } else {
+                    tier
+                };
                 let master_key = resolve_master_key(
                     &cfg.data_dir,
                     key_hex.as_deref(),
@@ -90,14 +1016,14 @@ async fn main() -> anyhow::Result<()> {
                 let store_with_owner = block_store
                     .clone()
                     .with_mesh_client(mesh_client.with_identity(owner_identity));
-                let (k, m, n) = tier.params();
+                let (k, m, n) = effective_tier.params();
                 info!(
                     file = %path.display(),
-                    ?tier,
+                    tier = ?effective_tier,
                     k_data = k,
                     m_parity = m,
                     n_total = n,
-                    stripe_size_mib = cfg.stripe_size_bytes / (1024 * 1024),
+                    stripe_size_kib = cfg.stripe_size_bytes / 1024,
                     "Encrypting (AES-256-GCM) and Reed-Solomon sharding file..."
                 );
 
@@ -105,7 +1031,7 @@ async fn main() -> anyhow::Result<()> {
                     &owner_peer_id,
                     &path,
                     &master_key,
-                    tier,
+                    effective_tier,
                     cfg.stripe_size_bytes,
                 )?;
                 let (dht_key, _) = manifest.to_encrypted_dht_record(&master_key)?;
@@ -123,7 +1049,7 @@ async fn main() -> anyhow::Result<()> {
                     k,
                     n,
                     (k as f64 / n as f64) * 100.0,
-                    tier.expansion_factor()
+                    effective_tier.expansion_factor()
                 );
                 println!("Total Stripes    : {}", manifest.stripes.len());
                 println!("Total Shards     : {}", manifest.stripes.len() * n);
@@ -169,6 +1095,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("Original Size    : {} bytes", manifest.original_file_size);
             }
         },
+
         Commands::Status => {
             let node_id = NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?;
             let pq_keypair = HybridPqSigningKeypair::load_or_generate_in_dir(&cfg.data_dir)?;
@@ -179,6 +1106,8 @@ async fn main() -> anyhow::Result<()> {
             println!("Data Directory        : {}", cfg.data_dir.display());
             println!("Device Peer ID        : {}", node_id.device_peer_id());
             println!("Owner PQ Fingerprint  : {}", pq_fp);
+            println!("Hardware Profile      : {}", cfg.hardware_profile);
+            println!("Trust Pool Mode       : {}", trust_mode);
             println!(
                 "Primary Transport     : TCP + Noise XX + Yamux ({})",
                 cfg.listen_tcp
@@ -254,6 +1183,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
+
         Commands::Identity => {
             let node_id = NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?;
             let pq_keypair = HybridPqSigningKeypair::load_or_generate_in_dir(&cfg.data_dir)?;
@@ -276,6 +1206,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Owner PQ Fingerprint    : {}", pq_pk.fingerprint_hex());
             println!("Master Key Fingerprint  : {}", mk_fp);
         }
+
         Commands::IssueDeviceCert {
             device_peer_id,
             device_label,
@@ -307,6 +1238,7 @@ async fn main() -> anyhow::Result<()> {
             }
             println!("Shareable Token         : {}", token_str);
         }
+
         Commands::VerifyDeviceCert {
             cert,
             owner_pq_pubkey_hex,
@@ -339,6 +1271,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Owner PQ Fingerprint    : {}", owner_pk.fingerprint_hex());
             println!("Verification Status     : VALID (Ed25519 + FIPS 204 ML-DSA-65 verified)");
         }
+
         Commands::DiffFolder {
             folder,
             snapshot,
@@ -362,6 +1295,7 @@ async fn main() -> anyhow::Result<()> {
             let diff = engine.diff_folder(&folder)?;
             print_folder_sync_diff(&folder, &diff);
         }
+
         Commands::WatchFolder {
             folder,
             snapshot_out,
@@ -377,6 +1311,14 @@ async fn main() -> anyhow::Result<()> {
             lite_seed_dir,
             device_cert,
         } => {
+            let effective_tier = if public_mode {
+                println!(
+                    "[parvault] Public Commons mode active: zero-knowledge AES-256-GCM encryption + 10-of-20 Reed-Solomon sharding."
+                );
+                ErasureTier::Consumer
+            } else {
+                tier
+            };
             let effective_seed_phrase = seed_phrase
                 .or_else(|| std::env::var("PARVAULT_SEED_PHRASE").ok())
                 .map(|s| s.trim().to_string())
@@ -400,15 +1342,14 @@ async fn main() -> anyhow::Result<()> {
                     (mk, id)
                 };
 
-            let mut store_for_sync = block_store.clone();
+            let mut store_for_sync = block_store
+                .clone()
+                .with_mesh_client(mesh_client.with_identity(owner_identity.clone()));
             let is_lite_net_seed = lite_seed_dir
                 .as_ref()
                 .map(|d| is_network_peer_addr(&d.to_string_lossy()))
                 .unwrap_or(false);
             if is_lite_net_seed {
-                // In Lite Mode over the network, do not upload 20x shards directly from the laptop
-                // during `sync_folder_once`; instead, encode locally, send 1.0x `SyndicateLiteStripe`
-                // to `parvault-seed`, and remove the local scratch shards!
                 store_for_sync.set_mesh_client(None);
             }
 
@@ -416,7 +1357,7 @@ async fn main() -> anyhow::Result<()> {
                 store_for_sync.clone(),
                 master_key.clone(),
                 owner_identity.clone(),
-                tier,
+                effective_tier,
             );
 
             if snapshot_out.exists() {
@@ -465,9 +1406,10 @@ async fn main() -> anyhow::Result<()> {
                         let mut snap = engine.sync_folder_once(&folder)?;
                         let net_client = MeshClient::new(
                             owner_identity.clone(),
-                            cfg.effective_peers(&cli.peers),
+                            mesh_client.all_network_endpoints(),
                             Some(seed_str.clone()),
-                        );
+                        )
+                        .with_data_dir_discovery(cfg.data_dir.clone(), lan_port);
                         let store_with_net =
                             block_store.clone().with_mesh_client(net_client.clone());
                         let mut receipt_count = 0usize;
@@ -538,7 +1480,6 @@ async fn main() -> anyhow::Result<()> {
                                                     stripe_meta.shard_hashes.len()
                                                 ]
                                             };
-                                            // Remove temporary local scratch shards on the Lite Client
                                             for (idx, &sh_hash) in
                                                 stripe_meta.shard_hashes.iter().enumerate()
                                             {
@@ -569,7 +1510,8 @@ async fn main() -> anyhow::Result<()> {
                     } else {
                         let seed_quota =
                             QuotaManager::new(cfg.max_storage_bytes, cfg.bootstrap_grace_bytes);
-                        let seed_store = BlockStore::new(seed_dir, seed_quota)?;
+                        let seed_store = BlockStore::new(seed_dir, seed_quota)?
+                            .with_stripe_size_bytes(cfg.stripe_size_bytes);
                         let mut seed_server = ZeroTrustSeedServer::new_homelab_vault(
                             "paired-homelab-seed",
                             seed_store,
@@ -597,14 +1539,15 @@ async fn main() -> anyhow::Result<()> {
                             .map(|d| d.to_string_lossy().to_string());
                         let net_client = MeshClient::new(
                             owner_identity.clone(),
-                            cfg.effective_peers(&cli.peers),
+                            mesh_client.all_network_endpoints(),
                             seed_str,
-                        );
+                        )
+                        .with_data_dir_discovery(cfg.data_dir.clone(), lan_port);
                         let net_engine = FolderSyncEngine::new(
                             block_store.clone().with_mesh_client(net_client),
                             master_key.clone(),
                             owner_identity.clone(),
-                            tier,
+                            effective_tier,
                         );
                         net_engine.prune_deleted_file_shards(&snapshot)?
                     } else {
@@ -650,9 +1593,10 @@ async fn main() -> anyhow::Result<()> {
                             .map(|d| d.to_string_lossy().to_string());
                         let net_client = MeshClient::new(
                             owner_identity.clone(),
-                            cfg.effective_peers(&cli.peers),
+                            mesh_client.all_network_endpoints(),
                             seed_str,
-                        );
+                        )
+                        .with_data_dir_discovery(cfg.data_dir.clone(), lan_port);
                         let _ = net_client
                             .put_dht_envelope(DhtWireEnvelope::VaultCatalog(envelope.clone()));
                     }
@@ -672,9 +1616,10 @@ async fn main() -> anyhow::Result<()> {
                             .map(|d| d.to_string_lossy().to_string());
                         let net_client = MeshClient::new(
                             owner_identity.clone(),
-                            cfg.effective_peers(&cli.peers),
+                            mesh_client.all_network_endpoints(),
                             seed_str,
-                        );
+                        )
+                        .with_data_dir_discovery(cfg.data_dir.clone(), lan_port);
                         let _ = net_client
                             .put_dht_envelope(DhtWireEnvelope::VaultCatalog(envelope.clone()));
                     }
@@ -686,9 +1631,10 @@ async fn main() -> anyhow::Result<()> {
                 if once {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(interval_secs.max(1))).await;
+                tokio::time::sleep(Duration::from_secs(interval_secs.max(1))).await;
             }
         }
+
         Commands::ListSnapshot { snapshot } => {
             let raw_snapshot = std::fs::read(&snapshot)?;
             let snapshot_manifest: FolderSnapshotManifest = bincode::deserialize(&raw_snapshot)?;
@@ -713,6 +1659,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
+
         Commands::RestoreFolder {
             snapshot,
             out_dir,
@@ -728,8 +1675,11 @@ async fn main() -> anyhow::Result<()> {
             let raw_snapshot = std::fs::read(&snapshot)?;
             let snapshot_manifest: FolderSnapshotManifest = bincode::deserialize(&raw_snapshot)?;
             let owner_identity = NodeIdentity::from_master_key(&master_key);
+            let store_with_owner = block_store
+                .clone()
+                .with_mesh_client(mesh_client.with_identity(owner_identity.clone()));
             let engine = FolderSyncEngine::new(
-                block_store,
+                store_with_owner,
                 master_key,
                 owner_identity,
                 snapshot_manifest.tier,
@@ -777,6 +1727,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
+
         Commands::RecoverFromSeed {
             seed_phrase,
             vault_namespace,
@@ -794,6 +1745,9 @@ async fn main() -> anyhow::Result<()> {
             );
             let owner_identity =
                 NodeIdentity::from_recovery_seed_phrase(&canonical_seed, &vault_namespace);
+            let recovery_store = block_store
+                .clone()
+                .with_mesh_client(mesh_client.with_identity(owner_identity.clone()));
 
             let envelope: EncryptedVaultCatalogEnvelope = if let Some(cat_path) = catalog_envelope {
                 let raw_env = std::fs::read(&cat_path)?;
@@ -802,14 +1756,14 @@ async fn main() -> anyhow::Result<()> {
                 })?
             } else {
                 let dht_key = master_key.derive_vault_root_dht_key(&vault_namespace);
-                if let Some(client) = block_store.mesh_client() {
+                if let Some(client) = recovery_store.mesh_client() {
                     if !client.all_network_endpoints().is_empty() {
                         match client.get_dht_envelope(&dht_key, DhtEnvelopeKind::VaultCatalog)? {
                             DhtWireEnvelope::VaultCatalog(env) => env,
                             _ => anyhow::bail!("unexpected DHT envelope kind for VaultCatalog"),
                         }
                     } else {
-                        block_store
+                        recovery_store
                             .get_dht_vault_catalog_envelope(&dht_key)
                             .ok_or_else(|| {
                                 anyhow::anyhow!(
@@ -818,7 +1772,7 @@ async fn main() -> anyhow::Result<()> {
                             })?
                     }
                 } else {
-                    block_store
+                    recovery_store
                         .get_dht_vault_catalog_envelope(&dht_key)
                         .ok_or_else(|| {
                             anyhow::anyhow!(
@@ -835,8 +1789,12 @@ async fn main() -> anyhow::Result<()> {
                     .filter(|s| !s.is_empty())
                     .collect();
                 let snapshot = envelope.open(&master_key, &pq_master_key)?;
-                let engine =
-                    FolderSyncEngine::new(block_store, master_key, owner_identity, snapshot.tier);
+                let engine = FolderSyncEngine::new(
+                    recovery_store,
+                    master_key,
+                    owner_identity,
+                    snapshot.tier,
+                );
                 let report = engine.restore_selective_subset(&snapshot, &filters, &out_dir)?;
                 println!(
                     "=== ParVault Selective Disaster Recovery From Seed Phrase Complete (ADR-17) ==="
@@ -850,7 +1808,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             } else {
                 let recovered_count = FolderSyncEngine::recover_folder_from_seed_phrase(
-                    &block_store,
+                    &recovery_store,
                     &seed_phrase,
                     &vault_namespace,
                     &envelope,
@@ -864,6 +1822,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("Files Restored     : {}", recovered_count);
             }
         }
+
         Commands::Scrub => {
             let report = block_store.scrub_all_shards()?;
             let healthy_shards =
@@ -885,17 +1844,18 @@ async fn main() -> anyhow::Result<()> {
                 corrupted_quarantined_shards
             );
         }
+
         Commands::Leave {
             handoff_to,
             keep_local,
         } => {
             let identity = NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?;
-            let target_dirs: Vec<std::path::PathBuf> = handoff_to
+            let target_dirs: Vec<PathBuf> = handoff_to
                 .unwrap_or_default()
                 .split(',')
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
-                .map(std::path::PathBuf::from)
+                .map(PathBuf::from)
                 .collect();
             let remove_local = !keep_local;
             let receipt = block_store.graceful_leave_and_redistribute(
@@ -1002,10 +1962,120 @@ fn load_manifest_by_arg(
     }
 }
 
-async fn run_daemon(cfg: NodeConfig, block_store: BlockStore) -> anyhow::Result<()> {
+fn parse_hex_32_cli(hex_str: &str, field_name: &str) -> anyhow::Result<[u8; 32]> {
+    let raw = hex::decode(hex_str.trim())
+        .map_err(|e| anyhow::anyhow!("Invalid hex in {field_name}: {e}"))?;
+    if raw.len() != 32 {
+        anyhow::bail!(
+            "Expected 64-character hex (32 bytes) for {field_name}, got {} bytes",
+            raw.len()
+        );
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&raw);
+    Ok(out)
+}
+
+fn parse_cli_eviction_target(
+    ip: Option<std::net::IpAddr>,
+    subnet: Option<String>,
+    peer_id: Option<String>,
+    pubkey_hex: Option<String>,
+    merkle_root: Option<String>,
+    locator: Option<String>,
+) -> anyhow::Result<EvictionTarget> {
+    let provided = [
+        ip.is_some(),
+        subnet.is_some(),
+        peer_id.is_some(),
+        pubkey_hex.is_some(),
+        merkle_root.is_some(),
+        locator.is_some(),
+    ]
+    .into_iter()
+    .filter(|b| *b)
+    .count();
+    if provided != 1 {
+        anyhow::bail!(
+            "Specify exactly one eviction target flag: --ip, --subnet, --peer-id, --pubkey-hex, --merkle-root, or --locator"
+        );
+    }
+    if let Some(addr) = ip {
+        Ok(EvictionTarget::IpAddress(addr))
+    } else if let Some(cidr) = subnet {
+        Ok(EvictionTarget::IpSubnet(cidr.trim().to_string()))
+    } else if let Some(pid) = peer_id {
+        Ok(EvictionTarget::Libp2pPeerId(pid.trim().to_string()))
+    } else if let Some(pk) = pubkey_hex {
+        Ok(EvictionTarget::PeerOrIssuerPubkey(parse_hex_32_cli(
+            &pk,
+            "--pubkey-hex",
+        )?))
+    } else if let Some(root) = merkle_root {
+        Ok(EvictionTarget::StripeMerkleRoot(parse_hex_32_cli(
+            &root,
+            "--merkle-root",
+        )?))
+    } else if let Some(loc) = locator {
+        Ok(EvictionTarget::BlindedLocator(parse_hex_32_cli(
+            &loc,
+            "--locator",
+        )?))
+    } else {
+        unreachable!()
+    }
+}
+
+fn load_manifest_for_abuse_report(
+    block_store: &BlockStore,
+    disclosed_mk: &MasterKey,
+    manifest_arg: &Path,
+) -> anyhow::Result<FileManifest> {
+    if manifest_arg.exists() {
+        let raw = std::fs::read(manifest_arg)?;
+        if let Ok(m) = FileManifest::from_encrypted_dht_record(disclosed_mk, &raw) {
+            return Ok(m);
+        }
+        if let Ok(m) = bincode::deserialize::<FileManifest>(&raw) {
+            return Ok(m);
+        }
+        if let Ok(m) = serde_json::from_slice::<FileManifest>(&raw) {
+            return Ok(m);
+        }
+        if let Ok(snap) = bincode::deserialize::<FolderSnapshotManifest>(&raw) {
+            if let Some(first) = snap.files.values().next() {
+                return Ok(first.manifest.clone());
+            }
+        }
+        anyhow::bail!(
+            "Failed to parse or decrypt FileManifest at {} with disclosed MasterKey",
+            manifest_arg.display()
+        );
+    }
+    load_manifest_by_arg(block_store, disclosed_mk, &manifest_arg.to_string_lossy())
+}
+
+fn extract_ip_from_multiaddr(addr: &Multiaddr) -> Option<std::net::IpAddr> {
+    for proto in addr.iter() {
+        match proto {
+            libp2p::multiaddr::Protocol::Ip4(ip4) => return Some(std::net::IpAddr::V4(ip4)),
+            libp2p::multiaddr::Protocol::Ip6(ip6) => return Some(std::net::IpAddr::V6(ip6)),
+            _ => {}
+        }
+    }
+    None
+}
+
+async fn run_daemon(
+    cfg: NodeConfig,
+    block_store: BlockStore,
+    opts: DaemonLaunchOptions,
+) -> anyhow::Result<()> {
+    let start_instant = Instant::now();
     let node_identity = NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?;
     let keypair = node_identity.to_libp2p_keypair()?;
     let local_peer_id = keypair.public().to_peer_id();
+    let local_pid_str = local_peer_id.to_string();
     let genesis_pubkey = NodeIdentity::resolve_genesis_root_pubkey_in_dir(
         &cfg.data_dir,
         cfg.genesis_root_pubkey_hex.as_deref(),
@@ -1016,26 +2086,182 @@ async fn run_daemon(cfg: NodeConfig, block_store: BlockStore) -> anyhow::Result<
         DEFAULT_SUBTREE_SLASH_LIMIT,
         &cfg.data_dir,
     );
+    wot.set_trust_pool_mode(opts.trust_mode, DEFAULT_PUBLIC_WOT_POW_BITS);
+
     let mut por_verifier =
         PorVerifierEngine::with_persistence_dir(cfg.por_timeout_ms, &cfg.data_dir);
     let mut nullifier_ledger =
         VoucherNullifierLedger::with_persistence_dir(genesis_pubkey, &cfg.data_dir);
     let pq_kem = HybridKemKeypair::load_or_generate_in_dir(&cfg.data_dir)?;
     let pq_signer = HybridPqSigningKeypair::load_or_generate_in_dir(&cfg.data_dir)?;
+    let pq_fp = pq_signer.public_key().fingerprint_hex();
     let mut lite_seed_server = ZeroTrustSeedServer::new_homelab_vault(
         node_identity.device_peer_id(),
         block_store.clone(),
         pq_signer.public_key(),
         2,
     );
+    let mut wan_registry =
+        WanRendezvousRegistry::load_or_new(Some(&cfg.data_dir.join("wan_rendezvous.bin")));
+    let mut eviction = PrivacyPreservingEvictionEngine::load_or_init(&cfg.data_dir)?;
+    let mut takedown_queue = PublicTrackerTakedownQueue::load_or_init(&cfg.data_dir)?;
+    let mut peer_remote_addrs: HashMap<String, Multiaddr> = HashMap::new();
 
     let mut swarm = build_mesh_swarm(keypair, cfg.enable_quic)?;
     let tcp_addr: Multiaddr = cfg.listen_tcp.parse()?;
-    swarm.listen_on(tcp_addr)?;
+    swarm.listen_on(tcp_addr.clone())?;
 
     if cfg.enable_quic {
         let quic_addr: Multiaddr = cfg.listen_quic.parse()?;
         swarm.listen_on(quic_addr)?;
+    }
+
+    let node_label = cfg.effective_node_label(&local_pid_str);
+    let beacon_role = cfg.hardware_profile.beacon_role();
+    let sas = derive_4word_pairing_sas(&local_pid_str, Some(&pq_fp), DEFAULT_LAN_PAIRING_NONCE);
+
+    if opts.print_pairing_banner {
+        println!("[parvault] ========================================================");
+        println!("[parvault] Home LAN Pairing Code: {}", sas.code);
+        println!(
+            "[parvault] Run on client: parvault join --code {}",
+            sas.code
+        );
+        println!("[parvault] ========================================================");
+    }
+    if opts.public_mode {
+        println!(
+            "[parvault] Public Commons mode active: zero-knowledge AES-256-GCM encryption + 10-of-20 RS + PoW admission."
+        );
+    }
+
+    let (mut bound_tcp_port, init_explicit_ip) =
+        extract_listen_port_and_ip(&tcp_addr).unwrap_or((4001, None));
+
+    let beacon_handle = if opts.lan_discovery_enabled {
+        let (used, max_b) = {
+            let q = block_store.quota();
+            let g = q.lock().expect("quota lock");
+            (g.used_storage_bytes(), g.max_storage_bytes())
+        };
+        let beacon_cfg = LanBeaconConfig::new(node_label.clone(), beacon_role, bound_tcp_port)
+            .with_discovery_port(opts.lan_discovery_port)
+            .with_explicit_listen_ip(init_explicit_ip)
+            .with_available_bytes(max_b.saturating_sub(used))
+            .with_owner_pq_fingerprint(Some(pq_fp.clone()))
+            .with_pairing_sas_commitment(Some(sas.commitment));
+        match LanBeaconResponder::spawn(node_identity.clone(), beacon_cfg) {
+            Ok(h) => {
+                info!(
+                    port = opts.lan_discovery_port,
+                    role = beacon_role,
+                    "LAN Beacon Responder active on UDP"
+                );
+                Some(h)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to bind LAN Beacon Responder; continuing without LAN UDP beacon");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let status_state_and_handle = if let Some(ref bind_str) = opts.status_http_bind {
+        let sock_addr: SocketAddr = bind_str.parse()?;
+        let (used_b, max_b) = {
+            let q = block_store.quota();
+            let g = q.lock().expect("quota lock");
+            (g.used_storage_bytes(), g.max_storage_bytes())
+        };
+        let known_peers = KnownPeersStore::load(&cfg.data_dir);
+        let initial_lan_peers: Vec<RouterNasPeerEntry> = known_peers
+            .peers
+            .values()
+            .map(|r| RouterNasPeerEntry {
+                peer_id: r.libp2p_peer_id.clone(),
+                label: r.node_label.clone(),
+                role: r.role.clone(),
+                multiaddr: r.multiaddr.clone(),
+                available_bytes: r.available_bytes,
+            })
+            .collect();
+        let mut snap = RouterNasLiveSnapshot {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            node_label: node_label.clone(),
+            hardware_profile: cfg.hardware_profile.to_string(),
+            device_peer_id: node_identity.device_peer_id(),
+            libp2p_peer_id: local_pid_str.clone(),
+            owner_pq_fingerprint: pq_fp.clone(),
+            stripe_size_bytes: cfg.stripe_size_bytes,
+            watched_folder: opts.watch_folder.as_ref().map(|p| p.display().to_string()),
+            pairing_sas_code: Some(sas.code.clone()),
+            sla_tier: format!("{:?}", opts.sync_tier),
+            used_storage_bytes: used_b,
+            max_storage_bytes: max_b,
+            rss_kib: 0,
+            hwm_kib: 0,
+            uptime_secs: 0,
+            lan_peers: initial_lan_peers,
+        };
+        snap.update_telemetry(start_instant);
+        let shared = Arc::new(RwLock::new(snap));
+        let (bound_http, handle) =
+            RouterNasStatusServer::bind_and_spawn(sock_addr, shared.clone()).await?;
+        println!(
+            "[parvault] Embedded Status Server listening on http://{}",
+            bound_http
+        );
+        info!(%bound_http, "RouterNasStatusServer active");
+        Some((shared, handle))
+    } else {
+        None
+    };
+
+    if let Some(ref folder_path) = opts.watch_folder {
+        let _ = std::fs::create_dir_all(folder_path);
+        let sync_folder = folder_path.clone();
+        let sync_data_dir = cfg.data_dir.clone();
+        let sync_passphrase = cfg.device_sealing_passphrase.clone();
+        let sync_store = block_store.clone();
+        let sync_tier = opts.sync_tier;
+        let sync_interval = opts.sync_interval_secs.max(1);
+        info!(folder = %sync_folder.display(), interval_secs = sync_interval, "Starting background continuous folder sync");
+        tokio::spawn(async move {
+            let snap_path = sync_data_dir.join("appliance_folder_snapshot.manifest.bin");
+            loop {
+                let folder_cl = sync_folder.clone();
+                let data_dir_cl = sync_data_dir.clone();
+                let pass_cl = sync_passphrase.clone();
+                let store_cl = sync_store.clone();
+                let snap_cl = snap_path.clone();
+                let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let mk = resolve_master_key(&data_dir_cl, None, pass_cl.as_deref())?;
+                    let owner_id = NodeIdentity::from_master_key(&mk);
+                    let store_owner = if let Some(mc) = store_cl.mesh_client().cloned() {
+                        store_cl.with_mesh_client(mc.with_identity(owner_id.clone()))
+                    } else {
+                        store_cl
+                    };
+                    let mut engine = FolderSyncEngine::new(store_owner, mk, owner_id, sync_tier);
+                    if snap_cl.exists() {
+                        if let Ok(raw) = std::fs::read(&snap_cl) {
+                            if let Ok(prev) = bincode::deserialize::<FolderSnapshotManifest>(&raw) {
+                                engine.load_previous_snapshot(&prev);
+                            }
+                        }
+                    }
+                    let updated = engine.sync_folder_once(&folder_cl)?;
+                    if let Ok(bytes) = bincode::serialize(&updated) {
+                        let _ = BlockStore::atomic_write_file(&snap_cl, &bytes);
+                    }
+                    Ok(())
+                })
+                .await;
+                tokio::time::sleep(Duration::from_secs(sync_interval)).await;
+            }
+        });
     }
 
     let slash_topic = gossipsub::IdentTopic::new("parvault-wot-slashing");
@@ -1049,12 +2275,17 @@ async fn run_daemon(cfg: NodeConfig, block_store: BlockStore) -> anyhow::Result<
         }
     }
 
-    let mut scrub_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    let mut telemetry_interval = tokio::time::interval(Duration::from_secs(5));
+    telemetry_interval.tick().await;
+    let mut scrub_interval = tokio::time::interval(Duration::from_secs(30));
     scrub_interval.tick().await;
     let mut maint_epoch: u64 = 1;
+    let mut announced_wan_once = false;
 
     info!(
         %local_peer_id,
+        profile = %cfg.hardware_profile,
+        stripe_size_bytes = cfg.stripe_size_bytes,
         listen_tcp = %cfg.listen_tcp,
         enable_quic = cfg.enable_quic,
         "parvault-daemon started (Noise XX + Yamux active)"
@@ -1066,6 +2297,45 @@ async fn run_daemon(cfg: NodeConfig, block_store: BlockStore) -> anyhow::Result<
                 match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
                         info!(%address, "Listening on mesh transport address");
+                        if let Some((p, ip_opt)) = extract_listen_port_and_ip(&address) {
+                            bound_tcp_port = p;
+                            if let Some(ref beacon) = beacon_handle {
+                                beacon.update_listen_endpoint(p, ip_opt);
+                            }
+                        }
+                        if !announced_wan_once
+                            && ((opts.public_mode && !opts.public_trackers.is_empty())
+                                || (opts.wan_announce && !opts.wan_seeds.is_empty()))
+                        {
+                            announced_wan_once = true;
+                            spawn_wan_and_tracker_announce(
+                                block_store.mesh_client().cloned(),
+                                node_identity.clone(),
+                                node_label.clone(),
+                                beacon_role.to_string(),
+                                opts.external_addrs.clone(),
+                                bound_tcp_port,
+                                local_pid_str.clone(),
+                                pq_fp.clone(),
+                                sas.code.clone(),
+                                opts.print_pairing_banner,
+                                opts.public_mode,
+                                opts.public_trackers.clone(),
+                                opts.wan_announce,
+                                opts.wan_seeds.clone(),
+                            );
+                        }
+                    }
+                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                        peer_remote_addrs.insert(
+                            peer_id.to_string(),
+                            endpoint.get_remote_address().clone(),
+                        );
+                    }
+                    SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                        if num_established == 0 {
+                            peer_remote_addrs.remove(&peer_id.to_string());
+                        }
                     }
                     SwarmEvent::Behaviour(MeshNetworkBehaviourEvent::Mdns(
                         mdns::Event::Discovered(list),
@@ -1095,25 +2365,88 @@ async fn run_daemon(cfg: NodeConfig, block_store: BlockStore) -> anyhow::Result<
                             message: Message::Request { request, channel, .. },
                         },
                     )) => {
+                        let peer_str = peer.to_string();
+                        let remote_addr = peer_remote_addrs.get(&peer_str);
                         let response = handle_wire_request(
-                            &peer.to_string(),
+                            &peer_str,
+                            remote_addr,
                             request,
+                            &cfg,
+                            &node_identity,
+                            genesis_pubkey,
+                            opts.public_mode,
                             &block_store,
                             &mut wot,
                             &mut por_verifier,
                             &mut nullifier_ledger,
                             &pq_kem,
                             &mut lite_seed_server,
+                            &mut wan_registry,
+                            &mut eviction,
+                            &mut takedown_queue,
                         );
                         let _ = swarm.behaviour_mut().req_resp.send_response(channel, response);
                     }
                     _ => {}
                 }
             }
+            _ = telemetry_interval.tick() => {
+                let (used_b, max_b) = {
+                    let q = block_store.quota();
+                    let g = q.lock().expect("quota lock");
+                    (g.used_storage_bytes(), g.max_storage_bytes())
+                };
+                if let Some(ref beacon) = beacon_handle {
+                    beacon.update_available_bytes(max_b.saturating_sub(used_b));
+                }
+                if let Some((ref state, _)) = status_state_and_handle {
+                    let known = KnownPeersStore::load(&cfg.data_dir);
+                    let peers_vec: Vec<RouterNasPeerEntry> = known
+                        .peers
+                        .values()
+                        .filter(|r| r.libp2p_peer_id != local_pid_str)
+                        .map(|r| RouterNasPeerEntry {
+                            peer_id: r.libp2p_peer_id.clone(),
+                            label: r.node_label.clone(),
+                            role: r.role.clone(),
+                            multiaddr: r.multiaddr.clone(),
+                            available_bytes: r.available_bytes,
+                        })
+                        .collect();
+                    let mut guard = state.write().await;
+                    guard.used_storage_bytes = used_b;
+                    guard.max_storage_bytes = max_b;
+                    if !peers_vec.is_empty() {
+                        guard.lan_peers = peers_vec;
+                    }
+                    guard.update_telemetry(start_instant);
+                }
+            }
             _ = scrub_interval.tick() => {
                 maint_epoch = maint_epoch.saturating_add(1);
+                wan_registry.prune_expired(now_unix_ms());
                 let _ = block_store.sweep_expired_blinded_shards(maint_epoch);
                 let _ = block_store.scrub_all_shards();
+                if (opts.public_mode && !opts.public_trackers.is_empty())
+                    || (opts.wan_announce && !opts.wan_seeds.is_empty())
+                {
+                    spawn_wan_and_tracker_announce(
+                        block_store.mesh_client().cloned(),
+                        node_identity.clone(),
+                        node_label.clone(),
+                        beacon_role.to_string(),
+                        opts.external_addrs.clone(),
+                        bound_tcp_port,
+                        local_pid_str.clone(),
+                        pq_fp.clone(),
+                        sas.code.clone(),
+                        opts.print_pairing_banner,
+                        opts.public_mode,
+                        opts.public_trackers.clone(),
+                        opts.wan_announce,
+                        opts.wan_seeds.clone(),
+                    );
+                }
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received Ctrl-C, shutting down parvault-daemon cleanly.");
@@ -1122,37 +2455,137 @@ async fn run_daemon(cfg: NodeConfig, block_store: BlockStore) -> anyhow::Result<
         }
     }
 
+    if let Some((_, http_handle)) = status_state_and_handle {
+        http_handle.shutdown();
+    }
+    if let Some(beacon) = beacon_handle {
+        beacon.shutdown();
+    }
+
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_wan_and_tracker_announce(
+    mesh_client_opt: Option<MeshClient>,
+    identity: NodeIdentity,
+    label: String,
+    role: String,
+    external_addrs: Vec<String>,
+    bound_tcp_port: u16,
+    local_pid: String,
+    pq_fp: String,
+    sas_code: String,
+    publish_pair_code: bool,
+    public_mode: bool,
+    public_trackers: Vec<String>,
+    wan_announce: bool,
+    wan_seeds: Vec<String>,
+) {
+    let Some(mc) = mesh_client_opt else {
+        return;
+    };
+    tokio::task::spawn_blocking(move || {
+        if public_mode {
+            for tracker in &public_trackers {
+                if let Ok(card) = build_wan_card_with_stun_port(
+                    &mc,
+                    tracker,
+                    PUBLIC_COMMONS_SWARM_SLOT,
+                    &identity,
+                    &label,
+                    &role,
+                    &external_addrs,
+                    bound_tcp_port,
+                    &local_pid,
+                    Some(pq_fp.clone()),
+                ) {
+                    let _ = mc.announce_and_discover_public_tracker(tracker, Some(&card));
+                }
+            }
+        }
+        if wan_announce {
+            let slot_probe = derive_slot_key_from_code(&sas_code);
+            for anchor in &wan_seeds {
+                if let Ok(card) = build_wan_card_with_stun_port(
+                    &mc,
+                    anchor,
+                    slot_probe,
+                    &identity,
+                    &label,
+                    &role,
+                    &external_addrs,
+                    bound_tcp_port,
+                    &local_pid,
+                    Some(pq_fp.clone()),
+                ) {
+                    let _ = mc.publish_wan_ddns_heartbeat(anchor, &pq_fp, &card);
+                    if publish_pair_code {
+                        let _ = mc.publish_wan_pairing_card(anchor, &sas_code, &card);
+                    }
+                }
+            }
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
 fn handle_wire_request(
     remote_peer_id: &str,
+    remote_addr: Option<&Multiaddr>,
     request: MeshWireRequest,
+    cfg: &NodeConfig,
+    node_identity: &NodeIdentity,
+    genesis_pubkey: [u8; 32],
+    public_mode: bool,
     block_store: &BlockStore,
     wot: &mut WebOfTrustRegistry,
     por_verifier: &mut PorVerifierEngine,
     nullifier_ledger: &mut VoucherNullifierLedger,
     pq_kem: &HybridKemKeypair,
     lite_seed_server: &mut ZeroTrustSeedServer,
+    wan_registry: &mut WanRendezvousRegistry,
+    eviction: &mut PrivacyPreservingEvictionEngine,
+    takedown_queue: &mut PublicTrackerTakedownQueue,
 ) -> MeshWireResponse {
+    let remote_ip = remote_addr.and_then(extract_ip_from_multiaddr);
+    let remote_pubkey = NodeConfig::extract_ed25519_pubkey_from_peer_str(remote_peer_id);
+
     match request {
-        MeshWireRequest::HandshakeWoT { chain, .. } => match wot.verify_and_admit_chain(&chain) {
-            Ok(_) => MeshWireResponse::HandshakeAck {
-                accepted: true,
-                reason: None,
-            },
-            Err(e) => {
-                // ADR-15 Red-Team Fix (RT3-03): Never penalize `chain.leaf_pubkey()` on an
-                // unverified `HandshakeWoT` failure, because an attacker could send 3 forged
-                // chains with a bit-flipped signature for an honest node's pubkey to frame and
-                // quarantine that honest node and its parent WoT branch!
-                MeshWireResponse::HandshakeAck {
+        MeshWireRequest::HandshakeWoT { chain, .. } => {
+            let leaf_pk = chain.leaf_pubkey();
+            if let Some(reason) = eviction.is_ingress_blocked(
+                remote_ip,
+                Some(remote_peer_id),
+                leaf_pk.as_ref(),
+                None,
+                None,
+            ) {
+                return MeshWireResponse::HandshakeAck {
                     accepted: false,
-                    reason: Some(e.to_string()),
+                    reason: Some(reason),
+                };
+            }
+            match wot.verify_and_admit_chain(&chain) {
+                Ok(_) => {
+                    if let (Some(ip), Some(pk)) = (remote_ip, leaf_pk) {
+                        let _ = eviction.record_peer_admission_ip(ip, pk);
+                    }
+                    MeshWireResponse::HandshakeAck {
+                        accepted: true,
+                        reason: None,
+                    }
+                }
+                Err(e) => {
+                    // ADR-15 Red-Team Fix (RT3-03): Never penalize `chain.leaf_pubkey()` on an
+                    // unverified `HandshakeWoT` failure.
+                    MeshWireResponse::HandshakeAck {
+                        accepted: false,
+                        reason: Some(e.to_string()),
+                    }
                 }
             }
-        },
+        }
         MeshWireRequest::PutShard {
             owner_peer_id,
             shard_id,
@@ -1160,6 +2593,18 @@ fn handle_wire_request(
             session_key_commit,
             repair_grant,
         } => {
+            if let Some(reason) = eviction.is_ingress_blocked(
+                remote_ip,
+                Some(remote_peer_id),
+                remote_pubkey.as_ref(),
+                Some(&shard_id.stripe_merkle_root),
+                None,
+            ) {
+                return MeshWireResponse::PutShardAck {
+                    stored: false,
+                    error: Some(reason),
+                };
+            }
             if let Some(grant) = repair_grant {
                 por_verifier.register_repair_grant(grant);
             }
@@ -1173,10 +2618,19 @@ fn handle_wire_request(
                 owner_peer_id.as_str()
             };
             match block_store.put_shard(effective_owner, &shard_id, &shard_bytes) {
-                Ok(_) => MeshWireResponse::PutShardAck {
-                    stored: true,
-                    error: None,
-                },
+                Ok(_) => {
+                    let _ = eviction.record_regular_shard_ingress(
+                        remote_ip,
+                        Some(remote_peer_id),
+                        remote_pubkey,
+                        effective_owner,
+                        shard_id,
+                    );
+                    MeshWireResponse::PutShardAck {
+                        stored: true,
+                        error: None,
+                    }
+                }
                 Err(e) => MeshWireResponse::PutShardAck {
                     stored: false,
                     error: Some(e.to_string()),
@@ -1213,10 +2667,7 @@ fn handle_wire_request(
             }
         }
         MeshWireRequest::PorAudit(challenge) => {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let now_ms = now_unix_ms();
             match por_verifier.handle_incoming_challenge(&challenge, now_ms, block_store) {
                 Ok(resp) => MeshWireResponse::PorAuditResult(Some(resp)),
                 Err(e) => {
@@ -1274,6 +2725,23 @@ fn handle_wire_request(
             lease_duration_epochs,
             delete_verifier,
         } => {
+            if let Some(reason) = eviction
+                .is_ingress_blocked(
+                    remote_ip,
+                    Some(remote_peer_id),
+                    Some(&voucher.issuer_pubkey),
+                    None,
+                    Some(&blinded_id.locator),
+                )
+                .or_else(|| {
+                    eviction.is_ingress_blocked(None, None, remote_pubkey.as_ref(), None, None)
+                })
+            {
+                return MeshWireResponse::PutBlindedShardAck {
+                    stored: false,
+                    error: Some(reason),
+                };
+            }
             nullifier_ledger.set_trusted_issuer_pubkey(voucher.issuer_pubkey);
             match block_store.put_blinded_shard_with_lease(
                 &blinded_id,
@@ -1285,10 +2753,21 @@ fn handle_wire_request(
                 lease_duration_epochs,
                 delete_verifier,
             ) {
-                Ok(_) => MeshWireResponse::PutBlindedShardAck {
-                    stored: true,
-                    error: None,
-                },
+                Ok(_) => {
+                    let _ = eviction.record_blinded_shard_ingress(
+                        remote_ip,
+                        Some(remote_peer_id),
+                        voucher.issuer_pubkey,
+                        blinded_id,
+                    );
+                    if let Some(ip) = remote_ip {
+                        let _ = eviction.record_peer_admission_ip(ip, voucher.issuer_pubkey);
+                    }
+                    MeshWireResponse::PutBlindedShardAck {
+                        stored: true,
+                        error: None,
+                    }
+                }
                 Err(e) => MeshWireResponse::PutBlindedShardAck {
                     stored: false,
                     error: Some(e.to_string()),
@@ -1330,6 +2809,18 @@ fn handle_wire_request(
             current_epoch,
             extension_epochs,
         } => {
+            if eviction
+                .is_ingress_blocked(
+                    remote_ip,
+                    Some(remote_peer_id),
+                    remote_pubkey.as_ref(),
+                    None,
+                    Some(&blinded_id.locator),
+                )
+                .is_some()
+            {
+                return MeshWireResponse::RenewBlindedLeaseAck { renewed: false };
+            }
             let renewed =
                 block_store.renew_blinded_shard_lease(&blinded_id, current_epoch, extension_epochs);
             MeshWireResponse::RenewBlindedLeaseAck { renewed }
@@ -1348,10 +2839,7 @@ fn handle_wire_request(
             },
         },
         MeshWireRequest::MultiSegmentPorAudit(challenge) => {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let now_ms = now_unix_ms();
             match por_verifier.handle_multi_segment_challenge(&challenge, now_ms, block_store) {
                 Ok(resp) => MeshWireResponse::MultiSegmentPorAuditResult(Some(resp)),
                 Err(e) => {
@@ -1369,6 +2857,18 @@ fn handle_wire_request(
             lease_duration_epochs,
             delete_verifier,
         } => {
+            if let Some(reason) = eviction.is_ingress_blocked(
+                remote_ip,
+                Some(remote_peer_id),
+                remote_pubkey.as_ref(),
+                None,
+                None,
+            ) {
+                return MeshWireResponse::RelayPqOnionAck {
+                    delivered: false,
+                    error: Some(reason),
+                };
+            }
             if let Some(next_hop) = target_peer_addr {
                 if let Some(client) = block_store.mesh_client() {
                     match client.relay_pq_onion_envelope(
@@ -1398,9 +2898,7 @@ fn handle_wire_request(
                 }
             } else if let Ok(hop) = envelope.peel_relay_hop_pq(pq_kem) {
                 if envelope.jitter_delay_ms > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        envelope.jitter_delay_ms.min(250),
-                    ));
+                    std::thread::sleep(Duration::from_millis(envelope.jitter_delay_ms.min(250)));
                 }
                 if let Some(client) = block_store.mesh_client() {
                     match client
@@ -1424,7 +2922,21 @@ fn handle_wire_request(
                     }
                 }
             } else if let Ok(bundle) = envelope.open_final_target_pq(pq_kem) {
+                if let Some(reason) = eviction.is_ingress_blocked(
+                    remote_ip,
+                    Some(remote_peer_id),
+                    Some(&bundle.voucher.issuer_pubkey),
+                    None,
+                    Some(&bundle.blinded_id.locator),
+                ) {
+                    return MeshWireResponse::RelayPqOnionAck {
+                        delivered: false,
+                        error: Some(reason),
+                    };
+                }
                 nullifier_ledger.set_trusted_issuer_pubkey(bundle.voucher.issuer_pubkey);
+                let voucher_pk = bundle.voucher.issuer_pubkey;
+                let bid = bundle.blinded_id;
                 match block_store.put_blinded_shard_with_lease(
                     &bundle.blinded_id,
                     &bundle.shard_bytes,
@@ -1435,10 +2947,18 @@ fn handle_wire_request(
                     bundle.lease_duration_epochs,
                     bundle.delete_verifier,
                 ) {
-                    Ok(_) => MeshWireResponse::RelayPqOnionAck {
-                        delivered: true,
-                        error: None,
-                    },
+                    Ok(_) => {
+                        let _ = eviction.record_blinded_shard_ingress(
+                            remote_ip,
+                            Some(remote_peer_id),
+                            voucher_pk,
+                            bid,
+                        );
+                        MeshWireResponse::RelayPqOnionAck {
+                            delivered: true,
+                            error: None,
+                        }
+                    }
                     Err(e) => MeshWireResponse::RelayPqOnionAck {
                         delivered: false,
                         error: Some(e.to_string()),
@@ -1447,7 +2967,20 @@ fn handle_wire_request(
             } else {
                 match envelope.open_pq(pq_kem) {
                     Ok((blinded_id, shard_bytes)) => {
+                        if let Some(reason) = eviction.is_ingress_blocked(
+                            remote_ip,
+                            Some(remote_peer_id),
+                            Some(&voucher.issuer_pubkey),
+                            None,
+                            Some(&blinded_id.locator),
+                        ) {
+                            return MeshWireResponse::RelayPqOnionAck {
+                                delivered: false,
+                                error: Some(reason),
+                            };
+                        }
                         nullifier_ledger.set_trusted_issuer_pubkey(voucher.issuer_pubkey);
+                        let voucher_pk = voucher.issuer_pubkey;
                         match block_store.put_blinded_shard_with_lease(
                             &blinded_id,
                             &shard_bytes,
@@ -1458,10 +2991,18 @@ fn handle_wire_request(
                             lease_duration_epochs,
                             delete_verifier,
                         ) {
-                            Ok(_) => MeshWireResponse::RelayPqOnionAck {
-                                delivered: true,
-                                error: None,
-                            },
+                            Ok(_) => {
+                                let _ = eviction.record_blinded_shard_ingress(
+                                    remote_ip,
+                                    Some(remote_peer_id),
+                                    voucher_pk,
+                                    blinded_id,
+                                );
+                                MeshWireResponse::RelayPqOnionAck {
+                                    delivered: true,
+                                    error: None,
+                                }
+                            }
                             Err(e) => MeshWireResponse::RelayPqOnionAck {
                                 delivered: false,
                                 error: Some(e.to_string()),
@@ -1480,6 +3021,19 @@ fn handle_wire_request(
             bundle,
             repair_grant,
         } => {
+            if let Some(reason) = eviction.is_ingress_blocked(
+                remote_ip,
+                Some(remote_peer_id),
+                remote_pubkey.as_ref(),
+                Some(&bundle.expected_stripe_merkle_root),
+                None,
+            ) {
+                return MeshWireResponse::SyndicateLiteStripeAck {
+                    receipt: None,
+                    syndicated_peers: Vec::new(),
+                    error: Some(reason),
+                };
+            }
             if let Some(ref grant) = repair_grant {
                 por_verifier.register_repair_grant(grant.clone());
             }
@@ -1555,6 +3109,123 @@ fn handle_wire_request(
                 used_bytes: rep.used_storage_bytes,
                 sla_score: rep.sla_ratio,
                 pq_kem_pubkey: Some(pq_kem.public_key()),
+            }
+        }
+        MeshWireRequest::RegisterWanRendezvous { slot_key, entry } => {
+            if let Some(reason) = eviction
+                .is_ingress_blocked(
+                    remote_ip,
+                    Some(remote_peer_id),
+                    Some(&entry.ed25519_pubkey),
+                    None,
+                    None,
+                )
+                .or_else(|| {
+                    eviction.is_ingress_blocked(None, None, remote_pubkey.as_ref(), None, None)
+                })
+            {
+                return MeshWireResponse::RegisterWanRendezvousAck {
+                    stored: false,
+                    observed_external_addr: None,
+                    error: Some(reason),
+                    tracker_admin_pubkey: None,
+                };
+            }
+            let observed_external_addr = remote_addr
+                .and_then(|addr| reflect_observed_wan_multiaddr(addr, 0, remote_peer_id));
+            let signer_pk = entry.ed25519_pubkey;
+            match wan_registry.register(slot_key, entry, now_unix_ms()) {
+                Ok(stored) => {
+                    if stored {
+                        if let Some(ip) = remote_ip {
+                            let _ = eviction.record_peer_admission_ip(ip, signer_pk);
+                        }
+                    }
+                    MeshWireResponse::RegisterWanRendezvousAck {
+                        stored,
+                        observed_external_addr,
+                        error: None,
+                        tracker_admin_pubkey: None,
+                    }
+                }
+                Err(err) => MeshWireResponse::RegisterWanRendezvousAck {
+                    stored: false,
+                    observed_external_addr,
+                    error: Some(err),
+                    tracker_admin_pubkey: None,
+                },
+            }
+        }
+        MeshWireRequest::LookupWanRendezvous { slot_key } => {
+            let observed_external_addr = remote_addr
+                .and_then(|addr| reflect_observed_wan_multiaddr(addr, 0, remote_peer_id));
+            let now = now_unix_ms();
+            let entries = if slot_key == PUBLIC_COMMONS_SWARM_SLOT {
+                wan_registry.lookup_public_swarm(32, now)
+            } else {
+                wan_registry.lookup(&slot_key, now)
+            };
+            MeshWireResponse::LookupWanRendezvousResult {
+                entries,
+                observed_external_addr,
+                tracker_admin_pubkey: None,
+            }
+        }
+        MeshWireRequest::SubmitAbuseTakedownReport(report) => {
+            let report_id = report.report_id;
+            match takedown_queue.enqueue_verified_report(report) {
+                Ok(outcome) => MeshWireResponse::SubmitAbuseTakedownAck {
+                    queued_for_admin_review: true,
+                    report_id,
+                    verified_plaintext_sha256: Some(outcome.verified_plaintext_sha256),
+                    error: None,
+                },
+                Err(err) => MeshWireResponse::SubmitAbuseTakedownAck {
+                    queued_for_admin_review: false,
+                    report_id,
+                    verified_plaintext_sha256: None,
+                    error: Some(err),
+                },
+            }
+        }
+        MeshWireRequest::BroadcastEvictionOrder(order) => {
+            let mut pinned_admins =
+                KnownPeersStore::load(&cfg.data_dir).pinned_tracker_admin_pubkeys();
+            if let Some(mc) = block_store.mesh_client() {
+                for pk in mc.pinned_tracker_admin_pubkeys() {
+                    if !pinned_admins.contains(&pk) {
+                        pinned_admins.push(pk);
+                    }
+                }
+            }
+            let (council, min_quorum) = cfg.resolve_eviction_council_and_quorum(
+                genesis_pubkey,
+                &pinned_admins,
+                public_mode,
+            );
+            let local_pk = node_identity.public_key_bytes();
+            match eviction.apply_signed_eviction_order_with_quorum(
+                &order,
+                Some(&local_pk),
+                &council,
+                min_quorum,
+                now_unix_ms(),
+                block_store,
+            ) {
+                Ok(rep) => MeshWireResponse::EvictionOrderAck {
+                    accepted: true,
+                    purged_regular_shards: rep.purged_regular_shards,
+                    purged_blinded_shards: rep.purged_blinded_shards,
+                    zero_wiped_bytes: rep.zero_wiped_bytes,
+                    error: None,
+                },
+                Err(err) => MeshWireResponse::EvictionOrderAck {
+                    accepted: false,
+                    purged_regular_shards: 0,
+                    purged_blinded_shards: 0,
+                    zero_wiped_bytes: 0,
+                    error: Some(err.to_string()),
+                },
             }
         }
     }

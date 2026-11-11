@@ -62,14 +62,16 @@ pub fn encode_with_params(
     };
 
     let total_shards = k_data + m_parity;
-    let mut padded = vec![0u8; shard_len * k_data];
-    padded[..original_ciphertext_len].copy_from_slice(ciphertext);
-
     let mut shards: Vec<Vec<u8>> = Vec::with_capacity(total_shards);
     for i in 0..k_data {
+        let mut shard = vec![0u8; shard_len];
         let start = i * shard_len;
-        let end = start + shard_len;
-        shards.push(padded[start..end].to_vec());
+        if start < original_ciphertext_len {
+            let end = (start + shard_len).min(original_ciphertext_len);
+            let copy_len = end - start;
+            shard[..copy_len].copy_from_slice(&ciphertext[start..end]);
+        }
+        shards.push(shard);
     }
     for _ in 0..m_parity {
         shards.push(vec![0u8; shard_len]);
@@ -240,7 +242,7 @@ pub fn reconstruct_ciphertext_stripe(
     expected_shard_hashes: Option<&[Hash32]>,
     expected_merkle_root: Option<Hash32>,
 ) -> Result<Vec<u8>, ShardingError> {
-    let all_shards = reconstruct_all_shards(
+    let mut all_shards = reconstruct_all_shards(
         shard_slots,
         k_data,
         m_parity,
@@ -248,12 +250,72 @@ pub fn reconstruct_ciphertext_stripe(
         expected_merkle_root,
     )?;
 
+    // Drop parity shards immediately to free memory on constrained SoCs
+    all_shards.truncate(k_data);
+
     let mut ciphertext = Vec::with_capacity(original_ciphertext_len);
-    for shard in all_shards.iter().take(k_data) {
-        ciphertext.extend_from_slice(shard);
+    for shard in all_shards {
+        let remaining = original_ciphertext_len.saturating_sub(ciphertext.len());
+        if remaining == 0 {
+            break;
+        }
+        let take_len = shard.len().min(remaining);
+        ciphertext.extend_from_slice(&shard[..take_len]);
+        // each shard's Vec is deallocated as it leaves scope
     }
     ciphertext.truncate(original_ciphertext_len);
     Ok(ciphertext)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_reed_solomon_encode_and_reconstruct_all_tiers() {
+        let tiers = [
+            ErasureTier::Consumer,
+            ErasureTier::Mixed,
+            ErasureTier::Homelab,
+            ErasureTier::Relay,
+        ];
+
+        for tier in tiers {
+            let (k, m, n) = tier.params();
+            // Test lengths: 1 byte, 100 bytes, 65537 bytes (unaligned)
+            for len in [1, 100, 65537] {
+                let original: Vec<u8> = (0..len).map(|i| (i * 17 % 256) as u8).collect();
+                let shard_set = encode_ciphertext_stripe(0, &original, tier).expect("encode");
+                assert_eq!(shard_set.k_data, k);
+                assert_eq!(shard_set.m_parity, m);
+                assert_eq!(shard_set.shards.len(), n);
+
+                // Simulate dropping m parity shards (leaving k data shards)
+                let slots: Vec<Option<Vec<u8>>> = shard_set
+                    .shards
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, s)| if idx < k { Some(s) } else { None })
+                    .collect();
+
+                let reconstructed = reconstruct_ciphertext_stripe(
+                    slots,
+                    k,
+                    m,
+                    original.len(),
+                    Some(&shard_set.shard_hashes),
+                    Some(shard_set.stripe_merkle_root),
+                )
+                .expect("reconstruct with exactly K shards");
+
+                assert_eq!(
+                    reconstructed, original,
+                    "Mismatch for tier {:?} len {}",
+                    tier, len
+                );
+            }
+        }
+    }
 }
 
 #[cfg(kani)]

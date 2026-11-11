@@ -1,0 +1,37 @@
+# ParVault v0.3.0 Turnkey Router Cloud-NAS Configuration (ADR-18)
+# Designed for OpenWrt / prplOS / ARM64 & x86_64 Gateway SoCs (<= 32-48 MiB cgroup RAM)
+
+hardware_profile = "router-soc"
+
+# Local persistent data directory (stored on attached USB drive, NVMe mount, or persistent overlay)
+data_dir = "/mnt/nas/.parvault-data"
+
+# P2P Listeners
+listen_tcp = "/ip4/0.0.0.0/tcp/4001"
+enable_quic = false
+listen_quic = "/ip4/0.0.0.0/udp/4001/quic-v1"
+
+# 1 MiB streaming stripe size for minimal RAM consumption (< 16 MiB transient VmHWM)
+stripe_size_bytes = 1048576
+
+# Storage allocation & Disk Safety Guard
+default_tier = "Consumer"
+max_storage_bytes = 34359738368 # 32 GiB shared pool allocation
+min_free_disk_bytes = 67108864 # 64 MiB safety floor preventing router flash/mount exhaustion
+
+# Zero-IP Home LAN Auto-Discovery (ADR-18)
+lan_discovery_enabled = true
+lan_discovery_port = 4009
+
+# Embedded Router NAS HTTP Status & Telemetry Dashboard (ADR-18)
+status_http_bind = "0.0.0.0:4080"
+
+# Node Identification
+node_label = "OpenWrt-Router-NAS"
+
+# Network Performance & Fanout Limits (Tuned for low-power SoCs)
+por_timeout_ms = 300
+local_rtt_threshold_ms = 5
+intra_asn_ratio = 0.70
+bootstrap_grace_bytes = 1073741824 # 1 GiB bootstrap grace
+max_connections = 24

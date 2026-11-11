@@ -1,9 +1,19 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::fmt;
+use std::path::{Path, PathBuf};
 
 /// Default streaming stripe size (16 MiB) per ADR-01 to cap RAM < 32 MiB on gateways.
 pub const DEFAULT_STRIPE_SIZE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Balanced streaming stripe size (4 MiB) for 24/7 Homelab NAS nodes.
+pub const HOMELAB_NAS_STRIPE_SIZE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Ultra-low-RAM streaming stripe size (1 MiB) for OpenWrt / prplOS / ARM64 Router SoCs (ADR-18).
+pub const ROUTER_SOC_STRIPE_SIZE_BYTES: usize = 1024 * 1024;
+
+/// Default UDP port for signed Home LAN zero-IP auto-discovery (`ADR-18`).
+pub const DEFAULT_LAN_DISCOVERY_PORT: u16 = 4009;
 
 /// Default Proof-of-Retrievability (PoR) latency ceiling (300 ms).
 pub const DEFAULT_POR_TIMEOUT_MS: u64 = 300;
@@ -21,16 +31,112 @@ const fn default_min_free_disk_bytes() -> u64 {
     crate::storage::quota::DEFAULT_MIN_FREE_DISK_BYTES
 }
 
+const fn default_max_connections() -> usize {
+    HardwareProfile::Desktop.max_connections()
+}
+
+const fn default_lan_discovery_enabled() -> bool {
+    true
+}
+
+const fn default_lan_discovery_port() -> u16 {
+    DEFAULT_LAN_DISCOVERY_PORT
+}
+
+/// Hardware resource profiles tuning stripe sizing, disk safety guards, and peer fanout (`ADR-18`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum, Default)]
+pub enum HardwareProfile {
+    /// Workstation / laptop profile (`16 MiB` stripes, `5 GiB` disk guard, `128` max connections)
+    #[default]
+    #[serde(rename = "desktop", alias = "Desktop")]
+    #[value(name = "desktop")]
+    Desktop,
+    /// Dedicated 24/7 home NAS / mini-server profile (`4 MiB` stripes, `1 GiB` disk guard, `64` max connections)
+    #[serde(rename = "homelab-nas", alias = "HomelabNas", alias = "homelab_nas")]
+    #[value(name = "homelab-nas")]
+    HomelabNas,
+    /// Constrained OpenWrt / prplOS / ARM64 router SoC profile (`1 MiB` stripes, `64 MiB` disk guard, `24` max connections)
+    #[serde(rename = "router-soc", alias = "RouterSoc", alias = "router_soc")]
+    #[value(name = "router-soc")]
+    RouterSoc,
+}
+
+impl HardwareProfile {
+    /// Streaming ciphertext stripe size in bytes for this hardware profile.
+    pub const fn stripe_size_bytes(self) -> usize {
+        match self {
+            Self::Desktop => DEFAULT_STRIPE_SIZE_BYTES,
+            Self::HomelabNas => HOMELAB_NAS_STRIPE_SIZE_BYTES,
+            Self::RouterSoc => ROUTER_SOC_STRIPE_SIZE_BYTES,
+        }
+    }
+
+    /// Minimum free OS filesystem space reserved as a safety guard against disk exhaustion.
+    pub const fn min_free_disk_bytes(self) -> u64 {
+        match self {
+            Self::Desktop => crate::storage::quota::DEFAULT_MIN_FREE_DISK_BYTES,
+            Self::HomelabNas => 1024 * 1024 * 1024, // 1 GiB
+            Self::RouterSoc => 64 * 1024 * 1024,    // 64 MiB for small USB/eMMC partitions
+        }
+    }
+
+    /// Recommended concurrent peer connection ceiling.
+    pub const fn max_connections(self) -> usize {
+        match self {
+            Self::Desktop => 128,
+            Self::HomelabNas => 64,
+            Self::RouterSoc => 24,
+        }
+    }
+
+    /// Recommended default local storage allocation when initializing a fresh node.
+    pub const fn default_max_storage_gib(self) -> u64 {
+        match self {
+            Self::Desktop => 100,
+            Self::HomelabNas => 500,
+            Self::RouterSoc => 32,
+        }
+    }
+
+    /// Canonical CLI / JSON / TOML profile slug (`"desktop"`, `"homelab-nas"`, `"router-soc"`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Desktop => "desktop",
+            Self::HomelabNas => "homelab-nas",
+            Self::RouterSoc => "router-soc",
+        }
+    }
+
+    /// Default role advertised in signed LAN beacons and WAN peer cards.
+    pub const fn beacon_role(self) -> &'static str {
+        match self {
+            Self::Desktop => "daemon",
+            Self::HomelabNas => "router-nas",
+            Self::RouterSoc => "router-nas",
+        }
+    }
+}
+
+impl fmt::Display for HardwareProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Comparative Erasure Coding Schemes (k-of-n) and Dynamic SLA Pools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 pub enum ErasureTier {
     /// 10-of-20 (50.0% efficiency, 2.00x expansion, tolerates 10 failures) — Unmanaged Consumer Gateways
+    #[serde(alias = "consumer")]
     Consumer,
     /// 16-of-24 (66.7% efficiency, 1.50x expansion, tolerates 8 failures) — Standard Mesh / Mixed Nodes
+    #[serde(alias = "mixed")]
     Mixed,
     /// 16-of-20 (80.0% efficiency, 1.25x expansion, tolerates 4 failures) — High-SLA Homelab / Prosumer Pool (>99.5% SLA)
+    #[serde(alias = "homelab")]
     Homelab,
     /// 20-of-24 (83.3% efficiency, 1.20x expansion, tolerates 4 failures) — Static Infrastructure Relays
+    #[serde(alias = "relay")]
     Relay,
 }
 
@@ -72,7 +178,7 @@ impl ErasureTier {
 #[command(
     name = "parvault",
     version,
-    about = "ParVault — Zero-knowledge post-quantum erasure-coded backup & P2P storage utility"
+    about = "ParVault — Zero-IP post-quantum erasure-coded backup, Home LAN/WAN Cloud-NAS & P2P storage utility"
 )]
 pub struct Cli {
     /// Path to optional TOML configuration file.
@@ -83,13 +189,47 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub data_dir: Option<PathBuf>,
 
+    /// Hardware profile (`desktop` = 16 MiB stripes, `homelab-nas` = 4 MiB stripes, `router-soc` = 1 MiB stripes / <32 MiB RAM).
+    #[arg(long, global = true, value_enum)]
+    pub profile: Option<HardwareProfile>,
+
     /// Optional comma-separated list of mesh peer Multiaddrs or `host:port` endpoints (overrides `bootstrap_peers` / `PARVAULT_PEERS`).
     #[arg(long, global = true, value_delimiter = ',')]
     pub peers: Vec<String>,
 
-    /// Optional `parvault-seed` Multiaddr or `host:port` endpoint (overrides `lite_seed_addr` / `PARVAULT_SEED_ADDR`).
+    /// Optional `parvault-seed` Multiaddr or `/dns4/...` endpoint for Lite-Client syndication and Online WAN rendezvous (overrides `lite_seed_addr` / `PARVAULT_SEED_ADDR`).
     #[arg(long, global = true)]
     pub seed_addr: Option<String>,
+
+    /// Optional comma-separated public WAN Multiaddrs or `/dns4/...` endpoints advertised during Online WAN pairing (`PARVAULT_EXTERNAL_ADDRS`).
+    #[arg(
+        long = "external-addr",
+        visible_alias = "external-addrs",
+        global = true,
+        value_delimiter = ','
+    )]
+    pub external_addrs: Vec<String>,
+
+    /// Optional UDP port for signed Home LAN zero-IP discovery (overrides `lan_discovery_port` / `PARVAULT_LAN_DISCOVERY_PORT`, default: `4009`).
+    #[arg(long, global = true)]
+    pub lan_discovery_port: Option<u16>,
+
+    /// Disable automatic signed Home LAN UDP/registry beacon responder (`PARVAULT_NO_LAN_DISCOVERY`).
+    #[arg(long, global = true, default_value_t = false)]
+    pub no_lan_discovery: bool,
+
+    /// Enable BitTorrent-style Zero-Pairing Public Commons mode (uses zero-knowledge client encryption + 10-of-20 RS + PoW self-admission).
+    #[arg(long, global = true, default_value_t = false)]
+    pub public: bool,
+
+    /// Optional comma-separated Public Commons tracker Multiaddrs (e.g. `parvault-seed --mode public-bootstrap` endpoints, overrides `public_trackers` / `PARVAULT_TRACKERS`).
+    #[arg(
+        long = "tracker",
+        visible_alias = "trackers",
+        global = true,
+        value_delimiter = ','
+    )]
+    pub trackers: Vec<String>,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -97,6 +237,168 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    /// Initialize keys (`0600`), print a fresh 24-word BIP-39 recovery phrase, and write a turnkey `config.toml`.
+    Init {
+        /// Optional folder to create and configure for automatic continuous backup.
+        #[arg(long, value_name = "DIR", visible_alias = "folder")]
+        watch: Option<PathBuf>,
+
+        /// Human-friendly node label shown on LAN discovery and the Router Cloud-NAS dashboard.
+        #[arg(long, value_name = "NAME")]
+        label: Option<String>,
+
+        /// Maximum local storage allocation in GiB (defaults to profile recommendation: 32/100/500 GiB).
+        #[arg(long, value_name = "GIB")]
+        max_storage_gib: Option<u64>,
+    },
+    /// Scan the Home LAN (and configured WAN rendezvous anchors) for ParVault nodes with zero IP configuration.
+    Discover {
+        /// LAN UDP broadcast/multicast discovery scan window in milliseconds.
+        #[arg(long, default_value_t = 500)]
+        timeout_ms: u64,
+
+        /// LAN discovery UDP port (defaults to `config.toml` `lan_discovery_port` or `4009`).
+        #[arg(long)]
+        port: Option<u16>,
+
+        /// Emit machine-readable JSON array of discovered peers.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+
+        /// Also query configured Online WAN rendezvous / DDNS anchors (`--seed-addr` / `wan_rendezvous_seeds`).
+        #[arg(long, default_value_t = false)]
+        wan: bool,
+    },
+    /// Generate a 4-word BIP-39 SAS pairing code and advertise this node over Home LAN and/or Online WAN rendezvous.
+    Pair {
+        /// LAN discovery UDP port (defaults to `config.toml` `lan_discovery_port` or `4009`).
+        #[arg(long)]
+        port: Option<u16>,
+
+        /// How long (in seconds) to keep broadcasting the pairing beacon for incoming `parvault join` peers.
+        #[arg(long, default_value_t = 120)]
+        duration_secs: u64,
+
+        /// Print the 4-word pairing code + compact pairing token, publish once, and exit immediately (for scripts/CI).
+        #[arg(long, default_value_t = false)]
+        once: bool,
+
+        /// Publish an encrypted `WanPeerCard` to Online WAN rendezvous seed(s) (`--seed-addr` / `wan_rendezvous_seeds`) with STUN-over-Noise reflection.
+        #[arg(long, default_value_t = false)]
+        wan: bool,
+
+        /// Optional TCP listen Multiaddr override advertised in the pairing beacon.
+        #[arg(long)]
+        listen: Option<String>,
+    },
+    /// Pair with a Home LAN Router/NAS or remote Online WAN peer using only its 4-word SAS code (zero IP addresses!).
+    Join {
+        /// 4-word BIP-39 SAS pairing code (e.g. `anchor-velvet-orbit-oak`) or compact pairing token.
+        #[arg(long, value_name = "4-WORD-SAS-OR-PAIR-TOKEN")]
+        code: String,
+
+        /// Discovery / rendezvous lookup timeout in milliseconds.
+        #[arg(long, default_value_t = 1500)]
+        timeout_ms: u64,
+
+        /// LAN discovery UDP port (defaults to `config.toml` `lan_discovery_port` or `4009`).
+        #[arg(long)]
+        port: Option<u16>,
+
+        /// Query Online WAN rendezvous seed(s) (`--seed-addr` / `wan_rendezvous_seeds`) in addition to LAN.
+        #[arg(long, default_value_t = false)]
+        wan: bool,
+    },
+    /// Turnkey single-command appliance mode: starts P2P storage daemon, zero-IP LAN/WAN discovery, optional HTTP status dashboard, and optional continuous folder sync.
+    Up {
+        /// Optional local directory to continuously watch and back up in the background.
+        #[arg(long, value_name = "DIR", visible_alias = "watch")]
+        folder: Option<PathBuf>,
+
+        /// Background folder sync polling interval in seconds (when `--folder` or `watched_folder` is active).
+        #[arg(long, default_value_t = 5)]
+        interval_secs: u64,
+
+        /// Bind address for the embedded zero-dependency Router Cloud-NAS HTTP dashboard & JSON API (e.g. `0.0.0.0:4080` or `127.0.0.1:0`).
+        #[arg(long, value_name = "ADDR")]
+        status_http: Option<String>,
+
+        /// Generate and advertise a 4-word SAS pairing code on startup (and display it on the status dashboard).
+        #[arg(long, default_value_t = false)]
+        pair: bool,
+
+        /// Publish encrypted Online WAN rendezvous / dynamic-IP presence to `--seed-addr` / `wan_rendezvous_seeds`.
+        #[arg(long, default_value_t = false)]
+        wan: bool,
+
+        /// Optional TCP listen multiaddr override (defaults to `config.toml` `listen_tcp` or `/ip4/0.0.0.0/tcp/4001`).
+        #[arg(long)]
+        listen: Option<String>,
+
+        /// Optional target SLA erasure coding tier for background `--folder` sync.
+        #[arg(long, value_enum)]
+        tier: Option<ErasureTier>,
+    },
+    /// Evict a bad actor or illegal content (0x00 zero-wipe + unlink + keyed HMAC ingress firewall, zero plaintext IPs on disk — ADR-19).
+    Evict {
+        /// Evict all shards uploaded from this IPv4/IPv6 address and block future ingress via keyed HMAC tag.
+        #[arg(long, value_name = "IP")]
+        ip: Option<std::net::IpAddr>,
+
+        /// Evict all shards uploaded from this canonical `/24` IPv4 or `/48` IPv6 CIDR subnet via keyed HMAC tag.
+        #[arg(long, value_name = "CIDR")]
+        subnet: Option<String>,
+
+        /// Evict all shards associated with this libp2p `PeerId` via keyed HMAC tag.
+        #[arg(long, value_name = "PEER_ID")]
+        peer_id: Option<String>,
+
+        /// Evict all regular or blinded shards associated with this 32-byte hex Ed25519 peer or voucher-issuer pubkey.
+        #[arg(long, value_name = "HEX")]
+        pubkey_hex: Option<String>,
+
+        /// Evict and permanently tombstone all shards belonging to a 32-byte hex `stripe_merkle_root`.
+        #[arg(long, value_name = "HEX")]
+        merkle_root: Option<String>,
+
+        /// Evict and permanently tombstone a specific 32-byte hex `blinded_locator` (`.bshard`).
+        #[arg(long, value_name = "HEX")]
+        locator: Option<String>,
+
+        /// Short human-readable audit reason attached to signed propagation orders (<= 256 bytes).
+        #[arg(long, value_name = "TEXT", default_value = "operator-eviction")]
+        reason: String,
+
+        /// Sign a `SignedBadActorEvictionOrder` and broadcast it to configured/known mesh peers & trackers.
+        #[arg(long, default_value_t = false)]
+        propagate: bool,
+    },
+    /// Submit a cryptographically verifiable illegal-content abuse report (AES-256-GCM burden-of-proof) to a Public Tracker Admin queue (`ADR-19`).
+    ReportAbuse {
+        /// Path to the leaked encrypted `.manifest.bin` (or serialized `FileManifest`) file.
+        #[arg(long, value_name = "PATH")]
+        manifest: PathBuf,
+
+        /// Disclosed 64-character hex `MasterKey` proving knowledge of the publicly distributed capability.
+        #[arg(long, value_name = "HEX")]
+        disclosed_key_hex: String,
+
+        /// Specific legal/abuse allegation explaining why the verified content is illegal (<= 512 bytes).
+        #[arg(long, value_name = "TEXT")]
+        allegation: String,
+
+        /// Reporter contact handle, email, or organization identifier.
+        #[arg(long, value_name = "TEXT", default_value = "anonymous-reporter")]
+        contact: String,
+
+        /// Optional observed IP address of the bad actor distributing the content.
+        #[arg(long, value_name = "IP")]
+        bad_actor_ip: Option<std::net::IpAddr>,
+
+        /// Sample stripe index to reconstruct & authenticate via AES-256-GCM (default: `0`).
+        #[arg(long, default_value_t = 0)]
+        stripe_index: u64,
+    },
     /// Manage the background P2P storage & PoR daemon.
     Daemon {
         #[command(subcommand)]
@@ -282,12 +584,16 @@ pub enum DaemonAction {
         /// Optionally enable secondary QUIC transport listener (ADR-08).
         #[arg(long, default_value_t = false)]
         enable_quic: bool,
+
+        /// Optional bind address for the embedded Router Cloud-NAS HTTP dashboard & JSON API (e.g. `0.0.0.0:4080`).
+        #[arg(long, value_name = "ADDR")]
+        status_http: Option<String>,
     },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum FileAction {
-    /// Encrypt a file with AES-256-GCM in 16 MiB stripes, split into Reed-Solomon shards, and store.
+    /// Encrypt a file with AES-256-GCM in streaming stripes, split into Reed-Solomon shards, and store.
     Store {
         /// Path to the plaintext input file (positional).
         #[arg(value_name = "PATH", required_unless_present = "path_flag")]
@@ -338,12 +644,17 @@ pub enum FileAction {
 
 /// Persistent node configuration loaded from `config.toml` or CLI defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NodeConfig {
     pub data_dir: PathBuf,
     pub listen_tcp: String,
     pub enable_quic: bool,
     pub listen_quic: String,
+    #[serde(default, alias = "profile")]
+    pub hardware_profile: HardwareProfile,
     pub stripe_size_bytes: usize,
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
     pub default_tier: ErasureTier,
     pub max_storage_bytes: u64,
     pub bootstrap_grace_bytes: u64,
@@ -360,13 +671,46 @@ pub struct NodeConfig {
     /// Optional paired `parvault-seed` Multiaddr (`--seed-addr` / `PARVAULT_SEED_ADDR`).
     #[serde(default)]
     pub lite_seed_addr: Option<String>,
+    /// Optional Online WAN rendezvous / DDNS seed Multiaddrs (including `/dns4/...` hostnames).
+    #[serde(default)]
+    pub wan_rendezvous_seeds: Vec<String>,
+    /// Optional BitTorrent-style Public Commons tracker Multiaddrs (`--tracker` / `PARVAULT_TRACKERS`).
+    #[serde(default, alias = "trackers")]
+    pub public_trackers: Vec<String>,
+    /// Trust admission mode (`"private"` default, `"public"`, or `"hybrid"` — `ADR-18`).
+    #[serde(default)]
+    pub trust_mode: crate::network::wot::TrustPoolMode,
+    /// Hex-encoded 32-byte Ed25519 public keys trusted to issue signed mesh eviction orders (`ADR-19`).
+    #[serde(default)]
+    pub eviction_authorities: Vec<String>,
+    /// Optional explicit `M-of-N` federated Public Tracker Operator quorum threshold (`None` = auto strict majority).
+    #[serde(default)]
+    pub tracker_eviction_quorum: Option<usize>,
+    /// Optional explicitly advertised public WAN Multiaddrs (`--external-addr` / `PARVAULT_EXTERNAL_ADDRS`).
+    #[serde(default)]
+    pub external_addrs: Vec<String>,
+    /// Enable zero-IP signed Home LAN discovery responder & scanner (`default = true`).
+    #[serde(default = "default_lan_discovery_enabled")]
+    pub lan_discovery_enabled: bool,
+    /// UDP port for signed Home LAN zero-IP discovery (`default = 4009`).
+    #[serde(default = "default_lan_discovery_port")]
+    pub lan_discovery_port: u16,
+    /// Optional human-readable node label advertised on LAN/WAN discovery & status dashboard.
+    #[serde(default, alias = "label")]
+    pub node_label: Option<String>,
+    /// Optional bind address for the embedded Router Cloud-NAS status HTTP server (e.g. `"0.0.0.0:4080"`).
+    #[serde(default, alias = "status_http")]
+    pub status_http_bind: Option<String>,
+    /// Optional default folder watched in `parvault up` turnkey appliance mode.
+    #[serde(default, alias = "watch_folder")]
+    pub watched_folder: Option<PathBuf>,
     /// Optional hex-encoded 32-byte Web-of-Trust Genesis Root public key (`PARVAULT_GENESIS_PUBKEY_HEX`).
     #[serde(default)]
     pub genesis_root_pubkey_hex: Option<String>,
     /// Optional passphrase for Argon2id hardware enclave key sealing (`PARVAULT_PASSPHRASE`).
     #[serde(default)]
     pub device_sealing_passphrase: Option<String>,
-    /// Minimum free OS filesystem space (default 5 GiB) reserved as a safety guard against disk exhaustion.
+    /// Minimum free OS filesystem space (default 5 GiB on Desktop, 1 GiB on HomelabNas, 64 MiB on RouterSoc).
     #[serde(default = "default_min_free_disk_bytes")]
     pub min_free_disk_bytes: u64,
     /// Optional upload bandwidth limit in Mbps (`0` = unlimited).
@@ -384,7 +728,9 @@ impl Default for NodeConfig {
             listen_tcp: "/ip4/0.0.0.0/tcp/4001".to_string(),
             enable_quic: false,
             listen_quic: "/ip4/0.0.0.0/udp/4001/quic-v1".to_string(),
+            hardware_profile: HardwareProfile::Desktop,
             stripe_size_bytes: DEFAULT_STRIPE_SIZE_BYTES,
+            max_connections: default_max_connections(),
             default_tier: ErasureTier::Consumer,
             max_storage_bytes: 100 * 1024 * 1024 * 1024, // 100 GiB default local allocation
             bootstrap_grace_bytes: DEFAULT_BOOTSTRAP_GRACE_BYTES,
@@ -395,6 +741,17 @@ impl Default for NodeConfig {
             override_region: None,
             bootstrap_peers: Vec::new(),
             lite_seed_addr: None,
+            wan_rendezvous_seeds: Vec::new(),
+            public_trackers: Vec::new(),
+            trust_mode: crate::network::wot::TrustPoolMode::PrivateRing,
+            eviction_authorities: Vec::new(),
+            tracker_eviction_quorum: None,
+            external_addrs: Vec::new(),
+            lan_discovery_enabled: default_lan_discovery_enabled(),
+            lan_discovery_port: default_lan_discovery_port(),
+            node_label: None,
+            status_http_bind: None,
+            watched_folder: None,
             genesis_root_pubkey_hex: None,
             device_sealing_passphrase: None,
             min_free_disk_bytes: default_min_free_disk_bytes(),
@@ -405,14 +762,69 @@ impl Default for NodeConfig {
 }
 
 impl NodeConfig {
+    pub fn from_toml_str(raw: &str) -> anyhow::Result<Self> {
+        let val: toml::Value = toml::from_str(raw)?;
+        let mut cfg: Self = toml::from_str(raw)?;
+        let has_profile = val.get("hardware_profile").is_some() || val.get("profile").is_some();
+        if has_profile {
+            if val.get("stripe_size_bytes").is_none() {
+                cfg.stripe_size_bytes = cfg.hardware_profile.stripe_size_bytes();
+            }
+            if val.get("min_free_disk_bytes").is_none() {
+                cfg.min_free_disk_bytes = cfg.hardware_profile.min_free_disk_bytes();
+            }
+            if val.get("max_connections").is_none() {
+                cfg.max_connections = cfg.hardware_profile.max_connections();
+            }
+        }
+        Ok(cfg)
+    }
+
     pub fn load_or_default(path: Option<&PathBuf>) -> anyhow::Result<Self> {
         if let Some(cfg_path) = path {
             let raw = std::fs::read_to_string(cfg_path)?;
-            let cfg: Self = toml::from_str(&raw)?;
-            Ok(cfg)
+            Self::from_toml_str(&raw)
         } else {
             Ok(Self::default())
         }
+    }
+
+    /// Loads `explicit_config` if provided; otherwise checks `<data_dir>/config.toml` if present,
+    /// falling back to `NodeConfig::default()`. Then applies `--data-dir` and `--profile` overrides.
+    pub fn load_for_cli(
+        explicit_config: Option<&PathBuf>,
+        cli_data_dir: Option<&Path>,
+        cli_profile: Option<HardwareProfile>,
+    ) -> anyhow::Result<Self> {
+        let mut cfg = if let Some(cfg_path) = explicit_config {
+            Self::load_or_default(Some(cfg_path))?
+        } else {
+            let candidate_dir = cli_data_dir
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from(".parvault-data"));
+            let auto_cfg_path = candidate_dir.join("config.toml");
+            if auto_cfg_path.is_file() {
+                Self::load_or_default(Some(&auto_cfg_path))?
+            } else {
+                Self::default()
+            }
+        };
+
+        if let Some(override_dir) = cli_data_dir {
+            cfg.data_dir = override_dir.to_path_buf();
+        }
+        if let Some(profile) = cli_profile {
+            cfg.apply_hardware_profile(profile);
+        }
+        Ok(cfg)
+    }
+
+    /// Applies `HardwareProfile` tuning (`stripe_size_bytes`, `min_free_disk_bytes`, `max_connections`).
+    pub fn apply_hardware_profile(&mut self, profile: HardwareProfile) {
+        self.hardware_profile = profile;
+        self.stripe_size_bytes = profile.stripe_size_bytes();
+        self.min_free_disk_bytes = profile.min_free_disk_bytes();
+        self.max_connections = profile.max_connections();
     }
 
     pub fn effective_peers(&self, cli_peers: &[String]) -> Vec<String> {
@@ -443,5 +855,501 @@ impl NodeConfig {
             }
         }
         self.lite_seed_addr.clone()
+    }
+
+    /// Collects deduplicated Online WAN rendezvous seed Multiaddrs from `--seed-addr`,
+    /// `PARVAULT_WAN_SEEDS`, `PARVAULT_SEED_ADDR`, and `wan_rendezvous_seeds`.
+    pub fn effective_wan_rendezvous_seeds(&self, cli_seed: Option<&str>) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut push_unique = |s: &str| {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+                out.push(trimmed.to_string());
+            }
+        };
+
+        if let Some(seed) = self.effective_seed_addr(cli_seed) {
+            push_unique(&seed);
+        }
+        if let Ok(env_wan) = std::env::var("PARVAULT_WAN_SEEDS") {
+            for part in env_wan.split(',') {
+                push_unique(part);
+            }
+        }
+        for seed in &self.wan_rendezvous_seeds {
+            push_unique(seed);
+        }
+        out
+    }
+
+    /// Collects deduplicated Public Commons tracker Multiaddrs from `--tracker`,
+    /// `PARVAULT_TRACKERS`, `public_trackers`, and (when `--public` is active) `--seed-addr`.
+    pub fn effective_public_trackers(
+        &self,
+        cli_trackers: &[String],
+        cli_seed: Option<&str>,
+        public_mode: bool,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut push_unique = |s: &str| {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+                out.push(trimmed.to_string());
+            }
+        };
+
+        for t in cli_trackers {
+            push_unique(t);
+        }
+        if let Ok(env_t) = std::env::var("PARVAULT_TRACKERS") {
+            for part in env_t.split(',') {
+                push_unique(part);
+            }
+        }
+        for t in &self.public_trackers {
+            push_unique(t);
+        }
+        if public_mode {
+            if let Some(seed) = self.effective_seed_addr(cli_seed) {
+                push_unique(&seed);
+            }
+        }
+        out
+    }
+
+    /// Collects deduplicated external/public WAN Multiaddrs from `--external-addr`,
+    /// `PARVAULT_EXTERNAL_ADDRS`, and `external_addrs`.
+    pub fn effective_external_addrs(&self, cli_external: &[String]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut push_unique = |s: &str| {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+                out.push(trimmed.to_string());
+            }
+        };
+
+        for addr in cli_external {
+            push_unique(addr);
+        }
+        if let Ok(env_ext) = std::env::var("PARVAULT_EXTERNAL_ADDRS") {
+            for part in env_ext.split(',') {
+                push_unique(part);
+            }
+        }
+        for addr in &self.external_addrs {
+            push_unique(addr);
+        }
+        out
+    }
+
+    pub fn effective_lan_discovery_port(&self, cli_port: Option<u16>) -> u16 {
+        if let Some(port) = cli_port {
+            return port;
+        }
+        if let Ok(env_port) = std::env::var("PARVAULT_LAN_DISCOVERY_PORT") {
+            if let Ok(parsed) = env_port.trim().parse::<u16>() {
+                if parsed > 0 {
+                    return parsed;
+                }
+            }
+        }
+        if self.lan_discovery_port == 0 {
+            DEFAULT_LAN_DISCOVERY_PORT
+        } else {
+            self.lan_discovery_port
+        }
+    }
+
+    pub fn effective_lan_discovery_enabled(&self, cli_no_lan_discovery: bool) -> bool {
+        if cli_no_lan_discovery {
+            return false;
+        }
+        if let Ok(env_dis) = std::env::var("PARVAULT_NO_LAN_DISCOVERY") {
+            let v = env_dis.trim().to_ascii_lowercase();
+            if matches!(v.as_str(), "1" | "true" | "yes") {
+                return false;
+            }
+        }
+        self.lan_discovery_enabled
+    }
+
+    pub fn effective_node_label(&self, fallback_peer_id: &str) -> String {
+        if let Some(label) = self
+            .node_label
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return label.to_string();
+        }
+        if let Ok(host) = std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")) {
+            let trimmed = host.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        let suffix: String = fallback_peer_id
+            .chars()
+            .rev()
+            .take(6)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("parvault-{}", suffix)
+    }
+
+    /// Resolves the active `TrustPoolMode` (`PrivateRing`, `PublicCommons`, or `Hybrid`)
+    /// honoring `--public`, `PARVAULT_PUBLIC`, `--tracker`, and `config.toml` `trust_mode`.
+    pub fn effective_trust_mode(
+        &self,
+        cli_public: bool,
+        cli_trackers: &[String],
+    ) -> crate::network::wot::TrustPoolMode {
+        use crate::network::wot::TrustPoolMode;
+        let env_public = std::env::var("PARVAULT_PUBLIC")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        if (cli_public || env_public || !cli_trackers.is_empty())
+            && self.trust_mode == TrustPoolMode::PrivateRing
+        {
+            return TrustPoolMode::Hybrid;
+        }
+        self.trust_mode
+    }
+
+    /// Extracts an inline Ed25519 32-byte public key from a `/p2p/<PeerId>` component in `addr`, if present.
+    pub fn extract_ed25519_pubkey_from_peer_str(addr: &str) -> Option<[u8; 32]> {
+        let peer_token = if let Some((_, tail)) = addr.rsplit_once("/p2p/") {
+            tail.split('/').next().unwrap_or(tail).trim()
+        } else {
+            addr.trim()
+        };
+        let peer_id = peer_token.parse::<libp2p::PeerId>().ok()?;
+        let mh = peer_id.as_ref();
+        // Identity multihash (code 0x00) containing protobuf-encoded Ed25519 PublicKey: 0x08 0x01 0x12 0x20 <32 bytes>
+        let digest = mh.digest();
+        if mh.code() == 0 && digest.len() == 36 && digest[..4] == [0x08, 0x01, 0x12, 0x20] {
+            let mut pk = [0u8; 32];
+            pk.copy_from_slice(&digest[4..36]);
+            return Some(pk);
+        }
+        None
+    }
+
+    /// Builds the deduplicated list of trusted 32-byte Ed25519 authority public keys allowed to issue
+    /// `SignedBadActorEvictionOrder`s (`ADR-19` Strict Mode Isolation):
+    /// - Always trusts `local_pubkey` and explicit `eviction_authorities` (`PARVAULT_EVICTION_AUTHORITIES`).
+    /// - In `PrivateRing` mode (`!public_commons_active`): external `tracker_admin_pubkey`s are
+    ///   **strictly ignored/rejected** so no public tracker authority can ever affect a private ring;
+    ///   only `local_pubkey` and explicit `genesis_pubkey` (+ explicit `eviction_authorities`) are trusted.
+    /// - In `--public` (`PublicCommons` / `Hybrid`) mode: trusts `local_pubkey` + pinned
+    ///   `tracker_admin_pubkey`s (`extra_pinned_admin_pubkeys` + `<data_dir>/pinned_tracker_admins.json`)
+    ///   + explicit `eviction_authorities`, rejecting all non-admin random public peers!
+    pub fn resolve_eviction_authorities(
+        &self,
+        local_pubkey: [u8; 32],
+        genesis_pubkey: [u8; 32],
+        extra_pinned_admin_pubkeys: &[[u8; 32]],
+        public_commons_active: bool,
+    ) -> Vec<[u8; 32]> {
+        let mut out = Vec::new();
+        let mut push_pk = |pk: [u8; 32]| {
+            if !out.contains(&pk) {
+                out.push(pk);
+            }
+        };
+
+        push_pk(local_pubkey);
+
+        for hex_str in &self.eviction_authorities {
+            if let Ok(bytes) = hex::decode(hex_str.trim()) {
+                if bytes.len() == 32 {
+                    let mut pk = [0u8; 32];
+                    pk.copy_from_slice(&bytes);
+                    push_pk(pk);
+                }
+            }
+        }
+        if let Ok(env_auth) = std::env::var("PARVAULT_EVICTION_AUTHORITIES") {
+            for part in env_auth.split(',') {
+                if let Ok(bytes) = hex::decode(part.trim()) {
+                    if bytes.len() == 32 {
+                        let mut pk = [0u8; 32];
+                        pk.copy_from_slice(&bytes);
+                        push_pk(pk);
+                    }
+                }
+            }
+        }
+
+        if public_commons_active {
+            for &pk in extra_pinned_admin_pubkeys {
+                push_pk(pk);
+            }
+            let pinned_path = self.data_dir.join("pinned_tracker_admins.json");
+            if let Ok(raw) = std::fs::read_to_string(&pinned_path) {
+                if let Ok(hex_list) = serde_json::from_str::<Vec<String>>(&raw) {
+                    for hex_str in hex_list {
+                        if let Ok(bytes) = hex::decode(hex_str.trim()) {
+                            if bytes.len() == 32 {
+                                let mut pk = [0u8; 32];
+                                pk.copy_from_slice(&bytes);
+                                push_pk(pk);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            push_pk(genesis_pubkey);
+        }
+        out
+    }
+
+    /// Resolves `(trusted_council_pubkeys, min_quorum)` for `apply_signed_eviction_order_with_quorum`
+    /// (`ADR-19` Strict Mode Isolation + `M-of-N` Federated Public Tracker Operator Council Quorum):
+    /// - `local_pubkey` is passed separately as `local_owner_pubkey` (`1-of-1` local device sovereignty),
+    ///   so it is not mixed into `trusted_council_pubkeys` when sizing the federated tracker council.
+    /// - In `PrivateRing` mode (`!public_commons_active`), external `tracker_admin_pubkey`s are
+    ///   strictly excluded; only `genesis_pubkey` + explicit `eviction_authorities` are trusted.
+    /// - In `--public` mode (`public_commons_active`), `trusted_council_pubkeys` consists of pinned
+    ///   `tracker_admin_pubkey`s + explicit `eviction_authorities`, and `min_quorum` defaults to
+    ///   `SignedBadActorEvictionOrder::default_tracker_quorum_threshold(trusted_council.len())`
+    ///   unless overridden via `tracker_eviction_quorum` or `PARVAULT_TRACKER_EVICTION_QUORUM`.
+    pub fn resolve_eviction_council_and_quorum(
+        &self,
+        genesis_pubkey: [u8; 32],
+        extra_pinned_admin_pubkeys: &[[u8; 32]],
+        public_commons_active: bool,
+    ) -> (Vec<[u8; 32]>, usize) {
+        let mut council = Vec::new();
+        let mut push_pk = |pk: [u8; 32]| {
+            if pk != [0u8; 32] && !council.contains(&pk) {
+                council.push(pk);
+            }
+        };
+
+        for hex_str in &self.eviction_authorities {
+            if let Ok(bytes) = hex::decode(hex_str.trim()) {
+                if bytes.len() == 32 {
+                    let mut pk = [0u8; 32];
+                    pk.copy_from_slice(&bytes);
+                    push_pk(pk);
+                }
+            }
+        }
+        if let Ok(env_auth) = std::env::var("PARVAULT_EVICTION_AUTHORITIES") {
+            for part in env_auth.split(',') {
+                if let Ok(bytes) = hex::decode(part.trim()) {
+                    if bytes.len() == 32 {
+                        let mut pk = [0u8; 32];
+                        pk.copy_from_slice(&bytes);
+                        push_pk(pk);
+                    }
+                }
+            }
+        }
+
+        let env_quorum = std::env::var("PARVAULT_TRACKER_EVICTION_QUORUM")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok());
+
+        if public_commons_active {
+            for &pk in extra_pinned_admin_pubkeys {
+                push_pk(pk);
+            }
+            let pinned_path = self.data_dir.join("pinned_tracker_admins.json");
+            if let Ok(raw) = std::fs::read_to_string(&pinned_path) {
+                if let Ok(hex_list) = serde_json::from_str::<Vec<String>>(&raw) {
+                    for hex_str in hex_list {
+                        if let Ok(bytes) = hex::decode(hex_str.trim()) {
+                            if bytes.len() == 32 {
+                                let mut pk = [0u8; 32];
+                                pk.copy_from_slice(&bytes);
+                                push_pk(pk);
+                            }
+                        }
+                    }
+                }
+            }
+            let min_quorum = self
+                .tracker_eviction_quorum
+                .or(env_quorum)
+                .unwrap_or_else(|| {
+                    crate::storage::SignedBadActorEvictionOrder::default_tracker_quorum_threshold(
+                        council.len(),
+                    )
+                })
+                .max(1);
+            (council, min_quorum)
+        } else {
+            push_pk(genesis_pubkey);
+            let min_quorum = self
+                .tracker_eviction_quorum
+                .or(env_quorum)
+                .unwrap_or(1)
+                .max(1);
+            (council, min_quorum)
+        }
+    }
+
+    /// Persists a discovered Public Tracker Admin Ed25519 pubkey into `<data_dir>/pinned_tracker_admins.json`.
+    pub fn persist_pinned_tracker_admin(&self, admin_pubkey: [u8; 32]) {
+        let pinned_path = self.data_dir.join("pinned_tracker_admins.json");
+        let mut list: Vec<String> = std::fs::read_to_string(&pinned_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let hex_pk = hex::encode(admin_pubkey);
+        if !list.iter().any(|existing| existing == &hex_pk) {
+            list.push(hex_pk);
+            if let Ok(json) = serde_json::to_vec_pretty(&list) {
+                let _ = crate::storage::BlockStore::atomic_write_file(&pinned_path, &json);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hardware_profile_parameters_and_backward_compatible_toml() {
+        assert_eq!(HardwareProfile::RouterSoc.stripe_size_bytes(), 1_048_576);
+        assert_eq!(
+            HardwareProfile::RouterSoc.min_free_disk_bytes(),
+            64 * 1024 * 1024
+        );
+        assert_eq!(HardwareProfile::RouterSoc.max_connections(), 24);
+
+        assert_eq!(HardwareProfile::HomelabNas.stripe_size_bytes(), 4_194_304);
+        assert_eq!(
+            HardwareProfile::HomelabNas.min_free_disk_bytes(),
+            1024 * 1024 * 1024
+        );
+
+        assert_eq!(
+            HardwareProfile::Desktop.stripe_size_bytes(),
+            16 * 1024 * 1024
+        );
+
+        // Legacy v0.2.0 minimal TOML without new v0.3.0 fields must parse cleanly
+        let legacy_toml = r#"
+            data_dir = "/var/lib/parvault"
+            listen_tcp = "/ip4/0.0.0.0/tcp/4001"
+            enable_quic = false
+            listen_quic = "/ip4/0.0.0.0/udp/4001/quic-v1"
+            stripe_size_bytes = 16777216
+            default_tier = "Consumer"
+            max_storage_bytes = 10737418240
+            bootstrap_grace_bytes = 1073741824
+            por_timeout_ms = 300
+            local_rtt_threshold_ms = 5
+            intra_asn_ratio = 0.7
+        "#;
+        let parsed_legacy = NodeConfig::from_toml_str(legacy_toml).expect("parse legacy config");
+        assert_eq!(parsed_legacy.hardware_profile, HardwareProfile::Desktop);
+        assert!(parsed_legacy.lan_discovery_enabled);
+        assert_eq!(parsed_legacy.lan_discovery_port, 4009);
+
+        // Minimal v0.3.0 router-soc TOML automatically applies 1 MiB stripe & 64 MiB disk guard
+        let router_toml = r#"
+            hardware_profile = "router-soc"
+            data_dir = "/mnt/nas/.parvault"
+            node_label = "openwrt-gateway"
+            status_http_bind = "0.0.0.0:4080"
+        "#;
+        let parsed_router = NodeConfig::from_toml_str(router_toml).expect("parse router config");
+        assert_eq!(parsed_router.hardware_profile, HardwareProfile::RouterSoc);
+        assert_eq!(parsed_router.stripe_size_bytes, 1_048_576);
+        assert_eq!(parsed_router.min_free_disk_bytes, 64 * 1024 * 1024);
+        assert_eq!(parsed_router.max_connections, 24);
+        assert_eq!(parsed_router.node_label.as_deref(), Some("openwrt-gateway"));
+        assert_eq!(
+            parsed_router.status_http_bind.as_deref(),
+            Some("0.0.0.0:4080")
+        );
+    }
+
+    #[test]
+    fn test_cli_parses_all_new_and_legacy_subcommands() {
+        let init_cli = Cli::try_parse_from([
+            "parvault",
+            "init",
+            "--profile",
+            "router-soc",
+            "--watch",
+            "/mnt/usb/shared",
+            "--label",
+            "home-router",
+            "--max-storage-gib",
+            "64",
+        ])
+        .expect("parse init");
+        assert_eq!(init_cli.profile, Some(HardwareProfile::RouterSoc));
+
+        let up_cli = Cli::try_parse_from([
+            "parvault",
+            "--profile",
+            "router-soc",
+            "up",
+            "--folder",
+            "/mnt/usb/shared",
+            "--status-http",
+            "0.0.0.0:4080",
+            "--pair",
+        ])
+        .expect("parse up");
+        assert_eq!(up_cli.profile, Some(HardwareProfile::RouterSoc));
+
+        let join_cli = Cli::try_parse_from([
+            "parvault",
+            "--seed-addr",
+            "/dns4/seed.example.org/tcp/4002",
+            "join",
+            "--code",
+            "anchor-velvet-orbit-oak",
+            "--wan",
+        ])
+        .expect("parse join");
+        assert_eq!(
+            join_cli.seed_addr.as_deref(),
+            Some("/dns4/seed.example.org/tcp/4002")
+        );
+
+        let evict_cli = Cli::try_parse_from([
+            "parvault",
+            "evict",
+            "--ip",
+            "203.0.113.42",
+            "--reason",
+            "abuse-report",
+            "--propagate",
+        ])
+        .expect("parse evict");
+        assert!(matches!(evict_cli.command, Commands::Evict { .. }));
+
+        let public_toml = r#"
+            trust_mode = "public"
+            public_trackers = ["/dns4/tracker.example.org/tcp/4002"]
+            eviction_authorities = ["1111111111111111111111111111111111111111111111111111111111111111"]
+        "#;
+        let parsed_pub = NodeConfig::from_toml_str(public_toml).expect("parse public toml");
+        assert_eq!(
+            parsed_pub.trust_mode,
+            crate::network::wot::TrustPoolMode::PublicCommons
+        );
+        assert_eq!(parsed_pub.eviction_authorities.len(), 1);
+
+        let id = crate::crypto::NodeIdentity::generate();
+        let pid = crate::network::node_identity_libp2p_peer_id(&id).expect("peer id");
+        let maddr = format!("/ip4/198.51.100.10/tcp/4002/p2p/{pid}");
+        assert_eq!(
+            NodeConfig::extract_ed25519_pubkey_from_peer_str(&maddr),
+            Some(id.public_key_bytes())
+        );
     }
 }

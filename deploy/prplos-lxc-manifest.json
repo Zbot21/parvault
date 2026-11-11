@@ -2,7 +2,7 @@
   "schema_version": "1.0",
   "container_name": "parvault-daemon",
   "vendor": "Neighborhood Cloud / Project ParVault",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "license": "AGPL-3.0-only",
   "target_platforms": [
     "aarch64-unknown-linux-musl",
@@ -12,24 +12,23 @@
     "type": "prplos-lxc",
     "entrypoint": "/usr/local/bin/parvault",
     "args": [
-      "daemon",
-      "start",
+      "up",
+      "--profile",
+      "router-soc",
       "--config",
-      "/etc/parvault/config.toml",
-      "--listen",
-      "/ip4/0.0.0.0/tcp/4001"
+      "/etc/parvault/router.toml"
     ],
     "restart_policy": "always",
     "restart_backoff_sec": 5
   },
   "resources": {
-    "memory_limit_mb": 64,
-    "memory_soft_limit_mb": 32,
+    "memory_limit_mb": 32,
+    "memory_soft_limit_mb": 24,
     "cpu_shares": 256,
     "max_cpu_percent_por_audit": 2,
     "storage_mounts": [
       {
-        "source": "/mnt/nvme0/parvault-vault",
+        "source": "/mnt/nas/parvault-vault",
         "destination": "/var/lib/parvault",
         "options": ["rw", "noatime", "nosuid", "nodev"]
       }
@@ -39,10 +38,13 @@
     "mode": "bridge",
     "ports": [
       { "protocol": "tcp", "port": 4001, "description": "libp2p TCP + Noise XX + Yamux" },
+      { "protocol": "tcp", "port": 4002, "description": "Seed direct TCP transport" },
+      { "protocol": "udp", "port": 4009, "description": "Signed zero-IP LAN beacon discovery (ADR-18)" },
+      { "protocol": "tcp", "port": 4080, "description": "Router NAS Web status & REST API (ADR-18)" },
       { "protocol": "udp", "port": 4001, "description": "Optional QUIC listener (ADR-08)" },
       { "protocol": "udp", "port": 5353, "description": "mDNS zero-config LAN discovery" }
     ],
-    "locality_policy": {
+  "locality_policy": {
       "intra_asn_ratio": 0.70,
       "inter_asn_ratio": 0.30,
       "target_rtt_ms": 5

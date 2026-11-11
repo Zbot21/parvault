@@ -6,9 +6,17 @@ use crate::crypto::{compute_sha256, HybridKemPublicKey, NodeIdentity, PqRelayedS
 use crate::network::behaviour::{
     classify_ip_asn, DhtEnvelopeKind, DhtWireEnvelope, MeshNetworkBehaviour,
     MeshNetworkBehaviourEvent, MeshWireRequest, MeshWireResponse, PeerTopologyMetrics,
-    PlacementEngine,
+    PlacementEngine, SignedWanRendezvousEntry,
+};
+use crate::network::discovery::{
+    discover_lan_peers, node_identity_libp2p_peer_id, KnownPeersStore, DEFAULT_LAN_DISCOVERY_PORT,
 };
 use crate::network::transport::build_mesh_client_swarm;
+use crate::network::wan_rendezvous::{
+    derive_peer_ddns_slot_key, derive_slot_key_from_code, now_ms as wan_now_ms,
+    open_ddns_heartbeat, open_public_tracker_card, open_wan_peer_card, seal_ddns_heartbeat,
+    seal_public_tracker_card, seal_wan_peer_card, WanPeerCard, PUBLIC_COMMONS_SWARM_SLOT,
+};
 use crate::network::wot::DelegationChain;
 use crate::por::{
     MultiSegmentPorChallenge, PorChallenge, PorResponse, PorVerifierEngine, RepairGrant,
@@ -16,7 +24,8 @@ use crate::por::{
 };
 use crate::sharding::StripeShardSet;
 use crate::storage::{
-    AnonymousQuotaVoucher, BlindedShardCapability, BlindedShardId, ShardId, StripeManifestEntry,
+    AnonymousQuotaVoucher, BlindedShardCapability, BlindedShardId, EvictionPurgeReport, ShardId,
+    SignedBadActorEvictionOrder, StripeManifestEntry, VerifiableAbuseReport,
 };
 use libp2p::{
     futures::StreamExt,
@@ -31,6 +40,7 @@ use libp2p::{
 };
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
@@ -919,6 +929,11 @@ pub struct MeshClient {
     peers: Vec<String>,
     seed_addr: Option<String>,
     request_timeout: Duration,
+    discovery_data_dir: Option<PathBuf>,
+    lan_discovery_port: u16,
+    last_lan_refresh: Arc<Mutex<Option<Instant>>>,
+    healed_peer_addrs: Arc<Mutex<HashMap<PeerId, String>>>,
+    tracker_admin_pubkeys: Arc<Mutex<HashMap<String, [u8; 32]>>>,
     dead_peers: Arc<Mutex<HashSet<String>>>,
     pinned_peers: Arc<Mutex<HashMap<String, PeerId>>>,
     peer_rtt_ms: Arc<Mutex<HashMap<String, f64>>>,
@@ -931,10 +946,16 @@ impl MeshClient {
     pub fn new(identity: NodeIdentity, peers: Vec<String>, seed_addr: Option<String>) -> Self {
         let mut normalized_peers = Vec::new();
         let mut seen = HashSet::new();
+        let mut initial_healed = HashMap::new();
         for p in peers {
             for item in p.split(',') {
                 let t = item.trim();
                 if !t.is_empty() && seen.insert(t.to_string()) {
+                    if let Ok(maddr) = parse_peer_multiaddr(t) {
+                        if let Some(pid) = extract_expected_peer_id(&maddr) {
+                            initial_healed.insert(pid, t.to_string());
+                        }
+                    }
                     normalized_peers.push(t.to_string());
                 }
             }
@@ -948,6 +969,11 @@ impl MeshClient {
             peers: normalized_peers,
             seed_addr,
             request_timeout: Duration::from_millis(1200),
+            discovery_data_dir: None,
+            lan_discovery_port: DEFAULT_LAN_DISCOVERY_PORT,
+            last_lan_refresh: Arc::new(Mutex::new(None)),
+            healed_peer_addrs: Arc::new(Mutex::new(initial_healed)),
+            tracker_admin_pubkeys: Arc::new(Mutex::new(HashMap::new())),
             dead_peers: Arc::new(Mutex::new(HashSet::new())),
             pinned_peers: Arc::new(Mutex::new(HashMap::new())),
             peer_rtt_ms: Arc::new(Mutex::new(HashMap::new())),
@@ -955,6 +981,132 @@ impl MeshClient {
             discovered_peers: Arc::new(Mutex::new(HashSet::new())),
             worker: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Enables Zero-IP LAN auto-discovery and DHCP IP/port-change self-healing backed by
+    /// `<data_dir>/known_peers.json`. If `MeshClient` starts with 0 peers or encounters dead
+    /// endpoints after a home DHCP renewal, it automatically re-scans LAN beacons and updates
+    /// pinned `/p2p/<PeerId>` Multiaddrs seamlessly.
+    pub fn with_data_dir_discovery(mut self, data_dir: PathBuf, discovery_port: u16) -> Self {
+        let store = KnownPeersStore::load(&data_dir);
+        if let (Ok(mut disc), Ok(mut healed)) =
+            (self.discovered_peers.lock(), self.healed_peer_addrs.lock())
+        {
+            for rec in store.peers.values() {
+                disc.insert(rec.multiaddr.clone());
+                if let Ok(pid) = rec.libp2p_peer_id.parse::<PeerId>() {
+                    healed.entry(pid).or_insert_with(|| rec.multiaddr.clone());
+                }
+            }
+        }
+        if let Ok(mut admins) = self.tracker_admin_pubkeys.lock() {
+            for (k, &pk) in &store.tracker_admin_pubkeys {
+                admins.entry(k.clone()).or_insert(pk);
+            }
+        }
+        self.discovery_data_dir = Some(data_dir);
+        self.lan_discovery_port = discovery_port;
+        self
+    }
+
+    /// Actively scans the local network via `discover_lan_peers`, persists updated endpoints to
+    /// `<data_dir>/known_peers.json` (if configured), updates DHCP-healed `PeerId -> Multiaddr`
+    /// mappings, and returns all active discovered peer Multiaddrs.
+    pub fn refresh_lan_peers(&self) -> Vec<String> {
+        let found = discover_lan_peers(Duration::from_millis(220), self.lan_discovery_port);
+        if let Ok(mut ts) = self.last_lan_refresh.lock() {
+            *ts = Some(Instant::now());
+        }
+
+        let mut active_addrs = Vec::new();
+        if let Some(ref dir) = self.discovery_data_dir {
+            let mut store = KnownPeersStore::load(dir);
+            if !found.is_empty() {
+                store.upsert_discovered(&found);
+                let _ = store.save(dir);
+            }
+            if let Some(ref seed) = self.seed_addr {
+                if is_network_peer_addr(seed) {
+                    let lan_pids: HashSet<&str> =
+                        found.iter().map(|p| p.libp2p_peer_id.as_str()).collect();
+                    let stale_records: Vec<_> = store
+                        .peers
+                        .values()
+                        .filter(|r| {
+                            !lan_pids.contains(r.libp2p_peer_id.as_str())
+                                && self.is_peer_marked_dead(&r.multiaddr)
+                        })
+                        .cloned()
+                        .collect();
+                    for rec in stale_records {
+                        let _ = self.lookup_wan_ddns_cards(seed, &rec.libp2p_peer_id);
+                        if let Some(ref fp) = rec.owner_pq_fingerprint {
+                            let _ = self.lookup_wan_ddns_cards(seed, fp);
+                        }
+                    }
+                    store = KnownPeersStore::load(dir);
+                }
+            }
+            for rec in store.peers.values() {
+                active_addrs.push(rec.multiaddr.clone());
+                if let Ok(pid) = rec.libp2p_peer_id.parse::<PeerId>() {
+                    if let Ok(mut healed) = self.healed_peer_addrs.lock() {
+                        healed.insert(pid, rec.multiaddr.clone());
+                    }
+                }
+                if let Ok(mut dead) = self.dead_peers.lock() {
+                    dead.remove(&rec.multiaddr);
+                }
+                if let Ok(mut disc) = self.discovered_peers.lock() {
+                    disc.insert(rec.multiaddr.clone());
+                }
+            }
+        } else {
+            for peer in &found {
+                active_addrs.push(peer.multiaddr.clone());
+                if let Ok(pid) = peer.libp2p_peer_id.parse::<PeerId>() {
+                    if let Ok(mut healed) = self.healed_peer_addrs.lock() {
+                        healed.insert(pid, peer.multiaddr.clone());
+                    }
+                }
+                if let Ok(mut dead) = self.dead_peers.lock() {
+                    dead.remove(&peer.multiaddr);
+                }
+                if let Ok(mut disc) = self.discovered_peers.lock() {
+                    disc.insert(peer.multiaddr.clone());
+                }
+            }
+        }
+        active_addrs
+    }
+
+    fn maybe_refresh_lan_peers_throttled(&self) -> bool {
+        if self.discovery_data_dir.is_none() {
+            return false;
+        }
+        let recently_refreshed = self
+            .last_lan_refresh
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(350));
+        if recently_refreshed {
+            return false;
+        }
+        !self.refresh_lan_peers().is_empty()
+    }
+
+    fn resolve_healed_peer_addr(&self, raw_addr: &str) -> Option<String> {
+        let maddr = parse_peer_multiaddr(raw_addr).ok()?;
+        let pid = extract_expected_peer_id(&maddr)?;
+        if let Ok(guard) = self.healed_peer_addrs.lock() {
+            if let Some(updated) = guard.get(&pid) {
+                if updated != raw_addr.trim() {
+                    return Some(updated.clone());
+                }
+            }
+        }
+        None
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -985,17 +1137,59 @@ impl MeshClient {
     }
 
     /// Returns all candidate network endpoints (`peers` + `seed_addr`, falling back to dynamically
-    /// discovered peers when no static `peers` list is configured).
+    /// discovered peers when no static `peers` list is configured, and remapping any DHCP-rotated
+    /// endpoints to their latest verified `/p2p/<PeerId>` Multiaddr).
     pub fn all_network_endpoints(&self) -> Vec<String> {
-        let mut out = if !self.peers.is_empty() {
-            self.peers.clone()
-        } else {
-            self.discovered_peers()
-        };
-        if let Some(ref seed) = self.seed_addr {
-            if is_network_peer_addr(seed) && !out.contains(seed) {
-                out.push(seed.clone());
+        let self_pid = node_identity_libp2p_peer_id(&self.identity).ok();
+        let build_list = || -> Vec<String> {
+            let mut list = Vec::new();
+            let mut seen = HashSet::new();
+            let mut push_unique = |addr: String| {
+                if let Some(local_pid) = self_pid {
+                    if let Ok(m) = parse_peer_multiaddr(&addr) {
+                        if extract_expected_peer_id(&m) == Some(local_pid) {
+                            return;
+                        }
+                    }
+                }
+                if seen.insert(addr.clone()) {
+                    list.push(addr);
+                }
+            };
+
+            if !self.peers.is_empty() {
+                for p in &self.peers {
+                    if let Some(healed) = self.resolve_healed_peer_addr(p) {
+                        push_unique(healed);
+                    } else {
+                        push_unique(p.clone());
+                    }
+                }
+                if self.discovery_data_dir.is_some() {
+                    for d in self.discovered_peers() {
+                        push_unique(d);
+                    }
+                }
+            } else {
+                for d in self.discovered_peers() {
+                    if let Some(healed) = self.resolve_healed_peer_addr(&d) {
+                        push_unique(healed);
+                    } else {
+                        push_unique(d);
+                    }
+                }
             }
+            if let Some(ref seed) = self.seed_addr {
+                if is_network_peer_addr(seed) {
+                    push_unique(seed.clone());
+                }
+            }
+            list
+        };
+
+        let mut out = build_list();
+        if out.is_empty() && self.maybe_refresh_lan_peers_throttled() {
+            out = build_list();
         }
         out
     }
@@ -1085,19 +1279,14 @@ impl MeshClient {
         Ok(guard.as_ref().expect("worker initialized").cmd_tx.clone())
     }
 
-    /// Sends a `MeshWireRequest` to `peer_addr` over the persistent background `libp2p` `Swarm`
-    /// (reusing open TCP + Noise XX + Yamux connections across RPCs).
-    pub fn send_request(
+    fn send_request_once(
         &self,
-        peer_addr: &str,
+        trimmed: &str,
         request: MeshWireRequest,
-    ) -> anyhow::Result<MeshWireResponse> {
-        let trimmed = peer_addr.trim();
-        if trimmed.is_empty() {
-            return Err(MeshClientError::InvalidAddress("empty peer address".into()).into());
-        }
-
-        let cmd_tx = self.worker_sender()?;
+    ) -> Result<MeshWireResponse, MeshClientError> {
+        let cmd_tx = self
+            .worker_sender()
+            .map_err(|e| MeshClientError::ProtocolError(e.to_string()))?;
         let timeout = self.request_timeout;
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
 
@@ -1108,7 +1297,10 @@ impl MeshClient {
                 timeout,
                 reply_tx,
             })
-            .map_err(|_| anyhow::anyhow!("MeshClient background Swarm worker channel closed"))?;
+            .map_err(|_| MeshClientError::OutboundFailure {
+                peer: trimmed.to_string(),
+                reason: "MeshClient background Swarm worker channel closed".to_string(),
+            })?;
 
         let res: Result<MeshWireResponse, MeshClientError> = match reply_rx.recv_timeout(timeout) {
             Ok(inner) => inner,
@@ -1137,7 +1329,51 @@ impl MeshClient {
             }
         }
 
-        res.map_err(Into::into)
+        res
+    }
+
+    /// Sends a `MeshWireRequest` to `peer_addr` over the persistent background `libp2p` `Swarm`
+    /// (reusing open TCP + Noise XX + Yamux connections across RPCs, and automatically healing
+    /// stale DHCP IP/port endpoints when `with_data_dir_discovery` is active).
+    pub fn send_request(
+        &self,
+        peer_addr: &str,
+        request: MeshWireRequest,
+    ) -> anyhow::Result<MeshWireResponse> {
+        let trimmed = peer_addr.trim();
+        if trimmed.is_empty() {
+            return Err(MeshClientError::InvalidAddress("empty peer address".into()).into());
+        }
+
+        // If `trimmed` was already marked dead and we know a newer verified endpoint for the
+        // exact same `/p2p/<PeerId>`, dial the healed endpoint directly.
+        if self.is_peer_marked_dead(trimmed) {
+            if let Some(healed) = self.resolve_healed_peer_addr(trimmed) {
+                if let Ok(resp) = self.send_request_once(&healed, request.clone()) {
+                    return Ok(resp);
+                }
+            }
+        }
+
+        match self.send_request_once(trimmed, request.clone()) {
+            Ok(resp) => Ok(resp),
+            Err(err) if err.is_peer_unreachable() => {
+                if let Some(healed) = self.resolve_healed_peer_addr(trimmed) {
+                    if let Ok(resp) = self.send_request_once(&healed, request.clone()) {
+                        return Ok(resp);
+                    }
+                }
+                if self.maybe_refresh_lan_peers_throttled() {
+                    if let Some(healed) = self.resolve_healed_peer_addr(trimmed) {
+                        if let Ok(resp) = self.send_request_once(&healed, request) {
+                            return Ok(resp);
+                        }
+                    }
+                }
+                Err(err.into())
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     pub fn is_peer_marked_dead(&self, peer_addr: &str) -> bool {
@@ -1172,6 +1408,455 @@ impl MeshClient {
             ))
             .into()),
         }
+    }
+
+    fn record_tracker_admin_pubkey(&self, peer_addr: &str, admin_pk: Option<[u8; 32]>) {
+        let Some(pk) = admin_pk.filter(|k| *k != [0u8; 32]) else {
+            return;
+        };
+        let key = peer_addr.trim().to_string();
+        if let Ok(mut guard) = self.tracker_admin_pubkeys.lock() {
+            guard.entry(key.clone()).or_insert(pk);
+            if let Ok(maddr) = parse_peer_multiaddr(&key) {
+                guard
+                    .entry(strip_p2p_protocol(&maddr).to_string())
+                    .or_insert(pk);
+                if let Some(pid) = extract_expected_peer_id(&maddr) {
+                    guard.entry(pid.to_string()).or_insert(pk);
+                }
+            }
+        }
+        if let Some(ref dir) = self.discovery_data_dir {
+            let mut store = KnownPeersStore::load(dir);
+            store.pin_tracker_admin_pubkey(&key, pk);
+            let _ = store.save(dir);
+        }
+    }
+
+    /// Returns all TOFU-pinned `tracker_admin_pubkey` keys learned from Public Trackers (`ADR-19`).
+    pub fn pinned_tracker_admin_pubkeys(&self) -> Vec<[u8; 32]> {
+        let mut out = Vec::new();
+        if let Ok(guard) = self.tracker_admin_pubkeys.lock() {
+            for &pk in guard.values() {
+                if !out.contains(&pk) {
+                    out.push(pk);
+                }
+            }
+        }
+        out
+    }
+
+    /// Returns the TOFU-pinned `tracker_admin_pubkey` for `tracker_addr`, if advertised.
+    pub fn tracker_admin_pubkey_for(&self, tracker_addr: &str) -> Option<[u8; 32]> {
+        let trimmed = tracker_addr.trim();
+        let guard = self.tracker_admin_pubkeys.lock().ok()?;
+        if let Some(&pk) = guard.get(trimmed) {
+            return Some(pk);
+        }
+        if let Ok(maddr) = parse_peer_multiaddr(trimmed) {
+            if let Some(&pk) = guard.get(&strip_p2p_protocol(&maddr).to_string()) {
+                return Some(pk);
+            }
+            if let Some(pid) = extract_expected_peer_id(&maddr) {
+                if let Some(&pk) = guard.get(&pid.to_string()) {
+                    return Some(pk);
+                }
+            }
+        }
+        None
+    }
+
+    /// Registers a signed zero-knowledge WAN rendezvous entry on `peer_addr` under `slot_key`,
+    /// returning the STUN-over-Noise `observed_external_addr` reflected by the remote node and
+    /// automatically TOFU-pinning any advertised `tracker_admin_pubkey`.
+    pub fn register_wan_rendezvous(
+        &self,
+        peer_addr: &str,
+        slot_key: [u8; 32],
+        entry: SignedWanRendezvousEntry,
+    ) -> anyhow::Result<Option<String>> {
+        match self.send_request(
+            peer_addr,
+            MeshWireRequest::RegisterWanRendezvous { slot_key, entry },
+        )? {
+            MeshWireResponse::RegisterWanRendezvousAck {
+                stored,
+                observed_external_addr,
+                error,
+                tracker_admin_pubkey,
+            } => {
+                self.record_tracker_admin_pubkey(peer_addr, tracker_admin_pubkey);
+                if !stored {
+                    return Err(MeshClientError::RemoteRejected {
+                        peer: peer_addr.to_string(),
+                        reason: format!("RegisterWanRendezvous rejected: {error:?}"),
+                    }
+                    .into());
+                }
+                Ok(observed_external_addr)
+            }
+            other => Err(MeshClientError::ProtocolError(format!(
+                "unexpected response to RegisterWanRendezvous: {other:?}"
+            ))
+            .into()),
+        }
+    }
+
+    /// Queries all unexpired `SignedWanRendezvousEntry` records under `slot_key` from `peer_addr`,
+    /// returning `(entries, observed_external_addr)` and TOFU-pinning any advertised `tracker_admin_pubkey`.
+    pub fn lookup_wan_rendezvous(
+        &self,
+        peer_addr: &str,
+        slot_key: [u8; 32],
+    ) -> anyhow::Result<(Vec<SignedWanRendezvousEntry>, Option<String>)> {
+        match self.send_request(peer_addr, MeshWireRequest::LookupWanRendezvous { slot_key })? {
+            MeshWireResponse::LookupWanRendezvousResult {
+                entries,
+                observed_external_addr,
+                tracker_admin_pubkey,
+            } => {
+                self.record_tracker_admin_pubkey(peer_addr, tracker_admin_pubkey);
+                Ok((entries, observed_external_addr))
+            }
+            other => Err(MeshClientError::ProtocolError(format!(
+                "unexpected response to LookupWanRendezvous: {other:?}"
+            ))
+            .into()),
+        }
+    }
+
+    fn ingest_verified_wan_card(&self, card: &WanPeerCard) {
+        let local_pid_str = node_identity_libp2p_peer_id(&self.identity)
+            .ok()
+            .map(|p| p.to_string());
+        if local_pid_str.as_deref() == Some(card.libp2p_peer_id.as_str()) {
+            return;
+        }
+        let Some(first_raw) = card
+            .wan_multiaddrs
+            .iter()
+            .map(|s| s.trim())
+            .find(|s| !s.is_empty())
+        else {
+            return;
+        };
+        let pinned_maddr = if first_raw.contains("/p2p/") {
+            first_raw.to_string()
+        } else {
+            format!("{first_raw}/p2p/{}", card.libp2p_peer_id)
+        };
+
+        if let Ok(pid) = card.libp2p_peer_id.parse::<PeerId>() {
+            if let Ok(mut healed) = self.healed_peer_addrs.lock() {
+                healed.insert(pid, pinned_maddr.clone());
+            }
+        }
+        if let Ok(mut dead) = self.dead_peers.lock() {
+            dead.remove(&pinned_maddr);
+        }
+        if let Ok(mut disc) = self.discovered_peers.lock() {
+            disc.insert(pinned_maddr.clone());
+        }
+        if let Some(ref dir) = self.discovery_data_dir {
+            let mut store = KnownPeersStore::load(dir);
+            store.upsert_pinned_multiaddr(
+                &card.libp2p_peer_id,
+                &pinned_maddr,
+                Some(&card.node_label),
+                Some(&card.role),
+            );
+            let _ = store.save(dir);
+        }
+    }
+
+    fn enrich_card_with_observed_addr(
+        &self,
+        card: &WanPeerCard,
+        observed_addr: Option<&str>,
+    ) -> anyhow::Result<WanPeerCard> {
+        if !card.wan_multiaddrs.is_empty() {
+            return Ok(card.clone());
+        }
+        let Some(obs) = observed_addr.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(card.clone());
+        };
+        WanPeerCard::new(
+            &self.identity,
+            card.node_label.clone(),
+            card.role.clone(),
+            vec![obs.to_string()],
+            card.relay_seed_addr.clone(),
+            card.owner_pq_fingerprint.clone(),
+            card.ttl_secs,
+            wan_now_ms(),
+        )
+    }
+
+    /// Zero-Pairing BitTorrent-Tracker-style Public Commons Swarm helper (`--public --tracker <ADDR>`):
+    /// 1. Queries `PUBLIC_COMMONS_SWARM_SLOT` on `tracker_addr` (obtaining STUN-reflected external IP).
+    /// 2. Optionally announces `card` (auto-filling `observed_external_addr` if `card.wan_multiaddrs` is empty).
+    /// 3. Decrypts, verifies, and pins all discovered public swarm `WanPeerCard`s into `MeshClient`
+    ///    and `known_peers.json`.
+    pub fn announce_and_discover_public_tracker(
+        &self,
+        tracker_addr: &str,
+        card: Option<&WanPeerCard>,
+    ) -> anyhow::Result<Vec<WanPeerCard>> {
+        let (mut entries, observed) =
+            self.lookup_wan_rendezvous(tracker_addr, PUBLIC_COMMONS_SWARM_SLOT)?;
+
+        if let Some(my_card) = card {
+            let enriched = self.enrich_card_with_observed_addr(my_card, observed.as_deref())?;
+            let signed_entry = seal_public_tracker_card(&enriched, &self.identity)?;
+            let _ = self.register_wan_rendezvous(
+                tracker_addr,
+                PUBLIC_COMMONS_SWARM_SLOT,
+                signed_entry,
+            )?;
+            if let Ok((refreshed, _)) =
+                self.lookup_wan_rendezvous(tracker_addr, PUBLIC_COMMONS_SWARM_SLOT)
+            {
+                entries = refreshed;
+            }
+        }
+
+        let local_pid = node_identity_libp2p_peer_id(&self.identity)
+            .ok()
+            .map(|p| p.to_string());
+        let now = wan_now_ms();
+        let mut peers = Vec::new();
+        for entry in &entries {
+            if let Ok(opened) = open_public_tracker_card(entry) {
+                if !opened.is_expired(now)
+                    && local_pid.as_deref() != Some(opened.libp2p_peer_id.as_str())
+                {
+                    self.ingest_verified_wan_card(&opened);
+                    peers.push(opened);
+                }
+            }
+        }
+        Ok(peers)
+    }
+
+    /// Publishes an AEAD-sealed 4-word WAN pairing card to `anchor_addr` (auto-filling STUN-reflected
+    /// external address if `card.wan_multiaddrs` is empty).
+    pub fn publish_wan_pairing_card(
+        &self,
+        anchor_addr: &str,
+        code: &str,
+        card: &WanPeerCard,
+    ) -> anyhow::Result<Option<String>> {
+        let slot_key = derive_slot_key_from_code(code);
+        let pre_observed = if card.wan_multiaddrs.is_empty() {
+            self.lookup_wan_rendezvous(anchor_addr, slot_key)
+                .ok()
+                .and_then(|(_, obs)| obs)
+        } else {
+            None
+        };
+        let enriched = self.enrich_card_with_observed_addr(card, pre_observed.as_deref())?;
+        let entry = seal_wan_peer_card(code, &enriched, &self.identity)?;
+        let ack_obs = self.register_wan_rendezvous(anchor_addr, slot_key, entry)?;
+        Ok(ack_obs.or(pre_observed))
+    }
+
+    /// Looks up, decrypts, verifies, and pins 4-word WAN pairing cards from `anchor_addr`.
+    pub fn lookup_wan_pairing_cards(
+        &self,
+        anchor_addr: &str,
+        code: &str,
+    ) -> anyhow::Result<(Vec<WanPeerCard>, Option<String>)> {
+        let slot_key = derive_slot_key_from_code(code);
+        let (entries, observed) = self.lookup_wan_rendezvous(anchor_addr, slot_key)?;
+        let local_pid = node_identity_libp2p_peer_id(&self.identity)
+            .ok()
+            .map(|p| p.to_string());
+        let now = wan_now_ms();
+        let mut out = Vec::new();
+        for entry in &entries {
+            if let Ok(card) = open_wan_peer_card(code, entry) {
+                if !card.is_expired(now)
+                    && local_pid.as_deref() != Some(card.libp2p_peer_id.as_str())
+                {
+                    self.ingest_verified_wan_card(&card);
+                    out.push(card);
+                }
+            }
+        }
+        Ok((out, observed))
+    }
+
+    /// Publishes an encrypted Dynamic-IP DDNS heartbeat under `fingerprint_or_secret` to `anchor_addr`.
+    pub fn publish_wan_ddns_heartbeat(
+        &self,
+        anchor_addr: &str,
+        fingerprint_or_secret: &str,
+        card: &WanPeerCard,
+    ) -> anyhow::Result<Option<String>> {
+        let slot_key = derive_peer_ddns_slot_key(fingerprint_or_secret);
+        let pre_observed = if card.wan_multiaddrs.is_empty() {
+            self.lookup_wan_rendezvous(anchor_addr, slot_key)
+                .ok()
+                .and_then(|(_, obs)| obs)
+        } else {
+            None
+        };
+        let enriched = self.enrich_card_with_observed_addr(card, pre_observed.as_deref())?;
+        let entry = seal_ddns_heartbeat(fingerprint_or_secret, &enriched, &self.identity)?;
+        let ack_obs = self.register_wan_rendezvous(anchor_addr, slot_key, entry)?;
+        Ok(ack_obs.or(pre_observed))
+    }
+
+    /// Resolves encrypted Dynamic-IP DDNS heartbeats under `fingerprint_or_secret` from `anchor_addr`,
+    /// automatically healing `KnownPeersStore` and `MeshClient` `PeerId` mappings across ISP IP changes.
+    pub fn lookup_wan_ddns_cards(
+        &self,
+        anchor_addr: &str,
+        fingerprint_or_secret: &str,
+    ) -> anyhow::Result<Vec<WanPeerCard>> {
+        let slot_key = derive_peer_ddns_slot_key(fingerprint_or_secret);
+        let (entries, _) = self.lookup_wan_rendezvous(anchor_addr, slot_key)?;
+        let now = wan_now_ms();
+        let mut out = Vec::new();
+        for entry in &entries {
+            if let Ok(card) = open_ddns_heartbeat(fingerprint_or_secret, entry) {
+                if !card.is_expired(now) {
+                    self.ingest_verified_wan_card(&card);
+                    out.push(card);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Submits a cryptographically verifiable abuse takedown report (`ADR-19`) to `tracker_addr`,
+    /// returning `(report_id, verified_plaintext_sha256)` once queued for Public Tracker Admin review.
+    pub fn submit_abuse_takedown_report_detailed(
+        &self,
+        tracker_addr: &str,
+        report: VerifiableAbuseReport,
+    ) -> anyhow::Result<([u8; 32], Option<[u8; 32]>)> {
+        match self.send_request(
+            tracker_addr,
+            MeshWireRequest::SubmitAbuseTakedownReport(report),
+        )? {
+            MeshWireResponse::SubmitAbuseTakedownAck {
+                queued_for_admin_review,
+                report_id,
+                verified_plaintext_sha256,
+                error,
+            } => {
+                if !queued_for_admin_review {
+                    return Err(MeshClientError::RemoteRejected {
+                        peer: tracker_addr.to_string(),
+                        reason: format!("SubmitAbuseTakedownReport rejected: {error:?}"),
+                    }
+                    .into());
+                }
+                Ok((report_id, verified_plaintext_sha256))
+            }
+            other => Err(MeshClientError::ProtocolError(format!(
+                "unexpected response to SubmitAbuseTakedownReport: {other:?}"
+            ))
+            .into()),
+        }
+    }
+
+    /// Submits a cryptographically verifiable abuse takedown report (`ADR-19`) to `tracker_addr`,
+    /// returning the queued `report_id` when cryptographic burden-of-proof verification succeeds.
+    pub fn submit_abuse_takedown_report(
+        &self,
+        tracker_addr: &str,
+        report: VerifiableAbuseReport,
+    ) -> anyhow::Result<[u8; 32]> {
+        let (report_id, _) = self.submit_abuse_takedown_report_detailed(tracker_addr, report)?;
+        Ok(report_id)
+    }
+
+    /// Sends a signed bad-actor or illegal-content eviction order (`ADR-19`) to `peer_addr`,
+    /// returning the remote node's `EvictionPurgeReport` if accepted.
+    pub fn broadcast_eviction_order(
+        &self,
+        peer_addr: &str,
+        order: SignedBadActorEvictionOrder,
+    ) -> anyhow::Result<EvictionPurgeReport> {
+        match self.send_request(peer_addr, MeshWireRequest::BroadcastEvictionOrder(order))? {
+            MeshWireResponse::EvictionOrderAck {
+                accepted,
+                purged_regular_shards,
+                purged_blinded_shards,
+                zero_wiped_bytes,
+                error,
+            } => {
+                if !accepted {
+                    return Err(MeshClientError::RemoteRejected {
+                        peer: peer_addr.to_string(),
+                        reason: format!("BroadcastEvictionOrder rejected: {error:?}"),
+                    }
+                    .into());
+                }
+                Ok(EvictionPurgeReport {
+                    purged_regular_shards,
+                    purged_blinded_shards,
+                    zero_wiped_bytes,
+                    firewall_rule_installed: true,
+                })
+            }
+            other => Err(MeshClientError::ProtocolError(format!(
+                "unexpected response to BroadcastEvictionOrder: {other:?}"
+            ))
+            .into()),
+        }
+    }
+
+    /// Propagates a `SignedBadActorEvictionOrder` across `peers` (or `self.all_network_endpoints()`
+    /// when `peers` is empty), aggregating the total `EvictionPurgeReport` across all accepting nodes.
+    pub fn propagate_eviction_order_to_peers(
+        &self,
+        peers: &[String],
+        order: &SignedBadActorEvictionOrder,
+    ) -> EvictionPurgeReport {
+        let self_pid = node_identity_libp2p_peer_id(&self.identity).ok();
+        let mut targets = Vec::new();
+        let mut seen = HashSet::new();
+        let push_target = |raw: &str, targets: &mut Vec<String>, seen: &mut HashSet<String>| {
+            for part in raw.split(',') {
+                let trimmed = part.trim();
+                if trimmed.is_empty() || !is_network_peer_addr(trimmed) {
+                    continue;
+                }
+                if let Some(local_pid) = self_pid {
+                    if let Ok(m) = parse_peer_multiaddr(trimmed) {
+                        if extract_expected_peer_id(&m) == Some(local_pid) {
+                            continue;
+                        }
+                    }
+                }
+                if seen.insert(trimmed.to_string()) {
+                    targets.push(trimmed.to_string());
+                }
+            }
+        };
+
+        for p in peers {
+            push_target(p, &mut targets, &mut seen);
+        }
+        if targets.is_empty() {
+            for ep in self.all_network_endpoints() {
+                push_target(&ep, &mut targets, &mut seen);
+            }
+        }
+
+        let mut aggregate = EvictionPurgeReport::default();
+        for peer in &targets {
+            match self.broadcast_eviction_order(peer, order.clone()) {
+                Ok(rep) => aggregate.merge(&rep),
+                Err(e) => {
+                    debug!(peer = %peer, error = %e, "Eviction order propagation skipped/rejected on peer");
+                }
+            }
+        }
+        aggregate
     }
 
     pub fn handshake_wot(
@@ -1641,6 +2326,15 @@ impl MeshClient {
                 }
             }
         }
+        if stored_count == 0 && self.maybe_refresh_lan_peers_throttled() {
+            for ep in self.all_network_endpoints() {
+                if let Ok(MeshWireResponse::PutDhtEnvelopeAck { stored: true, .. }) =
+                    self.send_request(&ep, MeshWireRequest::PutDhtEnvelope(envelope.clone()))
+                {
+                    stored_count += 1;
+                }
+            }
+        }
         if stored_count == 0 {
             return Err(
                 last_err.unwrap_or_else(|| anyhow::anyhow!("PutDhtEnvelope failed on all peers"))
@@ -1715,7 +2409,7 @@ impl MeshClient {
 
         // 2. Query storage daemons' disk-persisted ZeroTrustDhtStore over `/parvault/wire/1.0.0`.
         for ep in &endpoints {
-            if self.is_peer_marked_dead(ep) {
+            if self.is_peer_marked_dead(ep) && self.resolve_healed_peer_addr(ep).is_none() {
                 continue;
             }
             if let Ok(MeshWireResponse::GetDhtEnvelopeResult {
@@ -1731,6 +2425,27 @@ impl MeshClient {
                 if let Some(ver) = Self::validate_dht_candidate(dht_key, kind, &env) {
                     if best.as_ref().is_none_or(|(best_v, _)| ver > *best_v) {
                         best = Some((ver, env));
+                    }
+                }
+            }
+        }
+
+        if best.is_none() && self.maybe_refresh_lan_peers_throttled() {
+            for ep in self.all_network_endpoints() {
+                if let Ok(MeshWireResponse::GetDhtEnvelopeResult {
+                    envelope: Some(env),
+                    ..
+                }) = self.send_request(
+                    &ep,
+                    MeshWireRequest::GetDhtEnvelope {
+                        dht_key: *dht_key,
+                        kind,
+                    },
+                ) {
+                    if let Some(ver) = Self::validate_dht_candidate(dht_key, kind, &env) {
+                        if best.as_ref().is_none_or(|(best_v, _)| ver > *best_v) {
+                            best = Some((ver, env));
+                        }
                     }
                 }
             }
@@ -1756,8 +2471,14 @@ impl MeshClient {
         tier: ErasureTier,
         session_key: [u8; 32],
     ) -> anyhow::Result<Vec<String>> {
-        let raw_peers = if !self.peers.is_empty() {
-            self.peers.clone()
+        let raw_peers = if !self.peers.is_empty() && self.discovery_data_dir.is_none() {
+            self.peers
+                .iter()
+                .map(|p| {
+                    self.resolve_healed_peer_addr(p)
+                        .unwrap_or_else(|| p.clone())
+                })
+                .collect()
         } else {
             self.all_network_endpoints()
         };
@@ -2014,17 +2735,28 @@ impl MeshClient {
 
             let mut candidate_addrs: Vec<String> = Vec::new();
             if let Some(assigned) = stripe.assigned_peers.get(idx) {
+                if let Some(healed) = self.resolve_healed_peer_addr(assigned) {
+                    if !dead_peers.contains(&healed) && !self.is_peer_marked_dead(&healed) {
+                        candidate_addrs.push(healed);
+                    }
+                }
                 if is_network_peer_addr(assigned)
                     && !dead_peers.contains(assigned)
                     && !self.is_peer_marked_dead(assigned)
+                    && !candidate_addrs.contains(assigned)
                 {
                     candidate_addrs.push(assigned.clone());
                 }
             }
-            if !fallback_endpoints.is_empty() {
-                let n_ep = fallback_endpoints.len();
+            let current_fallbacks = if self.discovery_data_dir.is_some() {
+                self.all_network_endpoints()
+            } else {
+                fallback_endpoints.clone()
+            };
+            if !current_fallbacks.is_empty() {
+                let n_ep = current_fallbacks.len();
                 for shift in 0..n_ep {
-                    let ep = &fallback_endpoints[(idx + shift) % n_ep];
+                    let ep = &current_fallbacks[(idx + shift) % n_ep];
                     if !dead_peers.contains(ep)
                         && !self.is_peer_marked_dead(ep)
                         && !candidate_addrs.contains(ep)
@@ -2137,5 +2869,66 @@ mod tests {
             .expect_err("impersonator must be rejected");
         assert!(matches!(err, MeshClientError::PeerIdMismatch { .. }));
         assert!(err.is_peer_unreachable());
+    }
+
+    #[test]
+    fn test_tracker_admin_pubkey_tofu_pinning_and_persistence() {
+        let tmp = std::env::temp_dir().join(format!(
+            "parvault-tracker-tofu-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+
+        let tracker_id = NodeIdentity::generate();
+        let tracker_pid = node_identity_libp2p_peer_id(&tracker_id).expect("tracker peer id");
+        let tracker_addr = format!("/ip4/198.51.100.10/tcp/4010/p2p/{tracker_pid}");
+        let official_admin_pk = NodeIdentity::generate().public_key_bytes();
+        let spoofed_admin_pk = NodeIdentity::generate().public_key_bytes();
+
+        let client = MeshClient::new(NodeIdentity::generate(), Vec::new(), None)
+            .with_data_dir_discovery(tmp.clone(), DEFAULT_LAN_DISCOVERY_PORT);
+
+        // Zeroed key is ignored
+        client.record_tracker_admin_pubkey(&tracker_addr, Some([0u8; 32]));
+        assert!(client.pinned_tracker_admin_pubkeys().is_empty());
+
+        // First valid advertisement pins via TOFU and persists to known_peers.json
+        client.record_tracker_admin_pubkey(&tracker_addr, Some(official_admin_pk));
+        assert_eq!(
+            client.tracker_admin_pubkey_for(&tracker_addr),
+            Some(official_admin_pk)
+        );
+        assert_eq!(
+            client.tracker_admin_pubkey_for("/ip4/198.51.100.10/tcp/4010"),
+            Some(official_admin_pk)
+        );
+        assert_eq!(
+            client.pinned_tracker_admin_pubkeys(),
+            vec![official_admin_pk]
+        );
+
+        // Spoofed rotation attempt is rejected by TOFU pin
+        client.record_tracker_admin_pubkey(&tracker_addr, Some(spoofed_admin_pk));
+        assert_eq!(
+            client.tracker_admin_pubkey_for(&tracker_addr),
+            Some(official_admin_pk)
+        );
+
+        // Reloading from data_dir restores pinned tracker_admin_pubkey automatically
+        let reloaded = MeshClient::new(NodeIdentity::generate(), Vec::new(), None)
+            .with_data_dir_discovery(tmp.clone(), DEFAULT_LAN_DISCOVERY_PORT);
+        assert_eq!(
+            reloaded.tracker_admin_pubkey_for(&tracker_addr),
+            Some(official_admin_pk)
+        );
+        assert_eq!(
+            reloaded.pinned_tracker_admin_pubkeys(),
+            vec![official_admin_pk]
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

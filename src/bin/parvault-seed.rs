@@ -19,10 +19,14 @@ use libp2p::{
     Multiaddr,
 };
 use parvault::{
+    admin_rpc::{
+        spawn_admin_rpc_listener, SeedAdminRequest, SeedAdminResponse, SeedTelemetrySnapshot,
+    },
     bootstrap::{
         BlindedShardTombstone, EarnedStanding, ElasticBootstrapEngine, ElasticPeerCandidate,
         PeerRole, PersonalDeviceCert, SeedServerMode, ZeroTrustSeedServer,
     },
+    config::NodeConfig,
     crypto::{
         pqc::{HybridKemKeypair, HybridPqPublicKey, HybridPqSigningKeypair},
         MasterKey, NodeIdentity,
@@ -32,17 +36,28 @@ use parvault::{
             DhtEnvelopeKind, DhtWireEnvelope, MeshNetworkBehaviourEvent, MeshWireRequest,
             MeshWireResponse,
         },
-        build_mesh_swarm, MeshClient, WebOfTrustRegistry, DEFAULT_SUBTREE_SLASH_LIMIT,
+        build_mesh_swarm, derive_4word_pairing_sas, extract_listen_port_and_ip,
+        open_public_tracker_card, reflect_observed_wan_multiaddr, resolve_zero_config_peers,
+        KnownPeersStore, LanBeaconConfig, LanBeaconResponder, MeshClient, TrustPoolMode,
+        WanRendezvousRegistry, WebOfTrustRegistry, DEFAULT_LAN_DISCOVERY_PORT,
+        DEFAULT_LAN_PAIRING_NONCE, DEFAULT_PUBLIC_WOT_POW_BITS, DEFAULT_SUBTREE_SLASH_LIMIT,
+        PUBLIC_COMMONS_SWARM_SLOT,
     },
     por::PorVerifierEngine,
+    router_nas::read_linux_process_memory_kib,
     sharding::merkle::hash_shard_leaf,
     storage::{
-        AnonymousQuotaVoucher, BlindedShardCapability, BlindedShardId, BlockStore, QuotaManager,
-        ShardId, TrustLevel, VoucherNullifierLedger,
+        load_or_generate_tracker_admin_identity, AnonymousQuotaVoucher, BlindedShardCapability,
+        BlindedShardId, BlockStore, EvictionPurgeReport, EvictionTarget,
+        PrivacyPreservingEvictionEngine, PublicTrackerTakedownQueue, QuotaManager, ShardId,
+        SignedBadActorEvictionOrder, TakedownReviewStatus, TrustLevel, VoucherNullifierLedger,
     },
 };
-use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
@@ -114,6 +129,30 @@ enum SeedCommand {
         /// Initialize, print the status report (table + JSON), and exit immediately for CI/scripts
         #[arg(long, default_value_t = false)]
         once: bool,
+
+        /// Optional UDP port for signed Home LAN zero-IP discovery (default: 4009)
+        #[arg(long)]
+        lan_discovery_port: Option<u16>,
+
+        /// Disable signed Home LAN UDP/registry beacon responder
+        #[arg(long, default_value_t = false)]
+        no_lan_discovery: bool,
+
+        /// Opt-in out-of-band `parvault-control` Admin RPC TCP listen address (disabled by default when omitted)
+        #[arg(long)]
+        admin_rpc_listen: Option<SocketAddr>,
+
+        /// Authorized 64-char hex Ed25519 operator public key(s) for Zero-Key-On-VPS Admin RPC (`--admin-rpc-pubkey <HEX>`)
+        #[arg(long, visible_alias = "admin-rpc-pubkeys", value_delimiter = ',')]
+        admin_rpc_pubkey: Vec<String>,
+
+        /// Optional Federated M-of-N Public Tracker Council 64-char hex Ed25519 public keys (`--council-pubkeys <CSV>`)
+        #[arg(long, visible_alias = "council-pubkey", value_delimiter = ',')]
+        council_pubkeys: Vec<String>,
+
+        /// Optional explicit M-of-N tracker eviction quorum threshold override
+        #[arg(long)]
+        council_quorum: Option<usize>,
     },
 
     /// Display or initialize the persistent seed server NodeIdentity and Post-Quantum Owner Key
@@ -217,8 +256,130 @@ enum SeedCommand {
         keep_local: bool,
     },
 
+    /// Evict and zero-shred (0x00) shards linked to a bad-actor IP, subnet, PeerId, Ed25519 pubkey, Merkle root, or blinded locator (ADR-19)
+    Evict {
+        /// Seed server data directory
+        #[arg(long, default_value = "./.parvault-seed-data")]
+        data_dir: PathBuf,
+
+        /// Bad-actor IPv4 or IPv6 address (stored only as keyed HMAC-SHA256 tag)
+        #[arg(long)]
+        ip: Option<std::net::IpAddr>,
+
+        /// Bad-actor IPv4 `/24` or IPv6 `/48` CIDR subnet (stored only as keyed HMAC-SHA256 tag)
+        #[arg(long)]
+        subnet: Option<String>,
+
+        /// Bad-actor libp2p PeerId or device_peer_id
+        #[arg(long)]
+        peer_id: Option<String>,
+
+        /// Bad-actor or voucher cohort 64-char hex Ed25519 public key
+        #[arg(long)]
+        pubkey_hex: Option<String>,
+
+        /// Illegal-content 64-char hex Stripe Merkle Root
+        #[arg(long)]
+        merkle_root: Option<String>,
+
+        /// Anonymized 64-char hex BlindedShardId locator
+        #[arg(long)]
+        locator: Option<String>,
+
+        /// Human-readable audit reason (<= 256 bytes)
+        #[arg(long, default_value = "seed-operator-eviction")]
+        reason: String,
+
+        /// Sign and propagate eviction order(s) (including resolved IP cohort pubkeys) to peers
+        #[arg(long, default_value_t = false)]
+        propagate: bool,
+    },
+
+    /// Public Tracker Operator governance, abuse takedown review queue, emergency warrants, and M-of-N council co-signing (ADR-19)
+    Admin {
+        #[command(subcommand)]
+        action: SeedAdminAction,
+    },
+
     /// Execute built-in end-to-end verification of both `HomelabRedundancyVault` and `PublicNetworkBootstrapper` modes
     SelfTest,
+}
+
+#[derive(Subcommand, Debug)]
+enum SeedAdminAction {
+    /// Display this Public Tracker's persistent `tracker_admin.seed` Ed25519 authority public key
+    ShowAuthority {
+        #[arg(long, default_value = "./.parvault-seed-data")]
+        data_dir: PathBuf,
+    },
+    /// List queued cryptographic abuse takedown reports and emergency warrant audit records
+    ListTakedowns {
+        #[arg(long, default_value = "./.parvault-seed-data")]
+        data_dir: PathBuf,
+    },
+    /// Inspect cryptographic burden-of-proof details (`verified_plaintext_sha256`, stripes, reporter) for a queued report
+    InspectTakedown {
+        #[arg(long, default_value = "./.parvault-seed-data")]
+        data_dir: PathBuf,
+        #[arg(long)]
+        report_id: String,
+    },
+    /// Approve a PendingAdminReview takedown, zero-shred local shards, sign eviction orders, and optionally export/propagate
+    ApproveTakedown {
+        #[arg(long, default_value = "./.parvault-seed-data")]
+        data_dir: PathBuf,
+        #[arg(long)]
+        report_id: String,
+        #[arg(long, default_value = "")]
+        note: String,
+        #[arg(long)]
+        export_order: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        propagate: bool,
+    },
+    /// Reject a baseless or non-violating PendingAdminReview takedown report without deleting shards
+    RejectTakedown {
+        #[arg(long, default_value = "./.parvault-seed-data")]
+        data_dir: PathBuf,
+        #[arg(long)]
+        report_id: String,
+        #[arg(long, default_value = "rejected-by-admin")]
+        reason: String,
+    },
+    /// Issue an audited emergency law-enforcement / warrant eviction (strictly restricted to Public Trackers)
+    EmergencyEvict {
+        #[arg(long, default_value = "./.parvault-seed-data")]
+        data_dir: PathBuf,
+        #[arg(long)]
+        ip: Option<std::net::IpAddr>,
+        #[arg(long)]
+        subnet: Option<String>,
+        #[arg(long)]
+        peer_id: Option<String>,
+        #[arg(long)]
+        pubkey_hex: Option<String>,
+        #[arg(long)]
+        merkle_root: Option<String>,
+        #[arg(long)]
+        locator: Option<String>,
+        #[arg(long, visible_alias = "reason")]
+        warrant_ref: String,
+        #[arg(long)]
+        export_order: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        propagate: bool,
+    },
+    /// Co-sign an exported `SignedBadActorEvictionOrder` bundle as an independent M-of-N Public Tracker Council operator
+    CosignEviction {
+        #[arg(long, default_value = "./.parvault-seed-data")]
+        data_dir: PathBuf,
+        #[arg(long)]
+        order_file: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        propagate: bool,
+    },
 }
 
 #[tokio::main]
@@ -253,13 +414,68 @@ async fn main() -> anyhow::Result<()> {
             owner_pq_pubkey_hex,
             grace_epochs,
             once,
+            lan_discovery_port,
+            no_lan_discovery,
+            admin_rpc_listen,
+            admin_rpc_pubkey,
+            council_pubkeys,
+            council_quorum,
         } => {
+            let mut explicit_admin_pks = Vec::new();
+            for raw_hex in &admin_rpc_pubkey {
+                if !raw_hex.trim().is_empty() {
+                    let pk = parse_hex_32(raw_hex, "--admin-rpc-pubkey")?;
+                    if !explicit_admin_pks.contains(&pk) {
+                        explicit_admin_pks.push(pk);
+                    }
+                }
+            }
+            let mut explicit_council_pks = Vec::new();
+            for raw_hex in &council_pubkeys {
+                if !raw_hex.trim().is_empty() {
+                    let pk = parse_hex_32(raw_hex, "--council-pubkeys")?;
+                    if !explicit_council_pks.contains(&pk) {
+                        explicit_council_pks.push(pk);
+                    }
+                }
+            }
+            let has_external_admin_keys =
+                !explicit_admin_pks.is_empty() || !explicit_council_pks.is_empty();
+
+            let discovery_port = resolve_seed_lan_port(lan_discovery_port);
+            let lan_enabled = resolve_seed_lan_enabled(no_lan_discovery);
             let node_identity = NodeIdentity::load_or_generate_in_dir(&data_dir)?;
-            let mesh_client = MeshClient::new(node_identity.clone(), effective_peers.clone(), None);
+            let seed_peers = if effective_peers.is_empty() && lan_enabled && !once {
+                resolve_zero_config_peers(
+                    &data_dir,
+                    &[],
+                    discovery_port,
+                    Duration::from_millis(200),
+                )
+            } else {
+                effective_peers.clone()
+            };
+            let mesh_client = MeshClient::new(node_identity.clone(), seed_peers, None)
+                .with_data_dir_discovery(data_dir.clone(), discovery_port);
             let max_bytes = max_gb.saturating_mul(1024 * 1024 * 1024);
             let grace_bytes = 2 * 1024 * 1024 * 1024;
             let quota = QuotaManager::new(max_bytes, grace_bytes);
             let block_store = BlockStore::new(&data_dir, quota)?.with_mesh_client(mesh_client);
+            let mode_marker = match mode {
+                CliSeedMode::HomelabVault => "homelab-vault",
+                CliSeedMode::PublicBootstrap => "public-bootstrap",
+            };
+            let _ = BlockStore::atomic_write_file(
+                &data_dir.join("seed_mode.txt"),
+                mode_marker.as_bytes(),
+            );
+            // Zero-Private-Key-On-VPS invariant (`ADR-19`): NEVER auto-generate `tracker_admin.seed`
+            // when `--admin-rpc-pubkey` or `--council-pubkeys` is supplied!
+            if mode == CliSeedMode::PublicBootstrap
+                && (!has_external_admin_keys || data_dir.join("tracker_admin.seed").exists())
+            {
+                let _ = load_or_generate_tracker_admin_identity(&data_dir)?;
+            }
 
             let server = match mode {
                 CliSeedMode::HomelabVault => {
@@ -307,7 +523,19 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            run_seed_listener_loop(listen, block_store, server).await?;
+            run_seed_listener_loop(
+                listen,
+                block_store,
+                server,
+                lan_discovery_port,
+                no_lan_discovery,
+                admin_rpc_listen,
+                explicit_admin_pks,
+                explicit_council_pks,
+                council_quorum,
+                effective_peers,
+            )
+            .await?;
         }
 
         SeedCommand::Identity { data_dir } => {
@@ -540,8 +768,20 @@ async fn main() -> anyhow::Result<()> {
             handoff_to,
             keep_local,
         } => {
+            let discovery_port = resolve_seed_lan_port(None);
             let identity = NodeIdentity::load_or_generate_in_dir(&data_dir)?;
-            let mesh_client = MeshClient::new(identity.clone(), effective_peers.clone(), None);
+            let resolved_peers = if effective_peers.is_empty() {
+                resolve_zero_config_peers(
+                    &data_dir,
+                    &[],
+                    discovery_port,
+                    Duration::from_millis(300),
+                )
+            } else {
+                effective_peers.clone()
+            };
+            let mesh_client = MeshClient::new(identity.clone(), resolved_peers, None)
+                .with_data_dir_discovery(data_dir.clone(), discovery_port);
             let quota = QuotaManager::new(500 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
             let block_store = BlockStore::new(&data_dir, quota)?.with_mesh_client(mesh_client);
             let target_dirs: Vec<PathBuf> = handoff_to
@@ -578,6 +818,437 @@ async fn main() -> anyhow::Result<()> {
                 receipt.earned_standing_preserved
             );
         }
+
+        SeedCommand::Evict {
+            data_dir,
+            ip,
+            subnet,
+            peer_id,
+            pubkey_hex,
+            merkle_root,
+            locator,
+            reason,
+            propagate,
+        } => {
+            let target =
+                parse_seed_eviction_target(ip, subnet, peer_id, pubkey_hex, merkle_root, locator)?;
+            let quota = QuotaManager::new(500 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
+            let block_store = BlockStore::new(&data_dir, quota)?;
+            let mut eviction = PrivacyPreservingEvictionEngine::load_or_init(&data_dir)?;
+            let local_report = eviction.evict_target(&target, &block_store)?;
+
+            let mut remote_report = EvictionPurgeReport::default();
+            let mut propagated_orders = 0usize;
+            if propagate {
+                let is_homelab = is_seed_homelab_mode(&data_dir);
+                let issuer = if is_homelab {
+                    NodeIdentity::load_or_generate_in_dir(&data_dir)?
+                } else {
+                    load_or_generate_tracker_admin_identity(&data_dir)?
+                };
+                let now_ms = seed_now_ms();
+                let mut orders = vec![SignedBadActorEvictionOrder::issue(
+                    &issuer,
+                    target.clone(),
+                    reason.clone(),
+                    now_ms,
+                    0,
+                )];
+                match &target {
+                    EvictionTarget::IpAddress(bad_ip) => {
+                        for pk in eviction.resolve_pubkeys_for_ip(*bad_ip) {
+                            orders.push(SignedBadActorEvictionOrder::issue(
+                                &issuer,
+                                EvictionTarget::PeerOrIssuerPubkey(pk),
+                                reason.clone(),
+                                now_ms,
+                                0,
+                            ));
+                        }
+                    }
+                    EvictionTarget::IpSubnet(cidr) => {
+                        for pk in eviction.resolve_pubkeys_for_subnet(cidr) {
+                            orders.push(SignedBadActorEvictionOrder::issue(
+                                &issuer,
+                                EvictionTarget::PeerOrIssuerPubkey(pk),
+                                reason.clone(),
+                                now_ms,
+                                0,
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+                propagated_orders = orders.len();
+                let mesh_client = build_seed_propagation_client(&data_dir, &effective_peers)?;
+                for order in &orders {
+                    let rep = mesh_client.propagate_eviction_order_to_peers(&[], order);
+                    remote_report.merge(&rep);
+                }
+            }
+
+            println!("=== ParVault Seed Privacy-Preserving Eviction Complete (ADR-19) ===");
+            println!("Data Directory           : {}", data_dir.display());
+            println!(
+                "Local Regular Shards     : {} zero-shredded (0x00)",
+                local_report.purged_regular_shards
+            );
+            println!(
+                "Local Blinded Shards     : {} zero-shredded (0x00)",
+                local_report.purged_blinded_shards
+            );
+            println!(
+                "Local Zero-Wiped Bytes   : {} bytes",
+                local_report.zero_wiped_bytes
+            );
+            println!(
+                "HMAC Firewall Installed  : {} (zero plaintext IPs on disk)",
+                local_report.firewall_rule_installed
+            );
+            if propagate {
+                println!(
+                    "Mesh Propagation         : {} signed order(s) broadcast (remote purged: {} regular, {} blinded, {} bytes)",
+                    propagated_orders,
+                    remote_report.purged_regular_shards,
+                    remote_report.purged_blinded_shards,
+                    remote_report.zero_wiped_bytes
+                );
+            }
+        }
+
+        SeedCommand::Admin { action } => match action {
+            SeedAdminAction::ShowAuthority { data_dir } => {
+                let admin_id = load_or_generate_tracker_admin_identity(&data_dir)?;
+                let node_id = NodeIdentity::load_or_generate_in_dir(&data_dir)?;
+                println!("=== ParVault Public Tracker Admin Authority (ADR-19) ===");
+                println!("Data Directory              : {}", data_dir.display());
+                println!(
+                    "Tracker Admin Pubkey (hex)  : {}",
+                    hex::encode(admin_id.public_key_bytes())
+                );
+                println!("Node Transport Peer ID      : {}", node_id.device_peer_id());
+                println!(
+                    "Council Config Snippet      : eviction_authorities = [\"{}\"]",
+                    hex::encode(admin_id.public_key_bytes())
+                );
+            }
+            SeedAdminAction::ListTakedowns { data_dir } => {
+                let queue = PublicTrackerTakedownQueue::load_or_init(&data_dir)?;
+                let entries = queue.list_entries();
+                let emergencies = queue.list_emergency_actions();
+                println!("=== ParVault Public Tracker Takedown Governance Queue (ADR-19) ===");
+                println!("Data Directory              : {}", data_dir.display());
+                println!("Queued Abuse Reports        : {}", entries.len());
+                for entry in &entries {
+                    let status_label = match &entry.status {
+                        TakedownReviewStatus::PendingAdminReview => {
+                            "PendingAdminReview".to_string()
+                        }
+                        TakedownReviewStatus::Approved {
+                            issued_order_ids, ..
+                        } => {
+                            format!("Approved ({} orders)", issued_order_ids.len())
+                        }
+                        TakedownReviewStatus::Rejected { reason, .. } => {
+                            format!("Rejected ({reason})")
+                        }
+                    };
+                    println!(
+                        "  - report_id={} | status={} | file_root={} | plaintext_sha256={} | stripes={}",
+                        hex::encode(entry.report.report_id),
+                        status_label,
+                        hex::encode(entry.proof_outcome.file_merkle_root),
+                        hex::encode(entry.proof_outcome.verified_plaintext_sha256),
+                        entry.proof_outcome.stripe_merkle_roots.len()
+                    );
+                }
+                if !emergencies.is_empty() {
+                    println!("Audited Emergency Actions   : {}", emergencies.len());
+                    for act in &emergencies {
+                        println!(
+                            "  - action_id={} | warrant_ref={} | orders={} | wiped={} bytes",
+                            hex::encode(act.action_id),
+                            act.warrant_or_emergency_ref,
+                            act.issued_order_ids.len(),
+                            act.local_purge.zero_wiped_bytes
+                        );
+                    }
+                }
+            }
+            SeedAdminAction::InspectTakedown {
+                data_dir,
+                report_id,
+            } => {
+                let rid = parse_hex_32(&report_id, "report_id")?;
+                let queue = PublicTrackerTakedownQueue::load_or_init(&data_dir)?;
+                let entry = queue.get_entry(&rid).ok_or_else(|| {
+                    anyhow::anyhow!("Takedown report {} not found in queue", hex::encode(rid))
+                })?;
+                println!("=== ParVault Verifiable Abuse Report Inspection (ADR-19) ===");
+                println!(
+                    "Report ID                   : {}",
+                    hex::encode(entry.report.report_id)
+                );
+                println!("Status                      : {:?}", entry.status);
+                println!(
+                    "Submitted At (Unix ms)      : {}",
+                    entry.report.submitted_at_ms
+                );
+                println!(
+                    "Reporter Contact            : {}",
+                    entry.report.reporter_id_or_contact
+                );
+                println!(
+                    "Reporter Ed25519 Pubkey     : {}",
+                    hex::encode(entry.report.reporter_ed25519_pubkey)
+                );
+                println!(
+                    "Legal Allegation            : {}",
+                    entry.report.legal_allegation
+                );
+                println!(
+                    "File Merkle Root            : {}",
+                    hex::encode(entry.proof_outcome.file_merkle_root)
+                );
+                println!(
+                    "Verified Stripe Index       : {} ({} total stripes)",
+                    entry.proof_outcome.verified_stripe_index,
+                    entry.proof_outcome.stripe_merkle_roots.len()
+                );
+                println!(
+                    "Verified Plaintext SHA-256  : {} ({} bytes; plaintext zeroized in RAM)",
+                    hex::encode(entry.proof_outcome.verified_plaintext_sha256),
+                    entry.proof_outcome.verified_plaintext_len
+                );
+            }
+            SeedAdminAction::ApproveTakedown {
+                data_dir,
+                report_id,
+                note,
+                export_order,
+                propagate,
+            } => {
+                ensure_public_tracker_mode(&data_dir, "approve-takedown")?;
+                let rid = parse_hex_32(&report_id, "report_id")?;
+                let admin_id = load_or_generate_tracker_admin_identity(&data_dir)?;
+                let quota = QuotaManager::new(500 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
+                let block_store = BlockStore::new(&data_dir, quota)?;
+                let mut eviction = PrivacyPreservingEvictionEngine::load_or_init(&data_dir)?;
+                let mut queue = PublicTrackerTakedownQueue::load_or_init(&data_dir)?;
+                let (orders, local_purge) = queue.approve_takedown(
+                    &rid,
+                    &admin_id,
+                    &note,
+                    seed_now_ms(),
+                    &mut eviction,
+                    &block_store,
+                )?;
+                if let Some(ref out_path) = export_order {
+                    export_eviction_orders_json(out_path, &orders)?;
+                }
+                let mut remote_purge = EvictionPurgeReport::default();
+                if propagate {
+                    let mesh_client = build_seed_propagation_client(&data_dir, &effective_peers)?;
+                    for order in &orders {
+                        let rep = mesh_client.propagate_eviction_order_to_peers(&[], order);
+                        remote_purge.merge(&rep);
+                    }
+                }
+                println!("=== ParVault Public Tracker Takedown Approved (ADR-19) ===");
+                println!("Report ID                   : {}", hex::encode(rid));
+                println!(
+                    "Admin Signer Pubkey         : {}",
+                    hex::encode(admin_id.public_key_bytes())
+                );
+                println!("Signed Eviction Orders      : {}", orders.len());
+                println!(
+                    "Local Shards Shredded (0x00): {} regular, {} blinded ({} bytes wiped)",
+                    local_purge.purged_regular_shards,
+                    local_purge.purged_blinded_shards,
+                    local_purge.zero_wiped_bytes
+                );
+                if let Some(ref out_path) = export_order {
+                    println!("Exported Order Bundle       : {}", out_path.display());
+                }
+                if propagate {
+                    println!(
+                        "Swarm Broadcast Summary     : {} regular, {} blinded ({} bytes wiped across peers)",
+                        remote_purge.purged_regular_shards,
+                        remote_purge.purged_blinded_shards,
+                        remote_purge.zero_wiped_bytes
+                    );
+                }
+            }
+            SeedAdminAction::RejectTakedown {
+                data_dir,
+                report_id,
+                reason,
+            } => {
+                let rid = parse_hex_32(&report_id, "report_id")?;
+                let admin_id = load_or_generate_tracker_admin_identity(&data_dir)?;
+                let mut queue = PublicTrackerTakedownQueue::load_or_init(&data_dir)?;
+                queue.reject_takedown(&rid, &admin_id, &reason, seed_now_ms())?;
+                println!("=== ParVault Public Tracker Takedown Rejected (No Shards Deleted) ===");
+                println!("Report ID                   : {}", hex::encode(rid));
+                println!("Rejection Reason            : {}", reason);
+            }
+            SeedAdminAction::EmergencyEvict {
+                data_dir,
+                ip,
+                subnet,
+                peer_id,
+                pubkey_hex,
+                merkle_root,
+                locator,
+                warrant_ref,
+                export_order,
+                propagate,
+            } => {
+                ensure_public_tracker_mode(&data_dir, "emergency-evict")?;
+                if warrant_ref.trim().is_empty() {
+                    anyhow::bail!("--warrant-ref cannot be empty for audited emergency eviction");
+                }
+                let target = parse_seed_eviction_target(
+                    ip,
+                    subnet,
+                    peer_id,
+                    pubkey_hex,
+                    merkle_root,
+                    locator,
+                )?;
+                let admin_id = load_or_generate_tracker_admin_identity(&data_dir)?;
+                let quota = QuotaManager::new(500 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
+                let block_store = BlockStore::new(&data_dir, quota)?;
+                let mut eviction = PrivacyPreservingEvictionEngine::load_or_init(&data_dir)?;
+                let mut queue = PublicTrackerTakedownQueue::load_or_init(&data_dir)?;
+                let (orders, local_purge) = queue.issue_emergency_admin_eviction(
+                    &admin_id,
+                    target,
+                    &warrant_ref,
+                    seed_now_ms(),
+                    &mut eviction,
+                    &block_store,
+                )?;
+                if let Some(ref out_path) = export_order {
+                    export_eviction_orders_json(out_path, &orders)?;
+                }
+                let mut remote_purge = EvictionPurgeReport::default();
+                if propagate {
+                    let mesh_client = build_seed_propagation_client(&data_dir, &effective_peers)?;
+                    for order in &orders {
+                        let rep = mesh_client.propagate_eviction_order_to_peers(&[], order);
+                        remote_purge.merge(&rep);
+                    }
+                }
+                println!(
+                    "=== ParVault Public Tracker Emergency Warrant Eviction Issued (ADR-19) ==="
+                );
+                println!("Warrant / Emergency Ref     : {}", warrant_ref.trim());
+                println!(
+                    "Admin Signer Pubkey         : {}",
+                    hex::encode(admin_id.public_key_bytes())
+                );
+                println!("Signed Eviction Orders      : {}", orders.len());
+                println!(
+                    "Local Shards Shredded (0x00): {} regular, {} blinded ({} bytes wiped)",
+                    local_purge.purged_regular_shards,
+                    local_purge.purged_blinded_shards,
+                    local_purge.zero_wiped_bytes
+                );
+                if let Some(ref out_path) = export_order {
+                    println!("Exported Order Bundle       : {}", out_path.display());
+                }
+                if propagate {
+                    println!(
+                        "Swarm Broadcast Summary     : {} regular, {} blinded ({} bytes wiped across peers)",
+                        remote_purge.purged_regular_shards,
+                        remote_purge.purged_blinded_shards,
+                        remote_purge.zero_wiped_bytes
+                    );
+                }
+            }
+            SeedAdminAction::CosignEviction {
+                data_dir,
+                order_file,
+                out,
+                propagate,
+            } => {
+                ensure_public_tracker_mode(&data_dir, "cosign-eviction")?;
+                let admin_id = load_or_generate_tracker_admin_identity(&data_dir)?;
+                let dest_path = out.as_ref().unwrap_or(&order_file);
+                let (orders, newly_cosigned) =
+                    load_and_cosign_eviction_orders(&order_file, dest_path, &admin_id)?;
+
+                let mut local_purge = EvictionPurgeReport::default();
+                let quota = QuotaManager::new(500 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
+                let block_store = BlockStore::new(&data_dir, quota)?;
+                let mut eviction = PrivacyPreservingEvictionEngine::load_or_init(&data_dir)?;
+                let genesis_pk = NodeIdentity::resolve_genesis_root_pubkey_in_dir(&data_dir, None)?;
+                let (council, min_quorum) = resolve_seed_council_and_quorum(
+                    &data_dir,
+                    SeedServerMode::PublicNetworkBootstrapper,
+                    Some(admin_id.public_key_bytes()),
+                    &[],
+                    None,
+                    genesis_pk,
+                );
+                let now_ms = seed_now_ms();
+                for order in &orders {
+                    if let Ok(rep) = eviction.apply_signed_eviction_order_with_quorum(
+                        order,
+                        None,
+                        &council,
+                        min_quorum,
+                        now_ms,
+                        &block_store,
+                    ) {
+                        local_purge.merge(&rep);
+                    }
+                }
+
+                let mut remote_purge = EvictionPurgeReport::default();
+                if propagate {
+                    let mesh_client = build_seed_propagation_client(&data_dir, &effective_peers)?;
+                    for order in &orders {
+                        let rep = mesh_client.propagate_eviction_order_to_peers(&[], order);
+                        remote_purge.merge(&rep);
+                    }
+                }
+
+                let total_sigs = orders
+                    .first()
+                    .map(|o| 1 + o.cosignatures.len())
+                    .unwrap_or(0);
+                println!(
+                    "=== ParVault Tracker Council Co-Signature Applied (M-of-N Quorum, ADR-19) ==="
+                );
+                println!(
+                    "Cosigner Admin Pubkey       : {}",
+                    hex::encode(admin_id.public_key_bytes())
+                );
+                println!(
+                    "Orders Processed            : {} ({} newly co-signed, {} total signers on bundle)",
+                    orders.len(),
+                    newly_cosigned,
+                    total_sigs
+                );
+                println!("Saved Co-Signed Bundle      : {}", dest_path.display());
+                println!(
+                    "Local Purge Summary         : {} regular, {} blinded ({} bytes wiped)",
+                    local_purge.purged_regular_shards,
+                    local_purge.purged_blinded_shards,
+                    local_purge.zero_wiped_bytes
+                );
+                if propagate {
+                    println!(
+                        "Swarm Broadcast Summary     : {} regular, {} blinded ({} bytes wiped across peers)",
+                        remote_purge.purged_regular_shards,
+                        remote_purge.purged_blinded_shards,
+                        remote_purge.zero_wiped_bytes
+                    );
+                }
+            }
+        },
 
         SeedCommand::SelfTest => {
             run_builtin_self_test()?;
@@ -626,13 +1297,412 @@ fn print_status_report(
     Ok(())
 }
 
+fn resolve_seed_lan_port(cli_port: Option<u16>) -> u16 {
+    if let Some(port) = cli_port {
+        return port;
+    }
+    if let Ok(env_port) = std::env::var("PARVAULT_LAN_DISCOVERY_PORT") {
+        if let Ok(parsed) = env_port.trim().parse::<u16>() {
+            if parsed > 0 {
+                return parsed;
+            }
+        }
+    }
+    DEFAULT_LAN_DISCOVERY_PORT
+}
+
+fn resolve_seed_lan_enabled(cli_no_lan_discovery: bool) -> bool {
+    if cli_no_lan_discovery {
+        return false;
+    }
+    if let Ok(env_dis) = std::env::var("PARVAULT_NO_LAN_DISCOVERY") {
+        let v = env_dis.trim().to_ascii_lowercase();
+        if matches!(v.as_str(), "1" | "true" | "yes") {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_seed_homelab_mode(data_dir: &Path) -> bool {
+    std::fs::read_to_string(data_dir.join("seed_mode.txt"))
+        .map(|s| s.trim() == "homelab-vault")
+        .unwrap_or(false)
+}
+
+fn ensure_public_tracker_mode(data_dir: &Path, subcommand: &str) -> anyhow::Result<()> {
+    if is_seed_homelab_mode(data_dir) {
+        anyhow::bail!(
+            "Refused: `parvault-seed admin {subcommand}` is strictly disabled in `homelab-vault` (PrivateRing) mode (ADR-19 Strict Mode Isolation)"
+        );
+    }
+    Ok(())
+}
+
+fn parse_hex_32(hex_str: &str, field_name: &str) -> anyhow::Result<[u8; 32]> {
+    let raw = hex::decode(hex_str.trim())
+        .map_err(|e| anyhow::anyhow!("Invalid hex in {field_name}: {e}"))?;
+    if raw.len() != 32 {
+        anyhow::bail!(
+            "Expected 64-character hex (32 bytes) for {field_name}, got {} bytes",
+            raw.len()
+        );
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&raw);
+    Ok(out)
+}
+
+fn parse_seed_eviction_target(
+    ip: Option<std::net::IpAddr>,
+    subnet: Option<String>,
+    peer_id: Option<String>,
+    pubkey_hex: Option<String>,
+    merkle_root: Option<String>,
+    locator: Option<String>,
+) -> anyhow::Result<EvictionTarget> {
+    let provided = [
+        ip.is_some(),
+        subnet.is_some(),
+        peer_id.is_some(),
+        pubkey_hex.is_some(),
+        merkle_root.is_some(),
+        locator.is_some(),
+    ]
+    .into_iter()
+    .filter(|b| *b)
+    .count();
+    if provided != 1 {
+        anyhow::bail!(
+            "Specify exactly one eviction target flag: --ip, --subnet, --peer-id, --pubkey-hex, --merkle-root, or --locator"
+        );
+    }
+    if let Some(addr) = ip {
+        Ok(EvictionTarget::IpAddress(addr))
+    } else if let Some(cidr) = subnet {
+        Ok(EvictionTarget::IpSubnet(cidr.trim().to_string()))
+    } else if let Some(pid) = peer_id {
+        Ok(EvictionTarget::Libp2pPeerId(pid.trim().to_string()))
+    } else if let Some(pk) = pubkey_hex {
+        Ok(EvictionTarget::PeerOrIssuerPubkey(parse_hex_32(
+            &pk,
+            "--pubkey-hex",
+        )?))
+    } else if let Some(root) = merkle_root {
+        Ok(EvictionTarget::StripeMerkleRoot(parse_hex_32(
+            &root,
+            "--merkle-root",
+        )?))
+    } else if let Some(loc) = locator {
+        Ok(EvictionTarget::BlindedLocator(parse_hex_32(
+            &loc,
+            "--locator",
+        )?))
+    } else {
+        unreachable!()
+    }
+}
+
+fn export_eviction_orders_json(
+    out_path: &Path,
+    orders: &[SignedBadActorEvictionOrder],
+) -> anyhow::Result<()> {
+    let json = serde_json::to_vec_pretty(orders)?;
+    BlockStore::atomic_write_file(out_path, &json)?;
+    Ok(())
+}
+
+fn load_and_cosign_eviction_orders(
+    in_path: &Path,
+    out_path: &Path,
+    cosigner: &NodeIdentity,
+) -> anyhow::Result<(Vec<SignedBadActorEvictionOrder>, usize)> {
+    let raw = std::fs::read(in_path)?;
+    if let Ok(mut list) = serde_json::from_slice::<Vec<SignedBadActorEvictionOrder>>(&raw) {
+        if list.is_empty() {
+            anyhow::bail!(
+                "Order file {} contains zero eviction orders",
+                in_path.display()
+            );
+        }
+        let mut added = 0usize;
+        for o in &mut list {
+            if !o.verify_signature() {
+                anyhow::bail!("Primary signature verification failed on eviction order");
+            }
+            if o.add_cosignature(cosigner) {
+                added += 1;
+            }
+        }
+        BlockStore::atomic_write_file(out_path, &serde_json::to_vec_pretty(&list)?)?;
+        return Ok((list, added));
+    }
+    if let Ok(mut single) = serde_json::from_slice::<SignedBadActorEvictionOrder>(&raw) {
+        if !single.verify_signature() {
+            anyhow::bail!("Primary signature verification failed on eviction order");
+        }
+        let added = usize::from(single.add_cosignature(cosigner));
+        BlockStore::atomic_write_file(out_path, &serde_json::to_vec_pretty(&single)?)?;
+        return Ok((vec![single], added));
+    }
+    if let Ok(mut single_bin) = bincode::deserialize::<SignedBadActorEvictionOrder>(&raw) {
+        if !single_bin.verify_signature() {
+            anyhow::bail!("Primary signature verification failed on binary eviction order");
+        }
+        let added = usize::from(single_bin.add_cosignature(cosigner));
+        BlockStore::atomic_write_file(out_path, &bincode::serialize(&single_bin)?)?;
+        return Ok((vec![single_bin], added));
+    }
+    let mut list_bin: Vec<SignedBadActorEvictionOrder> =
+        bincode::deserialize(&raw).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse eviction order file {}: {e}",
+                in_path.display()
+            )
+        })?;
+    let mut added = 0usize;
+    for o in &mut list_bin {
+        if !o.verify_signature() {
+            anyhow::bail!("Primary signature verification failed on binary eviction order");
+        }
+        if o.add_cosignature(cosigner) {
+            added += 1;
+        }
+    }
+    BlockStore::atomic_write_file(out_path, &bincode::serialize(&list_bin)?)?;
+    Ok((list_bin, added))
+}
+
+fn push_unique_peer(peers: &mut Vec<String>, addr: String) {
+    let t = addr.trim();
+    if !t.is_empty() && !peers.iter().any(|existing| existing == t) {
+        peers.push(t.to_string());
+    }
+}
+
+fn build_seed_propagation_client(
+    data_dir: &Path,
+    explicit_peers: &[String],
+) -> anyhow::Result<MeshClient> {
+    let discovery_port = resolve_seed_lan_port(None);
+    let node_id = NodeIdentity::load_or_generate_in_dir(data_dir)?;
+    let mut peers: Vec<String> = Vec::new();
+    for p in explicit_peers {
+        push_unique_peer(&mut peers, p.clone());
+    }
+    let wan_reg_path = data_dir.join("wan_rendezvous.bin");
+    if wan_reg_path.exists() {
+        let mut reg = WanRendezvousRegistry::load_or_new(Some(&wan_reg_path));
+        for entry in reg.lookup_public_swarm(64, seed_now_ms()) {
+            if let Ok(card) = open_public_tracker_card(&entry) {
+                for maddr in card.wan_multiaddrs {
+                    let full = if maddr.contains("/p2p/") {
+                        maddr
+                    } else {
+                        format!("{maddr}/p2p/{}", card.libp2p_peer_id)
+                    };
+                    push_unique_peer(&mut peers, full);
+                }
+            }
+        }
+    }
+    if peers.is_empty() {
+        for p in
+            resolve_zero_config_peers(data_dir, &[], discovery_port, Duration::from_millis(250))
+        {
+            push_unique_peer(&mut peers, p);
+        }
+    } else {
+        for p in KnownPeersStore::load(data_dir).active_multiaddrs() {
+            push_unique_peer(&mut peers, p);
+        }
+    }
+    Ok(MeshClient::new(node_id, peers, None)
+        .with_data_dir_discovery(data_dir.to_path_buf(), discovery_port))
+}
+
+fn resolve_seed_council_and_quorum(
+    data_dir: &Path,
+    mode: SeedServerMode,
+    local_tracker_admin_pubkey: Option<[u8; 32]>,
+    extra_council_pubkeys: &[[u8; 32]],
+    cli_quorum_override: Option<usize>,
+    genesis_pubkey: [u8; 32],
+) -> (Vec<[u8; 32]>, usize) {
+    let mut council = Vec::new();
+    let mut push_pk = |pk: [u8; 32]| {
+        if pk != [0u8; 32] && !council.contains(&pk) {
+            council.push(pk);
+        }
+    };
+    if let Ok(env_auth) = std::env::var("PARVAULT_EVICTION_AUTHORITIES") {
+        for part in env_auth.split(',') {
+            if let Ok(bytes) = hex::decode(part.trim()) {
+                if bytes.len() == 32 {
+                    let mut pk = [0u8; 32];
+                    pk.copy_from_slice(&bytes);
+                    push_pk(pk);
+                }
+            }
+        }
+    }
+    let env_quorum = std::env::var("PARVAULT_TRACKER_EVICTION_QUORUM")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok());
+    let quorum_override = cli_quorum_override.or(env_quorum);
+
+    match mode {
+        SeedServerMode::PublicNetworkBootstrapper => {
+            if let Some(pk) = local_tracker_admin_pubkey {
+                push_pk(pk);
+            }
+            for pk in extra_council_pubkeys {
+                push_pk(*pk);
+            }
+            for pk in KnownPeersStore::load(data_dir).pinned_tracker_admin_pubkeys() {
+                push_pk(pk);
+            }
+            let min_quorum = quorum_override
+                .unwrap_or_else(|| {
+                    SignedBadActorEvictionOrder::default_tracker_quorum_threshold(council.len())
+                })
+                .max(1);
+            (council, min_quorum)
+        }
+        SeedServerMode::HomelabRedundancyVault => {
+            push_pk(genesis_pubkey);
+            let min_quorum = quorum_override.unwrap_or(1).max(1);
+            (council, min_quorum)
+        }
+    }
+}
+
+fn extract_ip_from_multiaddr(addr: &Multiaddr) -> Option<std::net::IpAddr> {
+    for proto in addr.iter() {
+        match proto {
+            libp2p::multiaddr::Protocol::Ip4(ip4) => return Some(std::net::IpAddr::V4(ip4)),
+            libp2p::multiaddr::Protocol::Ip6(ip6) => return Some(std::net::IpAddr::V6(ip6)),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn seed_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+struct SeedSharedState {
+    server: ZeroTrustSeedServer,
+    wot: WebOfTrustRegistry,
+    por_verifier: PorVerifierEngine,
+    nullifier_ledger: VoucherNullifierLedger,
+    wan_registry: WanRendezvousRegistry,
+    eviction: PrivacyPreservingEvictionEngine,
+    takedown_queue: PublicTrackerTakedownQueue,
+    max_probationary_lease_bytes: u64,
+    epoch_counter: u64,
+}
+
+fn count_blinded_shards_on_disk(block_store: &BlockStore) -> usize {
+    let Ok(rd) = std::fs::read_dir(block_store.shards_dir()) else {
+        return 0;
+    };
+    rd.flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|s| s.ends_with(".bshard"))
+        })
+        .count()
+}
+
+fn collect_public_swarm_diversity(
+    wan_registry: &mut WanRendezvousRegistry,
+    now_ms: u64,
+) -> (usize, usize, usize, Vec<String>) {
+    let entries = wan_registry.lookup_public_swarm(64, now_ms);
+    let mut active_peers = 0usize;
+    let mut v4_subnets: HashSet<[u8; 3]> = HashSet::new();
+    let mut v6_subnets: HashSet<[u16; 3]> = HashSet::new();
+    let mut multiaddrs: Vec<String> = Vec::new();
+
+    for entry in &entries {
+        if let Ok(card) = open_public_tracker_card(entry) {
+            active_peers += 1;
+            for raw_maddr in &card.wan_multiaddrs {
+                if let Ok(maddr) = raw_maddr.parse::<Multiaddr>() {
+                    if let Some(ip) = extract_ip_from_multiaddr(&maddr) {
+                        match PrivacyPreservingEvictionEngine::normalize_ip(ip) {
+                            std::net::IpAddr::V4(v4) => {
+                                let o = v4.octets();
+                                v4_subnets.insert([o[0], o[1], o[2]]);
+                            }
+                            std::net::IpAddr::V6(v6) => {
+                                let s = v6.segments();
+                                v6_subnets.insert([s[0], s[1], s[2]]);
+                            }
+                        }
+                    }
+                }
+                let full = if raw_maddr.contains("/p2p/") {
+                    raw_maddr.clone()
+                } else {
+                    format!("{raw_maddr}/p2p/{}", card.libp2p_peer_id)
+                };
+                push_unique_peer(&mut multiaddrs, full);
+            }
+        }
+    }
+
+    (active_peers, v4_subnets.len(), v6_subnets.len(), multiaddrs)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_seed_listener_loop(
     listen: String,
     block_store: BlockStore,
-    mut server: ZeroTrustSeedServer,
+    server: ZeroTrustSeedServer,
+    lan_discovery_port: Option<u16>,
+    no_lan_discovery: bool,
+    admin_rpc_listen: Option<SocketAddr>,
+    explicit_admin_pks: Vec<[u8; 32]>,
+    explicit_council_pks: Vec<[u8; 32]>,
+    council_quorum: Option<usize>,
+    effective_peers: Vec<String>,
 ) -> anyhow::Result<()> {
+    let start_instant = Instant::now();
     let data_dir = block_store.root_dir().to_path_buf();
     let node_identity = NodeIdentity::load_or_generate_in_dir(&data_dir)?;
+    let has_external_admin_keys =
+        !explicit_admin_pks.is_empty() || !explicit_council_pks.is_empty();
+    let local_tracker_admin =
+        if !has_external_admin_keys || data_dir.join("tracker_admin.seed").exists() {
+            Some(load_or_generate_tracker_admin_identity(&data_dir)?)
+        } else {
+            None
+        };
+    let local_tracker_admin_pk = local_tracker_admin.as_ref().map(|id| id.public_key_bytes());
+
+    let mut extra_council_pks = Vec::new();
+    for pk in explicit_council_pks.iter().chain(explicit_admin_pks.iter()) {
+        if *pk != [0u8; 32] && !extra_council_pks.contains(pk) {
+            extra_council_pks.push(*pk);
+        }
+    }
+    let advertised_admin_pk = if server.mode() == SeedServerMode::PublicNetworkBootstrapper {
+        local_tracker_admin_pk
+            .or_else(|| explicit_admin_pks.first().copied())
+            .or_else(|| explicit_council_pks.first().copied())
+    } else {
+        None
+    };
+
     let keypair = node_identity.to_libp2p_keypair()?;
     let local_peer_id = keypair.public().to_peer_id();
     let genesis_pubkey = NodeIdentity::resolve_genesis_root_pubkey_in_dir(&data_dir, None)?;
@@ -642,22 +1712,146 @@ async fn run_seed_listener_loop(
         DEFAULT_SUBTREE_SLASH_LIMIT,
         &data_dir,
     );
-    let mut por_verifier = PorVerifierEngine::with_persistence_dir(300, &data_dir);
-    let mut nullifier_ledger =
-        VoucherNullifierLedger::with_persistence_dir(genesis_pubkey, &data_dir);
+    if server.mode() == SeedServerMode::PublicNetworkBootstrapper {
+        wot.set_trust_pool_mode(TrustPoolMode::Hybrid, DEFAULT_PUBLIC_WOT_POW_BITS);
+    }
+    let por_verifier = PorVerifierEngine::with_persistence_dir(300, &data_dir);
+    let nullifier_ledger = VoucherNullifierLedger::with_persistence_dir(genesis_pubkey, &data_dir);
     let pq_kem = HybridKemKeypair::load_or_generate_in_dir(&data_dir)?;
+    let wan_registry =
+        WanRendezvousRegistry::load_or_new(Some(&data_dir.join("wan_rendezvous.bin")));
+    let eviction = PrivacyPreservingEvictionEngine::load_or_init(&data_dir)?;
+    let takedown_queue = PublicTrackerTakedownQueue::load_or_init(&data_dir)?;
+    let mut peer_remote_addrs: HashMap<String, Multiaddr> = HashMap::new();
 
     let mut swarm = build_mesh_swarm(keypair, false)?;
     let tcp_addr: Multiaddr = listen.parse()?;
-    swarm.listen_on(tcp_addr)?;
+    swarm.listen_on(tcp_addr.clone())?;
 
-    let mut epoch_counter: u64 = 1;
+    let seed_mode = server.mode();
+    let init_report = server.status_report(1);
+    let shared = Arc::new(Mutex::new(SeedSharedState {
+        server,
+        wot,
+        por_verifier,
+        nullifier_ledger,
+        wan_registry,
+        eviction,
+        takedown_queue,
+        max_probationary_lease_bytes: 64 * 1024 * 1024,
+        epoch_counter: 1,
+    }));
+
+    let _admin_rpc_handle = if let Some(bind_addr) = admin_rpc_listen {
+        let mut allowed_pks: Vec<[u8; 32]> = Vec::new();
+        for pk in explicit_admin_pks
+            .iter()
+            .chain(explicit_council_pks.iter())
+            .copied()
+        {
+            if pk != [0u8; 32] && !allowed_pks.contains(&pk) {
+                allowed_pks.push(pk);
+            }
+        }
+        if let Some(local_admin_pk) = local_tracker_admin_pk {
+            if !allowed_pks.contains(&local_admin_pk) {
+                allowed_pks.push(local_admin_pk);
+            }
+        }
+        if let Ok(env_auth) = std::env::var("PARVAULT_EVICTION_AUTHORITIES") {
+            for part in env_auth.split(',') {
+                if let Ok(bytes) = hex::decode(part.trim()) {
+                    if bytes.len() == 32 {
+                        let mut pk = [0u8; 32];
+                        pk.copy_from_slice(&bytes);
+                        if pk != [0u8; 32] && !allowed_pks.contains(&pk) {
+                            allowed_pks.push(pk);
+                        }
+                    }
+                }
+            }
+        }
+        if allowed_pks.is_empty() {
+            anyhow::bail!(
+                "--admin-rpc-listen requires at least one authorized operator key via --admin-rpc-pubkey <HEX> (or an existing tracker_admin.seed)"
+            );
+        }
+
+        let rpc_shared = Arc::clone(&shared);
+        let rpc_store = block_store.clone();
+        let rpc_data_dir = data_dir.clone();
+        let rpc_node_id = node_identity.clone();
+        let rpc_peer_id_str = local_peer_id.to_string();
+        let rpc_extra_council = extra_council_pks.clone();
+        let rpc_effective_peers = effective_peers.clone();
+
+        let (bound_rpc_addr, handle) =
+            spawn_admin_rpc_listener(bind_addr, node_identity.clone(), allowed_pks, move |req| {
+                handle_seed_admin_rpc_request(
+                    req,
+                    &rpc_shared,
+                    &rpc_store,
+                    &rpc_data_dir,
+                    &rpc_node_id,
+                    &rpc_peer_id_str,
+                    seed_mode,
+                    local_tracker_admin_pk,
+                    &rpc_extra_council,
+                    council_quorum,
+                    genesis_pubkey,
+                    &rpc_effective_peers,
+                    start_instant,
+                )
+            })
+            .await?;
+        println!("Admin RPC Listen Addr     : {}", bound_rpc_addr);
+        info!(%bound_rpc_addr, "parvault-seed out-of-band Admin RPC listener active");
+        Some(handle)
+    } else {
+        None
+    };
+
+    let beacon_handle = if resolve_seed_lan_enabled(no_lan_discovery) {
+        let discovery_port = resolve_seed_lan_port(lan_discovery_port);
+        let (init_port, init_ip) = extract_listen_port_and_ip(&tcp_addr).unwrap_or((4002, None));
+        let avail = init_report
+            .max_storage_bytes
+            .saturating_sub(init_report.used_storage_bytes);
+        let role = match seed_mode {
+            SeedServerMode::HomelabRedundancyVault => "homelab-seed",
+            SeedServerMode::PublicNetworkBootstrapper => "public-seed",
+        };
+        let pq_fp = HybridPqSigningKeypair::load_or_generate_in_dir(&data_dir)
+            .ok()
+            .map(|kp| kp.public_key().fingerprint_hex());
+        let sas = derive_4word_pairing_sas(
+            &local_peer_id.to_string(),
+            pq_fp.as_deref(),
+            DEFAULT_LAN_PAIRING_NONCE,
+        );
+        let beacon_cfg = LanBeaconConfig::new("parvault-seed", role, init_port)
+            .with_discovery_port(discovery_port)
+            .with_explicit_listen_ip(init_ip)
+            .with_available_bytes(avail)
+            .with_owner_pq_fingerprint(pq_fp)
+            .with_pairing_sas_commitment(Some(sas.commitment));
+        match LanBeaconResponder::spawn(node_identity.clone(), beacon_cfg) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                warn!(error = %e, "Failed to bind parvault-seed LAN beacon responder; continuing without LAN UDP beacon");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut gc_interval = tokio::time::interval(Duration::from_secs(60));
     gc_interval.tick().await;
 
     info!(
         %local_peer_id,
-        mode = ?server.mode(),
+        mode = ?seed_mode,
         listen_tcp = %listen,
         "parvault-seed zero-trust listener started (Noise XX + Yamux)"
     );
@@ -668,6 +1862,22 @@ async fn run_seed_listener_loop(
                 match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
                         info!(%address, "parvault-seed listening on transport address");
+                        if let Some(ref beacon) = beacon_handle {
+                            if let Some((bound_port, bound_ip)) = extract_listen_port_and_ip(&address) {
+                                beacon.update_listen_endpoint(bound_port, bound_ip);
+                            }
+                        }
+                    }
+                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                        peer_remote_addrs.insert(
+                            peer_id.to_string(),
+                            endpoint.get_remote_address().clone(),
+                        );
+                    }
+                    SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                        if num_established == 0 {
+                            peer_remote_addrs.remove(&peer_id.to_string());
+                        }
                     }
                     SwarmEvent::Behaviour(MeshNetworkBehaviourEvent::Mdns(
                         mdns::Event::Discovered(list),
@@ -682,31 +1892,76 @@ async fn run_seed_listener_loop(
                             message: Message::Request { request, channel, .. },
                         },
                     )) => {
-                        let resp = handle_seed_wire_request(
-                            &peer.to_string(),
-                            request,
-                            &block_store,
-                            &mut server,
-                            &mut wot,
-                            &mut por_verifier,
-                            &mut nullifier_ledger,
-                            &pq_kem,
-                        );
+                        let peer_str = peer.to_string();
+                        let remote_addr = peer_remote_addrs.get(&peer_str);
+                        let resp = {
+                            let mut st = shared
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let SeedSharedState {
+                                ref mut server,
+                                ref mut wot,
+                                ref mut por_verifier,
+                                ref mut nullifier_ledger,
+                                ref mut wan_registry,
+                                ref mut eviction,
+                                ref mut takedown_queue,
+                                max_probationary_lease_bytes,
+                                ..
+                            } = *st;
+                            handle_seed_wire_request(
+                                &peer_str,
+                                remote_addr,
+                                request,
+                                &data_dir,
+                                &node_identity,
+                                advertised_admin_pk,
+                                local_tracker_admin_pk,
+                                &extra_council_pks,
+                                council_quorum,
+                                max_probationary_lease_bytes,
+                                genesis_pubkey,
+                                &block_store,
+                                server,
+                                wot,
+                                por_verifier,
+                                nullifier_ledger,
+                                &pq_kem,
+                                wan_registry,
+                                eviction,
+                                takedown_queue,
+                            )
+                        };
                         let _ = swarm.behaviour_mut().req_resp.send_response(channel, resp);
                     }
                     _ => {}
                 }
             }
             _ = gc_interval.tick() => {
-                epoch_counter = epoch_counter.saturating_add(1);
-                if let Ok(purged) = server.sweep_expired_epoch(epoch_counter) {
-                    if !purged.is_empty() {
-                        info!(
-                            epoch = epoch_counter,
-                            purged_count = purged.len(),
-                            "Swept and unlinked expired .bshard files from disk"
-                        );
+                let mut avail_opt = None;
+                {
+                    let mut st = shared
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    st.epoch_counter = st.epoch_counter.saturating_add(1);
+                    let ep = st.epoch_counter;
+                    st.wan_registry.prune_expired(seed_now_ms());
+                    if let Ok(purged) = st.server.sweep_expired_epoch(ep) {
+                        if !purged.is_empty() {
+                            info!(
+                                epoch = ep,
+                                purged_count = purged.len(),
+                                "Swept and unlinked expired .bshard files from disk"
+                            );
+                        }
                     }
+                    if beacon_handle.is_some() {
+                        let rep = st.server.status_report(ep);
+                        avail_opt = Some(rep.max_storage_bytes.saturating_sub(rep.used_storage_bytes));
+                    }
+                }
+                if let (Some(ref beacon), Some(avail)) = (&beacon_handle, avail_opt) {
+                    beacon.update_available_bytes(avail);
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -720,27 +1975,356 @@ async fn run_seed_listener_loop(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn handle_seed_admin_rpc_request(
+    request: SeedAdminRequest,
+    shared: &Arc<Mutex<SeedSharedState>>,
+    block_store: &BlockStore,
+    data_dir: &Path,
+    node_identity: &NodeIdentity,
+    local_peer_id_str: &str,
+    seed_mode: SeedServerMode,
+    local_tracker_admin_pk: Option<[u8; 32]>,
+    extra_council_pks: &[[u8; 32]],
+    council_quorum: Option<usize>,
+    genesis_pubkey: [u8; 32],
+    effective_peers: &[String],
+    start_instant: Instant,
+) -> SeedAdminResponse {
+    match request {
+        SeedAdminRequest::GetSeedTelemetry => {
+            let mut st = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let rep = st.server.status_report(st.epoch_counter);
+            let (rss_kib, hwm_kib) = read_linux_process_memory_kib();
+            let stored_regular_shards = block_store
+                .list_stored_shards()
+                .map(|v| v.len())
+                .unwrap_or(0);
+            let stored_blinded_shards = count_blinded_shards_on_disk(block_store);
+            let (active_public_peers, unique_ipv4_24_subnets, unique_ipv6_48_subnets, _) =
+                collect_public_swarm_diversity(&mut st.wan_registry, seed_now_ms());
+            let pending_takedowns_count = st
+                .takedown_queue
+                .list_entries()
+                .iter()
+                .filter(|e| matches!(e.status, TakedownReviewStatus::PendingAdminReview))
+                .count();
+            let (_, min_quorum) = resolve_seed_council_and_quorum(
+                data_dir,
+                seed_mode,
+                local_tracker_admin_pk,
+                extra_council_pks,
+                council_quorum,
+                genesis_pubkey,
+            );
+            let mode_str = match seed_mode {
+                SeedServerMode::PublicNetworkBootstrapper => "public-bootstrap",
+                SeedServerMode::HomelabRedundancyVault => "homelab-vault",
+            };
+            SeedAdminResponse::Telemetry(SeedTelemetrySnapshot {
+                seed_peer_id: local_peer_id_str.to_string(),
+                seed_ed25519_pubkey: node_identity.public_key_bytes(),
+                mode: mode_str.to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                uptime_secs: start_instant.elapsed().as_secs(),
+                rss_kib,
+                hwm_kib,
+                stored_regular_shards,
+                stored_blinded_shards,
+                used_storage_bytes: rep.used_storage_bytes,
+                max_storage_bytes: rep.max_storage_bytes,
+                active_public_peers,
+                unique_ipv4_24_subnets,
+                unique_ipv6_48_subnets,
+                min_public_pow_bits: st.wot.min_public_pow_bits(),
+                max_probationary_lease_bytes: st.max_probationary_lease_bytes,
+                pending_takedowns_count,
+                active_eviction_blocks_count: st.eviction.active_block_rules_count(),
+                council_quorum_threshold: min_quorum,
+            })
+        }
+
+        SeedAdminRequest::SyncTakedownQueue { since_timestamp_ms } => {
+            let st = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let filtered = st
+                .takedown_queue
+                .list_entries()
+                .into_iter()
+                .filter(|entry| {
+                    let decision_ts = match &entry.status {
+                        TakedownReviewStatus::PendingAdminReview => 0,
+                        TakedownReviewStatus::Approved { approved_at_ms, .. } => *approved_at_ms,
+                        TakedownReviewStatus::Rejected { rejected_at_ms, .. } => *rejected_at_ms,
+                    };
+                    entry.report.submitted_at_ms >= since_timestamp_ms
+                        || decision_ts >= since_timestamp_ms
+                })
+                .collect();
+            SeedAdminResponse::TakedownEntries(filtered)
+        }
+
+        SeedAdminRequest::ResolveTargetImpact { target } => {
+            let mut st = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            st.eviction.refresh_from_disk_readonly();
+            let (
+                resolved_pubkeys,
+                local_regular_shards,
+                local_blinded_shards,
+                estimated_local_bytes,
+            ) = st
+                .eviction
+                .count_matching_shards_dry_run(&target, block_store);
+            let (reachable_public_peers, _, _, _) =
+                collect_public_swarm_diversity(&mut st.wan_registry, seed_now_ms());
+            SeedAdminResponse::TargetImpact {
+                resolved_pubkeys,
+                local_regular_shards,
+                local_blinded_shards,
+                estimated_local_bytes,
+                reachable_public_peers,
+            }
+        }
+
+        SeedAdminRequest::ExecuteSignedEvictionBatch {
+            orders,
+            propagate_to_swarm,
+        } => {
+            if seed_mode != SeedServerMode::PublicNetworkBootstrapper {
+                return SeedAdminResponse::Error {
+                    message: "Refused: ExecuteSignedEvictionBatch is strictly disabled in homelab-vault private mode".to_string(),
+                };
+            }
+            let (council, min_quorum) = resolve_seed_council_and_quorum(
+                data_dir,
+                seed_mode,
+                local_tracker_admin_pk,
+                extra_council_pks,
+                council_quorum,
+                genesis_pubkey,
+            );
+            let local_pk = node_identity.public_key_bytes();
+            let now_ms = seed_now_ms();
+
+            let (local_report, live_swarm_peers) = {
+                let mut st = shared
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut combined_local = EvictionPurgeReport::default();
+                for order in &orders {
+                    match st.eviction.apply_signed_eviction_order_with_quorum(
+                        order,
+                        Some(&local_pk),
+                        &council,
+                        min_quorum,
+                        now_ms,
+                        block_store,
+                    ) {
+                        Ok(rep) => combined_local.merge(&rep),
+                        Err(e) if e.to_string().contains("duplicate_replayed_eviction_order") => {}
+                        Err(e) => {
+                            return SeedAdminResponse::Error {
+                                message: format!("eviction order rejected on seed: {e}"),
+                            };
+                        }
+                    }
+                }
+                let (_, _, _, peers) = collect_public_swarm_diversity(&mut st.wan_registry, now_ms);
+                (combined_local, peers)
+            };
+
+            let mut swarm_propagated_report = EvictionPurgeReport::default();
+            let mut peers_contacted = 0usize;
+            let mut peers_accepted = 0usize;
+
+            if propagate_to_swarm && !orders.is_empty() {
+                let mut target_peers: Vec<String> = Vec::new();
+                for p in live_swarm_peers {
+                    if !p.ends_with(&format!("/p2p/{local_peer_id_str}")) {
+                        push_unique_peer(&mut target_peers, p);
+                    }
+                }
+                for p in effective_peers {
+                    if !p.ends_with(&format!("/p2p/{local_peer_id_str}")) {
+                        push_unique_peer(&mut target_peers, p.clone());
+                    }
+                }
+                for p in KnownPeersStore::load(data_dir).active_multiaddrs() {
+                    if !p.ends_with(&format!("/p2p/{local_peer_id_str}")) {
+                        push_unique_peer(&mut target_peers, p);
+                    }
+                }
+                if target_peers.is_empty() {
+                    let discovery_port = resolve_seed_lan_port(None);
+                    for p in resolve_zero_config_peers(
+                        data_dir,
+                        &[],
+                        discovery_port,
+                        Duration::from_millis(200),
+                    ) {
+                        if !p.ends_with(&format!("/p2p/{local_peer_id_str}")) {
+                            push_unique_peer(&mut target_peers, p);
+                        }
+                    }
+                }
+
+                if !target_peers.is_empty() {
+                    let discovery_port = resolve_seed_lan_port(None);
+                    let client = MeshClient::new(node_identity.clone(), target_peers.clone(), None)
+                        .with_data_dir_discovery(data_dir.to_path_buf(), discovery_port);
+                    peers_contacted = target_peers.len();
+                    for peer_addr in &target_peers {
+                        let mut peer_ok = false;
+                        for order in &orders {
+                            if let Ok(rep) =
+                                client.broadcast_eviction_order(peer_addr, order.clone())
+                            {
+                                swarm_propagated_report.merge(&rep);
+                                peer_ok = true;
+                            }
+                        }
+                        if peer_ok {
+                            peers_accepted += 1;
+                        }
+                    }
+                }
+            }
+
+            SeedAdminResponse::EvictionBatchResult {
+                local_report,
+                swarm_propagated_report,
+                peers_contacted,
+                peers_accepted,
+            }
+        }
+
+        SeedAdminRequest::RecordTakedownDecision {
+            report_id,
+            approved,
+            admin_pubkey,
+            note,
+        } => {
+            if seed_mode != SeedServerMode::PublicNetworkBootstrapper {
+                return SeedAdminResponse::Error {
+                    message:
+                        "Refused: RecordTakedownDecision disabled in homelab-vault private mode"
+                            .to_string(),
+                };
+            }
+            let mut st = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match st.takedown_queue.record_external_admin_decision(
+                &report_id,
+                approved,
+                admin_pubkey,
+                &note,
+                seed_now_ms(),
+            ) {
+                Ok(found) => SeedAdminResponse::Ack {
+                    ok: true,
+                    message: Some(if found {
+                        "takedown_decision_recorded".to_string()
+                    } else {
+                        "report_not_present_on_this_seed".to_string()
+                    }),
+                },
+                Err(e) => SeedAdminResponse::Error {
+                    message: format!("failed to persist takedown decision: {e}"),
+                },
+            }
+        }
+
+        SeedAdminRequest::UpdateAdmissionPolicy {
+            min_public_pow_bits,
+            max_probationary_lease_bytes,
+        } => {
+            if min_public_pow_bits > 32 {
+                return SeedAdminResponse::Error {
+                    message: format!("invalid min_public_pow_bits {min_public_pow_bits} (max 32)"),
+                };
+            }
+            let mut st = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let pool_mode = if seed_mode == SeedServerMode::PublicNetworkBootstrapper {
+                TrustPoolMode::Hybrid
+            } else {
+                TrustPoolMode::PrivateRing
+            };
+            st.wot.set_trust_pool_mode(pool_mode, min_public_pow_bits);
+            st.max_probationary_lease_bytes = max_probationary_lease_bytes;
+            SeedAdminResponse::Ack {
+                ok: true,
+                message: Some(format!(
+                    "updated min_public_pow_bits={min_public_pow_bits}, max_probationary_lease_bytes={max_probationary_lease_bytes}"
+                )),
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_seed_wire_request(
     remote_peer_id: &str,
+    remote_addr: Option<&Multiaddr>,
     request: MeshWireRequest,
+    data_dir: &Path,
+    node_identity: &NodeIdentity,
+    advertised_admin_pk: Option<[u8; 32]>,
+    local_tracker_admin_pk: Option<[u8; 32]>,
+    extra_council_pks: &[[u8; 32]],
+    council_quorum: Option<usize>,
+    max_probationary_lease_bytes: u64,
+    genesis_pubkey: [u8; 32],
     block_store: &BlockStore,
     server: &mut ZeroTrustSeedServer,
     wot: &mut WebOfTrustRegistry,
     por_verifier: &mut PorVerifierEngine,
     nullifier_ledger: &mut VoucherNullifierLedger,
     pq_kem: &HybridKemKeypair,
+    wan_registry: &mut WanRendezvousRegistry,
+    eviction: &mut PrivacyPreservingEvictionEngine,
+    takedown_queue: &mut PublicTrackerTakedownQueue,
 ) -> MeshWireResponse {
+    let remote_ip = remote_addr.and_then(extract_ip_from_multiaddr);
+    let remote_pubkey = NodeConfig::extract_ed25519_pubkey_from_peer_str(remote_peer_id);
+
     match request {
-        MeshWireRequest::HandshakeWoT { chain, .. } => match wot.verify_and_admit_chain(&chain) {
-            Ok(_) => MeshWireResponse::HandshakeAck {
-                accepted: true,
-                reason: None,
-            },
-            Err(e) => MeshWireResponse::HandshakeAck {
-                accepted: false,
-                reason: Some(e.to_string()),
-            },
-        },
+        MeshWireRequest::HandshakeWoT { chain, .. } => {
+            let leaf_pk = chain.leaf_pubkey();
+            if let Some(reason) = eviction.is_ingress_blocked(
+                remote_ip,
+                Some(remote_peer_id),
+                leaf_pk.as_ref(),
+                None,
+                None,
+            ) {
+                return MeshWireResponse::HandshakeAck {
+                    accepted: false,
+                    reason: Some(reason),
+                };
+            }
+            match wot.verify_and_admit_chain(&chain) {
+                Ok(_) => {
+                    if let (Some(ip), Some(pk)) = (remote_ip, leaf_pk) {
+                        let _ = eviction.record_peer_admission_ip(ip, pk);
+                    }
+                    MeshWireResponse::HandshakeAck {
+                        accepted: true,
+                        reason: None,
+                    }
+                }
+                Err(e) => MeshWireResponse::HandshakeAck {
+                    accepted: false,
+                    reason: Some(e.to_string()),
+                },
+            }
+        }
         MeshWireRequest::PutShard {
             owner_peer_id,
             shard_id,
@@ -748,6 +2332,18 @@ fn handle_seed_wire_request(
             session_key_commit,
             repair_grant,
         } => {
+            if let Some(reason) = eviction.is_ingress_blocked(
+                remote_ip,
+                Some(remote_peer_id),
+                remote_pubkey.as_ref(),
+                Some(&shard_id.stripe_merkle_root),
+                None,
+            ) {
+                return MeshWireResponse::PutShardAck {
+                    stored: false,
+                    error: Some(reason),
+                };
+            }
             if let Some(grant) = repair_grant {
                 por_verifier.register_repair_grant(grant);
             }
@@ -761,10 +2357,22 @@ fn handle_seed_wire_request(
                 owner_peer_id.as_str()
             };
             match block_store.put_shard(effective_owner, &shard_id, &shard_bytes) {
-                Ok(_) => MeshWireResponse::PutShardAck {
-                    stored: true,
-                    error: None,
-                },
+                Ok(_) => {
+                    let _ = eviction.record_regular_shard_ingress(
+                        remote_ip,
+                        Some(remote_peer_id),
+                        remote_pubkey,
+                        effective_owner,
+                        shard_id,
+                    );
+                    if let (Some(ip), Some(pk)) = (remote_ip, remote_pubkey) {
+                        let _ = eviction.record_peer_admission_ip(ip, pk);
+                    }
+                    MeshWireResponse::PutShardAck {
+                        stored: true,
+                        error: None,
+                    }
+                }
                 Err(e) => MeshWireResponse::PutShardAck {
                     stored: false,
                     error: Some(e.to_string()),
@@ -865,6 +2473,35 @@ fn handle_seed_wire_request(
             lease_duration_epochs,
             delete_verifier,
         } => {
+            if let Some(reason) = eviction
+                .is_ingress_blocked(
+                    remote_ip,
+                    Some(remote_peer_id),
+                    Some(&voucher.issuer_pubkey),
+                    None,
+                    Some(&blinded_id.locator),
+                )
+                .or_else(|| {
+                    eviction.is_ingress_blocked(None, None, remote_pubkey.as_ref(), None, None)
+                })
+            {
+                return MeshWireResponse::PutBlindedShardAck {
+                    stored: false,
+                    error: Some(reason),
+                };
+            }
+            if max_probationary_lease_bytes > 0
+                && (shard_bytes.len() as u64) > max_probationary_lease_bytes
+            {
+                return MeshWireResponse::PutBlindedShardAck {
+                    stored: false,
+                    error: Some(format!(
+                        "shard length {} exceeds max_probationary_lease_bytes {}",
+                        shard_bytes.len(),
+                        max_probationary_lease_bytes
+                    )),
+                };
+            }
             nullifier_ledger.set_trusted_issuer_pubkey(voucher.issuer_pubkey);
             match block_store.put_blinded_shard_with_lease(
                 &blinded_id,
@@ -876,10 +2513,21 @@ fn handle_seed_wire_request(
                 lease_duration_epochs,
                 delete_verifier,
             ) {
-                Ok(_) => MeshWireResponse::PutBlindedShardAck {
-                    stored: true,
-                    error: None,
-                },
+                Ok(_) => {
+                    let _ = eviction.record_blinded_shard_ingress(
+                        remote_ip,
+                        Some(remote_peer_id),
+                        voucher.issuer_pubkey,
+                        blinded_id,
+                    );
+                    if let Some(ip) = remote_ip {
+                        let _ = eviction.record_peer_admission_ip(ip, voucher.issuer_pubkey);
+                    }
+                    MeshWireResponse::PutBlindedShardAck {
+                        stored: true,
+                        error: None,
+                    }
+                }
                 Err(e) => MeshWireResponse::PutBlindedShardAck {
                     stored: false,
                     error: Some(e.to_string()),
@@ -921,6 +2569,18 @@ fn handle_seed_wire_request(
             current_epoch,
             extension_epochs,
         } => {
+            if eviction
+                .is_ingress_blocked(
+                    remote_ip,
+                    Some(remote_peer_id),
+                    remote_pubkey.as_ref(),
+                    None,
+                    Some(&blinded_id.locator),
+                )
+                .is_some()
+            {
+                return MeshWireResponse::RenewBlindedLeaseAck { renewed: false };
+            }
             let renewed = server.renew_blinded_lease(&blinded_id, current_epoch, extension_epochs);
             MeshWireResponse::RenewBlindedLeaseAck { renewed }
         }
@@ -962,6 +2622,18 @@ fn handle_seed_wire_request(
             lease_duration_epochs,
             delete_verifier,
         } => {
+            if let Some(reason) = eviction.is_ingress_blocked(
+                remote_ip,
+                Some(remote_peer_id),
+                remote_pubkey.as_ref(),
+                None,
+                None,
+            ) {
+                return MeshWireResponse::RelayPqOnionAck {
+                    delivered: false,
+                    error: Some(reason),
+                };
+            }
             if let Some(next_hop) = target_peer_addr {
                 if let Some(client) = block_store.mesh_client() {
                     match client.relay_pq_onion_envelope(
@@ -1015,7 +2687,21 @@ fn handle_seed_wire_request(
                     }
                 }
             } else if let Ok(bundle) = envelope.open_final_target_pq(pq_kem) {
+                if let Some(reason) = eviction.is_ingress_blocked(
+                    remote_ip,
+                    Some(remote_peer_id),
+                    Some(&bundle.voucher.issuer_pubkey),
+                    None,
+                    Some(&bundle.blinded_id.locator),
+                ) {
+                    return MeshWireResponse::RelayPqOnionAck {
+                        delivered: false,
+                        error: Some(reason),
+                    };
+                }
                 nullifier_ledger.set_trusted_issuer_pubkey(bundle.voucher.issuer_pubkey);
+                let voucher_pk = bundle.voucher.issuer_pubkey;
+                let bid = bundle.blinded_id;
                 match block_store.put_blinded_shard_with_lease(
                     &bundle.blinded_id,
                     &bundle.shard_bytes,
@@ -1026,10 +2712,18 @@ fn handle_seed_wire_request(
                     bundle.lease_duration_epochs,
                     bundle.delete_verifier,
                 ) {
-                    Ok(_) => MeshWireResponse::RelayPqOnionAck {
-                        delivered: true,
-                        error: None,
-                    },
+                    Ok(_) => {
+                        let _ = eviction.record_blinded_shard_ingress(
+                            remote_ip,
+                            Some(remote_peer_id),
+                            voucher_pk,
+                            bid,
+                        );
+                        MeshWireResponse::RelayPqOnionAck {
+                            delivered: true,
+                            error: None,
+                        }
+                    }
                     Err(e) => MeshWireResponse::RelayPqOnionAck {
                         delivered: false,
                         error: Some(e.to_string()),
@@ -1038,7 +2732,32 @@ fn handle_seed_wire_request(
             } else {
                 match envelope.open_pq(pq_kem) {
                     Ok((blinded_id, shard_bytes)) => {
+                        if let Some(reason) = eviction.is_ingress_blocked(
+                            remote_ip,
+                            Some(remote_peer_id),
+                            Some(&voucher.issuer_pubkey),
+                            None,
+                            Some(&blinded_id.locator),
+                        ) {
+                            return MeshWireResponse::RelayPqOnionAck {
+                                delivered: false,
+                                error: Some(reason),
+                            };
+                        }
+                        if max_probationary_lease_bytes > 0
+                            && (shard_bytes.len() as u64) > max_probationary_lease_bytes
+                        {
+                            return MeshWireResponse::RelayPqOnionAck {
+                                delivered: false,
+                                error: Some(format!(
+                                    "shard length {} exceeds max_probationary_lease_bytes {}",
+                                    shard_bytes.len(),
+                                    max_probationary_lease_bytes
+                                )),
+                            };
+                        }
                         nullifier_ledger.set_trusted_issuer_pubkey(voucher.issuer_pubkey);
+                        let voucher_pk = voucher.issuer_pubkey;
                         match block_store.put_blinded_shard_with_lease(
                             &blinded_id,
                             &shard_bytes,
@@ -1049,10 +2768,18 @@ fn handle_seed_wire_request(
                             lease_duration_epochs,
                             delete_verifier,
                         ) {
-                            Ok(_) => MeshWireResponse::RelayPqOnionAck {
-                                delivered: true,
-                                error: None,
-                            },
+                            Ok(_) => {
+                                let _ = eviction.record_blinded_shard_ingress(
+                                    remote_ip,
+                                    Some(remote_peer_id),
+                                    voucher_pk,
+                                    blinded_id,
+                                );
+                                MeshWireResponse::RelayPqOnionAck {
+                                    delivered: true,
+                                    error: None,
+                                }
+                            }
                             Err(e) => MeshWireResponse::RelayPqOnionAck {
                                 delivered: false,
                                 error: Some(e.to_string()),
@@ -1071,6 +2798,19 @@ fn handle_seed_wire_request(
             bundle,
             repair_grant,
         } => {
+            if let Some(reason) = eviction.is_ingress_blocked(
+                remote_ip,
+                Some(remote_peer_id),
+                remote_pubkey.as_ref(),
+                Some(&bundle.expected_stripe_merkle_root),
+                None,
+            ) {
+                return MeshWireResponse::SyndicateLiteStripeAck {
+                    receipt: None,
+                    syndicated_peers: Vec::new(),
+                    error: Some(reason),
+                };
+            }
             if let Some(ref grant) = repair_grant {
                 por_verifier.register_repair_grant(grant.clone());
             }
@@ -1146,6 +2886,145 @@ fn handle_seed_wire_request(
                 used_bytes: rep.used_storage_bytes,
                 sla_score: rep.sla_ratio,
                 pq_kem_pubkey: Some(pq_kem.public_key()),
+            }
+        }
+        MeshWireRequest::RegisterWanRendezvous { slot_key, entry } => {
+            if let Some(reason) = eviction
+                .is_ingress_blocked(
+                    remote_ip,
+                    Some(remote_peer_id),
+                    Some(&entry.ed25519_pubkey),
+                    None,
+                    None,
+                )
+                .or_else(|| {
+                    eviction.is_ingress_blocked(None, None, remote_pubkey.as_ref(), None, None)
+                })
+            {
+                return MeshWireResponse::RegisterWanRendezvousAck {
+                    stored: false,
+                    observed_external_addr: None,
+                    error: Some(reason),
+                    tracker_admin_pubkey: advertised_admin_pk,
+                };
+            }
+            let observed_external_addr = remote_addr
+                .and_then(|addr| reflect_observed_wan_multiaddr(addr, 0, remote_peer_id));
+            let signer_pk = entry.ed25519_pubkey;
+            let public_card_ips: Vec<std::net::IpAddr> = if slot_key == PUBLIC_COMMONS_SWARM_SLOT {
+                open_public_tracker_card(&entry)
+                    .ok()
+                    .map(|card| {
+                        card.wan_multiaddrs
+                            .iter()
+                            .filter_map(|s| s.parse::<Multiaddr>().ok())
+                            .filter_map(|m| extract_ip_from_multiaddr(&m))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            match wan_registry.register(slot_key, entry, seed_now_ms()) {
+                Ok(stored) => {
+                    if stored {
+                        if let Some(ip) = remote_ip {
+                            let _ = eviction.record_peer_admission_ip(ip, signer_pk);
+                        }
+                        for adv_ip in public_card_ips {
+                            let _ = eviction.record_peer_admission_ip(adv_ip, signer_pk);
+                        }
+                    }
+                    MeshWireResponse::RegisterWanRendezvousAck {
+                        stored,
+                        observed_external_addr,
+                        error: None,
+                        tracker_admin_pubkey: advertised_admin_pk,
+                    }
+                }
+                Err(err) => MeshWireResponse::RegisterWanRendezvousAck {
+                    stored: false,
+                    observed_external_addr,
+                    error: Some(err),
+                    tracker_admin_pubkey: advertised_admin_pk,
+                },
+            }
+        }
+        MeshWireRequest::LookupWanRendezvous { slot_key } => {
+            let observed_external_addr = remote_addr
+                .and_then(|addr| reflect_observed_wan_multiaddr(addr, 0, remote_peer_id));
+            let now = seed_now_ms();
+            let entries = if slot_key == PUBLIC_COMMONS_SWARM_SLOT {
+                wan_registry.lookup_public_swarm(32, now)
+            } else {
+                wan_registry.lookup(&slot_key, now)
+            };
+            MeshWireResponse::LookupWanRendezvousResult {
+                entries,
+                observed_external_addr,
+                tracker_admin_pubkey: advertised_admin_pk,
+            }
+        }
+        MeshWireRequest::SubmitAbuseTakedownReport(report) => {
+            let report_id = report.report_id;
+            if server.mode() != SeedServerMode::PublicNetworkBootstrapper {
+                return MeshWireResponse::SubmitAbuseTakedownAck {
+                    queued_for_admin_review: false,
+                    report_id,
+                    verified_plaintext_sha256: None,
+                    error: Some(
+                        "abuse takedown queue disabled in homelab-vault private mode".to_string(),
+                    ),
+                };
+            }
+            match takedown_queue.enqueue_verified_report(report) {
+                Ok(outcome) => MeshWireResponse::SubmitAbuseTakedownAck {
+                    queued_for_admin_review: true,
+                    report_id,
+                    verified_plaintext_sha256: Some(outcome.verified_plaintext_sha256),
+                    error: None,
+                },
+                Err(err) => MeshWireResponse::SubmitAbuseTakedownAck {
+                    queued_for_admin_review: false,
+                    report_id,
+                    verified_plaintext_sha256: None,
+                    error: Some(err),
+                },
+            }
+        }
+        MeshWireRequest::BroadcastEvictionOrder(order) => {
+            let (council, min_quorum) = resolve_seed_council_and_quorum(
+                data_dir,
+                server.mode(),
+                local_tracker_admin_pk,
+                extra_council_pks,
+                council_quorum,
+                genesis_pubkey,
+            );
+            let local_pk = node_identity.public_key_bytes();
+            let _ = max_probationary_lease_bytes;
+            match eviction.apply_signed_eviction_order_with_quorum(
+                &order,
+                Some(&local_pk),
+                &council,
+                min_quorum,
+                seed_now_ms(),
+                block_store,
+            ) {
+                Ok(rep) => MeshWireResponse::EvictionOrderAck {
+                    accepted: true,
+                    purged_regular_shards: rep.purged_regular_shards,
+                    purged_blinded_shards: rep.purged_blinded_shards,
+                    zero_wiped_bytes: rep.zero_wiped_bytes,
+                    error: None,
+                },
+                Err(err) => MeshWireResponse::EvictionOrderAck {
+                    accepted: false,
+                    purged_regular_shards: 0,
+                    purged_blinded_shards: 0,
+                    zero_wiped_bytes: 0,
+                    error: Some(err.to_string()),
+                },
             }
         }
     }

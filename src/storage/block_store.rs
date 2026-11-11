@@ -223,6 +223,10 @@ impl FileManifest {
     }
 }
 
+pub const SOC_ROUTER_STRIPE_SIZE_BYTES: usize = 1024 * 1024; // 1 MiB for <=48 MiB cgroup tiny-SoC
+pub const NAS_BALANCED_STRIPE_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB for mid-range NAS
+pub const DEFAULT_STRIPE_SIZE_BYTES: usize = crate::config::DEFAULT_STRIPE_SIZE_BYTES; // 16 MiB per ADR-01
+
 /// Local NVMe / USB sharded block storage engine (`storage::block_store`).
 #[derive(Clone)]
 pub struct BlockStore {
@@ -235,9 +239,14 @@ pub struct BlockStore {
     shard_id_by_file_key: Arc<Mutex<HashMap<String, ShardId>>>,
     dht_store: Arc<Mutex<ZeroTrustDhtStore>>,
     mesh_client: Option<crate::network::MeshClient>,
+    stripe_size_bytes: usize,
 }
 
 impl BlockStore {
+    pub const SOC_ROUTER_STRIPE_SIZE_BYTES: usize = SOC_ROUTER_STRIPE_SIZE_BYTES;
+    pub const NAS_BALANCED_STRIPE_SIZE_BYTES: usize = NAS_BALANCED_STRIPE_SIZE_BYTES;
+    pub const DEFAULT_STRIPE_SIZE_BYTES: usize = DEFAULT_STRIPE_SIZE_BYTES;
+
     pub fn new(root_dir: impl AsRef<Path>, mut quota: QuotaManager) -> Result<Self, StorageError> {
         let root_dir = root_dir.as_ref().to_path_buf();
         let shards_dir = root_dir.join("shards");
@@ -298,7 +307,22 @@ impl BlockStore {
             shard_id_by_file_key: Arc::new(Mutex::new(initial_shard_index)),
             dht_store: Arc::new(Mutex::new(dht_store)),
             mesh_client: None,
+            stripe_size_bytes: DEFAULT_STRIPE_SIZE_BYTES,
         })
+    }
+
+    pub fn with_stripe_size_bytes(mut self, stripe_size_bytes: usize) -> Self {
+        self.set_stripe_size_bytes(stripe_size_bytes);
+        self
+    }
+
+    pub fn set_stripe_size_bytes(&mut self, stripe_size_bytes: usize) {
+        self.stripe_size_bytes =
+            stripe_size_bytes.clamp(64 * 1024, Self::DEFAULT_STRIPE_SIZE_BYTES);
+    }
+
+    pub fn stripe_size_bytes(&self) -> usize {
+        self.stripe_size_bytes
     }
 
     pub fn with_mesh_client(mut self, client: crate::network::MeshClient) -> Self {
@@ -316,6 +340,14 @@ impl BlockStore {
 
     pub fn root_dir(&self) -> &Path {
         &self.root_dir
+    }
+
+    pub fn shards_dir(&self) -> &Path {
+        &self.shards_dir
+    }
+
+    pub fn manifests_dir(&self) -> &Path {
+        &self.manifests_dir
     }
 
     fn persist_shard_index(&self) {
@@ -1184,7 +1216,12 @@ impl BlockStore {
         let mut file = File::open(input_path)?;
         let original_file_size = file.metadata()?.len();
         let file_salt = generate_file_salt();
-        let stripe_cap = stripe_size_bytes.max(1024);
+        let stripe_cap =
+            if stripe_size_bytes == 0 || stripe_size_bytes == Self::DEFAULT_STRIPE_SIZE_BYTES {
+                self.stripe_size_bytes
+            } else {
+                stripe_size_bytes.clamp(64 * 1024, Self::DEFAULT_STRIPE_SIZE_BYTES)
+            };
 
         let mut stripes = Vec::new();
         let mut stripe_roots = Vec::new();
@@ -1618,5 +1655,95 @@ impl ZeroTrustDhtStore {
         dht_key: &[u8; 32],
     ) -> Option<&crate::sync::EncryptedVaultCatalogEnvelope> {
         self.catalog_records.get(dht_key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_configurable_stripe_sizing_and_interoperable_restore() {
+        let dir = tempdir().expect("tempdir");
+        let quota = QuotaManager::new(100 * 1024 * 1024, 10 * 1024 * 1024);
+        let mut store = BlockStore::new(dir.path(), quota).expect("create BlockStore");
+
+        // Defaults to 16 MiB
+        assert_eq!(
+            store.stripe_size_bytes(),
+            BlockStore::DEFAULT_STRIPE_SIZE_BYTES
+        );
+
+        // with_stripe_size_bytes
+        store = store.with_stripe_size_bytes(BlockStore::SOC_ROUTER_STRIPE_SIZE_BYTES);
+        assert_eq!(store.stripe_size_bytes(), 1024 * 1024);
+
+        // Clamping bounds: min 64 KiB, max 16 MiB
+        store.set_stripe_size_bytes(1024);
+        assert_eq!(store.stripe_size_bytes(), 64 * 1024);
+
+        store.set_stripe_size_bytes(64 * 1024 * 1024);
+        assert_eq!(
+            store.stripe_size_bytes(),
+            BlockStore::DEFAULT_STRIPE_SIZE_BYTES
+        );
+
+        // Set to 1 MiB for tiny-SoC test
+        store.set_stripe_size_bytes(BlockStore::SOC_ROUTER_STRIPE_SIZE_BYTES);
+
+        // Create 2.5 MiB payload -> exactly 3 stripes of 1 MiB max
+        let payload_len = (2.5 * 1024.0 * 1024.0) as usize;
+        let mut original_data = vec![0u8; payload_len];
+        for (i, byte) in original_data.iter_mut().enumerate() {
+            *byte = (i % 251) as u8;
+        }
+
+        let input_path = dir.path().join("input.bin");
+        fs::write(&input_path, &original_data).expect("write input");
+
+        let master_key = MasterKey::generate();
+        let manifest = store
+            .store_file_streaming(
+                "test-owner",
+                &input_path,
+                &master_key,
+                ErasureTier::Consumer,
+                0, // passes 0 so store's configured stripe_size_bytes (1 MiB) is used
+            )
+            .expect("store_file_streaming with 1 MiB stripes");
+
+        assert_eq!(manifest.stripe_size_bytes, 1024 * 1024);
+        assert_eq!(manifest.stripes.len(), 3);
+        assert_eq!(manifest.original_file_size, payload_len as u64);
+
+        // Restore using a store with default (16 MiB) configuration — must be 100% interoperable
+        let restore_dir = tempdir().expect("restore tempdir");
+        let restore_store = BlockStore::new(
+            restore_dir.path(),
+            QuotaManager::new(100 * 1024 * 1024, 10 * 1024 * 1024),
+        )
+        .expect("restore store");
+
+        // Copy shards from store to restore_store for local retrieval
+        for entry in fs::read_dir(store.shards_dir())
+            .expect("read shards dir")
+            .flatten()
+        {
+            fs::copy(
+                entry.path(),
+                restore_store.shards_dir().join(entry.file_name()),
+            )
+            .expect("copy shard");
+        }
+
+        let output_path = restore_dir.path().join("restored.bin");
+        restore_store
+            .restore_file_streaming(&manifest, &master_key, &output_path)
+            .expect("restore_file_streaming");
+
+        let restored_data = fs::read(&output_path).expect("read restored");
+        assert_eq!(restored_data.len(), original_data.len());
+        assert_eq!(restored_data, original_data);
     }
 }

@@ -4,6 +4,7 @@ set -eu
 
 REPO="${PARVAULT_REPO:-Zbot21/parvault}"
 INSTALL_DIR="${PARVAULT_INSTALL_DIR:-/usr/local/bin}"
+VERSION="${PARVAULT_VERSION:-latest}"
 
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -19,7 +20,11 @@ case "$ARCH" in
     ;;
 esac
 
-BASE_URL="https://github.com/${REPO}/releases/latest/download"
+if [ "$VERSION" = "latest" ]; then
+  BASE_URL="https://github.com/${REPO}/releases/latest/download"
+else
+  BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
+fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 

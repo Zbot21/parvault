@@ -633,7 +633,7 @@ fn test_cli_end_to_end_parvault_and_parvault_seed_subcommands() {
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
     let out_watch = std::process::Command::new(parvault_bin)
         .current_dir(&base)
-        .args(["watch-folder", "--folder"])
+        .args(["--no-lan-discovery", "watch-folder", "--folder"])
         .arg(&watched)
         .arg("--snapshot-out")
         .arg(&snap_path)
@@ -660,7 +660,7 @@ fn test_cli_end_to_end_parvault_and_parvault_seed_subcommands() {
     let seed_mk = MasterKey::from_recovery_seed_phrase(phrase, "homelab");
     let out_restore_single = std::process::Command::new(parvault_bin)
         .current_dir(&base)
-        .args(["restore-folder", "--snapshot"])
+        .args(["--no-lan-discovery", "restore-folder", "--snapshot"])
         .arg(&snap_path)
         .arg("--out-dir")
         .arg(&single_restore_dir)
@@ -682,6 +682,7 @@ fn test_cli_end_to_end_parvault_and_parvault_seed_subcommands() {
     let out_recover = std::process::Command::new(parvault_bin)
         .current_dir(&base)
         .args([
+            "--no-lan-discovery",
             "recover-from-seed",
             "--seed-phrase",
             phrase,
@@ -718,7 +719,7 @@ fn test_cli_end_to_end_parvault_and_parvault_seed_subcommands() {
 
     let out_status = std::process::Command::new(parvault_bin)
         .current_dir(&base)
-        .arg("status")
+        .args(["--no-lan-discovery", "status"])
         .output()
         .expect("run parvault status");
     assert!(out_status.status.success());
@@ -726,7 +727,7 @@ fn test_cli_end_to_end_parvault_and_parvault_seed_subcommands() {
 
     let out_leave = std::process::Command::new(parvault_bin)
         .current_dir(&base)
-        .arg("leave")
+        .args(["--no-lan-discovery", "leave"])
         .output()
         .expect("run parvault leave");
     assert!(out_leave.status.success());
@@ -880,6 +881,7 @@ fn test_live_libp2p_tcp_multi_daemon_network_backup_prune_and_seed_recovery() {
             "start",
             "--mode",
             "homelab-vault",
+            "--no-lan-discovery",
             "--listen",
             &seed_multiaddr,
             "--data-dir",
@@ -900,6 +902,7 @@ fn test_live_libp2p_tcp_multi_daemon_network_backup_prune_and_seed_recovery() {
             .arg("--data-dir")
             .arg(&ndir)
             .args([
+                "--no-lan-discovery",
                 "--peers",
                 &peers_csv,
                 "--seed-addr",

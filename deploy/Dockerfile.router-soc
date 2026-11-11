@@ -1,0 +1,48 @@
+# syntax=docker/dockerfile:1
+# Static musl build pipeline for ParVault Router-SoC ultra-compact scratch image
+FROM rust:alpine AS builder
+
+ARG TARGET_ARCH=x86_64-unknown-linux-musl
+
+RUN apk add --no-cache \
+    build-base \
+    musl-dev \
+    pkgconfig \
+    git \
+    ca-certificates
+
+RUN rustup target add ${TARGET_ARCH}
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock* ./
+COPY src ./src
+
+ENV RUST_MIN_STACK=33554432
+
+# Build with --profile soc (opt-level="z", lto="fat") for maximum size reduction
+RUN cargo build --profile soc --target ${TARGET_ARCH} --bin parvault \
+    && cargo build --profile soc --target ${TARGET_ARCH} --bin parvault-seed \
+    && cp target/${TARGET_ARCH}/soc/parvault /build/parvault \
+    && cp target/${TARGET_ARCH}/soc/parvault-seed /build/parvault-seed \
+    && strip --strip-all /build/parvault /build/parvault-seed
+
+COPY deploy/router-soc/parvault-router.toml /build/router.toml
+
+# Ultra-minimal scratch runtime: 0 OS overhead, statically linked musl binary
+FROM scratch
+
+COPY --from=builder /build/parvault /parvault
+COPY --from=builder /build/parvault-seed /parvault-seed
+COPY --from=builder /build/router.toml /etc/parvault/router.toml
+
+VOLUME ["/mnt/nas", "/var/lib/parvault"]
+
+# Ports:
+# 4001/tcp - libp2p TCP + Noise XX + Yamux
+# 4002/tcp - Direct seed peering
+# 4009/udp - Zero-IP Home LAN signed beacon discovery (ADR-18)
+# 4080/tcp - Router NAS Web status dashboard & JSON telemetry (ADR-18)
+EXPOSE 4001/tcp 4002/tcp 4009/udp 4080/tcp
+
+ENTRYPOINT ["/parvault"]
+CMD ["up", "--profile", "router-soc", "--config", "/etc/parvault/router.toml"]
