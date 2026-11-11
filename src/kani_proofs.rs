@@ -36,6 +36,7 @@ use crate::storage::eviction::{
     EvictionOrderSliceView, EvictionTarget, PrivacyPreservingEvictionEngine,
     SignedBadActorEvictionOrder, TrackerOperatorCosignature,
 };
+use crate::sync::{sanitize_sync_relative_path, sanitize_sync_relative_path_into};
 #[cfg(feature = "vfs")]
 use crate::vfs::{
     compute_vfs_block_window, parse_fuse_in_header, parse_fuse_read_in, FuseInHeader, FuseReadIn,
@@ -1060,4 +1061,71 @@ fn proof_fuse_header_parser_no_panic() {
         padding: kani::any(),
     };
     assert_eq!(parse_fuse_read_in(&sym_rd.to_ne_bytes()), Some(sym_rd));
+}
+
+/// Proves `sanitize_sync_relative_path_into` / `sanitize_sync_relative_path` (`src/sync.rs`,
+/// `ADR-33`) never panics across arbitrary symbolic `[u8; 10]` inputs of any length `0..=10`
+/// (`0` heap `Vec` allocations) and strictly rejects empty outputs, NUL bytes, leading/trailing
+/// `/` or `\`, Windows drive colons (`:`), duplicate `//`, and `.` or `..` path-traversal
+/// segments, while preserving exact normalization idempotence on every accepted path.
+#[kani::proof]
+#[kani::unwind(12)]
+fn proof_sanitize_sync_relative_path_no_traversal() {
+    let raw_bytes: [u8; 10] = kani::any();
+    let slice_len: usize = kani::any();
+    kani::assume(slice_len <= raw_bytes.len());
+
+    let mut out_buf = [0u8; 10];
+    let result =
+        sanitize_sync_relative_path_into(&raw_bytes[..slice_len], &mut out_buf[..slice_len]);
+
+    if slice_len == 0 || raw_bytes[0] == b'/' || raw_bytes[0] == b'\\' {
+        assert!(result.is_none());
+    }
+
+    if let Some(norm_len) = result {
+        assert!(norm_len >= 1 && norm_len <= slice_len);
+        let nb = &out_buf[..norm_len];
+        assert!(nb[0] != b'/' && nb[0] != b'\\');
+        assert!(nb[norm_len - 1] != b'/' && nb[norm_len - 1] != b'\\');
+
+        let mut p = 0usize;
+        let mut seg_len = 0usize;
+        let mut seg_dots = 0usize;
+        while p < 10 {
+            if p < norm_len {
+                let c = nb[p];
+                assert!(c != 0 && c != b'\\' && c != b':');
+                if c == b'/' {
+                    assert!(seg_len > 0);
+                    assert!(!(seg_len == 1 && seg_dots == 1));
+                    assert!(!(seg_len == 2 && seg_dots == 2));
+                    seg_len = 0;
+                    seg_dots = 0;
+                } else {
+                    if c == b'.' {
+                        seg_dots += 1;
+                    }
+                    seg_len += 1;
+                }
+            }
+            p += 1;
+        }
+        assert!(seg_len > 0);
+        assert!(!(seg_len == 1 && seg_dots == 1));
+        assert!(!(seg_len == 2 && seg_dots == 2));
+
+        // Prove normalization idempotence (`f(f(x)) == f(x)`):
+        let mut idemp_buf = [0u8; 10];
+        let idemp_len = sanitize_sync_relative_path_into(nb, &mut idemp_buf[..norm_len])
+            .expect("normalized relative path must remain valid");
+        assert_eq!(idemp_len, norm_len);
+        assert!(slice_eq_bounded::<10>(&idemp_buf[..idemp_len], nb));
+    }
+
+    // Concrete wrapper boundary checks on `sanitize_sync_relative_path`:
+    assert!(sanitize_sync_relative_path("").is_none());
+    assert!(sanitize_sync_relative_path("/etc/passwd").is_none());
+    assert!(sanitize_sync_relative_path("../escape").is_none());
+    assert!(sanitize_sync_relative_path("C:\\win").is_none());
 }

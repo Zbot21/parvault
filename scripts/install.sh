@@ -1,11 +1,11 @@
 #!/usr/bin/env sh
-# ParVault (parvault, parvault-seed, parvault-fuse) Static Binary Installer
+# ParVault (parvault, parvault-seed, parvault-fuse, parvault-sync) Static Binary Installer
 set -eu
 
 REPO="${PARVAULT_REPO:-Zbot21/parvault}"
 INSTALL_DIR="${PARVAULT_INSTALL_DIR:-/usr/local/bin}"
 VERSION="${PARVAULT_VERSION:-latest}"
-BINS="${PARVAULT_BINS:-parvault parvault-seed parvault-fuse}"
+BINS="${PARVAULT_BINS:-parvault parvault-seed parvault-fuse parvault-sync}"
 
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -51,7 +51,7 @@ for bin in $BINS; do
     parvault)
       "${TMP_DIR}/${bin}" gateway self-test
       ;;
-    parvault-seed|parvault-fuse)
+    parvault-seed|parvault-fuse|parvault-sync)
       "${TMP_DIR}/${bin}" self-test
       ;;
   esac

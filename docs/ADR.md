@@ -1,11 +1,11 @@
 # ParVault (`parvault`) — Master Architectural Decision Record (ADR) Index & Active Cryptographic Suite Guide (`v0.5.0`)
 
-- **Architecture Policy:** **Strictly Single-Concern ADRs** (`docs/adr/ADR-01-*.md` through `docs/adr/ADR-32-*.md`) — one architectural decision per file in canonical Michael Nygard format (**Status**, **Subsystem**, **Context**, **Decision**, **Consequences & Verification**).
-- **Target Build & Verification Posture:** `#![deny(unsafe_code)]` library + `#![forbid(unsafe_code)]` binaries (`x86_64-unknown-linux-musl` & `aarch64-unknown-linux-musl`), **`16` Kani Rust Bounded Model Checking symbolic harnesses**, **`7` TLA+ TLC formal specifications**, and full release/plugin security suites (see [`docs/SAFETY_AND_LINT_AUDIT.md`](SAFETY_AND_LINT_AUDIT.md), [`docs/GATEWAY_SOCKET_PROTOCOL.md`](GATEWAY_SOCKET_PROTOCOL.md), and [`docs/SECURITY_AND_CRYPTOGRAPHY.md`](SECURITY_AND_CRYPTOGRAPHY.md)).
+- **Architecture Policy:** **Strictly Single-Concern ADRs** (`docs/adr/ADR-01-*.md` through `docs/adr/ADR-33-*.md`) — one architectural decision per file in canonical Michael Nygard format (**Status**, **Subsystem**, **Context**, **Decision**, **Consequences & Verification**).
+- **Target Build & Verification Posture:** `#![deny(unsafe_code)]` library + `#![forbid(unsafe_code)]` binaries (`x86_64-unknown-linux-musl` & `aarch64-unknown-linux-musl`), **`17` Kani Rust Bounded Model Checking symbolic harnesses**, **`7` TLA+ TLC formal specifications**, and full release/plugin security suites (see [`docs/SAFETY_AND_LINT_AUDIT.md`](SAFETY_AND_LINT_AUDIT.md), [`docs/GATEWAY_SOCKET_PROTOCOL.md`](GATEWAY_SOCKET_PROTOCOL.md), and [`docs/SECURITY_AND_CRYPTOGRAPHY.md`](SECURITY_AND_CRYPTOGRAPHY.md)).
 
 ---
 
-## 1. Master Single-Concern ADR Catalog (`ADR-01` – `ADR-32`)
+## 1. Master Single-Concern ADR Catalog (`ADR-01` – `ADR-33`)
 
 | ADR | Subsystem | Single Architectural Concern | Status |
 | :--- | :--- | :--- | :--- |
@@ -41,6 +41,7 @@
 | **[`ADR-30`](adr/ADR-30-filesystem-free-in-memory-seed-mode.md)** | `bin/parvault-seed` / `storage::block_store` / `storage::eviction` | Filesystem-Free Bounded-RAM Ephemeral Seed & Relay Mode (`parvault-seed --no-fs`) | Accepted (`v0.4.0`) |
 | **[`ADR-31`](adr/ADR-31-unsafe-remediation-and-os-sys-ffi-boundary.md)** | `lib` / `os_sys` / `bin/*` | Crate-Wide `#![deny/forbid(unsafe_code)]` Policy & `src/os_sys.rs` POSIX FFI Isolation Boundary | Accepted (`v0.4.0`, Extended `v0.5.0`) |
 | **[`ADR-32`](adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md)** | `gateway` / `capabilities` / `os_sys` / `main` | Transport-Agnostic `GatewayBus` (`InProcess` vs `UnixSocket`), `F_ADD_SEALS` Anti-TOCTOU `memfd` Sealing & `SO_PEERCRED` UID-Bound Plugin Isolation | Accepted (`v0.5.0`) |
+| **[`ADR-33`](adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md)** | `gateway::ipc` / `vfs` / `sync` / `main` / `bin/parvault-sync` | Dual-Mode (`=y` / `=m`) `VirtualVaultFs` Hosting & Zero-Key Sibling `GatewayFolderSync` (`parvault-sync`) | Accepted (`v0.5.0`) |
 
 ---
 

@@ -1,6 +1,6 @@
 # Memory Safety, `unsafe` OS-FFI Proofs & Lint-Suppression Audit (`parvault` v0.5.0)
 
-This document records the complete memory-safety posture, lint-suppression inventory, and POSIX/Linux OS-FFI safety proofs for `parvault` (`v0.5.0`), verified automatically by `audit_workspace_hardening.sh`, `cargo clippy --all-targets -- -D warnings`, `cargo kani` (`16/16` symbolic harnesses), and the full release test suite.
+This document records the complete memory-safety posture, lint-suppression inventory, and POSIX/Linux OS-FFI safety proofs for `parvault` (`v0.5.0`), verified automatically by `audit_workspace_hardening.sh`, `cargo clippy --all-targets -- -D warnings`, `cargo kani` (`17/17` symbolic harnesses), and the full release test suite.
 
 ---
 
@@ -11,16 +11,18 @@ Every compilation root in `parvault` enforces a strict compiler-level `unsafe_co
 | Crate / Binary Target | Root File & Line | Attribute | Policy Rationale |
 | :--- | :--- | :--- | :--- |
 | `parvault` (library) | `src/lib.rs:1` | `#![deny(unsafe_code)]` | Forbids ad-hoc `unsafe` across all library modules (`crypto`, `sharding`, `storage`, `network`, `gateway`, `vfs`, `capabilities`, `sync`, `bootstrap`, `por`, `router_nas`, `telemetry`, `admin_rpc`, `config`). Only `src/os_sys.rs` contains narrowly scoped `#[allow(unsafe_code)]` POSIX kernel syscall wrappers. |
-| `parvault` (daemon, gateway & token CLI) | `src/main.rs:1` | `#![forbid(unsafe_code)]` | Zero FFI required in the consolidated daemon, `GatewayBus` host (`parvault up --ipc-socket` / `parvault gateway`), and `parvault token` entrypoint; all `memfd_create`, `F_ADD_SEALS`, `SO_PEERCRED`, and `SCM_RIGHTS` operations go through safe `OwnedFd` / `BorrowedFd` APIs in `parvault::os_sys`. |
+| `parvault` (daemon, built-in `=y` VFS, gateway & token CLI) | `src/main.rs:1` | `#![forbid(unsafe_code)]` | Zero FFI required in the consolidated daemon, built-in `=y` VFS host (`--vfs-webdav-listen` / `--vfs-fuse-fd`), `GatewayBus` host (`parvault up --ipc-socket` / `parvault gateway`), and `parvault token` entrypoint; all `memfd_create`, `F_ADD_SEALS`, `SO_PEERCRED`, and `SCM_RIGHTS` operations go through safe `OwnedFd` / `BorrowedFd` APIs in `parvault::os_sys`. |
 | `parvault-seed` | `src/bin/parvault-seed.rs:13` | `#![forbid(unsafe_code)]` | Zero FFI required in the headless seed/bootstrap server binary. |
-| `parvault-fuse` | `src/bin/parvault-fuse.rs:14` | `#![forbid(unsafe_code)]` | Zero FFI in the canonical reference plugin binary; `/dev/fuse` wire headers (`FuseInHeader`, `FuseReadIn`) are parsed via 100% safe `from_ne_bytes` slice conversions (`src/vfs.rs`) formally verified panic-free under Kani (`proof_fuse_header_parser_no_panic`). |
+| `parvault-fuse` | `src/bin/parvault-fuse.rs:14` | `#![forbid(unsafe_code)]` | Zero FFI in the canonical VFS reference plugin binary; `/dev/fuse` wire headers (`FuseInHeader`, `FuseReadIn`) are parsed via 100% safe `from_ne_bytes` slice conversions (`src/vfs.rs`) formally verified panic-free under Kani (`proof_fuse_header_parser_no_panic`). |
+| `parvault-sync` | `src/bin/parvault-sync.rs:9` | `#![forbid(unsafe_code)]` | Zero FFI and zero `MasterKey` / `NodeIdentity` secrets in the sibling incremental folder sync plugin (`GatewayFolderSync` over `GatewayBus`); compiles cleanly even under `--no-default-features`. |
 | `parvault-bench` | `src/bin/parvault-bench.rs:1` | `#![forbid(unsafe_code)]` | Zero FFI in the benchmark runner; RSS (`VmHWM`/`VmRSS`) is read safely from `/proc/self/status` and CPU nanoseconds via `parvault::os_sys::process_cpu_time_ns`. |
 
 ### Zero-`unsafe` Highlights in v0.4.0 – v0.5.0
 - **Positional File & `memfd` I/O (`pread_full_or_eof`, `pwrite_all`)**: Implemented in `src/os_sys.rs:25-64` using 100% safe `std::os::unix::fs::FileExt::{read_at, write_at}` (`0` `unsafe` blocks).
 - **Compact `PARVAULT-MAC-V1:` Binary Token Codec & `AllowedPeerUid` Caveat (`src/capabilities.rs`)**: Implemented in 100% safe, zero-heap-allocation stack encoding (`encode_stack`), formally verified by Kani (`proof_macaroon_peer_uid_and_compact_roundtrip`).
 - **Pure-Rust Linux FUSE `ABI 7.31` Wire Parser (`src/vfs.rs`)**: All three former `std::ptr::read_unaligned` pointer casts were replaced with safe fixed-array `u32::from_ne_bytes` / `u64::from_ne_bytes` parsers (`parse_fuse_in_header`, `parse_fuse_read_in`), proven panic-free across arbitrary byte lengths by Kani (`proof_fuse_header_parser_no_panic`).
-- **Zero-Mock Policy**: `0` `todo!()`, `0` `unimplemented!()`, and `0` mock/fake transport or storage shims exist anywhere in `src/`, `tests/`, or `benches/`. VFS `VfsStubNode` represents lazy-hydrated POSIX metadata inodes backed by a live `GatewayIpcServer` + kernel `memfd` pipeline.
+- **Zero-`unsafe` Relative Path Sanitizer & Zero-Key `GatewayFolderSync` (`src/sync.rs`)**: `sanitize_sync_relative_path` (`sanitize_sync_relative_path_into`) validates and normalizes relative sync paths in a single flat pass (`0` `unsafe`, `0` heap `Vec` growth), formally verified panic-free, traversal-free, and idempotent across symbolic byte slices by Kani (`proof_sanitize_sync_relative_path_no_traversal`).
+- **Zero-Mock Policy**: `0` `todo!()`, `0` `unimplemented!()`, and `0` mock/fake transport or storage shims exist anywhere in `src/`, `tests/`, or `benches/`. VFS `VfsStubNode` represents lazy-hydrated POSIX metadata inodes backed by a live `GatewayEngine` / `GatewayIpcServer` + kernel `memfd` pipeline.
 
 ---
 

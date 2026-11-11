@@ -73,6 +73,10 @@ struct DaemonLaunchOptions {
     strict_allowed_peer_uids: Option<Vec<u32>>,
     require_sealed_ingest_memfd: bool,
     macaroon_root_key: Option<[u8; 32]>,
+    vfs_webdav_listen: Option<String>,
+    vfs_fuse_fd: Option<i32>,
+    vfs_seed_dir: Option<PathBuf>,
+    vfs_cache_mib: u64,
     watch_folder: Option<PathBuf>,
     sync_interval_secs: u64,
     sync_tier: ErasureTier,
@@ -82,6 +86,72 @@ struct DaemonLaunchOptions {
     public_trackers: Vec<String>,
     external_addrs: Vec<String>,
     trust_mode: TrustPoolMode,
+}
+
+fn validate_builtin_vfs_flags(
+    vfs_webdav_listen: Option<&str>,
+    vfs_fuse_fd: Option<i32>,
+    vfs_seed_dir: Option<&Path>,
+) -> anyhow::Result<()> {
+    if vfs_webdav_listen.is_none() && vfs_fuse_fd.is_none() && vfs_seed_dir.is_none() {
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        anyhow::bail!(
+            "Built-in VFS (--vfs-webdav-listen / --vfs-fuse-fd / --vfs-seed-dir) is only supported on Unix targets"
+        );
+    }
+    #[cfg(all(unix, not(feature = "vfs")))]
+    {
+        anyhow::bail!(
+            "Built-in VFS (--vfs-webdav-listen / --vfs-fuse-fd) is disabled in this --no-default-features build; run standalone `parvault-fuse` over `--ipc-socket <PATH>` or rebuild `parvault` with `--features vfs`"
+        );
+    }
+    #[cfg(all(unix, feature = "vfs"))]
+    {
+        if let Some(fd) = vfs_fuse_fd {
+            if fd < 0 {
+                anyhow::bail!(
+                    "--vfs-fuse-fd must be a non-negative open /dev/fuse file descriptor"
+                );
+            }
+        }
+        if let Some(dir) = vfs_seed_dir {
+            if !dir.is_dir() {
+                anyhow::bail!(
+                    "--vfs-seed-dir '{}' is not an existing directory",
+                    dir.display()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_early_command_flags(cmd: &Commands) -> anyhow::Result<()> {
+    match cmd {
+        Commands::Up {
+            vfs_webdav_listen,
+            vfs_fuse_fd,
+            vfs_seed_dir,
+            ..
+        }
+        | Commands::Daemon {
+            action:
+                DaemonAction::Start {
+                    vfs_webdav_listen,
+                    vfs_fuse_fd,
+                    vfs_seed_dir,
+                    ..
+                },
+        } => validate_builtin_vfs_flags(
+            vfs_webdav_listen.as_deref(),
+            *vfs_fuse_fd,
+            vfs_seed_dir.as_deref(),
+        ),
+        _ => Ok(()),
+    }
 }
 
 fn command_needs_network_discovery(cmd: &Commands) -> bool {
@@ -333,6 +403,8 @@ async fn main() -> anyhow::Result<()> {
         return parvault::gateway::execute_gateway_cli(opts, action, &cfg, cli.profile, &cli.peers)
             .await;
     }
+
+    validate_early_command_flags(&cli.command)?;
 
     let node_identity = NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?;
     let explicit_peers = cfg.effective_peers(&cli.peers);
@@ -735,7 +807,16 @@ async fn main() -> anyhow::Result<()> {
             allow_peer_uid,
             require_sealed_memfd,
             macaroon_root_key_hex,
+            vfs_webdav_listen,
+            vfs_fuse_fd,
+            vfs_seed_dir,
+            vfs_cache_mib,
         } => {
+            validate_builtin_vfs_flags(
+                vfs_webdav_listen.as_deref(),
+                vfs_fuse_fd,
+                vfs_seed_dir.as_deref(),
+            )?;
             let strict_allowed_peer_uids = parvault::gateway::validate_plugin_security_flags(
                 ipc_socket.is_some(),
                 no_socket,
@@ -765,6 +846,10 @@ async fn main() -> anyhow::Result<()> {
                 strict_allowed_peer_uids,
                 require_sealed_ingest_memfd: require_sealed_memfd,
                 macaroon_root_key,
+                vfs_webdav_listen,
+                vfs_fuse_fd,
+                vfs_seed_dir,
+                vfs_cache_mib,
                 watch_folder: effective_folder,
                 sync_interval_secs: interval_secs.max(1),
                 sync_tier: effective_tier,
@@ -1024,7 +1109,16 @@ async fn main() -> anyhow::Result<()> {
                 allow_peer_uid,
                 require_sealed_memfd,
                 macaroon_root_key_hex,
+                vfs_webdav_listen,
+                vfs_fuse_fd,
+                vfs_seed_dir,
+                vfs_cache_mib,
             } => {
+                validate_builtin_vfs_flags(
+                    vfs_webdav_listen.as_deref(),
+                    vfs_fuse_fd,
+                    vfs_seed_dir.as_deref(),
+                )?;
                 let strict_allowed_peer_uids = parvault::gateway::validate_plugin_security_flags(
                     ipc_socket.is_some(),
                     no_socket,
@@ -1046,6 +1140,10 @@ async fn main() -> anyhow::Result<()> {
                     strict_allowed_peer_uids,
                     require_sealed_ingest_memfd: require_sealed_memfd,
                     macaroon_root_key,
+                    vfs_webdav_listen,
+                    vfs_fuse_fd,
+                    vfs_seed_dir,
+                    vfs_cache_mib,
                     watch_folder: None,
                     sync_interval_secs: 5,
                     sync_tier: cfg.default_tier,
@@ -2292,27 +2390,34 @@ async fn run_daemon(
     };
 
     #[cfg(unix)]
-    let mut ipc_gateway_handle = if let Some(ref sock_path) = opts.ipc_socket {
+    let builtin_vfs_requested = opts.vfs_webdav_listen.is_some()
+        || opts.vfs_fuse_fd.is_some()
+        || opts.vfs_seed_dir.is_some();
+
+    #[cfg(unix)]
+    let shared_gateway_engine = if opts.ipc_socket.is_some() || builtin_vfs_requested {
         let mk = resolve_master_key(
             &cfg.data_dir,
             None,
             cfg.device_sealing_passphrase.as_deref(),
         )?;
-        let mut ipc_srv = parvault::gateway::ipc::GatewayIpcServer::new(
-            sock_path.clone(),
-            block_store.clone(),
-            mk,
-        )
-        .with_profile(cfg.hardware_profile)
-        .with_tier(opts.sync_tier)
-        .with_require_sealed_ingest_memfd(opts.require_sealed_ingest_memfd);
-        if let Some(root_key) = opts.macaroon_root_key {
-            ipc_srv = ipc_srv.with_macaroon_root_key(root_key);
-        }
-        if let Some(ref uids) = opts.strict_allowed_peer_uids {
-            ipc_srv = ipc_srv.with_strict_allowed_peer_uids(uids.clone());
-        }
-        let handle = ipc_srv.spawn()?;
+        let eng = parvault::gateway::GatewayEngine::from_local_block_store(block_store.clone(), mk);
+        eng.set_stripe_size_bytes(cfg.hardware_profile.stripe_size_bytes());
+        eng.set_tier(opts.sync_tier);
+        eng.set_macaroon_root_key(opts.macaroon_root_key);
+        eng.set_strict_allowed_peer_uids(opts.strict_allowed_peer_uids.clone());
+        eng.set_require_sealed_ingest_memfd(opts.require_sealed_ingest_memfd);
+        Some(Arc::new(eng))
+    } else {
+        None
+    };
+
+    #[cfg(unix)]
+    let mut ipc_gateway_handle = if let (Some(ref sock_path), Some(ref eng)) =
+        (&opts.ipc_socket, &shared_gateway_engine)
+    {
+        let handle =
+            parvault::gateway::ipc::GatewayIpcServer::bind(sock_path, Arc::clone(eng))?.spawn()?;
         println!(
             "[parvault] Zero-Copy IPC Gateway listening on unix://{} (strict_plugins={}, sealed_memfd={})",
             sock_path.display(),
@@ -2324,12 +2429,78 @@ async fn run_daemon(
     } else {
         None
     };
+
+    #[cfg(all(unix, feature = "vfs"))]
+    let mut builtin_vfs_webdav_handle = if builtin_vfs_requested {
+        let eng = shared_gateway_engine
+            .as_ref()
+            .expect("shared_gateway_engine initialized when builtin_vfs_requested");
+        let cache_bytes = opts.vfs_cache_mib.max(1).saturating_mul(1024 * 1024);
+        let vfs = parvault::vfs::VirtualVaultFs::with_bus(
+            parvault::gateway::ipc::GatewayBus::in_process(Arc::clone(eng)),
+            cfg.data_dir.join("vfs_cache"),
+            cache_bytes,
+        )?;
+        if let Some(ref seed_dir) = opts.vfs_seed_dir {
+            let seeded = vfs.ingest_local_directory(seed_dir)?;
+            info!(
+                seed_dir = %seed_dir.display(),
+                seeded,
+                "Ingested built-in VFS seed directory"
+            );
+        }
+        if let Some(fuse_fd) = opts.vfs_fuse_fd {
+            let fuse_dev = parvault::os_sys::adopt_fuse_dev_fd(fuse_fd)?;
+            let vfs_fuse = vfs.clone();
+            std::thread::Builder::new()
+                .name("parvault-builtin-fuse".into())
+                .spawn(move || {
+                    if let Err(e) = vfs_fuse.serve_fuse_fd_blocking(fuse_dev) {
+                        warn!(error = %e, "Built-in FUSE protocol loop exited with error");
+                    }
+                })?;
+            println!(
+                "[parvault] Built-in VFS FUSE active on fd {} (in-process GatewayBus, socket={})",
+                fuse_fd,
+                opts.ipc_socket.is_some()
+            );
+        }
+        if let Some(ref webdav_addr) = opts.vfs_webdav_listen {
+            let handle = vfs.spawn_webdav_server(webdav_addr)?;
+            println!(
+                "[parvault] Built-in VFS WebDAV listening on http://{} (in-process GatewayBus, socket={})",
+                handle.local_addr(),
+                opts.ipc_socket.is_some()
+            );
+            info!(addr = %handle.local_addr(), "Built-in VFS WebDAV server active");
+            Some(handle)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    #[cfg(all(unix, not(feature = "vfs")))]
+    {
+        let _ = (
+            &opts.vfs_webdav_listen,
+            opts.vfs_fuse_fd,
+            &opts.vfs_seed_dir,
+            opts.vfs_cache_mib,
+        );
+    }
+
     #[cfg(not(unix))]
     {
         let _ = (
             &opts.strict_allowed_peer_uids,
             opts.require_sealed_ingest_memfd,
             &opts.macaroon_root_key,
+            &opts.vfs_webdav_listen,
+            opts.vfs_fuse_fd,
+            &opts.vfs_seed_dir,
+            opts.vfs_cache_mib,
         );
         if opts.ipc_socket.is_some() {
             anyhow::bail!(
@@ -2576,6 +2747,10 @@ async fn run_daemon(
         }
     }
 
+    #[cfg(all(unix, feature = "vfs"))]
+    if let Some(ref mut webdav_handle) = builtin_vfs_webdav_handle {
+        webdav_handle.shutdown();
+    }
     #[cfg(unix)]
     if let Some(ref mut ipc_handle) = ipc_gateway_handle {
         ipc_handle.shutdown();

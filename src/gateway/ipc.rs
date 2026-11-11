@@ -1110,6 +1110,170 @@ mod unix_impl {
                 Self::UnixSocket(client) => client.query_health().await,
             }
         }
+
+        // --- Synchronous Blocking Surface (`FUSE`, `WebDAV`, `GatewayFolderSync`) ---
+
+        fn ensure_in_process_peer_uid(engine: &GatewayEngine) -> io::Result<()> {
+            let uid = Some(crate::os_sys::geteuid());
+            if !engine.is_peer_uid_allowed(uid) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("peer UID {uid:?} rejected by strict_allowed_peer_uids policy"),
+                ));
+            }
+            Ok(())
+        }
+
+        /// Blocking `StorePayload` over either in-process `Arc<GatewayEngine>` or `GatewayIpcClient`.
+        /// Enforces `require_sealed_ingest_memfd` identically across `InProcess` and `UnixSocket`.
+        pub fn store_memfd_sync(
+            &self,
+            payload_fd: RawFd,
+            bytes_len: u64,
+            retention: RetentionPolicy,
+        ) -> io::Result<EphemeralShardManifest> {
+            match self {
+                Self::InProcess(engine) => {
+                    Self::ensure_in_process_peer_uid(engine)?;
+                    let dup = crate::os_sys::dup_fd_cloexec(payload_fd)?;
+                    if engine.require_sealed_ingest_memfd()
+                        && !crate::os_sys::has_immutable_memfd_seals(dup.as_fd()).unwrap_or(false)
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "unsealed ingest memfd rejected (F_SEAL_WRITE|F_SEAL_SHRINK|F_SEAL_GROW required)",
+                        ));
+                    }
+                    engine
+                        .store_from_owned_fd(dup, bytes_len, retention)
+                        .map_err(|e| io::Error::other(format!("StorePayload failed: {e}")))
+                }
+                Self::UnixSocket(client) => client.store_memfd(payload_fd, bytes_len, retention),
+            }
+        }
+
+        /// Seals `payload_fd` with `F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE`
+        /// (if not already immutably sealed) and stores `bytes_len` bytes synchronously.
+        pub fn store_sealed_memfd_sync(
+            &self,
+            payload_fd: RawFd,
+            bytes_len: u64,
+            retention: RetentionPolicy,
+        ) -> io::Result<EphemeralShardManifest> {
+            match self {
+                Self::InProcess(engine) => {
+                    Self::ensure_in_process_peer_uid(engine)?;
+                    let dup = crate::os_sys::dup_fd_cloexec(payload_fd)?;
+                    if !crate::os_sys::has_immutable_memfd_seals(dup.as_fd())? {
+                        crate::os_sys::seal_memfd_immutable(dup.as_fd())?;
+                    }
+                    engine
+                        .store_from_owned_fd(dup, bytes_len, retention)
+                        .map_err(|e| io::Error::other(format!("StorePayload failed: {e}")))
+                }
+                Self::UnixSocket(client) => {
+                    client.store_sealed_memfd(payload_fd, bytes_len, retention)
+                }
+            }
+        }
+
+        /// Reconstructs the full payload identified by `ephemeral_shard_ids` into `output_fd` synchronously.
+        pub fn fetch_into_memfd_sync(
+            &self,
+            ephemeral_shard_ids: Vec<[u8; 32]>,
+            output_fd: RawFd,
+        ) -> io::Result<u64> {
+            match self {
+                Self::InProcess(engine) => {
+                    Self::ensure_in_process_peer_uid(engine)?;
+                    let dup = crate::os_sys::dup_fd_cloexec(output_fd)?;
+                    engine
+                        .fetch_by_shard_ids_to_owned_fd(&ephemeral_shard_ids, dup)
+                        .map_err(|e| io::Error::other(format!("FetchPayload failed: {e}")))
+                }
+                Self::UnixSocket(client) => client.fetch_into_memfd(ephemeral_shard_ids, output_fd),
+            }
+        }
+
+        /// Fetches `[offset .. offset + len]` into `output_fd` synchronously, enforcing `macaroon`
+        /// and `peer_uid` (`Some(geteuid())` in-process vs `SO_PEERCRED` over Unix socket) identically.
+        pub fn fetch_range_into_memfd_sync(
+            &self,
+            manifest: &EphemeralShardManifest,
+            offset: u64,
+            len: u64,
+            output_fd: RawFd,
+            macaroon: Option<CapabilityMacaroon>,
+        ) -> io::Result<u64> {
+            match self {
+                Self::InProcess(engine) => {
+                    Self::ensure_in_process_peer_uid(engine)?;
+                    let dup = crate::os_sys::dup_fd_cloexec(output_fd)?;
+                    engine
+                        .fetch_range_to_owned_fd(manifest, offset, len, macaroon.as_ref(), dup)
+                        .map_err(|e| io::Error::other(format!("FetchRange failed: {e}")))
+                }
+                Self::UnixSocket(client) => {
+                    client.fetch_range_into_memfd(manifest, offset, len, output_fd, macaroon)
+                }
+            }
+        }
+
+        /// Allocates an ephemeral `memfd`, fetches `[offset .. offset + len]` synchronously, and
+        /// returns the verified plaintext slice.
+        pub fn fetch_range_bytes_sync(
+            &self,
+            manifest: &EphemeralShardManifest,
+            offset: u64,
+            len: u64,
+            macaroon: Option<CapabilityMacaroon>,
+        ) -> io::Result<Vec<u8>> {
+            match self {
+                Self::InProcess(_) => {
+                    let mfd = create_memfd("parvault-range")?;
+                    let streamed = self.fetch_range_into_memfd_sync(
+                        manifest,
+                        offset,
+                        len,
+                        mfd.as_raw_fd(),
+                        macaroon,
+                    )?;
+                    let mut file = File::from(mfd);
+                    file.seek(SeekFrom::Start(0))?;
+                    let mut buf = vec![0u8; streamed as usize];
+                    file.read_exact(&mut buf)?;
+                    Ok(buf)
+                }
+                Self::UnixSocket(client) => {
+                    client.fetch_range_bytes(manifest, offset, len, macaroon)
+                }
+            }
+        }
+
+        /// Registers an existing or sparse virtual `FileManifest` synchronously.
+        pub fn register_manifest_sync(
+            &self,
+            file_manifest: FileManifest,
+        ) -> io::Result<EphemeralShardManifest> {
+            match self {
+                Self::InProcess(engine) => {
+                    Self::ensure_in_process_peer_uid(engine)?;
+                    Ok(engine.register_manifest(file_manifest))
+                }
+                Self::UnixSocket(client) => client.register_manifest(file_manifest),
+            }
+        }
+
+        /// Queries `(iops, peer_count, por_sla_score)` synchronously.
+        pub fn query_health_sync(&self) -> io::Result<(u64, usize, f32)> {
+            match self {
+                Self::InProcess(engine) => {
+                    Self::ensure_in_process_peer_uid(engine)?;
+                    Ok(engine.health_snapshot())
+                }
+                Self::UnixSocket(client) => client.query_health_sync(),
+            }
+        }
     }
 }
 

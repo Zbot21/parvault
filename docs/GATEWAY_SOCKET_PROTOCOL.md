@@ -1,33 +1,34 @@
 # ParVault Zero-Copy Unix Socket & `GatewayBus` Plugin Protocol Specification (`v0.5.0`)
 
-- **Governing ADRs:** [`ADR-27`](adr/ADR-27-zero-copy-uds-gateway-and-hedged-pool.md), [`ADR-28`](adr/ADR-28-stateless-macaroon-capability-attenuation.md), [`ADR-29`](adr/ADR-29-pure-rust-fuse-and-webdav-lazy-vfs.md), [`ADR-31`](adr/ADR-31-unsafe-remediation-and-os-sys-ffi-boundary.md), [`ADR-32`](adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md)
-- **Canonical Reference Plugin:** [`src/bin/parvault-fuse.rs`](../src/bin/parvault-fuse.rs) (`parvault-fuse`)
-- **Core Implementation:** [`src/gateway/`](../src/gateway/), [`src/capabilities.rs`](../src/capabilities.rs), [`src/os_sys.rs`](../src/os_sys.rs)
+- **Governing ADRs:** [`ADR-27`](adr/ADR-27-zero-copy-uds-gateway-and-hedged-pool.md), [`ADR-28`](adr/ADR-28-stateless-macaroon-capability-attenuation.md), [`ADR-29`](adr/ADR-29-pure-rust-fuse-and-webdav-lazy-vfs.md), [`ADR-31`](adr/ADR-31-unsafe-remediation-and-os-sys-ffi-boundary.md), [`ADR-32`](adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md), [`ADR-33`](adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md)
+- **Canonical Reference Plugins:** [`src/bin/parvault-fuse.rs`](../src/bin/parvault-fuse.rs) (`parvault-fuse`) & [`src/bin/parvault-sync.rs`](../src/bin/parvault-sync.rs) (`parvault-sync`)
+- **Core Implementation:** [`src/gateway/`](../src/gateway/), [`src/vfs.rs`](../src/vfs.rs), [`src/sync.rs`](../src/sync.rs), [`src/capabilities.rs`](../src/capabilities.rs), [`src/os_sys.rs`](../src/os_sys.rs)
 
 ---
 
-## 1. Architecture Overview: Single Core Daemon + Isolated Plugins
+## 1. Architecture Overview: Single Core Daemon + Dual-Mode Plugins
 
 In `v0.5.0`, **`parvault up --ipc-socket /var/run/parvault.sock`** is the canonical single-daemon host. One `parvault` process simultaneously runs:
 
 1. Inbound + outbound reciprocal `libp2p` (`TCP + Noise XX + Yamux`) shard storage, Proof-of-Retrievability (`PoR`) auditing, 30-second bit-rot scrubbing, and zero-IP LAN/WAN discovery;
-2. Optional background POSIX folder backup (`--watch` / `FolderSyncEngine`); and
-3. The hardened zero-copy Unix Domain Socket server (`GatewayIpcServer`) on `/var/run/parvault.sock` (`0600` permissions by default).
+2. Optional background POSIX folder backup (`--watch` / `FolderSyncEngine`);
+3. The hardened zero-copy Unix Domain Socket server (`GatewayIpcServer`) on `/var/run/parvault.sock` (`0600` permissions by default); and
+4. Optional built-in `=y` `VirtualVaultFs` hosting (`--vfs-webdav-listen <ADDR>`, `--vfs-fuse-fd <FD>`, `--vfs-seed-dir <DIR>`, `--vfs-cache-mib <MiB>`) sharing the exact same `Arc<GatewayEngine>` via `GatewayBus::InProcess` — even when `--no-socket` is passed (`0` `.sock` files on disk).
 
 No second `parvault-gateway` daemon binary is required (`parvault gateway serve` remains available as a subcommand inside `parvault` for standalone outbound 40-lane socket benchmarking).
 
-### Why `parvault-fuse` Ships as the Canonical Reference Plugin Binary
+### Why `parvault-fuse` and `parvault-sync` Ship as Canonical Sibling Plugin Binaries
 
-Even though [`src/vfs.rs`](../src/vfs.rs) implements a 100% pure-Rust Linux `/dev/fuse` (`ABI 7.31`) loop with **zero** C `libfuse3` or `fuser` dependency (preserving stripped static `musl` builds on `x86_64` and `aarch64`), [`src/bin/parvault-fuse.rs`](../src/bin/parvault-fuse.rs) is packaged as a standalone `< 215`-line plugin binary for two reasons:
+Even though [`src/vfs.rs`](../src/vfs.rs) and [`src/sync.rs`](../src/sync.rs) can run in-process inside `parvault`, [`src/bin/parvault-fuse.rs`](../src/bin/parvault-fuse.rs) (lazy `/dev/fuse` `ABI 7.31` + HTTP `Range` / WebDAV) and [`src/bin/parvault-sync.rs`](../src/bin/parvault-sync.rs) (`GatewayFolderSync` `diff`, `push`, `watch`, `pull`, `list`, `self-test` — compiled even under `--no-default-features`) ship as standalone `#![forbid(unsafe_code)]` sibling binaries for two reasons:
 
-1. **Copy-Paste Developer Reference:** Third-party and companion plugins (`parvault-dvr`, `parvault-s3d`, `parvault-auth-broker`, `parvault-isp-agent`) can use `src/bin/parvault-fuse.rs` as a complete, minimal reference client speaking sealed `memfd` `SCM_RIGHTS` + `PARVAULT-MAC-V1:` macaroons over `/var/run/parvault.sock`.
-2. **Process & UID Privilege Separation:** Frontends that mount `/dev/fuse` (`fusermount3`) or expose LAN HTTP-Range / WebDAV / S3 ports run under a dedicated unprivileged POSIX user (for example UID `1042`) with **zero** `MasterKey` material in process memory, gated by `parvault up --ipc-socket /var/run/parvault.sock --strict-plugins --allow-peer-uid 1042 --require-sealed-memfd`.
+1. **Copy-Paste Developer Reference:** Third-party and companion plugins (`parvault-dvr`, `parvault-s3d`, `parvault-auth-broker`, `parvault-isp-agent`) can use `parvault-fuse` and `parvault-sync` as complete, minimal reference clients speaking sealed `memfd` `SCM_RIGHTS` + `PARVAULT-MAC-V1:` macaroons over `/var/run/parvault.sock`.
+2. **Process & UID Privilege Separation (`Zero-Key` Sync & VFS):** Frontends that mount `/dev/fuse` (`fusermount3`), expose LAN HTTP-Range / WebDAV ports, or crawl untrusted container directories (`parvault-sync`) run under a dedicated unprivileged POSIX user (for example UID `1042`) with **zero** `MasterKey` and **zero** `NodeIdentity` secrets in process memory or `GatewayFolderCatalog` state, gated by `parvault up --ipc-socket /var/run/parvault.sock --strict-plugins --allow-peer-uid 1042 --require-sealed-memfd`.
 
-### Dual-Mode `GatewayBus` (`=y` Built-In vs. `=m` Split Plugin)
+### Dual-Mode `GatewayBus` (`=y` Built-In vs. `=m` Split Plugin, Async + Sync Surface)
 
-[`parvault::gateway::GatewayBus`](../src/gateway/ipc.rs) exposes one unified async Rust API across both deployment models:
+[`parvault::gateway::GatewayBus`](../src/gateway/ipc.rs) exposes both an async Tokio surface and a synchronous blocking surface (`store_memfd_sync`, `store_sealed_memfd_sync`, `fetch_into_memfd_sync`, `fetch_range_into_memfd_sync`, `fetch_range_bytes_sync`, `register_manifest_sync`, `query_health_sync`) across both deployment models:
 
-- **`GatewayBus::InProcess(Arc<GatewayEngine>)` (`--no-socket`, Linux-kernel `=y` style):** Embeds the streaming gateway directly in-process with zero filesystem socket exposed and zero serialized IPC overhead. Duplicate file descriptors are created safely via `fcntl(F_DUPFD_CLOEXEC)` (`os_sys::dup_fd_cloexec`) and verified against `Some(geteuid())`.
+- **`GatewayBus::InProcess(Arc<GatewayEngine>)` (`--no-socket`, Linux-kernel `=y` style):** Embeds the streaming gateway directly in-process with zero filesystem socket exposed and zero serialized IPC overhead. Duplicate file descriptors are created safely via `fcntl(F_DUPFD_CLOEXEC)` (`os_sys::dup_fd_cloexec`), checked for `F_ADD_SEALS` immutability when `require_sealed_ingest_memfd` is active, and verified against `Some(geteuid())`.
 - **`GatewayBus::UnixSocket(GatewayIpcClient)` (`--ipc-socket /var/run/parvault.sock`, Linux-kernel `=m` style):** Connects out-of-process plugins over `AF_UNIX` `SOCK_STREAM` with `SCM_RIGHTS` `memfd` zero-copy descriptor passing and kernel `SO_PEERCRED` UID verification.
 
 ---
@@ -170,6 +171,18 @@ parvault --data-dir /var/lib/parvault up \
   --require-sealed-memfd
 
 parvault-fuse --socket /var/run/parvault.sock --macaroon "${PLUGIN_TOK}" webdav --listen 127.0.0.1:4918
+
+# 5. Zero-key incremental folder push & macaroon-attenuated selective pull via parvault-sync (=m)
+parvault-sync --socket /var/run/parvault.sock --catalog ./gw-catalog.bin push --folder /srv/project
+parvault-sync --socket /var/run/parvault.sock --catalog ./gw-catalog.bin --macaroon "${PLUGIN_TOK}" \
+  pull --output /tmp/restored-docs --filter "docs/*"
+
+# 6. Or run built-in (=y) WebDAV VFS inside parvault with --no-socket (zero .sock file on disk!)
+parvault --data-dir /var/lib/parvault up \
+  --no-socket \
+  --vfs-seed-dir /srv/media \
+  --vfs-cache-mib 64 \
+  --vfs-webdav-listen 127.0.0.1:4918
 ```
 
 ---
@@ -180,9 +193,9 @@ Operators and firmware integrators should consult the matrix below to understand
 
 | Mode / Build Configuration | Inbound P2P Shard Hosting & PoR Listener | Outbound Mesh Sharding & Restore | Local Folder Crawler (`FolderSyncEngine`) | Plugin Socket (`/var/run/parvault.sock`) | Key Operational Notes & Guardrails |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`parvault up --ipc-socket /var/run/parvault.sock`** *(Canonical Single-Daemon Host)* | **Active** (`PutShard`, `GetShard`, PoR, 30s bit-rot scrub, LAN/WAN pairing) | **Active** (`MeshClient` + `BlockStore`) | **Optional** (`--folder` / `watched_folder`) | **Active** (`GatewayIpcServer`) | Recommended single-process deployment for homelabs, desktops, and CPE routers. Auto-loads `<data_dir>/macaroon_root.key` if present. |
-| **`parvault up --no-socket`** | **Active** | **Active** | **Optional** | **Disabled** (`0` socket files) | Eliminates local Unix socket attack surface entirely; passing both `--no-socket` and `--ipc-socket` fails fast at CLI startup. |
-| **`parvault gateway serve`** *(Standalone Outbound Benchmark / Bridge)* | **Inactive** *(Rough Edge 1)* | **Active** (`40`-lane hedged `MeshClient` pool) | **Inactive** *(Rough Edge 2)* | **Active** (unless `--no-socket`) | **Rough Edge 1:** Outbound mesh client + local socket server only; a cluster composed *solely* of `gateway serve` processes has no inbound storage peers to host shards. **Rough Edge 2:** `watched_folder` in `config.toml` is ignored and emits an explicit startup `WARN` log; push backups via `/var/run/parvault.sock` or use `parvault up --watch`. |
-| **`cargo build --no-default-features --bin parvault --bin parvault-seed`** | **Active** (`parvault up` / `parvault-seed`) | **Active** | **Active** (`parvault`) | **Active** (`parvault`) | Excludes `vfs` (`src/vfs.rs` and `parvault-fuse`) from compilation for minimal core footprints when FUSE/WebDAV runs in a separate plugin container or is unused. |
+| **`parvault up --ipc-socket /var/run/parvault.sock`** *(Canonical Single-Daemon Host)* | **Active** (`PutShard`, `GetShard`, PoR, 30s bit-rot scrub, LAN/WAN pairing) | **Active** (`MeshClient` + `BlockStore`) | **Optional** (`--folder` / `watched_folder`) | **Active** (`GatewayIpcServer`) | Recommended single-process deployment for homelabs, desktops, and CPE routers. Auto-loads `<data_dir>/macaroon_root.key` if present; also supports built-in `=y` `--vfs-webdav-listen` / `--vfs-fuse-fd` sharing the same `Arc<GatewayEngine>`. |
+| **`parvault up --no-socket [--vfs-webdav-listen <ADDR>]`** | **Active** | **Active** | **Optional** | **Disabled** (`0` socket files) | Eliminates local Unix socket attack surface entirely while still permitting built-in `=y` WebDAV / `/dev/fuse` VFS over `GatewayBus::InProcess`; passing both `--no-socket` and `--ipc-socket` fails fast at CLI startup. |
+| **`parvault gateway serve`** *(Standalone Outbound Benchmark / Bridge)* | **Inactive** *(Rough Edge 1)* | **Active** (`40`-lane hedged `MeshClient` pool) | **Inactive** *(Rough Edge 2)* | **Active** (unless `--no-socket`) | **Rough Edge 1:** Outbound mesh client + local socket server only; a cluster composed *solely* of `gateway serve` processes has no inbound storage peers to host shards. **Rough Edge 2:** `watched_folder` in `config.toml` is ignored and emits an explicit startup `WARN` log; push backups via `parvault-sync` over `/var/run/parvault.sock` or use `parvault up --watch`. |
+| **`cargo build --no-default-features --bin parvault --bin parvault-seed --bin parvault-sync`** | **Active** (`parvault up` / `parvault-seed`) | **Active** | **Active** (`parvault` + zero-key `parvault-sync`) | **Active** (`parvault`) | Excludes `vfs` (`src/vfs.rs` and `parvault-fuse`) from compilation for minimal core footprints while still compiling `parvault-sync`. Passing `--vfs-webdav-listen` or `--vfs-fuse-fd` to a `--no-default-features` `parvault` binary fails fast with an actionable error instructing the operator to run `parvault-fuse` over `--ipc-socket` or rebuild with `--features vfs`. |
 | **`--strict-plugins --allow-peer-uid <UID,...>`** | *(Inherits host mode)* | *(Inherits host mode)* | *(Inherits host mode)* | **UID-Allowlisted (`SO_PEERCRED`)** | Calls `getsockopt(SOL_SOCKET, SO_PEERCRED)` immediately on `accept()` (both sync and async Tokio loops) and drops unauthorized UIDs **before reading 1 byte**. Passing `--strict-plugins` with an empty `--allow-peer-uid` list fails fast at CLI startup (`anyhow::bail!`). |
 | **`--require-sealed-memfd`** | *(Inherits host mode)* | *(Inherits host mode)* | *(Inherits host mode)* | **Sealed `memfd` Required** | Rejects any `StorePayload` descriptor lacking `F_SEAL_WRITE \| F_SEAL_SHRINK \| F_SEAL_GROW` before reading or encrypting any byte. Custom C/Go/Rust plugins **must** call `fcntl(F_ADD_SEALS)` prior to `sendmsg`. |

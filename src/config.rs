@@ -437,6 +437,22 @@ pub enum Commands {
         /// Optional 64-character hex 32-byte `K_macaroon_root` key enforcing `< 1 ms` in-RAM capability verification.
         #[arg(long, value_name = "64-HEX")]
         macaroon_root_key_hex: Option<String>,
+
+        /// Optional bind address for the built-in (`=y`) VFS HTTP `Range` (`206`) + WebDAV server (works even with `--no-socket`).
+        #[arg(long, value_name = "ADDR")]
+        vfs_webdav_listen: Option<String>,
+
+        /// Optional pre-mounted `/dev/fuse` file descriptor for the built-in (`=y`) pure-Rust FUSE protocol loop.
+        #[arg(long, value_name = "FD")]
+        vfs_fuse_fd: Option<i32>,
+
+        /// Optional local directory to ingest into the built-in (`=y`) VFS at startup (honors `.parvaultignore`).
+        #[arg(long, value_name = "DIR")]
+        vfs_seed_dir: Option<PathBuf>,
+
+        /// Bounded local LRU block cache capacity in MiB for the built-in (`=y`) VFS.
+        #[arg(long, default_value_t = 64, value_name = "MIB")]
+        vfs_cache_mib: u64,
     },
     /// Evict a bad actor or illegal content (0x00 zero-wipe + unlink + keyed HMAC ingress firewall, zero plaintext IPs on disk — ADR-19).
     Evict {
@@ -724,6 +740,22 @@ pub enum DaemonAction {
         /// Optional 64-character hex 32-byte `K_macaroon_root` key enforcing `< 1 ms` in-RAM capability verification.
         #[arg(long, value_name = "64-HEX")]
         macaroon_root_key_hex: Option<String>,
+
+        /// Optional bind address for the built-in (`=y`) VFS HTTP `Range` (`206`) + WebDAV server (works even with `--no-socket`).
+        #[arg(long, value_name = "ADDR")]
+        vfs_webdav_listen: Option<String>,
+
+        /// Optional pre-mounted `/dev/fuse` file descriptor for the built-in (`=y`) pure-Rust FUSE protocol loop.
+        #[arg(long, value_name = "FD")]
+        vfs_fuse_fd: Option<i32>,
+
+        /// Optional local directory to ingest into the built-in (`=y`) VFS at startup (honors `.parvaultignore`).
+        #[arg(long, value_name = "DIR")]
+        vfs_seed_dir: Option<PathBuf>,
+
+        /// Bounded local LRU block cache capacity in MiB for the built-in (`=y`) VFS.
+        #[arg(long, default_value_t = 64, value_name = "MIB")]
+        vfs_cache_mib: u64,
     },
 }
 
@@ -1519,5 +1551,29 @@ mod tests {
         ])
         .expect("parse gateway serve");
         assert!(matches!(gw_cli.command, Commands::Gateway { .. }));
+
+        let builtin_vfs_cli = Cli::try_parse_from([
+            "parvault",
+            "up",
+            "--no-socket",
+            "--vfs-webdav-listen",
+            "127.0.0.1:0",
+            "--vfs-fuse-fd",
+            "3",
+            "--vfs-seed-dir",
+            "/mnt/usb/seed",
+            "--vfs-cache-mib",
+            "32",
+        ])
+        .expect("parse up with built-in vfs");
+        assert!(matches!(
+            builtin_vfs_cli.command,
+            Commands::Up {
+                no_socket: true,
+                vfs_fuse_fd: Some(3),
+                vfs_cache_mib: 32,
+                ..
+            }
+        ));
     }
 }

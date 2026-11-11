@@ -1,6 +1,6 @@
 # AI Agent & Systems Engineer Guide (`AGENTS.md`)
 
-This document is the authoritative architectural, security, and verification manual for AI coding agents and human systems engineers working on **`parvault`** (`v0.5.0`, library crate `parvault`, binaries `parvault`, `parvault-seed`, `parvault-fuse`, and `parvault-bench`).
+This document is the authoritative architectural, security, and verification manual for AI coding agents and human systems engineers working on **`parvault`** (`v0.5.0`, library crate `parvault`, binaries `parvault`, `parvault-seed`, `parvault-fuse`, `parvault-sync`, and `parvault-bench`).
 
 ---
 
@@ -10,16 +10,18 @@ This document is the authoritative architectural, security, and verification man
 
 ### Binaries & Library Targets (`Cargo.toml`)
 1. **Library Crate (`parvault` — `src/lib.rs`, `#![deny(unsafe_code)]`):**
-   Embeddable Rust API exposing streaming encryption, Reed-Solomon erasure coding over $GF(2^8)$, incremental folder synchronization (`FolderSyncEngine`), `libp2p` P2P client/daemon networking (`MeshClient`), transport-agnostic `GatewayBus` (`InProcess` vs. `UnixSocket` `SCM_RIGHTS` `memfd` IPC in `gateway`), stateless `CapabilityMacaroon` attenuation & `PARVAULT-MAC-V1:` compact tokens (`capabilities`), pure-Rust `/dev/fuse` lazy VFS (`vfs`), audited Unix kernel wrappers (`os_sys`), Web-of-Trust admission, Proof-of-Retrievability (`PoR`), and elastic bootstrap state machines.
-2. **Consolidated Client, Peer Daemon & Plugin Host (`parvault` — `src/main.rs`, `#![forbid(unsafe_code)]`):**
-   Runs on user workstations, laptops, desktops, routers, or homelab nodes (`init`, `up`, `discover`, `pair`, `join`, `watch-folder`, `diff-folder`, `list-snapshot`, `restore-folder`, `recover-from-seed`, `file store`, `file restore`, `evict`, `report-abuse`, `cosign-eviction`, `identity`, `issue-device-cert`, `verify-device-cert`, `scrub`, `leave`, `status`, `daemon start`, `token {mint,attenuate,inspect}`, `gateway {serve,health,ipc-roundtrip,self-test}`). Supports both built-in `=y` mode (`--no-socket` / `GatewayBus::InProcess`) and hardened split-plugin `=m` host mode (`--ipc-socket /var/run/parvault.sock --strict-plugins --allow-peer-uid <UID> --require-sealed-memfd`; see [`docs/GATEWAY_SOCKET_PROTOCOL.md`](docs/GATEWAY_SOCKET_PROTOCOL.md) and [`ADR-32`](docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md)).
+   Embeddable Rust API exposing streaming encryption, Reed-Solomon erasure coding over $GF(2^8)$, incremental folder synchronization (`FolderSyncEngine` + zero-key `GatewayFolderSync`), `libp2p` P2P client/daemon networking (`MeshClient`), transport-agnostic `GatewayBus` (`InProcess` vs. `UnixSocket` `SCM_RIGHTS` `memfd` IPC in `gateway`, async + synchronous `*_sync` surface), stateless `CapabilityMacaroon` attenuation & `PARVAULT-MAC-V1:` compact tokens (`capabilities`), dual-mode `/dev/fuse` + WebDAV lazy VFS (`vfs`), audited Unix kernel wrappers (`os_sys`), Web-of-Trust admission, Proof-of-Retrievability (`PoR`), and elastic bootstrap state machines.
+2. **Consolidated Client, Peer Daemon, Built-In `=y` VFS & Plugin Host (`parvault` — `src/main.rs`, `#![forbid(unsafe_code)]`):**
+   Runs on user workstations, laptops, desktops, routers, or homelab nodes (`init`, `up`, `discover`, `pair`, `join`, `watch-folder`, `diff-folder`, `list-snapshot`, `restore-folder`, `recover-from-seed`, `file store`, `file restore`, `evict`, `report-abuse`, `cosign-eviction`, `identity`, `issue-device-cert`, `verify-device-cert`, `scrub`, `leave`, `status`, `daemon start`, `token {mint,attenuate,inspect}`, `gateway {serve,health,ipc-roundtrip,self-test}`). Supports both built-in `=y` mode (`--no-socket` + optional `--vfs-webdav-listen` / `--vfs-fuse-fd` / `--vfs-seed-dir` / `--vfs-cache-mib` over `GatewayBus::InProcess`) and hardened split-plugin `=m` host mode (`--ipc-socket /var/run/parvault.sock --strict-plugins --allow-peer-uid <UID> --require-sealed-memfd`; see [`docs/GATEWAY_SOCKET_PROTOCOL.md`](docs/GATEWAY_SOCKET_PROTOCOL.md), [`ADR-32`](docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md), and [`ADR-33`](docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md)).
 3. **Standalone Zero-Trust Seed & Redundancy Server (`parvault-seed` — `src/bin/parvault-seed.rs`, `#![forbid(unsafe_code)]`):**
    Runs on headless 24/7 hardware (NAS, Raspberry Pi, Unraid/TrueNAS, VPS, or pure RAM `--no-fs --in-memory-mb <MiB>`) in two strictly zero-plaintext modes (`holds_own_plaintext_files == false`):
    - `--mode homelab-vault` (`SeedServerMode::HomelabRedundancyVault`): Authenticates the owner's personal devices via post-quantum `PersonalDeviceCert`s (`0.0x` self-quota tax), syndicates Lite-Client `1.0x` stripes across mesh peers, and answers network PoR audits 24/7 to earn `TrustLevel::HighUptimeAnchor` (`16-of-20` `EarnedHomelabAnchorPool`, `5.0x` reciprocity multiplier).
    - `--mode public-bootstrap` (`SeedServerMode::PublicNetworkBootstrapper`): Stateless `FoundationSeedAnchor` (supporting `--no-fs` zero-filesystem mode and zero-private-key-on-VPS `admin_rpc` governance) that ingests only anonymized `.bshard` leases during cold-start (`1..19` peers) and automatically drains to `0` shards as verified organic community peers join.
 4. **Canonical Lazy-Streaming VFS Reference Plugin (`parvault-fuse` — `src/bin/parvault-fuse.rs`, `#![forbid(unsafe_code)]`):**
    Standalone out-of-process reference plugin (`--features vfs`, zero C `libfuse3`, zero `unsafe`) speaking [`docs/GATEWAY_SOCKET_PROTOCOL.md`](docs/GATEWAY_SOCKET_PROTOCOL.md) over `/var/run/parvault.sock` (`mount-fd` Linux `/dev/fuse` `ABI 7.31`, unprivileged HTTP `206` / WebDAV `PROPFIND`, and sealed-`memfd` folder `sync` with `--macaroon <PARVAULT-MAC-V1:...>` and bounded `LruBlockCache` `< 50 ms` TTFB).
-5. **Empirical Benchmark & Memory Telemetry Runner (`parvault-bench` — `src/bin/parvault-bench.rs`, `#![forbid(unsafe_code)]`):**
+5. **Zero-Key Incremental Folder Sync Sibling Plugin (`parvault-sync` — `src/bin/parvault-sync.rs`, `#![forbid(unsafe_code)]`):**
+   Standalone out-of-process folder synchronization plugin (`diff`, `push`, `watch`, `pull`, `list`, `self-test`; compiles even with `--no-default-features`) backed by `GatewayFolderSync` (`src/sync.rs`). Holds **zero** `MasterKey` and **zero** `NodeIdentity` secrets in process memory or `GatewayFolderCatalog` state, seals ingested `memfd`s (`F_ADD_SEALS`), enforces `sanitize_sync_relative_path` path-traversal rejection, and verifies streaming `SHA-256` digests on `1 MiB` chunked `--macaroon` restores (`ADR-33`).
+6. **Empirical Benchmark & Memory Telemetry Runner (`parvault-bench` — `src/bin/parvault-bench.rs`, `#![forbid(unsafe_code)]`):**
    Executes real wall-clock benchmarks (`Argon2id`, `AES-256-GCM`, `PqVaultMasterKey`, `X25519 + ML-KEM-768`, `Ed25519 + ML-DSA-65`, Reed-Solomon $GF(2^8)$) and Linux `/proc/self/status` (`VmRSS`, `VmHWM`) + `CLOCK_PROCESS_CPUTIME_ID` (`parvault::os_sys::process_cpu_time_ns`) streaming memory measurements.
 
 ---
@@ -48,13 +50,13 @@ This document is the authoritative architectural, security, and verification man
 | `src/storage/eviction.rs` | `PrivacyPreservingEvictionEngine`, `EvictionTarget` (IP, subnet, PeerId, pubkey, Merkle root, locator), `SignedBadActorEvictionOrder`, `EvictionOrderSliceView`, `EvictionPurgeReport`, `shred_and_unlink_file` (`0x00` wipe). Keyed HMAC-SHA256 indexing with ZERO plaintext IPs stored on disk. | `ADR-19` |
 | `src/storage/anonymity.rs` | 4-Layer Shard Anonymization: `BlindedShardId` (256-bit keyed HMAC locator under `blind_locator_subkey`), `BlindedShardCapability` ($V_i$ per-shard PoR/read key under `blind_capability_subkey` with $\pm 30\text{ s}$ NTP skew tolerance), `AnonymousQuotaVoucher` (ephemeral per-shard issuer via `mint_ephemeral`), `VoucherNullifierLedger` (bounded 65,536-entry FIFO persisted at `voucher_nullifiers.bin`), and `RelayedShardEnvelope`. | `ADR-11`, `ADR-15`, `ADR-16` |
 | `src/os_sys.rs` | Audited Unix/Linux kernel boundary (`#[cfg(unix)]`): 100% safe `pread_full_or_eof` & `pwrite_all` (`FileExt`), `/proc/self/status` RSS/HWM & `/proc/net/dev` readers, and all 13 narrowly scoped `#[allow(unsafe_code)]` POSIX syscall wrappers (`clock_gettime`, `geteuid`/`getegid`, `memfd_create`, `adopt_fuse_dev_fd`, `SCM_RIGHTS` `sendmsg`/`recvmsg`, `bind_reusable_udp_v4`, `peer_socket_ucred`, `seal_memfd_immutable`, `has_immutable_memfd_seals`, `dup_fd_cloexec`). | [`ADR-31`](docs/adr/ADR-31-unsafe-remediation-and-os-sys-ffi-boundary.md), [`ADR-32`](docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md) |
-| `src/gateway/` | `engine.rs` (`GatewayEngine` `40`-lane `128 KiB`-stack single-wave mesh pool, `strict_allowed_peer_uids`, `require_sealed_ingest_memfd`), `ipc.rs` (`GatewayBus`, `GatewayIpcServer`, `GatewayIpcClient`, `store_sealed_payload_fd`, `SO_PEERCRED` & `F_ADD_SEALS` enforcement), `cli_runner.rs` (`parvault token` & `parvault gateway` runners), and `shm.rs` (`SharedPayloadFd`, `0` `unsafe`). | [`ADR-27`](docs/adr/ADR-27-zero-copy-uds-gateway-and-hedged-pool.md), [`ADR-32`](docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md) |
+| `src/gateway/` | `engine.rs` (`GatewayEngine` `40`-lane `128 KiB`-stack single-wave mesh pool, `strict_allowed_peer_uids`, `require_sealed_ingest_memfd`), `ipc.rs` (`GatewayBus` async + blocking `*_sync` surface, `GatewayIpcServer`, `GatewayIpcClient`, `store_sealed_payload_fd`, `SO_PEERCRED` & `F_ADD_SEALS` enforcement), `cli_runner.rs` (`parvault token` & `parvault gateway` runners), and `shm.rs` (`SharedPayloadFd`, `0` `unsafe`). | [`ADR-27`](docs/adr/ADR-27-zero-copy-uds-gateway-and-hedged-pool.md), [`ADR-32`](docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md), [`ADR-33`](docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md) |
 | `src/capabilities.rs` | Stateless `HMAC-SHA256` `CapabilityMacaroon` minting, offline caveat attenuation (`AllowedManifest`, `ByteRange`, `ExpiresAtUnixMs`, `ReadOnly`, `AllowedPeerUid`), `PARVAULT-MAC-V1:` compact binary/hex encoding, `MacaroonSliceView`, and `< 1 ms` zero-DB RAM verification (`ct_eq_32`). | [`ADR-28`](docs/adr/ADR-28-stateless-macaroon-capability-attenuation.md), [`ADR-32`](docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md) |
-| `src/vfs.rs` | Pure-Rust Linux `/dev/fuse` (`ABI 7.31`, `0` `unsafe` `parse_fuse_in_header` / `parse_fuse_read_in`), `VirtualVaultFs`, `VfsStubNode`, `LruBlockCache`, `--macaroon` attenuation pass-through, `store_sealed_memfd` ingest, and unprivileged HTTP `206` / WebDAV `PROPFIND` server. | [`ADR-29`](docs/adr/ADR-29-pure-rust-fuse-and-webdav-lazy-vfs.md), [`ADR-32`](docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md) |
+| `src/vfs.rs` | Pure-Rust Linux `/dev/fuse` (`ABI 7.31`, `0` `unsafe` `parse_fuse_in_header` / `parse_fuse_read_in`), dual-mode `VirtualVaultFs` (`with_bus` / `with_bus_and_block_size`, `.parvaultignore`-aware `ingest_local_directory`), `VfsStubNode`, `LruBlockCache`, `--macaroon` attenuation pass-through, and RAII `VfsWebdavServerHandle` (`spawn_webdav_server`) + blocking HTTP `206` / WebDAV `PROPFIND` server. | [`ADR-29`](docs/adr/ADR-29-pure-rust-fuse-and-webdav-lazy-vfs.md), [`ADR-32`](docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md), [`ADR-33`](docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md) |
 | `src/admin_rpc.rs` | Forward-secret `X25519 + ChaCha20-Poly1305` + `Ed25519` challenge-authenticated TCP control channel for zero-private-key-on-VPS seed administration (`MAX_ADMIN_RPC_FRAME_BYTES`, `±60s` anti-replay window). | [`ADR-26`](docs/adr/ADR-26-verifiable-abuse-and-council-quorum-governance.md) |
-| `src/kani_proofs.rs` | `13` Kani Rust Bounded Model Checking symbolic harnesses (`#[cfg(kani)]`; `16` total across the crate including `capabilities`, `crypto::aes`, and `sharding::reed_solomon`). | [`ADR-01`–`ADR-32`](docs/ADR.md) |
+| `src/kani_proofs.rs` | `14` Kani Rust Bounded Model Checking symbolic harnesses (`#[cfg(kani)]`; `17` total across the crate including `capabilities`, `crypto::aes`, and `sharding::reed_solomon`). | [`ADR-01`–`ADR-33`](docs/ADR.md) |
 | `src/bootstrap.rs` | `EarnedStanding`, `ElasticBootstrapEngine`, `PersonalDeviceCert` (including compact `PARVAULT-CERT-V1:` token encoding), `BlindedShardTombstone` (generation-scoped), `ZeroTrustSeedServer`, `CorrelatedOutageController`, and `/32` IPv6 + RFC 6598 CGNAT Sybil subnet normalization. | `ADR-13`, `ADR-14`, `ADR-15`, `ADR-16`, `ADR-17` |
-| `src/sync.rs` | `FolderSyncEngine`, `FolderSnapshotManifest`, `EncryptedVaultCatalogEnvelope`, `.parvaultignore` matcher (`ParvaultIgnore`), `FolderSyncDiff` (`diff_folder`), `prune_deleted_file_shards` (local + remote `DeleteShard` GC), selective restore (`restore_single_file`, `restore_selective_subset`), and zero-local-state seed recovery (`recover_folder_from_seed_phrase`). | `ADR-10`, `ADR-15`, `ADR-16`, `ADR-17` |
+| `src/sync.rs` | Key-bearing `FolderSyncEngine`, zero-key `GatewayFolderSync` & `GatewayFolderCatalog` (`ADR-33`), `sanitize_sync_relative_path` (`sanitize_sync_relative_path_into`), `FolderSnapshotManifest`, `EncryptedVaultCatalogEnvelope`, `.parvaultignore` matcher (`ParvaultIgnore`), `FolderSyncDiff` (`diff_folder`), `prune_deleted_file_shards` (local + remote `DeleteShard` GC), selective restore (`restore_single_file`, `restore_selective_subset`), and zero-local-state seed recovery (`recover_folder_from_seed_phrase`). | `ADR-10`, `ADR-15`, `ADR-16`, `ADR-17`, [`ADR-33`](docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md) |
 | `src/telemetry.rs` | `AnonymousTelemetryBeacon` (rotating epoch nullifier + Hashcash PoW + power-of-two GiB bucketing capped at 64 TiB) and `NetworkCensusAggregator` (Tukey IQR outlier trimming + capture-recapture population estimate). | `ADR-14`, `ADR-15` |
 
 ---
@@ -84,17 +86,19 @@ Every code change or PR **must** preserve these 7 invariants:
 
 ### Rust Unit, Integration, Mathematical & Red-Team Suites
 ```bash
-# Check formatting and lints
+# Check formatting, lints, and --no-default-features compilation
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
+cargo check --no-default-features --bin parvault --bin parvault-seed --bin parvault-sync
 
-# Run all unit, integration, Stateright, TLA+ TLC, GatewayBus plugin security, VFS, and live localhost TCP P2P tests
+# Run all 133 unit, integration, Stateright, TLA+ TLC, GatewayBus, VFS, GatewayFolderSync, and live localhost TCP P2P tests
 TLA2TOOLS_JAR=/root/tla2tools.jar cargo test --release
 
-# Run built-in self-tests for seed, zero-copy IPC gateway, and lazy VFS reference plugin
+# Run built-in self-tests for seed, zero-copy IPC gateway, lazy VFS, and zero-key folder sync
 cargo run --release --bin parvault-seed -- self-test
 cargo run --release --bin parvault -- gateway self-test
 cargo run --release --bin parvault-fuse -- self-test
+cargo run --release --bin parvault-sync -- self-test
 
 # Run the empirical cryptography, Reed-Solomon, and /proc/self/status memory benchmark binary
 cargo run --release --bin parvault-bench -- run --payload-mib 64
@@ -105,18 +109,18 @@ bash scripts/docker_acceptance_gate.sh
 
 ### Static `musl` Cross-Compilation (`x86_64` & `aarch64`, `--profile soc`)
 ```bash
-# x86_64 static musl build (3.62-7.52 MiB stripped)
+# x86_64 static musl build (3.63-7.76 MiB stripped)
 cargo build --profile soc --target x86_64-unknown-linux-musl \
-  --bin parvault --bin parvault-seed --bin parvault-fuse
+  --bin parvault --bin parvault-seed --bin parvault-fuse --bin parvault-sync
 
-# ARM64 static musl build (2.88-5.89 MiB stripped: OpenWrt / prplOS LXC / RPi)
+# ARM64 static musl build (2.94-6.08 MiB stripped: OpenWrt / prplOS LXC / RPi)
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
   cargo build --profile soc --target aarch64-unknown-linux-musl \
-  --bin parvault --bin parvault-seed --bin parvault-fuse
+  --bin parvault --bin parvault-seed --bin parvault-fuse --bin parvault-sync
 ```
 
-### Kani Bounded Model Checking (`16` Harnesses) & TLA+ TLC Formal Model Checking (`7` Specs)
-All **16** Kani symbolic harnesses (`cargo kani`) and all **7** TLA+ specifications in `specs/` must complete with **0 errors** (see [`docs/SAFETY_AND_LINT_AUDIT.md`](docs/SAFETY_AND_LINT_AUDIT.md)):
+### Kani Bounded Model Checking (`17` Harnesses) & TLA+ TLC Formal Model Checking (`7` Specs)
+All **17** Kani symbolic harnesses (`cargo kani`) and all **7** TLA+ specifications in `specs/` must complete with **0 errors** (see [`docs/SAFETY_AND_LINT_AUDIT.md`](docs/SAFETY_AND_LINT_AUDIT.md)):
 ```bash
 bash scripts/verify_formal_proofs.sh
 

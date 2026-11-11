@@ -45,15 +45,15 @@ jobs:
             sudo rm -rf /var/lib/apt/lists/*
             sleep $((attempt * 3))
           done
-      - name: Build static parvault, parvault-seed, and parvault-fuse binaries
+      - name: Build static parvault, parvault-seed, parvault-fuse, and parvault-sync binaries
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
           fi
           cargo build --profile soc --target ${{ matrix.target }} \
-            --bin parvault --bin parvault-seed --bin parvault-fuse
+            --bin parvault --bin parvault-seed --bin parvault-fuse --bin parvault-sync
           mkdir -p release-dist
-          for bin in parvault parvault-seed parvault-fuse; do
+          for bin in parvault parvault-seed parvault-fuse parvault-sync; do
             cp "target/${{ matrix.target }}/soc/${bin}" "release-dist/${bin}-${{ matrix.target }}"
             ${{ matrix.strip }} "release-dist/${bin}-${{ matrix.target }}"
           done
@@ -78,16 +78,18 @@ jobs:
         run: |
           tar -czvf artifacts/parvault-router-soc-bundle.tar.gz -C deploy/router-soc parvault-router.toml parvault-nas.procd -C ../ prplos-lxc-manifest.json
           cd artifacts
-          chmod +x parvault-x86_64-* parvault-aarch64-* parvault-seed-* parvault-fuse-*
+          chmod +x parvault-x86_64-* parvault-aarch64-* parvault-seed-* parvault-fuse-* parvault-sync-*
           echo "=== Measured Stripped Binary Sizes ==="
-          ls -lh parvault-x86_64-* parvault-aarch64-* parvault-seed-* parvault-fuse-*
+          ls -lh parvault-x86_64-* parvault-aarch64-* parvault-seed-* parvault-fuse-* parvault-sync-*
           ./parvault-seed-x86_64-unknown-linux-musl self-test
           ./parvault-x86_64-unknown-linux-musl gateway self-test
           ./parvault-fuse-x86_64-unknown-linux-musl self-test
+          ./parvault-sync-x86_64-unknown-linux-musl self-test
           sha256sum \
             parvault-x86_64-unknown-linux-musl parvault-aarch64-unknown-linux-musl \
             parvault-seed-x86_64-unknown-linux-musl parvault-seed-aarch64-unknown-linux-musl \
             parvault-fuse-x86_64-unknown-linux-musl parvault-fuse-aarch64-unknown-linux-musl \
+            parvault-sync-x86_64-unknown-linux-musl parvault-sync-aarch64-unknown-linux-musl \
             parvault-router-soc-bundle.tar.gz > SHA256SUMS
           cat SHA256SUMS
       - name: Create GitHub Release
@@ -98,6 +100,7 @@ jobs:
             artifacts/parvault-aarch64-unknown-linux-musl
             artifacts/parvault-seed-*
             artifacts/parvault-fuse-*
+            artifacts/parvault-sync-*
             artifacts/parvault-router-soc-bundle.tar.gz
             artifacts/SHA256SUMS
           generate_release_notes: true

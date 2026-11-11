@@ -1,11 +1,13 @@
-//! Lazy-Streaming Virtual File System (`parvault::vfs`) backed by `/var/run/parvault.sock`.
+//! Lazy-Streaming Virtual File System (`parvault::vfs`) backed by [`crate::gateway::ipc::GatewayBus`].
 //!
-//! Built strictly as a zero-copy Unix Domain Socket client of [`crate::gateway::ipc::GatewayIpcClient`]:
+//! Supports both `=y` built-in in-process mode (`GatewayBus::InProcess(Arc<GatewayEngine>)`,
+//! `--no-socket` zero `.sock` file on disk) and `=m` split-plugin mode
+//! (`GatewayBus::UnixSocket(GatewayIpcClient)` over `/var/run/parvault.sock`):
 //! 1. **Instant Lazy-Loaded Metadata Inodes (`VfsStubNode`)**: Mounts `10 GiB+` virtual vaults
 //!    instantaneously in RAM (`O(1)` POSIX inode registration with zero eager shard downloads,
-//!    backed at read time by real `GatewayIpcServer` + `memfd` `SCM_RIGHTS` Reed-Solomon streaming).
+//!    backed at read time by `GatewayBus` Reed-Solomon streaming).
 //! 2. **Targeted On-Demand Range Retrieval (`< 50 ms` TTFB)**: Translates POSIX `(inode, offset, len)`
-//!    reads into `1 MiB` block-aligned `IpcCommand::FetchRange` calls (`SCM_RIGHTS` `memfd`).
+//!    reads into `1 MiB` block-aligned `fetch_range_bytes_sync` calls (`SCM_RIGHTS` `memfd` or in-process).
 //! 3. **Bounded LRU Disk Cache (`LruBlockCache`)**: Caches fetched `1 MiB` blocks on local disk and
 //!    deterministically evicts least-recently-used `.blk` files whenever `used_bytes` would exceed
 //!    `capacity_bytes`.
@@ -13,12 +15,12 @@
 //!    - Pure-Rust Linux `/dev/fuse` protocol loop (ABI `7.31`, zero C `libfuse` linkage for static `musl`).
 //!    - Unprivileged HTTP `Range` (`206 Partial Content`) + WebDAV (`PROPFIND`) server for locked-down
 //!      `prplOS` / `RDK-B` LXC containers lacking `/dev/fuse`.
-//!    - Userspace folder push/pull reconciler over `/var/run/parvault.sock`.
+//!    - Userspace folder seed/ingest helper honoring `.parvaultignore`.
 
 use crate::capabilities::CapabilityMacaroon;
 use crate::gateway::ipc::EphemeralShardManifest;
 #[cfg(unix)]
-use crate::gateway::ipc::{create_memfd, GatewayIpcClient, RetentionPolicy};
+use crate::gateway::ipc::{create_memfd, GatewayBus, RetentionPolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
@@ -353,14 +355,52 @@ pub const fn parse_fuse_read_in(payload: &[u8]) -> Option<FuseReadIn> {
 mod unix_vfs {
     use super::*;
     use std::io::{Read, Seek, SeekFrom, Write};
-    use std::net::TcpListener;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
     use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    /// Lazy-streaming Virtual File System client communicating with `parvault` over
-    /// `/var/run/parvault.sock`.
+    /// RAII handle controlling a background HTTP `Range` (`206 Partial Content`) + WebDAV server
+    /// spawned via [`VirtualVaultFs::spawn_webdav_server`].
+    pub struct VfsWebdavServerHandle {
+        local_addr: SocketAddr,
+        shutdown_flag: Arc<AtomicBool>,
+        join_handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl VfsWebdavServerHandle {
+        pub fn local_addr(&self) -> SocketAddr {
+            self.local_addr
+        }
+
+        pub fn shutdown(&mut self) {
+            self.shutdown_flag.store(true, Ordering::SeqCst);
+            let wake_ip = if self.local_addr.ip().is_unspecified() {
+                if self.local_addr.is_ipv4() {
+                    IpAddr::V4(Ipv4Addr::LOCALHOST)
+                } else {
+                    IpAddr::V6(Ipv6Addr::LOCALHOST)
+                }
+            } else {
+                self.local_addr.ip()
+            };
+            let wake_addr = SocketAddr::new(wake_ip, self.local_addr.port());
+            let _ = TcpStream::connect_timeout(&wake_addr, Duration::from_millis(100));
+            if let Some(jh) = self.join_handle.take() {
+                let _ = jh.join();
+            }
+        }
+    }
+
+    impl Drop for VfsWebdavServerHandle {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+
+    /// Lazy-streaming Virtual File System backed by [`GatewayBus`] (`InProcess` or `UnixSocket`).
     #[derive(Clone)]
     pub struct VirtualVaultFs {
-        ipc: GatewayIpcClient,
+        bus: GatewayBus,
         block_size: usize,
         default_macaroon: Option<CapabilityMacaroon>,
         nodes: Arc<Mutex<BTreeMap<u64, VfsStubNode>>>,
@@ -389,6 +429,33 @@ mod unix_vfs {
             cache_capacity_bytes: u64,
             block_size: usize,
         ) -> io::Result<Self> {
+            Self::with_bus_and_block_size(
+                GatewayBus::unix_socket(socket_path.into()),
+                cache_dir,
+                cache_capacity_bytes,
+                block_size,
+            )
+        }
+
+        pub fn with_bus(
+            bus: GatewayBus,
+            cache_dir: impl Into<PathBuf>,
+            cache_capacity_bytes: u64,
+        ) -> io::Result<Self> {
+            Self::with_bus_and_block_size(
+                bus,
+                cache_dir,
+                cache_capacity_bytes,
+                DEFAULT_VFS_BLOCK_BYTES,
+            )
+        }
+
+        pub fn with_bus_and_block_size(
+            bus: GatewayBus,
+            cache_dir: impl Into<PathBuf>,
+            cache_capacity_bytes: u64,
+            block_size: usize,
+        ) -> io::Result<Self> {
             let now_secs = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -412,7 +479,7 @@ mod unix_vfs {
             children.insert(VFS_ROOT_INO, BTreeMap::new());
             let cache = LruBlockCache::new(cache_dir, cache_capacity_bytes)?;
             Ok(Self {
-                ipc: GatewayIpcClient::new(socket_path.into()),
+                bus,
                 block_size: block_size.max(4096),
                 default_macaroon: None,
                 nodes: Arc::new(Mutex::new(nodes)),
@@ -420,6 +487,11 @@ mod unix_vfs {
                 next_ino: Arc::new(Mutex::new(2)),
                 cache: Arc::new(Mutex::new(cache)),
             })
+        }
+
+        /// Returns a reference to the underlying transport-agnostic [`GatewayBus`].
+        pub fn bus(&self) -> &GatewayBus {
+            &self.bus
         }
 
         /// Attaches a default [`CapabilityMacaroon`] presented on lazy `FetchRange` calls when an
@@ -621,7 +693,7 @@ mod unix_vfs {
                             .macaroon
                             .clone()
                             .or_else(|| self.default_macaroon.clone());
-                        let fetched = self.ipc.fetch_range_bytes(
+                        let fetched = self.bus.fetch_range_bytes_sync(
                             &manifest,
                             blk_start,
                             blk_len,
@@ -652,11 +724,13 @@ mod unix_vfs {
             Ok(bytes)
         }
 
-        /// Synchronizes all regular files in `local_dir` into `parvault` via sealed zero-copy
-        /// `memfd` `SCM_RIGHTS` (`StorePayload`) and mounts them as lazy VFS stubs.
+        /// Synchronizes all non-ignored regular files in `local_dir` into `parvault` via sealed
+        /// `memfd` (`store_sealed_memfd_sync`) and mounts them as lazy VFS stubs, honoring
+        /// [`crate::sync::ParvaultIgnore::from_folder`].
         pub fn ingest_local_directory(&self, local_dir: &Path) -> io::Result<usize> {
+            let ignore = crate::sync::ParvaultIgnore::from_folder(local_dir);
             let mut count = 0usize;
-            self.ingest_dir_recursive(local_dir, local_dir, &mut count)?;
+            self.ingest_dir_recursive(local_dir, local_dir, &ignore, &mut count)?;
             Ok(count)
         }
 
@@ -664,26 +738,36 @@ mod unix_vfs {
             &self,
             base: &Path,
             cur: &Path,
+            ignore: &crate::sync::ParvaultIgnore,
             count: &mut usize,
         ) -> io::Result<()> {
             for entry in fs::read_dir(cur)? {
                 let entry = entry?;
+                let ft = entry.file_type()?;
+                if ft.is_symlink() {
+                    continue;
+                }
                 let path = entry.path();
-                let meta = entry.metadata()?;
-                if meta.is_dir() {
-                    self.ingest_dir_recursive(base, &path, count)?;
-                } else if meta.is_file() {
-                    let rel = path
-                        .strip_prefix(base)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .replace('\\', "/");
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if ft.is_dir() {
+                    if ignore.is_ignored(&rel, true) {
+                        continue;
+                    }
+                    self.ingest_dir_recursive(base, &path, ignore, count)?;
+                } else if ft.is_file() {
+                    if ignore.is_ignored(&rel, false) {
+                        continue;
+                    }
                     let mfd = create_memfd("parvault-sync-in")?;
                     let mut mfd_file = std::fs::File::from(mfd);
                     let mut src = std::fs::File::open(&path)?;
                     let copied = io::copy(&mut src, &mut mfd_file)?;
                     mfd_file.seek(SeekFrom::Start(0))?;
-                    let manifest = self.ipc.store_sealed_memfd(
+                    let manifest = self.bus.store_sealed_memfd_sync(
                         mfd_file.as_raw_fd(),
                         copied,
                         RetentionPolicy::Persistent,
@@ -693,6 +777,45 @@ mod unix_vfs {
                 }
             }
             Ok(())
+        }
+
+        /// Spawns a background stoppable HTTP `Range` (`206 Partial Content`) + WebDAV
+        /// (`OPTIONS` / `PROPFIND`) server returning an RAII [`VfsWebdavServerHandle`].
+        pub fn spawn_webdav_server(&self, bind_addr: &str) -> io::Result<VfsWebdavServerHandle> {
+            let listener = TcpListener::bind(bind_addr)?;
+            listener.set_nonblocking(false)?;
+            let local_addr = listener.local_addr()?;
+            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let shutdown_cl = Arc::clone(&shutdown_flag);
+            let vfs = self.clone();
+
+            let join_handle = std::thread::Builder::new()
+                .name("parvault-vfs-webdav".into())
+                .spawn(move || {
+                    for conn in listener.incoming() {
+                        if shutdown_cl.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let Ok(mut stream) = conn else {
+                            continue;
+                        };
+                        let vfs_conn = vfs.clone();
+                        std::thread::Builder::new()
+                            .name("parvault-vfs-http".into())
+                            .stack_size(256 * 1024)
+                            .spawn(move || {
+                                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                                let _ = handle_webdav_http_conn(&mut stream, &vfs_conn);
+                            })
+                            .ok();
+                    }
+                })?;
+
+            Ok(VfsWebdavServerHandle {
+                local_addr,
+                shutdown_flag,
+                join_handle: Some(join_handle),
+            })
         }
 
         /// Serves an unprivileged HTTP `Range` (`206 Partial Content`) + WebDAV (`OPTIONS` /
@@ -1191,4 +1314,4 @@ mod unix_vfs {
 }
 
 #[cfg(unix)]
-pub use unix_vfs::VirtualVaultFs;
+pub use unix_vfs::{VfsWebdavServerHandle, VirtualVaultFs};

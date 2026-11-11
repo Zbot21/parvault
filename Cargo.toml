@@ -19,6 +19,10 @@ path = "src/bin/parvault-fuse.rs"
 required-features = ["vfs"]
 
 [[bin]]
+name = "parvault-sync"
+path = "src/bin/parvault-sync.rs"
+
+[[bin]]
 name = "parvault-bench"
 path = "src/bin/parvault-bench.rs"
 
