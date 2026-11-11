@@ -50,6 +50,7 @@ chmod +x "$BUILD_CTX/parvault" "$BUILD_CTX/parvault-seed"
 
 cat > "$BUILD_CTX/Dockerfile" <<EOF
 FROM ${BASE_IMAGE}
+RUN if command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y --no-install-recommends wget netcat-openbsd ca-certificates && rm -rf /var/lib/apt/lists/*; fi
 COPY parvault /usr/local/bin/parvault
 COPY parvault-seed /usr/local/bin/parvault-seed
 EXPOSE 4001/tcp 4002/tcp 4009/udp 4080/tcp

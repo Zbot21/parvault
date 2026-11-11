@@ -7,6 +7,11 @@
 
 Designed to run identically on multi-terabyte homelab NAS servers and memory-constrained residential gateways (`prplOS` / `OpenWrt` LXC containers with a strict **`< 32 MiB` active RAM ceiling**), `parvault` combines **16 MiB streaming `AES-256-GCM` + dual-cipher `PqVaultMasterKey` (`AES-256-GCM` + `ChaCha20-Poly1305`) cascaded encryption**, **Reed-Solomon erasure coding over $GF(2^8)$**, **4-layer shard anonymization ($\Omega_{\text{search}} \ge 2^{224}$)**, **Stateless Stratified Proof-of-Retrievability (PoR)**, and **Cryptographically Earned Uptime Tiers** so that **no storage peer, witness node, or DHT router is ever trusted with plaintext, metadata correlation, or unchecked shard concentration.**
 
+> [!NOTE]
+> **Public Tracker Status:** We are **not** currently operating an official public tracker or public bootstrap swarm. **All `parvault` features work standalone without a public tracker** — including Zero-IP home LAN auto-discovery (`UDP 4009`), 4-word SAS pairing (`parvault pair` / `parvault join`), Router-SoC Cloud-NAS mode (`--profile router-soc`), personal multi-machine rings, and private self-hosted `parvault-seed` rendezvous/vault servers for friends, family, or organizations.
+>
+> **Public Swarm Readiness:** The codebase is engineered with multiple subsystems specifically designed to initialize and govern a public tracker (`parvault-seed --mode public-bootstrap`) when desired — including memory-hard Argon2id & Hashcash Sybil PoW (`PublicCommonsTicket`), Web-of-Trust (`WoT`) vouching & 1-strike Byzantine slashing, earned storage reciprocity tiers, 4-vector privacy-preserving keyed-HMAC eviction (`ADR-19`), $M$-of-$N$ federated council co-signing, and zero-private-key-on-VPS `admin_rpc` hooks.
+
 ---
 
 ## Documentation Hub (Choose Your Path)
@@ -15,6 +20,8 @@ Designed to run identically on multi-terabyte homelab NAS servers and memory-con
 | :--- | :--- | :--- |
 | **[Homelab & Everyday User Quickstart (`QUICKSTART.md`)](QUICKSTART.md)** | **Homelabbers, Self-Hosters & Friend Co-Ops** | Plain-English (ELI15) overview and 5 copy-paste recipes (`parvault init`, `parvault up`, zero-IP `discover`, 4-word `join`, and 24-word "House Fire" recovery). |
 | **[Router SoC Hardware & Firmware Integration Guide (`docs/ROUTER_SOC_HARDWARE_GUIDE.md`)](docs/ROUTER_SOC_HARDWARE_GUIDE.md)** | **Router Vendors, OpenWrt & prplOS Integrators** | Turnkey integration for MediaTek Filogic / Rockchip / x86_64 routers: memory/flash budgets, `procd` init scripts, LXC manifests, and embedded status dashboards. |
+| **[Rust Library Embedding Guide (`docs/EMBEDDING.md`)](docs/EMBEDDING.md)** | **Rust Application & Firmware Developers** | Embedding `parvault` as a library crate: BIP-39 deterministic keys, `FolderSyncEngine`, `RouterSoc` vs. `Desktop` memory profiles, and `admin_rpc` wire hooks. |
+| **[Empirical Benchmarks & Memory Telemetry (`docs/BENCHMARKS.md`)](docs/BENCHMARKS.md)** | **Systems Engineers & Evaluators** | Reproducible `parvault-bench` throughput, `/proc/self/status` `VmHWM` (`9.36 MiB` Router-SoC), static `musl` binary footprints, and 14-container `48m` cgroup results. |
 | **[User & CLI Reference Manual (`docs/USER_AND_CLI_GUIDE.md`)](docs/USER_AND_CLI_GUIDE.md)** | **System Administrators & Power Users** | Complete CLI flag reference for `parvault` and `parvault-seed`, `PARVAULT-CERT-V1:` token workflows, `.parvaultignore` syntax, `config.toml` bandwidth rate limits, and bit-rot scrubbing. |
 | **[Security & Cryptography Proofs (`docs/SECURITY_AND_CRYPTOGRAPHY.md`)](docs/SECURITY_AND_CRYPTOGRAPHY.md)** | **Cryptographers & Security Auditors** | Mathematical proofs, $\ge 2^{224}$ combinatorial anonymity bounds, NIST FIPS 203 `ML-KEM-768` & FIPS 204 `ML-DSA-65` hybrid combiners, 6 TLA+ formal specs, and live 13-container Docker P2P regression reports. |
 | **[Architectural Decision Records (`docs/ADR.md`)](docs/ADR.md)** | **Distributed Systems Architects** | Complete engineering rationale across **`ADR-01` through `ADR-19`**. |
@@ -44,8 +51,9 @@ parvault join --code shield-copper-alpine-matrix
 # 5. Incrementally back up files (auto-finds paired router storage with zero --peers flags!)
 parvault watch-folder --folder ~/Documents --once
 
-# 6. Or join the open Public Commons swarm with zero pairing (BitTorrent-style public tracker):
-parvault watch-folder --folder ~/Documents --public --tracker /dns4/tracker.neighborhoodcloud.org/tcp/4002/p2p/... --once
+# 6. Optional: connect to a self-hosted or community-initialized public tracker (--public):
+#    (No official public tracker is currently hosted; supply your own parvault-seed multiaddr)
+parvault watch-folder --folder ~/Documents --public --tracker /ip4/<YOUR_SEED_IP>/tcp/4002/p2p/<SEED_PEER_ID> --once
 ```
 
 ---
@@ -88,96 +96,19 @@ flowchart LR
 
 ---
 
-## Embedding `parvault` as a Rust Library
-
-Parent applications can embed `parvault` directly for incremental folder synchronization, post-quantum catalog sealing, and zero-local-state disaster recovery:
-
-```rust
-use parvault::{
-    config::ErasureTier,
-    crypto::{MasterKey, NodeIdentity},
-    storage::{BlockStore, QuotaManager},
-    sync::FolderSyncEngine,
-};
-use std::path::Path;
-
-fn main() -> anyhow::Result<()> {
-    // 1. Derive deterministic keys from a checksummed BIP-39 recovery seed phrase (or use MasterKey::generate())
-    let seed = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-    let namespace = "my-homelab-vault";
-    let master_key = MasterKey::from_recovery_seed_phrase(seed, namespace);
-    let owner_identity = NodeIdentity::from_recovery_seed_phrase(seed, namespace);
-
-    // 2. Initialize crash-safe local BlockStore and incremental FolderSyncEngine
-    let quota = QuotaManager::new(100 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024);
-    let store = BlockStore::new(Path::new("./.parvault-data"), quota)?;
-    let mut engine = FolderSyncEngine::new(
-        store.clone(),
-        master_key,
-        owner_identity,
-        ErasureTier::Homelab, // 16-of-20 Reed-Solomon over GF(2^8)
-    );
-
-    // 3. Incrementally encrypt & erasure-code new/modified files (respecting .parvaultignore)
-    let snapshot = engine.sync_folder_once(Path::new("./my-folder"))?;
-    let catalog = engine.export_encrypted_vault_catalog(seed, namespace, &snapshot)?;
-
-    // 4. Zero-Local-State "House Fire" Recovery using only the seed phrase + encrypted catalog
-    let restored_files = FolderSyncEngine::recover_folder_from_seed_phrase(
-        store,
-        seed,
-        namespace,
-        &catalog,
-        Path::new("./restored-folder"),
-    )?;
-    println!("Verified and restored {restored_files} files!");
-    Ok(())
-}
-```
-
----
-
-## Empirical Benchmarks & Memory Telemetry (`parvault-bench`)
-
-Measured via `cargo run --release --bin parvault-bench -- run --payload-mib 64` (zero simulated sleeps or fabricated numbers; Linux `/proc/self/status` `VmRSS` & `VmHWM` + wall-clock timing):
-
-### Streaming Memory Footprint & Throughput (Dual Profile Comparison)
-
-| Profile | Stripe Size | Stripes | Baseline RSS | Peak VmHWM | SoC < 32 MiB Gate | Store Speed | Restore Speed |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Router-SoC** | `1 MiB` | `64` | `4.12 MiB` | **`9.39 MiB`** (`9,616 KiB`) | **PASS (< 32 MiB)** | **`78.8 MiB/s`** | **`117.8 MiB/s`** |
-| **Desktop / Homelab-NAS** | `16 MiB` | `4` | `5.44 MiB` | **`57.30 MiB`** (`58,676 KiB`) | Desktop Target | **`118.1 MiB/s`** | **`104.8 MiB/s`** |
-
-| Subsystem / Operation | Parameters / Construction | Measured Throughput / Latency |
-| :--- | :--- | :---: |
-| **`Argon2id` + `HKDF-SHA256` Seed Derivation** | `m = 64 MiB (65,536 KiB), t = 3, p = 4` (BIP-39 12-word) | **`156.44 ms`** |
-| **`AES-256-GCM` Stripe Encryption (Router-SoC)** | `1 MiB` stripe + HKDF per-purpose subkey/nonce | **`522.1 MiB/s`** |
-| **`AES-256-GCM` Stripe Decryption (Router-SoC)** | `1 MiB` stripe + tag verification | **`535.0 MiB/s`** |
-| **`AES-256-GCM` Stripe Encryption (Desktop)** | `16 MiB` stripe + HKDF per-purpose subkey/nonce | **`465.9 MiB/s`** |
-| **`AES-256-GCM` Stripe Decryption (Desktop)** | `16 MiB` stripe + tag verification | **`459.0 MiB/s`** |
-| **`PqVaultMasterKey` Dual-Cipher Encryption** | `16 MiB` (`AES-256-GCM` inner + `ChaCha20-Poly1305` outer) | **`247.5 MiB/s`** |
-| **`PqVaultMasterKey` Dual-Cipher Decryption** | `16 MiB` (`ChaCha20-Poly1305` outer + `AES-256-GCM` inner) | **`250.4 MiB/s`** |
-| **`HybridKemKeypair` Encapsulate / Decapsulate (X-Wing)** | `X25519 + NIST FIPS 203 ML-KEM-768` (`HKDF-SHA512`) | **`100.2 us` / `108.2 us`** |
-| **`HybridPqSigningKeypair` Sign / Verify** | `Ed25519 + NIST FIPS 204 ML-DSA-65` | **`515.3 us` / `167.9 us`** |
-| **Reed-Solomon $GF(2^8)$ `Router-SoC (16-of-20)` Encode / Reconstruct** | `1 MiB` stripe $\to$ `20 x 64 KiB` shards + Merkle quarantine | **`311.9 MiB/s` / `140.4 MiB/s`** |
-| **Reed-Solomon $GF(2^8)$ `Consumer (10-of-20)` Encode / Reconstruct** | `16 MiB` stripe $\to$ `20 x 1.6 MiB` shards + Merkle quarantine | **`142.7 MiB/s` / `83.6 MiB/s`** |
-| **Reed-Solomon $GF(2^8)$ `Homelab (16-of-20)` Encode / Reconstruct** | `16 MiB` stripe $\to$ `20 x 1.0 MiB` shards + Merkle quarantine | **`258.5 MiB/s` / `132.2 MiB/s`** |
-
----
-
 ## Build & Verification Commands
 
 ```bash
 # Run all unit, integration, mathematical proof, Stateright, TLA+ TLC, and live libp2p TCP test suites
 cargo test --release
 
-# Execute the empirical cryptography, Reed-Solomon, and /proc/self/status memory benchmark suite
+# Execute the empirical cryptography, Reed-Solomon, and /proc/self/status memory benchmark suite (see docs/BENCHMARKS.md)
 cargo run --release --bin parvault-bench -- run --payload-mib 64
 
 # Execute the built-in end-to-end verification of parvault-seed (homelab-vault + public-bootstrap)
 cargo run --release --bin parvault-seed -- self-test
 
-# Execute the 13-container live Docker P2P regression & disaster recovery gate (Stages 1-10)
+# Execute the 14-container live Docker P2P & 48 MiB Router-SoC acceptance gate (Stages 1-12)
 bash scripts/docker_acceptance_gate.sh
 
 # Build zero-dependency static Linux musl binaries (x86_64 and ARM64)

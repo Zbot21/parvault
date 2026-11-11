@@ -217,6 +217,24 @@
     }
     .copy-btn:hover { color: var(--fg); border-color: var(--fg-muted); }
 
+    .notice-box {
+      margin-top: 1.35rem;
+      padding: 0.8rem 1rem;
+      background: var(--bg-alt);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--amber);
+      border-radius: 3px;
+      font-size: 0.85rem;
+      color: var(--fg-muted);
+    }
+    .notice-box strong.notice-title {
+      font-family: var(--mono);
+      color: var(--amber);
+      font-size: 0.81rem;
+      display: block;
+      margin-bottom: 0.3rem;
+    }
+
     .two-col {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -325,6 +343,13 @@
 <span class="cmd">parvault-seed self-test</span></pre>
       </div>
     </section>
+
+    <div class="notice-box" role="note">
+      <strong class="notice-title">[STATUS NOTICE &bull; NO PUBLIC TRACKER CURRENTLY HOSTED]</strong>
+      We are <strong>not</strong> currently operating an official public tracker or public bootstrap swarm.
+      <strong>100% of <code>parvault</code> features work standalone today without a public tracker</strong>—including Zero-IP LAN auto-discovery (<code>UDP 4009</code>), 4-word SAS pairing (<code>parvault pair</code> / <code>parvault join</code>), Router-SoC Cloud-NAS mode (<code>--profile router-soc</code>), personal multi-device rings, and private self-hosted <code>parvault-seed</code> vaults for friends, family, or teams.
+      When you or a community want to initialize a public tracker (<code>parvault-seed --mode public-bootstrap</code>), the protocol already includes built-in subsystems for Sybil-resistant Argon2id/Hashcash PoW admission, Web-of-Trust vouching &amp; 1-strike Byzantine slashing, earned reciprocity tiers, 4-vector keyed-HMAC privacy-preserving eviction (<code>ADR-19</code>), and <code>M-of-N</code> federated seed-council governance.
+    </div>
 
     <!-- Section 1: Which Binary Do I Run + Copy-Paste CLI Usage -->
     <h2 id="quickstart">
