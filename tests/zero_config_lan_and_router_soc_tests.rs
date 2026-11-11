@@ -950,7 +950,7 @@ fn test_4_embedded_router_nas_status_server_http_and_html_dashboard() {
 
     let snap: RouterNasLiveSnapshot =
         serde_json::from_str(&body_health).expect("deserialize RouterNasLiveSnapshot");
-    assert_eq!(snap.version, "0.3.0");
+    assert_eq!(snap.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(snap.hardware_profile, "router-soc");
     assert_eq!(snap.stripe_size_bytes, 1_048_576);
     assert_eq!(

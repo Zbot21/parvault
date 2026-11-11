@@ -12,6 +12,71 @@ pub const HOMELAB_NAS_STRIPE_SIZE_BYTES: usize = 4 * 1024 * 1024;
 /// Ultra-low-RAM streaming stripe size (1 MiB) for OpenWrt / prplOS / ARM64 Router SoCs (ADR-18).
 pub const ROUTER_SOC_STRIPE_SIZE_BYTES: usize = 1024 * 1024;
 
+/// Minimum streaming stripe size floor (`64 KiB`).
+pub const MIN_STRIPE_SIZE_BYTES: usize = 64 * 1024;
+
+/// Maximum logical file size supported by the streaming pipeline (`u64::MAX` bytes).
+pub const MAX_FILE_BYTES: u64 = u64::MAX;
+
+/// Strict Router-SoC peak concurrent per-stripe RAM ceiling (`32 MiB`, `ADR-01` / `ADR-18`).
+pub const ROUTER_SOC_MAX_STRIPE_MEMORY_BYTES: usize = 32 * 1024 * 1024;
+
+/// AES-256-GCM authentication tag overhead per encrypted stripe (`16` bytes).
+pub const AES_GCM_TAG_OVERHEAD_BYTES: usize = 16;
+
+/// Deterministic streaming stripe decomposition for a file of `file_size_bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamingStripeLayout {
+    pub stripe_size_bytes: usize,
+    pub stripe_count: u64,
+    pub last_stripe_plaintext_bytes: usize,
+    pub max_stripe_plaintext_bytes: usize,
+    pub max_stripe_ciphertext_bytes: usize,
+}
+
+/// Computes the exact overflow-free streaming stripe layout for `file_size_bytes` (`0..=u64::MAX`),
+/// clamping `raw_stripe_size_bytes` into `[MIN_STRIPE_SIZE_BYTES, DEFAULT_STRIPE_SIZE_BYTES]`.
+/// Empty files (`0` bytes) emit exactly `1` authenticated `0`-byte plaintext (`16`-byte GCM tag) stripe.
+pub const fn compute_stripe_layout_for_size(
+    file_size_bytes: u64,
+    raw_stripe_size_bytes: usize,
+) -> StreamingStripeLayout {
+    let stripe_size_bytes = if raw_stripe_size_bytes < MIN_STRIPE_SIZE_BYTES {
+        MIN_STRIPE_SIZE_BYTES
+    } else if raw_stripe_size_bytes > DEFAULT_STRIPE_SIZE_BYTES {
+        DEFAULT_STRIPE_SIZE_BYTES
+    } else {
+        raw_stripe_size_bytes
+    };
+
+    if file_size_bytes == 0 {
+        StreamingStripeLayout {
+            stripe_size_bytes,
+            stripe_count: 1,
+            last_stripe_plaintext_bytes: 0,
+            max_stripe_plaintext_bytes: 0,
+            max_stripe_ciphertext_bytes: AES_GCM_TAG_OVERHEAD_BYTES,
+        }
+    } else {
+        let cap_u64 = stripe_size_bytes as u64;
+        let full_stripes_before_last = (file_size_bytes - 1) / cap_u64;
+        let stripe_count = full_stripes_before_last + 1;
+        let last_stripe_plaintext_bytes = (((file_size_bytes - 1) % cap_u64) as usize) + 1;
+        let max_stripe_plaintext_bytes = if stripe_count > 1 {
+            stripe_size_bytes
+        } else {
+            last_stripe_plaintext_bytes
+        };
+        StreamingStripeLayout {
+            stripe_size_bytes,
+            stripe_count,
+            last_stripe_plaintext_bytes,
+            max_stripe_plaintext_bytes,
+            max_stripe_ciphertext_bytes: max_stripe_plaintext_bytes + AES_GCM_TAG_OVERHEAD_BYTES,
+        }
+    }
+}
+
 /// Default UDP port for signed Home LAN zero-IP auto-discovery (`ADR-18`).
 pub const DEFAULT_LAN_DISCOVERY_PORT: u16 = 4009;
 
@@ -69,6 +134,16 @@ impl HardwareProfile {
             Self::HomelabNas => HOMELAB_NAS_STRIPE_SIZE_BYTES,
             Self::RouterSoc => ROUTER_SOC_STRIPE_SIZE_BYTES,
         }
+    }
+
+    /// Computes the exact overflow-free streaming stripe decomposition (`stripe_count`,
+    /// `last_stripe_plaintext_bytes`, and `max_stripe_ciphertext_bytes`) for `file_size_bytes`
+    /// under this hardware profile.
+    pub const fn compute_streaming_stripe_layout(
+        self,
+        file_size_bytes: u64,
+    ) -> StreamingStripeLayout {
+        compute_stripe_layout_for_size(file_size_bytes, self.stripe_size_bytes())
     }
 
     /// Minimum free OS filesystem space reserved as a safety guard against disk exhaustion.
@@ -338,6 +413,10 @@ pub enum Commands {
         /// Optional target SLA erasure coding tier for background `--folder` sync.
         #[arg(long, value_enum)]
         tier: Option<ErasureTier>,
+
+        /// Optional Unix Domain Socket path for the Zero-Copy IPC Gateway (e.g. `/var/run/parvault.sock`).
+        #[arg(long, value_name = "SOCK_PATH")]
+        ipc_socket: Option<PathBuf>,
     },
     /// Evict a bad actor or illegal content (0x00 zero-wipe + unlink + keyed HMAC ingress firewall, zero plaintext IPs on disk — ADR-19).
     Evict {
@@ -588,6 +667,10 @@ pub enum DaemonAction {
         /// Optional bind address for the embedded Router Cloud-NAS HTTP dashboard & JSON API (e.g. `0.0.0.0:4080`).
         #[arg(long, value_name = "ADDR")]
         status_http: Option<String>,
+
+        /// Optional Unix Domain Socket path for the Zero-Copy IPC Gateway (e.g. `/var/run/parvault.sock`).
+        #[arg(long, value_name = "SOCK_PATH")]
+        ipc_socket: Option<PathBuf>,
     },
 }
 
@@ -768,7 +851,10 @@ impl NodeConfig {
         let has_profile = val.get("hardware_profile").is_some() || val.get("profile").is_some();
         if has_profile {
             if val.get("stripe_size_bytes").is_none() {
-                cfg.stripe_size_bytes = cfg.hardware_profile.stripe_size_bytes();
+                cfg.stripe_size_bytes = cfg
+                    .hardware_profile
+                    .compute_streaming_stripe_layout(MAX_FILE_BYTES)
+                    .stripe_size_bytes;
             }
             if val.get("min_free_disk_bytes").is_none() {
                 cfg.min_free_disk_bytes = cfg.hardware_profile.min_free_disk_bytes();

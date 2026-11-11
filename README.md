@@ -1,9 +1,14 @@
-# ParVault (`parvault`, `parvault-seed` & `parvault-bench`)
-### Zero-Knowledge, Post-Quantum, Erasure-Coded P2P Backup Daemon & Dedicated Seed Server
+# ParVault (`parvault`, `parvault-seed`, `parvault-gateway`, `parvault-fuse` & `parvault-bench`)
+### Zero-Knowledge, Post-Quantum, Erasure-Coded P2P Storage Engine, Zero-Filesystem Seed Server & Zero-Copy UDS Gateway (`v0.4.0`)
 
-**[License: `AGPL-3.0-only`](LICENSE)** &bull; **Rust `2021` Edition** &bull; **[Targets: `x86_64` | `aarch64` static `musl`](#build--verification-commands)** &bull; **[Model-Checked: `6 TLA+ Protocol Specs & Stateright`](docs/SECURITY_AND_CRYPTOGRAPHY.md)**
+**[License: `AGPL-3.0-only`](LICENSE)** &bull; **Rust `2021` Edition** &bull; **[Targets: `x86_64` | `aarch64` static `musl`](#build--verification-commands)** &bull; **[Model-Checked: `11 Kani Bounded Model Checking Harnesses + 7 TLA+ Specs`](docs/SECURITY_AND_CRYPTOGRAPHY.md)**
 
-`parvault` (library crate `parvault`, binaries `parvault`, `parvault-seed`, and `parvault-bench`) is a **zero-knowledge, post-quantum hybrid, Byzantine-resilient P2P backup and continuous folder-synchronization engine** — essentially **"Filecoin without the coin"**, preserving the genuine distributed storage systems engineering (erasure coding, stateless Proof-of-Retrievability, symmetric Byte-Epoch reciprocity, zero-knowledge encryption) while eliminating 100% of cryptocurrency tokens, wallets, gas fees, and blockchain bloat so it runs inside **`9.39 MiB` RAM on a home router**.
+`parvault` (library crate `parvault`, binaries `parvault`, `parvault-seed`, `parvault-gateway`, `parvault-fuse`, and `parvault-bench`) is a **zero-knowledge, post-quantum hybrid, Byzantine-resilient P2P backup, zero-copy local gateway, and lazy-streaming virtual filesystem engine** — essentially **"Filecoin without the coin"**, preserving genuine distributed storage systems engineering (erasure coding, stateless Proof-of-Retrievability, symmetric Byte-Epoch reciprocity, zero-knowledge encryption, `memfd` `SCM_RIGHTS` zero-copy IPC, and sub-millisecond Macaroon capabilities) while eliminating 100% of cryptocurrency tokens, wallets, gas fees, and blockchain bloat so it runs inside **`9.39 MiB` RAM on a home router**.
+
+> [!TIP]
+> **Clean Architectural Separation (`v0.4.0`):**
+> - **`parvault` (this repository, `AGPL-3.0-only`):** Pure UNIX core daemons (`parvault`, `parvault-seed --no-fs`, `parvault-gateway` on `/var/run/parvault.sock`, and optional `parvault-fuse` lazy VFS behind `--features vfs`), post-quantum cryptography, $GF(2^8)$ Reed-Solomon sharding, HMAC-SHA256 `CapabilityMacaroon` attenuation, and formal verification (`cargo kani` + `7` TLA+ TLC specs).
+> - **Downstream Companion Appliances (`parvault-suite` & `parvault-control`):** High-level consumer/ISP daemons (`parvault-auth-broker`, `parvault-media-daemon`, `parvault-isp-agent`) and the Air-Gapped Hardware Operator Control Plane (`parvault-control`) connect strictly over `/var/run/parvault.sock` (`SCM_RIGHTS` `memfd` zero-copy IPC) and `admin_rpc` without bloating the core binaries.
 
 Designed to run identically on multi-terabyte homelab NAS servers and memory-constrained residential gateways (`prplOS` / `OpenWrt` LXC containers with a strict **`< 32 MiB` active RAM ceiling**), `parvault` combines **16 MiB streaming `AES-256-GCM` + dual-cipher `PqVaultMasterKey` (`AES-256-GCM` + `ChaCha20-Poly1305`) cascaded encryption**, **Reed-Solomon erasure coding over $GF(2^8)$**, **4-layer shard anonymization ($\Omega_{\text{search}} \ge 2^{224}$)**, **Stateless Stratified Proof-of-Retrievability (PoR)**, and **Cryptographically Earned Uptime Tiers** so that **no storage peer, witness node, or DHT router is ever trusted with plaintext, metadata correlation, or unchecked shard concentration.**
 
@@ -93,28 +98,47 @@ flowchart LR
 | **Elastic Day-1-to-10,000-User Scaling** | `PersonalDeviceCert` Day-1 ring (`2-of-3`), auto-draining `FoundationSeedAnchor`s, and earned `16-of-20` `HighUptimeAnchor` standing | `ADR-13`, `ADR-14` |
 | **Byzantine & Red-Team Hardening** | Pre-decoding Merkle quarantine, bounded `with_limit` wire framing (`32 MiB`), atomic `fsync`+`rename`, path-traversal blocking, and BIP-39 12/24-word seed recovery | `ADR-09`, `ADR-15` |
 | **Privacy-Preserving Eviction Engine** | 4-vector bad-actor/content eviction (`parvault evict`), zero plaintext IPs on disk (`eviction_index.bin` HMAC tags), multi-pass `0x00` shredding, $M$-of-$N$ Public Tracker Council quorum (`cosign-eviction`), cryptographic reporter burden-of-proof (`parvault report-abuse`) | `ADR-19` |
+| **Zero-Filesystem Bounded RAM Mode (`parvault-seed --no-fs`)** | Pure in-memory seed/bootstrap execution (`--no-fs --in-memory-mb <MiB>`, `--identity-env` / `--identity-file`) with **zero persistent directories or files** created, hard RAM byte-cap enforcement, and `0x00` `zeroize()` memory wiping on eviction/drop | `v0.4.0` |
+| **Zero-Copy UDS Gateway & Macaroon Capabilities (`parvault-gateway`)** | `/var/run/parvault.sock` Unix Domain Socket server passing Linux `memfd_create` descriptors via `SCM_RIGHTS` (`< 16 MiB` RSS streaming `100+ MiB`), enforced in `< 1 ms` RAM by HMAC-SHA256 `CapabilityMacaroon` caveats (`AllowedManifest`, `ByteRange`, `ExpiresAtUnixMs`, `ReadOnly`) | `v0.4.0` |
+| **Lazy-Streaming Virtual File System (`parvault-fuse`)** | Feature-gated (`--features vfs`) `/dev/fuse` (`ABI 7.31`) + unprivileged HTTP `206 Partial Content` & WebDAV `PROPFIND` server fetching targeted `1 MiB` stripes on demand (`< 50 ms` TTFB on `10 GiB` sparse vaults) with bounded `LruBlockCache` eviction | `v0.4.0` |
+| **Machine-Checked Formal Verification (`cargo kani` + `7` TLA+ Specs)** | **13 Kani Rust Bounded Model Checking symbolic harnesses** (`src/kani_proofs.rs`, `aes.rs`, `reed_solomon.rs`) + **7 exhaustive TLA+ TLC specifications** (`specs/*.tla`, including `ParVaultZeroKeyAdminAndQuorum.tla`) | `ADR-09`–`ADR-19` |
 
 ---
 
 ## Build & Verification Commands
 
 ```bash
-# Run all unit, integration, mathematical proof, Stateright, TLA+ TLC, and live libp2p TCP test suites
+# Run all unit, integration, mathematical proof, Stateright, TLA+ TLC, UDS zero-copy IPC & VFS test suites
 cargo test --release
+
+# Run all 13 Kani Rust Bounded Model Checking symbolic harnesses + all 7 TLA+ TLC specifications
+bash scripts/verify_formal_proofs.sh
+
+# Execute built-in end-to-end self-tests for seed, zero-copy IPC gateway, and lazy VFS daemons
+cargo run --release --bin parvault-seed -- self-test
+cargo run --release --bin parvault-gateway -- self-test
+cargo run --release --bin parvault-fuse -- self-test
+
+# Launch a zero-filesystem, RAM-capped seed node (zero directories or files created on disk)
+parvault-seed start --no-fs --in-memory-mb 256 --mode public-bootstrap --listen /ip4/0.0.0.0/tcp/4002
+
+# Launch the zero-copy Unix Domain Socket gateway and mount a lazy-streaming virtual filesystem
+parvault-gateway serve --socket /var/run/parvault.sock --data-dir ~/.parvault-gw
+parvault-fuse webdav --socket /var/run/parvault.sock --cache-dir /tmp/pv-cache --max-cache-mib 512 --listen 127.0.0.1:8088
 
 # Execute the empirical cryptography, Reed-Solomon, and /proc/self/status memory benchmark suite (see docs/BENCHMARKS.md)
 cargo run --release --bin parvault-bench -- run --payload-mib 64
 
-# Execute the built-in end-to-end verification of parvault-seed (homelab-vault + public-bootstrap)
-cargo run --release --bin parvault-seed -- self-test
-
 # Execute the 14-container live Docker P2P & 48 MiB Router-SoC acceptance gate (Stages 1-12)
 bash scripts/docker_acceptance_gate.sh
 
-# Build zero-dependency static Linux musl binaries (x86_64 and ARM64)
-cargo build --release --target x86_64-unknown-linux-musl
+# Build stripped zero-dependency static Linux musl binaries (--profile soc: x86_64 < 7.5 MiB, aarch64 < 6.0 MiB)
+# Router-SoC core (no VFS/FUSE):
+cargo build --profile soc --target x86_64-unknown-linux-musl --no-default-features --bin parvault --bin parvault-seed --bin parvault-gateway
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
-  cargo build --release --target aarch64-unknown-linux-musl
+  cargo build --profile soc --target aarch64-unknown-linux-musl --no-default-features --bin parvault --bin parvault-seed --bin parvault-gateway
+# Desktop (with lazy-streaming VFS/FUSE):
+cargo build --profile soc --target x86_64-unknown-linux-musl --bin parvault-fuse
 ```
 
 ---

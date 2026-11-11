@@ -153,6 +153,22 @@ enum SeedCommand {
         /// Optional explicit M-of-N tracker eviction quorum threshold override
         #[arg(long)]
         council_quorum: Option<usize>,
+
+        /// Zero-filesystem mode for read-only containers (`docker run --read-only`) and NAND/eMMC routers (`0` disk writes)
+        #[arg(long, default_value_t = false)]
+        no_fs: bool,
+
+        /// Bounded in-memory shard cache ceiling in MiB (implies `--no-fs`; defaults to `64` MiB when `--no-fs` is set)
+        #[arg(long, value_name = "MIB")]
+        in_memory_mb: Option<u64>,
+
+        /// Optional environment variable holding a 64-char hex Ed25519 seed for deterministic identity in `--no-fs` mode
+        #[arg(long, value_name = "ENV_VAR")]
+        identity_env: Option<String>,
+
+        /// Optional read-only file (raw 32-byte seed or 64-char hex) for deterministic identity in `--no-fs` mode
+        #[arg(long, value_name = "PATH")]
+        identity_file: Option<PathBuf>,
     },
 
     /// Display or initialize the persistent seed server NodeIdentity and Post-Quantum Owner Key
@@ -420,6 +436,10 @@ async fn main() -> anyhow::Result<()> {
             admin_rpc_pubkey,
             council_pubkeys,
             council_quorum,
+            no_fs,
+            in_memory_mb,
+            identity_env,
+            identity_file,
         } => {
             let mut explicit_admin_pks = Vec::new();
             for raw_hex in &admin_rpc_pubkey {
@@ -441,46 +461,97 @@ async fn main() -> anyhow::Result<()> {
             }
             let has_external_admin_keys =
                 !explicit_admin_pks.is_empty() || !explicit_council_pks.is_empty();
+            let in_memory_mode = no_fs || in_memory_mb.is_some();
 
             let discovery_port = resolve_seed_lan_port(lan_discovery_port);
             let lan_enabled = resolve_seed_lan_enabled(no_lan_discovery);
-            let node_identity = NodeIdentity::load_or_generate_in_dir(&data_dir)?;
-            let seed_peers = if effective_peers.is_empty() && lan_enabled && !once {
-                resolve_zero_config_peers(
-                    &data_dir,
-                    &[],
-                    discovery_port,
-                    Duration::from_millis(200),
-                )
+            let node_identity = if let Some(ref env_name) = identity_env {
+                let raw_val = std::env::var(env_name.trim()).map_err(|_| {
+                    anyhow::anyhow!("--identity-env variable '{}' is not set", env_name.trim())
+                })?;
+                let seed = parse_hex_32(&raw_val, "--identity-env")?;
+                NodeIdentity::from_seed(seed)
+            } else if let Some(ref id_path) = identity_file {
+                let raw_bytes = std::fs::read(id_path)?;
+                let seed = if raw_bytes.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&raw_bytes);
+                    arr
+                } else {
+                    let as_txt = std::str::from_utf8(&raw_bytes).map_err(|_| {
+                        anyhow::anyhow!("--identity-file must be 32 raw bytes or 64-char hex")
+                    })?;
+                    parse_hex_32(as_txt, "--identity-file")?
+                };
+                NodeIdentity::from_seed(seed)
+            } else if in_memory_mode {
+                NodeIdentity::generate()
             } else {
-                effective_peers.clone()
+                NodeIdentity::load_or_generate_in_dir(&data_dir)?
             };
-            let mesh_client = MeshClient::new(node_identity.clone(), seed_peers, None)
-                .with_data_dir_discovery(data_dir.clone(), discovery_port);
-            let max_bytes = max_gb.saturating_mul(1024 * 1024 * 1024);
-            let grace_bytes = 2 * 1024 * 1024 * 1024;
-            let quota = QuotaManager::new(max_bytes, grace_bytes);
-            let block_store = BlockStore::new(&data_dir, quota)?.with_mesh_client(mesh_client);
-            let mode_marker = match mode {
-                CliSeedMode::HomelabVault => "homelab-vault",
-                CliSeedMode::PublicBootstrap => "public-bootstrap",
-            };
-            let _ = BlockStore::atomic_write_file(
-                &data_dir.join("seed_mode.txt"),
-                mode_marker.as_bytes(),
-            );
-            // Zero-Private-Key-On-VPS invariant (`ADR-19`): NEVER auto-generate `tracker_admin.seed`
-            // when `--admin-rpc-pubkey` or `--council-pubkeys` is supplied!
-            if mode == CliSeedMode::PublicBootstrap
-                && (!has_external_admin_keys || data_dir.join("tracker_admin.seed").exists())
-            {
-                let _ = load_or_generate_tracker_admin_identity(&data_dir)?;
-            }
 
+            let seed_peers =
+                if effective_peers.is_empty() && lan_enabled && !once && !in_memory_mode {
+                    resolve_zero_config_peers(
+                        &data_dir,
+                        &[],
+                        discovery_port,
+                        Duration::from_millis(200),
+                    )
+                } else {
+                    effective_peers.clone()
+                };
+            let mesh_client = if in_memory_mode {
+                MeshClient::new(node_identity.clone(), seed_peers, None)
+            } else {
+                MeshClient::new(node_identity.clone(), seed_peers, None)
+                    .with_data_dir_discovery(data_dir.clone(), discovery_port)
+            };
+
+            let block_store = if in_memory_mode {
+                let ram_cap_bytes = in_memory_mb
+                    .unwrap_or(64)
+                    .max(1)
+                    .saturating_mul(1024 * 1024);
+                let mut quota = QuotaManager::new(ram_cap_bytes, ram_cap_bytes);
+                quota.set_min_free_disk_bytes(0);
+                BlockStore::new_in_memory(quota).with_mesh_client(mesh_client)
+            } else {
+                let max_bytes = max_gb.saturating_mul(1024 * 1024 * 1024);
+                let grace_bytes = 2 * 1024 * 1024 * 1024;
+                let quota = QuotaManager::new(max_bytes, grace_bytes);
+                let bs = BlockStore::new(&data_dir, quota)?.with_mesh_client(mesh_client);
+                let mode_marker = match mode {
+                    CliSeedMode::HomelabVault => "homelab-vault",
+                    CliSeedMode::PublicBootstrap => "public-bootstrap",
+                };
+                let _ = BlockStore::atomic_write_file(
+                    &data_dir.join("seed_mode.txt"),
+                    mode_marker.as_bytes(),
+                );
+                // Zero-Private-Key-On-VPS invariant (`ADR-19`): NEVER auto-generate `tracker_admin.seed`
+                // when `--admin-rpc-pubkey` or `--council-pubkeys` is supplied!
+                if mode == CliSeedMode::PublicBootstrap
+                    && (!has_external_admin_keys || data_dir.join("tracker_admin.seed").exists())
+                {
+                    let _ = load_or_generate_tracker_admin_identity(&data_dir)?;
+                }
+                bs
+            };
+
+            let mut ephemeral_pq_fp: Option<String> = None;
             let server = match mode {
                 CliSeedMode::HomelabVault => {
                     let owner_pubkey = if let Some(hex_str) = owner_pq_pubkey_hex {
                         HybridPqPublicKey::from_hex(hex_str.trim())?
+                    } else if in_memory_mode {
+                        let eph = HybridPqSigningKeypair::generate()?;
+                        let pk = eph.public_key();
+                        info!(
+                            fingerprint = %pk.fingerprint_hex(),
+                            "Generated ephemeral in-memory homelab HybridPqPublicKey (--no-fs)"
+                        );
+                        pk
                     } else {
                         let persistent =
                             HybridPqSigningKeypair::load_or_generate_in_dir(&data_dir)?;
@@ -492,6 +563,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                         pk
                     };
+                    ephemeral_pq_fp = Some(owner_pubkey.fingerprint_hex());
                     ZeroTrustSeedServer::new_homelab_vault(
                         "parvault-seed-homelab-vault",
                         block_store.clone(),
@@ -500,11 +572,20 @@ async fn main() -> anyhow::Result<()> {
                     )
                 }
                 CliSeedMode::PublicBootstrap => {
-                    let genesis_pubkey =
-                        NodeIdentity::resolve_genesis_root_pubkey_in_dir(&data_dir, None)?;
+                    let genesis_pubkey = if in_memory_mode {
+                        if let Ok(env_hex) = std::env::var("PARVAULT_GENESIS_PUBKEY_HEX") {
+                            parse_hex_32(&env_hex, "PARVAULT_GENESIS_PUBKEY_HEX")
+                                .unwrap_or_else(|_| node_identity.public_key_bytes())
+                        } else {
+                            node_identity.public_key_bytes()
+                        }
+                    } else {
+                        NodeIdentity::resolve_genesis_root_pubkey_in_dir(&data_dir, None)?
+                    };
                     info!(
                         lease_epochs,
                         grace_epochs,
+                        in_memory_mode,
                         "Configured PublicNetworkBootstrapper Byte-Epoch lease policy"
                     );
                     ZeroTrustSeedServer::new_public_bootstrapper(
@@ -517,7 +598,12 @@ async fn main() -> anyhow::Result<()> {
             };
 
             let report = server.status_report(1);
-            print_status_report(&listen, &data_dir, &report)?;
+            let display_dir = if in_memory_mode {
+                Path::new("in-memory (--no-fs)")
+            } else {
+                data_dir.as_path()
+            };
+            print_status_report(&listen, display_dir, &report)?;
 
             if once {
                 return Ok(());
@@ -525,6 +611,8 @@ async fn main() -> anyhow::Result<()> {
 
             run_seed_listener_loop(
                 listen,
+                node_identity,
+                ephemeral_pq_fp,
                 block_store,
                 server,
                 lan_discovery_port,
@@ -1559,8 +1647,10 @@ fn resolve_seed_council_and_quorum(
             for pk in extra_council_pubkeys {
                 push_pk(*pk);
             }
-            for pk in KnownPeersStore::load(data_dir).pinned_tracker_admin_pubkeys() {
-                push_pk(pk);
+            if !data_dir.as_os_str().is_empty() {
+                for pk in KnownPeersStore::load(data_dir).pinned_tracker_admin_pubkeys() {
+                    push_pk(pk);
+                }
             }
             let min_quorum = quorum_override
                 .unwrap_or_else(|| {
@@ -1608,6 +1698,9 @@ struct SeedSharedState {
 }
 
 fn count_blinded_shards_on_disk(block_store: &BlockStore) -> usize {
+    if block_store.is_in_memory() {
+        return block_store.blinded_lease_stats().1;
+    }
     let Ok(rd) = std::fs::read_dir(block_store.shards_dir()) else {
         return 0;
     };
@@ -1666,6 +1759,8 @@ fn collect_public_swarm_diversity(
 #[allow(clippy::too_many_arguments)]
 async fn run_seed_listener_loop(
     listen: String,
+    node_identity: NodeIdentity,
+    precomputed_pq_fp: Option<String>,
     block_store: BlockStore,
     server: ZeroTrustSeedServer,
     lan_discovery_port: Option<u16>,
@@ -1677,16 +1772,21 @@ async fn run_seed_listener_loop(
     effective_peers: Vec<String>,
 ) -> anyhow::Result<()> {
     let start_instant = Instant::now();
+    let in_memory_mode = block_store.is_in_memory();
     let data_dir = block_store.root_dir().to_path_buf();
-    let node_identity = NodeIdentity::load_or_generate_in_dir(&data_dir)?;
     let has_external_admin_keys =
         !explicit_admin_pks.is_empty() || !explicit_council_pks.is_empty();
-    let local_tracker_admin =
-        if !has_external_admin_keys || data_dir.join("tracker_admin.seed").exists() {
-            Some(load_or_generate_tracker_admin_identity(&data_dir)?)
+    let local_tracker_admin = if in_memory_mode {
+        if !has_external_admin_keys {
+            Some(node_identity.clone())
         } else {
             None
-        };
+        }
+    } else if !has_external_admin_keys || data_dir.join("tracker_admin.seed").exists() {
+        Some(load_or_generate_tracker_admin_identity(&data_dir)?)
+    } else {
+        None
+    };
     let local_tracker_admin_pk = local_tracker_admin.as_ref().map(|id| id.public_key_bytes());
 
     let mut extra_council_pks = Vec::new();
@@ -1705,23 +1805,59 @@ async fn run_seed_listener_loop(
 
     let keypair = node_identity.to_libp2p_keypair()?;
     let local_peer_id = keypair.public().to_peer_id();
-    let genesis_pubkey = NodeIdentity::resolve_genesis_root_pubkey_in_dir(&data_dir, None)?;
+    let genesis_pubkey = if in_memory_mode {
+        if let Ok(env_hex) = std::env::var("PARVAULT_GENESIS_PUBKEY_HEX") {
+            parse_hex_32(&env_hex, "PARVAULT_GENESIS_PUBKEY_HEX")
+                .unwrap_or_else(|_| node_identity.public_key_bytes())
+        } else {
+            node_identity.public_key_bytes()
+        }
+    } else {
+        NodeIdentity::resolve_genesis_root_pubkey_in_dir(&data_dir, None)?
+    };
 
-    let mut wot = WebOfTrustRegistry::with_persistence_dir(
-        genesis_pubkey,
-        DEFAULT_SUBTREE_SLASH_LIMIT,
-        &data_dir,
-    );
+    let mut wot = if in_memory_mode {
+        WebOfTrustRegistry::new(genesis_pubkey, DEFAULT_SUBTREE_SLASH_LIMIT)
+    } else {
+        WebOfTrustRegistry::with_persistence_dir(
+            genesis_pubkey,
+            DEFAULT_SUBTREE_SLASH_LIMIT,
+            &data_dir,
+        )
+    };
     if server.mode() == SeedServerMode::PublicNetworkBootstrapper {
         wot.set_trust_pool_mode(TrustPoolMode::Hybrid, DEFAULT_PUBLIC_WOT_POW_BITS);
     }
-    let por_verifier = PorVerifierEngine::with_persistence_dir(300, &data_dir);
-    let nullifier_ledger = VoucherNullifierLedger::with_persistence_dir(genesis_pubkey, &data_dir);
-    let pq_kem = HybridKemKeypair::load_or_generate_in_dir(&data_dir)?;
-    let wan_registry =
-        WanRendezvousRegistry::load_or_new(Some(&data_dir.join("wan_rendezvous.bin")));
-    let eviction = PrivacyPreservingEvictionEngine::load_or_init(&data_dir)?;
-    let takedown_queue = PublicTrackerTakedownQueue::load_or_init(&data_dir)?;
+    let por_verifier = if in_memory_mode {
+        PorVerifierEngine::new(300)
+    } else {
+        PorVerifierEngine::with_persistence_dir(300, &data_dir)
+    };
+    let nullifier_ledger = if in_memory_mode {
+        VoucherNullifierLedger::new(genesis_pubkey)
+    } else {
+        VoucherNullifierLedger::with_persistence_dir(genesis_pubkey, &data_dir)
+    };
+    let pq_kem = if in_memory_mode {
+        HybridKemKeypair::generate()?
+    } else {
+        HybridKemKeypair::load_or_generate_in_dir(&data_dir)?
+    };
+    let wan_registry = if in_memory_mode {
+        WanRendezvousRegistry::load_or_new(None)
+    } else {
+        WanRendezvousRegistry::load_or_new(Some(&data_dir.join("wan_rendezvous.bin")))
+    };
+    let eviction = if in_memory_mode {
+        PrivacyPreservingEvictionEngine::new_in_memory()
+    } else {
+        PrivacyPreservingEvictionEngine::load_or_init(&data_dir)?
+    };
+    let takedown_queue = if in_memory_mode {
+        PublicTrackerTakedownQueue::new_in_memory()
+    } else {
+        PublicTrackerTakedownQueue::load_or_init(&data_dir)?
+    };
     let mut peer_remote_addrs: HashMap<String, Multiaddr> = HashMap::new();
 
     let mut swarm = build_mesh_swarm(keypair, false)?;
@@ -1821,9 +1957,15 @@ async fn run_seed_listener_loop(
             SeedServerMode::HomelabRedundancyVault => "homelab-seed",
             SeedServerMode::PublicNetworkBootstrapper => "public-seed",
         };
-        let pq_fp = HybridPqSigningKeypair::load_or_generate_in_dir(&data_dir)
-            .ok()
-            .map(|kp| kp.public_key().fingerprint_hex());
+        let pq_fp = if in_memory_mode {
+            precomputed_pq_fp
+        } else {
+            precomputed_pq_fp.or_else(|| {
+                HybridPqSigningKeypair::load_or_generate_in_dir(&data_dir)
+                    .ok()
+                    .map(|kp| kp.public_key().fingerprint_hex())
+            })
+        };
         let sas = derive_4word_pairing_sas(
             &local_peer_id.to_string(),
             pq_fp.as_deref(),
@@ -2153,12 +2295,14 @@ fn handle_seed_admin_rpc_request(
                         push_unique_peer(&mut target_peers, p.clone());
                     }
                 }
-                for p in KnownPeersStore::load(data_dir).active_multiaddrs() {
-                    if !p.ends_with(&format!("/p2p/{local_peer_id_str}")) {
-                        push_unique_peer(&mut target_peers, p);
+                if !data_dir.as_os_str().is_empty() {
+                    for p in KnownPeersStore::load(data_dir).active_multiaddrs() {
+                        if !p.ends_with(&format!("/p2p/{local_peer_id_str}")) {
+                            push_unique_peer(&mut target_peers, p);
+                        }
                     }
                 }
-                if target_peers.is_empty() {
+                if target_peers.is_empty() && !data_dir.as_os_str().is_empty() {
                     let discovery_port = resolve_seed_lan_port(None);
                     for p in resolve_zero_config_peers(
                         data_dir,
@@ -2174,8 +2318,12 @@ fn handle_seed_admin_rpc_request(
 
                 if !target_peers.is_empty() {
                     let discovery_port = resolve_seed_lan_port(None);
-                    let client = MeshClient::new(node_identity.clone(), target_peers.clone(), None)
-                        .with_data_dir_discovery(data_dir.to_path_buf(), discovery_port);
+                    let client = if data_dir.as_os_str().is_empty() {
+                        MeshClient::new(node_identity.clone(), target_peers.clone(), None)
+                    } else {
+                        MeshClient::new(node_identity.clone(), target_peers.clone(), None)
+                            .with_data_dir_discovery(data_dir.to_path_buf(), discovery_port)
+                    };
                     peers_contacted = target_peers.len();
                     for peer_addr in &target_peers {
                         let mut peer_ok = false;
@@ -2699,6 +2847,18 @@ fn handle_seed_wire_request(
                         error: Some(reason),
                     };
                 }
+                if max_probationary_lease_bytes > 0
+                    && (bundle.shard_bytes.len() as u64) > max_probationary_lease_bytes
+                {
+                    return MeshWireResponse::RelayPqOnionAck {
+                        delivered: false,
+                        error: Some(format!(
+                            "shard length {} exceeds max_probationary_lease_bytes {}",
+                            bundle.shard_bytes.len(),
+                            max_probationary_lease_bytes
+                        )),
+                    };
+                }
                 nullifier_ledger.set_trusted_issuer_pubkey(bundle.voucher.issuer_pubkey);
                 let voucher_pk = bundle.voucher.issuer_pubkey;
                 let bid = bundle.blinded_id;
@@ -3002,7 +3162,6 @@ fn handle_seed_wire_request(
                 genesis_pubkey,
             );
             let local_pk = node_identity.public_key_bytes();
-            let _ = max_probationary_lease_bytes;
             match eviction.apply_signed_eviction_order_with_quorum(
                 &order,
                 Some(&local_pk),

@@ -2282,7 +2282,7 @@ dependencies = [
 
 [[package]]
 name = "parvault"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2297,6 +2297,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "libc",
  "libp2p",
  "rand 0.8.8",
  "reed-solomon-erasure",

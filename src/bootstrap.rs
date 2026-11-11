@@ -765,6 +765,10 @@ impl BlindedShardLeaseManager {
         self.grace_epochs = grace_epochs;
     }
 
+    pub const fn max_capacity_bytes(&self) -> u64 {
+        self.max_capacity_bytes
+    }
+
     pub const fn used_bytes(&self) -> u64 {
         self.used_bytes
     }
@@ -775,6 +779,15 @@ impl BlindedShardLeaseManager {
 
     pub fn lease_entry(&self, blinded_shard_id: &[u8; 32]) -> Option<&BlindedShardLeaseEntry> {
         self.leases.get(blinded_shard_id)
+    }
+
+    pub fn force_remove_locator(&mut self, locator: &[u8; 32]) -> bool {
+        if let Some(removed) = self.leases.remove(locator) {
+            self.used_bytes = self.used_bytes.saturating_sub(removed.size_bytes);
+            true
+        } else {
+            false
+        }
     }
 
     /// Stores or updates a blinded shard with an initial Byte-Epoch lease (`current_epoch + lease_duration_epochs`).
@@ -917,6 +930,52 @@ impl BlindedShardLeaseManager {
             }
         }
         evicted
+    }
+
+    /// Hard-cap eviction for bounded in-memory seed nodes (`--no-fs` / `--in-memory-mb`):
+    /// Evicts expired leases first, then evicts the oldest-expiring / LRU active leases until
+    /// `needed_bytes` fits strictly within `self.max_capacity_bytes`. Returns `None` if
+    /// `needed_bytes > self.max_capacity_bytes`.
+    pub fn evict_oldest_to_fit(
+        &mut self,
+        needed_bytes: u64,
+        current_epoch: u64,
+    ) -> Option<Vec<[u8; 32]>> {
+        if needed_bytes > self.max_capacity_bytes {
+            return None;
+        }
+        let mut evicted = self.evict_expired_to_fit(needed_bytes, current_epoch);
+        if self.max_capacity_bytes.saturating_sub(self.used_bytes) >= needed_bytes {
+            return Some(evicted);
+        }
+
+        let mut active_candidates: Vec<([u8; 32], u64, u64)> = self
+            .leases
+            .values()
+            .map(|e| {
+                (
+                    e.blinded_shard_id,
+                    e.lease_expires_epoch,
+                    e.last_renewed_epoch,
+                )
+            })
+            .collect();
+        active_candidates.sort_by_key(|(_id, exp, ren)| (*exp, *ren));
+
+        for (id, _, _) in active_candidates {
+            if self.max_capacity_bytes.saturating_sub(self.used_bytes) >= needed_bytes {
+                break;
+            }
+            if let Some(removed) = self.leases.remove(&id) {
+                self.used_bytes = self.used_bytes.saturating_sub(removed.size_bytes);
+                evicted.push(id);
+            }
+        }
+        if self.max_capacity_bytes.saturating_sub(self.used_bytes) >= needed_bytes {
+            Some(evicted)
+        } else {
+            None
+        }
     }
 
     /// Time-based background GC sweep: returns and removes all blinded shard locators whose

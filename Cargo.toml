@@ -1,6 +1,6 @@
 [package]
 name = "parvault"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "ParVault — Zero-knowledge post-quantum erasure-coded backup utility and P2P storage daemon with Noise transport, Web-of-Trust, and Proof of Retrievability (PoR) auditing."
@@ -14,6 +14,15 @@ name = "parvault-seed"
 path = "src/bin/parvault-seed.rs"
 
 [[bin]]
+name = "parvault-gateway"
+path = "src/bin/parvault-gateway.rs"
+
+[[bin]]
+name = "parvault-fuse"
+path = "src/bin/parvault-fuse.rs"
+required-features = ["vfs"]
+
+[[bin]]
 name = "parvault-bench"
 path = "src/bin/parvault-bench.rs"
 
@@ -22,11 +31,15 @@ name = "parvault"
 path = "src/lib.rs"
 
 [features]
-default = []
+default = ["vfs"]
+vfs = []
 simd-accel = ["reed-solomon-erasure/simd-accel"]
 
+[package.metadata.kani]
+flags = { lib = true }
+
 [dependencies]
-tokio = { version = "1.40", features = ["rt-multi-thread", "rt", "net", "io-util", "time", "sync", "macros", "fs", "signal"] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal"] }
 libp2p = { version = "0.54", features = [
     "tokio",
     "gossipsub",
@@ -67,6 +80,9 @@ thiserror = "1.0"
 anyhow = "1.0"
 hex = "0.4"
 async-trait = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.12"

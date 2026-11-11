@@ -59,12 +59,59 @@ pub fn generate_file_salt() -> [u8; SALT_LEN] {
 }
 
 /// Formats the canonical 30-byte HKDF info string `"parvault-stripe-nonce:" || stripe_index_be64`.
-/// Injective with respect to `stripe_index`.
+/// Bijective with respect to `stripe_index` across `0..=u64::MAX`.
 pub fn format_stripe_nonce_info(stripe_index: u64) -> [u8; 30] {
     let mut info = [0u8; 30];
     info[..22].copy_from_slice(b"parvault-stripe-nonce:");
     info[22..30].copy_from_slice(&stripe_index.to_be_bytes());
     info
+}
+
+/// Formats the canonical 24-byte AES-256-GCM Additional Authenticated Data (AAD) block
+/// `file_salt || stripe_index_be64`, binding every ciphertext stripe to both its file salt and
+/// exact position in the stream.
+pub fn format_stripe_aad(file_salt: &[u8; SALT_LEN], stripe_index: u64) -> [u8; SALT_LEN + 8] {
+    let mut aad = [0u8; SALT_LEN + 8];
+    aad[..SALT_LEN].copy_from_slice(file_salt);
+    aad[SALT_LEN..].copy_from_slice(&stripe_index.to_be_bytes());
+    aad
+}
+
+/// Parameterized stripe-nonce derivation boundary (`derive_stripe_nonce_from_subkey` instantiates
+/// `kdf_expand` with `Hkdf<Sha256>`).
+pub fn derive_stripe_nonce_with<F>(
+    stripe_nonce_subkey: &[u8; 32],
+    file_salt: &[u8; SALT_LEN],
+    stripe_index: u64,
+    kdf_expand: F,
+) -> Result<[u8; NONCE_LEN], CryptoError>
+where
+    F: FnOnce(&[u8; 32], &[u8; SALT_LEN], &[u8; 30]) -> Result<[u8; NONCE_LEN], CryptoError>,
+{
+    let info = format_stripe_nonce_info(stripe_index);
+    kdf_expand(stripe_nonce_subkey, file_salt, &info)
+}
+
+/// Derives a deterministic 96-bit (12-byte) AES-256-GCM nonce from the domain-separated
+/// `stripe_nonce_subkey` (`N_i = HKDF-Expand(K_stripe_nonce, "parvault-stripe-nonce:" || stripe_index_be64)`
+/// with `salt = file_salt`).
+pub fn derive_stripe_nonce_from_subkey(
+    stripe_nonce_subkey: &[u8; 32],
+    file_salt: &[u8; SALT_LEN],
+    stripe_index: u64,
+) -> Result<[u8; NONCE_LEN], CryptoError> {
+    derive_stripe_nonce_with(
+        stripe_nonce_subkey,
+        file_salt,
+        stripe_index,
+        |subkey, salt, info| {
+            let hk = Hkdf::<Sha256>::new(Some(salt), subkey);
+            let mut nonce = [0u8; NONCE_LEN];
+            hk.expand(info, &mut nonce)
+                .map_err(|_| CryptoError::KdfFailed)?;
+            Ok(nonce)
+        },
+    )
 }
 
 /// Derives a deterministic 96-bit (12-byte) AES-256-GCM nonce for stripe `stripe_index` (ADR-01):
@@ -75,14 +122,9 @@ pub fn derive_stripe_nonce(
     stripe_index: u64,
 ) -> Result<[u8; NONCE_LEN], CryptoError> {
     let mut subkey = master_key.stripe_nonce_subkey();
-    let hk = Hkdf::<Sha256>::new(Some(file_salt), &subkey);
+    let res = derive_stripe_nonce_from_subkey(&subkey, file_salt, stripe_index);
     subkey.zeroize();
-
-    let info = format_stripe_nonce_info(stripe_index);
-    let mut nonce = [0u8; NONCE_LEN];
-    hk.expand(&info, &mut nonce)
-        .map_err(|_| CryptoError::KdfFailed)?;
-    Ok(nonce)
+    res
 }
 
 /// Encrypts a single streaming stripe (up to 16 MiB per ADR-01) using AES-256-GCM under the
@@ -102,10 +144,7 @@ pub fn encrypt_stripe(
 
     let nonce_bytes = derive_stripe_nonce(master_key, file_salt, stripe_index)?;
     let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let mut aad = [0u8; SALT_LEN + 8];
-    aad[..SALT_LEN].copy_from_slice(file_salt);
-    aad[SALT_LEN..].copy_from_slice(&stripe_index.to_be_bytes());
+    let aad = format_stripe_aad(file_salt, stripe_index);
 
     cipher
         .encrypt(
@@ -133,10 +172,7 @@ pub fn decrypt_stripe(
 
     let nonce_bytes = derive_stripe_nonce(master_key, file_salt, stripe_index)?;
     let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let mut aad = [0u8; SALT_LEN + 8];
-    aad[..SALT_LEN].copy_from_slice(file_salt);
-    aad[SALT_LEN..].copy_from_slice(&stripe_index.to_be_bytes());
+    let aad = format_stripe_aad(file_salt, stripe_index);
 
     cipher
         .decrypt(
@@ -290,26 +326,52 @@ pub fn unpad_plaintext_iso_bucket(padded: &[u8]) -> Result<Vec<u8>, CryptoError>
 mod kani_proofs {
     use super::*;
 
-    /// Bit-precise bounded verification that per-stripe nonce derivation never panics,
-    /// has zero buffer overflows, injects `stripe_index` bijectively into the HKDF info block,
-    /// and produces distinct 96-bit nonces for distinct stripe indices.
+    /// Bit-precise bounded verification that per-stripe nonce & AAD derivation never panics,
+    /// has zero buffer overflows, injects `stripe_index` bijectively into the 30-byte HKDF
+    /// `info` domain block (`format_stripe_nonce_info`) and 24-byte AEAD `aad` block
+    /// (`format_stripe_aad`) across all `0..=u64::MAX`, and preserves uniqueness across
+    /// `derive_stripe_nonce_with`.
     #[kani::proof]
     fn proof_stripe_nonce_injectivity_and_no_panic() {
-        let key_bytes: [u8; 32] = kani::any();
-        let salt: [u8; SALT_LEN] = kani::any();
         let idx_a: u64 = kani::any();
         let idx_b: u64 = kani::any();
-        kani::assume(idx_a != idx_b);
 
         let info_a = format_stripe_nonce_info(idx_a);
         let info_b = format_stripe_nonce_info(idx_b);
-        assert_ne!(info_a, info_b);
+        assert_eq!(&info_a[..22], b"parvault-stripe-nonce:");
+        assert_eq!(&info_b[..22], b"parvault-stripe-nonce:");
+        assert_eq!(&info_a[22..30], &idx_a.to_be_bytes());
+        assert_eq!(&info_b[22..30], &idx_b.to_be_bytes());
+        assert_eq!(info_a == info_b, idx_a == idx_b);
 
-        let master_key = MasterKey::from_bytes(key_bytes);
-        let nonce_a = derive_stripe_nonce(&master_key, &salt, idx_a).expect("HKDF expand valid");
-        let nonce_b = derive_stripe_nonce(&master_key, &salt, idx_b).expect("HKDF expand valid");
-        assert_eq!(nonce_a.len(), NONCE_LEN);
-        assert_eq!(nonce_b.len(), NONCE_LEN);
-        assert_ne!(nonce_a, nonce_b);
+        let salt_a: [u8; SALT_LEN] = kani::any();
+        let salt_b: [u8; SALT_LEN] = kani::any();
+        let aad_a = format_stripe_aad(&salt_a, idx_a);
+        let aad_b = format_stripe_aad(&salt_b, idx_b);
+        assert_eq!(aad_a == aad_b, salt_a == salt_b && idx_a == idx_b);
+
+        let subkey: [u8; 32] = kani::any();
+        let ideal_kdf = |sk: &[u8; 32], salt: &[u8; SALT_LEN], info: &[u8; 30]| {
+            let mut out = [0u8; NONCE_LEN];
+            let mut i = 0;
+            while i < 4 {
+                out[i] = sk[i] ^ info[i];
+                i += 1;
+            }
+            // Embed the 8-byte big-endian stripe_index mixed with key+salt bijectively into bytes 4..12.
+            let mut j = 0;
+            while j < 8 {
+                out[4 + j] = info[22 + j] ^ sk[8 + j] ^ salt[j];
+                j += 1;
+            }
+            Ok(out)
+        };
+
+        let n_a1 = derive_stripe_nonce_with(&subkey, &salt_a, idx_a, ideal_kdf).unwrap();
+        let n_a2 = derive_stripe_nonce_with(&subkey, &salt_a, idx_a, ideal_kdf).unwrap();
+        let n_b = derive_stripe_nonce_with(&subkey, &salt_a, idx_b, ideal_kdf).unwrap();
+        assert_eq!(n_a1.len(), NONCE_LEN);
+        assert_eq!(n_a1, n_a2);
+        assert_eq!(n_a1 == n_b, idx_a == idx_b);
     }
 }

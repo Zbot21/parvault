@@ -226,7 +226,18 @@ impl SignedBadActorEvictionOrder {
     /// Verifies the primary Ed25519 signature and structural bounds (`reason.len() <= 256`,
     /// `cosignatures.len() <= 64`).
     pub fn verify_signature(&self) -> bool {
-        if self.reason.len() > MAX_EVICTION_REASON_BYTES
+        self.verify_signature_with(NodeIdentity::verify_with_pubkey)
+    }
+
+    /// Verifies structural bounds (`issuer_pubkey != [0u8; 32]`, `reason.len() <= 256`,
+    /// `cosignatures.len() <= 64`, bounded string targets) and checks the primary signature
+    /// over `self.canonical_sign_bytes()` using `verify_fn`.
+    pub fn verify_signature_with<F>(&self, verify_fn: F) -> bool
+    where
+        F: Fn(&[u8; 32], &[u8], &[u8; 64]) -> bool,
+    {
+        if self.issuer_pubkey == [0u8; 32]
+            || self.reason.len() > MAX_EVICTION_REASON_BYTES
             || self.cosignatures.len() > MAX_EVICTION_COSIGNATURES
         {
             return false;
@@ -239,40 +250,178 @@ impl SignedBadActorEvictionOrder {
             }
             _ => {}
         }
-        let msg = self.canonical_sign_bytes();
         let mut sig = [0u8; 64];
         sig[..32].copy_from_slice(&self.sig_r);
         sig[32..].copy_from_slice(&self.sig_s);
-        NodeIdentity::verify_with_pubkey(&self.issuer_pubkey, &msg, &sig)
+        if let Some((stack_buf, len)) = Self::encode_signing_payload_stack(
+            &self.order_id,
+            &self.target,
+            self.reason.as_bytes(),
+            self.issued_at_ms,
+            self.expires_at_ms,
+            &self.issuer_pubkey,
+        ) {
+            verify_fn(&self.issuer_pubkey, &stack_buf[..len], &sig)
+        } else {
+            let msg = self.canonical_sign_bytes();
+            verify_fn(&self.issuer_pubkey, &msg, &sig)
+        }
     }
 
     /// Counts how many **distinct** public keys in `trusted_council_pubkeys` have produced a
     /// cryptographically valid Ed25519 signature (primary `issuer_pubkey` + `cosignatures`) over
     /// `self.canonical_sign_bytes()`. Duplicate signatures from the same key count at most once.
     pub fn valid_council_signer_count(&self, trusted_council_pubkeys: &[[u8; 32]]) -> usize {
-        if trusted_council_pubkeys.is_empty() || !self.verify_signature() {
-            return 0;
-        }
-        let council_set: HashSet<[u8; 32]> = trusted_council_pubkeys.iter().copied().collect();
-        let mut distinct_valid: HashSet<[u8; 32]> = HashSet::new();
+        self.valid_council_signer_count_with(
+            trusted_council_pubkeys,
+            NodeIdentity::verify_with_pubkey,
+        )
+    }
 
-        if council_set.contains(&self.issuer_pubkey) {
-            distinct_valid.insert(self.issuer_pubkey);
+    /// Zero-allocation stack-capable `M-of-N` quorum tally and expiry evaluator shared by
+    /// `valid_council_signer_count_with`, `verify_against_quorum_with`, and Kani symbolic harnesses.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tally_and_verify_quorum_raw<F>(
+        order_id: &[u8; 32],
+        target: &EvictionTarget,
+        reason_bytes: &[u8],
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+        issuer_pubkey: &[u8; 32],
+        sig_r: &[u8; 32],
+        sig_s: &[u8; 32],
+        cosignatures: &[TrackerOperatorCosignature],
+        trusted_council_pubkeys: &[[u8; 32]],
+        min_quorum: usize,
+        now_ms: u64,
+        verify_fn: F,
+    ) -> (usize, bool)
+    where
+        F: Fn(&[u8; 32], &[u8], &[u8; 64]) -> bool,
+    {
+        if trusted_council_pubkeys.is_empty()
+            || *issuer_pubkey == [0u8; 32]
+            || reason_bytes.len() > MAX_EVICTION_REASON_BYTES
+            || cosignatures.len() > MAX_EVICTION_COSIGNATURES
+        {
+            return (0, false);
+        }
+        match target {
+            EvictionTarget::IpSubnet(s) | EvictionTarget::Libp2pPeerId(s)
+                if s.is_empty() || s.len() > MAX_TARGET_STRING_BYTES =>
+            {
+                return (0, false);
+            }
+            _ => {}
         }
 
-        if !self.cosignatures.is_empty() {
-            let msg = self.canonical_sign_bytes();
-            for cosig in &self.cosignatures {
-                if council_set.contains(&cosig.cosigner_pubkey)
-                    && !distinct_valid.contains(&cosig.cosigner_pubkey)
-                    && cosig.verify(&msg)
-                {
-                    distinct_valid.insert(cosig.cosigner_pubkey);
+        let heap_fallback;
+        let stack_opt = Self::encode_signing_payload_stack(
+            order_id,
+            target,
+            reason_bytes,
+            issued_at_ms,
+            expires_at_ms,
+            issuer_pubkey,
+        );
+        let msg_slice: &[u8] = if let Some((ref arr, len)) = stack_opt {
+            &arr[..len]
+        } else {
+            heap_fallback = Self::encode_signing_payload_bytes(
+                order_id,
+                target,
+                reason_bytes,
+                issued_at_ms,
+                expires_at_ms,
+                issuer_pubkey,
+            );
+            heap_fallback.as_slice()
+        };
+
+        let mut primary_sig = [0u8; 64];
+        primary_sig[..32].copy_from_slice(sig_r);
+        primary_sig[32..].copy_from_slice(sig_s);
+        if !verify_fn(issuer_pubkey, msg_slice, &primary_sig) {
+            return (0, false);
+        }
+
+        let is_council_member = |pk: &[u8; 32]| {
+            if *pk == [0u8; 32] {
+                return false;
+            }
+            let mut i = 0;
+            while i < trusted_council_pubkeys.len() {
+                if trusted_council_pubkeys[i] == *pk {
+                    return true;
+                }
+                i += 1;
+            }
+            false
+        };
+
+        let issuer_in_council = is_council_member(issuer_pubkey);
+        let mut count: usize = usize::from(issuer_in_council);
+
+        let limit = cosignatures.len().min(MAX_EVICTION_COSIGNATURES);
+        let mut valid_flags = [false; MAX_EVICTION_COSIGNATURES];
+        let mut idx = 0;
+        while idx < limit {
+            let candidate_pk = &cosignatures[idx].cosigner_pubkey;
+            if is_council_member(candidate_pk) {
+                let mut duplicate = issuer_in_council && (*candidate_pk == *issuer_pubkey);
+                let mut prev = 0;
+                while prev < idx {
+                    if valid_flags[prev] && cosignatures[prev].cosigner_pubkey == *candidate_pk {
+                        duplicate = true;
+                    }
+                    prev += 1;
+                }
+                if !duplicate {
+                    let mut sig = [0u8; 64];
+                    sig[..32].copy_from_slice(&cosignatures[idx].sig_r);
+                    sig[32..].copy_from_slice(&cosignatures[idx].sig_s);
+                    if verify_fn(candidate_pk, msg_slice, &sig) {
+                        valid_flags[idx] = true;
+                        count += 1;
+                    }
                 }
             }
+            idx += 1;
         }
 
-        distinct_valid.len()
+        let not_expired = expires_at_ms == 0 || now_ms <= expires_at_ms;
+        let quorum_ok = not_expired && count >= min_quorum.max(1);
+        (count, quorum_ok)
+    }
+
+    /// Deterministic `M-of-N` quorum tally over `trusted_council_pubkeys` parameterized by
+    /// signature verifier `verify_fn`. Rejects `[0u8; 32]` keys, requires a valid primary
+    /// signature over `self.canonical_sign_bytes()`, and strictly deduplicates signers so
+    /// repeated co-signatures from the same council key never count more than once.
+    pub fn valid_council_signer_count_with<F>(
+        &self,
+        trusted_council_pubkeys: &[[u8; 32]],
+        verify_fn: F,
+    ) -> usize
+    where
+        F: Fn(&[u8; 32], &[u8], &[u8; 64]) -> bool,
+    {
+        Self::tally_and_verify_quorum_raw(
+            &self.order_id,
+            &self.target,
+            self.reason.as_bytes(),
+            self.issued_at_ms,
+            self.expires_at_ms,
+            &self.issuer_pubkey,
+            &self.sig_r,
+            &self.sig_s,
+            &self.cosignatures,
+            trusted_council_pubkeys,
+            1,
+            0,
+            verify_fn,
+        )
+        .0
     }
 
     /// Verifies the primary signature, checks expiration, and requires at least `min_quorum.max(1)`
@@ -283,13 +432,49 @@ impl SignedBadActorEvictionOrder {
         min_quorum: usize,
         now_ms: u64,
     ) -> bool {
+        self.verify_against_quorum_with(
+            trusted_council_pubkeys,
+            min_quorum,
+            now_ms,
+            NodeIdentity::verify_with_pubkey,
+        )
+    }
+
+    /// Parameterized `M-of-N` council quorum verification enforcing non-empty council, expiration
+    /// window (`expires_at_ms == 0 || now_ms <= expires_at_ms`), primary signature validity, and
+    /// `valid_council_signer_count_with(...) >= min_quorum.max(1)`.
+    pub fn verify_against_quorum_with<F>(
+        &self,
+        trusted_council_pubkeys: &[[u8; 32]],
+        min_quorum: usize,
+        now_ms: u64,
+        verify_fn: F,
+    ) -> bool
+    where
+        F: Fn(&[u8; 32], &[u8], &[u8; 64]) -> bool,
+    {
         if trusted_council_pubkeys.is_empty() {
             return false;
         }
         if self.expires_at_ms != 0 && now_ms > self.expires_at_ms {
             return false;
         }
-        self.valid_council_signer_count(trusted_council_pubkeys) >= min_quorum.max(1)
+        Self::tally_and_verify_quorum_raw(
+            &self.order_id,
+            &self.target,
+            self.reason.as_bytes(),
+            self.issued_at_ms,
+            self.expires_at_ms,
+            &self.issuer_pubkey,
+            &self.sig_r,
+            &self.sig_s,
+            &self.cosignatures,
+            trusted_council_pubkeys,
+            min_quorum,
+            now_ms,
+            verify_fn,
+        )
+        .1
     }
 
     /// Verifies the Ed25519 signature, checks that `issuer_pubkey` is in `trusted_pubkeys`,
@@ -308,6 +493,92 @@ impl SignedBadActorEvictionOrder {
         self.verify_signature()
     }
 
+    /// Encodes the canonical `SignedBadActorEvictionOrder` preimage onto a fixed 256-byte stack
+    /// buffer whenever the serialized preimage fits in `<= 256` bytes (zero heap allocations).
+    pub fn encode_signing_payload_stack(
+        order_id: &[u8; 32],
+        target: &EvictionTarget,
+        reason_bytes: &[u8],
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+        issuer_pubkey: &[u8; 32],
+    ) -> Option<([u8; 256], usize)> {
+        let target_len = match target {
+            EvictionTarget::IpAddress(IpAddr::V4(_)) => 6,
+            EvictionTarget::IpAddress(IpAddr::V6(_)) => 18,
+            EvictionTarget::IpSubnet(s) | EvictionTarget::Libp2pPeerId(s) => 5 + s.len(),
+            EvictionTarget::PeerOrIssuerPubkey(_)
+            | EvictionTarget::StripeMerkleRoot(_)
+            | EvictionTarget::BlindedLocator(_) => 33,
+        };
+        let total = EVICTION_ORDER_DOMAIN
+            .len()
+            .checked_add(32)?
+            .checked_add(target_len)?
+            .checked_add(4)?
+            .checked_add(reason_bytes.len())?
+            .checked_add(8 + 8 + 32)?;
+        if total > 256 {
+            return None;
+        }
+        let mut buf = [0u8; 256];
+        let mut pos = 0usize;
+        let push_bytes = |dst: &mut [u8; 256], cursor: &mut usize, src: &[u8]| {
+            let mut i = 0;
+            while i < src.len() {
+                dst[*cursor + i] = src[i];
+                i += 1;
+            }
+            *cursor += src.len();
+        };
+        push_bytes(&mut buf, &mut pos, EVICTION_ORDER_DOMAIN);
+        push_bytes(&mut buf, &mut pos, order_id);
+        match target {
+            EvictionTarget::IpAddress(IpAddr::V4(v4)) => {
+                push_bytes(&mut buf, &mut pos, &[0x01, 0x04]);
+                push_bytes(&mut buf, &mut pos, &v4.octets());
+            }
+            EvictionTarget::IpAddress(IpAddr::V6(v6)) => {
+                push_bytes(&mut buf, &mut pos, &[0x01, 0x06]);
+                push_bytes(&mut buf, &mut pos, &v6.octets());
+            }
+            EvictionTarget::IpSubnet(cidr) => {
+                let b = cidr.as_bytes();
+                push_bytes(&mut buf, &mut pos, &[0x02]);
+                push_bytes(&mut buf, &mut pos, &(b.len() as u32).to_be_bytes());
+                push_bytes(&mut buf, &mut pos, b);
+            }
+            EvictionTarget::Libp2pPeerId(peer_id) => {
+                let b = peer_id.as_bytes();
+                push_bytes(&mut buf, &mut pos, &[0x03]);
+                push_bytes(&mut buf, &mut pos, &(b.len() as u32).to_be_bytes());
+                push_bytes(&mut buf, &mut pos, b);
+            }
+            EvictionTarget::PeerOrIssuerPubkey(pk) => {
+                push_bytes(&mut buf, &mut pos, &[0x04]);
+                push_bytes(&mut buf, &mut pos, pk);
+            }
+            EvictionTarget::StripeMerkleRoot(root) => {
+                push_bytes(&mut buf, &mut pos, &[0x05]);
+                push_bytes(&mut buf, &mut pos, root);
+            }
+            EvictionTarget::BlindedLocator(loc) => {
+                push_bytes(&mut buf, &mut pos, &[0x06]);
+                push_bytes(&mut buf, &mut pos, loc);
+            }
+        }
+        push_bytes(
+            &mut buf,
+            &mut pos,
+            &(reason_bytes.len() as u32).to_be_bytes(),
+        );
+        push_bytes(&mut buf, &mut pos, reason_bytes);
+        push_bytes(&mut buf, &mut pos, &issued_at_ms.to_be_bytes());
+        push_bytes(&mut buf, &mut pos, &expires_at_ms.to_be_bytes());
+        push_bytes(&mut buf, &mut pos, issuer_pubkey);
+        Some((buf, pos))
+    }
+
     fn encode_signing_payload(
         order_id: &[u8; 32],
         target: &EvictionTarget,
@@ -316,7 +587,35 @@ impl SignedBadActorEvictionOrder {
         expires_at_ms: u64,
         issuer_pubkey: &[u8; 32],
     ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(192 + reason.len());
+        Self::encode_signing_payload_bytes(
+            order_id,
+            target,
+            reason.as_bytes(),
+            issued_at_ms,
+            expires_at_ms,
+            issuer_pubkey,
+        )
+    }
+
+    fn encode_signing_payload_bytes(
+        order_id: &[u8; 32],
+        target: &EvictionTarget,
+        reason_bytes: &[u8],
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+        issuer_pubkey: &[u8; 32],
+    ) -> Vec<u8> {
+        if let Some((arr, len)) = Self::encode_signing_payload_stack(
+            order_id,
+            target,
+            reason_bytes,
+            issued_at_ms,
+            expires_at_ms,
+            issuer_pubkey,
+        ) {
+            return arr[..len].to_vec();
+        }
+        let mut buf = Vec::with_capacity(192 + reason_bytes.len());
         buf.extend_from_slice(EVICTION_ORDER_DOMAIN);
         buf.extend_from_slice(order_id);
         match target {
@@ -353,8 +652,8 @@ impl SignedBadActorEvictionOrder {
                 buf.extend_from_slice(loc);
             }
         }
-        buf.extend_from_slice(&(reason.len() as u32).to_be_bytes());
-        buf.extend_from_slice(reason.as_bytes());
+        buf.extend_from_slice(&(reason_bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(reason_bytes);
         buf.extend_from_slice(&issued_at_ms.to_be_bytes());
         buf.extend_from_slice(&expires_at_ms.to_be_bytes());
         buf.extend_from_slice(issuer_pubkey);
@@ -783,6 +1082,15 @@ impl PublicTrackerTakedownQueue {
         })
     }
 
+    /// Initializes a strictly zero-filesystem in-memory `PublicTrackerTakedownQueue` (`--no-fs`).
+    pub fn new_in_memory() -> Self {
+        Self {
+            queue_path: PathBuf::new(),
+            entries: Vec::new(),
+            emergency_actions: Vec::new(),
+        }
+    }
+
     /// Verifies `report.verify_cryptographic_burden_of_proof()` and, if valid, enqueues the report
     /// as `TakedownReviewStatus::PendingAdminReview` (`0600` atomic write). NEVER auto-evicts shards.
     pub fn enqueue_verified_report(
@@ -1134,6 +1442,9 @@ impl PublicTrackerTakedownQueue {
     }
 
     fn persist(&self) -> Result<(), StorageError> {
+        if self.queue_path.as_os_str().is_empty() {
+            return Ok(());
+        }
         let state = PersistedAdminTakedownState {
             entries: self.entries.clone(),
             emergency_actions: self.emergency_actions.clone(),
@@ -1280,6 +1591,28 @@ impl PrivacyPreservingEvictionEngine {
         &self.data_dir
     }
 
+    /// Constructs a deterministic in-memory `PrivacyPreservingEvictionEngine` from an explicit
+    /// 32-byte `K_node_evict` seed without touching the filesystem or `OsRng`.
+    pub fn in_memory_from_seed(seed: [u8; 32]) -> Self {
+        Self {
+            data_dir: PathBuf::new(),
+            index_path: PathBuf::new(),
+            hmac_seed: EvictionHmacSeed(seed),
+            index: PersistedEvictionIndex::default(),
+            seen_order_ids_set: HashSet::new(),
+        }
+    }
+
+    /// Constructs an in-memory `PrivacyPreservingEvictionEngine` seeded from `OsRng` with zero
+    /// filesystem directories or files created (`parvault-seed --no-fs` / `--in-memory-mb`).
+    pub fn new_in_memory() -> Self {
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let eng = Self::in_memory_from_seed(seed);
+        seed.zeroize();
+        eng
+    }
+
     /// Normalizes IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) to `IpAddr::V4(a.b.c.d)` so dual-stack
     /// sockets can never bypass IPv4 HMAC tags or `/24` subnet blocks.
     pub fn normalize_ip(ip: IpAddr) -> IpAddr {
@@ -1295,27 +1628,114 @@ impl PrivacyPreservingEvictionEngine {
         }
     }
 
-    /// Computes `HMAC-SHA256(K_node_evict, "parvault-evict-ip-v1:" || canonical_ip_bytes)`.
-    /// Normalizes IPv4-mapped IPv6 `::ffff:a.b.c.d` to `IpAddr::V4(a.b.c.d)` prior to hashing.
-    pub fn compute_ip_hmac_tag(&self, ip: IpAddr) -> [u8; 32] {
+    /// Encodes the exact domain-separated `HMAC-SHA256` input preimage for an `IpAddr`:
+    /// `"parvault-evict-ip-v1:" || version_byte (0x04 | 0x06) || canonical_ip_octets`.
+    pub fn encode_ip_hmac_preimage(ip: IpAddr) -> ([u8; 38], usize) {
         let normalized = Self::normalize_ip(ip);
-        let mut mac = <HmacSha256 as hmac::digest::KeyInit>::new_from_slice(&self.hmac_seed.0)
-            .expect("HMAC-SHA256 accepts 32-byte key");
-        mac.update(EVICT_IP_DOMAIN);
+        let mut buf = [0u8; 38];
+        let pfx = EVICT_IP_DOMAIN.len();
+        buf[..pfx].copy_from_slice(EVICT_IP_DOMAIN);
         match normalized {
             IpAddr::V4(v4) => {
-                mac.update(&[0x04]);
-                mac.update(&v4.octets());
+                buf[pfx] = 0x04;
+                buf[pfx + 1..pfx + 5].copy_from_slice(&v4.octets());
+                (buf, pfx + 5)
             }
             IpAddr::V6(v6) => {
-                mac.update(&[0x06]);
-                mac.update(&v6.octets());
+                buf[pfx] = 0x06;
+                buf[pfx + 1..pfx + 17].copy_from_slice(&v6.octets());
+                (buf, pfx + 17)
             }
         }
+    }
+
+    /// Stack-allocated domain-separated `HMAC-SHA256` input preimage for canonical subnet CIDRs up to
+    /// 64 bytes: `"parvault-evict-subnet-v1:" || canonical_cidr_bytes`.
+    pub fn encode_subnet_hmac_preimage_stack(
+        canonical_cidr_bytes: &[u8],
+    ) -> Option<([u8; 96], usize)> {
+        if canonical_cidr_bytes.len() > 64 {
+            return None;
+        }
+        let pfx = EVICT_SUBNET_DOMAIN.len();
+        let total = pfx + canonical_cidr_bytes.len();
+        let mut buf = [0u8; 96];
+        buf[..pfx].copy_from_slice(EVICT_SUBNET_DOMAIN);
+        let mut i = 0;
+        while i < 64 {
+            if i < canonical_cidr_bytes.len() {
+                buf[pfx + i] = canonical_cidr_bytes[i];
+            }
+            i += 1;
+        }
+        Some((buf, total))
+    }
+
+    /// Encodes the exact domain-separated `HMAC-SHA256` input preimage for a canonical subnet CIDR:
+    /// `"parvault-evict-subnet-v1:" || canonical_cidr.as_bytes()`.
+    pub fn encode_subnet_hmac_preimage(canonical_cidr: &str) -> Vec<u8> {
+        if let Some((buf, len)) = Self::encode_subnet_hmac_preimage_stack(canonical_cidr.as_bytes())
+        {
+            return buf[..len].to_vec();
+        }
+        let mut out = Vec::with_capacity(EVICT_SUBNET_DOMAIN.len() + canonical_cidr.len());
+        out.extend_from_slice(EVICT_SUBNET_DOMAIN);
+        out.extend_from_slice(canonical_cidr.as_bytes());
+        out
+    }
+
+    /// Stack-allocated domain-separated `HMAC-SHA256` input preimage for trimmed `peer_id` bytes up to
+    /// 64 bytes: `"parvault-evict-peerid-v1:" || trimmed_peer_id_bytes`.
+    pub fn encode_peer_id_hmac_preimage_stack(
+        trimmed_peer_id_bytes: &[u8],
+    ) -> Option<([u8; 96], usize)> {
+        if trimmed_peer_id_bytes.len() > 64 {
+            return None;
+        }
+        let pfx = EVICT_PEERID_DOMAIN.len();
+        let total = pfx + trimmed_peer_id_bytes.len();
+        let mut buf = [0u8; 96];
+        buf[..pfx].copy_from_slice(EVICT_PEERID_DOMAIN);
+        let mut i = 0;
+        while i < 64 {
+            if i < trimmed_peer_id_bytes.len() {
+                buf[pfx + i] = trimmed_peer_id_bytes[i];
+            }
+            i += 1;
+        }
+        Some((buf, total))
+    }
+
+    /// Encodes the exact domain-separated `HMAC-SHA256` input preimage for a `peer_id`:
+    /// `"parvault-evict-peerid-v1:" || peer_id.trim().as_bytes()`.
+    pub fn encode_peer_id_hmac_preimage(peer_id: &str) -> Vec<u8> {
+        let trimmed = peer_id.trim().as_bytes();
+        if let Some((buf, len)) = Self::encode_peer_id_hmac_preimage_stack(trimmed) {
+            return buf[..len].to_vec();
+        }
+        let mut out = Vec::with_capacity(EVICT_PEERID_DOMAIN.len() + trimmed.len());
+        out.extend_from_slice(EVICT_PEERID_DOMAIN);
+        out.extend_from_slice(trimmed);
+        out
+    }
+
+    /// Computes `HMAC-SHA256(seed, "parvault-evict-ip-v1:" || canonical_ip_bytes)` directly from a
+    /// 32-byte node eviction key without allocating `HashMap` state (`getrandom`-free for Kani BMC).
+    pub fn compute_ip_hmac_tag_with_seed(seed: &[u8; 32], ip: IpAddr) -> [u8; 32] {
+        let (preimage, len) = Self::encode_ip_hmac_preimage(ip);
+        let mut mac = <HmacSha256 as hmac::digest::KeyInit>::new_from_slice(seed)
+            .expect("HMAC-SHA256 accepts 32-byte key");
+        mac.update(&preimage[..len]);
         let digest = mac.finalize().into_bytes();
         let mut tag = [0u8; 32];
         tag.copy_from_slice(&digest);
         tag
+    }
+
+    /// Computes `HMAC-SHA256(K_node_evict, "parvault-evict-ip-v1:" || canonical_ip_bytes)`.
+    /// Normalizes IPv4-mapped IPv6 `::ffff:a.b.c.d` to `IpAddr::V4(a.b.c.d)` prior to hashing.
+    pub fn compute_ip_hmac_tag(&self, ip: IpAddr) -> [u8; 32] {
+        Self::compute_ip_hmac_tag_with_seed(&self.hmac_seed.0, ip)
     }
 
     /// Canonicalizes an `IpAddr` to its privacy/routing aggregation prefix:
@@ -1370,10 +1790,10 @@ impl PrivacyPreservingEvictionEngine {
 
     /// Computes `HMAC-SHA256(K_node_evict, "parvault-evict-peerid-v1:" || peer_id.trim())`.
     pub fn compute_peer_id_hmac_tag(&self, peer_id: &str) -> [u8; 32] {
+        let preimage = Self::encode_peer_id_hmac_preimage(peer_id);
         let mut mac = <HmacSha256 as hmac::digest::KeyInit>::new_from_slice(&self.hmac_seed.0)
             .expect("HMAC-SHA256 accepts 32-byte key");
-        mac.update(EVICT_PEERID_DOMAIN);
-        mac.update(peer_id.trim().as_bytes());
+        mac.update(&preimage);
         let digest = mac.finalize().into_bytes();
         let mut tag = [0u8; 32];
         tag.copy_from_slice(&digest);
@@ -1821,19 +2241,41 @@ impl PrivacyPreservingEvictionEngine {
         let mut estimated_bytes = 0u64;
         let mut regular_on_disk = 0usize;
         for sid in &matched_regular {
-            let p = block_store
-                .shards_dir()
-                .join(format!("{}.shard", sid.file_key()));
-            if let Ok(meta) = fs::metadata(&p) {
+            if let Some(len) = block_store.regular_shard_len(sid) {
                 regular_on_disk += 1;
-                estimated_bytes = estimated_bytes.saturating_add(meta.len());
+                estimated_bytes = estimated_bytes.saturating_add(len);
             }
         }
         let mut blinded_on_disk = 0usize;
-        for p in &matched_bshard_paths {
-            if let Ok(meta) = fs::metadata(p) {
-                blinded_on_disk += 1;
-                estimated_bytes = estimated_bytes.saturating_add(meta.len());
+        if block_store.is_in_memory() {
+            let mut matched_locs: HashSet<[u8; 32]> = HashSet::new();
+            match target {
+                EvictionTarget::BlindedLocator(loc) => {
+                    matched_locs.insert(*loc);
+                }
+                _ => {
+                    for (loc, attr) in &self.index.blinded_shards {
+                        let p = block_store
+                            .shards_dir()
+                            .join(format!("{}.bshard", attr.blinded_id.file_key()));
+                        if matched_bshard_paths.contains(&p) {
+                            matched_locs.insert(*loc);
+                        }
+                    }
+                }
+            }
+            for loc in matched_locs {
+                if let Some(len) = block_store.blinded_locator_len(&loc) {
+                    blinded_on_disk += 1;
+                    estimated_bytes = estimated_bytes.saturating_add(len);
+                }
+            }
+        } else {
+            for p in &matched_bshard_paths {
+                if let Ok(meta) = fs::metadata(p) {
+                    blinded_on_disk += 1;
+                    estimated_bytes = estimated_bytes.saturating_add(meta.len());
+                }
             }
         }
 
@@ -2134,8 +2576,8 @@ impl PrivacyPreservingEvictionEngine {
 
             EvictionTarget::BlindedLocator(loc) => {
                 self.index.tombstoned_blinded_locators.insert(*loc);
+                matched_blinded_locators.insert(*loc);
                 if let Some(attr) = self.index.blinded_shards.get(loc) {
-                    matched_blinded_locators.insert(*loc);
                     matched_bshard_paths.insert(
                         block_store
                             .shards_dir()
@@ -2143,20 +2585,23 @@ impl PrivacyPreservingEvictionEngine {
                     );
                 }
 
-                let direct_candidate = block_store
-                    .shards_dir()
-                    .join(format!("{}.bshard", hex::encode(loc)));
-                if direct_candidate.exists() {
-                    matched_bshard_paths.insert(direct_candidate);
-                }
+                if !block_store.is_in_memory() {
+                    let direct_candidate = block_store
+                        .shards_dir()
+                        .join(format!("{}.bshard", hex::encode(loc)));
+                    if direct_candidate.exists() {
+                        matched_bshard_paths.insert(direct_candidate);
+                    }
 
-                let file_key_prefix = format!("blind_{}_", hex::encode(&loc[..16]));
-                if block_store.shards_dir().exists() {
-                    for entry in fs::read_dir(block_store.shards_dir())? {
-                        let path = entry?.path();
-                        if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
-                            if fname.starts_with(&file_key_prefix) && fname.ends_with(".bshard") {
-                                matched_bshard_paths.insert(path);
+                    let file_key_prefix = format!("blind_{}_", hex::encode(&loc[..16]));
+                    if block_store.shards_dir().exists() {
+                        for entry in fs::read_dir(block_store.shards_dir())? {
+                            let path = entry?.path();
+                            if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
+                                if fname.starts_with(&file_key_prefix) && fname.ends_with(".bshard")
+                                {
+                                    matched_bshard_paths.insert(path);
+                                }
                             }
                         }
                     }
@@ -2170,6 +2615,26 @@ impl PrivacyPreservingEvictionEngine {
             zero_wiped_bytes: 0,
             firewall_rule_installed: true,
         };
+
+        if block_store.is_in_memory() {
+            for (shard_id, owner_peer_id) in matched_regular {
+                self.index.regular_shards.remove(&shard_id);
+                let wiped = block_store.zero_wipe_regular_shard(&owner_peer_id, &shard_id)?;
+                if wiped > 0 {
+                    report.purged_regular_shards += 1;
+                    report.zero_wiped_bytes = report.zero_wiped_bytes.saturating_add(wiped);
+                }
+            }
+            for loc in matched_blinded_locators {
+                self.index.blinded_shards.remove(&loc);
+                let wiped = block_store.zero_wipe_blinded_locator(&loc)?;
+                if wiped > 0 {
+                    report.purged_blinded_shards += 1;
+                    report.zero_wiped_bytes = report.zero_wiped_bytes.saturating_add(wiped);
+                }
+            }
+            return Ok(report);
+        }
 
         for (shard_id, owner_peer_id) in matched_regular {
             self.index.regular_shards.remove(&shard_id);
@@ -2215,10 +2680,10 @@ impl PrivacyPreservingEvictionEngine {
     }
 
     fn hmac_canonical_cidr(&self, canonical_cidr: &str) -> [u8; 32] {
+        let preimage = Self::encode_subnet_hmac_preimage(canonical_cidr);
         let mut mac = <HmacSha256 as hmac::digest::KeyInit>::new_from_slice(&self.hmac_seed.0)
             .expect("HMAC-SHA256 accepts 32-byte key");
-        mac.update(EVICT_SUBNET_DOMAIN);
-        mac.update(canonical_cidr.as_bytes());
+        mac.update(&preimage);
         let digest = mac.finalize().into_bytes();
         let mut tag = [0u8; 32];
         tag.copy_from_slice(&digest);
@@ -2239,6 +2704,9 @@ impl PrivacyPreservingEvictionEngine {
     }
 
     fn persist_index(&self) -> Result<(), StorageError> {
+        if self.index_path.as_os_str().is_empty() {
+            return Ok(());
+        }
         let encoded = bounded_bincode_options().serialize(&self.index)?;
         BlockStore::atomic_write_file(&self.index_path, &encoded)
     }

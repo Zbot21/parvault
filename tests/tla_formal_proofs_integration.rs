@@ -1,6 +1,6 @@
-//! TLA+ Formal Verification & Lite-Client Seed Failover Integration Suite (`ADR-17`):
+//! TLA+ Formal Verification & Lite-Client Seed Failover Integration Suite (`ADR-17` / `ADR-19`):
 //!
-//! 1. Executes the TLC Model Checker (`tla2tools.jar`) across all 6 formal TLA+ specifications
+//! 1. Executes the TLC Model Checker (`tla2tools.jar`) across all 7 formal TLA+ specifications
 //!    in `specs/` as a first-class Rust integration test (`cargo test --release`):
 //!    - `ParVaultProtocol.tla`
 //!    - `ParVaultConfidentialityAndTrust.tla`
@@ -8,6 +8,7 @@
 //!    - `ParVaultPostQuantum.tla`
 //!    - `ParVaultBootstrapAndEarnedTier.tla`
 //!    - `ParVaultLiteClientAndSeedFailover.tla`
+//!    - `ParVaultZeroKeyAdminAndQuorum.tla`
 //! 2. Verifies end-to-end `ADR-17` Lite-Client (`LiteSeedBacked`) 1.0x encrypted stripe deposit
 //!    to `ZeroTrustSeedServer`, background 20-shard Reed-Solomon mesh syndication,
 //!    "Cloud-Away-From-Home" selective subset restore, and automatic failover to direct
@@ -21,7 +22,7 @@ use parvault::{
     sync::FolderSyncEngine,
 };
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -62,7 +63,7 @@ fn locate_tla2tools_jar() -> Option<PathBuf> {
 }
 
 #[test]
-fn test_all_6_tla_plus_formal_specifications_via_tlc_model_checker() {
+fn test_all_7_tla_plus_formal_specifications_via_tlc_model_checker() {
     let Some(jar_path) = locate_tla2tools_jar() else {
         panic!(
             "tla2tools.jar not found in TLA2TOOLS_JAR, /tmp/tla2tools.jar, or /root/tla2tools.jar. \
@@ -81,6 +82,7 @@ fn test_all_6_tla_plus_formal_specifications_via_tlc_model_checker() {
         "ParVaultPostQuantum",
         "ParVaultBootstrapAndEarnedTier",
         "ParVaultLiteClientAndSeedFailover",
+        "ParVaultZeroKeyAdminAndQuorum",
     ];
 
     for spec_name in specs {
@@ -311,9 +313,4 @@ fn test_lite_client_seed_syndication_nas_death_failover_and_selective_partial_re
     assert_eq!(post_leave_slice, src_bytes);
 
     let _ = fs::remove_dir_all(&base);
-}
-
-#[allow(dead_code)]
-fn _assert_path_helper(p: &Path) -> bool {
-    p.exists()
 }

@@ -33,17 +33,29 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run Clippy lints
         run: cargo clippy --all-targets -- -D warnings
-      - name: Build binaries (parvault + parvault-seed)
+      - name: Check minimal headless build (--no-default-features, VFS excluded)
+        run: cargo check --no-default-features --bin parvault-seed --bin parvault-gateway
+      - name: Build binaries (parvault, parvault-seed, parvault-gateway, parvault-fuse)
         run: cargo build --release --bins
-      - name: Run all integration, formal (Stateright + TLA+ TLC) & red-team test suites
+      - name: Run all integration, formal (Stateright + TLA+ TLC), UDS zero-copy IPC & VFS test suites
         run: cargo test --release
-      - name: Run parvault-seed self-test
-        run: ./target/release/parvault-seed self-test
+      - name: Run binary self-tests (parvault-seed, parvault-gateway, parvault-fuse)
+        run: |
+          ./target/release/parvault-seed self-test
+          ./target/release/parvault-gateway self-test
+          ./target/release/parvault-fuse self-test
       - name: Run 13-Container Docker P2P Regression & Disaster Recovery Gate
         run: USE_GLIBC_IMAGE=1 bash scripts/docker_acceptance_gate.sh
 
+  kani-bounded-model-check:
+    name: Kani Rust Bounded Model Checking (13 Symbolic Harnesses)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: model-checking/kani-github-action@v1
+
   tla-model-check:
-    name: TLA+ TLC Formal Model Checking (6 Specs)
+    name: TLA+ TLC Formal Model Checking (7 Specs)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,10 +68,10 @@ jobs:
           curl --proto '=https' --tlsv1.2 -fsSL \
             https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar \
             -o /tmp/tla2tools.jar
-      - name: Verify all 6 TLA+ Protocol Specifications
+      - name: Verify all 7 TLA+ Protocol Specifications
         run: |
           cd specs
-          for spec in ParVaultProtocol ParVaultConfidentialityAndTrust ParVaultAnonymity ParVaultPostQuantum ParVaultBootstrapAndEarnedTier ParVaultLiteClientAndSeedFailover; do
+          for spec in ParVaultProtocol ParVaultConfidentialityAndTrust ParVaultAnonymity ParVaultPostQuantum ParVaultBootstrapAndEarnedTier ParVaultLiteClientAndSeedFailover ParVaultZeroKeyAdminAndQuorum; do
             echo "===> Model checking ${spec}.tla ..."
             java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -cleanup -config "${spec}.cfg" "${spec}.tla"
           done

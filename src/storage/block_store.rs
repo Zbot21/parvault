@@ -227,12 +227,49 @@ pub const SOC_ROUTER_STRIPE_SIZE_BYTES: usize = 1024 * 1024; // 1 MiB for <=48 M
 pub const NAS_BALANCED_STRIPE_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB for mid-range NAS
 pub const DEFAULT_STRIPE_SIZE_BYTES: usize = crate::config::DEFAULT_STRIPE_SIZE_BYTES; // 16 MiB per ADR-01
 
-/// Local NVMe / USB sharded block storage engine (`storage::block_store`).
+#[derive(Default)]
+struct InMemoryShardBacking {
+    regular_shards: HashMap<String, Vec<u8>>,
+    blinded_shards: HashMap<String, Vec<u8>>,
+    manifests: HashMap<Hash32, Vec<u8>>,
+}
+
+impl InMemoryShardBacking {
+    fn zero_wipe_vec(mut buf: Vec<u8>) -> u64 {
+        let len = buf.len() as u64;
+        zeroize::Zeroize::zeroize(&mut buf);
+        len
+    }
+
+    fn total_bytes(&self) -> u64 {
+        let reg: u64 = self.regular_shards.values().map(|v| v.len() as u64).sum();
+        let bln: u64 = self.blinded_shards.values().map(|v| v.len() as u64).sum();
+        let man: u64 = self.manifests.values().map(|v| v.len() as u64).sum();
+        reg.saturating_add(bln).saturating_add(man)
+    }
+}
+
+impl Drop for InMemoryShardBacking {
+    fn drop(&mut self) {
+        for (_, mut buf) in self.regular_shards.drain() {
+            zeroize::Zeroize::zeroize(&mut buf);
+        }
+        for (_, mut buf) in self.blinded_shards.drain() {
+            zeroize::Zeroize::zeroize(&mut buf);
+        }
+        for (_, mut buf) in self.manifests.drain() {
+            zeroize::Zeroize::zeroize(&mut buf);
+        }
+    }
+}
+
+/// Local NVMe / USB / bounded-RAM sharded block storage engine (`storage::block_store`).
 #[derive(Clone)]
 pub struct BlockStore {
     root_dir: PathBuf,
     shards_dir: PathBuf,
     manifests_dir: PathBuf,
+    in_memory: Option<Arc<Mutex<InMemoryShardBacking>>>,
     quota: Arc<Mutex<QuotaManager>>,
     blinded_leases: Arc<Mutex<BlindedShardLeaseManager>>,
     blinded_id_by_locator: Arc<Mutex<HashMap<[u8; 32], BlindedShardId>>>,
@@ -301,6 +338,7 @@ impl BlockStore {
             root_dir,
             shards_dir,
             manifests_dir,
+            in_memory: None,
             quota: Arc::new(Mutex::new(quota)),
             blinded_leases: Arc::new(Mutex::new(initial_leases)),
             blinded_id_by_locator: Arc::new(Mutex::new(initial_id_map)),
@@ -309,6 +347,149 @@ impl BlockStore {
             mesh_client: None,
             stripe_size_bytes: DEFAULT_STRIPE_SIZE_BYTES,
         })
+    }
+
+    /// Initializes a strictly zero-filesystem bounded-RAM `BlockStore` (`parvault-seed --no-fs` /
+    /// `--in-memory-mb`). Creates **zero** directories or files on disk, enforces `quota`'s hard
+    /// byte ceiling across regular and blinded shards, and `0x00`-wipes (`Zeroize`) every evicted
+    /// or deleted buffer in RAM.
+    pub fn new_in_memory(mut quota: QuotaManager) -> Self {
+        quota.set_min_free_disk_bytes(0);
+        let max_bytes = quota.max_storage_bytes();
+        Self {
+            root_dir: PathBuf::new(),
+            shards_dir: PathBuf::new(),
+            manifests_dir: PathBuf::new(),
+            in_memory: Some(Arc::new(Mutex::new(InMemoryShardBacking::default()))),
+            quota: Arc::new(Mutex::new(quota)),
+            blinded_leases: Arc::new(Mutex::new(BlindedShardLeaseManager::new(max_bytes, 2))),
+            blinded_id_by_locator: Arc::new(Mutex::new(HashMap::new())),
+            shard_id_by_file_key: Arc::new(Mutex::new(HashMap::new())),
+            dht_store: Arc::new(Mutex::new(ZeroTrustDhtStore::new())),
+            mesh_client: None,
+            stripe_size_bytes: SOC_ROUTER_STRIPE_SIZE_BYTES,
+        }
+    }
+
+    /// Returns `true` when operating in zero-filesystem bounded RAM mode (`--no-fs` / `--in-memory-mb`).
+    pub fn is_in_memory(&self) -> bool {
+        self.in_memory.is_some()
+    }
+
+    /// Returns exact total bytes currently held in `InMemoryShardBacking` (`0` when disk-backed).
+    pub fn in_memory_used_bytes(&self) -> u64 {
+        self.in_memory
+            .as_ref()
+            .and_then(|m| m.lock().ok().map(|g| g.total_bytes()))
+            .unwrap_or(0)
+    }
+
+    /// Returns the stored byte length of a regular shard (in RAM or on disk), if present.
+    pub fn regular_shard_len(&self, id: &ShardId) -> Option<u64> {
+        if let Some(ref mem) = self.in_memory {
+            return mem
+                .lock()
+                .ok()
+                .and_then(|g| g.regular_shards.get(&id.file_key()).map(|v| v.len() as u64));
+        }
+        fs::metadata(self.shard_path(id)).ok().map(|m| m.len())
+    }
+
+    /// Returns the stored byte length of a blinded shard locator (in RAM or on disk), if present.
+    pub fn blinded_locator_len(&self, loc: &[u8; 32]) -> Option<u64> {
+        let fkey = self
+            .blinded_id_by_locator
+            .lock()
+            .ok()
+            .and_then(|m| m.get(loc).map(|b| b.file_key()));
+        if let Some(ref mem) = self.in_memory {
+            let key = fkey?;
+            return mem
+                .lock()
+                .ok()
+                .and_then(|g| g.blinded_shards.get(&key).map(|v| v.len() as u64));
+        }
+        if let Some(key) = fkey {
+            let p = self.shards_dir.join(format!("{key}.bshard"));
+            if let Ok(meta) = fs::metadata(p) {
+                return Some(meta.len());
+            }
+        }
+        None
+    }
+
+    /// Zero-wipes (`0x00` `zeroize()`) an in-memory regular shard and updates quota + index tables.
+    pub fn zero_wipe_regular_shard(
+        &self,
+        owner_peer_id: &str,
+        id: &ShardId,
+    ) -> Result<u64, StorageError> {
+        if let Some(ref mem) = self.in_memory {
+            let removed = mem
+                .lock()
+                .expect("in_memory mutex poisoned")
+                .regular_shards
+                .remove(&id.file_key());
+            if let Ok(mut idx_map) = self.shard_id_by_file_key.lock() {
+                idx_map.remove(&id.file_key());
+            }
+            if let Some(buf) = removed {
+                let wiped = InMemoryShardBacking::zero_wipe_vec(buf);
+                if let Ok(mut q) = self.quota.lock() {
+                    q.record_shard_removed(owner_peer_id, &id.file_key(), wiped);
+                }
+                return Ok(wiped);
+            }
+            return Ok(0);
+        }
+        let path = self.shard_path(id);
+        let wiped =
+            crate::storage::eviction::PrivacyPreservingEvictionEngine::shred_and_unlink_file(
+                &path,
+            )?;
+        if wiped > 0 {
+            if let Ok(mut idx_map) = self.shard_id_by_file_key.lock() {
+                idx_map.remove(&id.file_key());
+            }
+            if let Ok(mut q) = self.quota.lock() {
+                q.record_shard_removed(owner_peer_id, &id.file_key(), wiped);
+            }
+        }
+        Ok(wiped)
+    }
+
+    /// Zero-wipes (`0x00` `zeroize()`) an in-memory blinded shard locator and removes its lease.
+    pub fn zero_wipe_blinded_locator(&self, loc: &[u8; 32]) -> Result<u64, StorageError> {
+        let removed_bid = self
+            .blinded_id_by_locator
+            .lock()
+            .ok()
+            .and_then(|mut m| m.remove(loc));
+        if let Some(ref mem) = self.in_memory {
+            if let Ok(mut mgr) = self.blinded_leases.lock() {
+                let _ = mgr.force_remove_locator(loc);
+            }
+            if let Some(bid) = removed_bid {
+                let removed = mem
+                    .lock()
+                    .expect("in_memory mutex poisoned")
+                    .blinded_shards
+                    .remove(&bid.file_key());
+                if let Some(buf) = removed {
+                    return Ok(InMemoryShardBacking::zero_wipe_vec(buf));
+                }
+            }
+            return Ok(0);
+        }
+        if let Some(bid) = removed_bid {
+            let p = self.shards_dir.join(format!("{}.bshard", bid.file_key()));
+            return Ok(
+                crate::storage::eviction::PrivacyPreservingEvictionEngine::shred_and_unlink_file(
+                    &p,
+                )?,
+            );
+        }
+        Ok(0)
     }
 
     pub fn with_stripe_size_bytes(mut self, stripe_size_bytes: usize) -> Self {
@@ -351,6 +532,9 @@ impl BlockStore {
     }
 
     fn persist_shard_index(&self) {
+        if self.is_in_memory() {
+            return;
+        }
         if let Ok(idx_map) = self.shard_id_by_file_key.lock() {
             if let Ok(raw) = bincode::serialize(&*idx_map) {
                 let _ = Self::atomic_write_file(&self.root_dir.join("shard_index.bin"), &raw);
@@ -469,6 +653,9 @@ impl BlockStore {
     }
 
     fn persist_blinded_lease_state(&self) {
+        if self.is_in_memory() {
+            return;
+        }
         if let (Ok(mgr), Ok(id_map)) = (
             self.blinded_leases.lock(),
             self.blinded_id_by_locator.lock(),
@@ -523,6 +710,67 @@ impl BlockStore {
         }
 
         let shard_size = bytes.len() as u64;
+        if let Some(ref mem) = self.in_memory {
+            let max_cap = {
+                let mut q = self.quota.lock().expect("quota mutex poisoned");
+                if !q.can_accept_shard(owner_peer_id, shard_size) {
+                    let evicted = q.evict_lru_to_fit(shard_size);
+                    {
+                        let mut m = mem.lock().expect("in_memory mutex poisoned");
+                        let mut idx_map = self
+                            .shard_id_by_file_key
+                            .lock()
+                            .expect("shard_id_by_file_key mutex poisoned");
+                        for evicted_key in evicted {
+                            idx_map.remove(&evicted_key);
+                            if let Some(buf) = m.regular_shards.remove(&evicted_key) {
+                                InMemoryShardBacking::zero_wipe_vec(buf);
+                            }
+                        }
+                    }
+                    if !q.can_accept_shard(owner_peer_id, shard_size) {
+                        return Err(StorageError::QuotaExceeded(owner_peer_id.to_string()));
+                    }
+                }
+                q.max_storage_bytes()
+            };
+            // Ensure combined regular + blinded RAM stays strictly <= max_cap.
+            let cur_mem = self.in_memory_used_bytes();
+            if cur_mem.saturating_add(shard_size) > max_cap {
+                let needed_blinded_free =
+                    cur_mem.saturating_add(shard_size).saturating_sub(max_cap);
+                let evicted_locs = {
+                    let mut mgr = self
+                        .blinded_leases
+                        .lock()
+                        .expect("blinded_leases mutex poisoned");
+                    let bl_free = mgr.max_capacity_bytes().saturating_sub(mgr.used_bytes());
+                    mgr.evict_oldest_to_fit(bl_free.saturating_add(needed_blinded_free), 1)
+                        .unwrap_or_default()
+                };
+                for loc in evicted_locs {
+                    let _ = self.zero_wipe_blinded_locator(&loc);
+                }
+                if self.in_memory_used_bytes().saturating_add(shard_size) > max_cap {
+                    return Err(StorageError::QuotaExceeded(owner_peer_id.to_string()));
+                }
+            }
+            {
+                let mut m = mem.lock().expect("in_memory mutex poisoned");
+                if let Some(prev) = m.regular_shards.insert(id.file_key(), bytes.to_vec()) {
+                    InMemoryShardBacking::zero_wipe_vec(prev);
+                }
+            }
+            {
+                let mut q = self.quota.lock().expect("quota mutex poisoned");
+                q.record_shard_stored(owner_peer_id, id.file_key(), shard_size);
+            }
+            if let Ok(mut idx_map) = self.shard_id_by_file_key.lock() {
+                idx_map.insert(id.file_key(), *id);
+            }
+            return Ok(PathBuf::from(format!("mem://{}.shard", id.file_key())));
+        }
+
         {
             let mut q = self.quota.lock().expect("quota mutex poisoned");
             if !q.can_accept_shard(owner_peer_id, shard_size) {
@@ -553,9 +801,26 @@ impl BlockStore {
         Ok(path)
     }
 
-    /// Reads an entire shard from disk and verifies its SHA-256 leaf digest.
+    /// Reads an entire shard from disk (or RAM in `--no-fs` mode) and verifies its SHA-256 leaf digest.
     /// Note: For remote requests, callers MUST verify a valid `RepairGrant` or owner token first (ADR-04).
     pub fn get_shard(&self, id: &ShardId) -> Result<Vec<u8>, StorageError> {
+        if let Some(ref mem) = self.in_memory {
+            let bytes = mem
+                .lock()
+                .expect("in_memory mutex poisoned")
+                .regular_shards
+                .get(&id.file_key())
+                .cloned()
+                .ok_or_else(|| StorageError::ShardNotFound(id.file_key()))?;
+            let computed = hash_shard_leaf(id.shard_index, &bytes);
+            if computed != id.shard_hash {
+                return Err(StorageError::CorruptedShard);
+            }
+            if let Ok(mut q) = self.quota.lock() {
+                q.touch_shard(&id.file_key());
+            }
+            return Ok(bytes);
+        }
         let path = self.shard_path(id);
         if !path.exists() {
             return Err(StorageError::ShardNotFound(id.file_key()));
@@ -571,7 +836,7 @@ impl BlockStore {
         Ok(bytes)
     }
 
-    /// Reads a bounded byte sub-range `[offset .. offset + length]` from a shard on disk.
+    /// Reads a bounded byte sub-range `[offset .. offset + length]` from a shard on disk or RAM.
     /// Used exclusively by `por::verifier` AFTER stateless RAM-only HMAC pre-verification passes (ADR-03).
     pub fn get_shard_range(
         &self,
@@ -579,6 +844,27 @@ impl BlockStore {
         offset: u64,
         length: u64,
     ) -> Result<Vec<u8>, StorageError> {
+        if let Some(ref mem) = self.in_memory {
+            let m = mem.lock().expect("in_memory mutex poisoned");
+            let bytes = m
+                .regular_shards
+                .get(&id.file_key())
+                .ok_or_else(|| StorageError::ShardNotFound(id.file_key()))?;
+            let file_len = bytes.len() as u64;
+            if length == 0 || offset.saturating_add(length) > file_len {
+                return Err(StorageError::InvalidRange {
+                    offset,
+                    length,
+                    size: file_len,
+                });
+            }
+            let slice = bytes[offset as usize..(offset + length) as usize].to_vec();
+            drop(m);
+            if let Ok(mut q) = self.quota.lock() {
+                q.touch_shard(&id.file_key());
+            }
+            return Ok(slice);
+        }
         let path = self.shard_path(id);
         if !path.exists() {
             return Err(StorageError::ShardNotFound(id.file_key()));
@@ -601,8 +887,12 @@ impl BlockStore {
         Ok(buf)
     }
 
-    /// Deletes a shard from local disk storage.
+    /// Deletes a shard from local disk or bounded RAM storage.
     pub fn delete_shard(&self, owner_peer_id: &str, id: &ShardId) -> Result<bool, StorageError> {
+        if self.is_in_memory() {
+            let wiped = self.zero_wipe_regular_shard(owner_peer_id, id)?;
+            return Ok(wiped > 0);
+        }
         let path = self.shard_path(id);
         if path.exists() {
             let len = fs::metadata(&path)?.len();
@@ -617,6 +907,12 @@ impl BlockStore {
     }
 
     pub fn has_shard(&self, id: &ShardId) -> bool {
+        if let Some(ref mem) = self.in_memory {
+            return mem
+                .lock()
+                .map(|m| m.regular_shards.contains_key(&id.file_key()))
+                .unwrap_or(false);
+        }
         self.shard_path(id).exists()
     }
 
@@ -666,6 +962,112 @@ impl BlockStore {
         let actual_sha = compute_sha256(shard_bytes);
         if actual_sha != blinded_id.content_sha256 {
             return Err(StorageError::CorruptedShard);
+        }
+
+        if let Some(ref mem) = self.in_memory {
+            let shard_size = shard_bytes.len() as u64;
+            let max_cap = self
+                .quota
+                .lock()
+                .map(|q| q.max_storage_bytes())
+                .unwrap_or(0);
+            if shard_size > max_cap {
+                return Err(StorageError::QuotaExceeded(
+                    "in_memory_capacity_exceeded".into(),
+                ));
+            }
+            // Enforce hard RAM ceiling BEFORE burning the caller's single-use voucher.
+            let pre_evicted = {
+                let mut mgr = self
+                    .blinded_leases
+                    .lock()
+                    .expect("blinded_leases mutex poisoned");
+                mgr.evict_oldest_to_fit(shard_size, current_epoch)
+                    .ok_or_else(|| {
+                        StorageError::QuotaExceeded("in_memory_capacity_exceeded".into())
+                    })?
+            };
+            for loc in pre_evicted {
+                let _ = self.zero_wipe_blinded_locator(&loc);
+            }
+            // If regular cached shards also share the RAM budget, evict LRU regular shards if needed.
+            if self.in_memory_used_bytes().saturating_add(shard_size) > max_cap {
+                let needed_reg = self
+                    .in_memory_used_bytes()
+                    .saturating_add(shard_size)
+                    .saturating_sub(max_cap);
+                let evicted_reg = {
+                    let mut q = self.quota.lock().expect("quota mutex poisoned");
+                    q.evict_lru_to_fit(needed_reg)
+                };
+                {
+                    let mut m = mem.lock().expect("in_memory mutex poisoned");
+                    let mut idx_map = self
+                        .shard_id_by_file_key
+                        .lock()
+                        .expect("shard_id_by_file_key mutex poisoned");
+                    for ek in evicted_reg {
+                        idx_map.remove(&ek);
+                        if let Some(buf) = m.regular_shards.remove(&ek) {
+                            InMemoryShardBacking::zero_wipe_vec(buf);
+                        }
+                    }
+                }
+                while self.in_memory_used_bytes().saturating_add(shard_size) > max_cap {
+                    let next_loc = self.blinded_leases.lock().ok().and_then(|mut mgr| {
+                        let free = mgr.max_capacity_bytes().saturating_sub(mgr.used_bytes());
+                        mgr.evict_oldest_to_fit(free.saturating_add(1), current_epoch)
+                            .and_then(|v| v.into_iter().next())
+                    });
+                    if let Some(loc) = next_loc {
+                        let _ = self.zero_wipe_blinded_locator(&loc);
+                    } else {
+                        return Err(StorageError::QuotaExceeded(
+                            "in_memory_capacity_exceeded".into(),
+                        ));
+                    }
+                }
+            }
+
+            nullifier_ledger.redeem_voucher(voucher, shard_size)?;
+
+            let evicted_locators = {
+                let mut mgr = self
+                    .blinded_leases
+                    .lock()
+                    .expect("blinded_leases mutex poisoned");
+                mgr.store_with_capability_and_lease(
+                    blinded_id.locator,
+                    shard_size,
+                    current_epoch,
+                    lease_duration_epochs,
+                    delete_verifier,
+                    Some(capability.capability_pubkey),
+                )
+            };
+            for loc in evicted_locators {
+                let _ = self.zero_wipe_blinded_locator(&loc);
+            }
+            {
+                let mut m = mem.lock().expect("in_memory mutex poisoned");
+                if let Some(prev) = m
+                    .blinded_shards
+                    .insert(blinded_id.file_key(), shard_bytes.to_vec())
+                {
+                    InMemoryShardBacking::zero_wipe_vec(prev);
+                }
+            }
+            {
+                let mut id_map = self
+                    .blinded_id_by_locator
+                    .lock()
+                    .expect("blinded_id_by_locator mutex poisoned");
+                id_map.insert(blinded_id.locator, *blinded_id);
+            }
+            return Ok(PathBuf::from(format!(
+                "mem://{}.bshard",
+                blinded_id.file_key()
+            )));
         }
 
         // Write and fsync the `.bshard` file atomically BEFORE burning the single-use voucher
@@ -741,9 +1143,9 @@ impl BlockStore {
         renewed
     }
 
-    /// Time-driven eviction sweep: physically deletes all `.bshard` files on disk whose
-    /// `lease_expires_epoch + grace_epochs <= current_epoch` (belonging to nodes that left the network)
-    /// and returns the list of deleted `BlindedShardId`s.
+    /// Time-driven eviction sweep: physically deletes all `.bshard` files on disk (or zero-wipes
+    /// in RAM) whose `lease_expires_epoch + grace_epochs <= current_epoch` and returns the list
+    /// of deleted `BlindedShardId`s.
     pub fn sweep_expired_blinded_shards(
         &self,
         current_epoch: u64,
@@ -764,9 +1166,20 @@ impl BlockStore {
                 .expect("blinded_id_by_locator mutex poisoned");
             for loc in expired_locators {
                 if let Some(bid) = id_map.remove(&loc) {
-                    let p = self.shards_dir.join(format!("{}.bshard", bid.file_key()));
-                    if p.exists() {
-                        fs::remove_file(&p)?;
+                    if let Some(ref mem) = self.in_memory {
+                        if let Some(buf) = mem
+                            .lock()
+                            .expect("in_memory mutex poisoned")
+                            .blinded_shards
+                            .remove(&bid.file_key())
+                        {
+                            InMemoryShardBacking::zero_wipe_vec(buf);
+                        }
+                    } else {
+                        let p = self.shards_dir.join(format!("{}.bshard", bid.file_key()));
+                        if p.exists() {
+                            fs::remove_file(&p)?;
+                        }
                     }
                     deleted_ids.push(bid);
                 }
@@ -776,7 +1189,8 @@ impl BlockStore {
         Ok(deleted_ids)
     }
 
-    /// Immediately verifies a `BlindedShardTombstone` and physically deletes `{locator}.bshard` from disk.
+    /// Immediately verifies a `BlindedShardTombstone` and physically deletes `{locator}.bshard`
+    /// from disk (or zero-wipes in RAM).
     pub fn delete_blinded_shard_with_tombstone(
         &self,
         blinded_id: &BlindedShardId,
@@ -795,6 +1209,17 @@ impl BlockStore {
         if let Ok(mut id_map) = self.blinded_id_by_locator.lock() {
             id_map.remove(&blinded_id.locator);
         }
+        if let Some(ref mem) = self.in_memory {
+            if let Some(buf) = mem
+                .lock()
+                .expect("in_memory mutex poisoned")
+                .blinded_shards
+                .remove(&blinded_id.file_key())
+            {
+                InMemoryShardBacking::zero_wipe_vec(buf);
+            }
+            return Ok(true);
+        }
         let path = self
             .shards_dir
             .join(format!("{}.bshard", blinded_id.file_key()));
@@ -805,14 +1230,20 @@ impl BlockStore {
         Ok(true)
     }
 
-    /// Checks whether a `.bshard` file physically exists on the storage node's filesystem.
+    /// Checks whether a `.bshard` file exists on the storage node's filesystem (or in RAM when `--no-fs`).
     pub fn has_blinded_shard_on_disk(&self, blinded_id: &BlindedShardId) -> bool {
+        if let Some(ref mem) = self.in_memory {
+            return mem
+                .lock()
+                .map(|m| m.blinded_shards.contains_key(&blinded_id.file_key()))
+                .unwrap_or(false);
+        }
         self.shards_dir
             .join(format!("{}.bshard", blinded_id.file_key()))
             .exists()
     }
 
-    /// Reads an anonymized `BlindedShardId` from disk if and only if the caller presents a valid
+    /// Reads an anonymized `BlindedShardId` from disk (or RAM) if and only if the caller presents a valid
     /// Ed25519 signature under the shard's registered `BlindedShardCapability` key (ADR-11 / ADR-15).
     pub fn get_blinded_shard_authorized(
         &self,
@@ -841,6 +1272,19 @@ impl BlockStore {
                 "unauthorized_blinded_shard_capability".into(),
             ));
         }
+        if let Some(ref mem) = self.in_memory {
+            let bytes = mem
+                .lock()
+                .expect("in_memory mutex poisoned")
+                .blinded_shards
+                .get(&blinded_id.file_key())
+                .cloned()
+                .ok_or_else(|| StorageError::ShardNotFound(blinded_id.file_key()))?;
+            if compute_sha256(&bytes) != blinded_id.content_sha256 {
+                return Err(StorageError::CorruptedShard);
+            }
+            return Ok(bytes);
+        }
         let path = self
             .shards_dir
             .join(format!("{}.bshard", blinded_id.file_key()));
@@ -860,6 +1304,64 @@ impl BlockStore {
     /// PoR challenge or restore egress request can trigger a slashing penalty.
     pub fn scrub_all_shards(&self) -> Result<ScrubReport, StorageError> {
         let mut report = ScrubReport::default();
+
+        if let Some(ref mem) = self.in_memory {
+            let reg_snapshot: Vec<(String, Vec<u8>)> = mem
+                .lock()
+                .expect("in_memory mutex poisoned")
+                .regular_shards
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            for (stem, bytes) in reg_snapshot {
+                let parts: Vec<&str> = stem.split('_').collect();
+                if parts.len() == 3 {
+                    if let Ok(shard_idx) = parts[1].parse::<u32>() {
+                        let computed = hash_shard_leaf(shard_idx, &bytes);
+                        if hex::encode(&computed[..16]) == parts[2] {
+                            report.verified_healthy_shards += 1;
+                        } else {
+                            if let Some(buf) = mem
+                                .lock()
+                                .expect("in_memory mutex poisoned")
+                                .regular_shards
+                                .remove(&stem)
+                            {
+                                InMemoryShardBacking::zero_wipe_vec(buf);
+                            }
+                            if let Ok(mut q) = self.quota.lock() {
+                                q.record_shard_removed("local", &stem, bytes.len() as u64);
+                            }
+                            report.quarantined_corrupted_shards.push(stem);
+                        }
+                    }
+                }
+            }
+            let blinded_snapshot: Vec<([u8; 32], BlindedShardId)> = self
+                .blinded_id_by_locator
+                .lock()
+                .expect("blinded_id_by_locator mutex poisoned")
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect();
+            let mut corrupted_locators = Vec::new();
+            for (locator, bid) in blinded_snapshot {
+                let is_valid = mem
+                    .lock()
+                    .expect("in_memory mutex poisoned")
+                    .blinded_shards
+                    .get(&bid.file_key())
+                    .is_some_and(|b| compute_sha256(b) == bid.content_sha256);
+                if is_valid {
+                    report.verified_healthy_blinded_shards += 1;
+                } else {
+                    let _ = self.zero_wipe_blinded_locator(&locator);
+                    corrupted_locators.push(locator);
+                }
+            }
+            report.quarantined_corrupted_blinded_locators = corrupted_locators;
+            return Ok(report);
+        }
 
         // 1. Scrub all regular `.shard` files (`{root8}_{shard_idx:02}_{hash16}.shard`)
         if self.shards_dir.exists() {
@@ -1146,8 +1648,20 @@ impl BlockStore {
         manifest: &FileManifest,
     ) -> Result<PathBuf, StorageError> {
         let (_, encrypted) = manifest.to_encrypted_dht_record(master_key)?;
-        let path = self.manifest_path(&manifest.file_merkle_root);
-        Self::atomic_write_file(&path, &encrypted)?;
+        let path = if let Some(ref mem) = self.in_memory {
+            let mut m = mem.lock().expect("in_memory mutex poisoned");
+            if let Some(prev) = m.manifests.insert(manifest.file_merkle_root, encrypted) {
+                InMemoryShardBacking::zero_wipe_vec(prev);
+            }
+            PathBuf::from(format!(
+                "mem://{}.manifest.bin",
+                hex::encode(manifest.file_merkle_root)
+            ))
+        } else {
+            let p = self.manifest_path(&manifest.file_merkle_root);
+            Self::atomic_write_file(&p, &encrypted)?;
+            p
+        };
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1171,15 +1685,26 @@ impl BlockStore {
         Ok(path)
     }
 
-    /// Loads and decrypts a `FileManifest` by its 32-byte File Merkle Root from local disk
+    /// Loads and decrypts a `FileManifest` by its 32-byte File Merkle Root from local disk/RAM
     /// or over `libp2p` Kademlia DHT when `mesh_client` is configured.
     pub fn load_manifest(
         &self,
         master_key: &MasterKey,
         file_merkle_root: &Hash32,
     ) -> Result<FileManifest, StorageError> {
+        if let Some(ref mem) = self.in_memory {
+            if let Some(encrypted) = mem
+                .lock()
+                .expect("in_memory mutex poisoned")
+                .manifests
+                .get(file_merkle_root)
+                .cloned()
+            {
+                return FileManifest::from_encrypted_dht_record(master_key, &encrypted);
+            }
+        }
         let path = self.manifest_path(file_merkle_root);
-        if path.exists() {
+        if !self.is_in_memory() && path.exists() {
             let encrypted = fs::read(path)?;
             return FileManifest::from_encrypted_dht_record(master_key, &encrypted);
         }
@@ -1216,15 +1741,34 @@ impl BlockStore {
         let mut file = File::open(input_path)?;
         let original_file_size = file.metadata()?.len();
         let file_salt = generate_file_salt();
-        let stripe_cap =
+        let raw_cap =
             if stripe_size_bytes == 0 || stripe_size_bytes == Self::DEFAULT_STRIPE_SIZE_BYTES {
                 self.stripe_size_bytes
             } else {
-                stripe_size_bytes.clamp(64 * 1024, Self::DEFAULT_STRIPE_SIZE_BYTES)
+                stripe_size_bytes
             };
+        let layout = crate::config::compute_stripe_layout_for_size(original_file_size, raw_cap);
+        let (_shard_len, peak_stripe_ram) =
+            crate::sharding::reed_solomon::compute_stripe_memory_footprint_bytes(
+                layout.max_stripe_plaintext_bytes,
+                tier,
+            )?;
+        if layout.stripe_size_bytes <= crate::config::ROUTER_SOC_STRIPE_SIZE_BYTES
+            && peak_stripe_ram >= crate::config::ROUTER_SOC_MAX_STRIPE_MEMORY_BYTES
+        {
+            return Err(StorageError::Sharding(
+                crate::sharding::reed_solomon::ShardingError::ErasureError(
+                    "RouterSoC stripe memory ceiling exceeded".to_string(),
+                ),
+            ));
+        }
+        let stripe_cap = layout.stripe_size_bytes;
+        let prealloc_stripes = usize::try_from(layout.stripe_count)
+            .unwrap_or(1024)
+            .min(1024);
 
-        let mut stripes = Vec::new();
-        let mut stripe_roots = Vec::new();
+        let mut stripes = Vec::with_capacity(prealloc_stripes);
+        let mut stripe_roots = Vec::with_capacity(prealloc_stripes);
         let mut stripe_index: u64 = 0;
 
         let use_network = self
@@ -1315,6 +1859,336 @@ impl BlockStore {
         Ok(manifest)
     }
 
+    /// Streams `expected_len` bytes from an arbitrary `Read` source (such as a zero-copy Linux
+    /// `memfd` passed over `SCM_RIGHTS`) using a single reusable `stripe_size_bytes` buffer so RSS
+    /// stays strictly bounded (`< 16 MiB` under `HardwareProfile::RouterSoc` `1 MiB` stripes).
+    pub fn store_reader_streaming<R: Read>(
+        &self,
+        owner_peer_id: &str,
+        reader: &mut R,
+        expected_len: u64,
+        master_key: &MasterKey,
+        tier: ErasureTier,
+        stripe_size_bytes: usize,
+    ) -> Result<FileManifest, StorageError> {
+        let file_salt = generate_file_salt();
+        let raw_cap =
+            if stripe_size_bytes == 0 || stripe_size_bytes == Self::DEFAULT_STRIPE_SIZE_BYTES {
+                self.stripe_size_bytes
+            } else {
+                stripe_size_bytes
+            };
+        let layout = crate::config::compute_stripe_layout_for_size(expected_len, raw_cap);
+        let stripe_cap = layout.stripe_size_bytes;
+        let prealloc_stripes = usize::try_from(layout.stripe_count)
+            .unwrap_or(1024)
+            .min(1024);
+
+        let mut stripes = Vec::with_capacity(prealloc_stripes);
+        let mut stripe_roots = Vec::with_capacity(prealloc_stripes);
+        let mut stripe_index: u64 = 0;
+        let mut total_read_bytes: u64 = 0;
+
+        let use_network = self
+            .mesh_client
+            .as_ref()
+            .is_some_and(|c| !c.all_network_endpoints().is_empty());
+
+        let mut reusable_buf = vec![0u8; stripe_cap];
+        let mut wrote_local_batch = false;
+
+        loop {
+            let remaining = expected_len.saturating_sub(total_read_bytes);
+            let target_chunk = (remaining as usize).min(stripe_cap);
+            let mut read_total = 0usize;
+            while read_total < target_chunk {
+                let n = reader.read(&mut reusable_buf[read_total..target_chunk])?;
+                if n == 0 {
+                    break;
+                }
+                read_total += n;
+            }
+            if read_total == 0 && stripe_index > 0 {
+                break;
+            }
+            total_read_bytes = total_read_bytes.saturating_add(read_total as u64);
+
+            let ciphertext = encrypt_stripe(
+                master_key,
+                &file_salt,
+                stripe_index,
+                &reusable_buf[..read_total],
+            )?;
+            let shard_set = encode_ciphertext_stripe(stripe_index, &ciphertext, tier)?;
+            stripe_roots.push(shard_set.stripe_merkle_root);
+
+            let assigned_peers = if use_network {
+                let client = self.mesh_client.as_ref().expect("checked use_network");
+                let session_key = client
+                    .identity()
+                    .derive_stripe_por_session_key(&shard_set.stripe_merkle_root);
+                client
+                    .distribute_stripe_shards(
+                        client.identity(),
+                        owner_peer_id,
+                        &shard_set,
+                        tier,
+                        session_key,
+                    )
+                    .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?
+            } else {
+                wrote_local_batch = true;
+                for (idx, shard_bytes) in shard_set.shards.iter().enumerate() {
+                    let shard_id = ShardId {
+                        stripe_merkle_root: shard_set.stripe_merkle_root,
+                        shard_index: idx as u32,
+                        shard_hash: shard_set.shard_hashes[idx],
+                    };
+                    self.put_shard_deferred_flush(owner_peer_id, &shard_id, shard_bytes)?;
+                }
+                let (_, _, n_total) = tier.params();
+                vec![owner_peer_id.to_string(); n_total]
+            };
+
+            stripes.push(StripeManifestEntry {
+                stripe_index,
+                k_data: shard_set.k_data,
+                m_parity: shard_set.m_parity,
+                original_ciphertext_len: shard_set.original_ciphertext_len,
+                shard_len: shard_set.shard_len,
+                stripe_merkle_root: shard_set.stripe_merkle_root,
+                shard_hashes: shard_set.shard_hashes,
+                assigned_peers,
+            });
+
+            stripe_index += 1;
+            if total_read_bytes >= expected_len || read_total < stripe_cap {
+                break;
+            }
+        }
+
+        if wrote_local_batch {
+            if let Ok(q) = self.quota.lock() {
+                q.flush_persistence();
+            }
+            self.persist_shard_index();
+        }
+
+        let file_merkle_root = compute_file_merkle_root(&stripe_roots);
+        let manifest = FileManifest {
+            version: 1,
+            file_merkle_root,
+            file_salt,
+            original_file_size: total_read_bytes,
+            stripe_size_bytes: stripe_cap,
+            tier,
+            stripes,
+            witness_peers: Vec::new(),
+        };
+
+        self.save_manifest(master_key, &manifest)?;
+        Ok(manifest)
+    }
+
+    fn put_shard_deferred_flush(
+        &self,
+        owner_peer_id: &str,
+        id: &ShardId,
+        bytes: &[u8],
+    ) -> Result<(), StorageError> {
+        if self.is_in_memory() {
+            let _ = self.put_shard(owner_peer_id, id, bytes)?;
+            return Ok(());
+        }
+        let computed = hash_shard_leaf(id.shard_index, bytes);
+        if computed != id.shard_hash {
+            return Err(StorageError::CorruptedShard);
+        }
+        let shard_size = bytes.len() as u64;
+        {
+            let mut q = self.quota.lock().expect("quota mutex poisoned");
+            if !q.can_accept_shard(owner_peer_id, shard_size) {
+                let evicted = q.evict_lru_to_fit(shard_size);
+                for evicted_key in evicted {
+                    let p = self.shards_dir.join(format!("{evicted_key}.shard"));
+                    let _ = fs::remove_file(p);
+                }
+                if !q.can_accept_shard(owner_peer_id, shard_size) {
+                    return Err(StorageError::QuotaExceeded(owner_peer_id.to_string()));
+                }
+            }
+        }
+        let path = self.shard_path(id);
+        fs::write(&path, bytes)?;
+        {
+            let mut q = self.quota.lock().expect("quota mutex poisoned");
+            q.record_shard_stored_deferred(owner_peer_id, id.file_key(), shard_size);
+        }
+        if let Ok(mut idx_map) = self.shard_id_by_file_key.lock() {
+            idx_map.insert(id.file_key(), *id);
+        }
+        Ok(())
+    }
+
+    /// Reconstructs and authenticates a single plaintext stripe from `>= K` shards
+    /// (or materializes a zero-filled sparse extent when `stripe.original_ciphertext_len == 0`).
+    pub fn reconstruct_and_decrypt_stripe(
+        &self,
+        manifest: &FileManifest,
+        stripe: &StripeManifestEntry,
+        master_key: &MasterKey,
+    ) -> Result<Vec<u8>, StorageError> {
+        if stripe.original_ciphertext_len == 0 {
+            let stripe_cap = manifest.stripe_size_bytes.max(1);
+            let stripe_start = stripe.stripe_index.saturating_mul(stripe_cap as u64);
+            let rem = manifest.original_file_size.saturating_sub(stripe_start);
+            let plain_len = (rem as usize).min(stripe_cap);
+            return Ok(vec![0u8; plain_len]);
+        }
+        let total_shards = stripe.k_data + stripe.m_parity;
+        let mut shard_slots: Vec<Option<Vec<u8>>> = Vec::with_capacity(total_shards);
+        let mut local_found = 0usize;
+
+        for idx in 0..total_shards {
+            let id = ShardId {
+                stripe_merkle_root: stripe.stripe_merkle_root,
+                shard_index: idx as u32,
+                shard_hash: stripe.shard_hashes[idx],
+            };
+            match self.get_shard(&id) {
+                Ok(bytes) => {
+                    local_found += 1;
+                    shard_slots.push(Some(bytes));
+                }
+                Err(_) => shard_slots.push(None),
+            }
+        }
+
+        if local_found < stripe.k_data {
+            let has_net_assigned = stripe
+                .assigned_peers
+                .iter()
+                .any(|p| crate::network::is_network_peer_addr(p));
+            let net_client = if let Some(ref c) = self.mesh_client {
+                if !c.all_network_endpoints().is_empty() || has_net_assigned {
+                    Some(c.clone())
+                } else {
+                    None
+                }
+            } else if has_net_assigned {
+                let id = NodeIdentity::from_master_key(master_key);
+                Some(crate::network::MeshClient::new(
+                    id,
+                    stripe.assigned_peers.clone(),
+                    None,
+                ))
+            } else {
+                None
+            };
+
+            if let Some(client) = net_client {
+                let remote_slots = client.fetch_stripe_shards(stripe, client.identity());
+                for (slot, rem) in shard_slots.iter_mut().zip(remote_slots) {
+                    if slot.is_none() && rem.is_some() {
+                        *slot = rem;
+                    }
+                }
+            }
+        }
+
+        let ciphertext = reconstruct_ciphertext_stripe(
+            shard_slots,
+            stripe.k_data,
+            stripe.m_parity,
+            stripe.original_ciphertext_len,
+            Some(&stripe.shard_hashes),
+            Some(stripe.stripe_merkle_root),
+        )?;
+
+        Ok(decrypt_stripe(
+            master_key,
+            &manifest.file_salt,
+            stripe.stripe_index,
+            &ciphertext,
+        )?)
+    }
+
+    /// Streams reconstructed, authenticated plaintext stripes directly into `writer` (such as a
+    /// Linux `memfd` passed over `SCM_RIGHTS`), bounding RAM to a single stripe.
+    pub fn restore_to_writer_streaming<W: Write>(
+        &self,
+        manifest: &FileManifest,
+        master_key: &MasterKey,
+        writer: &mut W,
+    ) -> Result<u64, StorageError> {
+        let mut streamed = 0u64;
+        for stripe in &manifest.stripes {
+            let plaintext = self.reconstruct_and_decrypt_stripe(manifest, stripe, master_key)?;
+            streamed = streamed.saturating_add(plaintext.len() as u64);
+            writer.write_all(&plaintext)?;
+        }
+        writer.flush()?;
+        Ok(streamed)
+    }
+
+    /// Lazily reconstructs and decrypts **only** the minimal intersecting stripe window covering
+    /// `[offset .. offset + length]` (e.g. `O(1)` stripes for a `5 MiB` slice inside a `10 GiB`
+    /// vault), writing exact verified plaintext bytes to `writer`.
+    pub fn read_plaintext_range<W: Write>(
+        &self,
+        manifest: &FileManifest,
+        master_key: &MasterKey,
+        offset: u64,
+        length: u64,
+        writer: &mut W,
+    ) -> Result<u64, StorageError> {
+        if offset > manifest.original_file_size {
+            return Err(StorageError::InvalidRange {
+                offset,
+                length,
+                size: manifest.original_file_size,
+            });
+        }
+        if length == 0 || offset == manifest.original_file_size {
+            return Ok(0);
+        }
+        let end_offset = offset
+            .saturating_add(length)
+            .min(manifest.original_file_size);
+        let stripe_cap = (manifest.stripe_size_bytes.max(1)) as u64;
+        let first_stripe_idx = offset / stripe_cap;
+        let last_stripe_idx = (end_offset - 1) / stripe_cap;
+
+        let mut streamed = 0u64;
+        for target_idx in first_stripe_idx..=last_stripe_idx {
+            let stripe = manifest
+                .stripes
+                .get(target_idx as usize)
+                .filter(|s| s.stripe_index == target_idx)
+                .or_else(|| {
+                    manifest
+                        .stripes
+                        .iter()
+                        .find(|s| s.stripe_index == target_idx)
+                })
+                .ok_or_else(|| {
+                    StorageError::ShardNotFound(format!("missing stripe index {target_idx}"))
+                })?;
+
+            let plaintext = self.reconstruct_and_decrypt_stripe(manifest, stripe, master_key)?;
+            let stripe_start = target_idx.saturating_mul(stripe_cap);
+            let local_start = offset.saturating_sub(stripe_start) as usize;
+            let local_end = ((end_offset - stripe_start) as usize).min(plaintext.len());
+            if local_start < local_end {
+                let slice = &plaintext[local_start..local_end];
+                writer.write_all(slice)?;
+                streamed = streamed.saturating_add(slice.len() as u64);
+            }
+        }
+        writer.flush()?;
+        Ok(streamed)
+    }
+
     /// Reconstructs and decrypts a file from its `FileManifest` using at least `K` surviving
     /// shards per stripe (fetched over `libp2p` via `MeshClient` or from local disk),
     /// writing the verified plaintext to `output_path`.
@@ -1330,81 +2204,7 @@ impl BlockStore {
             }
         }
         let mut out_file = File::create(output_path)?;
-
-        for stripe in &manifest.stripes {
-            let total_shards = stripe.k_data + stripe.m_parity;
-            let mut shard_slots: Vec<Option<Vec<u8>>> = Vec::with_capacity(total_shards);
-            let mut local_found = 0usize;
-
-            for idx in 0..total_shards {
-                let id = ShardId {
-                    stripe_merkle_root: stripe.stripe_merkle_root,
-                    shard_index: idx as u32,
-                    shard_hash: stripe.shard_hashes[idx],
-                };
-                match self.get_shard(&id) {
-                    Ok(bytes) => {
-                        local_found += 1;
-                        shard_slots.push(Some(bytes));
-                    }
-                    Err(_) => shard_slots.push(None),
-                }
-            }
-
-            if local_found < stripe.k_data {
-                let has_net_assigned = stripe
-                    .assigned_peers
-                    .iter()
-                    .any(|p| crate::network::is_network_peer_addr(p));
-                let net_client = if let Some(ref c) = self.mesh_client {
-                    if !c.all_network_endpoints().is_empty() || has_net_assigned {
-                        Some(c.clone())
-                    } else {
-                        None
-                    }
-                } else if has_net_assigned {
-                    let id = NodeIdentity::from_master_key(master_key);
-                    Some(crate::network::MeshClient::new(
-                        id,
-                        stripe.assigned_peers.clone(),
-                        None,
-                    ))
-                } else {
-                    None
-                };
-
-                if let Some(client) = net_client {
-                    let remote_slots = client.fetch_stripe_shards(stripe, client.identity());
-                    for (slot, rem) in shard_slots.iter_mut().zip(remote_slots) {
-                        if slot.is_none() && rem.is_some() {
-                            *slot = rem;
-                        }
-                    }
-                }
-            }
-
-            // Reconstruct ciphertext in GF(2^8) from >= K surviving shards and verify Merkle root.
-            let ciphertext = reconstruct_ciphertext_stripe(
-                shard_slots,
-                stripe.k_data,
-                stripe.m_parity,
-                stripe.original_ciphertext_len,
-                Some(&stripe.shard_hashes),
-                Some(stripe.stripe_merkle_root),
-            )?;
-
-            // Authenticate and decrypt AES-256-GCM stripe.
-            let plaintext = decrypt_stripe(
-                master_key,
-                &manifest.file_salt,
-                stripe.stripe_index,
-                &ciphertext,
-            )?;
-
-            out_file.write_all(&plaintext)?;
-        }
-
-        out_file.flush()?;
+        self.restore_to_writer_streaming(manifest, master_key, &mut out_file)?;
         Ok(())
     }
 }

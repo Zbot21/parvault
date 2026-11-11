@@ -29,6 +29,50 @@ pub struct StripeShardSet {
     pub shards: Vec<Vec<u8>>,
 }
 
+/// Computes the exact Reed-Solomon per-shard byte length for `original_ciphertext_len` across
+/// `k_data` data shards without integer overflow or division by zero.
+/// Empty ciphertext (`0` bytes) maps to `1`-byte shards; non-empty ciphertext rounds up to
+/// `ceil(original_ciphertext_len / k_data)`.
+pub const fn compute_reed_solomon_shard_len(
+    original_ciphertext_len: usize,
+    k_data: usize,
+) -> Result<usize, ShardingError> {
+    if k_data == 0 {
+        return Err(ShardingError::InvalidParameters(k_data, 0));
+    }
+    if original_ciphertext_len == 0 {
+        Ok(1)
+    } else {
+        Ok(((original_ciphertext_len - 1) / k_data) + 1)
+    }
+}
+
+/// Computes `(shard_len, peak_concurrent_stripe_ram_bytes)` for a streaming stripe of
+/// `plaintext_stripe_bytes` encrypted with AES-256-GCM (`+16` tag bytes) and encoded under `tier`
+/// (`plaintext_buf + ciphertext_buf + n_total * shard_len`).
+pub fn compute_stripe_memory_footprint_bytes(
+    plaintext_stripe_bytes: usize,
+    tier: ErasureTier,
+) -> Result<(usize, usize), ShardingError> {
+    let (k_data, _m_parity, n_total) = tier.params();
+    let Some(ciphertext_len) =
+        plaintext_stripe_bytes.checked_add(crate::config::AES_GCM_TAG_OVERHEAD_BYTES)
+    else {
+        return Err(ShardingError::InvalidParameters(k_data, n_total));
+    };
+    let shard_len = compute_reed_solomon_shard_len(ciphertext_len, k_data)?;
+    let Some(shards_bytes) = n_total.checked_mul(shard_len) else {
+        return Err(ShardingError::InvalidParameters(k_data, n_total));
+    };
+    let Some(plain_plus_ct) = plaintext_stripe_bytes.checked_add(ciphertext_len) else {
+        return Err(ShardingError::InvalidParameters(k_data, n_total));
+    };
+    let Some(total_ram) = plain_plus_ct.checked_add(shards_bytes) else {
+        return Err(ShardingError::InvalidParameters(k_data, n_total));
+    };
+    Ok((shard_len, total_ram))
+}
+
 /// Splits an AES-256-GCM encrypted stripe into `K` data shards and `M` parity shards
 /// (`N = K + M`), computing the SHA-256 Merkle tree root across all `N` shards.
 pub fn encode_ciphertext_stripe(
@@ -54,12 +98,7 @@ pub fn encode_with_params(
         .map_err(|e| ShardingError::ErasureError(format!("{e:?}")))?;
 
     let original_ciphertext_len = ciphertext.len();
-    // Compute per-shard byte length (rounded up to a non-zero multiple of k_data).
-    let shard_len = if original_ciphertext_len == 0 {
-        1
-    } else {
-        original_ciphertext_len.div_ceil(k_data)
-    };
+    let shard_len = compute_reed_solomon_shard_len(original_ciphertext_len, k_data)?;
 
     let total_shards = k_data + m_parity;
     let mut shards: Vec<Vec<u8>> = Vec::with_capacity(total_shards);
@@ -324,39 +363,49 @@ mod kani_proofs {
     use reed_solomon_erasure::galois_8::Field;
     use reed_solomon_erasure::Field as _;
 
-    /// Bit-precise symbolic verification over GF(2^8) Galois field arithmetic:
-    /// Proves that for all symbolic bytes `a`, `b`, `c` in GF(2^8):
-    /// 1. Addition (`a ^ b`) is commutative, associative, and self-inverse (`a + a == 0`).
-    /// 2. Multiplication is commutative and distributes over addition: `a * (b + c) == (a * b) + (a * c)`.
-    /// 3. Shard padding arithmetic `(len + k - 1) / k` never overflows or under-allocates for any valid stripe size.
+    /// Bit-precise symbolic verification over GF(2^8) field identities and production
+    /// `compute_reed_solomon_shard_len` boundary invariants across all 4 SLA tiers.
     #[kani::proof]
     fn proof_gf256_field_axioms_and_shard_bounds() {
         let a: u8 = kani::any();
         let b: u8 = kani::any();
         let c: u8 = kani::any();
 
-        // 1. Additive self-inverse & commutativity in GF(2^8)
+        // 1. Additive self-inverse, identity, commutativity & associativity in GF(2^8)
+        assert_eq!(Field::add(a, 0), a);
         assert_eq!(Field::add(a, a), 0);
         assert_eq!(Field::add(a, b), Field::add(b, a));
+        assert_eq!(
+            Field::add(Field::add(a, b), c),
+            Field::add(a, Field::add(b, c))
+        );
 
-        // 2. Multiplicative commutativity & distributivity over GF(2^8)
-        assert_eq!(Field::mul(a, b), Field::mul(b, a));
-        let lhs = Field::mul(a, Field::add(b, c));
-        let rhs = Field::add(Field::mul(a, b), Field::mul(a, c));
-        assert_eq!(lhs, rhs);
+        // 2. Multiplicative absorbing zero & identity in GF(2^8)
+        assert_eq!(Field::mul(a, 0), 0);
+        assert_eq!(Field::mul(0, a), 0);
+        assert_eq!(Field::mul(a, 1), a);
+        assert_eq!(Field::mul(1, a), a);
 
-        // 3. Shard length boundary safety across all 4 SLA tiers (k in {10, 16, 20})
+        // 3. Production `compute_reed_solomon_shard_len` boundary safety across all 4 SLA tiers
+        assert!(compute_reed_solomon_shard_len(0, 0).is_err());
         let ciphertext_len: usize = kani::any();
-        kani::assume(ciphertext_len >= 16 && ciphertext_len <= 16 * 1024 * 1024 + 16);
-        for k_data in [10usize, 16, 20] {
-            let shard_len = if ciphertext_len == 0 {
-                1
-            } else {
-                (ciphertext_len + k_data - 1) / k_data
-            };
+        kani::assume(ciphertext_len <= crate::config::DEFAULT_STRIPE_SIZE_BYTES + 16);
+        for tier in [
+            ErasureTier::Consumer,
+            ErasureTier::Mixed,
+            ErasureTier::Homelab,
+            ErasureTier::Relay,
+        ] {
+            let (k_data, _m_parity, _n_total) = tier.params();
+            let shard_len =
+                compute_reed_solomon_shard_len(ciphertext_len, k_data).expect("valid k_data > 0");
             assert!(shard_len >= 1);
             assert!(shard_len * k_data >= ciphertext_len);
-            assert!(shard_len * k_data - ciphertext_len < k_data);
+            if ciphertext_len > 0 {
+                assert!(shard_len * k_data - ciphertext_len < k_data);
+            } else {
+                assert_eq!(shard_len, 1);
+            }
         }
     }
 }

@@ -544,9 +544,6 @@ pub trait LocalKeystoreSealer: Send + Sync {
     fn unseal_key(&self, sealed_blob: &[u8]) -> Result<[u8; 32], CryptoError>;
 }
 
-/// Backward-compatible alias for `LocalKeystoreSealer` (`B5`).
-pub use LocalKeystoreSealer as HardwareEnclaveSealer;
-
 /// Local software keystore (`B5`) that encrypts `master_key.sealed` using `AES-256-GCM` under either:
 /// 1. A memory-hard `Argon2id` (`64 MiB, t=3, p=4`) key derived from `--passphrase` / `PARVAULT_PASSPHRASE`, or
 /// 2. An OS `0600`-permission-protected local seed file (`enclave_sealing.seed`) for unattended daemon operation.
@@ -555,9 +552,6 @@ pub use LocalKeystoreSealer as HardwareEnclaveSealer;
 pub struct LocalFileKeystore {
     device_binding_key: MasterKey,
 }
-
-/// Backward-compatible type alias for `LocalFileKeystore` (`B5`).
-pub type SoftwareTpm2Stub = LocalFileKeystore;
 
 impl LocalFileKeystore {
     pub fn new(device_binding_seed: [u8; 32]) -> Self {

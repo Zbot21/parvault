@@ -306,8 +306,14 @@ impl QuotaManager {
         burned
     }
 
-    /// Commits a newly stored shard to quota accounting and pushes it to the back of the LRU queue.
-    pub fn record_shard_stored(&mut self, peer_id: &str, shard_key: String, shard_bytes: u64) {
+    /// Commits a newly stored shard to in-memory quota accounting and LRU queue without
+    /// immediately rewriting `quota_state.bin` (call [`Self::flush_persistence`] after a stripe batch).
+    pub fn record_shard_stored_deferred(
+        &mut self,
+        peer_id: &str,
+        shard_key: String,
+        shard_bytes: u64,
+    ) {
         if let Some(prev_size) = self.shard_sizes.insert(shard_key.clone(), shard_bytes) {
             self.used_storage_bytes = self.used_storage_bytes.saturating_sub(prev_size);
             if let Some(prev_owner) = self.shard_owners.get(&shard_key) {
@@ -325,6 +331,16 @@ impl QuotaManager {
             acct.epoch_ingress_bytes_written.saturating_add(shard_bytes);
         self.used_storage_bytes = self.used_storage_bytes.saturating_add(shard_bytes);
         self.touch_shard(&shard_key);
+    }
+
+    /// Flushes `quota_state.bin` atomically to disk when persistence is bound.
+    pub fn flush_persistence(&self) {
+        self.persist();
+    }
+
+    /// Commits a newly stored shard to quota accounting and pushes it to the back of the LRU queue.
+    pub fn record_shard_stored(&mut self, peer_id: &str, shard_key: String, shard_bytes: u64) {
+        self.record_shard_stored_deferred(peer_id, shard_key, shard_bytes);
         self.persist();
     }
 

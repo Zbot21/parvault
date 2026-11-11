@@ -36,8 +36,114 @@ pub const ADMIN_RPC_AEAD_INFO: &[u8] = b"parvault-admin-rpc-aead-v1";
 pub const ADMIN_RPC_REQ_DOMAIN: &[u8] = b"parvault-admin-rpc-req-v1:";
 /// Bounded frame ceiling (`32 MiB`) preventing pre-auth / post-auth heap OOM bombs.
 pub const MAX_ADMIN_RPC_FRAME_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum initial `Vec::with_capacity` pre-allocation (`64 KiB`) before socket bytes arrive.
+pub const MAX_ADMIN_RPC_INITIAL_ALLOC_BYTES: usize = 64 * 1024;
 /// Maximum allowed clock skew (`5 minutes`) on `AuthenticatedAdminRpcRequest::timestamp_ms`.
 pub const MAX_ADMIN_RPC_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
+
+/// Typed wire-framing rejection returned by [`validate_admin_rpc_frame_header`] before any
+/// socket payload allocation occurs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AdminRpcFrameError {
+    #[error("admin_rpc frame length {0} overflows usize")]
+    LengthOverflowsUsize(u32),
+    #[error("admin_rpc frame length {declared} exceeds max {effective_max}")]
+    ExceedsMaxFrameBytes {
+        declared: usize,
+        effective_max: usize,
+    },
+}
+
+/// Validates a 4-byte big-endian `admin_rpc` wire length prefix against `max_len`
+/// (hard-capped at `MAX_ADMIN_RPC_FRAME_BYTES + 64`) without panic, heap allocation, or integer
+/// overflow, returning `(declared_frame_len, capped_initial_alloc_bytes)`.
+pub const fn validate_admin_rpc_frame_header(
+    len_buf: [u8; 4],
+    max_len: usize,
+) -> Result<(usize, usize), AdminRpcFrameError> {
+    let hard_ceiling = MAX_ADMIN_RPC_FRAME_BYTES.saturating_add(64);
+    let effective_max = if max_len < hard_ceiling {
+        max_len
+    } else {
+        hard_ceiling
+    };
+    let len_u32 = u32::from_be_bytes(len_buf);
+    if (len_u32 as u64) > (usize::MAX as u64) {
+        return Err(AdminRpcFrameError::LengthOverflowsUsize(len_u32));
+    }
+    let len = len_u32 as usize;
+    if len > effective_max {
+        return Err(AdminRpcFrameError::ExceedsMaxFrameBytes {
+            declared: len,
+            effective_max,
+        });
+    }
+    let initial_cap = if len < MAX_ADMIN_RPC_INITIAL_ALLOC_BYTES {
+        len
+    } else {
+        MAX_ADMIN_RPC_INITIAL_ALLOC_BYTES
+    };
+    Ok((len, initial_cap))
+}
+
+/// Validates `admin_rpc` operator slice allowlist membership (strictly rejecting `[0u8; 32]`),
+/// single-use 32-byte `challenge_nonce` binding, and symmetric `MAX_ADMIN_RPC_CLOCK_SKEW_MS`
+/// (`±300,000 ms`) replay-window tolerance using overflow-free `u64::abs_diff`.
+pub fn validate_admin_rpc_slice_replay_and_auth_meta(
+    allowed_pubkeys: &[[u8; 32]],
+    admin_pubkey: &[u8; 32],
+    expected_challenge_nonce: &[u8; 32],
+    request_challenge_nonce: &[u8; 32],
+    now_ms: u64,
+    request_timestamp_ms: u64,
+) -> Result<(), &'static str> {
+    if *admin_pubkey == [0u8; 32] {
+        return Err("unauthorized admin_pubkey");
+    }
+    let mut authorized = false;
+    let mut i = 0;
+    while i < allowed_pubkeys.len() {
+        if allowed_pubkeys[i] == *admin_pubkey {
+            authorized = true;
+            break;
+        }
+        i += 1;
+    }
+    if !authorized {
+        return Err("unauthorized admin_pubkey");
+    }
+    if request_challenge_nonce != expected_challenge_nonce {
+        return Err("challenge_nonce mismatch (replay rejected)");
+    }
+    if now_ms.abs_diff(request_timestamp_ms) > MAX_ADMIN_RPC_CLOCK_SKEW_MS {
+        return Err("admin_rpc request timestamp outside 5-minute replay window");
+    }
+    Ok(())
+}
+
+/// Validates `admin_rpc` operator allowlist membership (strictly rejecting `[0u8; 32]`),
+/// single-use 32-byte `challenge_nonce` binding, and symmetric `MAX_ADMIN_RPC_CLOCK_SKEW_MS`
+/// (`±300,000 ms`) replay-window tolerance using overflow-free `u64::abs_diff`.
+pub fn validate_admin_rpc_replay_and_auth_meta(
+    allowlist: &AllowedAdminPubkeys,
+    admin_pubkey: &[u8; 32],
+    expected_challenge_nonce: &[u8; 32],
+    request_challenge_nonce: &[u8; 32],
+    now_ms: u64,
+    request_timestamp_ms: u64,
+) -> Result<(), &'static str> {
+    let Ok(guard) = allowlist.0.read() else {
+        return Err("unauthorized admin_pubkey");
+    };
+    validate_admin_rpc_slice_replay_and_auth_meta(
+        &guard,
+        admin_pubkey,
+        expected_challenge_nonce,
+        request_challenge_nonce,
+        now_ms,
+        request_timestamp_ms,
+    )
+}
 
 /// Live health, memory, shard, subnet diversity, PoW policy, and governance telemetry snapshot
 /// reported by a `parvault-seed` node over `SeedAdminRequest::GetSeedTelemetry`.
@@ -371,10 +477,7 @@ where
             return Err(e);
         }
     };
-    let mut resp_nonce_bytes = [0u8; 12];
-    resp_nonce_bytes[11] = 1;
     let resp_nonce = Nonce::from([1u8; 12]);
-    let _ = resp_nonce_bytes;
     let decrypted = cipher.decrypt(&resp_nonce, resp_ct.as_ref()).map_err(|_| {
         anyhow::anyhow!("ChaCha20Poly1305 response decryption/tag verification failed")
     });
@@ -619,39 +722,40 @@ async fn serve_single_admin_rpc_conn<H: SeedAdminRpcHandler>(
 
     // 3. Verify allowlisted operator pubkey, fresh challenge_nonce, clock skew, and Ed25519 signature.
     let now_ms = now_unix_ms();
-    let response = if !allowlist.contains(&auth_req.admin_pubkey) {
-        SeedAdminResponse::Error {
-            message: "unauthorized admin_pubkey".to_string(),
-        }
-    } else if auth_req.challenge_nonce != challenge_nonce {
-        SeedAdminResponse::Error {
-            message: "challenge_nonce mismatch (replay rejected)".to_string(),
-        }
-    } else if now_ms.abs_diff(auth_req.timestamp_ms) > MAX_ADMIN_RPC_CLOCK_SKEW_MS {
-        SeedAdminResponse::Error {
-            message: "admin_rpc request timestamp outside 5-minute replay window".to_string(),
-        }
-    } else {
-        let expected_sign_bytes = admin_rpc_request_sign_bytes(
-            &challenge_nonce,
-            auth_req.timestamp_ms,
-            &auth_req.request,
-        );
-        let mut sig = [0u8; 64];
-        sig[..32].copy_from_slice(&auth_req.sig_r);
-        sig[32..].copy_from_slice(&auth_req.sig_s);
-        if !NodeIdentity::verify_with_pubkey(&auth_req.admin_pubkey, &expected_sign_bytes, &sig) {
-            SeedAdminResponse::Error {
-                message: "invalid Ed25519 signature on admin_rpc request".to_string(),
-            }
-        } else {
-            let req = auth_req.request;
-            let h = Arc::clone(&handler);
-            match tokio::task::spawn_blocking(move || h.handle_request(req)).await {
-                Ok(resp) => resp,
-                Err(join_err) => SeedAdminResponse::Error {
-                    message: format!("admin_rpc handler panicked: {join_err}"),
-                },
+    let response = match validate_admin_rpc_replay_and_auth_meta(
+        &allowlist,
+        &auth_req.admin_pubkey,
+        &challenge_nonce,
+        &auth_req.challenge_nonce,
+        now_ms,
+        auth_req.timestamp_ms,
+    ) {
+        Err(reason) => SeedAdminResponse::Error {
+            message: reason.to_string(),
+        },
+        Ok(()) => {
+            let expected_sign_bytes = admin_rpc_request_sign_bytes(
+                &challenge_nonce,
+                auth_req.timestamp_ms,
+                &auth_req.request,
+            );
+            let mut sig = [0u8; 64];
+            sig[..32].copy_from_slice(&auth_req.sig_r);
+            sig[32..].copy_from_slice(&auth_req.sig_s);
+            if !NodeIdentity::verify_with_pubkey(&auth_req.admin_pubkey, &expected_sign_bytes, &sig)
+            {
+                SeedAdminResponse::Error {
+                    message: "invalid Ed25519 signature on admin_rpc request".to_string(),
+                }
+            } else {
+                let req = auth_req.request;
+                let h = Arc::clone(&handler);
+                match tokio::task::spawn_blocking(move || h.handle_request(req)).await {
+                    Ok(resp) => resp,
+                    Err(join_err) => SeedAdminResponse::Error {
+                        message: format!("admin_rpc handler panicked: {join_err}"),
+                    },
+                }
             }
         }
     };
@@ -684,11 +788,8 @@ async fn read_length_prefixed_frame(
 ) -> anyhow::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > max_len {
-        anyhow::bail!("admin_rpc frame length {len} exceeds max {max_len}");
-    }
-    let mut out = Vec::with_capacity(len.min(64 * 1024));
+    let (len, initial_cap) = validate_admin_rpc_frame_header(len_buf, max_len)?;
+    let mut out = Vec::with_capacity(initial_cap);
     let mut limited = (&mut *stream).take(len as u64);
     let n = limited.read_to_end(&mut out).await?;
     if n != len {

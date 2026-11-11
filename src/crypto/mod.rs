@@ -14,9 +14,8 @@ pub use bip39::{
     validate_recovery_seed_phrase_or_passphrase, BIP39_ENGLISH_WORDLIST,
 };
 pub use keys::{
-    write_secret_file_atomic_0600, HardwareEnclaveSealer, LocalFileKeystore, LocalKeystoreSealer,
-    MasterKey, NodeIdentity, SoftwareTpm2Stub, ARGON2_M_COST_KIB, ARGON2_P_COST, ARGON2_T_COST,
-    KEY_LEN,
+    write_secret_file_atomic_0600, LocalFileKeystore, LocalKeystoreSealer, MasterKey, NodeIdentity,
+    ARGON2_M_COST_KIB, ARGON2_P_COST, ARGON2_T_COST, KEY_LEN,
 };
 pub use pqc::{
     HybridKemCiphertext, HybridKemKeypair, HybridKemPublicKey, HybridPqPublicKey,

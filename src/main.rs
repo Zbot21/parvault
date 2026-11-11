@@ -14,7 +14,7 @@ use parvault::{
     crypto::{
         compute_sha256, encrypt_stripe, generate_bip39_mnemonic,
         pqc::{HybridKemKeypair, HybridPqPublicKey, HybridPqSigningKeypair},
-        MasterKey, NodeIdentity, SoftwareTpm2Stub,
+        LocalFileKeystore, MasterKey, NodeIdentity,
     },
     network::{
         behaviour::{
@@ -67,6 +67,7 @@ struct DaemonLaunchOptions {
     lan_discovery_port: u16,
     print_pairing_banner: bool,
     status_http_bind: Option<String>,
+    ipc_socket: Option<PathBuf>,
     watch_folder: Option<PathBuf>,
     sync_interval_secs: u64,
     sync_tier: ErasureTier,
@@ -697,6 +698,7 @@ async fn main() -> anyhow::Result<()> {
             wan,
             listen,
             tier,
+            ipc_socket,
         } => {
             if let Some(listen_override) = listen {
                 cfg.listen_tcp = listen_override;
@@ -713,6 +715,7 @@ async fn main() -> anyhow::Result<()> {
                 lan_discovery_port: lan_port,
                 print_pairing_banner: pair,
                 status_http_bind: effective_status_http,
+                ipc_socket,
                 watch_folder: effective_folder,
                 sync_interval_secs: interval_secs.max(1),
                 sync_tier: effective_tier,
@@ -966,6 +969,7 @@ async fn main() -> anyhow::Result<()> {
                 listen,
                 enable_quic,
                 status_http,
+                ipc_socket,
             } => {
                 cfg.listen_tcp = listen;
                 cfg.enable_quic = enable_quic;
@@ -974,6 +978,7 @@ async fn main() -> anyhow::Result<()> {
                     lan_discovery_port: lan_port,
                     print_pairing_banner: false,
                     status_http_bind: status_http.or_else(|| cfg.status_http_bind.clone()),
+                    ipc_socket,
                     watch_folder: None,
                     sync_interval_secs: 5,
                     sync_tier: cfg.default_tier,
@@ -1936,7 +1941,7 @@ fn resolve_master_key(
     if let Some(hex_str) = key_hex {
         Ok(MasterKey::from_hex(hex_str)?)
     } else {
-        let sealer = SoftwareTpm2Stub::from_passphrase_or_csprng_in_dir(data_dir, passphrase)?;
+        let sealer = LocalFileKeystore::from_passphrase_or_csprng_in_dir(data_dir, passphrase)?;
         let sealed_path = data_dir.join("master_key.sealed");
         sealer.load_or_create_master_key(&sealed_path)
     }
@@ -2219,6 +2224,35 @@ async fn run_daemon(
         None
     };
 
+    #[cfg(unix)]
+    let mut ipc_gateway_handle = if let Some(ref sock_path) = opts.ipc_socket {
+        let mk = resolve_master_key(
+            &cfg.data_dir,
+            None,
+            cfg.device_sealing_passphrase.as_deref(),
+        )?;
+        let handle = parvault::gateway::ipc::GatewayIpcServer::new(
+            sock_path.clone(),
+            block_store.clone(),
+            mk,
+        )
+        .with_profile(cfg.hardware_profile)
+        .with_tier(opts.sync_tier)
+        .spawn()?;
+        println!(
+            "[parvault] Zero-Copy IPC Gateway listening on unix://{}",
+            sock_path.display()
+        );
+        info!(socket = %sock_path.display(), "GatewayIpcServer active");
+        Some(handle)
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    if opts.ipc_socket.is_some() {
+        anyhow::bail!("--ipc-socket Unix Domain Socket gateway is only supported on Unix targets");
+    }
+
     if let Some(ref folder_path) = opts.watch_folder {
         let _ = std::fs::create_dir_all(folder_path);
         let sync_folder = folder_path.clone();
@@ -2455,6 +2489,10 @@ async fn run_daemon(
         }
     }
 
+    #[cfg(unix)]
+    if let Some(ref mut ipc_handle) = ipc_gateway_handle {
+        ipc_handle.shutdown();
+    }
     if let Some((_, http_handle)) = status_state_and_handle {
         http_handle.shutdown();
     }

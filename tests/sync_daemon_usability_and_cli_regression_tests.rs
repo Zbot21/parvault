@@ -758,7 +758,7 @@ fn test_cli_end_to_end_parvault_and_parvault_seed_subcommands() {
 fn test_persistent_por_repair_grants_dht_store_and_libp2p_keypair_across_restarts() {
     use parvault::{
         config::ErasureTier,
-        crypto::{pqc::PqVaultMasterKey, HardwareEnclaveSealer, NodeIdentity, SoftwareTpm2Stub},
+        crypto::{pqc::PqVaultMasterKey, LocalFileKeystore, LocalKeystoreSealer, NodeIdentity},
         por::{PorVerifierEngine, RepairGrant},
         sharding::merkle::hash_shard_leaf,
         storage::{BlockStore, QuotaManager, ShardId, ZeroTrustDhtStore},
@@ -773,13 +773,13 @@ fn test_persistent_por_repair_grants_dht_store_and_libp2p_keypair_across_restart
     let kp2 = id2.to_libp2p_keypair().unwrap();
     assert_eq!(kp1.public().to_peer_id(), kp2.public().to_peer_id());
 
-    // 2. SoftwareTpm2Stub seals/unseals consistently from persisted CSPRNG/passphrase key
-    let tpm1 =
-        SoftwareTpm2Stub::from_passphrase_or_csprng_in_dir(&base, Some("vault-pass")).unwrap();
-    let tpm2 =
-        SoftwareTpm2Stub::from_passphrase_or_csprng_in_dir(&base, Some("vault-pass")).unwrap();
-    let sealed = tpm1.seal_key(&[0xAB; 32]).unwrap();
-    let unsealed = tpm2.unseal_key(&sealed).unwrap();
+    // 2. LocalFileKeystore seals/unseals consistently from persisted CSPRNG/passphrase key
+    let ks1 =
+        LocalFileKeystore::from_passphrase_or_csprng_in_dir(&base, Some("vault-pass")).unwrap();
+    let ks2 =
+        LocalFileKeystore::from_passphrase_or_csprng_in_dir(&base, Some("vault-pass")).unwrap();
+    let sealed = ks1.seal_key(&[0xAB; 32]).unwrap();
+    let unsealed = ks2.unseal_key(&sealed).unwrap();
     assert_eq!(unsealed, [0xAB; 32]);
 
     // 3. PorVerifierEngine persists repair_grants and session_keys across restarts
