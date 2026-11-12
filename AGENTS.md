@@ -107,6 +107,8 @@ cargo run --release --bin parvault-bench -- run --payload-mib 64
 bash scripts/docker_acceptance_gate.sh
 ```
 
+- **Change-scoped gates during iteration:** `.scoped-gates.map` maps each path to its `--lib` filter, test suites, Kani harnesses, TLA+ specs, and docs; run it with the swarm skill's `run_scoped_gates.sh` (unmapped paths escalate to the full gate run).
+
 ### Static `musl` Cross-Compilation (`x86_64` & `aarch64`, `--profile soc`)
 ```bash
 # x86_64 static musl build (3.63-7.76 MiB stripped)

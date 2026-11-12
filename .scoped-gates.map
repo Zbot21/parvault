@@ -1,0 +1,350 @@
+# .scoped-gates.map: change-scoped gates (format: quota-aware-verified-swarm
+# references/scoped_gates_map.md). Unmapped paths escalate to the full run,
+# so no glob (not even a doc line, which also counts as coverage) catches
+# new files under src/, src/bin/, tests/ or specs/.
+# Test lists = suites that import the module, plus suites that spawn a binary
+# running it, plus runtime callers (e.g. bootstrap leases inside BlockStore).
+
+# --- Crate-wide blast radius -> full -----------------------------------------
+src/lib.rs                      full    # module tree, crate attrs, cfg(kani)
+src/main.rs                     full    # CLI composition root for every subsystem
+src/config.rs                   full    # Cli, ErasureTier, stripe layout used crate-wide
+src/crypto/*                    full    # crypto paths
+src/os_sys.rs                   full    # sole unsafe FFI boundary; needs clippy
+src/crypto/aes.rs               kani    proof_stripe_nonce_injectivity_and_no_panic
+src/crypto/pqc.rs               tla     specs/ParVaultPostQuantum.tla
+src/crypto/pqc.rs               tla     specs/ParVaultAnonymity.tla
+src/config.rs                   kani    proof_streaming_stripe_layout_all_u64_file_sizes_and_profiles
+src/config.rs                   kani    proof_router_soc_and_desktop_reed_solomon_memory_ceiling
+
+# --- storage/* (BlockStore, quota, anonymity, eviction are mutually coupled) -
+src/storage/*                   lib     storage::
+src/storage/*                   test    anonymity_and_degraded_net_tests
+src/storage/*                   test    anonymous_telemetry_tests
+src/storage/*                   test    bootstrap_and_earned_tier_tests
+src/storage/*                   test    confidentiality_and_trust_proofs
+src/storage/*                   test    gateway_bus_and_plugin_security
+src/storage/*                   test    gateway_ipc_benchmark
+src/storage/*                   test    m3_dual_mode_vfs_and_gateway_sync
+src/storage/*                   test    phase1_to_4_integration
+src/storage/*                   test    post_quantum_security_proofs
+src/storage/*                   test    red_team_hardening_tests
+src/storage/*                   test    seed_server_integration
+src/storage/*                   test    sync_daemon_usability_and_cli_regression_tests
+src/storage/*                   test    tla_formal_proofs_integration
+src/storage/*                   test    vfs_lazy_stream
+src/storage/*                   test    zero_config_lan_and_router_soc_tests
+src/storage/*                   test    zero_trust_adversarial
+src/storage/anonymity.rs        tla     specs/ParVaultAnonymity.tla
+src/storage/quota.rs            tla     specs/ParVaultConfidentialityAndTrust.tla
+src/storage/quota.rs            tla     specs/ParVaultBootstrapAndEarnedTier.tla
+src/storage/block_store.rs      tla     specs/ParVaultProtocol.tla
+src/storage/eviction.rs         tla     specs/ParVaultZeroKeyAdminAndQuorum.tla
+src/storage/eviction.rs         kani    proof_eviction_quorum_sub_threshold_and_duplicate_signer_rejected
+src/storage/eviction.rs         kani    proof_eviction_quorum_authorized_distinct_signers_and_expiry
+src/storage/eviction.rs         kani    proof_eviction_signing_payload_collision_free_across_all_fields
+src/storage/eviction.rs         kani    proof_eviction_hmac_dual_stack_normalization_and_domain_isolation
+
+# --- bootstrap.rs (seed server + lease manager used inside BlockStore) -------
+src/bootstrap.rs                lib     bootstrap::
+src/bootstrap.rs                test    anonymity_and_degraded_net_tests
+src/bootstrap.rs                test    anonymous_telemetry_tests
+src/bootstrap.rs                test    bootstrap_and_earned_tier_tests
+src/bootstrap.rs                test    confidentiality_and_trust_proofs
+src/bootstrap.rs                test    gateway_bus_and_plugin_security
+src/bootstrap.rs                test    gateway_ipc_benchmark
+src/bootstrap.rs                test    m3_dual_mode_vfs_and_gateway_sync
+src/bootstrap.rs                test    phase1_to_4_integration
+src/bootstrap.rs                test    red_team_hardening_tests
+src/bootstrap.rs                test    seed_server_integration
+src/bootstrap.rs                test    sync_daemon_usability_and_cli_regression_tests
+src/bootstrap.rs                test    tla_formal_proofs_integration
+src/bootstrap.rs                test    vfs_lazy_stream
+src/bootstrap.rs                test    zero_config_lan_and_router_soc_tests
+src/bootstrap.rs                test    zero_trust_adversarial
+src/bootstrap.rs                tla     specs/ParVaultBootstrapAndEarnedTier.tla
+src/bootstrap.rs                tla     specs/ParVaultLiteClientAndSeedFailover.tla
+
+# --- sharding/* (Reed-Solomon + Merkle on every store/restore path) ----------
+src/sharding/*                  lib     sharding::
+src/sharding/*                  test    anonymity_and_degraded_net_tests
+src/sharding/*                  test    bootstrap_and_earned_tier_tests
+src/sharding/*                  test    confidentiality_and_trust_proofs
+src/sharding/*                  test    formal_verification
+src/sharding/*                  test    gateway_bus_and_plugin_security
+src/sharding/*                  test    gateway_ipc_benchmark
+src/sharding/*                  test    m3_dual_mode_vfs_and_gateway_sync
+src/sharding/*                  test    phase1_to_4_integration
+src/sharding/*                  test    post_quantum_security_proofs
+src/sharding/*                  test    red_team_hardening_tests
+src/sharding/*                  test    seed_server_integration
+src/sharding/*                  test    sync_daemon_usability_and_cli_regression_tests
+src/sharding/*                  test    tla_formal_proofs_integration
+src/sharding/*                  test    vfs_lazy_stream
+src/sharding/*                  test    zero_config_lan_and_router_soc_tests
+src/sharding/*                  test    zero_trust_adversarial
+src/sharding/*                  tla     specs/ParVaultProtocol.tla
+src/sharding/*                  tla     specs/ParVaultConfidentialityAndTrust.tla
+src/sharding/reed_solomon.rs    kani    proof_gf256_field_axioms_and_shard_bounds
+src/sharding/reed_solomon.rs    kani    proof_router_soc_and_desktop_reed_solomon_memory_ceiling
+
+# --- por/* -------------------------------------------------------------------
+src/por/*                       lib     por::
+src/por/*                       test    bootstrap_and_earned_tier_tests
+src/por/*                       test    gateway_ipc_benchmark
+src/por/*                       test    phase1_to_4_integration
+src/por/*                       test    red_team_hardening_tests
+src/por/*                       test    seed_server_integration
+src/por/*                       test    sync_daemon_usability_and_cli_regression_tests
+src/por/*                       test    zero_config_lan_and_router_soc_tests
+src/por/*                       test    zero_trust_adversarial
+src/por/*                       tla     specs/ParVaultProtocol.tla
+src/por/*                       tla     specs/ParVaultConfidentialityAndTrust.tla
+
+# --- network/* ---------------------------------------------------------------
+src/network/*                   lib     network::
+src/network/*                   test    gateway_bus_and_plugin_security
+src/network/*                   test    phase1_to_4_integration
+src/network/*                   test    red_team_hardening_tests
+src/network/*                   test    sync_daemon_usability_and_cli_regression_tests
+src/network/*                   test    zero_config_lan_and_router_soc_tests
+src/network/*                   test    zero_trust_adversarial
+src/network/wot.rs              tla     specs/ParVaultProtocol.tla
+
+# --- gateway/* ---------------------------------------------------------------
+src/gateway/*                   lib     gateway::
+src/gateway/*                   test    gateway_bus_and_plugin_security
+src/gateway/*                   test    gateway_ipc_benchmark
+src/gateway/*                   test    m3_dual_mode_vfs_and_gateway_sync
+src/gateway/*                   test    vfs_lazy_stream
+src/gateway/engine.rs           kani    proof_pinned_ring_capacity_invariant
+src/gateway/ipc.rs              kani    proof_gateway_ipc_frame_header_bounds
+
+# --- capabilities.rs / vfs.rs / sync.rs --------------------------------------
+src/capabilities.rs             lib     capabilities::
+src/capabilities.rs             test    gateway_bus_and_plugin_security
+src/capabilities.rs             test    gateway_ipc_benchmark
+src/capabilities.rs             test    m3_dual_mode_vfs_and_gateway_sync
+src/capabilities.rs             test    vfs_lazy_stream
+src/capabilities.rs             kani    proof_macaroon_peer_uid_and_compact_roundtrip
+src/capabilities.rs             kani    proof_macaroon_caveat_attenuation_monotonic_and_zero_key_rejected
+src/vfs.rs                      lib     vfs::
+src/vfs.rs                      test    gateway_bus_and_plugin_security
+src/vfs.rs                      test    m3_dual_mode_vfs_and_gateway_sync
+src/vfs.rs                      test    vfs_lazy_stream
+src/vfs.rs                      kani    proof_vfs_block_window_power_of_two_and_zero_bounds
+src/vfs.rs                      kani    proof_fuse_header_parser_no_panic
+src/sync.rs                     lib     sync::
+src/sync.rs                     test    confidentiality_and_trust_proofs
+src/sync.rs                     test    m3_dual_mode_vfs_and_gateway_sync
+src/sync.rs                     test    red_team_hardening_tests
+src/sync.rs                     test    sync_daemon_usability_and_cli_regression_tests
+src/sync.rs                     test    tla_formal_proofs_integration
+src/sync.rs                     test    vfs_lazy_stream
+src/sync.rs                     kani    proof_sanitize_sync_relative_path_no_traversal
+src/sync.rs                     tla     specs/ParVaultLiteClientAndSeedFailover.tla
+
+# --- admin_rpc.rs / telemetry.rs / router_nas.rs -----------------------------
+src/admin_rpc.rs                lib     admin_rpc::
+src/admin_rpc.rs                test    gateway_ipc_benchmark                            # spawns parvault-seed
+src/admin_rpc.rs                test    sync_daemon_usability_and_cli_regression_tests   # spawns parvault-seed
+src/admin_rpc.rs                test    zero_config_lan_and_router_soc_tests             # spawns parvault-seed
+src/admin_rpc.rs                kani    proof_admin_rpc_wire_frame_header_no_panic_or_unbounded_alloc
+src/admin_rpc.rs                kani    proof_admin_rpc_replay_window_challenge_and_zero_key_rejection
+src/admin_rpc.rs                tla     specs/ParVaultZeroKeyAdminAndQuorum.tla
+src/telemetry.rs                lib     telemetry::
+src/telemetry.rs                test    anonymous_telemetry_tests
+src/telemetry.rs                test    red_team_hardening_tests
+src/router_nas.rs               lib     router_nas::
+src/router_nas.rs               test    zero_config_lan_and_router_soc_tests
+
+# --- Binaries (cargo builds every bin for any --test run) --------------------
+src/bin/parvault-seed.rs        test    gateway_ipc_benchmark
+src/bin/parvault-seed.rs        test    sync_daemon_usability_and_cli_regression_tests
+src/bin/parvault-seed.rs        test    zero_config_lan_and_router_soc_tests
+src/bin/parvault-seed.rs        tla     specs/ParVaultZeroKeyAdminAndQuorum.tla
+src/bin/parvault-sync.rs        test    m3_dual_mode_vfs_and_gateway_sync     # GatewayFolderSync; self-test not a map kind
+src/bin/parvault-fuse.rs        test    vfs_lazy_stream                       # VirtualVaultFs; self-test not a map kind
+src/bin/parvault-fuse.rs        test    m3_dual_mode_vfs_and_gateway_sync
+src/bin/parvault-bench.rs       test    gateway_ipc_benchmark                 # compile + RSS readers
+
+# --- Kani harness module (cfg(kani) only) ------------------------------------
+src/kani_proofs.rs              kani    proof_eviction_quorum_sub_threshold_and_duplicate_signer_rejected
+src/kani_proofs.rs              kani    proof_eviction_quorum_authorized_distinct_signers_and_expiry
+src/kani_proofs.rs              kani    proof_eviction_signing_payload_collision_free_across_all_fields
+src/kani_proofs.rs              kani    proof_eviction_hmac_dual_stack_normalization_and_domain_isolation
+src/kani_proofs.rs              kani    proof_admin_rpc_wire_frame_header_no_panic_or_unbounded_alloc
+src/kani_proofs.rs              kani    proof_admin_rpc_replay_window_challenge_and_zero_key_rejection
+src/kani_proofs.rs              kani    proof_streaming_stripe_layout_all_u64_file_sizes_and_profiles
+src/kani_proofs.rs              kani    proof_router_soc_and_desktop_reed_solomon_memory_ceiling
+src/kani_proofs.rs              kani    proof_macaroon_caveat_attenuation_monotonic_and_zero_key_rejected
+src/kani_proofs.rs              kani    proof_gateway_ipc_frame_header_bounds
+src/kani_proofs.rs              kani    proof_vfs_block_window_power_of_two_and_zero_bounds
+src/kani_proofs.rs              kani    proof_pinned_ring_capacity_invariant
+src/kani_proofs.rs              kani    proof_fuse_header_parser_no_panic
+src/kani_proofs.rs              kani    proof_sanitize_sync_relative_path_no_traversal
+
+# --- Integration test binaries: each runs itself -----------------------------
+tests/anonymity_and_degraded_net_tests.rs                test    anonymity_and_degraded_net_tests
+tests/anonymous_telemetry_tests.rs                       test    anonymous_telemetry_tests
+tests/bootstrap_and_earned_tier_tests.rs                 test    bootstrap_and_earned_tier_tests
+tests/confidentiality_and_trust_proofs.rs                test    confidentiality_and_trust_proofs
+tests/formal_verification.rs                             test    formal_verification
+tests/gateway_bus_and_plugin_security.rs                 test    gateway_bus_and_plugin_security
+tests/gateway_ipc_benchmark.rs                           test    gateway_ipc_benchmark
+tests/m3_dual_mode_vfs_and_gateway_sync.rs               test    m3_dual_mode_vfs_and_gateway_sync
+tests/phase1_to_4_integration.rs                         test    phase1_to_4_integration
+tests/post_quantum_security_proofs.rs                    test    post_quantum_security_proofs
+tests/red_team_hardening_tests.rs                        test    red_team_hardening_tests
+tests/seed_server_integration.rs                         test    seed_server_integration
+tests/sync_daemon_usability_and_cli_regression_tests.rs  test    sync_daemon_usability_and_cli_regression_tests
+tests/tla_formal_proofs_integration.rs                   test    tla_formal_proofs_integration   # runs all 7 specs
+tests/vfs_lazy_stream.rs                                 test    vfs_lazy_stream
+tests/zero_config_lan_and_router_soc_tests.rs            test    zero_config_lan_and_router_soc_tests
+tests/zero_trust_adversarial.rs                          test    zero_trust_adversarial
+
+# --- TLA+ specs: one spec per line; flags match verify_formal_proofs.sh ------
+specs/ParVaultProtocol.*                    tla     specs/ParVaultProtocol.tla
+specs/ParVaultConfidentialityAndTrust.*     tla     specs/ParVaultConfidentialityAndTrust.tla
+specs/ParVaultAnonymity.*                   tla     specs/ParVaultAnonymity.tla
+specs/ParVaultPostQuantum.*                 tla     specs/ParVaultPostQuantum.tla
+specs/ParVaultBootstrapAndEarnedTier.*      tla     specs/ParVaultBootstrapAndEarnedTier.tla
+specs/ParVaultLiteClientAndSeedFailover.*   tla     specs/ParVaultLiteClientAndSeedFailover.tla
+specs/ParVaultZeroKeyAdminAndQuorum.*       tla     specs/ParVaultZeroKeyAdminAndQuorum.tla
+
+# --- Scripts, CI, deploy, misc -----------------------------------------------
+scripts/verify_formal_proofs.sh     full    # the formal gate itself (kani + all TLC)
+.github/workflows/*                 none    # exercised only by CI on push; local gates cannot run it
+scripts/docker_acceptance_gate.sh   none    # Docker gate, run by hand; not one of the 6 gates
+scripts/install.sh                  none
+website/*                           none
+deploy/*                            none    # container/procd packaging; Docker gate covers it
+.gitignore                          none
+.dockerignore                       none
+LICENSE                             none
+
+# --- Docs to review when the code changes (never executed) ------------------
+src/admin_rpc.rs                doc     AGENTS.md
+src/admin_rpc.rs                doc     docs/SECURITY_AND_CRYPTOGRAPHY.md
+src/admin_rpc.rs                doc     docs/adr/ADR-26-verifiable-abuse-and-council-quorum-governance.md
+src/bootstrap.rs                doc     AGENTS.md
+src/bootstrap.rs                doc     docs/SECURITY_AND_CRYPTOGRAPHY.md
+src/bootstrap.rs                doc     docs/adr/ADR-15-elastic-bootstrap-and-earned-tiers.md
+src/bootstrap.rs                doc     docs/adr/ADR-16-zero-trust-seed-server.md
+src/bootstrap.rs                doc     docs/adr/ADR-20-lite-client-seed-syndication-and-failover.md
+src/capabilities.rs             doc     AGENTS.md
+src/capabilities.rs             doc     README.md
+src/capabilities.rs             doc     docs/EMBEDDING.md
+src/capabilities.rs             doc     docs/GATEWAY_SOCKET_PROTOCOL.md
+src/capabilities.rs             doc     docs/SECURITY_AND_CRYPTOGRAPHY.md
+src/capabilities.rs             doc     docs/adr/ADR-28-stateless-macaroon-capability-attenuation.md
+src/config.rs                   doc     AGENTS.md
+src/config.rs                   doc     docs/EMBEDDING.md
+src/config.rs                   doc     docs/USER_AND_CLI_GUIDE.md
+src/config.rs                   doc     docs/ROUTER_SOC_HARDWARE_GUIDE.md
+src/config.rs                   doc     docs/adr/ADR-21-router-soc-1mib-streaming-profile.md
+src/crypto/*                    doc     AGENTS.md
+src/crypto/*                    doc     docs/SECURITY_AND_CRYPTOGRAPHY.md
+src/crypto/*                    doc     docs/BENCHMARKS.md
+src/crypto/aes.rs               doc     docs/adr/ADR-01-streaming-stripes-and-encrypt-before-shard.md
+src/crypto/keys.rs              doc     docs/adr/ADR-18-seed-phrase-house-fire-disaster-recovery.md
+src/crypto/bip39.rs             doc     docs/adr/ADR-18-seed-phrase-house-fire-disaster-recovery.md
+src/crypto/pqc.rs               doc     docs/adr/ADR-12-asymmetric-post-quantum-hybrids.md
+src/crypto/pqc.rs               doc     docs/adr/ADR-13-symmetric-pq-grover-baseline-and-cascaded-aead.md
+src/gateway/*                   doc     AGENTS.md
+src/gateway/*                   doc     docs/EMBEDDING.md
+src/gateway/*                   doc     docs/GATEWAY_SOCKET_PROTOCOL.md
+src/gateway/*                   doc     docs/SECURITY_AND_CRYPTOGRAPHY.md
+src/gateway/*                   doc     docs/adr/ADR-27-zero-copy-uds-gateway-and-hedged-pool.md
+src/gateway/*                   doc     docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md
+src/gateway/ipc.rs              doc     docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md
+src/gateway/cli_runner.rs       doc     docs/USER_AND_CLI_GUIDE.md
+src/kani_proofs.rs              doc     AGENTS.md
+src/kani_proofs.rs              doc     README.md
+src/kani_proofs.rs              doc     docs/SAFETY_AND_LINT_AUDIT.md
+src/kani_proofs.rs              doc     docs/SECURITY_AND_CRYPTOGRAPHY.md
+src/lib.rs                      doc     AGENTS.md
+src/lib.rs                      doc     docs/EMBEDDING.md
+src/lib.rs                      doc     docs/SAFETY_AND_LINT_AUDIT.md
+src/main.rs                     doc     AGENTS.md
+src/main.rs                     doc     README.md
+src/main.rs                     doc     QUICKSTART.md
+src/main.rs                     doc     docs/USER_AND_CLI_GUIDE.md
+src/main.rs                     doc     docs/SAFETY_AND_LINT_AUDIT.md
+src/main.rs                     doc     docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md
+src/network/*                   doc     AGENTS.md
+src/network/behaviour.rs        doc     docs/adr/ADR-06-hybrid-locality-and-70-30-placement.md
+src/network/behaviour.rs        doc     docs/adr/ADR-08-noise-xx-transport-and-bounded-wire-framing.md
+src/network/transport.rs        doc     docs/adr/ADR-08-noise-xx-transport-and-bounded-wire-framing.md
+src/network/client.rs           doc     docs/adr/ADR-02-dht-encrypted-manifests.md
+src/network/discovery.rs        doc     docs/adr/ADR-22-zero-ip-lan-discovery-and-sas-pairing.md
+src/network/wan_rendezvous.rs   doc     docs/adr/ADR-23-online-wan-rendezvous-and-stun-over-noise.md
+src/network/wot.rs              doc     docs/adr/ADR-05-recursive-wot-and-subtree-slashing.md
+src/network/wot.rs              doc     docs/adr/ADR-24-public-commons-pow-swarm-mode.md
+src/os_sys.rs                   doc     AGENTS.md
+src/os_sys.rs                   doc     CONTRIBUTING.md
+src/os_sys.rs                   doc     docs/SAFETY_AND_LINT_AUDIT.md
+src/os_sys.rs                   doc     docs/GATEWAY_SOCKET_PROTOCOL.md
+src/os_sys.rs                   doc     docs/adr/ADR-31-unsafe-remediation-and-os-sys-ffi-boundary.md
+src/os_sys.rs                   doc     docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md
+src/por/*                       doc     AGENTS.md
+src/por/*                       doc     docs/SECURITY_AND_CRYPTOGRAPHY.md
+src/por/*                       doc     docs/adr/ADR-03-stateless-witness-por-auditing.md
+src/por/verifier.rs             doc     docs/adr/ADR-04-repair-grant-ciphertext-reconstruction.md
+src/por/verifier.rs             doc     docs/adr/ADR-09-byzantine-merkle-quarantine-and-egress-slashing.md
+src/router_nas.rs               doc     AGENTS.md
+src/router_nas.rs               doc     docs/ROUTER_SOC_HARDWARE_GUIDE.md
+src/sharding/*                  doc     AGENTS.md
+src/sharding/*                  doc     docs/SECURITY_AND_CRYPTOGRAPHY.md
+src/sharding/*                  doc     docs/adr/ADR-01-streaming-stripes-and-encrypt-before-shard.md
+src/sharding/*                  doc     docs/adr/ADR-09-byzantine-merkle-quarantine-and-egress-slashing.md
+src/sharding/reed_solomon.rs    doc     README.md
+src/sharding/reed_solomon.rs    doc     docs/BENCHMARKS.md
+src/storage/*                   doc     AGENTS.md
+src/storage/*                   doc     docs/EMBEDDING.md
+src/storage/anonymity.rs        doc     docs/SECURITY_AND_CRYPTOGRAPHY.md
+src/storage/anonymity.rs        doc     docs/adr/ADR-11-four-layer-shard-anonymization.md
+src/storage/block_store.rs      doc     docs/adr/ADR-01-streaming-stripes-and-encrypt-before-shard.md
+src/storage/block_store.rs      doc     docs/adr/ADR-02-dht-encrypted-manifests.md
+src/storage/block_store.rs      doc     docs/adr/ADR-19-crash-safe-atomic-storage-and-lease-pinning.md
+src/storage/block_store.rs      doc     docs/adr/ADR-30-filesystem-free-in-memory-seed-mode.md
+src/storage/eviction.rs         doc     docs/SAFETY_AND_LINT_AUDIT.md
+src/storage/eviction.rs         doc     docs/adr/ADR-25-hmac-blinded-shard-eviction-and-shredding.md
+src/storage/eviction.rs         doc     docs/adr/ADR-26-verifiable-abuse-and-council-quorum-governance.md
+src/storage/quota.rs            doc     docs/SECURITY_AND_CRYPTOGRAPHY.md
+src/storage/quota.rs            doc     docs/adr/ADR-07-tier-weighted-reciprocity-ledger.md
+src/storage/quota.rs            doc     docs/adr/ADR-10-dynamic-uptime-trust-ladder.md
+src/sync.rs                     doc     AGENTS.md
+src/sync.rs                     doc     docs/EMBEDDING.md
+src/sync.rs                     doc     docs/GATEWAY_SOCKET_PROTOCOL.md
+src/sync.rs                     doc     docs/SECURITY_AND_CRYPTOGRAPHY.md
+src/sync.rs                     doc     docs/adr/ADR-14-incremental-folder-sync-engine.md
+src/sync.rs                     doc     docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md
+src/telemetry.rs                doc     AGENTS.md
+src/telemetry.rs                doc     docs/adr/ADR-17-anonymous-census-telemetry.md
+src/vfs.rs                      doc     AGENTS.md
+src/vfs.rs                      doc     docs/EMBEDDING.md
+src/vfs.rs                      doc     docs/GATEWAY_SOCKET_PROTOCOL.md
+src/vfs.rs                      doc     docs/adr/ADR-29-pure-rust-fuse-and-webdav-lazy-vfs.md
+src/vfs.rs                      doc     docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md
+src/bin/parvault-seed.rs        doc     AGENTS.md
+src/bin/parvault-seed.rs        doc     docs/USER_AND_CLI_GUIDE.md
+src/bin/parvault-seed.rs        doc     docs/SAFETY_AND_LINT_AUDIT.md
+src/bin/parvault-sync.rs        doc     AGENTS.md
+src/bin/parvault-sync.rs        doc     docs/USER_AND_CLI_GUIDE.md
+src/bin/parvault-sync.rs        doc     docs/SAFETY_AND_LINT_AUDIT.md
+src/bin/parvault-fuse.rs        doc     AGENTS.md
+src/bin/parvault-fuse.rs        doc     docs/USER_AND_CLI_GUIDE.md
+src/bin/parvault-fuse.rs        doc     docs/SAFETY_AND_LINT_AUDIT.md
+src/bin/parvault-bench.rs       doc     AGENTS.md
+src/bin/parvault-bench.rs       doc     docs/USER_AND_CLI_GUIDE.md
+src/bin/parvault-bench.rs       doc     docs/SAFETY_AND_LINT_AUDIT.md
+src/bin/parvault-bench.rs       doc     docs/BENCHMARKS.md
+src/bin/parvault-fuse.rs        doc     docs/GATEWAY_SOCKET_PROTOCOL.md
+src/bin/parvault-sync.rs        doc     docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md
+tests/gateway_ipc_benchmark.rs  doc     docs/BENCHMARKS.md
+tests/tla_formal_proofs_integration.rs  doc  AGENTS.md
+scripts/install.sh              doc     QUICKSTART.md
+scripts/install.sh              doc     website/install.sh
+website/install.sh              doc     scripts/install.sh
+deploy/*                        doc     docs/ROUTER_SOC_HARDWARE_GUIDE.md
