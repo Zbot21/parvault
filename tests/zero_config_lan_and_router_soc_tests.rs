@@ -125,6 +125,17 @@ fn wait_for_beacon_files(registry_dir: &Path, expected_count: usize, timeout: Du
     );
 }
 
+/// The master key a `parvault` data directory sealed (the CLI never prints it, W-02).
+fn sealed_master_key_hex(data_dir: &Path) -> String {
+    let keystore =
+        parvault::crypto::keys::LocalFileKeystore::from_passphrase_or_csprng_in_dir(data_dir, None)
+            .expect("open keystore");
+    keystore
+        .load_or_create_master_key(&data_dir.join("master_key.sealed"))
+        .expect("load sealed master key")
+        .to_hex()
+}
+
 fn extract_field_after_colon(stdout: &str, prefix: &str) -> String {
     stdout
         .lines()
@@ -435,7 +446,7 @@ fn test_1_zero_ip_home_lan_auto_discovery_4word_pairing_and_cli_backup_restore()
         .expect("zero-IP parvault file store");
     let store_stdout = assert_cmd_ok(&store_out, "zero-IP file store");
     let merkle_root = extract_field_after_colon(&store_stdout, "File Merkle Root");
-    let master_key_hex = extract_field_after_colon(&store_stdout, "Master Key (hex)");
+    let master_key_hex = sealed_master_key_hex(&zero_ip_store_dir);
 
     // Wipe uploader local state completely to prove shards & manifest live on LAN peers
     fs::remove_dir_all(&zero_ip_store_dir).unwrap();
@@ -492,7 +503,7 @@ fn test_1_zero_ip_home_lan_auto_discovery_4word_pairing_and_cli_backup_restore()
         .output()
         .expect("zero-IP watch-folder --once");
     let watch_stdout = assert_cmd_ok(&watch_out, "zero-IP watch-folder --once");
-    let watch_key_hex = extract_field_after_colon(&watch_stdout, "Master Key (hex)");
+    let watch_key_hex = sealed_master_key_hex(&watch_client_dir);
 
     // Wipe local client shards so restore-folder pulls from LAN peers with zero --peers
     fs::remove_dir_all(&watch_client_dir).unwrap();
@@ -595,7 +606,7 @@ fn test_2_dhcp_ip_port_change_self_healing() {
         .expect("store before DHCP change");
     let store_stdout = assert_cmd_ok(&store_out, "store before DHCP change");
     let merkle_root = extract_field_after_colon(&store_stdout, "File Merkle Root");
-    let master_key_hex = extract_field_after_colon(&store_stdout, "Master Key (hex)");
+    let master_key_hex = sealed_master_key_hex(&client_dir);
 
     // Delete local client shards & manifests while preserving `known_peers.json` (which still has old ports!)
     let _ = fs::remove_dir_all(client_dir.join("shards"));
@@ -768,7 +779,7 @@ fn test_3_interoperable_router_soc_1mib_homelab_4mib_desktop_16mib_streaming_str
         "5 MiB payload on --profile router-soc (1 MiB stripes) must produce 5 stripes:\n{soc_stdout}"
     );
     let soc_root = extract_field_after_colon(&soc_stdout, "File Merkle Root");
-    let soc_key = extract_field_after_colon(&soc_stdout, "Master Key (hex)");
+    let soc_key = sealed_master_key_hex(&soc_client_dir);
     fs::remove_dir_all(&soc_client_dir).unwrap();
 
     // 2. Store 5 MiB with `--profile homelab-nas` (4 MiB stripes -> 2 stripes)
@@ -797,7 +808,7 @@ fn test_3_interoperable_router_soc_1mib_homelab_4mib_desktop_16mib_streaming_str
         "5 MiB payload on --profile homelab-nas (4 MiB stripes) must produce 2 stripes:\n{nas_stdout}"
     );
     let nas_root = extract_field_after_colon(&nas_stdout, "File Merkle Root");
-    let nas_key = extract_field_after_colon(&nas_stdout, "Master Key (hex)");
+    let nas_key = sealed_master_key_hex(&nas_client_dir);
     fs::remove_dir_all(&nas_client_dir).unwrap();
 
     // 3. Restore the 5-stripe `router-soc` file on a `--profile desktop` (16 MiB) client!
@@ -1197,7 +1208,7 @@ fn test_5_zero_ip_online_wan_rendezvous_stun_reflection_and_ddns_ip_rotation() {
         .expect("Bob WAN file store");
     let bob_store_stdout = assert_cmd_ok(&bob_store, "Bob WAN file store");
     let root_hex = extract_field_after_colon(&bob_store_stdout, "File Merkle Root");
-    let key_hex = extract_field_after_colon(&bob_store_stdout, "Master Key (hex)");
+    let key_hex = sealed_master_key_hex(&bob_dir);
 
     // Wipe Bob's local shards & manifests so restore MUST traverse the network to Alice
     let _ = fs::remove_dir_all(bob_dir.join("shards"));
@@ -1497,7 +1508,7 @@ fn test_6_zero_pairing_public_tracker_swarm() {
         "Public Commons mode must enforce Consumer 10-of-20 erasure redundancy:\n{pub_store_stdout}"
     );
     let pub_root = extract_field_after_colon(&pub_store_stdout, "File Merkle Root");
-    let pub_key = extract_field_after_colon(&pub_store_stdout, "Master Key (hex)");
+    let pub_key = sealed_master_key_hex(&fresh_uploader_dir);
 
     // Verify remote stranger daemons hold ciphertext shards on disk
     let remote_shard_total: usize = stranger_dirs
@@ -1855,7 +1866,7 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
         .expect("store honest file");
     let honest_stdout = assert_cmd_ok(&honest_store_out, "store honest file");
     let honest_root_hex = extract_field_after_colon(&honest_stdout, "File Merkle Root");
-    let honest_key_hex = extract_field_after_colon(&honest_stdout, "Master Key (hex)");
+    let honest_key_hex = sealed_master_key_hex(&honest_client_dir);
 
     let illegal_file_path = base.join("leaked_contraband.bin");
     fs::write(
@@ -1881,7 +1892,7 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
         .expect("store illegal file");
     let illegal_stdout = assert_cmd_ok(&illegal_store_out, "store illegal file");
     let illegal_root_hex = extract_field_after_colon(&illegal_stdout, "File Merkle Root");
-    let illegal_key_hex = extract_field_after_colon(&illegal_stdout, "Master Key (hex)");
+    let illegal_key_hex = sealed_master_key_hex(&bad_client_dir);
     let illegal_manifest_path = bad_client_dir
         .join("manifests")
         .join(format!("{illegal_root_hex}.manifest.bin"));
@@ -2286,7 +2297,7 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
         .expect("store file on council daemon");
     let c_store_stdout = assert_cmd_ok(&c_store_out, "store on council daemon");
     let c_root_hex = extract_field_after_colon(&c_store_stdout, "File Merkle Root");
-    let c_key_hex = extract_field_after_colon(&c_store_stdout, "Master Key (hex)");
+    let c_key_hex = sealed_master_key_hex(&council_uploader_dir);
     let c_mk = MasterKey::from_hex(&c_key_hex).unwrap();
     let c_manifest = parvault::storage::FileManifest::from_encrypted_dht_record(
         &c_mk,

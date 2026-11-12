@@ -176,15 +176,16 @@ if [ "$DISCOVERED_COUNT" -lt 10 ]; then
     exit 1
 fi
 
-# Also prove zero-`--peers` file store & restore over Docker bridge auto-discovery
-docker exec parvault-client sh -cex '
+# Also prove zero-`--peers` file store & restore over Docker bridge auto-discovery.
+# The CLI never prints the master key (W-02): store and restore with one explicit key.
+ZKEY="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+docker exec -e ZKEY="$ZKEY" parvault-client sh -cex '
     mkdir -p /tmp/zero-ip-store /tmp/zero-ip-restore
     echo "Zero-IP LAN discovery file store/restore over 172.28.0.0/24 bridge" > /tmp/zero-ip-store/lan_zero_ip.txt
     sha256sum /tmp/zero-ip-store/lan_zero_ip.txt > /tmp/lan_zero_ip.sha256
-    ZOUT=$(/usr/local/bin/parvault --data-dir /tmp/zero-ip-store/data file store --path /tmp/zero-ip-store/lan_zero_ip.txt)
+    ZOUT=$(/usr/local/bin/parvault --data-dir /tmp/zero-ip-store/data file store --path /tmp/zero-ip-store/lan_zero_ip.txt --key-hex "$ZKEY")
     echo "$ZOUT"
     ZROOT=$(echo "$ZOUT" | awk "/File Merkle Root/ {print \$5}")
-    ZKEY=$(echo "$ZOUT" | awk "/Master Key/ {print \$5}")
     rm -rf /tmp/zero-ip-store
     /usr/local/bin/parvault --data-dir /tmp/zero-ip-restore/data file restore "$ZROOT" --output /tmp/zero-ip-store/lan_zero_ip.txt --key-hex "$ZKEY"
     sha256sum -c /tmp/lan_zero_ip.sha256
@@ -388,14 +389,14 @@ docker exec parvault-client sh -cex '
 '
 
 echo "=== [11/12] Cross-Machine 'parvault file store' -> 'parvault file restore --key-hex' with Wiped Local State ==="
-docker exec -e SURVIVING_PEERS="$SURVIVING_PEERS" parvault-client sh -cex '
+XKEY="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+docker exec -e SURVIVING_PEERS="$SURVIVING_PEERS" -e KEY="$XKEY" parvault-client sh -cex '
     mkdir -p /tmp/machine-a /tmp/machine-b
     echo "cross-machine file store and restore verified on v0.3.0" > /tmp/machine-a/secret.txt
     sha256sum /tmp/machine-a/secret.txt > /tmp/secret.sha256
-    OUT=$(/usr/local/bin/parvault --data-dir /tmp/machine-a/data --peers "$SURVIVING_PEERS" file store --path /tmp/machine-a/secret.txt)
+    OUT=$(/usr/local/bin/parvault --data-dir /tmp/machine-a/data --peers "$SURVIVING_PEERS" file store --path /tmp/machine-a/secret.txt --key-hex "$KEY")
     echo "$OUT"
     ROOT=$(echo "$OUT" | awk "/File Merkle Root/ {print \$5}")
-    KEY=$(echo "$OUT" | awk "/Master Key/ {print \$5}")
     rm -rf /tmp/machine-a
     /usr/local/bin/parvault --data-dir /tmp/machine-b/data --peers "$SURVIVING_PEERS" file restore "$ROOT" --output /tmp/machine-a/secret.txt --key-hex "$KEY"
     sha256sum -c /tmp/secret.sha256
@@ -451,6 +452,7 @@ SOC_EXPECTED_SHA256="$(docker run --rm -v "$SOC_VOL_NAME:/mnt/nas" parvault:acce
     sha256sum /mnt/nas/router_soc_5mib.bin | awk "{print \$1}"
 ')"
 
+SOC_KEY="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
 SOC_STORE_OUT="$(docker run --name parvault-soc-store \
     -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     --network parvault-acceptance-net \
@@ -459,7 +461,7 @@ SOC_STORE_OUT="$(docker run --name parvault-soc-store \
     parvault:router-soc \
     --profile router-soc \
     --data-dir /mnt/nas/store-data \
-    file store --path /mnt/nas/router_soc_5mib.bin)"
+    file store --path /mnt/nas/router_soc_5mib.bin --key-hex "$SOC_KEY")"
 echo "$SOC_STORE_OUT"
 
 SOC_STORE_OOM="$(docker inspect -f '{{.State.OOMKilled}}' parvault-soc-store)"
@@ -472,7 +474,6 @@ fi
 echo "$SOC_STORE_OUT" | grep -Eq "Total Stripes[[:space:]]*:[[:space:]]*5"
 
 SOC_ROOT="$(echo "$SOC_STORE_OUT" | awk '/File Merkle Root/ {print $5}')"
-SOC_KEY="$(echo "$SOC_STORE_OUT" | awk '/Master Key/ {print $5}')"
 
 # Wipe local store-data so restore pulls all 5 stripes over libp2p inside another 48 MiB cgroup container!
 docker run --rm -v "$SOC_VOL_NAME:/mnt/nas" parvault:acceptance rm -rf /mnt/nas/store-data
