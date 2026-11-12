@@ -170,7 +170,16 @@ pub(crate) async fn run_daemon(
             // The seed directory is stored like any other data: on the node's pinned ring peers,
             // or locally when it has none. If its peers are unreachable the ingest fails; the
             // daemon keeps serving instead of exiting (W-04).
-            match vfs.ingest_local_directory(seed_dir) {
+            let (ingested, local_only_stripes) =
+                parvault::storage::local_only::track(|| vfs.ingest_local_directory(seed_dir));
+            if local_only_stripes > 0 {
+                tracing::error!(
+                    seed_dir = %seed_dir.display(),
+                    "{}",
+                    parvault::storage::local_only::summary_line(local_only_stripes)
+                );
+            }
+            match ingested {
                 Ok(seeded) => info!(
                     seed_dir = %seed_dir.display(),
                     seeded,
@@ -584,7 +593,18 @@ fn spawn_folder_sync(opts: &DaemonLaunchOptions, cfg: &NodeConfig, block_store: 
                             }
                         }
                     }
-                    let updated = engine.sync_folder_once(&folder_cl)?;
+                    let (updated, local_only_stripes) =
+                        parvault::storage::local_only::track(|| {
+                            engine.sync_folder_once(&folder_cl)
+                        });
+                    if local_only_stripes > 0 {
+                        tracing::error!(
+                            folder = %folder_cl.display(),
+                            "{}",
+                            parvault::storage::local_only::summary_line(local_only_stripes)
+                        );
+                    }
+                    let updated = updated?;
                     if let Ok(bytes) = bincode::serialize(&updated) {
                         let _ = BlockStore::atomic_write_file(&snap_cl, &bytes);
                     }

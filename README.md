@@ -69,6 +69,8 @@ parvault wot install-chain --token <TOKEN>          # laptop
 #    phrase, so a fresh machine can restore this folder after losing this one (keep it offline)
 export PARVAULT_SEED_PHRASE="$(parvault new-seed-phrase)"; echo "$PARVAULT_SEED_PHRASE"
 parvault watch-folder --folder ~/Documents --vault-namespace laptop --once
+#    If no ring peer takes the data, it prints "N stripe(s) kept only on this machine: NOT backed up"
+#    and exits with code 3 (--allow-local-only exits 0).
 
 # 7. Optional: connect to a self-hosted or community-initialized public tracker (--public):
 #    (No official public tracker is currently hosted; supply your own parvault-seed multiaddr)
@@ -131,7 +133,7 @@ flowchart LR
 - **Erasure coding:** fixed per run with `--tier` (default `homelab`, 16-of-20). Earned standing does not change it yet.
 - **One router:** with a single paired storage node, every shard is on that node.
 - **Recovery:** `recover-from-seed` restores only folders backed up with `watch-folder` and a phrase (`PARVAULT_SEED_PHRASE` or `--seed-phrase`) and the same `--vault-namespace`, while peers holding the shards are reachable. `parvault init` prints no phrase; `parvault new-seed-phrase` makes one. Folders served by `parvault up --folder` have no phrase recovery.
-- **Placement:** stores go to the node's pinned peers that accept them (ring members); peers of other rings or offline peers are skipped, and when none accepts, the stripe is kept locally (with a warning), as with no peers at all. The 70/30 latency split is applied; the `<= 4 shards per /24` cap is planned (not applied on the CLI store path).
+- **Placement:** stores go to the node's pinned peers that accept them (ring members); peers of other rings or offline peers are skipped, and when none accepts, the stripe is kept only on this machine, as with no peers at all: that data is **not backed up**. One-shot commands (`watch-folder --once`, `file store`, `parvault-sync push`) then print `N stripe(s) kept only on this machine: NOT backed up` and exit with code `3` unless given `--allow-local-only`; `up --folder`, `--vfs-seed-dir` and the `watch-folder` loop log it as an error each pass, and `parvault status` shows the count. The 70/30 latency split is applied; the `<= 4 shards per /24` cap is planned (not applied on the CLI store path).
 - **Built-in VFS seed folder (W-04):** if the seed folder cannot be stored at all, the daemon prints a warning and keeps serving without it.
 - **Personal device rings:** the "zero storage quota tax" for linked devices is planned; nothing charges or waives quota by device certificate yet.
 - **Public tracker:** none is hosted; `--public` needs your own `parvault-seed`.

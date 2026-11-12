@@ -155,6 +155,13 @@ pub enum IpcResponse {
     Error {
         message: String,
     },
+    /// Appended (R3-1): stored, but `local_only_stripes` stripes are only on the daemon's machine
+    /// (no ring peer accepted them), so they are not backed up. Clients count them on the
+    /// calling thread (`storage::local_only`).
+    StoreSuccessLocalOnly {
+        manifest: EphemeralShardManifest,
+        local_only_stripes: u64,
+    },
 }
 
 /// Domain-separated SHA-256 digest of a vector of 32-byte shard/stripe identifiers used to index
@@ -500,7 +507,14 @@ mod unix_impl {
                         message: "unsealed ingest memfd rejected (F_SEAL_WRITE|F_SEAL_SHRINK|F_SEAL_GROW required)".into(),
                     };
                 }
-                match engine.store_from_owned_fd(owned_fd, bytes_len, retention_policy) {
+                let (stored, local_only_stripes) = crate::storage::local_only::track(|| {
+                    engine.store_from_owned_fd(owned_fd, bytes_len, retention_policy)
+                });
+                match stored {
+                    Ok(manifest) if local_only_stripes > 0 => IpcResponse::StoreSuccessLocalOnly {
+                        manifest,
+                        local_only_stripes,
+                    },
                     Ok(manifest) => IpcResponse::StoreSuccess { manifest },
                     Err(e) => IpcResponse::Error {
                         message: format!("StorePayload failed: {e}"),
@@ -691,6 +705,13 @@ mod unix_impl {
                 retention_policy,
             };
             match self.send_command(&cmd, Some(payload_fd)).await? {
+                IpcResponse::StoreSuccessLocalOnly {
+                    manifest,
+                    local_only_stripes,
+                } => {
+                    crate::storage::local_only::note(local_only_stripes);
+                    Ok(manifest)
+                }
                 IpcResponse::StoreSuccess { manifest } => Ok(manifest),
                 IpcResponse::Error { message } => {
                     anyhow::bail!("gateway StorePayload error: {message}")
@@ -838,6 +859,13 @@ mod unix_impl {
                 retention_policy,
             };
             match self.send_request_sync(&cmd, Some(payload_fd))? {
+                IpcResponse::StoreSuccessLocalOnly {
+                    manifest,
+                    local_only_stripes,
+                } => {
+                    crate::storage::local_only::note(local_only_stripes);
+                    Ok(manifest)
+                }
                 IpcResponse::StoreSuccess { manifest } => Ok(manifest),
                 IpcResponse::Error { message } => Err(io::Error::other(message)),
                 other => Err(io::Error::other(format!(

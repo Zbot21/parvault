@@ -614,6 +614,11 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         once: bool,
 
+        /// Exit 0 even if some stripes stayed only on this machine (no ring peer accepted them).
+        /// Without it the command prints how many and exits with code 3: that data is NOT backed up.
+        #[arg(long, default_value_t = false)]
+        allow_local_only: bool,
+
         /// Optional hex-encoded 32-byte master key.
         #[arg(long)]
         key_hex: Option<String>,
@@ -824,6 +829,11 @@ pub enum FileAction {
         /// Hex-encoded 32-byte master key (if omitted, uses or generates the local master key).
         #[arg(long)]
         key_hex: Option<String>,
+
+        /// Exit 0 even if some stripes stayed only on this machine (no ring peer accepted them).
+        /// Without it the command prints how many and exits with code 3: that data is NOT backed up.
+        #[arg(long, default_value_t = false)]
+        allow_local_only: bool,
     },
     /// Reconstruct and decrypt a file from its File Manifest or Merkle Root hex.
     Restore {

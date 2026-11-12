@@ -50,6 +50,16 @@ pub(crate) async fn status(env: CliEnv, command: Commands) -> anyhow::Result<()>
         cfg.local_rtt_threshold_ms,
         (1.0 - cfg.intra_asn_ratio) * 100.0
     );
+    let local_only = block_store.local_only_stripe_count();
+    println!(
+        "Local-Only Stripes    : {}{}",
+        local_only,
+        if local_only > 0 {
+            " (kept only on this machine: NOT backed up)"
+        } else {
+            ""
+        }
+    );
     println!(
         "Local Storage Quota   : {} / {} bytes used ({} bytes bootstrap grace)",
         q_guard.used_storage_bytes(),

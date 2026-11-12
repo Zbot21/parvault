@@ -82,6 +82,7 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
         tier,
         interval_secs,
         once,
+        allow_local_only,
         key_hex,
         dry_run,
         prune_deleted,
@@ -153,6 +154,7 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
     }
 
     loop {
+        let mut pass_local_only = 0u64;
         let (snapshot, lite_receipts_count) = if let Some(seed_dir) = &lite_seed_dir {
             let pq_kp = HybridPqSigningKeypair::load_or_generate_in_dir(&cfg.data_dir)?;
             let cert = if let Some(cert_arg) = &device_cert {
@@ -179,7 +181,10 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
 
             let seed_str = seed_dir.to_string_lossy().to_string();
             if is_network_peer_addr(&seed_str) {
-                let mut snap = engine.sync_folder_once(&folder)?;
+                let (snap, n) =
+                    parvault::storage::local_only::track(|| engine.sync_folder_once(&folder));
+                pass_local_only += n;
+                let mut snap = snap?;
                 let net_client = MeshClient::new(
                     owner_identity.clone(),
                     mesh_client.all_network_endpoints(),
@@ -291,7 +296,10 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                 (snap, receipts.len())
             }
         } else {
-            (engine.sync_folder_once(&folder)?, 0)
+            let (snap, n) =
+                parvault::storage::local_only::track(|| engine.sync_folder_once(&folder));
+            pass_local_only += n;
+            (snap?, 0)
         };
         let raw_snapshot = bincode::serialize(&snapshot)?;
         BlockStore::atomic_write_file(&snapshot_out, &raw_snapshot)?;
@@ -329,6 +337,12 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
             hex::encode(snapshot.folder_merkle_root)
         );
         println!("Files Synced       : {}", snapshot.files.len());
+        if pass_local_only > 0 {
+            println!(
+                "Not Backed Up      : {}",
+                parvault::storage::local_only::summary_line(pass_local_only)
+            );
+        }
         println!("Deleted Tombstones : {}", snapshot.deleted_tombstones.len());
         if lite_receipts_count > 0 {
             println!(
@@ -386,7 +400,14 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
         }
 
         if once {
+            parvault::storage::local_only::finish_one_shot(pass_local_only, allow_local_only);
             break;
+        }
+        if pass_local_only > 0 {
+            tracing::error!(
+                "{}",
+                parvault::storage::local_only::summary_line(pass_local_only)
+            );
         }
         tokio::time::sleep(Duration::from_secs(interval_secs.max(1))).await;
     }
@@ -417,6 +438,16 @@ pub(crate) async fn list_snapshot(env: CliEnv, command: Commands) -> anyhow::Res
             item.stripe_count,
             &hex::encode(item.file_merkle_root)[..16]
         );
+        // Full stripe roots: the value `evict --merkle-root` takes (R3-2).
+        if let Some(entry) = snapshot_manifest.files.get(&item.relative_path) {
+            for stripe in &entry.manifest.stripes {
+                println!(
+                    "      stripe {} root={}",
+                    stripe.stripe_index,
+                    hex::encode(stripe.stripe_merkle_root)
+                );
+            }
+        }
     }
     Ok(())
 }

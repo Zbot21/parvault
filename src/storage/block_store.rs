@@ -1963,6 +1963,7 @@ impl BlockStore {
                 session_key,
             ) {
                 Ok(assigned) => return Ok((assigned, false)),
+                // R3-1: this stripe is not backed up; the store path reports it.
                 Err(e) => tracing::warn!(
                     error = %e,
                     "no ring peer accepted the stripe; storing it locally"
@@ -1981,8 +1982,42 @@ impl BlockStore {
                 self.put_shard(owner_peer_id, &shard_id, shard_bytes)?;
             }
         }
+        self.record_local_only_stripe(&shard_set.stripe_merkle_root);
         let (_, _, n_total) = tier.params();
         Ok((vec![owner_peer_id.to_string(); n_total], true))
+    }
+
+    /// Records a stripe whose shards are all on this machine (not backed up, R3-1): counted on
+    /// the calling thread for the command summary and listed in the data directory for
+    /// `parvault status`.
+    pub fn record_local_only_stripe(&self, stripe_root: &Hash32) {
+        crate::storage::local_only::note(1);
+        if self.is_in_memory() {
+            return;
+        }
+        let path = self
+            .root_dir
+            .join(crate::storage::local_only::LOCAL_ONLY_STRIPES_FILE);
+        let line = hex::encode(stripe_root);
+        let mut text = fs::read_to_string(&path).unwrap_or_default();
+        if text.lines().any(|l| l == line) {
+            return;
+        }
+        text.push_str(&line);
+        text.push('\n');
+        if let Err(e) = Self::atomic_write_file(&path, text.as_bytes()) {
+            tracing::error!(error = %e, "could not record a local-only stripe");
+        }
+    }
+
+    /// Number of stripes stored on this node that never reached a ring peer (R3-1).
+    pub fn local_only_stripe_count(&self) -> usize {
+        fs::read_to_string(
+            self.root_dir
+                .join(crate::storage::local_only::LOCAL_ONLY_STRIPES_FILE),
+        )
+        .map(|t| t.lines().filter(|l| !l.is_empty()).count())
+        .unwrap_or(0)
     }
 
     fn put_shard_deferred_flush(

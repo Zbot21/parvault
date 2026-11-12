@@ -26,6 +26,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `CorrelatedOutageController::verify_weather_quorum` and `SignedWeatherAttestation` (never called; F-15).
 
 ### Changed
+- Stripes that no ring peer accepted (or stored with no peers) are no longer reported as a finished backup. `watch-folder --once`, `file store` and `parvault-sync push` print `N stripe(s) kept only on this machine: NOT backed up` and exit with code `3` unless given `--allow-local-only`; `up --folder`, `--vfs-seed-dir` and the `watch-folder` loop log it as an error each pass; `parvault status` shows `Local-Only Stripes`. Gateway IPC appends `IpcResponse::StoreSuccessLocalOnly` (discriminant 4).
+- `list-snapshot` prints each file's full stripe roots, the value `evict --merkle-root` takes.
 - The gateway engine's 40 mesh lanes send as the owner identity (one `PeerId`).
 - The seed's syndication puts carry an empty owner claim (accounted to the seed).
 - **Shared wire handler (`#codehealth`):** the daemon and `parvault-seed` now serve every `MeshWireRequest` through one `handle_mesh_wire_request` in `src/network/wire_handler.rs`; the nine role differences are explicit `WireRolePolicy` hooks. Behaviour and wire format are unchanged (pinned by `tests/wire_handler_equivalence.rs`).

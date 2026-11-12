@@ -755,7 +755,13 @@ fn f04_graceful_leave_handoff_accepted() {
             target.log_text()
         );
     };
-    run(&["file", "store", "--path", file.to_str().unwrap()]);
+    run(&[
+        "file",
+        "store",
+        "--allow-local-only",
+        "--path",
+        file.to_str().unwrap(),
+    ]);
     let local = shard_files(&dir);
     assert!(local > 0, "the departing node holds shards");
     run(&["leave", "--handoff-to", &target.addr]);
@@ -2649,4 +2655,67 @@ fn d1_gateway_store_with_only_non_ring_peers_stays_local() {
     let node = d1_up_with_pins("d1-only-node", &[&other]);
     assert!(shard_files(&node.dir) > 0, "stored locally");
     assert_eq!(shard_files(&other.dir), 0, "nothing on the non-ring peer");
+}
+
+/// R3-1: runs `watch-folder --once` on a ring node whose only pinned peer belongs to another
+/// ring, so every stripe stays on this machine. Returns (exit code, stdout).
+fn r3_watch_once_with_only_non_ring_peer(label: &str, extra: &[&str]) -> (Option<i32>, String) {
+    let other = other_ring_daemon(&format!("{label}-other"));
+    let (root, dir, reg, _log) = prepare(label);
+    let folder = root.path().join("docs");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.txt"), b"never left this machine").unwrap();
+    let mut store = parvault::network::KnownPeersStore::load(&dir);
+    let pid = other.peer_id().to_string();
+    store.upsert_pinned_multiaddr(
+        &pid,
+        &format!("{}/p2p/{pid}", other.addr),
+        None,
+        Some("daemon"),
+    );
+    store.save(&dir).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+        .arg("--data-dir")
+        .arg(&dir)
+        .args(["--no-lan-discovery", "watch-folder", "--once", "--folder"])
+        .arg(&folder)
+        .arg("--snapshot-out")
+        .arg(root.path().join("snap.bin"))
+        .args(extra)
+        .output()
+        .expect("run watch-folder");
+    assert_eq!(shard_files(&other.dir), 0, "nothing on the non-ring peer");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// R3-1: a pass that backed nothing up says so and exits with the documented code.
+#[test]
+fn r3_watch_once_local_only_exits_with_code() {
+    let (code, stdout) = r3_watch_once_with_only_non_ring_peer("r3-local-only", &[]);
+    assert_eq!(
+        code,
+        Some(parvault::storage::local_only::EXIT_CODE_LOCAL_ONLY),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("stripe(s) kept only on this machine: NOT backed up"),
+        "{stdout}"
+    );
+}
+
+/// R3-1: `--allow-local-only` prints the same line and exits 0.
+#[test]
+fn r3_watch_once_allow_local_only_exits_zero() {
+    let (code, stdout) =
+        r3_watch_once_with_only_non_ring_peer("r3-allow-local-only", &["--allow-local-only"]);
+    assert_eq!(code, Some(0), "{stdout}");
+    assert!(
+        stdout.contains("kept only on this machine: NOT backed up"),
+        "{stdout}"
+    );
 }
