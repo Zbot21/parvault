@@ -130,6 +130,12 @@ CLOSE_RE = re.compile(r"^\s*/metric\s*$")
 LOOKS_LIKE_MARKER = re.compile(r"^\s*/?\s*metric\b")
 UNCLOSED_RE = re.compile(r"<!--\s*/?\s*metric\b")
 FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+LIST_ITEM_RE = re.compile(r"^(\s*(?:[-*+]|\d{1,9}[.)])\s+)\S")
+LIST_FENCE_RE = re.compile(r"^(\s*(?:[-*+]|\d{1,9}[.)])\s+)(`{3,}|~{3,})(.*)$")
+INDENTED_FENCE_RE = re.compile(r"^( +)(`{3,}|~{3,})(.*)$")
+QUOTE_FENCE_RE = re.compile(r"^\s*>\s?( {0,3})(`{3,}|~{3,})(.*)$")
+QUOTE_LINE_RE = re.compile(r"^\s*>\s?(.*)$")
+IGNORED_MARKER_RE = re.compile(rf"<!--\s*metric:({KEY})\s*-->")
 CODE_FORM_RE = re.compile(r"(`+)([^`](?:.*[^`])?)\1")
 PLAIN_ESCAPES = set("\\`*_[]<>|~$&")
 
@@ -250,6 +256,59 @@ with open(md_list, "rb") as fh:
             errors.append(f"{raw_name!r}: Markdown file name is not valid UTF-8")
 md_files = sorted(md_files)
 
+def fence_open(line, lineno, list_indent):
+    # Returns fence state for a top-level, list-item, or blockquote opener.
+    m = FENCE_RE.match(line)
+    if m:
+        state = {"kind": "top", "indent": 0, "marker": m.group(1), "rest": m.group(2)}
+    else:
+        m = LIST_FENCE_RE.match(line)
+        if m:
+            state = {"kind": "list", "indent": len(m.group(1)), "marker": m.group(2), "rest": m.group(3)}
+        else:
+            m = QUOTE_FENCE_RE.match(line)
+            if m:
+                state = {"kind": "quote", "indent": 0, "marker": m.group(2), "rest": m.group(3)}
+            else:
+                m = INDENTED_FENCE_RE.match(line)
+                if not (m and list_indent is not None and 0 <= len(m.group(1)) - list_indent <= 3):
+                    return None
+                state = {"kind": "list", "indent": list_indent, "marker": m.group(2), "rest": m.group(3)}
+    if state["marker"][0] == "`" and "`" in state["rest"]:
+        return None
+    state.update(char=state["marker"][0], len=len(state["marker"]), line=lineno)
+    return state
+
+
+def fence_step(f, line):
+    # Returns (closed, inside) for a line while fence f is open.
+    if f["kind"] == "list":
+        if not line.strip():
+            return False, True
+        if len(line) - len(line.lstrip(" ")) < f["indent"]:
+            return False, False
+        body = line[f["indent"]:]
+    elif f["kind"] == "quote":
+        qm = QUOTE_LINE_RE.match(line)
+        if not qm:
+            return False, False
+        body = qm.group(1)
+    else:
+        body = line
+    m = FENCE_RE.match(body)
+    if m and m.group(1)[0] == f["char"] and len(m.group(1)) >= f["len"] and not m.group(2).strip():
+        return True, True
+    return False, True
+
+
+ignored = []  # (where, key) for markers inside fences or code spans
+
+
+def scan_ignored(text, where):
+    for m in IGNORED_MARKER_RE.finditer(text):
+        ignored.append((where, m.group(1)))
+
+
 markers = []  # (file, lineno, key, content)
 edits = {}  # path -> list of lines (with EOL) after replacement
 used = set()
@@ -262,25 +321,33 @@ for md in md_files:
         continue
     md_lines = split_lines(body)
     out_lines = list(md_lines)
-    in_fence, fence_char, fence_len, fence_line = False, "", 0, 0
+    fence = None
+    list_indent = None  # content indent of the most recent list item
     for idx, raw in enumerate(md_lines):
         lineno = idx + 1
         where = f"{md}:{lineno}"
         line = raw.rstrip("\r\n")
         eol_part = raw[len(line):]
-        fm = FENCE_RE.match(line)
-        if fm:
-            marker, rest = fm.group(1), fm.group(2)
-            if not in_fence and (marker[0] == "~" or "`" not in rest):
-                in_fence, fence_char, fence_len, fence_line = True, marker[0], len(marker), lineno
+        if fence is not None:
+            closed, inside = fence_step(fence, line)
+            if inside:
+                scan_ignored(line, where)
+                if closed:
+                    fence = None
                 continue
-            if in_fence and marker[0] == fence_char and len(marker) >= fence_len and not rest.strip():
-                in_fence = False
-                continue
-        if in_fence:
+            fence = None  # the list item or blockquote ended; read the line normally
+        fence = fence_open(line, lineno, list_indent)
+        if fence is not None:
+            scan_ignored(line, where)
             continue
+        lm = LIST_ITEM_RE.match(line)
+        if lm:
+            list_indent = len(lm.group(1))
+        elif line.strip() and not line[0].isspace():
+            list_indent = None
         masked = list(line)
         for cm in CODESPAN_RE.finditer(line):
+            scan_ignored(cm.group(0), where)
             for i in range(cm.start(), cm.end()):
                 masked[i] = "\0"
         masked = "".join(masked)
@@ -336,10 +403,17 @@ for md in md_files:
                     print(f"{where}: metric '{key}' is '{content}', expected '{expected}'")
                 new_line = new_line[:start] + expected + new_line[end:]
         out_lines[idx] = new_line + eol_part
-    if in_fence:
-        errors.append(f"{md}:{fence_line}: fenced code block is never closed (markers after it would be skipped)")
+    if fence is not None:
+        errors.append(f"{md}:{fence['line']}: fenced code block is never closed (markers after it would be skipped)")
     if out_lines != md_lines:
         edits[path] = out_lines
+
+# Invariant: a marker the parser ignores (fence or code span) must not use a
+# real key. Syntax examples use keys that are not in the metrics file.
+if metrics:
+    for where, key in ignored:
+        if key in metrics:
+            errors.append(f"{where}: marker for real key '{key}' is inside code and would not be synced")
 
 if markers and metrics is None and text is None:
     errors.append(f"{len(markers)} metric marker(s) found but the metrics file is missing: {metrics_rel}")
@@ -359,7 +433,11 @@ if errors:
 if mode == "list":
     for md, lineno, key, content in markers:
         print(f"{md}:{lineno}: {key} = {content}")
+    for where, key in ignored:
+        print(f"{where}: [ignored, in code] {key}")
     sys.exit(0)
+
+IGNORED_NOTE = f"; {len(ignored)} ignored in code"
 
 if mode == "check":
     drift = len(edits)
@@ -373,46 +451,78 @@ if mode == "check":
             parts.append(f"{drift} doc file(s) out of sync with {metrics_rel}")
         print(f">>> DOC METRICS DRIFT: {'; '.join(parts)} <<<")
         sys.exit(1)
-    print(f"[PASS] {len(markers)} metric marker(s) in sync with {metrics_rel if text is not None else 'no metrics file'}.")
+    print(f"[PASS] {len(markers)} metric marker(s) in sync with {metrics_rel if text is not None else 'no metrics file'}{IGNORED_NOTE}.")
     sys.exit(0)
 
-# Write phase: prepare every output, check every target is writable, then
-# replace each file through a temp file in the same directory (os.replace).
+# Write phase. 1: resolve symlinks, refuse targets outside the repository,
+# and check writability. 2: write every temp file. 3: os.replace them all.
+# A failure in 1 or 2 replaces nothing and removes every temp file.
 outputs = []
 if stale_block:
     outputs.append((metrics_path, text, f"{metrics_rel}: generated block refreshed"))
 for path, out_lines in sorted(edits.items()):
     outputs.append((path, "".join(out_lines), rel(path)))
+repo_real = os.path.realpath(repo)
+targets = []
 blocked = []
-for path, _, _ in outputs:
-    parent = os.path.dirname(path)
-    if os.path.exists(path) and not os.access(path, os.W_OK):
+seen_real = {}
+for path, content, label in outputs:
+    real = os.path.realpath(path)
+    if real in seen_real:
+        # Two tracked paths (e.g. a symlink and its target) share one file.
+        if seen_real[real] != content:
+            blocked.append(f"{rel(path)}: shares {real} with another path but would get different content")
+        continue
+    seen_real[real] = content
+    if os.path.commonpath([repo_real, real]) != repo_real:
+        blocked.append(f"{rel(path)}: resolves outside the repository ({real})")
+        continue
+    parent = os.path.dirname(real)
+    if os.path.exists(real) and not os.access(real, os.W_OK):
         blocked.append(f"{rel(path)}: file is not writable")
     elif os.path.isdir(parent) and not os.access(parent, os.W_OK | os.X_OK):
         blocked.append(f"{rel(path)}: directory is not writable")
+    else:
+        targets.append((real, content, label))
 if blocked:
     for b in blocked:
         print(f"ERROR: {b}", file=sys.stderr)
-    print(f">>> DOC METRICS: {len(blocked)} unwritable target(s); nothing written <<<", file=sys.stderr)
+    print(f">>> DOC METRICS: {len(blocked)} blocked target(s); nothing written <<<", file=sys.stderr)
     sys.exit(2)
-for path, content, label in outputs:
-    parent = os.path.dirname(path)
-    try:
+
+temps = []  # (real target, temp path)
+
+
+def remove_temps():
+    for _, tmp in temps:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+try:
+    for real, content, _ in targets:
+        parent = os.path.dirname(real)
         os.makedirs(parent, exist_ok=True)
-        mode_bits = os.stat(path).st_mode & 0o7777 if os.path.exists(path) else 0o644
+        mode_bits = os.stat(real).st_mode & 0o7777 if os.path.exists(real) else 0o644
         fd, tmp = tempfile.mkstemp(prefix=".metrics-sync-", dir=parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
-                fh.write(content)
-            os.chmod(tmp, mode_bits)
-            os.replace(tmp, path)
-        except BaseException:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-            raise
-    except OSError as exc:
-        print(f"ERROR: {rel(path)}: write failed: {exc}", file=sys.stderr)
-        sys.exit(2)
+        temps.append((real, tmp))
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(content)
+        os.chmod(tmp, mode_bits)
+except OSError as exc:
+    remove_temps()
+    print(f"ERROR: preparing {len(targets)} file(s) failed: {exc}; nothing written", file=sys.stderr)
+    sys.exit(2)
+replaced = 0
+try:
+    for real, tmp in temps:
+        os.replace(tmp, real)
+        replaced += 1
+except OSError as exc:
+    remove_temps()
+    print(f"ERROR: replace failed after {replaced} of {len(temps)} file(s): {exc}", file=sys.stderr)
+    sys.exit(2)
+for _, _, label in targets:
     print(f"[SYNC] {label}")
-print(f"[PASS] {len(markers)} metric marker(s); {len(edits)} file(s) rewritten.")
+print(f"[PASS] {len(markers)} metric marker(s); {len(edits)} file(s) rewritten{IGNORED_NOTE}.")
 PY
