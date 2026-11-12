@@ -28,7 +28,7 @@ Status values:
 | F-10 | Medium | The DHT reader does not bind `owner_pubkey` (a squatted `u64::MAX` wins); a raw Kademlia `put` bypasses the monotonic store. | 2b | Fixed (QA pending): reader bound to its own identity (`dht_candidate_decision`, claim F-10a; post-quantum manifests are not owner-bound, no reader uses them); Kademlia records filtered (`kad_record_decision`, claim F-10b) |
 | F-11 | Medium | `--no-lan-discovery` does not disable mDNS; mDNS peers enter Kademlia with no admission check. | 2b | Fixed (QA pending): `--no-lan-discovery` turns mDNS off without changing the Kademlia mode; mDNS never feeds Kademlia, admission does (`kad_routing_decision`, claim F-11) |
 | F-12 | Medium | Slashing gossip is receive-only; nothing issues `SlashingEvidence`. | 2c | Deferred (2c): the topic is no longer subscribed; publishing proof-carrying evidence is 2c |
-| F-15 | Low | `verify_weather_quorum` has no caller, but `docs/SECURITY_AND_CRYPTOGRAPHY.md` claims it. | 2b | Static |
+| F-15 | Low | `verify_weather_quorum` has no caller, but `docs/SECURITY_AND_CRYPTOGRAPHY.md` claims it. | 2b | Fixed (QA pending): function, its attestation type and the doc claim deleted |
 | F-17 | Medium | `GatewayIdentityStatement` verification does not pin the signing authority; expiry `0` is permanent. | 2c | Reported |
 | F-18 | Medium | Onion relay jitter is a blocking `std::thread::sleep` on the swarm task. | 2c | Reported |
 | F-20 | High | No production path admits a peer (no handshake caller, no invitation issuer, self-generated genesis). | 2b | Fixed for option A (QA pending): self-issue from the ring genesis, `wot invite` / `install-chain` |

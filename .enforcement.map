@@ -21,8 +21,6 @@ reach      F-03      sym=src/network/wire_handler.rs::admission_decision from=sr
 reach      F-05      sym=src/network/wot.rs::verify_and_admit_public_ticket from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
 reach      F-06      sym=src/por/verifier.rs::verify_audit_response from=src/cli/daemon.rs::run_daemon ref=docs/security/TRUST_FINDINGS.md
 open       F-06      expect=reach by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
-reach      F-15      sym=src/bootstrap.rs::verify_weather_quorum from=src/bin/parvault-seed.rs::run_seed_listener_loop ref=docs/security/TRUST_FINDINGS.md
-open       F-15      expect=reach by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 
 # --- Blocking calls on handler paths --------------------------------------------------------------
 no-blocking F-18     path=src/network/wire_handler.rs
@@ -62,4 +60,4 @@ claim      F-25-DHT  sym=src/network/wire_handler.rs::admission_decision accept=
 # Findings with no line yet (no check function exists to name): F-07, F-08, F-09, F-12, F-17
 #   (2c); F-22, F-23, F-26 (2c); F-24 issuer policy (2c).
 
-ratchet    R         open=10 waive=0
+ratchet    R         open=9 waive=0

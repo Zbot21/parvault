@@ -122,9 +122,9 @@ To protect long-lived backup shards and P2P envelopes against **Harvest-Now, Dec
 | **`EarnedVerifiedMixedPool`** | Earned `VerifiedNeighbor` ($\ge 50$ PoR passes, $\ge 98.0\%$ SLA, $P \ge 24$) | **`16-of-24`** (`K=16, M=8`) | **`1.50x`** (`66.7%` efficiency) | `4 shards` |
 | **`EarnedHomelabAnchorPool`** | Earned `HighUptimeAnchor` ($\ge 200$ PoR passes, $\ge 99.8\%$ SLA, $P \ge 20$) | **`16-of-20`** (`K=16, M=4`) | **`1.25x`** (`80.0%` efficiency) | `4 shards` |
 
-### Correlated Regional ISP Outage & Weather-Quorum Protection (`CorrelatedOutageController`)
+### Correlated Regional ISP Outage Protection (`CorrelatedOutageController`)
 - Because **70%** of a stripe's shards are placed intra-ASN ($\le 5\text{ ms}$) and **30%** cross-region (`ADR-06`), combined with a strict $\le 4$ shards per `/24` fault-domain cap, a single `/24` router failure never exceeds the parity budget $M = N - K$.
-- During a macro-regional ISP or power grid outage ($\ge 30\%$ simultaneous cohort drop across $\ge 20$ verified subnets), `CorrelatedOutageController::verify_weather_quorum` requires $\ge 3$ independent anchor-signed `SignedWeatherAttestation`s before activating a temporary SLA grace freeze—preventing both unfair mass demotions of honest homelabs and fake-outage spoofing by small colluding groups.
+- No weather quorum gates a correlated outage in `v0.5.0`: an earlier `verify_weather_quorum` had no caller and was removed (finding F-15). SLA grace during a regional outage is not implemented.
 
 ---
 
