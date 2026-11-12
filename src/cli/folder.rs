@@ -35,6 +35,38 @@ pub(crate) async fn diff_folder(env: CliEnv, command: Commands) -> anyhow::Resul
     Ok(())
 }
 
+/// The recovery phrase from `--seed-phrase` or `PARVAULT_SEED_PHRASE`, if any.
+fn effective_seed_phrase(arg: Option<String>) -> Option<String> {
+    arg.or_else(|| std::env::var("PARVAULT_SEED_PHRASE").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The vault keys: derived from the recovery phrase and namespace when one is given (ADR-18),
+/// otherwise the node's sealed master key (or `--key-hex`).
+fn vault_keys(
+    phrase: Option<&str>,
+    vault_namespace: &str,
+    cfg: &NodeConfig,
+    key_hex: Option<&str>,
+) -> anyhow::Result<(MasterKey, NodeIdentity)> {
+    if let Some(phrase) = phrase {
+        let canonical = parvault::crypto::validate_recovery_seed_phrase_or_passphrase(phrase)?;
+        Ok((
+            MasterKey::from_recovery_seed_phrase(&canonical, vault_namespace),
+            NodeIdentity::from_recovery_seed_phrase(&canonical, vault_namespace),
+        ))
+    } else {
+        let mk = resolve_master_key(
+            &cfg.data_dir,
+            key_hex,
+            cfg.device_sealing_passphrase.as_deref(),
+        )?;
+        let id = NodeIdentity::from_master_key(&mk);
+        Ok((mk, id))
+    }
+}
+
 pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Result<()> {
     let CliEnv {
         cfg,
@@ -70,10 +102,7 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
     } else {
         tier
     };
-    let effective_seed_phrase = seed_phrase
-        .or_else(|| std::env::var("PARVAULT_SEED_PHRASE").ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let effective_seed_phrase = effective_seed_phrase(seed_phrase);
     anyhow::ensure!(
         catalog_out.is_none() || effective_seed_phrase.is_some(),
         "--catalog-out needs --seed-phrase (or PARVAULT_SEED_PHRASE): the catalog is sealed under the recovery phrase"
@@ -84,21 +113,12 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
         folder.display()
     );
 
-    let (master_key, owner_identity) = if let Some(phrase) = effective_seed_phrase.as_deref() {
-        let canonical = parvault::crypto::validate_recovery_seed_phrase_or_passphrase(phrase)?;
-        (
-            MasterKey::from_recovery_seed_phrase(&canonical, &vault_namespace),
-            NodeIdentity::from_recovery_seed_phrase(&canonical, &vault_namespace),
-        )
-    } else {
-        let mk = resolve_master_key(
-            &cfg.data_dir,
-            key_hex.as_deref(),
-            cfg.device_sealing_passphrase.as_deref(),
-        )?;
-        let id = NodeIdentity::from_master_key(&mk);
-        (mk, id)
-    };
+    let (master_key, owner_identity) = vault_keys(
+        effective_seed_phrase.as_deref(),
+        &vault_namespace,
+        &cfg,
+        key_hex.as_deref(),
+    )?;
 
     let mut store_for_sync = block_store
         .clone()
@@ -412,20 +432,22 @@ pub(crate) async fn restore_folder(env: CliEnv, command: Commands) -> anyhow::Re
         snapshot,
         out_dir,
         key_hex,
+        seed_phrase,
+        vault_namespace,
         file,
         filter,
     } = command
     else {
         unreachable!("restore_folder() is only dispatched for Commands::RestoreFolder")
     };
-    let master_key = resolve_master_key(
-        &cfg.data_dir,
+    let (master_key, owner_identity) = vault_keys(
+        effective_seed_phrase(seed_phrase).as_deref(),
+        &vault_namespace,
+        &cfg,
         key_hex.as_deref(),
-        cfg.device_sealing_passphrase.as_deref(),
     )?;
     let raw_snapshot = std::fs::read(&snapshot)?;
     let snapshot_manifest: FolderSnapshotManifest = bincode::deserialize(&raw_snapshot)?;
-    let owner_identity = NodeIdentity::from_master_key(&master_key);
     let store_with_owner = block_store
         .clone()
         .with_mesh_client(mesh_client.with_identity(owner_identity.clone()));
@@ -494,13 +516,9 @@ pub(crate) async fn recover_from_seed(env: CliEnv, command: Commands) -> anyhow:
     else {
         unreachable!("recover_from_seed() is only dispatched for Commands::RecoverFromSeed")
     };
-    let seed_phrase = seed_phrase
-        .or_else(|| std::env::var("PARVAULT_SEED_PHRASE").ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("recover-from-seed needs --seed-phrase or PARVAULT_SEED_PHRASE")
-        })?;
+    let seed_phrase = effective_seed_phrase(seed_phrase).ok_or_else(|| {
+        anyhow::anyhow!("recover-from-seed needs --seed-phrase or PARVAULT_SEED_PHRASE")
+    })?;
     let canonical_seed =
         parvault::crypto::validate_recovery_seed_phrase_or_passphrase(&seed_phrase)?;
     let master_key = MasterKey::from_recovery_seed_phrase(&canonical_seed, &vault_namespace);

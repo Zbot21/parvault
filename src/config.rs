@@ -669,6 +669,15 @@ pub enum Commands {
         #[arg(long)]
         key_hex: Option<String>,
 
+        /// Recovery seed phrase the folder was backed up with (or `PARVAULT_SEED_PHRASE`). Without
+        /// it, the node's own master key is used.
+        #[arg(long)]
+        seed_phrase: Option<String>,
+
+        /// Vault namespace used with `--seed-phrase` (ADR-18).
+        #[arg(long, default_value = "default")]
+        vault_namespace: String,
+
         /// Optional relative file path inside the snapshot to selectively restore a single file.
         #[arg(long)]
         file: Option<String>,

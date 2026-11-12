@@ -2424,6 +2424,34 @@ fn w01_phrase_backup_recovers_byte_identical() {
     }
 }
 
+/// W-01: a folder backed up with the phrase restores with `restore-folder` and the same phrase
+/// and namespace (the QUICKSTART step 4 commands).
+#[test]
+fn w01_restore_folder_with_phrase() {
+    let node = spawn_daemon("w01-restore");
+    let backup = w01_backup(&node, "w01-restore-a", Some(PHRASE));
+    let out = phrase_client(&backup.path().join("data"), backup.path(), &node.addr)
+        .env("PARVAULT_SEED_PHRASE", PHRASE)
+        .args([
+            "restore-folder",
+            "--snapshot",
+            "./folder_snapshot.manifest.bin",
+            "--vault-namespace",
+            W01_NS,
+            "--out-dir",
+            "./restored-docs",
+            "--file",
+            "notes.txt",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", out_text(&out));
+    assert_eq!(
+        std::fs::read(backup.path().join("restored-docs/notes.txt")).unwrap(),
+        b"house fire drill"
+    );
+}
+
 /// W-01 test 3: a wrong phrase or namespace fails and writes nothing.
 #[test]
 fn w01_wrong_phrase_or_namespace_recovers_nothing() {
