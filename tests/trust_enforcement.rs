@@ -1468,28 +1468,54 @@ fn f24_onion_relay_forwards_for_unadmitted_originator() {
     gate_ran("trust_enforcement::f24_onion_relay_forwards_for_unadmitted_originator");
 }
 
-// --- F-23: lease renewal carries no credential -----------------------------------------------------------
+// --- F-23: lease renewal needs the capability key -----------------------------------------------------
 
-#[test]
-fn repro_f23_renew_without_credential() {
-    let node = spawn_daemon("f23");
+fn put_for_renew(label: &str) -> (Node, Blinded, NodeIdentity) {
+    let node = spawn_daemon(label);
     let uploader = key(0xF3);
     let b = blinded(0x53, 512);
-    send(
-        &uploader,
-        &node,
-        MeshWireRequest::PutBlindedShard {
-            blinded_id: b.id,
-            shard_bytes: b.bytes.clone(),
-            capability: b.cap,
-            voucher: AnonymousQuotaVoucher::mint(&uploader, 8192),
-            current_epoch: 1,
-            lease_duration_epochs: 30,
-            delete_verifier: b.delete_verifier,
-        },
-    );
+    let resp = send(&uploader, &node, blinded_put(&b, &uploader));
+    assert!(format!("{resp:?}").contains("stored: true"), "{resp:?}");
+    let mk = MasterKey::from_bytes([0x53; 32]);
+    let (cap_ident, _) = BlindedShardCapability::derive_keypair(&mk, &b.id.locator);
+    (node, b, cap_ident)
+}
+
+fn renew_signed_by(b: &Blinded, signer: &NodeIdentity) -> MeshWireRequest {
+    let ts = now_ms();
+    MeshWireRequest::RenewBlindedLeaseSigned {
+        blinded_id: b.id,
+        current_epoch: 2,
+        extension_epochs: 10,
+        timestamp_ms: ts,
+        sig: BlindedShardCapability::sign_lease_renewal(signer, &b.id.locator, 2, 10, ts).to_vec(),
+    }
+}
+
+fn renewed(resp: &MeshWireResponse) -> bool {
+    matches!(
+        resp,
+        MeshWireResponse::RenewBlindedLeaseAck { renewed: true }
+    )
+}
+
+/// F-23 accept: the capability holder's signed renewal is applied.
+#[test]
+fn f23_capability_holder_renews() {
+    let (node, b, cap_ident) = put_for_renew("f23-a");
+    let resp = send(&key(0xF4), &node, renew_signed_by(&b, &cap_ident));
+    assert!(renewed(&resp), "{resp:?}");
+    gate_ran("trust_enforcement::f23_capability_holder_renews");
+}
+
+/// F-23 reject: a renewal signed by any other key is refused, and so is the unsigned variant.
+#[test]
+fn f23_stranger_renew_refused() {
+    let (node, b, _) = put_for_renew("f23-r");
     let stranger = key(0xF4);
-    let resp = send(
+    let resp = send(&stranger, &node, renew_signed_by(&b, &stranger));
+    assert!(!renewed(&resp), "{resp:?}");
+    let legacy = send(
         &stranger,
         &node,
         MeshWireRequest::RenewBlindedLease {
@@ -1498,14 +1524,9 @@ fn repro_f23_renew_without_credential() {
             extension_epochs: 10,
         },
     );
-    assert!(
-        matches!(
-            resp,
-            MeshWireResponse::RenewBlindedLeaseAck { renewed: true, .. }
-        ),
-        "gap: an unrelated key renews the lease: {resp:?}"
-    );
-    gate_ran("trust_enforcement::repro_f23_renew_without_credential");
+    assert!(!renewed(&legacy), "{legacy:?}");
+    assert_logged(&node, "reject.renew_capability_invalid");
+    gate_ran("trust_enforcement::f23_stranger_renew_refused");
 }
 
 // --- F-22: rendezvous registration before admission -------------------------------------------------------

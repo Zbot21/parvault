@@ -94,6 +94,12 @@ pub struct BlindedShardCapability {
 /// Maximum bidirectional NTP clock-skew tolerance (30 seconds) for `BlindedShardCapability` read tokens (`ADR-15`).
 pub const MAX_CAPABILITY_CLOCK_SKEW_MS: u64 = 30_000;
 
+/// Domain tag of a signed lease renewal (F-23).
+pub const RENEW_LEASE_DOMAIN: &[u8] = b"parvault-renew-blinded-lease-v1";
+
+/// The most epochs one renewal may extend a lease by (F-23).
+pub const MAX_LEASE_EXTENSION_EPOCHS: u64 = 365;
+
 /// Maximum single bearer `AnonymousQuotaVoucher` credit ceiling (1 GiB) to prevent `u64::MAX` overflow exploits.
 pub const MAX_SINGLE_VOUCHER_BYTES: u64 = 1024 * 1024 * 1024;
 
@@ -125,6 +131,52 @@ impl BlindedShardCapability {
     ) -> [u8; 64] {
         let msg = Self::canonical_bytes(locator, timestamp_ms);
         cap_identity.sign(&msg)
+    }
+
+    /// Signs a lease renewal (F-23) with the shard's capability key.
+    pub fn sign_lease_renewal(
+        cap_identity: &NodeIdentity,
+        locator: &[u8; 32],
+        current_epoch: u64,
+        extension_epochs: u64,
+        timestamp_ms: u64,
+    ) -> [u8; 64] {
+        cap_identity.sign(&Self::renewal_bytes(
+            locator,
+            current_epoch,
+            extension_epochs,
+            timestamp_ms,
+        ))
+    }
+
+    /// Verifies a lease renewal signed by `self.capability_pubkey` (F-23).
+    pub fn verify_lease_renewal(
+        &self,
+        current_epoch: u64,
+        extension_epochs: u64,
+        timestamp_ms: u64,
+        signature: &[u8],
+    ) -> bool {
+        let Ok(sig) = <[u8; 64]>::try_from(signature) else {
+            return false;
+        };
+        let msg = Self::renewal_bytes(&self.locator, current_epoch, extension_epochs, timestamp_ms);
+        NodeIdentity::verify_with_pubkey(&self.capability_pubkey, &msg, &sig)
+    }
+
+    fn renewal_bytes(
+        locator: &[u8; 32],
+        current_epoch: u64,
+        extension_epochs: u64,
+        timestamp_ms: u64,
+    ) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(RENEW_LEASE_DOMAIN.len() + 56);
+        msg.extend_from_slice(RENEW_LEASE_DOMAIN);
+        msg.extend_from_slice(locator);
+        msg.extend_from_slice(&current_epoch.to_le_bytes());
+        msg.extend_from_slice(&extension_epochs.to_le_bytes());
+        msg.extend_from_slice(&timestamp_ms.to_le_bytes());
+        msg
     }
 
     /// Verifies a read/repair token against `self.capability_pubkey` without learning `owner_pubkey`

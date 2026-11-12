@@ -1121,6 +1121,15 @@ impl BlockStore {
     }
 
     /// Renews a blinded shard's Byte-Epoch lease on disk so it is not evicted over time.
+    /// The capability key registered when a blinded shard was stored, if any (F-23).
+    pub fn blinded_capability_pubkey(&self, blinded_id: &BlindedShardId) -> Option<[u8; 32]> {
+        self.blinded_leases
+            .lock()
+            .ok()?
+            .lease_entry(&blinded_id.locator)?
+            .capability_pubkey
+    }
+
     pub fn renew_blinded_shard_lease(
         &self,
         blinded_id: &BlindedShardId,

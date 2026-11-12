@@ -34,7 +34,7 @@
 //! | `eviction_council`: seed drops its local tracker admin | hook | `broadcast_eviction_order` |
 //! | `shard_owner` accepts a foreign claim | symmetric | `put_shard`, `refused_put_keeps_por_session_key`, `f04_invented_owner_claim_refused`, lib: `shard_owner_rule_binds_the_sender` |
 //! | `PutBlindedShard` drops `record_peer_admission_ip` | symmetric | `put_blinded_shard` |
-//! | `RenewBlindedLease` ignores `extension_epochs` | symmetric | `renew_blinded_lease` |
+//! | `RenewBlindedLease` ignores `extension_epochs` (now `RenewBlindedLeaseSigned`, F-23) | symmetric | `renew_blinded_lease` |
 //! | `PutShard` registers its grant for no shard | symmetric | `get_ciphertext_shard`, `f02a_grant_for_other_stripe_not_registered`, `f02a_owner_grant_update_registered`, `f02a_rejected_put_registers_nothing`, `f02b_registered_grant_repair_read`, `f26_owner_reads_after_root_squat` |
 //! | `admission_decision` admits strangers | decision | `put_shard`, `f03_unadmitted_put_shard_refused_daemon`, `f03_unadmitted_put_shard_refused_seed`, `f05_public_ticket_one_bit_short_refused`, `f24_unadmitted_blinded_put_refused`, `f24_unadmitted_layered_final_refused`, `f24_unadmitted_onion_final_refused`, `f25_unadmitted_dht_put_refused`, `invitee_serves_the_ring`, `refused_credential_is_not_presented_on_every_request`, lib: `admission_decision_rules` |
 //! | `chain_leaf_decision` ignores the sender (F-21, `wot.rs`) | decision | `f21_handshake_chain_leaf_not_sender_refused`, lib: `chain_leaf_decision_binds_the_sender` |
@@ -669,7 +669,8 @@ fn covering_case(req: &MeshWireRequest) -> &'static str {
         MeshWireRequest::GetCiphertextShard { .. } => "get_ciphertext_shard",
         MeshWireRequest::PutBlindedShard { .. } => "put_blinded_shard",
         MeshWireRequest::GetBlindedShard { .. } => "get_blinded_shard",
-        MeshWireRequest::RenewBlindedLease { .. } => "renew_blinded_lease",
+        MeshWireRequest::RenewBlindedLease { .. }
+        | MeshWireRequest::RenewBlindedLeaseSigned { .. } => "renew_blinded_lease",
         MeshWireRequest::DeleteBlindedShardTombstone { .. } => "delete_blinded_tombstone",
         MeshWireRequest::MultiSegmentPorAudit(_) => "multi_segment_por_audit",
         MeshWireRequest::RelayPqOnionEnvelope { .. } => "relay_pq_onion",
@@ -1248,6 +1249,25 @@ fn get_blinded_shard() {
 
 // --- 8. RenewBlindedLease (same effect via the seed server's shared store) -----------------------
 
+/// A lease renewal signed by `b`'s capability key, timestamped now (F-23).
+fn signed_renew(b: &Blinded, current_epoch: u64, extension_epochs: u64) -> MeshWireRequest {
+    let ts = now_ms();
+    MeshWireRequest::RenewBlindedLeaseSigned {
+        blinded_id: b.id,
+        current_epoch,
+        extension_epochs,
+        timestamp_ms: ts,
+        sig: BlindedShardCapability::sign_lease_renewal(
+            &b.cap_ident,
+            &b.id.locator,
+            current_epoch,
+            extension_epochs,
+            ts,
+        )
+        .to_vec(),
+    }
+}
+
 #[test]
 fn renew_blinded_lease() {
     let _g = env_guard();
@@ -1260,23 +1280,21 @@ fn renew_blinded_lease() {
         &peer,
         &put_blinded(&b, AnonymousQuotaVoucher::mint(&issuer, 8192)),
     );
-    let req = MeshWireRequest::RenewBlindedLease {
+    // The unsigned variant carries no credential and is refused on every role (F-23).
+    let legacy = MeshWireRequest::RenewBlindedLease {
         blinded_id: b.id,
         current_epoch: 2,
         extension_epochs: 10,
     };
+    let o = t.run(&peer, &legacy);
+    assert!(o[0].resp.contains("renewed: false"), "{}", o[0].resp);
+    assert_identical(&o);
+    let req = signed_renew(&b, 2, 10);
     let o = t.run(&peer, &req);
     assert!(o[0].resp.contains("renewed: true"), "{}", o[0].resp);
     assert_identical(&o);
     let unknown = blinded(15, 16);
-    let o = t.run(
-        &peer,
-        &MeshWireRequest::RenewBlindedLease {
-            blinded_id: unknown.id,
-            current_epoch: 2,
-            extension_epochs: 10,
-        },
-    );
+    let o = t.run(&peer, &signed_renew(&unknown, 2, 10));
     assert!(o[0].resp.contains("renewed: false"));
     assert_identical(&o);
     let loc = b.id.locator;
@@ -1292,14 +1310,7 @@ fn renew_blinded_lease() {
         &peer,
         &put_blinded(&b2, AnonymousQuotaVoucher::mint(&issuer, 8192)),
     );
-    let o = t.run(
-        &peer,
-        &MeshWireRequest::RenewBlindedLease {
-            blinded_id: b2.id,
-            current_epoch: 2,
-            extension_epochs: 10,
-        },
-    );
+    let o = t.run(&peer, &signed_renew(&b2, 2, 10));
     assert!(o[0].resp.contains("renewed: true"), "{}", o[0].resp);
     for fx in &t.fx {
         let _ = fx.store.sweep_expired_blinded_shards(13);

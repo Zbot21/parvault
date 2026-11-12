@@ -369,6 +369,15 @@ pub enum MeshWireRequest {
     /// node in public-commons or hybrid mode (ADR-24). Appended in v0.5.0; the ticket key must be
     /// the sender's transport key.
     AdmitPublicTicket(PublicCommonsTicket),
+    /// Renews a blinded shard's lease, signed by its capability key (F-23). Appended; the
+    /// unsigned `RenewBlindedLease` is refused.
+    RenewBlindedLeaseSigned {
+        blinded_id: BlindedShardId,
+        current_epoch: u64,
+        extension_epochs: u64,
+        timestamp_ms: u64,
+        sig: Vec<u8>,
+    },
 }
 
 /// Wire-level response messages exchanged over `/parvault/wire/1.0.0`.

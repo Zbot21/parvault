@@ -476,6 +476,7 @@ pub const fn admission_class(request: &MeshWireRequest) -> AdmissionClass {
         | MeshWireRequest::LookupWanRendezvous { .. } => AdmissionClass::PreAdmission,
         MeshWireRequest::GetBlindedShard { .. }
         | MeshWireRequest::RenewBlindedLease { .. }
+        | MeshWireRequest::RenewBlindedLeaseSigned { .. }
         | MeshWireRequest::DeleteBlindedShardTombstone { .. }
         | MeshWireRequest::GetCiphertextShard { .. }
         | MeshWireRequest::DeleteShard { .. }
@@ -570,6 +571,30 @@ pub fn device_cert_decision(
     }
 }
 
+/// What the lease-renewal decision needs to know (F-23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenewFacts {
+    /// The shard has a registered capability key and the request is signed by it.
+    pub signed_by_capability: bool,
+    /// The signature's timestamp is within the capability clock-skew window.
+    pub fresh: bool,
+    pub extension_epochs: u64,
+}
+
+/// A blinded shard's lease may be renewed only by its capability holder, recently, and by at
+/// most `MAX_LEASE_EXTENSION_EPOCHS` (F-23).
+pub fn renew_decision(facts: &RenewFacts) -> Result<(), &'static str> {
+    if !facts.signed_by_capability || !facts.fresh {
+        return Err("reject.renew_capability_invalid");
+    }
+    if facts.extension_epochs == 0
+        || facts.extension_epochs > crate::storage::MAX_LEASE_EXTENSION_EPOCHS
+    {
+        return Err("reject.renew_extension_unbounded");
+    }
+    Ok(())
+}
+
 /// The one refusal text for every failed handshake (F-30): the reason stays in the local log.
 pub const HANDSHAKE_REFUSED_TEXT: &str = "handshake refused";
 
@@ -638,7 +663,8 @@ pub fn reject_response(request: &MeshWireRequest, reason: String) -> MeshWireRes
             shard_bytes: None,
             error: Some(reason),
         },
-        MeshWireRequest::RenewBlindedLease { .. } => {
+        MeshWireRequest::RenewBlindedLease { .. }
+        | MeshWireRequest::RenewBlindedLeaseSigned { .. } => {
             MeshWireResponse::RenewBlindedLeaseAck { renewed: false }
         }
         MeshWireRequest::DeleteBlindedShardTombstone { .. } => {
@@ -1082,11 +1108,53 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                 },
             }
         }
-        MeshWireRequest::RenewBlindedLease {
+        MeshWireRequest::RenewBlindedLease { .. } => {
+            // Carries no credential (F-23): refused; use `RenewBlindedLeaseSigned`.
+            let unsigned = RenewFacts {
+                signed_by_capability: false,
+                fresh: false,
+                extension_epochs: 0,
+            };
+            if let Err(code) = renew_decision(&unsigned) {
+                warn!(
+                    code,
+                    peer = remote_peer_id,
+                    "refused an unsigned lease renewal"
+                );
+            }
+            MeshWireResponse::RenewBlindedLeaseAck { renewed: false }
+        }
+        MeshWireRequest::RenewBlindedLeaseSigned {
             blinded_id,
             current_epoch,
             extension_epochs,
+            timestamp_ms,
+            sig,
         } => {
+            let signed_by_capability = block_store
+                .blinded_capability_pubkey(&blinded_id)
+                .is_some_and(|pk| {
+                    crate::storage::BlindedShardCapability {
+                        locator: blinded_id.locator,
+                        capability_pubkey: pk,
+                    }
+                    .verify_lease_renewal(
+                        current_epoch,
+                        extension_epochs,
+                        timestamp_ms,
+                        &sig,
+                    )
+                });
+            let facts = RenewFacts {
+                signed_by_capability,
+                fresh: timestamp_ms.abs_diff(now_unix_ms())
+                    <= crate::storage::MAX_CAPABILITY_CLOCK_SKEW_MS,
+                extension_epochs,
+            };
+            if let Err(code) = renew_decision(&facts) {
+                warn!(code, peer = remote_peer_id, "refused a lease renewal");
+                return MeshWireResponse::RenewBlindedLeaseAck { renewed: false };
+            }
             if eviction
                 .is_ingress_blocked(
                     remote_ip,
