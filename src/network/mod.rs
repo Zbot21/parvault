@@ -3,6 +3,7 @@ pub mod client;
 pub mod discovery;
 pub mod placement;
 pub mod rate_limit;
+pub mod server_events;
 pub mod transport;
 pub mod wan_rendezvous;
 pub mod wire_handler;

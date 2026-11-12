@@ -1,13 +1,8 @@
 #![forbid(unsafe_code)]
 
 use clap::Parser;
-use libp2p::{
-    futures::StreamExt,
-    gossipsub, mdns,
-    request_response::{self, Message},
-    swarm::SwarmEvent,
-    Multiaddr,
-};
+use libp2p::{futures::StreamExt, gossipsub, swarm::SwarmEvent, Multiaddr};
+use parvault::network::server_events::ServerSwarmEvents;
 use parvault::network::wire_handler::{handle_daemon_wire_request, DaemonWireHandlerCtx};
 use parvault::{
     bootstrap::{
@@ -42,7 +37,6 @@ use parvault::{
     },
 };
 use serde::Serialize;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2262,7 +2256,7 @@ async fn run_daemon(
         WanRendezvousRegistry::load_or_new(Some(&cfg.data_dir.join("wan_rendezvous.bin")));
     let mut eviction = PrivacyPreservingEvictionEngine::load_or_init(&cfg.data_dir)?;
     let mut takedown_queue = PublicTrackerTakedownQueue::load_or_init(&cfg.data_dir)?;
-    let mut peer_remote_addrs: HashMap<String, Multiaddr> = HashMap::new();
+    let mut server_events = ServerSwarmEvents::new(true);
 
     let mut swarm = build_mesh_swarm(keypair, cfg.enable_quic)?;
     let tcp_addr: Multiaddr = cfg.listen_tcp.parse()?;
@@ -2571,6 +2565,29 @@ async fn run_daemon(
     loop {
         tokio::select! {
             event = swarm.select_next_some() => {
+                let unhandled = server_events.handle(&mut swarm, event, |peer_str, remote_addr, request| {
+                    handle_daemon_wire_request(
+                        peer_str,
+                        remote_addr,
+                        request,
+                            DaemonWireHandlerCtx {
+                                cfg: &cfg,
+                                node_identity: &node_identity,
+                                genesis_pubkey,
+                                public_mode: opts.public_mode,
+                                block_store: &block_store,
+                                wot: &mut wot,
+                                por_verifier: &mut por_verifier,
+                                nullifier_ledger: &mut nullifier_ledger,
+                                pq_kem: &pq_kem,
+                                lite_seed_server: &mut lite_seed_server,
+                                wan_registry: &mut wan_registry,
+                                eviction: &mut eviction,
+                                takedown_queue: &mut takedown_queue,
+                            },
+                    )
+                });
+                let Some(event) = unhandled else { continue };
                 match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
                         info!(%address, "Listening on mesh transport address");
@@ -2603,25 +2620,6 @@ async fn run_daemon(
                             });
                         }
                     }
-                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-                        peer_remote_addrs.insert(
-                            peer_id.to_string(),
-                            endpoint.get_remote_address().clone(),
-                        );
-                    }
-                    SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
-                        if num_established == 0 {
-                            peer_remote_addrs.remove(&peer_id.to_string());
-                        }
-                    }
-                    SwarmEvent::Behaviour(MeshNetworkBehaviourEvent::Mdns(
-                        mdns::Event::Discovered(list),
-                    )) => {
-                        for (peer_id, multiaddr) in list {
-                            info!(%peer_id, %multiaddr, "Discovered LAN peer via mDNS");
-                            swarm.behaviour_mut().kademlia.add_address(&peer_id, multiaddr);
-                        }
-                    }
                     SwarmEvent::Behaviour(MeshNetworkBehaviourEvent::Gossipsub(
                         gossipsub::Event::Message { message, .. },
                     )) => {
@@ -2635,36 +2633,6 @@ async fn run_daemon(
                                 );
                             }
                         }
-                    }
-                    SwarmEvent::Behaviour(MeshNetworkBehaviourEvent::ReqResp(
-                        request_response::Event::Message {
-                            peer,
-                            message: Message::Request { request, channel, .. },
-                        },
-                    )) => {
-                        let peer_str = peer.to_string();
-                        let remote_addr = peer_remote_addrs.get(&peer_str);
-                        let response = handle_daemon_wire_request(
-                            &peer_str,
-                            remote_addr,
-                            request,
-                            DaemonWireHandlerCtx {
-                                cfg: &cfg,
-                                node_identity: &node_identity,
-                                genesis_pubkey,
-                                public_mode: opts.public_mode,
-                                block_store: &block_store,
-                                wot: &mut wot,
-                                por_verifier: &mut por_verifier,
-                                nullifier_ledger: &mut nullifier_ledger,
-                                pq_kem: &pq_kem,
-                                lite_seed_server: &mut lite_seed_server,
-                                wan_registry: &mut wan_registry,
-                                eviction: &mut eviction,
-                                takedown_queue: &mut takedown_queue,
-                            },
-                        );
-                        let _ = swarm.behaviour_mut().req_resp.send_response(channel, response);
                     }
                     _ => {}
                 }

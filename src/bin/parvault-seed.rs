@@ -13,13 +13,8 @@
 #![forbid(unsafe_code)]
 
 use clap::{Parser, Subcommand, ValueEnum};
-use libp2p::{
-    futures::StreamExt,
-    mdns,
-    request_response::{self, Message},
-    swarm::SwarmEvent,
-    Multiaddr,
-};
+use libp2p::{futures::StreamExt, swarm::SwarmEvent, Multiaddr};
+use parvault::network::server_events::ServerSwarmEvents;
 use parvault::network::wire_handler::{
     extract_ip_from_multiaddr, handle_seed_wire_request, resolve_seed_council_and_quorum,
     SeedWireHandlerCtx,
@@ -37,11 +32,11 @@ use parvault::{
         MasterKey, NodeIdentity,
     },
     network::{
-        behaviour::MeshNetworkBehaviourEvent, build_mesh_swarm, derive_4word_pairing_sas,
-        extract_listen_port_and_ip, open_public_tracker_card, resolve_zero_config_peers,
-        KnownPeersStore, LanBeaconConfig, LanBeaconResponder, MeshClient, TrustPoolMode,
-        WanRendezvousRegistry, WebOfTrustRegistry, DEFAULT_LAN_DISCOVERY_PORT,
-        DEFAULT_LAN_PAIRING_NONCE, DEFAULT_PUBLIC_WOT_POW_BITS, DEFAULT_SUBTREE_SLASH_LIMIT,
+        build_mesh_swarm, derive_4word_pairing_sas, extract_listen_port_and_ip,
+        open_public_tracker_card, resolve_zero_config_peers, KnownPeersStore, LanBeaconConfig,
+        LanBeaconResponder, MeshClient, TrustPoolMode, WanRendezvousRegistry, WebOfTrustRegistry,
+        DEFAULT_LAN_DISCOVERY_PORT, DEFAULT_LAN_PAIRING_NONCE, DEFAULT_PUBLIC_WOT_POW_BITS,
+        DEFAULT_SUBTREE_SLASH_LIMIT,
     },
     por::PorVerifierEngine,
     router_nas::read_linux_process_memory_kib,
@@ -53,7 +48,7 @@ use parvault::{
         SignedBadActorEvictionOrder, TakedownReviewStatus, TrustLevel, VoucherNullifierLedger,
     },
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -1804,7 +1799,7 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
     } else {
         PublicTrackerTakedownQueue::load_or_init(&data_dir)?
     };
-    let mut peer_remote_addrs: HashMap<String, Multiaddr> = HashMap::new();
+    let mut server_events = ServerSwarmEvents::new(false);
 
     let mut swarm = build_mesh_swarm(keypair, false)?;
     let tcp_addr: Multiaddr = listen.parse()?;
@@ -1949,42 +1944,7 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             event = swarm.select_next_some() => {
-                match event {
-                    SwarmEvent::NewListenAddr { address, .. } => {
-                        info!(%address, "parvault-seed listening on transport address");
-                        if let Some(ref beacon) = beacon_handle {
-                            if let Some((bound_port, bound_ip)) = extract_listen_port_and_ip(&address) {
-                                beacon.update_listen_endpoint(bound_port, bound_ip);
-                            }
-                        }
-                    }
-                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-                        peer_remote_addrs.insert(
-                            peer_id.to_string(),
-                            endpoint.get_remote_address().clone(),
-                        );
-                    }
-                    SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
-                        if num_established == 0 {
-                            peer_remote_addrs.remove(&peer_id.to_string());
-                        }
-                    }
-                    SwarmEvent::Behaviour(MeshNetworkBehaviourEvent::Mdns(
-                        mdns::Event::Discovered(list),
-                    )) => {
-                        for (peer_id, multiaddr) in list {
-                            swarm.behaviour_mut().kademlia.add_address(&peer_id, multiaddr);
-                        }
-                    }
-                    SwarmEvent::Behaviour(MeshNetworkBehaviourEvent::ReqResp(
-                        request_response::Event::Message {
-                            peer,
-                            message: Message::Request { request, channel, .. },
-                        },
-                    )) => {
-                        let peer_str = peer.to_string();
-                        let remote_addr = peer_remote_addrs.get(&peer_str);
-                        let resp = {
+                let unhandled = server_events.handle(&mut swarm, event, |peer_str, remote_addr, request| {
                             let mut st = shared
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2000,7 +1960,7 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
                                 ..
                             } = *st;
                             handle_seed_wire_request(
-                                &peer_str,
+                                peer_str,
                                 remote_addr,
                                 request,
                                 SeedWireHandlerCtx {
@@ -2023,10 +1983,14 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
                                     takedown_queue,
                                 },
                             )
-                        };
-                        let _ = swarm.behaviour_mut().req_resp.send_response(channel, resp);
+                });
+                if let Some(SwarmEvent::NewListenAddr { address, .. }) = unhandled {
+                    info!(%address, "parvault-seed listening on transport address");
+                    if let Some(ref beacon) = beacon_handle {
+                        if let Some((bound_port, bound_ip)) = extract_listen_port_and_ip(&address) {
+                            beacon.update_listen_endpoint(bound_port, bound_ip);
+                        }
                     }
-                    _ => {}
                 }
             }
             _ = gc_interval.tick() => {
