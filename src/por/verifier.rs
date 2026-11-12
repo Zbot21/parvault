@@ -22,13 +22,11 @@ pub struct GrantRegFacts {
     /// The grant names the stripe of the shard that was just stored (`true` when no shard is
     /// involved).
     pub root_matches: bool,
-    /// The owner of the grant already registered for that stripe, if any.
-    pub existing_owner: Option<[u8; 32]>,
-    pub grant_owner: [u8; 32],
 }
 
-/// Registers a grant only if it is valid, names the stored shard's stripe, and does not replace
-/// another owner's grant (first registrant wins; same-owner updates are allowed).
+/// Registers a grant only if it is valid and names the stripe of the shard stored with it.
+/// Grants are keyed by (stripe root, owner), so one owner's grant never replaces another's
+/// (F-26); which grant authorises a shard is decided per shard (`grant_owner_decision`).
 pub fn grant_registration_decision(facts: &GrantRegFacts) -> Result<(), &'static str> {
     if !facts.grant_valid {
         return Err("reject.repair_grant_invalid");
@@ -36,13 +34,21 @@ pub fn grant_registration_decision(facts: &GrantRegFacts) -> Result<(), &'static
     if !facts.root_matches {
         return Err("reject.repair_grant_root_mismatch");
     }
-    if facts
-        .existing_owner
-        .is_some_and(|owner| owner != facts.grant_owner)
-    {
-        return Err("reject.repair_grant_owner_conflict");
-    }
     Ok(())
+}
+
+/// A read or delete authorised by a grant owner applies only to shards that were stored with
+/// that owner's grant (F-26): an owner who registered a grant for the same stripe root first
+/// gains nothing over another owner's shards.
+pub fn grant_owner_decision(
+    grant_owner: &[u8; 32],
+    shard_grant_owner: Option<&[u8; 32]>,
+) -> Result<(), &'static str> {
+    if shard_grant_owner == Some(grant_owner) {
+        Ok(())
+    } else {
+        Err("reject.grant_owner_not_shard_owner")
+    }
 }
 
 /// What the repair-read decision needs to know (F-02b).
@@ -244,11 +250,24 @@ pub struct AuditOutcome {
     pub slash_peer: bool,
 }
 
+/// The persisted state before F-26 (grants keyed by stripe root only), read on upgrade.
 #[derive(Serialize, Deserialize, Default)]
-struct PersistedPorState {
+struct PersistedPorStateV1 {
     session_keys: HashMap<String, [u8; 32]>,
     repair_grants: HashMap<Hash32, RepairGrant>,
 }
+
+/// The persisted state since F-26: grants keyed by (stripe root, owner) and the grant owner each
+/// stored shard was stored with.
+#[derive(Serialize, Deserialize, Default)]
+struct PersistedPorState {
+    version: u32,
+    session_keys: HashMap<String, [u8; 32]>,
+    repair_grants: HashMap<(Hash32, [u8; 32]), RepairGrant>,
+    shard_grant_owners: HashMap<String, [u8; 32]>,
+}
+
+const POR_STATE_VERSION: u32 = 2;
 
 /// Stateless PoR verification, DDoS pre-filtering, and `RepairGrant` authorization engine (`por::verifier`).
 pub struct PorVerifierEngine {
@@ -260,8 +279,10 @@ pub struct PorVerifierEngine {
     seen_nonces_ram: HashSet<[u8; 32]>,
     /// Bounded FIFO queue ordering `seen_nonces_ram` so RAM usage never exceeds `MAX_SEEN_NONCES_RAM`.
     seen_nonces_fifo: VecDeque<[u8; 32]>,
-    /// Registered `RepairGrant` descriptors indexed by `stripe_merkle_root`.
-    repair_grants_ram: HashMap<Hash32, RepairGrant>,
+    /// Registered `RepairGrant` descriptors indexed by (`stripe_merkle_root`, owner key).
+    repair_grants_ram: HashMap<(Hash32, [u8; 32]), RepairGrant>,
+    /// The owner of the grant each stored shard (file key) was stored with (F-26).
+    shard_grant_owners: HashMap<String, [u8; 32]>,
     /// Counter of disk reads prevented by RAM-only stateless HMAC/nonce rejection.
     blocked_ddos_challenges: u64,
     /// Optional path to persist `session_keys_ram` and `repair_grants_ram` across daemon restarts.
@@ -276,6 +297,7 @@ impl PorVerifierEngine {
             seen_nonces_ram: HashSet::new(),
             seen_nonces_fifo: VecDeque::new(),
             repair_grants_ram: HashMap::new(),
+            shard_grant_owners: HashMap::new(),
             blocked_ddos_challenges: 0,
             persistence_path: None,
         }
@@ -286,21 +308,42 @@ impl PorVerifierEngine {
     pub fn with_persistence_dir(max_latency_ms: u64, data_dir: &std::path::Path) -> Self {
         let _ = std::fs::create_dir_all(data_dir);
         let path = data_dir.join("por_verifier_state.bin");
-        let (session_keys_ram, repair_grants_ram) = if path.exists() {
-            std::fs::read(&path)
-                .ok()
-                .and_then(|bytes| bincode::deserialize::<PersistedPorState>(&bytes).ok())
-                .map(|s| (s.session_keys, s.repair_grants))
-                .unwrap_or_default()
-        } else {
-            (HashMap::new(), HashMap::new())
-        };
+        let state = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| {
+                bincode::deserialize::<PersistedPorState>(&bytes)
+                    .ok()
+                    .filter(|s| s.version == POR_STATE_VERSION)
+                    .or_else(|| {
+                        // Upgrade: re-key v1 grants by owner; shard owners are unknown, so old
+                        // shards are readable again after their owner's next put.
+                        bincode::deserialize::<PersistedPorStateV1>(&bytes)
+                            .ok()
+                            .map(|v1| PersistedPorState {
+                                version: POR_STATE_VERSION,
+                                session_keys: v1.session_keys,
+                                repair_grants: v1
+                                    .repair_grants
+                                    .into_values()
+                                    .map(|g| ((g.stripe_merkle_root, g.owner_pubkey), g))
+                                    .collect(),
+                                shard_grant_owners: HashMap::new(),
+                            })
+                    })
+            })
+            .unwrap_or_default();
+        let (session_keys_ram, repair_grants_ram, shard_grant_owners) = (
+            state.session_keys,
+            state.repair_grants,
+            state.shard_grant_owners,
+        );
         Self {
             max_latency_ms,
             session_keys_ram,
             seen_nonces_ram: HashSet::new(),
             seen_nonces_fifo: VecDeque::new(),
             repair_grants_ram,
+            shard_grant_owners,
             blocked_ddos_challenges: 0,
             persistence_path: Some(path),
         }
@@ -309,8 +352,10 @@ impl PorVerifierEngine {
     fn persist_state_if_configured(&self) {
         if let Some(ref path) = self.persistence_path {
             let state = PersistedPorState {
+                version: POR_STATE_VERSION,
                 session_keys: self.session_keys_ram.clone(),
                 repair_grants: self.repair_grants_ram.clone(),
+                shard_grant_owners: self.shard_grant_owners.clone(),
             };
             if let Ok(encoded) = bincode::serialize(&state) {
                 let _ = std::fs::write(path, encoded);
@@ -349,30 +394,50 @@ impl PorVerifierEngine {
     /// Registers an owner-signed `RepairGrant` for a stripe in RAM (ADR-04).
     pub fn register_repair_grant(&mut self, grant: RepairGrant) -> bool {
         let root = grant.stripe_merkle_root;
-        self.register_repair_grant_for_stored(grant, &root).is_ok()
+        self.register_grant(grant, &root, &[]).is_ok()
     }
 
-    /// Registers `grant` after a shard of stripe `stored_root` was stored (F-02a); `Err` carries
-    /// the reason code.
+    /// Registers `grant` after `stored` shards were stored with it (F-02a, F-26); `Err` carries
+    /// the reason code. Each of those shards records the grant's owner.
     pub fn register_repair_grant_for_stored(
         &mut self,
         grant: RepairGrant,
+        stored: &[ShardId],
+    ) -> Result<(), &'static str> {
+        let root = stored
+            .first()
+            .map(|s| s.stripe_merkle_root)
+            .unwrap_or(grant.stripe_merkle_root);
+        self.register_grant(grant, &root, stored)
+    }
+
+    fn register_grant(
+        &mut self,
+        grant: RepairGrant,
         stored_root: &Hash32,
+        stored: &[ShardId],
     ) -> Result<(), &'static str> {
         let facts = GrantRegFacts {
             grant_valid: grant.verify(),
-            root_matches: grant.stripe_merkle_root == *stored_root,
-            existing_owner: self
-                .repair_grants_ram
-                .get(&grant.stripe_merkle_root)
-                .map(|g| g.owner_pubkey),
-            grant_owner: grant.owner_pubkey,
+            root_matches: grant.stripe_merkle_root == *stored_root
+                && stored.iter().all(|s| s.stripe_merkle_root == *stored_root),
         };
         grant_registration_decision(&facts)?;
+        for shard in stored {
+            self.shard_grant_owners
+                .insert(shard.file_key(), grant.owner_pubkey);
+        }
         self.repair_grants_ram
-            .insert(grant.stripe_merkle_root, grant);
+            .insert((grant.stripe_merkle_root, grant.owner_pubkey), grant);
         self.persist_state_if_configured();
         Ok(())
+    }
+
+    /// The grant `shard_id` was stored with, if any.
+    fn grant_for_shard(&self, shard_id: &ShardId) -> Option<&RepairGrant> {
+        let owner = self.shard_grant_owners.get(&shard_id.file_key())?;
+        self.repair_grants_ram
+            .get(&(shard_id.stripe_merkle_root, *owner))
     }
 
     /// Retrieves the registered `K_session` and `RepairGrant` for `shard_id` (used during graceful node handoff).
@@ -382,9 +447,7 @@ impl PorVerifierEngine {
     ) -> (Option<[u8; 32]>, Option<RepairGrant>) {
         (
             self.session_keys_ram.get(&shard_id.file_key()).copied(),
-            self.repair_grants_ram
-                .get(&shard_id.stripe_merkle_root)
-                .cloned(),
+            self.grant_for_shard(shard_id).cloned(),
         )
     }
 
@@ -423,7 +486,7 @@ impl PorVerifierEngine {
         {
             return false;
         }
-        let authorized = match self.repair_grants_ram.get(&shard_id.stripe_merkle_root) {
+        let authorized = match self.grant_for_shard(shard_id) {
             Some(grant) => {
                 grant.owner_pubkey == *owner_pub
                     && NodeIdentity::verify_with_pubkey(owner_pub, signed_payload, sig)
@@ -531,12 +594,19 @@ impl PorVerifierEngine {
                     == shard_id.stripe_merkle_root.as_slice()
                 && &signed_payload[DOMAIN_PREFIX.len() + 32..DOMAIN_PREFIX.len() + 36]
                     == shard_id.shard_index.to_be_bytes().as_slice()
+                && NodeIdentity::verify_with_pubkey(owner_pub, signed_payload, sig)
             {
-                if let Some(grant) = self.repair_grants_ram.get(&shard_id.stripe_merkle_root) {
-                    if grant.owner_pubkey == *owner_pub
-                        && NodeIdentity::verify_with_pubkey(owner_pub, signed_payload, sig)
-                    {
-                        return Ok(block_store.get_shard(shard_id)?);
+                let registered = self
+                    .repair_grants_ram
+                    .contains_key(&(shard_id.stripe_merkle_root, *owner_pub));
+                match grant_owner_decision(
+                    owner_pub,
+                    self.shard_grant_owners.get(&shard_id.file_key()),
+                ) {
+                    Ok(()) if registered => return Ok(block_store.get_shard(shard_id)?),
+                    Ok(()) => {}
+                    Err(code) => {
+                        tracing::warn!(code, "refused an owner read of another owner's shard")
                     }
                 }
             }
@@ -545,7 +615,16 @@ impl PorVerifierEngine {
         // Case B: Offline Witness Cohort Repair (`RepairGrant` + >= 2 distinct witness signatures).
         if let Some((grant, receipts)) = repair_bundle {
             if grant.stripe_merkle_root == shard_id.stripe_merkle_root && grant.verify() {
-                let registered = self.repair_grants_ram.get(&shard_id.stripe_merkle_root);
+                let registered = self
+                    .repair_grants_ram
+                    .get(&(shard_id.stripe_merkle_root, grant.owner_pubkey))
+                    .filter(|_| {
+                        grant_owner_decision(
+                            &grant.owner_pubkey,
+                            self.shard_grant_owners.get(&shard_id.file_key()),
+                        )
+                        .is_ok()
+                    });
                 let authorized_set: HashSet<[u8; 32]> =
                     grant.authorized_witness_pubkeys.iter().copied().collect();
                 let mut valid_signers: HashSet<[u8; 32]> = HashSet::new();
@@ -878,15 +957,17 @@ mod decision_tests {
         let base = GrantRegFacts {
             grant_valid: true,
             root_matches: true,
-            existing_owner: None,
-            grant_owner: [1; 32],
         };
         assert_eq!(grant_registration_decision(&base), Ok(()));
-        let same_owner = GrantRegFacts {
-            existing_owner: Some([1; 32]),
-            ..base
-        };
-        assert_eq!(grant_registration_decision(&same_owner), Ok(()));
+        assert_eq!(grant_owner_decision(&[1; 32], Some(&[1; 32])), Ok(()));
+        assert_eq!(
+            grant_owner_decision(&[1; 32], Some(&[2; 32])),
+            Err("reject.grant_owner_not_shard_owner")
+        );
+        assert_eq!(
+            grant_owner_decision(&[1; 32], None),
+            Err("reject.grant_owner_not_shard_owner")
+        );
         let cases = [
             (
                 GrantRegFacts {
@@ -901,13 +982,6 @@ mod decision_tests {
                     ..base
                 },
                 "reject.repair_grant_root_mismatch",
-            ),
-            (
-                GrantRegFacts {
-                    existing_owner: Some([2; 32]),
-                    ..base
-                },
-                "reject.repair_grant_owner_conflict",
             ),
         ];
         for (facts, code) in cases {

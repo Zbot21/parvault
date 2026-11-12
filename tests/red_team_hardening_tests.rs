@@ -369,7 +369,10 @@ fn test_rt4_wire_codec_oom_bomb_defense_por_cross_protocol_replay_and_telemetry_
         vec![witness1.public_key_bytes(), witness2.public_key_bytes()],
         ErasureTier::Homelab,
     );
-    assert!(por_verifier.register_repair_grant(grant.clone()));
+    // v0.5.0 (F-26): a grant authorises the shards stored with it.
+    assert!(por_verifier
+        .register_repair_grant_for_stored(grant.clone(), &[shard_id])
+        .is_ok());
 
     // Attacker tries to replay the owner's signature over an arbitrary non-read-token message
     let arbitrary_msg = b"parvault-repair-grant-v1:replay-attempt";

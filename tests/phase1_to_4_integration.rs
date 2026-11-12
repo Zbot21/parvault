@@ -220,7 +220,10 @@ fn test_por_stateless_hmac_and_witness_repair_grant() {
         vec![witness1.public_key_bytes(), witness2.public_key_bytes()],
         ErasureTier::Homelab,
     );
-    assert!(verifier.register_repair_grant(grant.clone()));
+    // v0.5.0 (F-26): a grant authorises the shards stored with it.
+    assert!(verifier
+        .register_repair_grant_for_stored(grant.clone(), &[shard_id])
+        .is_ok());
 
     let r1 = WitnessFailureReceipt::issue(&witness1, shard_set.stripe_merkle_root, 1, now_ms);
     let r_unauth = WitnessFailureReceipt::issue(

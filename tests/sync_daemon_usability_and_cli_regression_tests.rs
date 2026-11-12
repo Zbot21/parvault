@@ -821,7 +821,10 @@ fn test_persistent_por_repair_grants_dht_store_and_libp2p_keypair_across_restart
     );
     {
         let mut por1 = PorVerifierEngine::with_persistence_dir(400, &base);
-        assert!(por1.register_repair_grant(grant));
+        // v0.5.0 (F-26): a grant authorises the shards stored with it.
+        assert!(por1
+            .register_repair_grant_for_stored(grant, &[shard_id])
+            .is_ok());
         por1.register_shard_session(&shard_id, [0x77; 32]);
     }
     {

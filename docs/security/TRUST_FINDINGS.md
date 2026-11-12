@@ -17,7 +17,7 @@ Status values:
 | ID | Sev | Finding | Item | Status |
 | :--- | :--- | :--- | :--- | :--- |
 | F-01 | Blocker | Gossip `SlashingEvidence` quarantines on one trusted reporter's accusation, with no guard for genesis or self. | 2b | Fixed (QA pending): gossip subscription and handler removed until 2c; `slash_target_decision` guards genesis and own keys (unit-tested; no wire trigger remains, so no claim) |
-| F-02 | High | A repair read (Case B) is not bound to the registered grant; `PutShard` registers any self-signed grant, before the put succeeds, overwriting the existing one. | 2b | Fixed (QA pending): `grant_registration_decision` (F-02a), `repair_read_decision` (F-02b); first-wins residual is F-26 |
+| F-02 | High | A repair read (Case B) is not bound to the registered grant; `PutShard` registers any self-signed grant, before the put succeeds, overwriting the existing one. | 2b | Fixed (QA pending): `grant_registration_decision` (F-02a: after the put, matching root), `repair_read_decision` (F-02b) |
 | F-03 | High | Web-of-trust admission is never consulted on the wire request path. | 2b | Fixed (QA pending): `admission_decision`, claims F-03 and F-03-SEED |
 | F-04 | High | `PutShard` takes a caller-supplied `owner_peer_id`; each invented id gets a fresh account with bootstrap grace. | 2b | Fixed (QA pending): `shard_owner_decision`, claim F-04; leave, seed syndication and 40 gateway lanes tested |
 | F-05 | High | Public-commons PoW admission has no wire carrier and no production caller. | 2b | Fixed (QA pending): `AdmitPublicTicket`, `public_ticket_decision`, claim F-05 |
@@ -37,7 +37,7 @@ Status values:
 | F-23 | Medium | `RenewBlindedLease` carries no credential. | 2c | Reproduced |
 | F-24 | Medium | Blinded-shard vouchers are self-certifying (the receiver trusts the issuer the voucher names). | 2b (admission), 2c (issuer policy) | Admission fixed (QA pending): claims F-24, F-24-ONION; issuer policy open (2c) |
 | F-25 | Medium | `SyndicateLiteStripe` accepts a `PersonalDeviceCert` not bound to the sender (any key that holds a valid cert can replay it) and re-uploads under a constant owner; `PutDhtEnvelope` writes self-signed records into uncapped maps. | 2b | Fixed (QA pending): admission (claim F-25-DHT) and cert bound to the sender (`device_cert_decision`, claim F-25); seed re-uploads accounted to the seed (F-04) |
-| F-26 | Low | First-wins grant registration lets an admitted holder of one shard squat a stripe root on other nodes (residual after F-02). | 2c | Read |
+| F-26 | Low | First-wins grant registration let an admitted holder of one shard squat a stripe root on other nodes, and the first-registered grant also authorised owner reads, so a squat gave ciphertext reads and locked the real owner out (QA). | 2b | Fixed (QA pending): grants keyed by (root, owner); each shard records the owner of the grant it was stored with; reads and repair reads need that owner (`grant_owner_decision`, claim F-26) |
 | F-27 | High | Public-commons ticket admission amplifies: every accepted ticket rewrote the whole registry, a ticket was reusable (no freshness, not bound to the verifier), and a sybil could flush legitimate peers from the FIFO (QA 2b B4). | 2b | Fixed (QA pending): admissions written in batches; re-sent ticket a no-op; ticket fresh within 10 min and bound to the verifier key (the refusal states key and bits, the client re-mints once); 8 new tickets per subnet per minute; when full, expired admissions are pruned and new tickets refused (a live admission is never evicted). Claim F-27, unit tests per rule |
 | F-28 | Medium | The handshake was a quarantine oracle: quarantine was checked before signatures and the raw error was returned on the wire (QA candidate 1). | 2b | Fixed (QA pending): chain verified before quarantine; one fixed refusal text ("handshake refused"), code in the local log |
 | F-29 | Medium | Inbound Kademlia `PutRecord` had no admission check, a route around F-25-DHT (QA candidate 2). | 2b | Fixed (QA pending): `kad_record_decision` requires an admitted source, claim F-29 |
@@ -71,7 +71,7 @@ Claim lines in `.enforcement.map` use the finding id, or the finding id with a s
 
 | ID | Pair |
 | :--- | :--- |
-| F-02a | F-02, grant registration (after the put, matching root, no owner replacement). |
+| F-02a | F-02, grant registration (after the put, matching root). |
 | F-02b | F-02, repair reads bound to the registered grant. |
 | F-03-SEED | F-03 on `parvault-seed`. |
 | F-10a | F-10, the DHT reader. |

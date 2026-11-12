@@ -1000,22 +1000,86 @@ fn f02a_owner_grant_update_registered() {
     gate_ran("trust_enforcement::f02a_owner_grant_update_registered");
 }
 
-/// F-02a reject: another admitted key storing a shard of the same stripe with its own grant does
-/// not replace the owner's grant; the owner's signed read keeps working.
+/// F-02a reject: a grant naming another stripe is not registered with the shard it came with;
+/// the owner's signed read keeps working.
 #[test]
-fn f02a_foreign_grant_not_registered() {
+fn f02a_grant_for_other_stripe_not_registered() {
     let node = spawn_daemon("f02a-r");
     let owner = key(0xE1);
     let (sid, bytes) = store_with_grant(&node, &owner, &[]);
-    let attacker = key(0xE2);
-    let resp = send(&attacker, &node, second_shard_put(sid, &attacker));
+    let bytes1 = vec![0x77; 1024];
+    let sid1 = ShardId {
+        stripe_merkle_root: sid.stripe_merkle_root,
+        shard_index: 1,
+        shard_hash: parvault::sharding::merkle::hash_shard_leaf(1, &bytes1),
+    };
+    let wrong_root = RepairGrant::issue(&owner, [0x99; 32], vec![], ErasureTier::Homelab);
+    let resp = send(&owner, &node, put_shard("", sid1, bytes1, Some(wrong_root)));
     assert!(stored(&resp), "the shard itself is stored: {resp:?}");
-    assert_logged(&node, "reject.repair_grant_owner_conflict");
+    assert_logged(&node, "reject.repair_grant_root_mismatch");
     assert_eq!(
         read_bytes(&send(&owner, &node, owner_read(&owner, sid))),
         Some(bytes)
     );
-    gate_ran("trust_enforcement::f02a_foreign_grant_not_registered");
+    gate_ran("trust_enforcement::f02a_grant_for_other_stripe_not_registered");
+}
+
+/// An attacker registers a grant for the owner's stripe root first, by storing its own shard
+/// (index 1) of that root; then the owner stores its shard (index 0) with its grant.
+fn squat_then_store(node: &Node) -> (NodeIdentity, NodeIdentity, ShardId, Vec<u8>) {
+    let owner = key(0xE5);
+    let attacker = key(0xE6);
+    let (sid, bytes) = shard(0x45, 2048);
+    let junk = vec![0x13; 1024];
+    let squat = ShardId {
+        stripe_merkle_root: sid.stripe_merkle_root,
+        shard_index: 1,
+        shard_hash: parvault::sharding::merkle::hash_shard_leaf(1, &junk),
+    };
+    let attacker_grant = RepairGrant::issue(
+        &attacker,
+        sid.stripe_merkle_root,
+        vec![],
+        ErasureTier::Homelab,
+    );
+    assert!(stored(&send(
+        &attacker,
+        node,
+        put_shard("", squat, junk, Some(attacker_grant))
+    )));
+    let owner_grant =
+        RepairGrant::issue(&owner, sid.stripe_merkle_root, vec![], ErasureTier::Homelab);
+    assert!(stored(&send(
+        &owner,
+        node,
+        put_shard("", sid, bytes.clone(), Some(owner_grant))
+    )));
+    (owner, attacker, sid, bytes)
+}
+
+/// F-26 accept: the owner reads its shard although an attacker registered the root first.
+#[test]
+fn f26_owner_reads_after_root_squat() {
+    let node = spawn_daemon("f26-a");
+    let (owner, _attacker, sid, bytes) = squat_then_store(&node);
+    assert_eq!(
+        read_bytes(&send(&owner, &node, owner_read(&owner, sid))),
+        Some(bytes)
+    );
+    gate_ran("trust_enforcement::f26_owner_reads_after_root_squat");
+}
+
+/// F-26 reject: the squatter's own signed read of the owner's shard is refused.
+#[test]
+fn f26_squatter_cannot_read_owner_shard() {
+    let node = spawn_daemon("f26-r");
+    let (_owner, attacker, sid, _bytes) = squat_then_store(&node);
+    assert_eq!(
+        read_bytes(&send(&attacker, &node, owner_read(&attacker, sid))),
+        None
+    );
+    assert_logged(&node, "reject.grant_owner_not_shard_owner");
+    gate_ran("trust_enforcement::f26_squatter_cannot_read_owner_shard");
 }
 
 /// F-02a (failed put): a rejected put registers nothing, so the owner's read keeps working.

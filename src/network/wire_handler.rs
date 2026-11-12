@@ -595,6 +595,23 @@ fn handshake_refused() -> MeshWireResponse {
     }
 }
 
+/// The shard ids a syndicated stripe was stored as (its root and expected shard hashes).
+fn syndicated_shard_ids(
+    bundle: &crate::bootstrap::LiteStripeSyndicationBundle,
+    root: crate::sharding::merkle::Hash32,
+) -> Vec<crate::storage::ShardId> {
+    bundle
+        .expected_shard_hashes
+        .iter()
+        .enumerate()
+        .map(|(i, h)| crate::storage::ShardId {
+            stripe_merkle_root: root,
+            shard_index: i as u32,
+            shard_hash: *h,
+        })
+        .collect()
+}
+
 /// The refusal text for an owner claim that does not name the sender.
 const OWNER_NOT_SENDER_TEXT: &str = "owner claim does not match the sender";
 
@@ -852,8 +869,8 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                     por_verifier.register_shard_session(&shard_id, session_key_commit);
                     // F-02a: a grant registers only after the shard is stored, for its stripe.
                     if let Some(grant) = repair_grant {
-                        if let Err(code) = por_verifier
-                            .register_repair_grant_for_stored(grant, &shard_id.stripe_merkle_root)
+                        if let Err(code) =
+                            por_verifier.register_repair_grant_for_stored(grant, &[shard_id])
                         {
                             warn!(code, peer = %remote_peer_id, "repair grant not registered");
                         }
@@ -1370,9 +1387,10 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                 Ok((receipt, syndicated_peers)) => {
                     // F-02a: register only after the stripe was ingested, for that stripe.
                     if let Some(grant) = grant_to_register {
-                        if let Err(code) = por_verifier
-                            .register_repair_grant_for_stored(grant, &receipt.stripe_merkle_root)
-                        {
+                        if let Err(code) = por_verifier.register_repair_grant_for_stored(
+                            grant,
+                            &syndicated_shard_ids(&bundle, receipt.stripe_merkle_root),
+                        ) {
                             warn!(code, peer = %remote_peer_id, "repair grant not registered");
                         }
                     }
