@@ -732,8 +732,7 @@ fn f04_seed_syndication_accounted_to_seed() {
 #[test]
 fn f04_gateway_lanes_send_as_owner() {
     // In-process lanes take their credential from the process-wide source (the ring genesis).
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| std::env::set_var("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED)));
+    provision_process_genesis();
     let peer = spawn_daemon("f04-lanes-peer");
     let root = temp_root("f04-lanes");
     let engine = parvault::gateway::GatewayEngine::new(
@@ -1146,6 +1145,71 @@ fn f24_unadmitted_onion_final_refused() {
     );
     assert_logged(&node, "reject.peer_not_admitted");
     gate_ran("trust_enforcement::f24_unadmitted_onion_final_refused");
+}
+
+/// Sets the ring genesis in this test process, so in-process clients can reach a credential
+/// through the process-wide admission source.
+fn provision_process_genesis() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| std::env::set_var("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED)));
+}
+
+/// ADR-11 / QA B1: a ring member that originates a layered onion through a relay is neither
+/// admitted at nor identified to the relay (the originator path cannot present a credential,
+/// although one is reachable in this process); the relay's last hop to the target is admitted.
+#[test]
+fn ring_member_originator_stays_anonymous_at_the_relay() {
+    provision_process_genesis();
+    let relay = spawn_daemon("b1-relay");
+    let target = spawn_daemon("b1-target");
+    let originator = key(0xF7);
+    let originator_id = node_identity_libp2p_peer_id(&originator).unwrap();
+    let b = blinded(0x57, 512);
+    let bundle = parvault::crypto::pqc::PqOnionFinalBundle {
+        blinded_id: b.id,
+        shard_bytes: b.bytes.clone(),
+        capability: b.cap,
+        voucher: AnonymousQuotaVoucher::mint(&originator, 8192),
+        current_epoch: 1,
+        lease_duration_epochs: 30,
+        delete_verifier: b.delete_verifier,
+    };
+    let layered = PqRelayedShardEnvelope::seal_layered_pq(
+        &relay.kem_public(),
+        "relay",
+        &target.kem_public(),
+        target.addr.clone(),
+        &bundle,
+        0,
+        0,
+    )
+    .unwrap();
+    parvault::network::OnionOriginator::new(originator.clone(), Vec::new())
+        .send_layered_onion(&relay.addr, layered)
+        .unwrap_or_else(|e| panic!("{e}\nrelay log:\n{}", relay.log_text()));
+    let relay_log = relay.log_text();
+    assert!(
+        !relay_log.contains(&originator_id.to_string())
+            || !relay_log.contains("routing table updated"),
+        "the relay admitted the originator:\n{relay_log}"
+    );
+    assert!(
+        !relay_log
+            .lines()
+            .any(|l| l.contains("routing table updated") && l.contains(&originator_id.to_string())),
+        "{relay_log}"
+    );
+    // The last hop (relay -> target) is admitted: the target routes the relay.
+    let relay_id = relay.peer_id().to_string();
+    assert!(
+        target
+            .log_text()
+            .lines()
+            .any(|l| l.contains("routing table updated") && l.contains(&relay_id)),
+        "{}",
+        target.log_text()
+    );
+    gate_ran("trust_enforcement::ring_member_originator_stays_anonymous_at_the_relay");
 }
 
 /// F-24 (relay): an originator without a chain sends a 2-layer onion through an admitted relay;

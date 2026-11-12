@@ -954,6 +954,53 @@ pub fn dht_candidate_decision(
     }
 }
 
+/// Originates onion uploads (ADR-11). It wraps a private client and reaches only the anonymous
+/// transport, so it cannot present an admission credential or trigger a handshake: the entry
+/// relay never learns that the originator is a ring member. Only the relay's forward to the
+/// final target (the last hop) presents the relay's own chain.
+pub struct OnionOriginator {
+    client: MeshClient,
+}
+
+impl OnionOriginator {
+    pub fn new(identity: NodeIdentity, peers: Vec<String>) -> Self {
+        Self {
+            client: MeshClient::new(identity, peers, None),
+        }
+    }
+
+    /// Sends a single-layer envelope to `entry_relay` (with `next_hop`, or for final delivery).
+    pub fn send_onion(
+        &self,
+        entry_relay: &str,
+        next_hop: Option<String>,
+        envelope: PqRelayedShardEnvelope,
+        capability: BlindedShardCapability,
+        voucher: AnonymousQuotaVoucher,
+        lease: crate::storage::BlindedLeaseSpec,
+    ) -> anyhow::Result<()> {
+        self.client.send_onion(
+            entry_relay,
+            next_hop,
+            envelope,
+            capability,
+            voucher,
+            lease,
+            false,
+        )
+    }
+
+    /// Sends a 2-layer envelope to `entry_relay`, which peels it and forwards to the target.
+    pub fn send_layered_onion(
+        &self,
+        entry_relay: &str,
+        outer_envelope: PqRelayedShardEnvelope,
+    ) -> anyhow::Result<()> {
+        self.client
+            .send_layered_onion(entry_relay, outer_envelope, false)
+    }
+}
+
 /// A (sender public key, peer address) pair that accepted this process's handshake.
 type AdmittedAt = ([u8; 32], String);
 
@@ -1420,16 +1467,27 @@ impl MeshClient {
     /// Sends a `MeshWireRequest` to `peer_addr` over the persistent background `libp2p` `Swarm`
     /// (reusing open TCP + Noise XX + Yamux connections across RPCs, and automatically healing
     /// stale DHCP IP/port endpoints when `with_data_dir_discovery` is active).
+    /// Sends `request` as this client's identity. Before a request that needs an admitted sender
+    /// it first presents this identity's admission credential (once per peer).
     pub fn send_request(
         &self,
         peer_addr: &str,
         request: MeshWireRequest,
     ) -> anyhow::Result<MeshWireResponse> {
+        self.send_request_inner(peer_addr, request, true)
+    }
+
+    fn send_request_inner(
+        &self,
+        peer_addr: &str,
+        request: MeshWireRequest,
+        present_credential: bool,
+    ) -> anyhow::Result<MeshWireResponse> {
         let trimmed = peer_addr.trim();
         if trimmed.is_empty() {
             return Err(MeshClientError::InvalidAddress("empty peer address".into()).into());
         }
-        if crate::network::admission::requires_admitted_sender(&request) {
+        if present_credential && crate::network::admission::requires_admitted_sender(&request) {
             self.ensure_admitted(trimmed);
         }
 
@@ -2255,6 +2313,8 @@ impl MeshClient {
         }
     }
 
+    /// A relay's forward of an onion envelope to its next hop, sent as this node (admitted). Used
+    /// by the wire handler for the last hop; originators use [`OnionOriginator`].
     pub fn relay_pq_onion_envelope(
         &self,
         relay_peer_addr: &str,
@@ -2264,7 +2324,29 @@ impl MeshClient {
         voucher: AnonymousQuotaVoucher,
         lease: crate::storage::BlindedLeaseSpec,
     ) -> anyhow::Result<()> {
-        match self.send_request(
+        self.send_onion(
+            relay_peer_addr,
+            target_peer_addr,
+            envelope,
+            capability,
+            voucher,
+            lease,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_onion(
+        &self,
+        relay_peer_addr: &str,
+        target_peer_addr: Option<String>,
+        envelope: PqRelayedShardEnvelope,
+        capability: BlindedShardCapability,
+        voucher: AnonymousQuotaVoucher,
+        lease: crate::storage::BlindedLeaseSpec,
+        present_credential: bool,
+    ) -> anyhow::Result<()> {
+        match self.send_request_inner(
             relay_peer_addr,
             MeshWireRequest::RelayPqOnionEnvelope {
                 target_peer_addr,
@@ -2275,6 +2357,7 @@ impl MeshClient {
                 lease_duration_epochs: lease.lease_duration_epochs,
                 delete_verifier: lease.delete_verifier,
             },
+            present_credential,
         )? {
             MeshWireResponse::RelayPqOnionAck { delivered, error } => {
                 if !delivered {
@@ -2303,6 +2386,15 @@ impl MeshClient {
         relay_peer_addr: &str,
         outer_envelope: PqRelayedShardEnvelope,
     ) -> anyhow::Result<()> {
+        self.send_layered_onion(relay_peer_addr, outer_envelope, true)
+    }
+
+    fn send_layered_onion(
+        &self,
+        relay_peer_addr: &str,
+        outer_envelope: PqRelayedShardEnvelope,
+        present_credential: bool,
+    ) -> anyhow::Result<()> {
         let dummy_capability = BlindedShardCapability {
             locator: [0u8; 32],
             capability_pubkey: [0u8; 32],
@@ -2314,13 +2406,14 @@ impl MeshClient {
             sig_r: [0u8; 32],
             sig_s: [0u8; 32],
         };
-        self.relay_pq_onion_envelope(
+        self.send_onion(
             relay_peer_addr,
             None,
             outer_envelope,
             dummy_capability,
             dummy_voucher,
             crate::storage::BlindedLeaseSpec::new(0, 0, [0u8; 32]),
+            present_credential,
         )
     }
 

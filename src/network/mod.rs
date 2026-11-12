@@ -15,7 +15,7 @@ pub use behaviour::{
     is_routable_public_ip, DhtEnvelopeKind, DhtWireEnvelope, MeshNetworkBehaviour, MeshWireRequest,
     MeshWireResponse,
 };
-pub use client::{is_network_peer_addr, parse_peer_multiaddr, MeshClient};
+pub use client::{is_network_peer_addr, parse_peer_multiaddr, MeshClient, OnionOriginator};
 pub use discovery::{
     compute_pairing_sas_commitment, derive_4word_pairing_sas,
     derive_libp2p_peer_id_from_ed25519_pubkey, detect_primary_lan_ipv4, discover_lan_peers,
