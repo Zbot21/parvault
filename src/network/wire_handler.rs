@@ -577,6 +577,24 @@ pub fn device_cert_decision(
     }
 }
 
+/// The one refusal text for every failed handshake (F-28): the reason stays in the local log.
+pub const HANDSHAKE_REFUSED_TEXT: &str = "handshake refused";
+
+/// The local reason code for a failed handshake (never sent on the wire).
+pub fn handshake_refusal_code(err: &crate::network::wot::WebOfTrustError) -> &'static str {
+    match err {
+        crate::network::wot::WebOfTrustError::QuarantinedSubtree => "reject.handshake_quarantined",
+        _ => "reject.handshake_chain_invalid",
+    }
+}
+
+fn handshake_refused() -> MeshWireResponse {
+    MeshWireResponse::HandshakeAck {
+        accepted: false,
+        reason: Some(HANDSHAKE_REFUSED_TEXT.to_string()),
+    }
+}
+
 /// The refusal text for an owner claim that does not name the sender.
 const OWNER_NOT_SENDER_TEXT: &str = "owner claim does not match the sender";
 
@@ -727,17 +745,12 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                 None,
                 None,
             ) {
-                return MeshWireResponse::HandshakeAck {
-                    accepted: false,
-                    reason: Some(reason),
-                };
+                warn!(%reason, peer = %remote_peer_id, "refused a handshake from a blocked peer");
+                return handshake_refused();
             }
             if let Err(code) = WebOfTrustRegistry::chain_leaf_decision(leaf_pk, remote_pubkey) {
                 warn!(code, peer = %remote_peer_id, "refused a handshake for another key's chain");
-                return MeshWireResponse::HandshakeAck {
-                    accepted: false,
-                    reason: Some("chain leaf is not the sender".to_string()),
-                };
+                return handshake_refused();
             }
             match wot.verify_and_admit_chain(&chain) {
                 Ok(_) => {
@@ -752,10 +765,9 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                 Err(e) => {
                     // ADR-15 Red-Team Fix (RT3-03): Never penalize `chain.leaf_pubkey()` on an
                     // unverified `HandshakeWoT` failure.
-                    MeshWireResponse::HandshakeAck {
-                        accepted: false,
-                        reason: Some(e.to_string()),
-                    }
+                    let code = handshake_refusal_code(&e);
+                    warn!(code, error = %e, peer = %remote_peer_id, "refused a handshake");
+                    handshake_refused()
                 }
             }
         }

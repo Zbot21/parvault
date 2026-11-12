@@ -732,12 +732,40 @@ fn handshake_wot() {
     let pk = peer.ident.public_key_bytes();
     t.each(|fx, k| fx.ban(k, EvictionTarget::PeerOrIssuerPubkey(pk)));
     let o = t.run(&peer, &good);
+    // F-28: a blocked peer gets the same fixed text as any other refused handshake.
     assert!(
-        o[0].resp.contains("accepted: false") && o[0].resp.contains("blocked"),
+        o[0].resp.contains("accepted: false") && o[0].resp.contains("handshake refused"),
         "{}",
         o[0].resp
     );
     assert_identical(&o);
+    // F-28: the handshake is not a quarantine oracle. A forged hop (rogue inviter) for a
+    // quarantined key and for an ordinary key gets the same response on every role.
+    let quarantined = Peer::new(0x54, "198.51.100.32");
+    let ordinary = Peer::new(0x55, "198.51.100.33");
+    let qk = quarantined.ident.public_key_bytes();
+    t.each(|fx, _| {
+        fx.wot.slash_immediately(qk);
+    });
+    // The probe names the genesis as inviter but carries a rogue signature.
+    let genesis_pk = t.keys.genesis.public_key_bytes();
+    let forged = |p: &Peer| {
+        let mut hop = InvitationHop::issue(&rogue, p.ident.public_key_bytes(), 1, 100);
+        hop.inviter_pubkey = genesis_pk;
+        MeshWireRequest::HandshakeWoT {
+            chain: DelegationChain { hops: vec![hop] },
+            asn: None,
+            region: None,
+        }
+    };
+    let oq = t.run(&quarantined, &forged(&quarantined));
+    let oo = t.run(&ordinary, &forged(&ordinary));
+    assert_eq!(
+        oq[0].resp, oo[0].resp,
+        "quarantine state must not show on the wire"
+    );
+    assert!(oq[0].resp.contains("handshake refused"), "{}", oq[0].resp);
+    assert_identical(&oq);
 }
 
 // --- 2. PutShard (seed also records the admission IP) -------------------------------------------

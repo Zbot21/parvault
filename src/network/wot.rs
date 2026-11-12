@@ -658,18 +658,21 @@ impl WebOfTrustRegistry {
             return Err(WebOfTrustError::UntrustedGenesisRoot);
         }
 
+        // Links and signatures first: quarantine state is consulted only for a chain that is
+        // otherwise valid, so a forged probe cannot learn whether a key is quarantined (F-28).
         for (idx, hop) in chain.hops.iter().enumerate() {
-            if self.quarantined_keys.contains(&hop.inviter_pubkey)
-                || self.quarantined_keys.contains(&hop.invitee_pubkey)
-            {
-                return Err(WebOfTrustError::QuarantinedSubtree);
-            }
             if idx > 0 && hop.inviter_pubkey != chain.hops[idx - 1].invitee_pubkey {
                 return Err(WebOfTrustError::BrokenChainLink(idx));
             }
             if !hop.verify_signature() {
                 return Err(WebOfTrustError::InvalidHopSignature(idx));
             }
+        }
+        if chain.hops.iter().any(|hop| {
+            self.quarantined_keys.contains(&hop.inviter_pubkey)
+                || self.quarantined_keys.contains(&hop.invitee_pubkey)
+        }) {
+            return Err(WebOfTrustError::QuarantinedSubtree);
         }
 
         let leaf = chain.leaf_pubkey().expect("checked non-empty");
