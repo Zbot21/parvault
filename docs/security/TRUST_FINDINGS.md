@@ -48,7 +48,7 @@ Status values:
 | F-34 | High | No verifier can check a PoR response: the commitment is `SHA-256(nonce ‖ bytes)`, so the verifier needs the shard bytes; ADR-03's stateless-witness model cannot work as written. | 2c | Reported (2c plan) |
 | F-35 | Medium | Voucher nullifiers are a FIFO of `65,536` with no voucher expiry, so a spent voucher is redeemable again after rollover. | 2c | Reported (2c plan) |
 | F-36 | High | `authorize_owner_shard_delete` accepts a delete token signed by any key for a shard stored without a grant, so an admitted peer can delete another peer's grant-less shards by id. | 2b | Fixed (QA pending): `shard_delete_decision` (grant owner, or else the key that stored the shard), claim F-36 |
-| W-05 | Medium | Regular `.shard` file names carry the file Merkle-root prefix and the stripe index (`storage/block_store.rs:161`), so a storage node can tell which shards belong to the same file and how large it is. Blinded `.bshard` names exist only on the seed/lite path. | 2e | Registered, not redesigned: documented in the README limits section |
+| W-05 | Medium | Regular `.shard` file names start with the first 8 bytes of the stripe Merkle root, then the shard index (`ShardId::file_key`, `storage/block_store.rs:159`), so a storage node can group the shards of each stripe and count stripes. Blinded `.bshard` names exist only on the seed/lite path. | 2e | Registered, not redesigned: documented in the README limits section |
 
 ## Proof gaps
 
