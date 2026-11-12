@@ -249,9 +249,11 @@ parvault up \
 ## 7. OpenWrt `procd` Service Installation
 
 ### Binary Installation
+The command downloads the latest published release, <!-- metric:released_version_tag -->`v0.4.0`<!-- /metric -->.
+
 ```bash
 # 1. Download static aarch64 or x86_64 musl binary
-wget -O /usr/bin/parvault https://github.com/Zbot21/parvault/releases/download/v0.5.0/parvault-aarch64-unknown-linux-musl
+wget -O /usr/bin/parvault https://github.com/Zbot21/parvault/releases/download/v0.4.0/parvault-aarch64-unknown-linux-musl
 chmod +x /usr/bin/parvault
 
 # 2. Create runtime directories

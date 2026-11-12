@@ -207,4 +207,14 @@ PY
 )" || fail "deriving values from docs/metrics.txt failed"
 [[ -n "$derived" ]] || fail "no derived values"
 
+# --- Fetch commands name the latest published release ------------------------
+# A doc command that downloads a release asset or pins a git tag must name
+# released_version_tag (static, docs/metrics.txt), not the unreleased crate version.
+released="$(sed -n 's/^released_version_tag = \(v[0-9][0-9.]*\)$/\1/p' docs/metrics.txt)"
+[[ -n "$released" ]] || fail "missing static key released_version_tag"
+stale="$(git ls-files -z -- '*.md' \
+  | xargs -0 grep -noE 'parvault/releases/download/v[0-9][0-9.]*|parvault\.git", tag = "v[0-9][0-9.]*"' \
+  | grep -vE "/download/${released}\$|tag = \"${released}\"\$" || true)"
+[[ -z "$stale" ]] || fail "fetch commands must name released_version_tag ($released): $stale"
+
 printf '%s\n%s\n' "$counts" "$derived"
