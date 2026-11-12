@@ -26,12 +26,28 @@ open       F-06      expect=reach by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 reach      F-15      sym=src/bootstrap.rs::verify_weather_quorum from=src/bin/parvault-seed.rs::run_seed_listener_loop ref=docs/security/TRUST_FINDINGS.md
 open       F-15      expect=reach by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 
-# --- Not expressible with this skill snapshot (add when the kinds are available) -------------------
-# claim-missing: one per 2b check function until its pair exists. 2b adds real claim lines as each
-#   fix lands (F-01 guard, F-02a, F-02b, F-03, F-04, F-05, F-10a, F-10b, F-11, F-21, F-24 admission,
-#   F-25).
-# Findings with no line yet (no check function exists to name): F-07, F-08, F-09, F-12, F-17,
-#   F-18 (2c); F-22, F-23, F-26 (2c); F-24 issuer policy (2c).
-# kani / tla-mutant / no-blocking / xref: P-01 to P-05 (2d-beta).
+# --- Blocking calls on handler paths --------------------------------------------------------------
+no-blocking F-18     path=src/network/wire_handler.rs
+open       F-18      expect=no-blocking by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+no-blocking B-DISC   path=src/network/discovery.rs
+open       B-DISC    expect=no-blocking by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 
-ratchet    R         open=7 waive=0
+# --- ADR cross-references (existence only; F-16's keyword table is curated in its own item) --------
+xref       X-ADR     path=src/**.rs pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md
+xref       X-ADR-DOC path=docs/**.md pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md
+
+# --- Formal proofs (P-01 to P-05; mutants are authored by QA) --------------------------------------
+tla-spec   T-SPECS   path=specs/*.tla
+open       T-SPECS   expect=tla-lint by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+open       T-SPECS   expect=completeness by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+module     P-01      path=src/network/wot.rs pattern=^(verify_and_admit_|is_peer_|apply_slashing_|slash_|record_failure) kani=required
+open       P-01      expect=completeness by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+
+# --- Claims ----------------------------------------------------------------------------------------
+# Each 2b fix adds its claim line (a differential pair rewritten from its reproduction in
+# tests/trust_enforcement.rs) in the same commit. A claim cannot be declared before its check
+# function exists (an unknown sym is an error even under expect=claim-missing).
+# Findings with no line yet (no check function exists to name): F-07, F-08, F-09, F-12, F-17
+#   (2c); F-22, F-23, F-26 (2c); F-24 issuer policy (2c).
+
+ratchet    R         open=12 waive=0

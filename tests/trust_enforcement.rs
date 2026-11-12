@@ -823,18 +823,20 @@ fn repro_f10b_raw_kad_put_stored() {
             .put_record(record, kad::Quorum::One)
             .unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        loop {
+        let mut outcome = None;
+        while outcome.is_none() {
             tokio::select! {
                 ev = swarm.select_next_some() => {
                     if let SwarmEvent::Behaviour(parvault::network::behaviour::MeshNetworkBehaviourEvent::Kademlia(
                         kad::Event::OutboundQueryProgressed { result: kad::QueryResult::PutRecord(r), .. },
                     )) = ev {
-                        return r.is_ok();
+                        outcome = Some(r.is_ok());
                     }
                 }
-                _ = tokio::time::sleep_until(deadline) => return false,
+                _ = tokio::time::sleep_until(deadline) => outcome = Some(false),
             }
         }
+        outcome.unwrap()
     });
     assert!(ok, "gap: the daemon stores a raw unsigned Kademlia record");
     gate_ran("trust_enforcement::repro_f10b_raw_kad_put_stored");
