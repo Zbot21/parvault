@@ -1117,26 +1117,44 @@ impl MeshClient {
         {
             return;
         }
-        use crate::network::admission::AdmissionCredential;
-        let credential = match self.admission.as_deref() {
-            Some(source) => source.credential(&self.identity),
-            None => crate::network::admission::process_source()
-                .and_then(|source| source.credential(&self.identity)),
-        };
-        let request = match credential {
-            Some(AdmissionCredential::Chain(chain)) => MeshWireRequest::HandshakeWoT {
-                chain,
-                asn: None,
-                region: None,
-            },
-            Some(AdmissionCredential::Ticket(ticket)) => MeshWireRequest::AdmitPublicTicket(ticket),
-            None => return,
-        };
-        let admitted = matches!(
-            self.send_request(peer_addr, request),
-            Ok(MeshWireResponse::HandshakeAck { accepted: true, .. })
-                | Ok(MeshWireResponse::AdmitPublicTicketAck { admitted: true, .. })
-        );
+        // A ticket is bound to the peer's key: known from a `/p2p/<PeerId>` address, else learned
+        // from the peer's refusal, which states its key and required bits (one re-mint).
+        let mut verifier = parse_peer_multiaddr(peer_addr)
+            .ok()
+            .and_then(|m| extract_expected_peer_id(&m))
+            .and_then(|pid| {
+                crate::config::NodeConfig::extract_ed25519_pubkey_from_peer_str(&pid.to_string())
+            })
+            .unwrap_or([0u8; 32]);
+        let mut required_bits = None;
+        let mut admitted = false;
+        for _attempt in 0..2 {
+            let Some(request) = self.admission_request(verifier, required_bits) else {
+                return;
+            };
+            let is_ticket = matches!(request, MeshWireRequest::AdmitPublicTicket(_));
+            match self.send_request(peer_addr, request) {
+                Ok(MeshWireResponse::HandshakeAck { accepted: true, .. })
+                | Ok(MeshWireResponse::AdmitPublicTicketAck { admitted: true, .. }) => {
+                    admitted = true;
+                    break;
+                }
+                Ok(MeshWireResponse::AdmitPublicTicketAck {
+                    admitted: false,
+                    verifier_pubkey,
+                    required_pow_bits,
+                    ..
+                }) if is_ticket
+                    && verifier_pubkey != [0u8; 32]
+                    && (verifier_pubkey != verifier
+                        || required_bits != Some(required_pow_bits)) =>
+                {
+                    verifier = verifier_pubkey;
+                    required_bits = Some(required_pow_bits);
+                }
+                _ => break,
+            }
+        }
         if admitted {
             if let Ok(mut m) = self.admission_refused_at.lock() {
                 m.remove(&key);
@@ -1147,6 +1165,28 @@ impl MeshClient {
         } else if let Ok(mut m) = self.admission_refused_at.lock() {
             m.insert(key, Instant::now());
         }
+    }
+
+    /// The admission request this identity presents: a chain, or a ticket bound to `verifier`.
+    fn admission_request(
+        &self,
+        verifier: [u8; 32],
+        required_bits: Option<u8>,
+    ) -> Option<MeshWireRequest> {
+        use crate::network::admission::AdmissionCredential;
+        let credential = match self.admission.as_deref() {
+            Some(source) => source.credential(&self.identity, verifier, required_bits),
+            None => crate::network::admission::process_source()
+                .and_then(|source| source.credential(&self.identity, verifier, required_bits)),
+        };
+        Some(match credential? {
+            AdmissionCredential::Chain(chain) => MeshWireRequest::HandshakeWoT {
+                chain,
+                asn: None,
+                region: None,
+            },
+            AdmissionCredential::Ticket(ticket) => MeshWireRequest::AdmitPublicTicket(ticket),
+        })
     }
 
     /// Enables Zero-IP LAN auto-discovery and DHCP IP/port-change self-healing backed by

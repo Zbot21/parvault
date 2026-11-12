@@ -196,17 +196,26 @@ impl AdmissionSource {
 
     /// The one place a client chooses how to be admitted: a chain when it has one, else a
     /// public-commons ticket when the process runs in public or hybrid mode.
-    pub fn credential(&self, identity: &NodeIdentity) -> Option<AdmissionCredential> {
+    ///
+    /// A ticket is bound to `verifier` (the peer's Ed25519 key) and minted at `required_bits`
+    /// when the peer stated them, else at this source's default.
+    pub fn credential(
+        &self,
+        identity: &NodeIdentity,
+        verifier: [u8; 32],
+        required_bits: Option<u8>,
+    ) -> Option<AdmissionCredential> {
         if let Some(chain) = self.credential_for(identity) {
             return Some(AdmissionCredential::Chain(chain));
         }
-        let bits = self.public_ticket_bits?;
+        let bits = required_bits.or(self.public_ticket_bits)?;
+        self.public_ticket_bits?;
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         Some(AdmissionCredential::Ticket(PublicCommonsTicket::mint(
-            identity, now_ms, bits,
+            identity, verifier, now_ms, bits,
         )))
     }
 

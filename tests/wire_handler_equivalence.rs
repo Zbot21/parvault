@@ -2175,7 +2175,12 @@ fn admit_public_ticket() {
     let _g = env_guard();
     let mut t = Trio::new("ticket");
     let peer = Peer::new(0x77, "198.51.100.22");
-    let ticket = PublicCommonsTicket::mint(&peer.ident, now_ms(), DEFAULT_PUBLIC_WOT_POW_BITS);
+    let ticket = PublicCommonsTicket::mint(
+        &peer.ident,
+        NodeIdentity::from_seed([0x11; 32]).public_key_bytes(),
+        now_ms(),
+        DEFAULT_PUBLIC_WOT_POW_BITS,
+    );
     // Private ring (the fixtures' mode): refused by every role, no state change.
     let o = t.run(&peer, &MeshWireRequest::AdmitPublicTicket(ticket.clone()));
     assert!(o[0].resp.contains("admitted: false"), "{}", o[0].resp);
@@ -2204,7 +2209,12 @@ fn admit_public_ticket() {
     }
     // A ticket for another key is refused even in public commons.
     let other = Peer::new(0x78, "198.51.100.23");
-    let foreign = PublicCommonsTicket::mint(&peer.ident, now_ms(), DEFAULT_PUBLIC_WOT_POW_BITS);
+    let foreign = PublicCommonsTicket::mint(
+        &peer.ident,
+        NodeIdentity::from_seed([0x11; 32]).public_key_bytes(),
+        now_ms(),
+        DEFAULT_PUBLIC_WOT_POW_BITS,
+    );
     let o = t.run(&other, &MeshWireRequest::AdmitPublicTicket(foreign));
     assert!(o[0].resp.contains("admitted: false"), "{}", o[0].resp);
     assert_identical(&o);

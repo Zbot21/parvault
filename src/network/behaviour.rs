@@ -468,6 +468,10 @@ pub enum MeshWireResponse {
     AdmitPublicTicketAck {
         admitted: bool,
         reason: Option<String>,
+        /// The node a ticket must be bound to (its Ed25519 key).
+        verifier_pubkey: [u8; 32],
+        /// The PoW bits this node requires.
+        required_pow_bits: u8,
     },
 }
 

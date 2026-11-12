@@ -43,7 +43,7 @@ pub(crate) async fn file(env: CliEnv, command: Commands) -> anyhow::Result<()> {
             // on every shard.
             if !mesh_client.all_network_endpoints().is_empty()
                 && parvault::network::admission::process_source()
-                    .and_then(|source| source.credential(&owner_identity))
+                    .and_then(|source| source.credential(&owner_identity, [0u8; 32], None))
                     .is_none()
             {
                 anyhow::bail!("{}", parvault::crypto::keys::NOT_IN_RING_MESSAGE);

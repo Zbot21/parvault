@@ -541,7 +541,12 @@ fn admit_ticket(node: &Node, sender: &NodeIdentity, bits: u8) -> MeshWireRespons
     send_as_stranger(
         sender,
         node,
-        MeshWireRequest::AdmitPublicTicket(PublicCommonsTicket::mint(sender, now_ms(), bits)),
+        MeshWireRequest::AdmitPublicTicket(PublicCommonsTicket::mint(
+            sender,
+            node.identity().public_key_bytes(),
+            now_ms(),
+            bits,
+        )),
     )
 }
 
@@ -586,6 +591,35 @@ fn f05_public_ticket_one_bit_short_refused() {
     let put = send_as_stranger(&stranger, &node, put_shard("", sid, bytes, None));
     assert_eq!(refusal_text(&put).as_deref(), Some(NOT_ADMITTED), "{put:?}");
     gate_ran("trust_enforcement::f05_public_ticket_one_bit_short_refused");
+}
+
+/// F-27 reject: a ticket at the required bits but 20 minutes old is refused (freshness window).
+#[test]
+fn f27_stale_ticket_refused() {
+    let node = spawn_public_daemon("f27-stale");
+    let stranger = key(0xA6);
+    let resp = send_as_stranger(
+        &stranger,
+        &node,
+        MeshWireRequest::AdmitPublicTicket(PublicCommonsTicket::mint(
+            &stranger,
+            node.identity().public_key_bytes(),
+            now_ms() - 20 * 60_000,
+            DEFAULT_PUBLIC_WOT_POW_BITS,
+        )),
+    );
+    assert!(
+        matches!(
+            resp,
+            MeshWireResponse::AdmitPublicTicketAck {
+                admitted: false,
+                ..
+            }
+        ),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.ticket_stale");
+    gate_ran("trust_enforcement::f27_stale_ticket_refused");
 }
 
 /// F-05 (CLI): a client without any chain stores a file on a public-commons daemon through

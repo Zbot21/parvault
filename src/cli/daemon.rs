@@ -322,6 +322,8 @@ pub(crate) async fn run_daemon(
                 }
             }
             _ = telemetry_interval.tick() => {
+                // Admissions are written in batches (F-27, F-30).
+                wot.flush();
                 let (used_b, max_b) = {
                     let q = block_store.quota();
                     let g = q.lock().expect("quota lock");
@@ -381,6 +383,7 @@ pub(crate) async fn run_daemon(
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received Ctrl-C, shutting down parvault-daemon cleanly.");
+                wot.flush();
                 break;
             }
         }

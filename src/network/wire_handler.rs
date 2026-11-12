@@ -608,6 +608,8 @@ pub fn reject_response(request: &MeshWireRequest, reason: String) -> MeshWireRes
         MeshWireRequest::AdmitPublicTicket(_) => MeshWireResponse::AdmitPublicTicketAck {
             admitted: false,
             reason: Some(reason),
+            verifier_pubkey: [0u8; 32],
+            required_pow_bits: 0,
         },
         MeshWireRequest::PutShard { .. } => MeshWireResponse::PutShardAck {
             stored: false,
@@ -772,6 +774,15 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
             }
         }
         MeshWireRequest::AdmitPublicTicket(ticket) => {
+            let verifier_pubkey = node_identity.public_key_bytes();
+            let required_pow_bits = wot.required_public_pow_bits();
+            let ack =
+                |admitted: bool, reason: Option<String>| MeshWireResponse::AdmitPublicTicketAck {
+                    admitted,
+                    reason,
+                    verifier_pubkey,
+                    required_pow_bits,
+                };
             if let Some(reason) = eviction.is_ingress_blocked(
                 remote_ip,
                 Some(remote_peer_id),
@@ -779,33 +790,33 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                 None,
                 None,
             ) {
-                return MeshWireResponse::AdmitPublicTicketAck {
-                    admitted: false,
-                    reason: Some(reason),
-                };
+                return ack(false, Some(reason));
             }
-            let facts = wot.ticket_facts(&ticket, remote_pubkey);
+            let subnet = remote_ip
+                .map(PrivacyPreservingEvictionEngine::canonicalize_ip_subnet)
+                .unwrap_or_else(|| "unknown".to_string());
+            let facts = wot.ticket_facts(
+                &ticket,
+                remote_pubkey,
+                verifier_pubkey,
+                &subnet,
+                now_unix_ms(),
+            );
             if let Err(code) = WebOfTrustRegistry::public_ticket_decision(&facts) {
                 warn!(code, peer = %remote_peer_id, "refused a public-commons ticket");
-                return MeshWireResponse::AdmitPublicTicketAck {
-                    admitted: false,
-                    reason: Some("public-commons ticket refused".to_string()),
-                };
+                return ack(false, Some("public-commons ticket refused".to_string()));
+            }
+            if facts.already_admitted {
+                return ack(true, None);
             }
             match wot.verify_and_admit_public_ticket(&ticket) {
                 Ok(()) => {
                     if let Some(ip) = remote_ip {
                         let _ = eviction.record_peer_admission_ip(ip, ticket.peer_pubkey);
                     }
-                    MeshWireResponse::AdmitPublicTicketAck {
-                        admitted: true,
-                        reason: None,
-                    }
+                    ack(true, None)
                 }
-                Err(e) => MeshWireResponse::AdmitPublicTicketAck {
-                    admitted: false,
-                    reason: Some(e.to_string()),
-                },
+                Err(e) => ack(false, Some(e.to_string())),
             }
         }
         MeshWireRequest::PutShard {
@@ -1794,7 +1805,7 @@ mod tests {
             ),
             (
                 MeshWireRequest::AdmitPublicTicket(crate::network::wot::PublicCommonsTicket::mint(
-                    &id, 1, 1,
+                    &id, [0; 32], 1, 1,
                 )),
                 "AdmitPublicTicketAck",
                 true,

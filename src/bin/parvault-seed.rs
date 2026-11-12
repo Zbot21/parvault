@@ -2013,6 +2013,8 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     st.epoch_counter = st.epoch_counter.saturating_add(1);
                     let ep = st.epoch_counter;
+                    // Admissions are written in batches (F-27, F-30).
+                    st.wot.flush();
                     st.wan_registry.prune_expired(seed_now_ms());
                     if let Ok(purged) = st.server.sweep_expired_epoch(ep) {
                         if !purged.is_empty() {
@@ -2034,6 +2036,11 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received Ctrl-C, shutting down parvault-seed cleanly.");
+                shared
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .wot
+                    .flush();
                 break;
             }
         }
