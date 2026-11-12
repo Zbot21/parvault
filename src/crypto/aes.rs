@@ -27,6 +27,9 @@ pub enum CryptoError {
     KdfFailed,
     #[error("Invalid key or hex encoding: {0}")]
     InvalidKeyMaterial(String),
+    /// The node's ring membership is missing or inconsistent (the message says what to do).
+    #[error("{0}")]
+    RingMembership(String),
 }
 
 /// Deserializes a `bincode`-encoded payload with a strict upper memory allocation bound `max_bytes` (`B12`).

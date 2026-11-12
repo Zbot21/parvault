@@ -413,16 +413,14 @@ impl NodeIdentity {
             ));
         }
         let Some(&(_, first)) = found.first() else {
-            return Err(CryptoError::InvalidKeyMaterial(
-                NOT_IN_RING_MESSAGE.to_string(),
-            ));
+            return Err(CryptoError::RingMembership(NOT_IN_RING_MESSAGE.to_string()));
         };
         if found.iter().any(|(_, pk)| *pk != first) {
             let list: Vec<String> = found
                 .iter()
                 .map(|(src, pk)| format!("{src}={}", hex::encode(pk)))
                 .collect();
-            return Err(CryptoError::InvalidKeyMaterial(format!(
+            return Err(CryptoError::RingMembership(format!(
                 "conflicting ring genesis sources: {}",
                 list.join(", ")
             )));
