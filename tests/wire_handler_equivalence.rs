@@ -1676,7 +1676,7 @@ fn dht_envelopes() {
     let owner = NodeIdentity::from_seed([0x6E; 32]);
     let mk = MasterKey::from_bytes([0x6F; 32]);
     let manifest = FileManifest {
-        version: 1,
+        version: 2,
         file_merkle_root: [0x11; 32],
         file_salt: [0x22; 32],
         original_file_size: 1024,
@@ -1691,6 +1691,7 @@ fn dht_envelopes() {
             stripe_merkle_root: [0x33; 32],
             shard_hashes: vec![[0x44; 32]; 20],
             assigned_peers: vec!["peer".to_string(); 20],
+            shard_chunk_roots: Vec::new(),
         }],
         witness_peers: vec!["w1".to_string()],
     };
@@ -1997,7 +1998,7 @@ fn submit_abuse_takedown() {
     let mut t = Trio::new("abuse");
     let peer = Peer::new(0x74, "198.51.100.18");
     let manifest = FileManifest {
-        version: 1,
+        version: 2,
         file_merkle_root: [0x11; 32],
         file_salt: [0x22; 32],
         original_file_size: 16,

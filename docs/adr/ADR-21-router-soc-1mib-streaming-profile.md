@@ -21,4 +21,5 @@ With `16 MiB` Desktop stripes, transient working-set memory during `16-of-20` Re
 ## Consequences & Verification
 
 - **Consequences:** Cuts streaming peak `VmHWM` 6× from <!-- metric:bench.desktop.vmhwm -->`57.91 MiB`<!-- /metric --> to **<!-- metric:bench.soc.vmhwm -->`9.72–9.74 MiB`<!-- /metric -->** (<!-- metric:bench.soc.store -->`75.9–82.1 MiB/s`<!-- /metric --> store, <!-- metric:bench.soc.restore -->`127.1–127.4 MiB/s`<!-- /metric --> restore), running comfortably inside a `32–48 MiB` router cgroup.
+- **Chunk roots (manifest version 2, [ADR-03](ADR-03-stateless-witness-por-auditing.md)):** ingest hashes every shard once more to build its chunk root, about `n/k` (1.25× at 16-of-20) SHA-256 passes over each stripe's ciphertext. Not yet re-measured in the benchmarks above.
 - **Verification:** Kani harnesses `proof_router_soc_and_desktop_reed_solomon_memory_ceiling` and `proof_streaming_stripe_layout_all_u64_file_sizes_and_profiles`; `tests/zero_config_lan_and_router_soc_tests.rs`; Stage 12 (`48m` cgroup) of `scripts/docker_acceptance_gate.sh`.

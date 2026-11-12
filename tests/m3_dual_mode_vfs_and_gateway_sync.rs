@@ -170,7 +170,7 @@ fn test_gateway_bus_sync_surface_parity_and_sealed_memfd_enforcement() {
 
         // 5. `register_manifest_sync` + `query_health_sync`
         let sparse_fm = FileManifest {
-            version: 1,
+            version: 2,
             file_merkle_root: [0x55; 32],
             file_salt: [0x66; 32],
             original_file_size: 0,
@@ -210,7 +210,7 @@ fn test_gateway_bus_sync_surface_parity_and_sealed_memfd_enforcement() {
     let denied_mfd = File::from(create_memfd_sized("denied-m3", 64).unwrap());
     pwrite_all(&denied_mfd, 0, &[0xAB; 64]).unwrap();
     let denied_fm = FileManifest {
-        version: 1,
+        version: 2,
         file_merkle_root: [0x77; 32],
         file_salt: [0x88; 32],
         original_file_size: 0,

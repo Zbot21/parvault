@@ -12,6 +12,7 @@ pub use anonymity::{
 pub use block_store::{
     BlindedLeaseSpec, BlockStore, FileManifest, GracefulDepartureReceipt, ScrubReport, ShardId,
     SignedDhtManifestEnvelope, StorageError, StripeManifestEntry, ZeroTrustDhtStore,
+    FILE_MANIFEST_VERSION,
 };
 pub use eviction::*;
 pub use quota::{PeerCreditAccount, QuotaManager, TrustLevel};

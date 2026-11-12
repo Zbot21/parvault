@@ -41,6 +41,8 @@ pub enum StorageError {
     DhtManifestPoisonedOrRollback,
     #[error("Rejected unsafe or path-traversal restore path: {0}")]
     InvalidRestorePath(String),
+    #[error("Malformed or unknown FileManifest encoding: {0}")]
+    ManifestFormat(String),
 }
 
 /// Summary report returned by `BlockStore::scrub_all_shards` (`ADR-15` background bit-rot scrubber).
@@ -178,6 +180,102 @@ pub struct StripeManifestEntry {
     pub shard_hashes: Vec<Hash32>,
     /// Target PeerIDs assigned by the 70/30 network topology placement engine (index-aligned with `shard_hashes`).
     pub assigned_peers: Vec<String>,
+    /// Per-shard chunk Merkle roots (`por::chunk_merkle`), index-aligned with `shard_hashes`.
+    /// Empty for manifests written before version 2: those shards cannot be chunk-audited.
+    #[serde(default)]
+    pub shard_chunk_roots: Vec<Hash32>,
+}
+
+impl StripeManifestEntry {
+    /// Builds the entry for a freshly encoded stripe, computing the chunk roots from its shards.
+    pub fn from_shard_set(
+        shard_set: crate::sharding::reed_solomon::StripeShardSet,
+        assigned_peers: Vec<String>,
+    ) -> Self {
+        let shard_chunk_roots = crate::por::chunk_merkle::stripe_chunk_roots(&shard_set.shards);
+        Self {
+            stripe_index: shard_set.stripe_index,
+            k_data: shard_set.k_data,
+            m_parity: shard_set.m_parity,
+            original_ciphertext_len: shard_set.original_ciphertext_len,
+            shard_len: shard_set.shard_len,
+            stripe_merkle_root: shard_set.stripe_merkle_root,
+            shard_hashes: shard_set.shard_hashes,
+            assigned_peers,
+            shard_chunk_roots,
+        }
+    }
+
+    /// True when every shard has a chunk root, so the stripe can be chunk-audited.
+    pub fn is_chunk_auditable(&self) -> bool {
+        !self.shard_hashes.is_empty() && self.shard_chunk_roots.len() == self.shard_hashes.len()
+    }
+}
+
+/// Current `FileManifest` encoding layout. Version 2 appended `StripeManifestEntry::shard_chunk_roots`.
+pub const FILE_MANIFEST_VERSION: u32 = 2;
+
+/// Frozen version-1 layouts, kept only to decode manifests written before chunk roots existed.
+/// Never change these structs.
+pub mod manifest_v1 {
+    use super::{FileManifest, Hash32, StripeManifestEntry, FILE_MANIFEST_VERSION, SALT_LEN};
+    use crate::config::ErasureTier;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct StripeManifestEntryV1 {
+        pub stripe_index: u64,
+        pub k_data: usize,
+        pub m_parity: usize,
+        pub original_ciphertext_len: usize,
+        pub shard_len: usize,
+        pub stripe_merkle_root: Hash32,
+        pub shard_hashes: Vec<Hash32>,
+        pub assigned_peers: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct FileManifestV1 {
+        pub version: u32,
+        pub file_merkle_root: Hash32,
+        pub file_salt: [u8; SALT_LEN],
+        pub original_file_size: u64,
+        pub stripe_size_bytes: usize,
+        pub tier: ErasureTier,
+        pub stripes: Vec<StripeManifestEntryV1>,
+        pub witness_peers: Vec<String>,
+    }
+
+    impl From<FileManifestV1> for FileManifest {
+        /// Converts to the current layout with empty chunk roots (unauditable). The version is
+        /// the current one because `version` names the encoding layout, not the audit state.
+        fn from(v1: FileManifestV1) -> Self {
+            FileManifest {
+                version: FILE_MANIFEST_VERSION,
+                file_merkle_root: v1.file_merkle_root,
+                file_salt: v1.file_salt,
+                original_file_size: v1.original_file_size,
+                stripe_size_bytes: v1.stripe_size_bytes,
+                tier: v1.tier,
+                stripes: v1
+                    .stripes
+                    .into_iter()
+                    .map(|e| StripeManifestEntry {
+                        stripe_index: e.stripe_index,
+                        k_data: e.k_data,
+                        m_parity: e.m_parity,
+                        original_ciphertext_len: e.original_ciphertext_len,
+                        shard_len: e.shard_len,
+                        stripe_merkle_root: e.stripe_merkle_root,
+                        shard_hashes: e.shard_hashes,
+                        assigned_peers: e.assigned_peers,
+                        shard_chunk_roots: Vec::new(),
+                    })
+                    .collect(),
+                witness_peers: v1.witness_peers,
+            }
+        }
+    }
 }
 
 /// Complete File Manifest required to verify, audit, and reconstruct an encrypted vault file (ADR-02).
@@ -200,6 +298,13 @@ impl FileManifest {
         &self,
         master_key: &MasterKey,
     ) -> Result<([u8; 32], Vec<u8>), StorageError> {
+        if self.version != FILE_MANIFEST_VERSION {
+            return Err(StorageError::ManifestFormat(format!(
+                "refusing to encode FileManifest version {} in the version {} layout",
+                self.version, FILE_MANIFEST_VERSION
+            )));
+        }
+        self.check_chunk_roots_aligned()?;
         let raw = bincode::serialize(self)?;
         let encrypted = encrypt_manifest(master_key, &raw)?;
         let root_hex = hex::encode(self.file_merkle_root);
@@ -213,8 +318,46 @@ impl FileManifest {
         encrypted_record: &[u8],
     ) -> Result<Self, StorageError> {
         let raw = decrypt_manifest(master_key, encrypted_record)?;
-        let manifest: Self = bincode::deserialize(&raw)?;
-        Ok(manifest)
+        Self::decode_bytes(&raw)
+    }
+
+    /// Decodes a bincode `FileManifest` of any known version. The leading `u32` version selects
+    /// the layout: version 1 decodes through the frozen [`manifest_v1`] structs with empty chunk
+    /// roots; version 2 must carry either no chunk roots or one per shard in every stripe.
+    pub fn decode_bytes(raw: &[u8]) -> Result<Self, StorageError> {
+        let version = raw
+            .get(..4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .ok_or_else(|| {
+                StorageError::ManifestFormat("FileManifest shorter than its version".into())
+            })?;
+        match version {
+            1 => Ok(bincode::deserialize::<manifest_v1::FileManifestV1>(raw)?.into()),
+            FILE_MANIFEST_VERSION => {
+                let manifest: Self = bincode::deserialize(raw)?;
+                manifest.check_chunk_roots_aligned()?;
+                Ok(manifest)
+            }
+            other => Err(StorageError::ManifestFormat(format!(
+                "unknown FileManifest version {other}"
+            ))),
+        }
+    }
+
+    /// Every stripe carries either no chunk roots (written before version 2) or one per shard.
+    pub fn check_chunk_roots_aligned(&self) -> Result<(), StorageError> {
+        for e in &self.stripes {
+            if !e.shard_chunk_roots.is_empty() && e.shard_chunk_roots.len() != e.shard_hashes.len()
+            {
+                return Err(StorageError::ManifestFormat(format!(
+                    "stripe {} has {} chunk roots for {} shards",
+                    e.stripe_index,
+                    e.shard_chunk_roots.len(),
+                    e.shard_hashes.len()
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1807,16 +1950,10 @@ impl BlockStore {
             let (assigned_peers, _) =
                 self.place_stripe(owner_peer_id, &shard_set, tier, use_network, false)?;
 
-            stripes.push(StripeManifestEntry {
-                stripe_index,
-                k_data: shard_set.k_data,
-                m_parity: shard_set.m_parity,
-                original_ciphertext_len: shard_set.original_ciphertext_len,
-                shard_len: shard_set.shard_len,
-                stripe_merkle_root: shard_set.stripe_merkle_root,
-                shard_hashes: shard_set.shard_hashes,
+            stripes.push(StripeManifestEntry::from_shard_set(
+                shard_set,
                 assigned_peers,
-            });
+            ));
 
             stripe_index += 1;
             if read_total < stripe_cap {
@@ -1826,7 +1963,7 @@ impl BlockStore {
 
         let file_merkle_root = compute_file_merkle_root(&stripe_roots);
         let manifest = FileManifest {
-            version: 1,
+            version: FILE_MANIFEST_VERSION,
             file_merkle_root,
             file_salt,
             original_file_size,
@@ -1907,16 +2044,10 @@ impl BlockStore {
                 self.place_stripe(owner_peer_id, &shard_set, tier, use_network, true)?;
             wrote_local_batch |= local;
 
-            stripes.push(StripeManifestEntry {
-                stripe_index,
-                k_data: shard_set.k_data,
-                m_parity: shard_set.m_parity,
-                original_ciphertext_len: shard_set.original_ciphertext_len,
-                shard_len: shard_set.shard_len,
-                stripe_merkle_root: shard_set.stripe_merkle_root,
-                shard_hashes: shard_set.shard_hashes,
+            stripes.push(StripeManifestEntry::from_shard_set(
+                shard_set,
                 assigned_peers,
-            });
+            ));
 
             stripe_index += 1;
             if total_read_bytes >= expected_len || read_total < stripe_cap {
@@ -1933,7 +2064,7 @@ impl BlockStore {
 
         let file_merkle_root = compute_file_merkle_root(&stripe_roots);
         let manifest = FileManifest {
-            version: 1,
+            version: FILE_MANIFEST_VERSION,
             file_merkle_root,
             file_salt,
             original_file_size: total_read_bytes,
@@ -2466,6 +2597,106 @@ impl ZeroTrustDhtStore {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn v1_manifest() -> manifest_v1::FileManifestV1 {
+        manifest_v1::FileManifestV1 {
+            version: 1,
+            file_merkle_root: [0x11; 32],
+            file_salt: [0x22; SALT_LEN],
+            original_file_size: 1024,
+            stripe_size_bytes: 1024 * 1024,
+            tier: ErasureTier::Homelab,
+            stripes: vec![manifest_v1::StripeManifestEntryV1 {
+                stripe_index: 0,
+                k_data: 16,
+                m_parity: 4,
+                original_ciphertext_len: 1040,
+                shard_len: 65,
+                stripe_merkle_root: [0x33; 32],
+                shard_hashes: vec![[0x44; 32]; 20],
+                assigned_peers: vec!["peer".to_string(); 20],
+            }],
+            witness_peers: vec!["w1".to_string()],
+        }
+    }
+
+    #[test]
+    fn chunk_roots_v1_bytes_decode_with_empty_roots() {
+        let v1 = v1_manifest();
+        let raw = bincode::serialize(&v1).unwrap();
+        let m = FileManifest::decode_bytes(&raw).expect("v1 decodes");
+        assert_eq!(m.version, FILE_MANIFEST_VERSION);
+        assert_eq!(m.stripes[0].shard_hashes, v1.stripes[0].shard_hashes);
+        assert!(m.stripes[0].shard_chunk_roots.is_empty());
+        assert!(!m.stripes[0].is_chunk_auditable());
+
+        // The same v1 bytes through the encrypted DHT record path.
+        let mk = MasterKey::generate();
+        let enc = crate::crypto::aes::encrypt_manifest(&mk, &raw).unwrap();
+        let m2 = FileManifest::from_encrypted_dht_record(&mk, &enc).unwrap();
+        assert_eq!(m2, m);
+
+        // Re-encoded, it is a valid v2 record that still says "unauditable".
+        let (_, enc2) = m.to_encrypted_dht_record(&mk).unwrap();
+        let m3 = FileManifest::from_encrypted_dht_record(&mk, &enc2).unwrap();
+        assert_eq!(m3, m);
+    }
+
+    #[test]
+    fn chunk_roots_bad_layouts_are_refused() {
+        let mut m: FileManifest = v1_manifest().into();
+        m.stripes[0].shard_chunk_roots = vec![[0x55; 32]; 19];
+        let raw = bincode::serialize(&m).unwrap();
+        assert!(matches!(
+            FileManifest::decode_bytes(&raw),
+            Err(StorageError::ManifestFormat(_))
+        ));
+        let mk = MasterKey::generate();
+        assert!(m.to_encrypted_dht_record(&mk).is_err());
+
+        let mut wrong_version: FileManifest = v1_manifest().into();
+        wrong_version.version = 1;
+        assert!(wrong_version.to_encrypted_dht_record(&mk).is_err());
+
+        let mut unknown = bincode::serialize(&FileManifest::from(v1_manifest())).unwrap();
+        unknown[..4].copy_from_slice(&3u32.to_le_bytes());
+        assert!(FileManifest::decode_bytes(&unknown).is_err());
+        assert!(FileManifest::decode_bytes(&[1, 0]).is_err());
+    }
+
+    #[test]
+    fn chunk_roots_new_store_writes_one_root_per_shard() {
+        let dir = tempdir().expect("tempdir");
+        let quota = QuotaManager::new(200 * 1024 * 1024, 10 * 1024 * 1024);
+        let store = BlockStore::new(dir.path(), quota)
+            .expect("create BlockStore")
+            .with_stripe_size_bytes(BlockStore::SOC_ROUTER_STRIPE_SIZE_BYTES);
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let input_path = dir.path().join("input.bin");
+        fs::write(&input_path, &data).unwrap();
+        let mk = MasterKey::generate();
+        let manifest = store
+            .store_file_streaming("owner", &input_path, &mk, ErasureTier::Homelab, 0)
+            .unwrap();
+        assert_eq!(manifest.version, FILE_MANIFEST_VERSION);
+        for stripe in &manifest.stripes {
+            assert_eq!(stripe.shard_chunk_roots.len(), 20);
+            assert!(stripe.is_chunk_auditable());
+            for (i, root) in stripe.shard_chunk_roots.iter().enumerate() {
+                let id = ShardId {
+                    stripe_merkle_root: stripe.stripe_merkle_root,
+                    shard_index: i as u32,
+                    shard_hash: stripe.shard_hashes[i],
+                };
+                let shard = store.get_shard(&id).unwrap();
+                assert_eq!(*root, crate::por::chunk_merkle::shard_chunk_root(&shard));
+            }
+        }
+        let reloaded = store
+            .load_manifest(&mk, &manifest.file_merkle_root)
+            .unwrap();
+        assert_eq!(reloaded, manifest);
+    }
 
     #[test]
     fn test_configurable_stripe_sizing_and_interoperable_restore() {

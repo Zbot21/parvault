@@ -99,6 +99,7 @@ fn test_vfs_lazy_fetch_latency() {
                 stripe_merkle_root: shard_set.stripe_merkle_root,
                 shard_hashes: shard_set.shard_hashes,
                 assigned_peers: vec!["local".to_string(); n_total],
+                shard_chunk_roots: Vec::new(),
             });
         } else {
             let sparse_root = [0u8; 32];
@@ -112,13 +113,14 @@ fn test_vfs_lazy_fetch_latency() {
                 stripe_merkle_root: sparse_root,
                 shard_hashes: vec![[0u8; 32]; n_total],
                 assigned_peers: Vec::new(),
+                shard_chunk_roots: Vec::new(),
             });
         }
     }
 
     let file_merkle_root = compute_file_merkle_root(&stripe_roots);
     let manifest_10gib = FileManifest {
-        version: 1,
+        version: 2,
         file_merkle_root,
         file_salt,
         original_file_size: TEN_GIB,

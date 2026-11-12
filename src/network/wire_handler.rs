@@ -1694,7 +1694,7 @@ mod tests {
         let kem = HybridKemKeypair::generate().unwrap();
         let owner_pq = HybridPqSigningKeypair::generate().unwrap();
         let manifest = FileManifest {
-            version: 1,
+            version: 2,
             file_merkle_root: [5; 32],
             file_salt: [6; 32],
             original_file_size: 1,

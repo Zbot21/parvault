@@ -579,7 +579,7 @@ fn spawn_folder_sync(opts: &DaemonLaunchOptions, cfg: &NodeConfig, block_store: 
                     let mut engine = FolderSyncEngine::new(store_owner, mk, owner_id, sync_tier);
                     if snap_cl.exists() {
                         if let Ok(raw) = std::fs::read(&snap_cl) {
-                            if let Ok(prev) = bincode::deserialize::<FolderSnapshotManifest>(&raw) {
+                            if let Ok(prev) = FolderSnapshotManifest::decode_bytes(&raw) {
                                 engine.load_previous_snapshot(&prev);
                             }
                         }

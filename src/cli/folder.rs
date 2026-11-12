@@ -26,7 +26,7 @@ pub(crate) async fn diff_folder(env: CliEnv, command: Commands) -> anyhow::Resul
     if let Some(snap_path) = &snapshot {
         if snap_path.exists() {
             let raw = std::fs::read(snap_path)?;
-            let prev_snap: FolderSnapshotManifest = bincode::deserialize(&raw)?;
+            let prev_snap = FolderSnapshotManifest::decode_bytes(&raw)?;
             engine.load_previous_snapshot(&prev_snap);
         }
     }
@@ -140,7 +140,7 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
 
     if snapshot_out.exists() {
         if let Ok(raw_prev) = std::fs::read(&snapshot_out) {
-            if let Ok(prev_snapshot) = bincode::deserialize::<FolderSnapshotManifest>(&raw_prev) {
+            if let Ok(prev_snapshot) = FolderSnapshotManifest::decode_bytes(&raw_prev) {
                 engine.load_previous_snapshot(&prev_snapshot);
             }
         }
@@ -399,7 +399,7 @@ pub(crate) async fn list_snapshot(env: CliEnv, command: Commands) -> anyhow::Res
         unreachable!("list_snapshot() is only dispatched for Commands::ListSnapshot")
     };
     let raw_snapshot = std::fs::read(&snapshot)?;
-    let snapshot_manifest: FolderSnapshotManifest = bincode::deserialize(&raw_snapshot)?;
+    let snapshot_manifest = FolderSnapshotManifest::decode_bytes(&raw_snapshot)?;
     let entries = FolderSyncEngine::list_snapshot_catalog(&snapshot_manifest);
     println!("=== ParVault Vault Snapshot Catalog (Zero-Shard-Download Browse, ADR-17) ===");
     println!("Snapshot File      : {}", snapshot.display());
@@ -447,7 +447,7 @@ pub(crate) async fn restore_folder(env: CliEnv, command: Commands) -> anyhow::Re
         key_hex.as_deref(),
     )?;
     let raw_snapshot = std::fs::read(&snapshot)?;
-    let snapshot_manifest: FolderSnapshotManifest = bincode::deserialize(&raw_snapshot)?;
+    let snapshot_manifest = FolderSnapshotManifest::decode_bytes(&raw_snapshot)?;
     let store_with_owner = block_store
         .clone()
         .with_mesh_client(mesh_client.with_identity(owner_identity.clone()));

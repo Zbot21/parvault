@@ -133,6 +133,7 @@ flowchart LR
 - **Recovery:** `recover-from-seed` restores only folders backed up with `watch-folder` and a phrase (`PARVAULT_SEED_PHRASE` or `--seed-phrase`) and the same `--vault-namespace`, while peers holding the shards are reachable. `parvault init` prints no phrase; `parvault new-seed-phrase` makes one. Folders served by `parvault up --folder` have no phrase recovery.
 - **Placement:** stores go to the node's pinned peers that accept them (ring members); peers of other rings or offline peers are skipped, and when none accepts, the stripe is kept locally (with a warning), as with no peers at all. The 70/30 latency split is applied; the `<= 4 shards per /24` cap is planned (not applied on the CLI store path).
 - **Built-in VFS seed folder (W-04):** if the seed folder cannot be stored at all, the daemon prints a warning and keeps serving without it.
+- **Storage audits:** new manifests (version 2) record a chunk Merkle root per shard, but the audit loop does not issue challenges yet. Manifests written before version 2 have no chunk roots and cannot be audited; re-store the file to add them.
 - **Personal device rings:** the "zero storage quota tax" for linked devices is planned; nothing charges or waives quota by device certificate yet.
 - **Public tracker:** none is hosted; `--public` needs your own `parvault-seed`.
 - **RAM:** `< 32 MiB` is a design target; the evidence is a 48 MiB cgroup Docker stage and `parvault-bench`.

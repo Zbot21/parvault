@@ -625,16 +625,10 @@ mod unix_engine {
                     vec![(*self.owner_peer_id).clone(); n_total]
                 };
 
-                stripes.push(StripeManifestEntry {
-                    stripe_index,
-                    k_data: shard_set.k_data,
-                    m_parity: shard_set.m_parity,
-                    original_ciphertext_len: shard_set.original_ciphertext_len,
-                    shard_len: shard_set.shard_len,
-                    stripe_merkle_root: shard_set.stripe_merkle_root,
-                    shard_hashes: shard_set.shard_hashes,
+                stripes.push(StripeManifestEntry::from_shard_set(
+                    shard_set,
                     assigned_peers,
-                });
+                ));
 
                 self.ops_counter.fetch_add(1, Ordering::Relaxed);
                 self.bytes_ingested
@@ -653,7 +647,7 @@ mod unix_engine {
 
             let file_merkle_root = compute_file_merkle_root(&stripe_roots);
             let fm = FileManifest {
-                version: 1,
+                version: crate::storage::block_store::FILE_MANIFEST_VERSION,
                 file_merkle_root,
                 file_salt,
                 original_file_size: total_size,

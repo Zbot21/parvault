@@ -540,13 +540,13 @@ fn load_manifest_for_abuse_report(
         if let Ok(m) = FileManifest::from_encrypted_dht_record(disclosed_mk, &raw) {
             return Ok(m);
         }
-        if let Ok(m) = bincode::deserialize::<FileManifest>(&raw) {
+        if let Ok(m) = FileManifest::decode_bytes(&raw) {
             return Ok(m);
         }
         if let Ok(m) = serde_json::from_slice::<FileManifest>(&raw) {
             return Ok(m);
         }
-        if let Ok(snap) = bincode::deserialize::<FolderSnapshotManifest>(&raw) {
+        if let Ok(snap) = FolderSnapshotManifest::decode_bytes(&raw) {
             if let Some(first) = snap.files.values().next() {
                 return Ok(first.manifest.clone());
             }
