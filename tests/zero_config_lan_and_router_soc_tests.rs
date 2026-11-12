@@ -502,7 +502,7 @@ fn test_1_zero_ip_home_lan_auto_discovery_4word_pairing_and_cli_backup_restore()
         .args(["--tier", "consumer", "--once"])
         .output()
         .expect("zero-IP watch-folder --once");
-    let watch_stdout = assert_cmd_ok(&watch_out, "zero-IP watch-folder --once");
+    assert_cmd_ok(&watch_out, "zero-IP watch-folder --once");
     let watch_key_hex = sealed_master_key_hex(&watch_client_dir);
 
     // Wipe local client shards so restore-folder pulls from LAN peers with zero --peers
