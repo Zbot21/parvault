@@ -131,6 +131,7 @@ flowchart LR
 - **Erasure coding:** fixed per run with `--tier` (default `homelab`, 16-of-20). Earned standing does not change it yet.
 - **One router:** with a single paired storage node, every shard is on that node.
 - **Recovery:** `recover-from-seed` restores only folders backed up with `watch-folder` and a phrase (`PARVAULT_SEED_PHRASE` or `--seed-phrase`) and the same `--vault-namespace`, while peers holding the shards are reachable. `parvault init` prints no phrase; `parvault new-seed-phrase` makes one. Folders served by `parvault up --folder` have no phrase recovery.
+- **Built-in VFS seed folder (W-04):** `up --vfs-seed-dir` stores the folder on the node's pinned ring peers, or locally only when it has none. If its pinned peers are offline at start, the folder is not stored (the daemon prints a warning and keeps serving); there is no local fallback yet.
 - **Public tracker:** none is hosted; `--public` needs your own `parvault-seed`.
 - **RAM:** `< 32 MiB` is a design target; the evidence is a 48 MiB cgroup Docker stage and `parvault-bench`.
 
