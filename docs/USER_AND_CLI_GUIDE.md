@@ -61,6 +61,8 @@ Global options (available on all subcommands):
 | `parvault identity` | *(none)* | Initializes (if absent) and displays your persistent `Device Peer ID`, `Ed25519 Public Key`, `Owner PQ Public Key Hex` (`Ed25519 + ML-DSA-65`), and `Master Key Fingerprint`. |
 | `parvault issue-device-cert` | `--device-peer-id <ID>` *(required)*<br>`--device-label <LABEL>` *(default: `"personal-device"`)*<br>`--cert-out <PATH>` *(optional)* | Signs a post-quantum composite `PersonalDeviceCert` (`Ed25519 + NIST FIPS 204 ML-DSA-65`) authorizing `<device-peer-id>` to store shards on your Personal Device Ring at `0.0x` quota cost. Outputs both JSON and a compact `PARVAULT-CERT-V1:<hex>` token. |
 | `parvault verify-device-cert` | `--cert <PATH_OR_JSON_OR_TOKEN>` *(required)*<br>`--owner-pq-pubkey-hex <HEX>` *(optional)* | Cryptographically verifies a `PersonalDeviceCert` from a `.json` file, raw JSON string, or `PARVAULT-CERT-V1:<hex>` token against the expected Owner PQ Public Key. |
+| `parvault wot invite` | `--peer <PUBKEY_HEX>` *(required)* | Prints a chain token admitting that key to this ring (`v0.5.0`). Needs the ring genesis seed (`PARVAULT_GENESIS_SEED_HEX` or `<data_dir>/genesis_root.seed`). |
+| `parvault wot install-chain` | `--token <HEX>` *(required)* | Installs a chain token into `<data_dir>/wot_chains/`; the node then presents it before storing on ring peers. |
 
 ### 2.3 Continuous Folder Sync, Diff & Disaster Recovery
 | Command | Flags & Arguments | Description |

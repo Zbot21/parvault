@@ -8,7 +8,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Security
+- **Ring admission is enforced (item 2b, `docs/security/TRUST_FINDINGS.md`).** Storage requests (`PutShard`, `SyndicateLiteStripe`, `PutDhtEnvelope`, `PutBlindedShard`, onion final delivery) need an admitted sender; others get `peer not admitted; v0.5.0 requires ring admission`. Every node in a ring must share the ring genesis (`PARVAULT_GENESIS_SEED_HEX`), or install a chain with `parvault wot invite` / `parvault wot install-chain`. `v0.4.0` peers are refused.
+- `HandshakeWoT` admits only the sender's own chain; the accounted shard owner is always the sender (foreign owner claims are refused); a syndication device cert must name the sender.
+- Repair grants register only after a stored shard, for its stripe, without replacing another owner's grant; witness repair reads need the registered grant.
+- The DHT reader ignores envelopes not sealed by the reading identity; inbound Kademlia records must be valid signed envelopes.
+- Slashing gossip is no longer applied (until proof-carrying evidence, 2c); the genesis and the node's own key are never slashed.
+- `--no-lan-discovery` turns mDNS off; mDNS never feeds Kademlia, admission does.
+
+### Added
+- `MeshWireRequest::AdmitPublicTicket` / `MeshWireResponse::AdmitPublicTicketAck` (appended; existing indices unchanged) and `parvault wot invite` / `parvault wot install-chain`.
+
+### Removed
+- `CorrelatedOutageController::verify_weather_quorum` and `SignedWeatherAttestation` (never called; F-15).
+
 ### Changed
+- The gateway engine's 40 mesh lanes send as the owner identity (one `PeerId`).
+- The seed's syndication puts carry an empty owner claim (accounted to the seed).
 - **Shared wire handler (`#codehealth`):** the daemon and `parvault-seed` now serve every `MeshWireRequest` through one `handle_mesh_wire_request` in `src/network/wire_handler.rs`; the nine role differences are explicit `WireRolePolicy` hooks. Behaviour and wire format are unchanged (pinned by `tests/wire_handler_equivalence.rs`).
 - **Log targets:** the seed's wire-handler warnings now log under `parvault::network::wire_handler` instead of `parvault_seed`, and the daemon's mDNS discovery line under `parvault::network::server_events`. The default filters (`parvault=info`) still print them; a custom `RUST_LOG` that names `parvault_seed` will not.
 - `parvault` command implementations moved from `src/main.rs` into `src/cli/`; `PlacementEngine` and `TokenBucketRateLimiter` moved to `network::placement` / `network::rate_limit` (re-exported at their old paths).

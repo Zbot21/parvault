@@ -15,6 +15,11 @@ Closed invitation rings (`PrivateRing`) provide maximum isolation for families a
 1. **Explicit Trust Pool Modes (`TrustPoolMode`):** Separates default `PrivateRing` (strict invitation chains only) from opt-in `PublicCommons` and `Hybrid` (`--public --tracker <MULTIADDR>`, indexed under `PUBLIC_COMMONS_SWARM_SLOT`).
 2. **Self-Signed Hashcash Admission (`PublicCommonsTicket`):** Stranger nodes in `PublicCommons` mode mint a self-signed Ed25519 ticket carrying a leading-zero SHA-256 Hashcash Proof-of-Work (`DEFAULT_PUBLIC_WOT_POW_BITS = 12`) bound to their `PeerId` and timestamp, paired with mandatory `10-of-20` Reed-Solomon redundancy, `/24` subnet caps, and pre-decoding Merkle quarantine.
 
+## `v0.5.0` Enforcement
+
+- Tickets travel in `MeshWireRequest::AdmitPublicTicket` (appended in `v0.5.0`). In public-commons or hybrid mode a ticket whose key is the sender and that meets the node's PoW bits admits the sender; otherwise it is refused (F-05 in `docs/security/TRUST_FINDINGS.md`).
+- A client presents a chain when it has one and otherwise, in public or hybrid mode, mints a ticket.
+
 ## Consequences & Verification
 
 - **Consequences:** Supports optional self-hosted public swarms with zero manual pairing codes while keeping default `PrivateRing` deployments 100% isolated from public trackers.

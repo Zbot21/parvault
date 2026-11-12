@@ -29,6 +29,10 @@ $$
 3. **Layer 3 — Ephemeral-Issuer Bearer Quota Vouchers (`AnonymousQuotaVoucher`):** Mints single-use bearer tokens signed by fresh per-shard ephemeral Ed25519 keys (`mint_ephemeral`) redeemed into a disk-persisted `65,536`-entry `VoucherNullifierLedger` (`1-to-1` conservation with zero `PeerId` linkage).
 4. **Layer 4 — 2-Layer Post-Quantum Onion Relay Dispatch (`PqRelayedShardEnvelope`):** Wraps `PqInnerStorageEnvelope` (sealed to destination storage peer's `HybridKemPublicKey`) inside an outer relay envelope (sealed to an intermediate relay peer's `HybridKemPublicKey` with `jitter_delay_ms`) so the relay never sees `Locator_i` or `voucher` and the storage peer never sees the uploader's IP/`PeerId`.
 
+## `v0.5.0` Enforcement
+
+- Vouchers are self-certifying in `v0.5.0` (the receiver trusts the issuer the voucher names; issuer policy is item 2c, F-24). Until then a `PutBlindedShard` and an onion final delivery also need an admitted sender: the last hop. A relay forwards under its own identity, so the originator is never asked to identify itself.
+
 ## Consequences & Verification
 
 - **Consequences:** Eliminates static disk grouping, PoR key correlation, quota ledger linkage, and single-hop IP exposure; paired with hedged parallel $N$-shard reads across degraded WANs.
