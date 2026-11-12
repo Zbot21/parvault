@@ -103,7 +103,7 @@ cargo run --release --bin parvault-sync -- self-test
 # Run the empirical cryptography, Reed-Solomon, and /proc/self/status memory benchmark binary
 cargo run --release --bin parvault-bench -- run --payload-mib 64
 
-# Run the 14-container Docker P2P & 48 MiB Router-SoC regression acceptance gate
+# Run the multi-container Docker P2P & 48 MiB Router-SoC regression acceptance gate
 bash scripts/docker_acceptance_gate.sh
 ```
 

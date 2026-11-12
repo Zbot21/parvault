@@ -27,4 +27,4 @@ K_hybrid = HKDF-SHA512(salt = salt, ikm = ikm, info = info)
 ## Consequences & Verification
 
 - **Consequences:** Immunizes asymmetric key encapsulation and long-lived identity/manifest certificates against Shor's algorithm on a CRQC while retaining classical `x25519-dalek` / `ed25519-dalek` security guarantees. (For symmetric encryption under Grover's bound, see [ADR-13](ADR-13-symmetric-pq-grover-baseline-and-cascaded-aead.md).)
-- **Verification:** `specs/ParVaultPostQuantum.tla` (`Safety_HNDLConfidentialityPreserved`, `Safety_QuantumSignatureUnforgeability`, `927` distinct states, `0` errors) and `tests/post_quantum_security_proofs.rs`.
+- **Verification:** `specs/ParVaultPostQuantum.tla` (`Safety_HNDLConfidentialityPreserved`, `Safety_QuantumSignatureUnforgeability`, <!-- metric:tlc.distinct.ParVaultPostQuantum -->`927`<!-- /metric --> distinct states, `0` errors) and `tests/post_quantum_security_proofs.rs`.

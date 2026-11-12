@@ -13,7 +13,7 @@ Thank you for contributing to **Neighborhood Cloud (`parvault`)**! Because `parv
    ```
 3. **Java `17+` & `tla2tools.jar` + Kani Rust Verifier (When modifying protocol state machines or wire parsers):**
    Required to run the TLA+ TLC model checker across the **<!-- metric:tla_specs -->7<!-- /metric -->** formal specifications in [`specs/`](specs/) and `cargo kani` across the **<!-- metric:kani_harnesses -->17<!-- /metric -->** symbolic harnesses (`bash scripts/verify_formal_proofs.sh`).
-4. **Docker Engine:** Required to run the 14-container P2P regression and `48m` Router-SoC acceptance gate (`scripts/docker_acceptance_gate.sh`).
+4. **Docker Engine:** Required to run the multi-container P2P regression and `48m` Router-SoC acceptance gate (`scripts/docker_acceptance_gate.sh`).
 
 ---
 

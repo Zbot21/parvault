@@ -5,12 +5,16 @@
 # Default mode (used by `scripts/sync_doc_metrics.sh --generate`, run in CI):
 #   prints `key = value` lines computed from the tree only: no network, no
 #   cargo build, stable order. It prints:
-#     - counts taken from the source (version, Kani harnesses, TLA+ specs,
-#       ADRs, test functions, integration suites)
+#     - counts taken from the source (Kani harnesses, TLA+ specs, ADRs,
+#       test functions)
 #     - values derived from the static measured keys in docs/metrics.txt
 #       (MiB from exact bytes, min-max ranges), so they cannot disagree.
 #
-# --measured (opt-in, never run by CI): re-runs the repository's existing
+# Fails closed: every value is computed and checked before anything is
+# printed. An impossible value (empty, 0) exits 1 with a message on stderr
+# and prints nothing on stdout, so --generate cannot write it into the docs.
+#
+# --measured [sizes|tlc] (opt-in, never run by CI; default both): re-runs the repository's existing
 #   measurement commands and prints fresh values for the STATIC measured keys.
 #   Review them, then copy them into the static section of docs/metrics.txt
 #   with a new provenance comment (command + date). It runs:
@@ -18,7 +22,8 @@
 #       targets, then `stat` -> size.<bin>.<arch>.bytes
 #       (aarch64 needs CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER)
 #     - TLC on every specs/*.tla (needs TLA2TOOLS_JAR) ->
-#       tlc.generated, tlc.distinct.<Spec>
+#       tlc.generated.<Spec>, tlc.distinct.<Spec>, tlc.depth.<Spec> (store
+#       only the depth keys a doc uses)
 #   Benchmark, RSS and latency keys are min-max ranges over repeated runs of
 #   parvault-bench and the self-tests, so they are re-measured by hand (see
 #   the comments in docs/metrics.txt).
@@ -29,73 +34,102 @@ cd "$(git rev-parse --show-toplevel)"
 
 # 1234567 -> 1,234,567 (locale-independent)
 group() { printf '%s' "$1" | rev | sed -E 's/([0-9]{3})/\1,/g; s/,$//' | rev; }
+fail() { echo "gen_metrics.sh: $*" >&2; exit 1; }
 
 if [[ "${1:-}" == "--measured" ]]; then
-  : "${CARGO_TARGET_DIR:?set CARGO_TARGET_DIR}"
-  for target in aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
-    arch="${target%%-*}"
-    for bin in parvault parvault-seed parvault-fuse parvault-sync; do
-      cargo build -q --profile soc --target "$target" --bin "$bin" >&2
-      bytes="$(stat -c %s "$CARGO_TARGET_DIR/$target/soc/$bin")"
-      printf 'size.%s.%s.bytes = %s B\n' "$bin" "$arch" "$(group "$bytes")"
+  what="${2:-all}"
+  [[ "$what" == all || "$what" == sizes || "$what" == tlc ]] || fail "usage: --measured [sizes|tlc]"
+  out=""
+  if [[ "$what" != tlc ]]; then
+    [[ -n "${CARGO_TARGET_DIR:-}" ]] || fail "--measured sizes needs CARGO_TARGET_DIR"
+    for target in aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
+      arch="${target%%-*}"
+      for bin in parvault parvault-seed parvault-fuse parvault-sync; do
+        cargo build -q --profile soc --target "$target" --bin "$bin" >&2
+        bytes="$(stat -c %s "$CARGO_TARGET_DIR/$target/soc/$bin")"
+        [[ "$bytes" =~ ^[1-9][0-9]*$ ]] || fail "no size for $bin ($target)"
+        out+="size.$bin.$arch.bytes = $(group "$bytes") B"$'\n'
+      done
     done
-  done
-  : "${TLA2TOOLS_JAR:?set TLA2TOOLS_JAR}"
-  meta="$(mktemp -d)"; trap 'rm -rf "$meta"' EXIT
-  total=0
-  for spec in specs/*.tla; do
-    name="$(basename "$spec" .tla)"
-    out="$(cd specs && java -XX:+UseParallelGC -cp "$TLA2TOOLS_JAR" tlc2.TLC -workers auto -cleanup \
-      -metadir "$meta/$name" -config "$name.cfg" "$name.tla")"
-    line="$(grep -E '[0-9,]+ states generated, [0-9,]+ distinct states found' <<<"$out" | tail -1)"
-    gen="$(sed -E 's/^([0-9,]+) states generated.*/\1/' <<<"$line" | tr -d ,)"
-    dist="$(sed -E 's/.*generated, ([0-9,]+) distinct.*/\1/' <<<"$line" | tr -d ,)"
-    total=$((total + gen))
-    printf 'tlc.distinct.%s = %s\n' "$name" "$(group "$dist")"
-  done
-  printf 'tlc.generated = %s\n' "$(group "$total")"
+  fi
+  if [[ "$what" != sizes ]]; then
+    [[ -f "${TLA2TOOLS_JAR:-}" ]] || fail "--measured tlc needs TLA2TOOLS_JAR"
+    meta="$(mktemp -d)"; trap 'rm -rf "$meta"' EXIT
+    for spec in specs/*.tla; do
+      [[ -f "$spec" ]] || fail "no specs/*.tla"
+      name="$(basename "$spec" .tla)"
+      log="$(cd specs && java -XX:+UseParallelGC -cp "$TLA2TOOLS_JAR" tlc2.TLC -workers auto -cleanup \
+        -metadir "$meta/$name" -config "$name.cfg" "$name.tla")" || fail "TLC failed on $name"
+      line="$(grep -E '[0-9,]+ states generated, [0-9,]+ distinct states found' <<<"$log" | tail -1 || true)"
+      [[ -n "$line" ]] || fail "no state counts in TLC output for $name"
+      gen="$(sed -E 's/^([0-9,]+) states generated.*/\1/' <<<"$line" | tr -d ,)"
+      dist="$(sed -E 's/.*generated, ([0-9,]+) distinct.*/\1/' <<<"$line" | tr -d ,)"
+      depth="$(sed -nE 's/.*depth of the complete state graph search is ([0-9]+).*/\1/p' <<<"$log" | tail -1)"
+      [[ -n "$depth" ]] || fail "no search depth in TLC output for $name"
+      out+="tlc.generated.$name = $(group "$gen")"$'\n'"tlc.distinct.$name = $(group "$dist")"$'\n'
+      out+="tlc.depth.$name = $depth"$'\n'
+    done
+  fi
+  printf '%s' "$out"
   exit 0
 fi
-[[ $# -eq 0 ]] || { echo "usage: gen_metrics.sh [--measured]" >&2; exit 2; }
+[[ $# -eq 0 ]] || fail "usage: gen_metrics.sh [--measured [sizes|tlc]]"
 
 export LC_ALL=C
 
-# --- Counts from the tree -----------------------------------------------------
-version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
-kani_total="$(grep -rhE '^\s*#\[kani::proof\]' src | wc -l)"
-kani_module="$(grep -hE '^\s*#\[kani::proof\]' src/kani_proofs.rs | wc -l)"
-tla_specs="$(find specs -maxdepth 1 -name '*.tla' | wc -l)"
-adr_count="$(find docs/adr -maxdepth 1 -name 'ADR-[0-9]*.md' | wc -l)"
-adr_last="$(find docs/adr -maxdepth 1 -name 'ADR-[0-9]*.md' -printf '%f\n' | sort | tail -1 | grep -oE '^ADR-[0-9]+')"
-suites="$(find tests -maxdepth 1 -name '*.rs' | wc -l)"
-test_attr='^\s*#\[(tokio::)?test(\(.*\))?\]'
-tests_unit="$(grep -rhE "$test_attr" src | wc -l)"
-kani_in() { grep -hE '^\s*#\[kani::proof\]' "$1" | wc -l; }
-tests_int="$(grep -hE "$test_attr" tests/*.rs | wc -l)"
+# --- Counts from the tree (each checked before any output) ---------------------
+# count <regex> <file>...: matching lines across existing .rs files; a missing
+# file is an error, not 0.
+count() {
+  local re="$1"; shift
+  local f
+  for f in "$@"; do [[ -f "$f" ]] || fail "missing file: $f"; done
+  { grep -hE "$re" "$@" || true; } | wc -l
+}
+rs_under() { find "$1" -type f -name '*.rs' -print | sort; }
+positive() { [[ "$2" =~ ^[1-9][0-9]*$ ]] || fail "$1 is '$2' (expected a positive count)"; }
+
+kani_re='^\s*#\[kani::proof\]'
+test_re='^\s*#\[(tokio::)?test(\(.*\))?\]'
+mapfile -t src_rs < <(rs_under src)
+mapfile -t test_rs < <(find tests -maxdepth 1 -type f -name '*.rs' -print | sort)
+mapfile -t specs < <(find specs -maxdepth 1 -type f -name '*.tla' -print)
+mapfile -t adrs < <(find docs/adr -maxdepth 1 -type f -name 'ADR-[0-9]*.md' -printf '%f\n' | grep -oE '^ADR-[0-9]+' | sort -t- -k2,2n)
+[[ ${#src_rs[@]} -gt 0 ]] || fail "no src/**/*.rs"
+[[ ${#test_rs[@]} -gt 0 ]] || fail "no tests/*.rs"
+
+kani_total="$(count "$kani_re" "${src_rs[@]}")";                positive kani_harnesses "$kani_total"
+kani_module="$(count "$kani_re" src/kani_proofs.rs)";            positive kani_harnesses_module "$kani_module"
+kani_caps="$(count "$kani_re" src/capabilities.rs)";             positive kani_harnesses.capabilities "$kani_caps"
+kani_aes="$(count "$kani_re" src/crypto/aes.rs)";                positive kani_harnesses.aes "$kani_aes"
+kani_rs="$(count "$kani_re" src/sharding/reed_solomon.rs)";      positive kani_harnesses.reed_solomon "$kani_rs"
+tla_specs="${#specs[@]}";                                        positive tla_specs "$tla_specs"
+adr_count="${#adrs[@]}";                                         positive adr_count "$adr_count"
+adr_last="${adrs[adr_count - 1]}"
+[[ "$adr_last" =~ ^ADR-[0-9]+$ ]] || fail "adr_last is '$adr_last'"
+tests_unit="$(count "$test_re" "${src_rs[@]}")";                 positive tests_unit "$tests_unit"
+tests_int="$(count "$test_re" "${test_rs[@]}")";                 positive tests_integration "$tests_int"
 tests_total=$((tests_unit + tests_int))
 
-cat <<EOF
-crate_version = $version
-kani_harnesses = $kani_total
+counts="kani_harnesses = $kani_total
 kani_harnesses_module = $kani_module
 kani_pass = $kani_total / $kani_total
 kani_pass_compact = $kani_total/$kani_total
-kani_harnesses.capabilities = $(kani_in src/capabilities.rs)
-kani_harnesses.aes = $(kani_in src/crypto/aes.rs)
-kani_harnesses.reed_solomon = $(kani_in src/sharding/reed_solomon.rs)
+kani_harnesses.capabilities = $kani_caps
+kani_harnesses.aes = $kani_aes
+kani_harnesses.reed_solomon = $kani_rs
 tla_specs = $tla_specs
 tla_pass = $tla_specs / $tla_specs
 adr_count = $adr_count
 adr_last = $adr_last
-integration_suites = $suites
 tests_unit = $tests_unit
 tests_integration = $tests_int
 tests_total = $tests_total
-tests_pass = $tests_total / $tests_total
-EOF
+tests_pass = $tests_total / $tests_total"
 
 # --- Values derived from static measured keys ----------------------------------
-python3 - docs/metrics.txt <<'PY'
+[[ -f docs/metrics.txt ]] || fail "missing docs/metrics.txt"
+derived="$(python3 - docs/metrics.txt <<'PY'
 import re, sys
 static = {}
 in_gen = False
@@ -122,6 +156,11 @@ for k, v in static.items():
         mib = num(v) / 1048576
         sizes.setdefault(m.group(2), []).append(mib)
         out.append((f"size.{m.group(1)}.{m.group(2)}", f"{mib:.2f} MiB"))
+BINS = ("parvault", "parvault-seed", "parvault-fuse", "parvault-sync")
+missing = [f"size.{b}.{a}.bytes" for a in ("aarch64", "x86_64") for b in BINS
+           if f"size.{b}.{a}.bytes" not in static]
+if missing:
+    sys.exit("missing static keys: " + ", ".join(missing))
 for arch in ("aarch64", "x86_64"):
     v = sizes[arch]
     out.append((f"size.{arch}.range", f"{min(v):.2f}–{max(v):.2f} MiB"))
@@ -145,10 +184,19 @@ out.append(("bench.soc.vmhwm_reduction", f"{num(static['bench.desktop.vmhwm']) /
 a, b = span(static["aes.enc.desktop"]), span(static["aes.enc.soc"])
 out.append(("aes.enc.span", f"{min(a[0], b[0]):.1f}–{max(a[1], b[1]):.1f} MiB/s"))
 
-# TLC distinct states: sum of the per-spec counts.
-dist = sum(int(num(v)) for k, v in static.items() if k.startswith("tlc.distinct."))
-out.append(("tlc.distinct", f"{dist:,}"))
+# TLC totals: sums of the per-spec counts (every spec needs both keys).
+specs = sorted(k[len("tlc.distinct."):] for k in static if k.startswith("tlc.distinct."))
+if not specs or any(f"tlc.generated.{s}" not in static for s in specs):
+    sys.exit("tlc.generated.<Spec> / tlc.distinct.<Spec> keys missing or unpaired")
+for kind in ("generated", "distinct"):
+    out.append((f"tlc.{kind}", f"{sum(int(num(static[f'tlc.{kind}.{s}'])) for s in specs):,}"))
 
 for k, v in out:
+    if not v or v.startswith(("0 ", "0.00")):
+        sys.exit(f"derived value {k} = '{v}' is empty or zero")
     print(f"{k} = {v}")
 PY
+)" || fail "deriving values from docs/metrics.txt failed"
+[[ -n "$derived" ]] || fail "no derived values"
+
+printf '%s\n%s\n' "$counts" "$derived"
