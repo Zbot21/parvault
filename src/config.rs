@@ -335,7 +335,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Initialize keys (`0600`), print a fresh 24-word BIP-39 recovery phrase, and write a turnkey `config.toml`.
+    /// Initialize keys (`0600`) and write a turnkey `config.toml`.
     Init {
         /// Optional folder to create and configure for automatic continuous backup.
         #[arg(long, value_name = "DIR", visible_alias = "folder")]
@@ -551,6 +551,9 @@ pub enum Commands {
     Status,
     /// Display or initialize the persistent NodeIdentity, Post-Quantum Owner Key, and Master Key fingerprints.
     Identity,
+    /// Print a fresh 24-word BIP-39 recovery phrase and store nothing. Back up with
+    /// `watch-folder --seed-phrase` to make a folder recoverable with `recover-from-seed` (ADR-18).
+    NewSeedPhrase,
     /// Issue a post-quantum PersonalDeviceCert (Ed25519 + ML-DSA-65) authorizing a personal device on the Homelab Ring.
     IssueDeviceCert {
         /// Device Peer ID to authorize (e.g. `parvault-peer-...`).
@@ -623,15 +626,18 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         prune_deleted: bool,
 
-        /// Optional recovery seed phrase to derive deterministic keys and export an EncryptedVaultCatalogEnvelope.
+        /// Recovery seed phrase (or `PARVAULT_SEED_PHRASE`): derives the vault keys and publishes an
+        /// EncryptedVaultCatalogEnvelope, so `recover-from-seed` can restore this folder (ADR-18).
+        /// Without it the folder has no phrase recovery.
         #[arg(long)]
         seed_phrase: Option<String>,
 
-        /// Vault namespace used with `--seed-phrase` for deterministic disaster recovery (ADR-15).
+        /// Vault namespace used with `--seed-phrase` for disaster recovery (ADR-18).
         #[arg(long, default_value = "default")]
         vault_namespace: String,
 
         /// Optional output file path for the post-quantum EncryptedVaultCatalogEnvelope (`.catalog.bin`).
+        /// Needs `--seed-phrase` (or `PARVAULT_SEED_PHRASE`).
         #[arg(long)]
         catalog_out: Option<PathBuf>,
 
@@ -671,11 +677,13 @@ pub enum Commands {
         #[arg(long)]
         filter: Option<String>,
     },
-    /// Zero-Local-State "House Fire" Disaster Recovery from a memorized seed phrase and network peers or EncryptedVaultCatalogEnvelope (ADR-15 / ADR-17).
+    /// Zero-Local-State "House Fire" Disaster Recovery from a memorized seed phrase and network peers or EncryptedVaultCatalogEnvelope (ADR-18). Recovers only folders backed up with
+    /// `watch-folder --seed-phrase` and the same `--vault-namespace`.
     RecoverFromSeed {
-        /// Memorized recovery seed phrase.
+        /// Memorized recovery seed phrase (default: `PARVAULT_SEED_PHRASE`, which keeps it out of
+        /// the process list).
         #[arg(long)]
-        seed_phrase: String,
+        seed_phrase: Option<String>,
 
         /// Vault namespace (default: "default").
         #[arg(long, default_value = "default")]

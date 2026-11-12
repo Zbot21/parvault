@@ -59,7 +59,6 @@ pub(crate) fn init(
             None,
             cfg.device_sealing_passphrase.as_deref(),
         )?;
-        let mnemonic = generate_bip39_mnemonic(24)?;
 
         let cfg_out_path = cli
             .config
@@ -92,9 +91,6 @@ pub(crate) fn init(
         if let Some(ref wdir) = cfg.watched_folder {
             println!("Watched Folder          : {}", wdir.display());
         }
-        println!("----------------------------------------------------------------------");
-        println!("24-Word BIP-39 Recovery Mnemonic (Write this down offline!):");
-        println!("  {}", mnemonic);
         println!("----------------------------------------------------------------------");
         println!("Next Steps (Zero-IP Quickstart):");
         println!(

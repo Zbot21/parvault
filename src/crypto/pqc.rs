@@ -538,7 +538,7 @@ impl PqVaultMasterKey {
     }
 
     /// Deterministically derives a 512-bit `PqVaultMasterKey` from a memorized
-    /// recovery seed phrase and `vault_namespace` (`ADR-15` zero-local-state disaster recovery).
+    /// recovery seed phrase and `vault_namespace` (`ADR-18` zero-local-state disaster recovery).
     /// Applies Unicode NFKD normalization (`B6`), stretches into a 64-byte root seed via `Argon2id`
     /// (`64 MiB, t=3, p=4`), and expands via `HKDF-SHA512` (`A1`).
     pub fn from_recovery_seed_phrase(seed_phrase: &str, vault_namespace: &str) -> Self {

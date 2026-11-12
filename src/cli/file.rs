@@ -77,7 +77,6 @@ pub(crate) async fn file(env: CliEnv, command: Commands) -> anyhow::Result<()> {
                 hex::encode(manifest.file_merkle_root)
             );
             println!("DHT Manifest Key : {}", hex::encode(dht_key));
-            println!("Master Key (hex) : {}", master_key.to_hex());
             println!("Original Size    : {} bytes", manifest.original_file_size);
             println!(
                 "Erasure Scheme   : {}-of-{} ({:.1}% efficiency, {:.2}x expansion)",

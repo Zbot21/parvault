@@ -2281,3 +2281,261 @@ fn conflicting_genesis_sources_refuse_to_start() {
     assert!(text.contains("conflicting ring genesis sources"), "{text}");
     gate_ran("trust_enforcement::conflicting_genesis_sources_refuse_to_start");
 }
+
+// --- W-01: the recovery phrase is opt-in at backup time ---------------------------------------
+
+/// A ring-member client on `dir` (working directory `cwd`) that reaches only `peers`.
+fn phrase_client(dir: &Path, cwd: &Path, peers: &str) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.current_dir(cwd)
+        .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+        .env_remove("PARVAULT_GENESIS_PUBKEY_HEX")
+        .env_remove("PARVAULT_SEED_PHRASE")
+        .env("PARVAULT_LAN_REGISTRY_DIR", cwd.join("lan-registry"))
+        .env_remove("PARVAULT_PEERS")
+        .arg("--data-dir")
+        .arg(dir)
+        .arg("--no-lan-discovery");
+    if !peers.is_empty() {
+        cmd.env("PARVAULT_PEERS", peers);
+    }
+    cmd
+}
+
+const W01_NS: &str = "laptop";
+
+fn w01_files() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        ("notes.txt", b"house fire drill".to_vec()),
+        (
+            "docs/plan.bin",
+            (0..70_000u32).map(|i| (i % 251) as u8).collect(),
+        ),
+    ]
+}
+
+/// Backs up a folder from a fresh client into `node`, with the phrase in `PARVAULT_SEED_PHRASE`
+/// if `phrase` is set (the documented commands). Returns the client's root directory.
+fn w01_backup(node: &Node, label: &str, phrase: Option<&str>) -> TempDir {
+    let root = temp_root(label);
+    let folder = root.path().join("Documents");
+    for (rel, bytes) in w01_files() {
+        let p = folder.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, bytes).unwrap();
+    }
+    let mut cmd = phrase_client(&root.path().join("data"), root.path(), &node.addr);
+    if let Some(p) = phrase {
+        cmd.env("PARVAULT_SEED_PHRASE", p);
+    }
+    let out = cmd
+        .arg("watch-folder")
+        .arg("--folder")
+        .arg(&folder)
+        .args(["--once", "--vault-namespace", W01_NS])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", out_text(&out));
+    root
+}
+
+/// Runs `recover-from-seed` from a fresh data directory into `<root>/Recovered`.
+fn w01_recover(
+    node: &Node,
+    label: &str,
+    phrase: &str,
+    ns: &str,
+) -> (TempDir, std::process::Output) {
+    let root = temp_root(label);
+    let out = phrase_client(&root.path().join("data"), root.path(), &node.addr)
+        .env("PARVAULT_SEED_PHRASE", phrase)
+        .args(["recover-from-seed", "--vault-namespace", ns, "--out-dir"])
+        .arg(root.path().join("Recovered"))
+        .output()
+        .unwrap();
+    (root, out)
+}
+
+fn assert_nothing_recovered(root: &TempDir) {
+    let out_dir = root.path().join("Recovered");
+    let empty = !out_dir.exists() || std::fs::read_dir(&out_dir).unwrap().next().is_none();
+    assert!(empty, "files were written to {}", out_dir.display());
+}
+
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            out.extend(files_under(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// W-01 test 1: `init` prints no phrase and no recovery line, and a second `init` leaves the
+/// sealed master key unchanged.
+#[test]
+fn w01_init_prints_no_phrase() {
+    let root = temp_root("w01-init");
+    let dir = root.path().join("n");
+    let first = parvault_cli(&dir, false, &["init"]);
+    assert!(first.status.success(), "{}", out_text(&first));
+    let sealed = std::fs::read(dir.join("master_key.sealed")).unwrap();
+    let second = parvault_cli(&dir, false, &["init"]);
+    assert!(second.status.success(), "{}", out_text(&second));
+    for out in [&first, &second] {
+        let text = out_text(out);
+        assert!(
+            !text.contains("Recovery") && !text.contains("Mnemonic"),
+            "{text}"
+        );
+        for line in text.lines() {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let phrase_like = words.len() >= 12
+                && words
+                    .iter()
+                    .all(|w| w.chars().all(|c| c.is_ascii_lowercase()));
+            assert!(!phrase_like, "init printed a phrase: {line}");
+        }
+    }
+    assert_eq!(
+        std::fs::read(dir.join("master_key.sealed")).unwrap(),
+        sealed
+    );
+}
+
+/// W-01 test 2: a folder backed up with the phrase is recovered byte for byte into a fresh
+/// data directory with the documented commands.
+#[test]
+fn w01_phrase_backup_recovers_byte_identical() {
+    let node = spawn_daemon("w01-rec");
+    let _backup = w01_backup(&node, "w01-rec-a", Some(PHRASE));
+    let (root, out) = w01_recover(&node, "w01-rec-b", PHRASE, W01_NS);
+    assert!(out.status.success(), "{}", out_text(&out));
+    for (rel, bytes) in w01_files() {
+        assert_eq!(
+            std::fs::read(root.path().join("Recovered").join(rel)).unwrap(),
+            bytes,
+            "{rel}"
+        );
+    }
+}
+
+/// W-01 test 3: a wrong phrase or namespace fails and writes nothing.
+#[test]
+fn w01_wrong_phrase_or_namespace_recovers_nothing() {
+    let node = spawn_daemon("w01-wrong");
+    let _backup = w01_backup(&node, "w01-wrong-a", Some(PHRASE));
+    let other = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    for (label, phrase, ns) in [
+        ("w01-wrong-p", other, W01_NS),
+        ("w01-wrong-n", PHRASE, "desktop"),
+    ] {
+        let (root, out) = w01_recover(&node, label, phrase, ns);
+        assert!(!out.status.success(), "{label}: {}", out_text(&out));
+        assert_nothing_recovered(&root);
+    }
+}
+
+/// W-01 test 4: a vault backed up without a phrase cannot be recovered from one, and the
+/// command fails cleanly.
+#[test]
+fn w01_vault_without_phrase_is_not_recoverable() {
+    let node = spawn_daemon("w01-nophrase");
+    let _backup = w01_backup(&node, "w01-nophrase-a", None);
+    let (root, out) = w01_recover(&node, "w01-nophrase-b", PHRASE, W01_NS);
+    let text = out_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(!text.contains("panicked"), "{text}");
+    assert_nothing_recovered(&root);
+}
+
+/// W-01 test 5: the phrase is written nowhere: not in the data directory, the snapshot, the
+/// catalog or `config.toml`.
+#[test]
+fn w01_phrase_is_never_stored() {
+    let node = spawn_daemon("w01-store");
+    let backup = w01_backup(&node, "w01-store-a", Some(PHRASE));
+    let files = files_under(backup.path());
+    assert!(
+        files
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with(".manifest.bin")),
+        "{files:?}"
+    );
+    for p in files.iter().chain(files_under(&node.dir).iter()) {
+        let bytes = std::fs::read(p).unwrap();
+        let found = bytes.windows(PHRASE.len()).any(|w| w == PHRASE.as_bytes());
+        assert!(!found, "the phrase is stored in {}", p.display());
+    }
+}
+
+/// W-01 test 6 (W-02): `watch-folder` and `file store` never print the master key.
+#[test]
+fn w01_master_key_is_never_printed() {
+    let node = spawn_daemon("w01-mk");
+    let root = temp_root("w01-mk-a");
+    let key_hex = hex::encode([0x5Au8; 32]);
+    let folder = root.path().join("Documents");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.txt"), b"master key must stay secret").unwrap();
+    let dir = root.path().join("data");
+    let watch = phrase_client(&dir, root.path(), &node.addr)
+        .arg("watch-folder")
+        .arg("--folder")
+        .arg(&folder)
+        .args(["--once", "--key-hex", &key_hex])
+        .output()
+        .unwrap();
+    let store = phrase_client(&dir, root.path(), &node.addr)
+        .args(["file", "store", "--key-hex", &key_hex])
+        .arg(folder.join("a.txt"))
+        .output()
+        .unwrap();
+    for out in [&watch, &store] {
+        let text = out_text(out);
+        assert!(out.status.success(), "{text}");
+        assert!(!text.to_lowercase().contains(&key_hex), "{text}");
+        assert!(!text.contains("Master Key (hex)"), "{text}");
+    }
+}
+
+/// W-01: `--catalog-out` without a phrase is an error (it used to seal under a public constant).
+#[test]
+fn w01_catalog_out_needs_a_phrase() {
+    let root = temp_root("w01-cat");
+    let folder = root.path().join("Documents");
+    std::fs::create_dir_all(&folder).unwrap();
+    let out = phrase_client(&root.path().join("data"), root.path(), "")
+        .arg("watch-folder")
+        .arg("--folder")
+        .arg(&folder)
+        .arg("--once")
+        .arg("--catalog-out")
+        .arg(root.path().join("c.catalog.bin"))
+        .output()
+        .unwrap();
+    let text = out_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("--catalog-out needs --seed-phrase"), "{text}");
+    assert!(!root.path().join("c.catalog.bin").exists());
+}
+
+/// W-03: `watch-folder` on a missing folder exits non-zero.
+#[test]
+fn w03_missing_folder_fails() {
+    let root = temp_root("w03");
+    let out = phrase_client(&root.path().join("data"), root.path(), "")
+        .arg("watch-folder")
+        .arg("--folder")
+        .arg(root.path().join("no-such-folder"))
+        .arg("--once")
+        .output()
+        .unwrap();
+    let text = out_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("does not exist"), "{text}");
+}

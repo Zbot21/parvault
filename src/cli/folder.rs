@@ -74,6 +74,15 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
         .or_else(|| std::env::var("PARVAULT_SEED_PHRASE").ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    anyhow::ensure!(
+        catalog_out.is_none() || effective_seed_phrase.is_some(),
+        "--catalog-out needs --seed-phrase (or PARVAULT_SEED_PHRASE): the catalog is sealed under the recovery phrase"
+    );
+    anyhow::ensure!(
+        folder.is_dir(),
+        "watched folder {} does not exist or is not a directory",
+        folder.display()
+    );
 
     let (master_key, owner_identity) = if let Some(phrase) = effective_seed_phrase.as_deref() {
         let canonical = parvault::crypto::validate_recovery_seed_phrase_or_passphrase(phrase)?;
@@ -311,12 +320,11 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
             println!("Pruned Shards      : {}", pruned_shards);
         }
         println!("Snapshot Saved To  : {}", snapshot_out.display());
-        println!("Master Key (hex)   : {}", master_key.to_hex());
 
         if let Some(cat_path) = &catalog_out {
             let phrase = effective_seed_phrase
                 .as_deref()
-                .unwrap_or("parvault-default-local-catalog-seed");
+                .expect("checked above: --catalog-out needs a seed phrase");
             let envelope =
                 engine.export_encrypted_vault_catalog(phrase, &vault_namespace, &snapshot)?;
             if is_lite_net_seed {
@@ -486,6 +494,13 @@ pub(crate) async fn recover_from_seed(env: CliEnv, command: Commands) -> anyhow:
     else {
         unreachable!("recover_from_seed() is only dispatched for Commands::RecoverFromSeed")
     };
+    let seed_phrase = seed_phrase
+        .or_else(|| std::env::var("PARVAULT_SEED_PHRASE").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("recover-from-seed needs --seed-phrase or PARVAULT_SEED_PHRASE")
+        })?;
     let canonical_seed =
         parvault::crypto::validate_recovery_seed_phrase_or_passphrase(&seed_phrase)?;
     let master_key = MasterKey::from_recovery_seed_phrase(&canonical_seed, &vault_namespace);
@@ -554,7 +569,7 @@ pub(crate) async fn recover_from_seed(env: CliEnv, command: Commands) -> anyhow:
             &envelope,
             &out_dir,
         )?;
-        println!("=== ParVault Disaster Recovery From Seed Phrase Complete (ADR-15) ===");
+        println!("=== ParVault Disaster Recovery From Seed Phrase Complete (ADR-18) ===");
         println!("Vault Namespace    : {}", vault_namespace);
         println!("Catalog Version    : {}", envelope.monotonic_version);
         println!("DHT Root Key (hex) : {}", hex::encode(envelope.dht_key));

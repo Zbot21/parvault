@@ -128,6 +128,7 @@ fn command_needs_network_discovery(cmd: &Commands) -> bool {
     !matches!(
         cmd,
         Commands::Init { .. }
+            | Commands::NewSeedPhrase
             | Commands::Discover { .. }
             | Commands::Pair { .. }
             | Commands::Join { .. }
@@ -255,6 +256,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // Stores nothing and needs no data directory or configuration.
+    if matches!(cli.command, Commands::NewSeedPhrase) {
+        println!("{}", generate_bip39_mnemonic(24)?);
+        return Ok(());
+    }
     let cfg = NodeConfig::load_for_cli(cli.config.as_ref(), cli.data_dir.as_deref(), cli.profile)?;
 
     let lan_port = cfg.effective_lan_discovery_port(cli.lan_discovery_port);
@@ -355,6 +361,7 @@ async fn main() -> anyhow::Result<()> {
     };
     match cli.command {
         Commands::Init { .. }
+        | Commands::NewSeedPhrase
         | Commands::Token { .. }
         | Commands::Wot { .. }
         | Commands::Gateway { .. } => {
