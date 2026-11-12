@@ -149,6 +149,7 @@ src/sharding/reed_solomon.rs    kani    proof_gf256_field_axioms_and_shard_bound
 src/sharding/reed_solomon.rs    kani    proof_router_soc_and_desktop_reed_solomon_memory_ceiling
 
 # --- por/* -------------------------------------------------------------------
+src/por/*                       lib     por::verifier::
 src/por/*                       lib     admin_rpc::
 src/por/*                       lib     capabilities::
 src/por/*                       lib     config::

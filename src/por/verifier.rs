@@ -14,6 +14,57 @@ use thiserror::Error;
 /// during an offline cohort repair (ADR-04).
 pub const MIN_WITNESS_SIGNATURES_FOR_REPAIR: usize = 2;
 
+/// What the grant-registration decision needs to know (F-02a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrantRegFacts {
+    /// The grant's owner signature verifies.
+    pub grant_valid: bool,
+    /// The grant names the stripe of the shard that was just stored (`true` when no shard is
+    /// involved).
+    pub root_matches: bool,
+    /// The owner of the grant already registered for that stripe, if any.
+    pub existing_owner: Option<[u8; 32]>,
+    pub grant_owner: [u8; 32],
+}
+
+/// Registers a grant only if it is valid, names the stored shard's stripe, and does not replace
+/// another owner's grant (first registrant wins; same-owner updates are allowed).
+pub fn grant_registration_decision(facts: &GrantRegFacts) -> Result<(), &'static str> {
+    if !facts.grant_valid {
+        return Err("reject.repair_grant_invalid");
+    }
+    if !facts.root_matches {
+        return Err("reject.repair_grant_root_mismatch");
+    }
+    if facts
+        .existing_owner
+        .is_some_and(|owner| owner != facts.grant_owner)
+    {
+        return Err("reject.repair_grant_owner_conflict");
+    }
+    Ok(())
+}
+
+/// What the repair-read decision needs to know (F-02b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepairReadFacts {
+    /// The presented grant equals the grant registered for the stripe (owner, witnesses, tier).
+    pub grant_is_registered: bool,
+    /// Distinct witnesses named by that grant who signed a valid failure receipt.
+    pub valid_witness_receipts: usize,
+}
+
+/// A witness-cohort repair read needs the registered grant and enough of its witnesses.
+pub fn repair_read_decision(facts: &RepairReadFacts) -> Result<(), &'static str> {
+    if !facts.grant_is_registered {
+        return Err("reject.repair_grant_unregistered");
+    }
+    if facts.valid_witness_receipts < MIN_WITNESS_SIGNATURES_FOR_REPAIR {
+        return Err("reject.repair_witness_quorum");
+    }
+    Ok(())
+}
+
 /// Maximum clock skew / expiration window for stateless PoR challenges (30 seconds).
 pub const CHALLENGE_FRESHNESS_WINDOW_MS: u64 = 30_000;
 
@@ -297,13 +348,31 @@ impl PorVerifierEngine {
 
     /// Registers an owner-signed `RepairGrant` for a stripe in RAM (ADR-04).
     pub fn register_repair_grant(&mut self, grant: RepairGrant) -> bool {
-        if !grant.verify() {
-            return false;
-        }
+        let root = grant.stripe_merkle_root;
+        self.register_repair_grant_for_stored(grant, &root).is_ok()
+    }
+
+    /// Registers `grant` after a shard of stripe `stored_root` was stored (F-02a); `Err` carries
+    /// the reason code.
+    pub fn register_repair_grant_for_stored(
+        &mut self,
+        grant: RepairGrant,
+        stored_root: &Hash32,
+    ) -> Result<(), &'static str> {
+        let facts = GrantRegFacts {
+            grant_valid: grant.verify(),
+            root_matches: grant.stripe_merkle_root == *stored_root,
+            existing_owner: self
+                .repair_grants_ram
+                .get(&grant.stripe_merkle_root)
+                .map(|g| g.owner_pubkey),
+            grant_owner: grant.owner_pubkey,
+        };
+        grant_registration_decision(&facts)?;
         self.repair_grants_ram
             .insert(grant.stripe_merkle_root, grant);
         self.persist_state_if_configured();
-        true
+        Ok(())
     }
 
     /// Retrieves the registered `K_session` and `RepairGrant` for `shard_id` (used during graceful node handoff).
@@ -476,6 +545,7 @@ impl PorVerifierEngine {
         // Case B: Offline Witness Cohort Repair (`RepairGrant` + >= 2 distinct witness signatures).
         if let Some((grant, receipts)) = repair_bundle {
             if grant.stripe_merkle_root == shard_id.stripe_merkle_root && grant.verify() {
+                let registered = self.repair_grants_ram.get(&shard_id.stripe_merkle_root);
                 let authorized_set: HashSet<[u8; 32]> =
                     grant.authorized_witness_pubkeys.iter().copied().collect();
                 let mut valid_signers: HashSet<[u8; 32]> = HashSet::new();
@@ -489,8 +559,13 @@ impl PorVerifierEngine {
                     }
                 }
 
-                if valid_signers.len() >= MIN_WITNESS_SIGNATURES_FOR_REPAIR {
-                    return Ok(block_store.get_shard(shard_id)?);
+                let facts = RepairReadFacts {
+                    grant_is_registered: registered == Some(grant),
+                    valid_witness_receipts: valid_signers.len(),
+                };
+                match repair_read_decision(&facts) {
+                    Ok(()) => return Ok(block_store.get_shard(shard_id)?),
+                    Err(code) => tracing::warn!(code, "refused a witness-cohort repair read"),
                 }
             }
         }
@@ -791,5 +866,61 @@ impl EgressWithholdingEvidence {
         buf.extend_from_slice(&por_passed_at_unix_ms.to_be_bytes());
         buf.extend_from_slice(&restore_failed_at_unix_ms.to_be_bytes());
         buf
+    }
+}
+
+#[cfg(test)]
+mod decision_tests {
+    use super::*;
+
+    #[test]
+    fn grant_and_repair_read_decisions() {
+        let base = GrantRegFacts {
+            grant_valid: true,
+            root_matches: true,
+            existing_owner: None,
+            grant_owner: [1; 32],
+        };
+        assert_eq!(grant_registration_decision(&base), Ok(()));
+        let same_owner = GrantRegFacts {
+            existing_owner: Some([1; 32]),
+            ..base
+        };
+        assert_eq!(grant_registration_decision(&same_owner), Ok(()));
+        let cases = [
+            (
+                GrantRegFacts {
+                    grant_valid: false,
+                    ..base
+                },
+                "reject.repair_grant_invalid",
+            ),
+            (
+                GrantRegFacts {
+                    root_matches: false,
+                    ..base
+                },
+                "reject.repair_grant_root_mismatch",
+            ),
+            (
+                GrantRegFacts {
+                    existing_owner: Some([2; 32]),
+                    ..base
+                },
+                "reject.repair_grant_owner_conflict",
+            ),
+        ];
+        for (facts, code) in cases {
+            assert_eq!(grant_registration_decision(&facts), Err(code));
+        }
+        let read = |grant_is_registered, valid_witness_receipts| {
+            repair_read_decision(&RepairReadFacts {
+                grant_is_registered,
+                valid_witness_receipts,
+            })
+        };
+        assert_eq!(read(true, 2), Ok(()));
+        assert_eq!(read(false, 2), Err("reject.repair_grant_unregistered"));
+        assert_eq!(read(true, 1), Err("reject.repair_witness_quorum"));
     }
 }

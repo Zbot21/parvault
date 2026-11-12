@@ -802,9 +802,6 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                     error: Some(reason),
                 };
             }
-            if let Some(grant) = repair_grant {
-                por_verifier.register_repair_grant(grant);
-            }
             por_verifier.register_shard_session(&shard_id, session_key_commit);
             let Some(effective_owner) = shard_owner(peer, Some(owner_peer_id.as_str())) else {
                 return MeshWireResponse::PutShardAck {
@@ -815,6 +812,14 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
             let effective_owner = effective_owner.as_str();
             match block_store.put_shard(effective_owner, &shard_id, &shard_bytes) {
                 Ok(_) => {
+                    // F-02a: a grant registers only after the shard is stored, for its stripe.
+                    if let Some(grant) = repair_grant {
+                        if let Err(code) = por_verifier
+                            .register_repair_grant_for_stored(grant, &shard_id.stripe_merkle_root)
+                        {
+                            warn!(code, peer = %remote_peer_id, "repair grant not registered");
+                        }
+                    }
                     let _ = eviction.record_regular_shard_ingress(
                         remote_ip,
                         Some(remote_peer_id),
@@ -1306,20 +1311,28 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                     error: Some(reason),
                 };
             }
-            if let Some(ref grant) = repair_grant {
-                por_verifier.register_repair_grant(grant.clone());
-            }
+            let grant_to_register = repair_grant.clone();
             match server.ingest_and_syndicate_lite_stripe_with_grant(
                 &cert,
                 &bundle,
                 &[],
                 repair_grant,
             ) {
-                Ok((receipt, syndicated_peers)) => MeshWireResponse::SyndicateLiteStripeAck {
-                    receipt: Some(receipt),
-                    syndicated_peers,
-                    error: None,
-                },
+                Ok((receipt, syndicated_peers)) => {
+                    // F-02a: register only after the stripe was ingested, for that stripe.
+                    if let Some(grant) = grant_to_register {
+                        if let Err(code) = por_verifier
+                            .register_repair_grant_for_stored(grant, &receipt.stripe_merkle_root)
+                        {
+                            warn!(code, peer = %remote_peer_id, "repair grant not registered");
+                        }
+                    }
+                    MeshWireResponse::SyndicateLiteStripeAck {
+                        receipt: Some(receipt),
+                        syndicated_peers,
+                        error: None,
+                    }
+                }
                 Err(e) => MeshWireResponse::SyndicateLiteStripeAck {
                     receipt: None,
                     syndicated_peers: Vec::new(),

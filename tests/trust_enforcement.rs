@@ -768,26 +768,61 @@ fn f04_gateway_lanes_send_as_owner() {
 
 // --- F-02: repair grants -----------------------------------------------------------------------------
 
-/// F-02b: a foreign self-signed grant plus receipts from witnesses it names reads another owner's
-/// shard (Case B is not bound to the registered grant).
+/// Stores a shard of stripe `root` (index 0) with a grant by `owner` naming `witnesses`.
+fn store_with_grant(
+    node: &Node,
+    owner: &NodeIdentity,
+    witnesses: &[&NodeIdentity],
+) -> (ShardId, Vec<u8>) {
+    let (sid, bytes) = shard(0x31, 2048);
+    let grant = RepairGrant::issue(
+        owner,
+        sid.stripe_merkle_root,
+        witnesses.iter().map(|w| w.public_key_bytes()).collect(),
+        ErasureTier::Homelab,
+    );
+    let resp = send(owner, node, put_shard("", sid, bytes.clone(), Some(grant)));
+    assert!(stored(&resp), "{resp:?}");
+    (sid, bytes)
+}
+
+fn repair_read(sid: ShardId, grant: RepairGrant, witnesses: &[&NodeIdentity]) -> MeshWireRequest {
+    let receipts = witnesses
+        .iter()
+        .map(|w| WitnessFailureReceipt::issue(w, sid.stripe_merkle_root, sid.shard_index, now_ms()))
+        .collect();
+    MeshWireRequest::GetCiphertextShard {
+        shard_id: sid,
+        owner_signature: None,
+        repair_proof: Some((grant, receipts)),
+    }
+}
+
+/// F-02b accept: the registered grant plus receipts from two of its witnesses reads the shard.
 #[test]
-fn repro_f02b_foreign_grant_reads_shard() {
-    let node = spawn_daemon("f02b");
+fn f02b_registered_grant_repair_read() {
+    let node = spawn_daemon("f02b-a");
     let owner = key(0xD1);
     let (w1, w2) = (key(0xD2), key(0xD3));
-    let (sid, bytes) = shard(0x31, 2048);
+    let (sid, bytes) = store_with_grant(&node, &owner, &[&w1, &w2]);
     let grant = RepairGrant::issue(
         &owner,
         sid.stripe_merkle_root,
         vec![w1.public_key_bytes(), w2.public_key_bytes()],
         ErasureTier::Homelab,
     );
-    assert!(stored(&send(
-        &owner,
-        &node,
-        put_shard("", sid, bytes.clone(), Some(grant))
-    )));
+    let resp = send(&w1, &node, repair_read(sid, grant, &[&w1, &w2]));
+    assert_eq!(read_bytes(&resp), Some(bytes));
+    gate_ran("trust_enforcement::f02b_registered_grant_repair_read");
+}
 
+/// F-02b reject: a foreign self-signed grant plus receipts from its own witnesses is refused.
+#[test]
+fn f02b_foreign_grant_repair_read_refused() {
+    let node = spawn_daemon("f02b-r");
+    let owner = key(0xD1);
+    let (w1, w2) = (key(0xD2), key(0xD3));
+    let (sid, _) = store_with_grant(&node, &owner, &[&w1, &w2]);
     let attacker = key(0xD4);
     let (a1, a2) = (key(0xD5), key(0xD6));
     let foreign = RepairGrant::issue(
@@ -796,49 +831,82 @@ fn repro_f02b_foreign_grant_reads_shard() {
         vec![a1.public_key_bytes(), a2.public_key_bytes()],
         ErasureTier::Homelab,
     );
-    let receipts = vec![
-        WitnessFailureReceipt::issue(&a1, sid.stripe_merkle_root, 0, now_ms()),
-        WitnessFailureReceipt::issue(&a2, sid.stripe_merkle_root, 0, now_ms()),
-    ];
-    let resp = send(
-        &attacker,
-        &node,
-        MeshWireRequest::GetCiphertextShard {
-            shard_id: sid,
-            owner_signature: None,
-            repair_proof: Some((foreign, receipts)),
-        },
-    );
+    let resp = send(&attacker, &node, repair_read(sid, foreign, &[&a1, &a2]));
     assert_eq!(
         read_bytes(&resp),
-        Some(bytes),
-        "gap: a foreign grant reads the owner's shard"
+        None,
+        "a foreign grant must not read the shard"
     );
-    gate_ran("trust_enforcement::repro_f02b_foreign_grant_reads_shard");
+    assert_logged(&node, "reject.repair_grant_unregistered");
+    gate_ran("trust_enforcement::f02b_foreign_grant_repair_read_refused");
 }
 
-/// F-02a: a rejected PutShard still registers its grant, replacing the owner's, so the owner's own
-/// signed read stops working.
+/// A second shard (index 1) of the stripe of `sid`, with a grant by `granter`.
+fn second_shard_put(sid: ShardId, granter: &NodeIdentity) -> MeshWireRequest {
+    let bytes = vec![0x77; 1024];
+    let sid1 = ShardId {
+        stripe_merkle_root: sid.stripe_merkle_root,
+        shard_index: 1,
+        shard_hash: parvault::sharding::merkle::hash_shard_leaf(1, &bytes),
+    };
+    let grant = RepairGrant::issue(
+        granter,
+        sid.stripe_merkle_root,
+        vec![],
+        ErasureTier::Homelab,
+    );
+    put_shard("", sid1, bytes, Some(grant))
+}
+
+/// F-02a accept: the owner's own grant for a further shard of its stripe is registered (a
+/// same-owner update) and the owner's signed read keeps working.
 #[test]
-fn repro_f02a_rejected_put_replaces_owner_grant() {
-    let node = spawn_daemon("f02a");
+fn f02a_owner_grant_update_registered() {
+    let node = spawn_daemon("f02a-a");
     let owner = key(0xE1);
-    let (sid, bytes) = shard(0x41, 2048);
-    let grant = RepairGrant::issue(&owner, sid.stripe_merkle_root, vec![], ErasureTier::Homelab);
-    assert!(stored(&send(
-        &owner,
-        &node,
-        put_shard("", sid, bytes.clone(), Some(grant))
-    )));
+    let (sid, bytes) = store_with_grant(&node, &owner, &[]);
+    let resp = send(&owner, &node, second_shard_put(sid, &owner));
+    assert!(stored(&resp), "{resp:?}");
     assert_eq!(
         read_bytes(&send(&owner, &node, owner_read(&owner, sid))),
         Some(bytes)
     );
+    assert!(
+        !node.log_text().contains("reject.repair_grant"),
+        "{}",
+        node.log_text()
+    );
+    gate_ran("trust_enforcement::f02a_owner_grant_update_registered");
+}
 
+/// F-02a reject: another admitted key storing a shard of the same stripe with its own grant does
+/// not replace the owner's grant; the owner's signed read keeps working.
+#[test]
+fn f02a_foreign_grant_not_registered() {
+    let node = spawn_daemon("f02a-r");
+    let owner = key(0xE1);
+    let (sid, bytes) = store_with_grant(&node, &owner, &[]);
     let attacker = key(0xE2);
+    let resp = send(&attacker, &node, second_shard_put(sid, &attacker));
+    assert!(stored(&resp), "the shard itself is stored: {resp:?}");
+    assert_logged(&node, "reject.repair_grant_owner_conflict");
+    assert_eq!(
+        read_bytes(&send(&owner, &node, owner_read(&owner, sid))),
+        Some(bytes)
+    );
+    gate_ran("trust_enforcement::f02a_foreign_grant_not_registered");
+}
+
+/// F-02a (failed put): a rejected put registers nothing, so the owner's read keeps working.
+#[test]
+fn f02a_rejected_put_registers_nothing() {
+    let node = spawn_daemon("f02a-f");
+    let owner = key(0xE3);
+    let (sid, bytes) = store_with_grant(&node, &owner, &[]);
+    let attacker = key(0xE4);
     let mut bad = sid;
     bad.shard_index = 1;
-    bad.shard_hash = [0xEE; 32]; // hash mismatch: the put itself is rejected
+    bad.shard_hash = [0xEE; 32];
     let foreign = RepairGrant::issue(
         &attacker,
         sid.stripe_merkle_root,
@@ -850,13 +918,12 @@ fn repro_f02a_rejected_put_replaces_owner_grant() {
         &node,
         put_shard("", bad, vec![1; 64], Some(foreign)),
     );
-    assert!(!stored(&resp), "the attacker's put itself fails: {resp:?}");
+    assert!(!stored(&resp), "{resp:?}");
     assert_eq!(
         read_bytes(&send(&owner, &node, owner_read(&owner, sid))),
-        None,
-        "gap: the rejected put replaced the owner's grant"
+        Some(bytes)
     );
-    gate_ran("trust_enforcement::repro_f02a_rejected_put_replaces_owner_grant");
+    gate_ran("trust_enforcement::f02a_rejected_put_registers_nothing");
 }
 
 // --- F-24: self-certifying vouchers --------------------------------------------------------------------

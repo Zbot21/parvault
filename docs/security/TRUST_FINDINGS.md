@@ -17,7 +17,7 @@ Status values:
 | ID | Sev | Finding | Item | Status |
 | :--- | :--- | :--- | :--- | :--- |
 | F-01 | Blocker | Gossip `SlashingEvidence` quarantines on one trusted reporter's accusation, with no guard for genesis or self. | 2b | Reproduced |
-| F-02 | High | A repair read (Case B) is not bound to the registered grant; `PutShard` registers any self-signed grant, before the put succeeds, overwriting the existing one. | 2b | Reproduced (F-02a, F-02b) |
+| F-02 | High | A repair read (Case B) is not bound to the registered grant; `PutShard` registers any self-signed grant, before the put succeeds, overwriting the existing one. | 2b | Fixed (QA pending): `grant_registration_decision` (F-02a), `repair_read_decision` (F-02b); first-wins residual is F-26 |
 | F-03 | High | Web-of-trust admission is never consulted on the wire request path. | 2b | Fixed (QA pending): `admission_decision`, claims F-03 and F-03-SEED |
 | F-04 | High | `PutShard` takes a caller-supplied `owner_peer_id`; each invented id gets a fresh account with bootstrap grace. | 2b | Fixed (QA pending): `shard_owner_decision`, claim F-04; leave, seed syndication and 40 gateway lanes tested |
 | F-05 | High | Public-commons PoW admission has no wire carrier and no production caller. | 2b | Fixed (QA pending): `AdmitPublicTicket`, `public_ticket_decision`, claim F-05 |
@@ -66,6 +66,8 @@ Claim lines in `.enforcement.map` use the finding id, or the finding id with a s
 
 | ID | Pair |
 | :--- | :--- |
+| F-02a | F-02, grant registration (after the put, matching root, no owner replacement). |
+| F-02b | F-02, repair reads bound to the registered grant. |
 | F-03-SEED | F-03 on `parvault-seed`. |
 | F-24-ONION | F-24 admission at onion final delivery (forwarding needs no admission). |
 | F-25-DHT | F-25 admission for `PutDhtEnvelope`. |
