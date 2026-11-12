@@ -9,7 +9,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Security
-- **Ring admission is enforced (item 2b, `docs/security/TRUST_FINDINGS.md`).** Storage requests (`PutShard`, `SyndicateLiteStripe`, `PutDhtEnvelope`, `PutBlindedShard`, onion final delivery) need an admitted sender; others get `peer not admitted; v0.5.0 requires ring admission`. Every node in a ring must share the ring genesis (`PARVAULT_GENESIS_SEED_HEX`), or install a chain with `parvault wot invite` / `parvault wot install-chain`. `v0.4.0` peers are refused.
+- **Ring admission is enforced (item 2b, `docs/security/TRUST_FINDINGS.md`).** Storage requests (`PutShard`, `SyndicateLiteStripe`, `PutDhtEnvelope`, `PutBlindedShard`, onion final delivery) need an admitted sender; others get `peer not admitted; v0.5.0 requires ring admission`. Start a ring with `parvault wot init` and add devices with `parvault wot invite` / `parvault wot install-chain`. No node creates a genesis on its own any more: a private-mode daemon outside any ring, or with conflicting genesis sources, refuses to start. `v0.4.0` peers are refused.
+- Onion originators (`OnionOriginator`) never present a ring credential to the entry relay; only the relay's forward to the final target is admitted.
+- Public-commons tickets are bound to the verifier and fresh for 10 minutes, rate-limited per subnet, and never evict a live admission; admissions are written in batches.
+- The handshake returns one fixed refusal text; members may sub-invite at most 64 keys; inbound Kademlia records need an admitted source; repair grants are keyed by owner and bound to the shards stored with them; only a shard's owner can delete it.
 - `HandshakeWoT` admits only the sender's own chain; the accounted shard owner is always the sender (foreign owner claims are refused); a syndication device cert must name the sender.
 - Repair grants register only after a stored shard, for its stripe, without replacing another owner's grant; witness repair reads need the registered grant.
 - The DHT reader ignores envelopes not sealed by the reading identity; inbound Kademlia records must be valid signed envelopes.
@@ -17,7 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `--no-lan-discovery` turns mDNS off; mDNS never feeds Kademlia, admission does.
 
 ### Added
-- `MeshWireRequest::AdmitPublicTicket` / `MeshWireResponse::AdmitPublicTicketAck` (appended; existing indices unchanged) and `parvault wot invite` / `parvault wot install-chain`.
+- `MeshWireRequest::AdmitPublicTicket` / `MeshWireResponse::AdmitPublicTicketAck` (appended; existing indices unchanged) and `parvault wot init` / `invite` / `install-chain`.
 
 ### Removed
 - `CorrelatedOutageController::verify_weather_quorum` and `SignedWeatherAttestation` (never called; F-15).

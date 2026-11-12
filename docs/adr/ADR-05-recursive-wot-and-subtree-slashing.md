@@ -22,7 +22,7 @@ In private neighborhood and co-op rings, uninvited Sybil nodes must be rejected 
 
 - **Admission on the wire:** a `PutShard`, `SyndicateLiteStripe`, `PutDhtEnvelope` or `PutBlindedShard` from a sender that is not admitted (genesis, an unquarantined chain, or a public-commons ticket) is refused with `peer not admitted; v0.5.0 requires ring admission`. A sender without an Ed25519 transport key is refused.
 - **Handshake binding:** `HandshakeWoT` admits only the key at the chain's leaf, and that key must be the sender's transport key.
-- **A ring is one genesis.** A process holding the genesis seed (`PARVAULT_GENESIS_SEED_HEX` or `<data_dir>/genesis_root.seed`) self-issues a one-hop chain for any key it sends as. Other processes install a chain from `parvault wot invite --peer <pubkey>` with `parvault wot install-chain --token <hex>`.
+- **A ring is one genesis**, created only by `parvault wot init` (`ring_genesis.seed`). The holder self-issues one-hop chains; other nodes join with `parvault wot invite --peer <pubkey>` / `parvault wot install-chain --token <hex>`, which verifies the chain against the ring key and pins it (`ring_genesis.pub`). No node creates a genesis on its own; conflicting sources stop the daemon.
 - **Decision 2 is suspended:** nodes do not subscribe to the slashing gossip topic, so `SlashingEvidence` is not applied from gossip until it is proof-carrying (item 2c). The genesis and the node's own key are never slashed.
 - Register: `docs/security/TRUST_FINDINGS.md` (F-01, F-03, F-20, F-21).
 

@@ -55,7 +55,7 @@ Rather than trusting static peer claims, `parvault` enforces a cryptographically
 | **`UntrustedProbationary`** | Newly invited via Ed25519 Web-of-Trust (`< 50` consecutive PoR passes) | **1 shard** | **$1.0\times$** | Strict Sybil containment for unproven residential peers |
 | **`VerifiedNeighbor`** | $\ge 50$ consecutive PoR passes & $\ge 98.0\%$ rolling SLA | **2 shards** | **$2.5\times$** | Standard neighborhood gateway tier; minimum standing to receive drained seed shards |
 | **`HighUptimeAnchor`** | $\ge 200$ consecutive PoR passes & $\ge 99.5\%$–$99.8\%$ 30-day Homelab SLA | **4 shards** | **$5.0\times$** | High-reliability backbone anchor ($80\%$ net efficiency pool) |
-| **`SlashedQuarantined`** | Any cryptographic fault (poisoned Merkle shard, forged WoT hop, or confirmed egress withholding) | **0 shards** | **$0.0\times$ (100% Credit Burn)** | Immediate Gossipsub quarantine + parent inviter slash penalty |
+| **`SlashedQuarantined`** | Any cryptographic fault (poisoned Merkle shard, forged WoT hop, or confirmed egress withholding) | **0 shards** | **$0.0\times$ (100% Credit Burn)** | Local quarantine + parent inviter slash penalty (no slashing evidence is exchanged in `v0.5.0`; the genesis and the node's own key are never slashed) |
 
 ### Proof of Zero-Knowledge Confidentiality Under Subnet Collusion ($4 \ll K = 16$)
 1. **Bounded Algebraic Concentration:** Even if an adversary controls an entire `HighUptimeAnchor` `/24` subnet and all nodes on that subnet collude, the placement engine caps the subnet at **at most 4 shards** per stripe. Under $16\text{-of-}20$ (or $10\text{-of-}20$) Reed-Solomon erasure coding over $GF(2^8)$, any subset of fewer than $K$ shards (`< K`) leaves the remaining $K - 4$ polynomial coefficients underdetermined.

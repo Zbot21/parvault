@@ -42,7 +42,7 @@ Global options (available on all subcommands):
 - `--peers <CSV>`: Comma-separated list of mesh peer `Multiaddr`s or `host:port` endpoints (overrides `bootstrap_peers` / `PARVAULT_PEERS`).
 - `--seed-addr <ADDR>`: Paired `parvault-seed` `Multiaddr` or `host:port` endpoint (overrides `lite_seed_addr` / `PARVAULT_SEED_ADDR`).
 - `--lan-discovery-port <PORT>`: UDP port for zero-config signed LAN beacon discovery (default: `4009`).
-- `--no-lan-discovery`: Disable automatic UDP LAN beaconing and responder.
+- `--no-lan-discovery`: Disable automatic UDP LAN beaconing and responder, and libp2p mDNS.
 - `--public`: Enable open BitTorrent-style Public Commons mode (uses self-signed Hashcash PoW ticket, zero pairing required).
 - `--tracker <MULTIADDR>`: Specify public commons bootstrap tracker `Multiaddr`.
 
@@ -61,8 +61,9 @@ Global options (available on all subcommands):
 | `parvault identity` | *(none)* | Initializes (if absent) and displays your persistent `Device Peer ID`, `Ed25519 Public Key`, `Owner PQ Public Key Hex` (`Ed25519 + ML-DSA-65`), and `Master Key Fingerprint`. |
 | `parvault issue-device-cert` | `--device-peer-id <ID>` *(required)*<br>`--device-label <LABEL>` *(default: `"personal-device"`)*<br>`--cert-out <PATH>` *(optional)* | Signs a post-quantum composite `PersonalDeviceCert` (`Ed25519 + NIST FIPS 204 ML-DSA-65`) authorizing `<device-peer-id>` to store shards on your Personal Device Ring at `0.0x` quota cost. Outputs both JSON and a compact `PARVAULT-CERT-V1:<hex>` token. |
 | `parvault verify-device-cert` | `--cert <PATH_OR_JSON_OR_TOKEN>` *(required)*<br>`--owner-pq-pubkey-hex <HEX>` *(optional)* | Cryptographically verifies a `PersonalDeviceCert` from a `.json` file, raw JSON string, or `PARVAULT-CERT-V1:<hex>` token against the expected Owner PQ Public Key. |
-| `parvault wot invite` | `--peer <PUBKEY_HEX>` *(required)* | Prints a chain token admitting that key to this ring (`v0.5.0`). Needs the ring genesis seed (`PARVAULT_GENESIS_SEED_HEX` or `<data_dir>/genesis_root.seed`). |
-| `parvault wot install-chain` | `--token <HEX>` *(required)* | Installs a chain token into `<data_dir>/wot_chains/`; the node then presents it before storing on ring peers. |
+| `parvault wot init` | *(none)* | Starts a new ring on this node: creates the ring genesis secret (`<data_dir>/ring_genesis.seed`, `0600`). The only way a genesis is created; refused if the node is already in a ring. |
+| `parvault wot invite` | `--peer <PUBKEY_HEX>` *(required)* | Prints a ring invitation token (the chain and the ring's genesis key) admitting that key. Needs the ring secret from `parvault wot init` (or `PARVAULT_GENESIS_SEED_HEX`). |
+| `parvault wot install-chain` | `--token <HEX>` *(required)* | Verifies the invitation against its ring key, pins that key (`ring_genesis.pub`) and installs the chain; the node then serves the ring and presents the chain before storing on ring peers. |
 
 ### 2.3 Continuous Folder Sync, Diff & Disaster Recovery
 | Command | Flags & Arguments | Description |
@@ -83,7 +84,7 @@ Global options (available on all subcommands):
 | `parvault report-abuse` | `--tracker <MULTIADDR>` *(required)*<br>`--manifest <PATH>` *(required)*<br>`--disclosed-key-hex <HEX>` *(required)*<br>`--allegation <TEXT>` *(required, max 256 B)*<br>`--contact <TEXT>` *(optional)*<br>`--bad-actor-ip <IP>` *(optional)*<br>`--stripe-index <U64>` *(default: `0`)* | **Cryptographic Burden-of-Proof Abuse Reporting (`ADR-19`):** Submits a `VerifiableAbuseReport` to a Public Tracker Operator, proving illegal content distribution via leaked decryption key, sample shards, and AES-256-GCM authenticated plaintext digest for human admin takedown review. |
 | `parvault leave` | `--handoff-to <CSV>` *(optional `Multiaddr`s or paths)*<br>`--keep-local` *(optional)* | Gracefully decommissions the node, performing a `1.0x` direct shard handoff over `libp2p` (preserving PoR session keys and `RepairGrant`s) and writing a signed `graceful_departure_receipt.json`. |
 | `parvault status` | *(none)* | Displays node configuration, active transport (`TCP + Noise XX + Yamux`), hardware profile, storage quota usage, minimum free disk reserve, bandwidth rate limits, SLA erasure pools, and Earned Standing ladder. |
-| `parvault daemon start` | `--listen <MULTIADDR>` *(default: `/ip4/0.0.0.0/tcp/4001`)*<br>`--profile <router-soc\|homelab-nas\|desktop>` *(optional)*<br>`--lan-discovery-port <PORT>` *(default: `4009`)*<br>`--no-lan-discovery` *(optional)*<br>`--status-http <ADDR>` *(optional)*<br>`--enable-quic` *(optional)* | Starts the asynchronous P2P storage, Kademlia DHT, Gossipsub slashing, periodic bit-rot scrubber, UDP LAN beacon responder, and stateless PoR responder daemon. |
+| `parvault daemon start` | `--listen <MULTIADDR>` *(default: `/ip4/0.0.0.0/tcp/4001`)*<br>`--profile <router-soc\|homelab-nas\|desktop>` *(optional)*<br>`--lan-discovery-port <PORT>` *(default: `4009`)*<br>`--no-lan-discovery` *(optional)*<br>`--status-http <ADDR>` *(optional)*<br>`--enable-quic` *(optional)* | Starts the asynchronous P2P storage (ring members only), Kademlia DHT, periodic bit-rot scrubber, UDP LAN beacon responder, and stateless PoR responder daemon. |
 
 ---
 
@@ -121,7 +122,7 @@ parvault init --profile router-soc --watch /mnt/usb-nas/shared --label "Router-N
 ```
 
 #### 2. Turnkey Appliance Mode (`parvault up`)
-Start your node as a continuous backup appliance with zero further setup:
+Start the ring once (`parvault wot init`; a private-mode daemon outside any ring refuses to start), then start your node as a continuous backup appliance:
 ```bash
 parvault up \
   --profile router-soc \
@@ -141,6 +142,15 @@ parvault discover
 parvault join --code shield-copper-alpine-matrix
 ```
 Both devices are now pinned in `<data_dir>/known_peers.json`. If your router reboots or DHCP assigns a new internal IP, ParVault auto-heals the connection dynamically.
+
+#### 3b. Ring Membership (`parvault wot`)
+Discovery and pairing find and pin peers; storing data needs ring membership. Invite each device from a node that ran `parvault wot init`:
+```bash
+parvault identity                                   # on the device: note "Ed25519 Public Key"
+parvault wot invite --peer <DEVICE_ED25519_KEY>     # on the ring's first node: prints a token
+parvault wot install-chain --token <TOKEN>          # on the device: pins the ring and installs the chain
+```
+A device outside the ring is refused with `peer not admitted; v0.5.0 requires ring admission`. `PARVAULT_GENESIS_SEED_HEX` (ring secret) and `PARVAULT_GENESIS_PUBKEY_HEX` (ring key) override the files `ring_genesis.seed` and `ring_genesis.pub`; sources that disagree stop the daemon.
 
 #### 4. Zero-Pairing BitTorrent-Style Public Commons Mode (`--public`)
 If you want to back up files without pairing with anyone, connect directly to the Public Commons swarm:

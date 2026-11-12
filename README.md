@@ -15,7 +15,7 @@ Designed to run identically on multi-terabyte homelab NAS servers and memory-con
 > [!NOTE]
 > **Public Tracker Status:** We are **not** currently operating an official public tracker or public bootstrap swarm. **All `parvault` features work standalone without a public tracker** — including Zero-IP home LAN auto-discovery (`UDP 4009`), 4-word SAS pairing (`parvault pair` / `parvault join`), Router-SoC Cloud-NAS mode (`--profile router-soc`), personal multi-machine rings, and private self-hosted `parvault-seed` rendezvous/vault servers for friends, family, or organizations.
 >
-> **Public Swarm Readiness:** The codebase is engineered with multiple subsystems specifically designed to initialize and govern a public tracker (`parvault-seed --mode public-bootstrap`) when desired — including memory-hard Argon2id & Hashcash Sybil PoW (`PublicCommonsTicket`), Web-of-Trust (`WoT`) vouching & 1-strike Byzantine slashing, earned storage reciprocity tiers, 4-vector privacy-preserving keyed-HMAC eviction (`ADR-19`), $M$-of-$N$ federated council co-signing, and zero-private-key-on-VPS `admin_rpc` hooks.
+> **Public Swarm Readiness:** The codebase is engineered with multiple subsystems specifically designed to initialize and govern a public tracker (`parvault-seed --mode public-bootstrap`) when desired — including memory-hard Argon2id & Hashcash Sybil PoW (`PublicCommonsTicket`), Web-of-Trust (`WoT`) ring admission (slashing is applied locally only in `v0.5.0`), earned storage reciprocity tiers, 4-vector privacy-preserving keyed-HMAC eviction (`ADR-19`), $M$-of-$N$ federated council co-signing, and zero-private-key-on-VPS `admin_rpc` hooks.
 
 ---
 
@@ -42,26 +42,35 @@ Designed to run identically on multi-terabyte homelab NAS servers and memory-con
 # 1. Initialize your vault with a 24-word BIP-39 recovery mnemonic
 parvault init --profile router-soc --watch /mnt/usb-nas/shared --label "Router-NAS"
 
-# 2. Launch turnkey Cloud-NAS appliance mode on your router or home server
+# 2. Start your ring on the router (once). Only ring members can store data on each other.
+parvault wot init
+
+# 3. Launch turnkey Cloud-NAS appliance mode on your router or home server
 parvault up \
   --profile router-soc \
   --folder /mnt/usb-nas/shared \
   --status-http 0.0.0.0:4080 \
   --pair
 
-# 3. On your laptop: auto-discover home LAN storage (Zero IP addresses to type!)
+# 4. On your laptop: discover home LAN storage (no IP addresses to type) and pair with the code
 parvault discover
-
-# 4. Pair permanently with the 4-word code displayed on your router
 parvault join --code shield-copper-alpine-matrix
 
-# 5. Incrementally back up files (auto-finds paired router storage with zero --peers flags!)
+# 5. Invite the laptop into the ring: print its key on the laptop, invite it on the router,
+#    install the printed token on the laptop
+parvault identity                                   # laptop: note "Ed25519 Public Key"
+parvault wot invite --peer <LAPTOP_ED25519_KEY>     # router: prints a token
+parvault wot install-chain --token <TOKEN>          # laptop
+
+# 6. Incrementally back up files to the paired router
 parvault watch-folder --folder ~/Documents --once
 
 # 6. Optional: connect to a self-hosted or community-initialized public tracker (--public):
 #    (No official public tracker is currently hosted; supply your own parvault-seed multiaddr)
 parvault watch-folder --folder ~/Documents --public --tracker /ip4/<YOUR_SEED_IP>/tcp/4002/p2p/<SEED_PEER_ID> --once
 ```
+
+Discovery and pairing find and pin peers; storing data needs ring membership. A node outside the ring is refused with `peer not admitted; v0.5.0 requires ring admission`, and a node with no ring prints how to start or join one (`parvault wot init` or `parvault wot install-chain`).
 
 ---
 

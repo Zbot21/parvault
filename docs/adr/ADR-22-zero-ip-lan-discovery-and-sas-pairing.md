@@ -18,7 +18,7 @@ Typing 60-character `/ip4/.../tcp/.../p2p/<PeerId>` multiaddrs blocks non-techni
 
 ## `v0.5.0` Enforcement
 
-- Discovery and SAS pairing find and pin endpoints; they do not admit. Storage needs ring admission (ADR-05): nodes sharing the ring genesis admit each other, and anyone else installs a chain from `parvault wot invite`.
+- Discovery and SAS pairing find and pin endpoints; they do not admit. Storage needs ring admission (ADR-05): the first node runs `parvault wot init`, and every other node joins with `parvault wot invite` / `parvault wot install-chain`.
 - `--no-lan-discovery` now also turns libp2p mDNS off. mDNS never feeds the Kademlia routing table; a peer enters it when it is admitted (F-11).
 
 ## Consequences & Verification
