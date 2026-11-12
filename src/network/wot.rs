@@ -550,6 +550,18 @@ impl WebOfTrustRegistry {
         self.seen_slashing_nonces.len()
     }
 
+    /// The handshake binding (F-21): a chain admits only the key at its leaf, so the sender's
+    /// transport key must be that leaf. Fails closed when the sender has no Ed25519 key.
+    pub fn chain_leaf_decision(
+        chain_leaf: Option<[u8; 32]>,
+        sender_pubkey: Option<[u8; 32]>,
+    ) -> Result<(), &'static str> {
+        match (chain_leaf, sender_pubkey) {
+            (Some(leaf), Some(sender)) if leaf == sender => Ok(()),
+            _ => Err("reject.chain_leaf_not_sender"),
+        }
+    }
+
     /// Validates and admits a peer's `DelegationChain` if anchored at `genesis_pubkey`
     /// and free of quarantined ancestors.
     pub fn verify_and_admit_chain(
@@ -811,6 +823,25 @@ impl WebOfTrustRegistry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chain_leaf_decision_binds_the_sender() {
+        let leaf = Some([1u8; 32]);
+        assert_eq!(WebOfTrustRegistry::chain_leaf_decision(leaf, leaf), Ok(()));
+        assert_eq!(
+            WebOfTrustRegistry::chain_leaf_decision(leaf, Some([2; 32])),
+            Err("reject.chain_leaf_not_sender")
+        );
+        assert_eq!(
+            WebOfTrustRegistry::chain_leaf_decision(leaf, None),
+            Err("reject.chain_leaf_not_sender"),
+            "a sender without an Ed25519 key fails closed"
+        );
+        assert_eq!(
+            WebOfTrustRegistry::chain_leaf_decision(None, leaf),
+            Err("reject.chain_leaf_not_sender")
+        );
+    }
+
     use super::*;
 
     #[test]

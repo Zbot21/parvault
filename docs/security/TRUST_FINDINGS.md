@@ -32,7 +32,7 @@ Status values:
 | F-17 | Medium | `GatewayIdentityStatement` verification does not pin the signing authority; expiry `0` is permanent. | 2c | Reported |
 | F-18 | Medium | Onion relay jitter is a blocking `std::thread::sleep` on the swarm task. | 2c | Reported |
 | F-20 | High | No production path admits a peer (no handshake caller, no invitation issuer, self-generated genesis). | 2b | Fixed for option A (QA pending): self-issue from the ring genesis, `wot invite` / `install-chain` |
-| F-21 | Medium | `HandshakeWoT` does not bind the chain leaf to the sender's transport key. | 2b | Reproduced |
+| F-21 | Medium | `HandshakeWoT` does not bind the chain leaf to the sender's transport key. | 2b | Fixed (QA pending): `chain_leaf_decision`, claim F-21 |
 | F-22 | Medium | `RegisterWanRendezvous` lets an unadmitted peer store about `512 MiB` and write the admission-IP map. | 2c | Reproduced |
 | F-23 | Medium | `RenewBlindedLease` carries no credential. | 2c | Reproduced |
 | F-24 | Medium | Blinded-shard vouchers are self-certifying (the receiver trusts the issuer the voucher names). | 2b (admission), 2c (issuer policy) | Admission fixed (QA pending): claims F-24, F-24-ONION; issuer policy open (2c) |

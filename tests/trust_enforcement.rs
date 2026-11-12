@@ -459,17 +459,26 @@ fn f03_unadmitted_put_shard_refused_seed() {
 
 // --- F-21: the handshake does not bind the chain leaf to the sender --------------------------------
 
+/// F-21 accept: a chain whose leaf is the sender admits it.
 #[test]
-fn repro_f21_handshake_chain_leaf_not_sender_accepted() {
-    let node = spawn_daemon("f21");
+fn f21_handshake_own_chain_accepted() {
+    let node = spawn_daemon("f21-a");
+    let leaf = key(0xB1);
+    let resp = handshake(&leaf, &node, chain_for(&leaf));
+    assert!(accepted(&resp), "{resp:?}");
+    gate_ran("trust_enforcement::f21_handshake_own_chain_accepted");
+}
+
+/// F-21 reject: the same chain sent by another key is refused.
+#[test]
+fn f21_handshake_chain_leaf_not_sender_refused() {
+    let node = spawn_daemon("f21-r");
     let leaf = key(0xB1);
     let other_sender = key(0xB2);
     let resp = handshake(&other_sender, &node, chain_for(&leaf));
-    assert!(
-        accepted(&resp),
-        "gap: a chain for another key is accepted: {resp:?}"
-    );
-    gate_ran("trust_enforcement::repro_f21_handshake_chain_leaf_not_sender_accepted");
+    assert!(!accepted(&resp), "{resp:?}");
+    assert_logged(&node, "reject.chain_leaf_not_sender");
+    gate_ran("trust_enforcement::f21_handshake_chain_leaf_not_sender_refused");
 }
 
 // --- F-04: the claimed owner is not bound to the sender --------------------------------------------

@@ -669,6 +669,13 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                     reason: Some(reason),
                 };
             }
+            if let Err(code) = WebOfTrustRegistry::chain_leaf_decision(leaf_pk, remote_pubkey) {
+                warn!(code, peer = %remote_peer_id, "refused a handshake for another key's chain");
+                return MeshWireResponse::HandshakeAck {
+                    accepted: false,
+                    reason: Some("chain leaf is not the sender".to_string()),
+                };
+            }
             match wot.verify_and_admit_chain(&chain) {
                 Ok(_) => {
                     if let (Some(ip), Some(pk)) = (remote_ip, leaf_pk) {
