@@ -21,6 +21,12 @@ pub const MAX_SEEN_SLASHING_NONCES: usize = 65_536;
 /// Maximum number of probationary Public Commons peer tickets retained in bounded RAM.
 pub const MAX_PUBLIC_COMMONS_PEERS: usize = 65_536;
 
+/// How many keys one member (not the genesis) may sub-invite (F-30).
+pub const MAX_SUBINVITES_PER_INVITER: usize = 64;
+
+/// How many delegation chains a node keeps (F-30).
+pub const MAX_ADMITTED_CHAINS: usize = 65_536;
+
 /// How long a public-commons ticket admission lasts (F-27): 24 hours from the ticket's timestamp.
 pub const PUBLIC_COMMONS_ADMISSION_TTL_MS: u64 = 24 * 3600 * 1000;
 
@@ -138,6 +144,8 @@ pub enum WebOfTrustError {
     InsufficientPublicPow,
     #[error("Public Commons admissions are full")]
     PublicCommonsFull,
+    #[error("Chain admission limit reached")]
+    ChainAdmissionLimit,
 }
 
 /// Alias for [`WebOfTrustError`] used by Public Commons WoT admission APIs.
@@ -400,6 +408,19 @@ impl SubnetTicketBudget {
     }
 }
 
+/// What [`WebOfTrustRegistry::chain_admission_decision`] needs to know (F-30).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainAdmissionFacts {
+    /// The leaf's inviter (the last hop's signer) is the genesis.
+    pub inviter_is_genesis: bool,
+    /// Other keys that inviter has already sub-invited here.
+    pub inviter_subinvites: usize,
+    /// The leaf has no chain on record yet.
+    pub new_leaf: bool,
+    pub admitted_total: usize,
+    pub capacity: usize,
+}
+
 /// What [`WebOfTrustRegistry::slash_target_decision`] needs to know about one slash target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlashTargetFacts {
@@ -570,6 +591,9 @@ pub struct WebOfTrustRegistry {
     /// Capacity of `public_commons_peers` (defaults to `MAX_PUBLIC_COMMONS_PEERS`).
     #[serde(skip)]
     public_commons_capacity: Option<usize>,
+    /// Capacity of `admitted_chains` (defaults to `MAX_ADMITTED_CHAINS`).
+    #[serde(skip)]
+    admitted_chains_capacity: Option<usize>,
 }
 
 impl WebOfTrustRegistry {
@@ -601,6 +625,7 @@ impl WebOfTrustRegistry {
             dirty: false,
             ticket_rate: HashMap::new(),
             public_commons_capacity: None,
+            admitted_chains_capacity: None,
         }
     }
 
@@ -870,11 +895,50 @@ impl WebOfTrustRegistry {
         }
 
         let leaf = chain.leaf_pubkey().expect("checked non-empty");
+        // Re-sending the chain already on record is a no-op that writes nothing (F-30).
+        if self.admitted_chains.get(&leaf) == Some(chain) {
+            return Ok(leaf);
+        }
+        let inviter = chain.hops.last().expect("checked non-empty").inviter_pubkey;
+        let facts = ChainAdmissionFacts {
+            inviter_is_genesis: inviter == self.genesis_pubkey,
+            inviter_subinvites: self
+                .admitted_chains
+                .values()
+                .filter(|c| c.hops.last().map(|h| h.inviter_pubkey) == Some(inviter))
+                .filter(|c| c.leaf_pubkey() != Some(leaf))
+                .count(),
+            new_leaf: !self.admitted_chains.contains_key(&leaf),
+            admitted_total: self.admitted_chains.len(),
+            capacity: self.admitted_chains_capacity.unwrap_or(MAX_ADMITTED_CHAINS),
+        };
+        if let Err(code) = Self::chain_admission_decision(&facts) {
+            tracing::warn!(code, leaf = %hex::encode(leaf), "refused a chain admission");
+            return Err(WebOfTrustError::ChainAdmissionLimit);
+        }
         // Upgrading to a full PrivateRing chain supersedes any probationary PublicCommons ticket.
         self.public_commons_peers.remove(&leaf);
         self.admitted_chains.insert(leaf, chain.clone());
         self.mark_dirty();
         Ok(leaf)
+    }
+
+    /// Bounds chain admissions (F-30): a member (not the genesis) may sub-invite at most
+    /// `MAX_SUBINVITES_PER_INVITER` keys, and the store holds at most `capacity` chains. When
+    /// full, new leaves are refused; admitted chains are never evicted.
+    pub fn chain_admission_decision(facts: &ChainAdmissionFacts) -> Result<(), &'static str> {
+        if !facts.inviter_is_genesis && facts.inviter_subinvites >= MAX_SUBINVITES_PER_INVITER {
+            return Err("reject.subinvite_limit");
+        }
+        if facts.new_leaf && facts.admitted_total >= facts.capacity {
+            return Err("reject.admitted_chains_full");
+        }
+        Ok(())
+    }
+
+    /// Sets the chain-store capacity (tests and small devices).
+    pub fn set_admitted_chains_capacity(&mut self, capacity: usize) {
+        self.admitted_chains_capacity = Some(capacity);
     }
 
     /// Verifies and admits a stranger peer's self-signed Hashcash `PublicCommonsTicket` when
@@ -1127,6 +1191,86 @@ impl WebOfTrustRegistry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn f30_subinvites_and_chain_store_are_bounded() {
+        let genesis = NodeIdentity::from_seed([0x47; 32]);
+        let member = NodeIdentity::from_seed([0x48; 32]);
+        let mut reg = WebOfTrustRegistry::new(genesis.public_key_bytes(), 3);
+        let base = DelegationChain {
+            hops: vec![InvitationHop::issue(
+                &genesis,
+                member.public_key_bytes(),
+                1,
+                1,
+            )],
+        };
+        reg.verify_and_admit_chain(&base).unwrap();
+        reg.flush();
+        // Re-sending the same chain writes nothing.
+        reg.verify_and_admit_chain(&base).unwrap();
+        assert!(!reg.has_pending_writes());
+        let sub = |n: u32| {
+            let leaf = NodeIdentity::from_seed([(n % 250) as u8 + 1; 32]);
+            let mut hops = base.hops.clone();
+            hops.push(InvitationHop::issue(
+                &member,
+                {
+                    let mut k = leaf.public_key_bytes();
+                    k[31] = (n / 250) as u8;
+                    k
+                },
+                2,
+                1,
+            ));
+            DelegationChain { hops }
+        };
+        for n in 0..MAX_SUBINVITES_PER_INVITER as u32 {
+            reg.verify_and_admit_chain(&sub(n)).unwrap();
+        }
+        assert_eq!(
+            reg.verify_and_admit_chain(&sub(MAX_SUBINVITES_PER_INVITER as u32)),
+            Err(WebOfTrustError::ChainAdmissionLimit)
+        );
+        assert_eq!(
+            WebOfTrustRegistry::chain_admission_decision(&ChainAdmissionFacts {
+                inviter_is_genesis: false,
+                inviter_subinvites: MAX_SUBINVITES_PER_INVITER,
+                new_leaf: true,
+                admitted_total: 1,
+                capacity: 10,
+            }),
+            Err("reject.subinvite_limit")
+        );
+        // A full store refuses new leaves and keeps the admitted ones.
+        let mut reg = WebOfTrustRegistry::new(genesis.public_key_bytes(), 3);
+        reg.set_admitted_chains_capacity(1);
+        reg.verify_and_admit_chain(&base).unwrap();
+        let other = NodeIdentity::from_seed([0x49; 32]);
+        let second = DelegationChain {
+            hops: vec![InvitationHop::issue(
+                &genesis,
+                other.public_key_bytes(),
+                1,
+                1,
+            )],
+        };
+        assert_eq!(
+            reg.verify_and_admit_chain(&second),
+            Err(WebOfTrustError::ChainAdmissionLimit)
+        );
+        assert!(reg.is_private_ring_peer(&member.public_key_bytes()));
+        assert_eq!(
+            WebOfTrustRegistry::chain_admission_decision(&ChainAdmissionFacts {
+                inviter_is_genesis: true,
+                inviter_subinvites: 0,
+                new_leaf: true,
+                admitted_total: 1,
+                capacity: 1,
+            }),
+            Err("reject.admitted_chains_full")
+        );
+    }
+
     fn public_registry(capacity: usize) -> WebOfTrustRegistry {
         let mut reg = WebOfTrustRegistry::new([0u8; 32], 3);
         reg.set_trust_pool_mode(TrustPoolMode::PublicCommons, 8);
