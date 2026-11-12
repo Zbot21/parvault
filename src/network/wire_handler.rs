@@ -1,8 +1,9 @@
-//! Inbound `MeshWireRequest` handlers for the `parvault` daemon and the
-//! `parvault-seed` server.
+//! Inbound `MeshWireRequest` handling shared by the `parvault` daemon and `parvault-seed`.
 //!
-//! Moved verbatim from `src/main.rs` and `src/bin/parvault-seed.rs`; behaviour
-//! and wire format are unchanged.
+//! [`handle_mesh_wire_request`] implements every variant once. The daemon and the seed differ
+//! only through [`WireRolePolicy`] ([`DaemonWirePolicy`], [`SeedWirePolicy`]); the divergence
+//! table is on the trait. [`admission_class`], `admit` and `shard_owner` are the single places for
+//! an admission check and the shard-owner quota identity; both are inert in this version.
 
 use crate::bootstrap::{SeedServerMode, ZeroTrustSeedServer};
 use crate::config::NodeConfig;
@@ -22,6 +23,7 @@ use crate::storage::{
     SignedBadActorEvictionOrder, VoucherNullifierLedger,
 };
 use libp2p::Multiaddr;
+use std::net::IpAddr;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
@@ -39,13 +41,6 @@ pub fn extract_ip_from_multiaddr(addr: &Multiaddr) -> Option<std::net::IpAddr> {
 }
 
 fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn seed_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -128,6 +123,32 @@ pub struct DaemonWireHandlerCtx<'a> {
     pub takedown_queue: &'a mut PublicTrackerTakedownQueue,
 }
 
+/// State borrowed by the seed wire handler for one request.
+pub struct SeedWireHandlerCtx<'a> {
+    pub data_dir: &'a Path,
+    pub node_identity: &'a NodeIdentity,
+    pub advertised_admin_pk: Option<[u8; 32]>,
+    pub local_tracker_admin_pk: Option<[u8; 32]>,
+    pub extra_council_pks: &'a [[u8; 32]],
+    pub council_quorum: Option<usize>,
+    pub max_probationary_lease_bytes: u64,
+    pub genesis_pubkey: [u8; 32],
+    pub block_store: &'a BlockStore,
+    pub server: &'a mut ZeroTrustSeedServer,
+    pub wot: &'a mut WebOfTrustRegistry,
+    pub por_verifier: &'a mut PorVerifierEngine,
+    pub nullifier_ledger: &'a mut VoucherNullifierLedger,
+    pub pq_kem: &'a HybridKemKeypair,
+    pub wan_registry: &'a mut WanRendezvousRegistry,
+    pub eviction: &'a mut PrivacyPreservingEvictionEngine,
+    pub takedown_queue: &'a mut PublicTrackerTakedownQueue,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Role entry points (one per binary). Each builds its policy per request from the ctx, so live
+// seed state (`max_probationary_lease_bytes`, `server.mode()`) is read under the caller's lock.
+// ---------------------------------------------------------------------------------------------
+
 /// Handles one inbound request on the `parvault` daemon.
 pub fn handle_daemon_wire_request(
     remote_peer_id: &str,
@@ -135,23 +156,447 @@ pub fn handle_daemon_wire_request(
     request: MeshWireRequest,
     ctx: DaemonWireHandlerCtx<'_>,
 ) -> MeshWireResponse {
-    let DaemonWireHandlerCtx {
-        cfg,
+    let policy = DaemonWirePolicy {
+        cfg: ctx.cfg,
+        public_mode: ctx.public_mode,
+    };
+    let state = WireState {
+        node_identity: ctx.node_identity,
+        genesis_pubkey: ctx.genesis_pubkey,
+        block_store: ctx.block_store,
+        server: ctx.lite_seed_server,
+        wot: ctx.wot,
+        por_verifier: ctx.por_verifier,
+        nullifier_ledger: ctx.nullifier_ledger,
+        pq_kem: ctx.pq_kem,
+        wan_registry: ctx.wan_registry,
+        eviction: ctx.eviction,
+        takedown_queue: ctx.takedown_queue,
+    };
+    handle_mesh_wire_request(
+        &WirePeer::new(remote_peer_id, remote_addr),
+        request,
+        state,
+        &policy,
+    )
+}
+
+/// Handles one inbound request on `parvault-seed`.
+pub fn handle_seed_wire_request(
+    remote_peer_id: &str,
+    remote_addr: Option<&Multiaddr>,
+    request: MeshWireRequest,
+    ctx: SeedWireHandlerCtx<'_>,
+) -> MeshWireResponse {
+    let policy = SeedWirePolicy {
+        data_dir: ctx.data_dir,
+        advertised_admin_pk: ctx.advertised_admin_pk,
+        local_tracker_admin_pk: ctx.local_tracker_admin_pk,
+        extra_council_pks: ctx.extra_council_pks,
+        council_quorum: ctx.council_quorum,
+        max_probationary_lease_bytes: ctx.max_probationary_lease_bytes,
+    };
+    let state = WireState {
+        node_identity: ctx.node_identity,
+        genesis_pubkey: ctx.genesis_pubkey,
+        block_store: ctx.block_store,
+        server: ctx.server,
+        wot: ctx.wot,
+        por_verifier: ctx.por_verifier,
+        nullifier_ledger: ctx.nullifier_ledger,
+        pq_kem: ctx.pq_kem,
+        wan_registry: ctx.wan_registry,
+        eviction: ctx.eviction,
+        takedown_queue: ctx.takedown_queue,
+    };
+    handle_mesh_wire_request(
+        &WirePeer::new(remote_peer_id, remote_addr),
+        request,
+        state,
+        &policy,
+    )
+}
+
+// ---------------------------------------------------------------------------------------------
+// Shared handler
+// ---------------------------------------------------------------------------------------------
+
+/// The remote side of one request, with its IP and Ed25519 key derived once.
+pub struct WirePeer<'a> {
+    pub peer_id: &'a str,
+    pub addr: Option<&'a Multiaddr>,
+    pub ip: Option<IpAddr>,
+    pub pubkey: Option<[u8; 32]>,
+}
+
+impl<'a> WirePeer<'a> {
+    pub fn new(peer_id: &'a str, addr: Option<&'a Multiaddr>) -> Self {
+        Self {
+            peer_id,
+            addr,
+            ip: addr.and_then(extract_ip_from_multiaddr),
+            pubkey: NodeConfig::extract_ed25519_pubkey_from_peer_str(peer_id),
+        }
+    }
+}
+
+/// Node state the handler reads and mutates for one request.
+pub struct WireState<'a> {
+    pub node_identity: &'a NodeIdentity,
+    pub genesis_pubkey: [u8; 32],
+    pub block_store: &'a BlockStore,
+    /// The daemon's embedded lite seed server, or the seed binary's server.
+    pub server: &'a mut ZeroTrustSeedServer,
+    pub wot: &'a mut WebOfTrustRegistry,
+    pub por_verifier: &'a mut PorVerifierEngine,
+    pub nullifier_ledger: &'a mut VoucherNullifierLedger,
+    pub pq_kem: &'a HybridKemKeypair,
+    pub wan_registry: &'a mut WanRendezvousRegistry,
+    pub eviction: &'a mut PrivacyPreservingEvictionEngine,
+    pub takedown_queue: &'a mut PublicTrackerTakedownQueue,
+}
+
+/// Role-specific behaviour of the shared handler: one method per row where the daemon and the
+/// seed handlers differed before the merge. No method has a default body.
+///
+/// | Row | Variant | Daemon | Seed |
+/// | :-- | :-- | :-- | :-- |
+/// | 2 | `PutShard` | no extra record | also `record_peer_admission_ip(ip, pubkey)` |
+/// | 4, 10 | `PorAudit`, `MultiSegmentPorAudit` | no heartbeat | `record_por_heartbeat(true)` on success |
+/// | 6, 11 | `PutBlindedShard`, onion final delivery | no size limit | `max_probationary_lease_bytes` (0 = off) |
+/// | 9 | `DeleteBlindedShardTombstone` | `BlockStore` error text | via the seed server: "Seed server storage error: " prefix |
+/// | 15 | `QueryNodeStatus` | region `local-neighborhood` | region `seed-anchor` |
+/// | 16, 17 | Register / Lookup rendezvous | `tracker_admin_pubkey: None` | advertised admin key |
+/// | 16 | Register on the public slot | no extra record | records every advertised card IP |
+/// | 18 | `SubmitAbuseTakedownReport` | always queued | refused unless public bootstrapper |
+/// | 19 | `BroadcastEvictionOrder` | `NodeConfig` council resolver | `resolve_seed_council_and_quorum` |
+pub trait WireRolePolicy {
+    /// Row 2.
+    fn record_put_shard_admission_ip(&self) -> bool;
+    /// Rows 4 and 10: called after a PoR challenge passes.
+    fn on_por_pass(&self, server: &mut ZeroTrustSeedServer);
+    /// Rows 6 and 11: blinded shards longer than this are refused; 0 disables the check.
+    fn max_probationary_lease_bytes(&self) -> u64;
+    /// Row 9: route tombstones through the seed server (changes only the error text).
+    fn tombstone_via_seed_server(&self) -> bool;
+    /// Row 15.
+    fn status_region(&self) -> &'static str;
+    /// Rows 16 and 17.
+    fn tracker_admin_pubkey(&self) -> Option<[u8; 32]>;
+    /// Row 16.
+    fn record_public_card_ips(&self) -> bool;
+    /// Row 18: `Err(reason)` refuses the report before it reaches the queue.
+    fn takedown_gate(&self, mode: SeedServerMode) -> Result<(), String>;
+    /// Row 19: the eviction council and minimum quorum.
+    fn eviction_council(
+        &self,
+        block_store: &BlockStore,
+        mode: SeedServerMode,
+        genesis_pubkey: [u8; 32],
+    ) -> (Vec<[u8; 32]>, usize);
+}
+
+/// Policy of the `parvault` daemon.
+pub struct DaemonWirePolicy<'a> {
+    pub cfg: &'a NodeConfig,
+    pub public_mode: bool,
+}
+
+/// Policy of `parvault-seed`. Built per request from live seed state.
+pub struct SeedWirePolicy<'a> {
+    pub data_dir: &'a Path,
+    pub advertised_admin_pk: Option<[u8; 32]>,
+    pub local_tracker_admin_pk: Option<[u8; 32]>,
+    pub extra_council_pks: &'a [[u8; 32]],
+    pub council_quorum: Option<usize>,
+    pub max_probationary_lease_bytes: u64,
+}
+
+impl WireRolePolicy for DaemonWirePolicy<'_> {
+    fn record_put_shard_admission_ip(&self) -> bool {
+        false
+    }
+    fn on_por_pass(&self, _server: &mut ZeroTrustSeedServer) {}
+    fn max_probationary_lease_bytes(&self) -> u64 {
+        0
+    }
+    fn tombstone_via_seed_server(&self) -> bool {
+        false
+    }
+    fn status_region(&self) -> &'static str {
+        "local-neighborhood"
+    }
+    fn tracker_admin_pubkey(&self) -> Option<[u8; 32]> {
+        None
+    }
+    fn record_public_card_ips(&self) -> bool {
+        false
+    }
+    fn takedown_gate(&self, _mode: SeedServerMode) -> Result<(), String> {
+        Ok(())
+    }
+    fn eviction_council(
+        &self,
+        block_store: &BlockStore,
+        _mode: SeedServerMode,
+        genesis_pubkey: [u8; 32],
+    ) -> (Vec<[u8; 32]>, usize) {
+        let mut pinned_admins =
+            KnownPeersStore::load(&self.cfg.data_dir).pinned_tracker_admin_pubkeys();
+        if let Some(mc) = block_store.mesh_client() {
+            for pk in mc.pinned_tracker_admin_pubkeys() {
+                if !pinned_admins.contains(&pk) {
+                    pinned_admins.push(pk);
+                }
+            }
+        }
+        self.cfg.resolve_eviction_council_and_quorum(
+            genesis_pubkey,
+            &pinned_admins,
+            self.public_mode,
+        )
+    }
+}
+
+impl WireRolePolicy for SeedWirePolicy<'_> {
+    fn record_put_shard_admission_ip(&self) -> bool {
+        true
+    }
+    fn on_por_pass(&self, server: &mut ZeroTrustSeedServer) {
+        server.record_por_heartbeat(true);
+    }
+    fn max_probationary_lease_bytes(&self) -> u64 {
+        self.max_probationary_lease_bytes
+    }
+    fn tombstone_via_seed_server(&self) -> bool {
+        true
+    }
+    fn status_region(&self) -> &'static str {
+        "seed-anchor"
+    }
+    fn tracker_admin_pubkey(&self) -> Option<[u8; 32]> {
+        self.advertised_admin_pk
+    }
+    fn record_public_card_ips(&self) -> bool {
+        true
+    }
+    fn takedown_gate(&self, mode: SeedServerMode) -> Result<(), String> {
+        if mode != SeedServerMode::PublicNetworkBootstrapper {
+            return Err("abuse takedown queue disabled in homelab-vault private mode".to_string());
+        }
+        Ok(())
+    }
+    fn eviction_council(
+        &self,
+        _block_store: &BlockStore,
+        mode: SeedServerMode,
+        genesis_pubkey: [u8; 32],
+    ) -> (Vec<[u8; 32]>, usize) {
+        resolve_seed_council_and_quorum(
+            self.data_dir,
+            mode,
+            self.local_tracker_admin_pk,
+            self.extra_council_pks,
+            self.council_quorum,
+            genesis_pubkey,
+        )
+    }
+}
+
+/// How a request may be authorised. Inert in 2a; the admission check (`admit`) will use it.
+/// Every variant is listed (no wildcard), so a new request type must be classified to build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionClass {
+    /// Must stay reachable before a peer is admitted (handshake, rendezvous, status).
+    PreAdmission,
+    /// Authorised by the request itself: blinded vouchers / capabilities, onion relays,
+    /// owner signatures, PoR session keys, signed DHT envelopes.
+    SelfAuthorised,
+    /// Authorised by a council or reporter signature checked inside the arm.
+    CouncilSigned,
+    /// Requires an admitted peer.
+    AdmittedPeer,
+}
+
+/// Classifies a request for admission.
+pub const fn admission_class(request: &MeshWireRequest) -> AdmissionClass {
+    match request {
+        MeshWireRequest::HandshakeWoT { .. }
+        | MeshWireRequest::QueryNodeStatus
+        | MeshWireRequest::RegisterWanRendezvous { .. }
+        | MeshWireRequest::LookupWanRendezvous { .. } => AdmissionClass::PreAdmission,
+        MeshWireRequest::PutBlindedShard { .. }
+        | MeshWireRequest::GetBlindedShard { .. }
+        | MeshWireRequest::RenewBlindedLease { .. }
+        | MeshWireRequest::DeleteBlindedShardTombstone { .. }
+        | MeshWireRequest::RelayPqOnionEnvelope { .. }
+        | MeshWireRequest::GetCiphertextShard { .. }
+        | MeshWireRequest::DeleteShard { .. }
+        | MeshWireRequest::PorAudit(_)
+        | MeshWireRequest::MultiSegmentPorAudit(_)
+        | MeshWireRequest::PutDhtEnvelope(_)
+        | MeshWireRequest::GetDhtEnvelope { .. } => AdmissionClass::SelfAuthorised,
+        MeshWireRequest::SubmitAbuseTakedownReport(_)
+        | MeshWireRequest::BroadcastEvictionOrder(_) => AdmissionClass::CouncilSigned,
+        MeshWireRequest::PutShard { .. } | MeshWireRequest::SyndicateLiteStripe { .. } => {
+            AdmissionClass::AdmittedPeer
+        }
+    }
+}
+
+/// The single admission check: `Some(rejection)` refuses the request before dispatch.
+/// Always admits in 2a (today's behaviour).
+fn admit(
+    _peer: &WirePeer<'_>,
+    _request: &MeshWireRequest,
+    _class: AdmissionClass,
+    _st: &mut WireState<'_>,
+) -> Option<MeshWireResponse> {
+    None
+}
+
+/// The single quota-identity decision for shard ownership. `claimed` is the owner named in the
+/// request (`PutShard`), or `None` where none is sent (`DeleteShard`). Today's rule: an empty,
+/// `local` or `self` claim, or no claim, means the remote peer.
+fn shard_owner<'r>(peer: &WirePeer<'r>, claimed: Option<&'r str>) -> &'r str {
+    match claimed {
+        Some(owner) if !(owner.is_empty() || owner == "local" || owner == "self") => owner,
+        _ => peer.peer_id,
+    }
+}
+
+/// The negative acknowledgement for `request` carrying `reason` (for use by `admit`).
+pub fn reject_response(request: &MeshWireRequest, reason: String) -> MeshWireResponse {
+    match request {
+        MeshWireRequest::HandshakeWoT { .. } => MeshWireResponse::HandshakeAck {
+            accepted: false,
+            reason: Some(reason),
+        },
+        MeshWireRequest::PutShard { .. } => MeshWireResponse::PutShardAck {
+            stored: false,
+            error: Some(reason),
+        },
+        MeshWireRequest::PorAudit(_) => MeshWireResponse::PorAuditResult(None),
+        MeshWireRequest::GetCiphertextShard { .. } => MeshWireResponse::CiphertextShardResult {
+            shard_bytes: None,
+            error: Some(reason),
+        },
+        MeshWireRequest::PutBlindedShard { .. } => MeshWireResponse::PutBlindedShardAck {
+            stored: false,
+            error: Some(reason),
+        },
+        MeshWireRequest::GetBlindedShard { .. } => MeshWireResponse::BlindedShardResult {
+            shard_bytes: None,
+            error: Some(reason),
+        },
+        MeshWireRequest::RenewBlindedLease { .. } => {
+            MeshWireResponse::RenewBlindedLeaseAck { renewed: false }
+        }
+        MeshWireRequest::DeleteBlindedShardTombstone { .. } => {
+            MeshWireResponse::DeleteBlindedShardAck {
+                deleted: false,
+                error: Some(reason),
+            }
+        }
+        MeshWireRequest::MultiSegmentPorAudit(_) => {
+            MeshWireResponse::MultiSegmentPorAuditResult(None)
+        }
+        MeshWireRequest::RelayPqOnionEnvelope { .. } => MeshWireResponse::RelayPqOnionAck {
+            delivered: false,
+            error: Some(reason),
+        },
+        MeshWireRequest::SyndicateLiteStripe { .. } => MeshWireResponse::SyndicateLiteStripeAck {
+            receipt: None,
+            syndicated_peers: Vec::new(),
+            error: Some(reason),
+        },
+        MeshWireRequest::PutDhtEnvelope(_) => MeshWireResponse::PutDhtEnvelopeAck {
+            stored: false,
+            error: Some(reason),
+        },
+        MeshWireRequest::GetDhtEnvelope { .. } => MeshWireResponse::GetDhtEnvelopeResult {
+            envelope: None,
+            error: Some(reason),
+        },
+        MeshWireRequest::DeleteShard { .. } => MeshWireResponse::DeleteShardAck {
+            deleted: false,
+            error: Some(reason),
+        },
+        MeshWireRequest::QueryNodeStatus => MeshWireResponse::NodeStatusResult {
+            peer_id: String::new(),
+            asn: 0,
+            region: String::new(),
+            available_bytes: 0,
+            used_bytes: 0,
+            sla_score: 0.0,
+            pq_kem_pubkey: None,
+        },
+        MeshWireRequest::RegisterWanRendezvous { .. } => {
+            MeshWireResponse::RegisterWanRendezvousAck {
+                stored: false,
+                observed_external_addr: None,
+                error: Some(reason),
+                tracker_admin_pubkey: None,
+            }
+        }
+        MeshWireRequest::LookupWanRendezvous { .. } => {
+            MeshWireResponse::LookupWanRendezvousResult {
+                entries: Vec::new(),
+                observed_external_addr: None,
+                tracker_admin_pubkey: None,
+            }
+        }
+        MeshWireRequest::SubmitAbuseTakedownReport(report) => {
+            MeshWireResponse::SubmitAbuseTakedownAck {
+                queued_for_admin_review: false,
+                report_id: report.report_id,
+                verified_plaintext_sha256: None,
+                error: Some(reason),
+            }
+        }
+        MeshWireRequest::BroadcastEvictionOrder(_) => MeshWireResponse::EvictionOrderAck {
+            accepted: false,
+            purged_regular_shards: 0,
+            purged_blinded_shards: 0,
+            zero_wiped_bytes: 0,
+            error: Some(reason),
+        },
+    }
+}
+
+fn lease_limit_error(len: usize, limit: u64) -> Option<String> {
+    (limit > 0 && (len as u64) > limit)
+        .then(|| format!("shard length {len} exceeds max_probationary_lease_bytes {limit}"))
+}
+
+/// Handles one inbound `MeshWireRequest` for either role.
+pub fn handle_mesh_wire_request<P: WireRolePolicy>(
+    peer: &WirePeer<'_>,
+    request: MeshWireRequest,
+    mut st: WireState<'_>,
+    policy: &P,
+) -> MeshWireResponse {
+    let class = admission_class(&request);
+    if let Some(rejection) = admit(peer, &request, class, &mut st) {
+        return rejection;
+    }
+    let WireState {
         node_identity,
         genesis_pubkey,
-        public_mode,
         block_store,
+        server,
         wot,
         por_verifier,
         nullifier_ledger,
         pq_kem,
-        lite_seed_server,
         wan_registry,
         eviction,
         takedown_queue,
-    } = ctx;
-    let remote_ip = remote_addr.and_then(extract_ip_from_multiaddr);
-    let remote_pubkey = NodeConfig::extract_ed25519_pubkey_from_peer_str(remote_peer_id);
+    } = st;
+    let remote_peer_id = peer.peer_id;
+    let remote_addr = peer.addr;
+    let remote_ip = peer.ip;
+    let remote_pubkey = peer.pubkey;
 
     match request {
         MeshWireRequest::HandshakeWoT { chain, .. } => {
@@ -211,14 +656,7 @@ pub fn handle_daemon_wire_request(
                 por_verifier.register_repair_grant(grant);
             }
             por_verifier.register_shard_session(&shard_id, session_key_commit);
-            let effective_owner = if owner_peer_id.is_empty()
-                || owner_peer_id == "local"
-                || owner_peer_id == "self"
-            {
-                remote_peer_id
-            } else {
-                owner_peer_id.as_str()
-            };
+            let effective_owner = shard_owner(peer, Some(owner_peer_id.as_str()));
             match block_store.put_shard(effective_owner, &shard_id, &shard_bytes) {
                 Ok(_) => {
                     let _ = eviction.record_regular_shard_ingress(
@@ -228,742 +666,10 @@ pub fn handle_daemon_wire_request(
                         effective_owner,
                         shard_id,
                     );
-                    MeshWireResponse::PutShardAck {
-                        stored: true,
-                        error: None,
-                    }
-                }
-                Err(e) => MeshWireResponse::PutShardAck {
-                    stored: false,
-                    error: Some(e.to_string()),
-                },
-            }
-        }
-        MeshWireRequest::DeleteShard {
-            shard_id,
-            owner_signature: (owner_pub, payload, r, s),
-        } => {
-            let mut sig64 = [0u8; 64];
-            sig64[..32].copy_from_slice(&r);
-            sig64[32..].copy_from_slice(&s);
-            if !por_verifier.authorize_owner_shard_delete(
-                &shard_id,
-                &owner_pub,
-                payload.as_slice(),
-                &sig64,
-            ) {
-                return MeshWireResponse::DeleteShardAck {
-                    deleted: false,
-                    error: Some("unauthorized owner shard delete signature".to_string()),
-                };
-            }
-            match block_store.delete_shard(remote_peer_id, &shard_id) {
-                Ok(deleted) => MeshWireResponse::DeleteShardAck {
-                    deleted,
-                    error: None,
-                },
-                Err(e) => MeshWireResponse::DeleteShardAck {
-                    deleted: false,
-                    error: Some(e.to_string()),
-                },
-            }
-        }
-        MeshWireRequest::PorAudit(challenge) => {
-            let now_ms = now_unix_ms();
-            match por_verifier.handle_incoming_challenge(&challenge, now_ms, block_store) {
-                Ok(resp) => MeshWireResponse::PorAuditResult(Some(resp)),
-                Err(e) => {
-                    warn!(peer = remote_peer_id, error = %e, "Dropped PoR challenge in RAM pre-check");
-                    MeshWireResponse::PorAuditResult(None)
-                }
-            }
-        }
-        MeshWireRequest::GetCiphertextShard {
-            shard_id,
-            owner_signature,
-            repair_proof,
-        } => {
-            let owner_sig_storage;
-            let owner_sig_ref = if let Some((owner_pub, payload, r, s)) = &owner_signature {
-                let mut sig64 = [0u8; 64];
-                sig64[..32].copy_from_slice(r);
-                sig64[32..].copy_from_slice(s);
-                owner_sig_storage = (*owner_pub, payload.as_slice(), sig64);
-                Some((
-                    owner_sig_storage.0,
-                    owner_sig_storage.1,
-                    &owner_sig_storage.2,
-                ))
-            } else {
-                None
-            };
-
-            let repair_ref = repair_proof
-                .as_ref()
-                .map(|(grant, receipts)| (grant, receipts.as_slice()));
-
-            match por_verifier.authorize_raw_shard_read(
-                &shard_id,
-                owner_sig_ref.as_ref(),
-                repair_ref,
-                block_store,
-            ) {
-                Ok(bytes) => MeshWireResponse::CiphertextShardResult {
-                    shard_bytes: Some(bytes),
-                    error: None,
-                },
-                Err(e) => MeshWireResponse::CiphertextShardResult {
-                    shard_bytes: None,
-                    error: Some(e.to_string()),
-                },
-            }
-        }
-        MeshWireRequest::PutBlindedShard {
-            blinded_id,
-            shard_bytes,
-            capability,
-            voucher,
-            current_epoch,
-            lease_duration_epochs,
-            delete_verifier,
-        } => {
-            if let Some(reason) = eviction
-                .is_ingress_blocked(
-                    remote_ip,
-                    Some(remote_peer_id),
-                    Some(&voucher.issuer_pubkey),
-                    None,
-                    Some(&blinded_id.locator),
-                )
-                .or_else(|| {
-                    eviction.is_ingress_blocked(None, None, remote_pubkey.as_ref(), None, None)
-                })
-            {
-                return MeshWireResponse::PutBlindedShardAck {
-                    stored: false,
-                    error: Some(reason),
-                };
-            }
-            nullifier_ledger.set_trusted_issuer_pubkey(voucher.issuer_pubkey);
-            match block_store.put_blinded_shard_with_lease(
-                &blinded_id,
-                &shard_bytes,
-                capability,
-                &voucher,
-                nullifier_ledger,
-                crate::storage::BlindedLeaseSpec::new(
-                    current_epoch,
-                    lease_duration_epochs,
-                    delete_verifier,
-                ),
-            ) {
-                Ok(_) => {
-                    let _ = eviction.record_blinded_shard_ingress(
-                        remote_ip,
-                        Some(remote_peer_id),
-                        voucher.issuer_pubkey,
-                        blinded_id,
-                    );
-                    if let Some(ip) = remote_ip {
-                        let _ = eviction.record_peer_admission_ip(ip, voucher.issuer_pubkey);
-                    }
-                    MeshWireResponse::PutBlindedShardAck {
-                        stored: true,
-                        error: None,
-                    }
-                }
-                Err(e) => MeshWireResponse::PutBlindedShardAck {
-                    stored: false,
-                    error: Some(e.to_string()),
-                },
-            }
-        }
-        MeshWireRequest::GetBlindedShard {
-            blinded_id,
-            capability,
-            timestamp_ms,
-            read_sig,
-        } => {
-            if read_sig.len() != 64 {
-                return MeshWireResponse::BlindedShardResult {
-                    shard_bytes: None,
-                    error: Some("invalid 64-byte capability signature length".to_string()),
-                };
-            }
-            let mut sig64 = [0u8; 64];
-            sig64.copy_from_slice(&read_sig);
-            match block_store.get_blinded_shard_authorized(
-                &blinded_id,
-                &capability,
-                timestamp_ms,
-                &sig64,
-            ) {
-                Ok(bytes) => MeshWireResponse::BlindedShardResult {
-                    shard_bytes: Some(bytes),
-                    error: None,
-                },
-                Err(e) => MeshWireResponse::BlindedShardResult {
-                    shard_bytes: None,
-                    error: Some(e.to_string()),
-                },
-            }
-        }
-        MeshWireRequest::RenewBlindedLease {
-            blinded_id,
-            current_epoch,
-            extension_epochs,
-        } => {
-            if eviction
-                .is_ingress_blocked(
-                    remote_ip,
-                    Some(remote_peer_id),
-                    remote_pubkey.as_ref(),
-                    None,
-                    Some(&blinded_id.locator),
-                )
-                .is_some()
-            {
-                return MeshWireResponse::RenewBlindedLeaseAck { renewed: false };
-            }
-            let renewed =
-                block_store.renew_blinded_shard_lease(&blinded_id, current_epoch, extension_epochs);
-            MeshWireResponse::RenewBlindedLeaseAck { renewed }
-        }
-        MeshWireRequest::DeleteBlindedShardTombstone {
-            blinded_id,
-            tombstone,
-        } => match block_store.delete_blinded_shard_with_tombstone(&blinded_id, &tombstone) {
-            Ok(deleted) => MeshWireResponse::DeleteBlindedShardAck {
-                deleted,
-                error: None,
-            },
-            Err(e) => MeshWireResponse::DeleteBlindedShardAck {
-                deleted: false,
-                error: Some(e.to_string()),
-            },
-        },
-        MeshWireRequest::MultiSegmentPorAudit(challenge) => {
-            let now_ms = now_unix_ms();
-            match por_verifier.handle_multi_segment_challenge(&challenge, now_ms, block_store) {
-                Ok(resp) => MeshWireResponse::MultiSegmentPorAuditResult(Some(resp)),
-                Err(e) => {
-                    warn!(peer = remote_peer_id, error = %e, "Dropped MultiSegmentPorAudit in RAM pre-check");
-                    MeshWireResponse::MultiSegmentPorAuditResult(None)
-                }
-            }
-        }
-        MeshWireRequest::RelayPqOnionEnvelope {
-            target_peer_addr,
-            envelope,
-            capability,
-            voucher,
-            current_epoch,
-            lease_duration_epochs,
-            delete_verifier,
-        } => {
-            if let Some(reason) = eviction.is_ingress_blocked(
-                remote_ip,
-                Some(remote_peer_id),
-                remote_pubkey.as_ref(),
-                None,
-                None,
-            ) {
-                return MeshWireResponse::RelayPqOnionAck {
-                    delivered: false,
-                    error: Some(reason),
-                };
-            }
-            if let Some(next_hop) = target_peer_addr {
-                if let Some(client) = block_store.mesh_client() {
-                    match client.relay_pq_onion_envelope(
-                        &next_hop,
-                        None,
-                        envelope,
-                        capability,
-                        voucher,
-                        crate::storage::BlindedLeaseSpec::new(
-                            current_epoch,
-                            lease_duration_epochs,
-                            delete_verifier,
-                        ),
-                    ) {
-                        Ok(()) => MeshWireResponse::RelayPqOnionAck {
-                            delivered: true,
-                            error: None,
-                        },
-                        Err(e) => MeshWireResponse::RelayPqOnionAck {
-                            delivered: false,
-                            error: Some(e.to_string()),
-                        },
-                    }
-                } else {
-                    MeshWireResponse::RelayPqOnionAck {
-                        delivered: false,
-                        error: Some("no MeshClient available for onion forwarding".to_string()),
-                    }
-                }
-            } else if let Ok(hop) = envelope.peel_relay_hop_pq(pq_kem) {
-                if envelope.jitter_delay_ms > 0 {
-                    std::thread::sleep(Duration::from_millis(envelope.jitter_delay_ms.min(250)));
-                }
-                if let Some(client) = block_store.mesh_client() {
-                    match client
-                        .relay_layered_pq_onion_envelope(&hop.target_peer_addr, hop.inner_envelope)
-                    {
-                        Ok(()) => MeshWireResponse::RelayPqOnionAck {
-                            delivered: true,
-                            error: None,
-                        },
-                        Err(e) => MeshWireResponse::RelayPqOnionAck {
-                            delivered: false,
-                            error: Some(e.to_string()),
-                        },
-                    }
-                } else {
-                    MeshWireResponse::RelayPqOnionAck {
-                        delivered: false,
-                        error: Some(
-                            "no MeshClient available for 2-layer onion forwarding".to_string(),
-                        ),
-                    }
-                }
-            } else if let Ok(bundle) = envelope.open_final_target_pq(pq_kem) {
-                if let Some(reason) = eviction.is_ingress_blocked(
-                    remote_ip,
-                    Some(remote_peer_id),
-                    Some(&bundle.voucher.issuer_pubkey),
-                    None,
-                    Some(&bundle.blinded_id.locator),
-                ) {
-                    return MeshWireResponse::RelayPqOnionAck {
-                        delivered: false,
-                        error: Some(reason),
-                    };
-                }
-                nullifier_ledger.set_trusted_issuer_pubkey(bundle.voucher.issuer_pubkey);
-                let voucher_pk = bundle.voucher.issuer_pubkey;
-                let bid = bundle.blinded_id;
-                match block_store.put_blinded_shard_with_lease(
-                    &bundle.blinded_id,
-                    &bundle.shard_bytes,
-                    bundle.capability,
-                    &bundle.voucher,
-                    nullifier_ledger,
-                    crate::storage::BlindedLeaseSpec::new(
-                        bundle.current_epoch,
-                        bundle.lease_duration_epochs,
-                        bundle.delete_verifier,
-                    ),
-                ) {
-                    Ok(_) => {
-                        let _ = eviction.record_blinded_shard_ingress(
-                            remote_ip,
-                            Some(remote_peer_id),
-                            voucher_pk,
-                            bid,
-                        );
-                        MeshWireResponse::RelayPqOnionAck {
-                            delivered: true,
-                            error: None,
+                    if policy.record_put_shard_admission_ip() {
+                        if let (Some(ip), Some(pk)) = (remote_ip, remote_pubkey) {
+                            let _ = eviction.record_peer_admission_ip(ip, pk);
                         }
-                    }
-                    Err(e) => MeshWireResponse::RelayPqOnionAck {
-                        delivered: false,
-                        error: Some(e.to_string()),
-                    },
-                }
-            } else {
-                match envelope.open_pq(pq_kem) {
-                    Ok((blinded_id, shard_bytes)) => {
-                        if let Some(reason) = eviction.is_ingress_blocked(
-                            remote_ip,
-                            Some(remote_peer_id),
-                            Some(&voucher.issuer_pubkey),
-                            None,
-                            Some(&blinded_id.locator),
-                        ) {
-                            return MeshWireResponse::RelayPqOnionAck {
-                                delivered: false,
-                                error: Some(reason),
-                            };
-                        }
-                        nullifier_ledger.set_trusted_issuer_pubkey(voucher.issuer_pubkey);
-                        let voucher_pk = voucher.issuer_pubkey;
-                        match block_store.put_blinded_shard_with_lease(
-                            &blinded_id,
-                            &shard_bytes,
-                            capability,
-                            &voucher,
-                            nullifier_ledger,
-                            crate::storage::BlindedLeaseSpec::new(
-                                current_epoch,
-                                lease_duration_epochs,
-                                delete_verifier,
-                            ),
-                        ) {
-                            Ok(_) => {
-                                let _ = eviction.record_blinded_shard_ingress(
-                                    remote_ip,
-                                    Some(remote_peer_id),
-                                    voucher_pk,
-                                    blinded_id,
-                                );
-                                MeshWireResponse::RelayPqOnionAck {
-                                    delivered: true,
-                                    error: None,
-                                }
-                            }
-                            Err(e) => MeshWireResponse::RelayPqOnionAck {
-                                delivered: false,
-                                error: Some(e.to_string()),
-                            },
-                        }
-                    }
-                    Err(e) => MeshWireResponse::RelayPqOnionAck {
-                        delivered: false,
-                        error: Some(e.to_string()),
-                    },
-                }
-            }
-        }
-        MeshWireRequest::SyndicateLiteStripe {
-            cert,
-            bundle,
-            repair_grant,
-        } => {
-            if let Some(reason) = eviction.is_ingress_blocked(
-                remote_ip,
-                Some(remote_peer_id),
-                remote_pubkey.as_ref(),
-                Some(&bundle.expected_stripe_merkle_root),
-                None,
-            ) {
-                return MeshWireResponse::SyndicateLiteStripeAck {
-                    receipt: None,
-                    syndicated_peers: Vec::new(),
-                    error: Some(reason),
-                };
-            }
-            if let Some(ref grant) = repair_grant {
-                por_verifier.register_repair_grant(grant.clone());
-            }
-            match lite_seed_server.ingest_and_syndicate_lite_stripe_with_grant(
-                &cert,
-                &bundle,
-                &[],
-                repair_grant,
-            ) {
-                Ok((receipt, syndicated_peers)) => MeshWireResponse::SyndicateLiteStripeAck {
-                    receipt: Some(receipt),
-                    syndicated_peers,
-                    error: None,
-                },
-                Err(e) => MeshWireResponse::SyndicateLiteStripeAck {
-                    receipt: None,
-                    syndicated_peers: Vec::new(),
-                    error: Some(e.to_string()),
-                },
-            }
-        }
-        MeshWireRequest::PutDhtEnvelope(env) => {
-            let res = match env {
-                DhtWireEnvelope::ClassicalManifest(m) => block_store.put_dht_manifest_envelope(m),
-                DhtWireEnvelope::PostQuantumManifest(m) => {
-                    block_store.put_dht_pq_manifest_envelope(m)
-                }
-                DhtWireEnvelope::VaultCatalog(m) => block_store.put_dht_vault_catalog_envelope(m),
-            };
-            match res {
-                Ok(()) => MeshWireResponse::PutDhtEnvelopeAck {
-                    stored: true,
-                    error: None,
-                },
-                Err(e) => MeshWireResponse::PutDhtEnvelopeAck {
-                    stored: false,
-                    error: Some(e.to_string()),
-                },
-            }
-        }
-        MeshWireRequest::GetDhtEnvelope { dht_key, kind } => {
-            let found = match kind {
-                DhtEnvelopeKind::ClassicalManifest => block_store
-                    .get_dht_manifest_envelope(&dht_key)
-                    .map(DhtWireEnvelope::ClassicalManifest),
-                DhtEnvelopeKind::PostQuantumManifest => block_store
-                    .get_dht_pq_manifest_envelope(&dht_key)
-                    .map(DhtWireEnvelope::PostQuantumManifest),
-                DhtEnvelopeKind::VaultCatalog => block_store
-                    .get_dht_vault_catalog_envelope(&dht_key)
-                    .map(DhtWireEnvelope::VaultCatalog),
-            };
-            if let Some(env) = found {
-                MeshWireResponse::GetDhtEnvelopeResult {
-                    envelope: Some(env),
-                    error: None,
-                }
-            } else {
-                MeshWireResponse::GetDhtEnvelopeResult {
-                    envelope: None,
-                    error: Some("DHT envelope not found".to_string()),
-                }
-            }
-        }
-        MeshWireRequest::QueryNodeStatus => {
-            let rep = lite_seed_server.status_report(1);
-            let available_bytes = rep.max_storage_bytes.saturating_sub(rep.used_storage_bytes);
-            MeshWireResponse::NodeStatusResult {
-                peer_id: lite_seed_server.server_peer_id().to_string(),
-                asn: 64512,
-                region: "local-neighborhood".to_string(),
-                available_bytes,
-                used_bytes: rep.used_storage_bytes,
-                sla_score: rep.sla_ratio,
-                pq_kem_pubkey: Some(pq_kem.public_key()),
-            }
-        }
-        MeshWireRequest::RegisterWanRendezvous { slot_key, entry } => {
-            if let Some(reason) = eviction
-                .is_ingress_blocked(
-                    remote_ip,
-                    Some(remote_peer_id),
-                    Some(&entry.ed25519_pubkey),
-                    None,
-                    None,
-                )
-                .or_else(|| {
-                    eviction.is_ingress_blocked(None, None, remote_pubkey.as_ref(), None, None)
-                })
-            {
-                return MeshWireResponse::RegisterWanRendezvousAck {
-                    stored: false,
-                    observed_external_addr: None,
-                    error: Some(reason),
-                    tracker_admin_pubkey: None,
-                };
-            }
-            let observed_external_addr = remote_addr
-                .and_then(|addr| reflect_observed_wan_multiaddr(addr, 0, remote_peer_id));
-            let signer_pk = entry.ed25519_pubkey;
-            match wan_registry.register(slot_key, entry, now_unix_ms()) {
-                Ok(stored) => {
-                    if stored {
-                        if let Some(ip) = remote_ip {
-                            let _ = eviction.record_peer_admission_ip(ip, signer_pk);
-                        }
-                    }
-                    MeshWireResponse::RegisterWanRendezvousAck {
-                        stored,
-                        observed_external_addr,
-                        error: None,
-                        tracker_admin_pubkey: None,
-                    }
-                }
-                Err(err) => MeshWireResponse::RegisterWanRendezvousAck {
-                    stored: false,
-                    observed_external_addr,
-                    error: Some(err),
-                    tracker_admin_pubkey: None,
-                },
-            }
-        }
-        MeshWireRequest::LookupWanRendezvous { slot_key } => {
-            let observed_external_addr = remote_addr
-                .and_then(|addr| reflect_observed_wan_multiaddr(addr, 0, remote_peer_id));
-            let now = now_unix_ms();
-            let entries = if slot_key == PUBLIC_COMMONS_SWARM_SLOT {
-                wan_registry.lookup_public_swarm(32, now)
-            } else {
-                wan_registry.lookup(&slot_key, now)
-            };
-            MeshWireResponse::LookupWanRendezvousResult {
-                entries,
-                observed_external_addr,
-                tracker_admin_pubkey: None,
-            }
-        }
-        MeshWireRequest::SubmitAbuseTakedownReport(report) => {
-            let report_id = report.report_id;
-            match takedown_queue.enqueue_verified_report(report) {
-                Ok(outcome) => MeshWireResponse::SubmitAbuseTakedownAck {
-                    queued_for_admin_review: true,
-                    report_id,
-                    verified_plaintext_sha256: Some(outcome.verified_plaintext_sha256),
-                    error: None,
-                },
-                Err(err) => MeshWireResponse::SubmitAbuseTakedownAck {
-                    queued_for_admin_review: false,
-                    report_id,
-                    verified_plaintext_sha256: None,
-                    error: Some(err),
-                },
-            }
-        }
-        MeshWireRequest::BroadcastEvictionOrder(order) => {
-            let mut pinned_admins =
-                KnownPeersStore::load(&cfg.data_dir).pinned_tracker_admin_pubkeys();
-            if let Some(mc) = block_store.mesh_client() {
-                for pk in mc.pinned_tracker_admin_pubkeys() {
-                    if !pinned_admins.contains(&pk) {
-                        pinned_admins.push(pk);
-                    }
-                }
-            }
-            let (council, min_quorum) = cfg.resolve_eviction_council_and_quorum(
-                genesis_pubkey,
-                &pinned_admins,
-                public_mode,
-            );
-            let local_pk = node_identity.public_key_bytes();
-            match eviction.apply_signed_eviction_order_with_quorum(
-                &order,
-                Some(&local_pk),
-                &council,
-                min_quorum,
-                now_unix_ms(),
-                block_store,
-            ) {
-                Ok(rep) => MeshWireResponse::EvictionOrderAck {
-                    accepted: true,
-                    purged_regular_shards: rep.purged_regular_shards,
-                    purged_blinded_shards: rep.purged_blinded_shards,
-                    zero_wiped_bytes: rep.zero_wiped_bytes,
-                    error: None,
-                },
-                Err(err) => MeshWireResponse::EvictionOrderAck {
-                    accepted: false,
-                    purged_regular_shards: 0,
-                    purged_blinded_shards: 0,
-                    zero_wiped_bytes: 0,
-                    error: Some(err.to_string()),
-                },
-            }
-        }
-    }
-}
-
-/// State borrowed by the seed wire handler for one request.
-pub struct SeedWireHandlerCtx<'a> {
-    pub data_dir: &'a Path,
-    pub node_identity: &'a NodeIdentity,
-    pub advertised_admin_pk: Option<[u8; 32]>,
-    pub local_tracker_admin_pk: Option<[u8; 32]>,
-    pub extra_council_pks: &'a [[u8; 32]],
-    pub council_quorum: Option<usize>,
-    pub max_probationary_lease_bytes: u64,
-    pub genesis_pubkey: [u8; 32],
-    pub block_store: &'a BlockStore,
-    pub server: &'a mut ZeroTrustSeedServer,
-    pub wot: &'a mut WebOfTrustRegistry,
-    pub por_verifier: &'a mut PorVerifierEngine,
-    pub nullifier_ledger: &'a mut VoucherNullifierLedger,
-    pub pq_kem: &'a HybridKemKeypair,
-    pub wan_registry: &'a mut WanRendezvousRegistry,
-    pub eviction: &'a mut PrivacyPreservingEvictionEngine,
-    pub takedown_queue: &'a mut PublicTrackerTakedownQueue,
-}
-
-/// Handles one inbound request on `parvault-seed`.
-pub fn handle_seed_wire_request(
-    remote_peer_id: &str,
-    remote_addr: Option<&Multiaddr>,
-    request: MeshWireRequest,
-    ctx: SeedWireHandlerCtx<'_>,
-) -> MeshWireResponse {
-    let SeedWireHandlerCtx {
-        data_dir,
-        node_identity,
-        advertised_admin_pk,
-        local_tracker_admin_pk,
-        extra_council_pks,
-        council_quorum,
-        max_probationary_lease_bytes,
-        genesis_pubkey,
-        block_store,
-        server,
-        wot,
-        por_verifier,
-        nullifier_ledger,
-        pq_kem,
-        wan_registry,
-        eviction,
-        takedown_queue,
-    } = ctx;
-    let remote_ip = remote_addr.and_then(extract_ip_from_multiaddr);
-    let remote_pubkey = NodeConfig::extract_ed25519_pubkey_from_peer_str(remote_peer_id);
-
-    match request {
-        MeshWireRequest::HandshakeWoT { chain, .. } => {
-            let leaf_pk = chain.leaf_pubkey();
-            if let Some(reason) = eviction.is_ingress_blocked(
-                remote_ip,
-                Some(remote_peer_id),
-                leaf_pk.as_ref(),
-                None,
-                None,
-            ) {
-                return MeshWireResponse::HandshakeAck {
-                    accepted: false,
-                    reason: Some(reason),
-                };
-            }
-            match wot.verify_and_admit_chain(&chain) {
-                Ok(_) => {
-                    if let (Some(ip), Some(pk)) = (remote_ip, leaf_pk) {
-                        let _ = eviction.record_peer_admission_ip(ip, pk);
-                    }
-                    MeshWireResponse::HandshakeAck {
-                        accepted: true,
-                        reason: None,
-                    }
-                }
-                Err(e) => MeshWireResponse::HandshakeAck {
-                    accepted: false,
-                    reason: Some(e.to_string()),
-                },
-            }
-        }
-        MeshWireRequest::PutShard {
-            owner_peer_id,
-            shard_id,
-            shard_bytes,
-            session_key_commit,
-            repair_grant,
-        } => {
-            if let Some(reason) = eviction.is_ingress_blocked(
-                remote_ip,
-                Some(remote_peer_id),
-                remote_pubkey.as_ref(),
-                Some(&shard_id.stripe_merkle_root),
-                None,
-            ) {
-                return MeshWireResponse::PutShardAck {
-                    stored: false,
-                    error: Some(reason),
-                };
-            }
-            if let Some(grant) = repair_grant {
-                por_verifier.register_repair_grant(grant);
-            }
-            por_verifier.register_shard_session(&shard_id, session_key_commit);
-            let effective_owner = if owner_peer_id.is_empty()
-                || owner_peer_id == "local"
-                || owner_peer_id == "self"
-            {
-                remote_peer_id
-            } else {
-                owner_peer_id.as_str()
-            };
-            match block_store.put_shard(effective_owner, &shard_id, &shard_bytes) {
-                Ok(_) => {
-                    let _ = eviction.record_regular_shard_ingress(
-                        remote_ip,
-                        Some(remote_peer_id),
-                        remote_pubkey,
-                        effective_owner,
-                        shard_id,
-                    );
-                    if let (Some(ip), Some(pk)) = (remote_ip, remote_pubkey) {
-                        let _ = eviction.record_peer_admission_ip(ip, pk);
                     }
                     MeshWireResponse::PutShardAck {
                         stored: true,
@@ -994,7 +700,7 @@ pub fn handle_seed_wire_request(
                     error: Some("unauthorized owner shard delete signature".to_string()),
                 };
             }
-            match block_store.delete_shard(remote_peer_id, &shard_id) {
+            match block_store.delete_shard(shard_owner(peer, None), &shard_id) {
                 Ok(deleted) => MeshWireResponse::DeleteShardAck {
                     deleted,
                     error: None,
@@ -1006,13 +712,10 @@ pub fn handle_seed_wire_request(
             }
         }
         MeshWireRequest::PorAudit(challenge) => {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let now_ms = now_unix_ms();
             match por_verifier.handle_incoming_challenge(&challenge, now_ms, block_store) {
                 Ok(resp) => {
-                    server.record_por_heartbeat(true);
+                    policy.on_por_pass(server);
                     MeshWireResponse::PorAuditResult(Some(resp))
                 }
                 Err(e) => {
@@ -1087,16 +790,12 @@ pub fn handle_seed_wire_request(
                     error: Some(reason),
                 };
             }
-            if max_probationary_lease_bytes > 0
-                && (shard_bytes.len() as u64) > max_probationary_lease_bytes
+            if let Some(err) =
+                lease_limit_error(shard_bytes.len(), policy.max_probationary_lease_bytes())
             {
                 return MeshWireResponse::PutBlindedShardAck {
                     stored: false,
-                    error: Some(format!(
-                        "shard length {} exceeds max_probationary_lease_bytes {}",
-                        shard_bytes.len(),
-                        max_probationary_lease_bytes
-                    )),
+                    error: Some(err),
                 };
             }
             nullifier_ledger.set_trusted_issuer_pubkey(voucher.issuer_pubkey);
@@ -1180,30 +879,41 @@ pub fn handle_seed_wire_request(
             {
                 return MeshWireResponse::RenewBlindedLeaseAck { renewed: false };
             }
-            let renewed = server.renew_blinded_lease(&blinded_id, current_epoch, extension_epochs);
+            // The seed called `server.renew_blinded_lease`, a one-line delegate to this call on
+            // the same (shared) store.
+            let renewed =
+                block_store.renew_blinded_shard_lease(&blinded_id, current_epoch, extension_epochs);
             MeshWireResponse::RenewBlindedLeaseAck { renewed }
         }
         MeshWireRequest::DeleteBlindedShardTombstone {
             blinded_id,
             tombstone,
-        } => match server.execute_blinded_tombstone(&blinded_id, &tombstone) {
-            Ok(deleted) => MeshWireResponse::DeleteBlindedShardAck {
-                deleted,
-                error: None,
-            },
-            Err(e) => MeshWireResponse::DeleteBlindedShardAck {
-                deleted: false,
-                error: Some(e.to_string()),
-            },
-        },
+        } => {
+            let result = if policy.tombstone_via_seed_server() {
+                server
+                    .execute_blinded_tombstone(&blinded_id, &tombstone)
+                    .map_err(|e| e.to_string())
+            } else {
+                block_store
+                    .delete_blinded_shard_with_tombstone(&blinded_id, &tombstone)
+                    .map_err(|e| e.to_string())
+            };
+            match result {
+                Ok(deleted) => MeshWireResponse::DeleteBlindedShardAck {
+                    deleted,
+                    error: None,
+                },
+                Err(e) => MeshWireResponse::DeleteBlindedShardAck {
+                    deleted: false,
+                    error: Some(e),
+                },
+            }
+        }
         MeshWireRequest::MultiSegmentPorAudit(challenge) => {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let now_ms = now_unix_ms();
             match por_verifier.handle_multi_segment_challenge(&challenge, now_ms, block_store) {
                 Ok(resp) => {
-                    server.record_por_heartbeat(true);
+                    policy.on_por_pass(server);
                     MeshWireResponse::MultiSegmentPorAuditResult(Some(resp))
                 }
                 Err(e) => {
@@ -1300,16 +1010,13 @@ pub fn handle_seed_wire_request(
                         error: Some(reason),
                     };
                 }
-                if max_probationary_lease_bytes > 0
-                    && (bundle.shard_bytes.len() as u64) > max_probationary_lease_bytes
-                {
+                if let Some(err) = lease_limit_error(
+                    bundle.shard_bytes.len(),
+                    policy.max_probationary_lease_bytes(),
+                ) {
                     return MeshWireResponse::RelayPqOnionAck {
                         delivered: false,
-                        error: Some(format!(
-                            "shard length {} exceeds max_probationary_lease_bytes {}",
-                            bundle.shard_bytes.len(),
-                            max_probationary_lease_bytes
-                        )),
+                        error: Some(err),
                     };
                 }
                 nullifier_ledger.set_trusted_issuer_pubkey(bundle.voucher.issuer_pubkey);
@@ -1359,16 +1066,13 @@ pub fn handle_seed_wire_request(
                                 error: Some(reason),
                             };
                         }
-                        if max_probationary_lease_bytes > 0
-                            && (shard_bytes.len() as u64) > max_probationary_lease_bytes
-                        {
+                        if let Some(err) = lease_limit_error(
+                            shard_bytes.len(),
+                            policy.max_probationary_lease_bytes(),
+                        ) {
                             return MeshWireResponse::RelayPqOnionAck {
                                 delivered: false,
-                                error: Some(format!(
-                                    "shard length {} exceeds max_probationary_lease_bytes {}",
-                                    shard_bytes.len(),
-                                    max_probationary_lease_bytes
-                                )),
+                                error: Some(err),
                             };
                         }
                         nullifier_ledger.set_trusted_issuer_pubkey(voucher.issuer_pubkey);
@@ -1498,7 +1202,7 @@ pub fn handle_seed_wire_request(
             MeshWireResponse::NodeStatusResult {
                 peer_id: server.server_peer_id().to_string(),
                 asn: 64512,
-                region: "seed-anchor".to_string(),
+                region: policy.status_region().to_string(),
                 available_bytes,
                 used_bytes: rep.used_storage_bytes,
                 sla_score: rep.sla_ratio,
@@ -1506,6 +1210,7 @@ pub fn handle_seed_wire_request(
             }
         }
         MeshWireRequest::RegisterWanRendezvous { slot_key, entry } => {
+            let tracker_admin_pubkey = policy.tracker_admin_pubkey();
             if let Some(reason) = eviction
                 .is_ingress_blocked(
                     remote_ip,
@@ -1522,27 +1227,28 @@ pub fn handle_seed_wire_request(
                     stored: false,
                     observed_external_addr: None,
                     error: Some(reason),
-                    tracker_admin_pubkey: advertised_admin_pk,
+                    tracker_admin_pubkey,
                 };
             }
             let observed_external_addr = remote_addr
                 .and_then(|addr| reflect_observed_wan_multiaddr(addr, 0, remote_peer_id));
             let signer_pk = entry.ed25519_pubkey;
-            let public_card_ips: Vec<std::net::IpAddr> = if slot_key == PUBLIC_COMMONS_SWARM_SLOT {
-                open_public_tracker_card(&entry)
-                    .ok()
-                    .map(|card| {
-                        card.wan_multiaddrs
-                            .iter()
-                            .filter_map(|s| s.parse::<Multiaddr>().ok())
-                            .filter_map(|m| extract_ip_from_multiaddr(&m))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            match wan_registry.register(slot_key, entry, seed_now_ms()) {
+            let public_card_ips: Vec<IpAddr> =
+                if policy.record_public_card_ips() && slot_key == PUBLIC_COMMONS_SWARM_SLOT {
+                    open_public_tracker_card(&entry)
+                        .ok()
+                        .map(|card| {
+                            card.wan_multiaddrs
+                                .iter()
+                                .filter_map(|s| s.parse::<Multiaddr>().ok())
+                                .filter_map(|m| extract_ip_from_multiaddr(&m))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+            match wan_registry.register(slot_key, entry, now_unix_ms()) {
                 Ok(stored) => {
                     if stored {
                         if let Some(ip) = remote_ip {
@@ -1556,21 +1262,21 @@ pub fn handle_seed_wire_request(
                         stored,
                         observed_external_addr,
                         error: None,
-                        tracker_admin_pubkey: advertised_admin_pk,
+                        tracker_admin_pubkey,
                     }
                 }
                 Err(err) => MeshWireResponse::RegisterWanRendezvousAck {
                     stored: false,
                     observed_external_addr,
                     error: Some(err),
-                    tracker_admin_pubkey: advertised_admin_pk,
+                    tracker_admin_pubkey,
                 },
             }
         }
         MeshWireRequest::LookupWanRendezvous { slot_key } => {
             let observed_external_addr = remote_addr
                 .and_then(|addr| reflect_observed_wan_multiaddr(addr, 0, remote_peer_id));
-            let now = seed_now_ms();
+            let now = now_unix_ms();
             let entries = if slot_key == PUBLIC_COMMONS_SWARM_SLOT {
                 wan_registry.lookup_public_swarm(32, now)
             } else {
@@ -1579,19 +1285,17 @@ pub fn handle_seed_wire_request(
             MeshWireResponse::LookupWanRendezvousResult {
                 entries,
                 observed_external_addr,
-                tracker_admin_pubkey: advertised_admin_pk,
+                tracker_admin_pubkey: policy.tracker_admin_pubkey(),
             }
         }
         MeshWireRequest::SubmitAbuseTakedownReport(report) => {
             let report_id = report.report_id;
-            if server.mode() != SeedServerMode::PublicNetworkBootstrapper {
+            if let Err(reason) = policy.takedown_gate(server.mode()) {
                 return MeshWireResponse::SubmitAbuseTakedownAck {
                     queued_for_admin_review: false,
                     report_id,
                     verified_plaintext_sha256: None,
-                    error: Some(
-                        "abuse takedown queue disabled in homelab-vault private mode".to_string(),
-                    ),
+                    error: Some(reason),
                 };
             }
             match takedown_queue.enqueue_verified_report(report) {
@@ -1610,21 +1314,15 @@ pub fn handle_seed_wire_request(
             }
         }
         MeshWireRequest::BroadcastEvictionOrder(order) => {
-            let (council, min_quorum) = resolve_seed_council_and_quorum(
-                data_dir,
-                server.mode(),
-                local_tracker_admin_pk,
-                extra_council_pks,
-                council_quorum,
-                genesis_pubkey,
-            );
+            let (council, min_quorum) =
+                policy.eviction_council(block_store, server.mode(), genesis_pubkey);
             let local_pk = node_identity.public_key_bytes();
             match eviction.apply_signed_eviction_order_with_quorum(
                 &order,
                 Some(&local_pk),
                 &council,
                 min_quorum,
-                seed_now_ms(),
+                now_unix_ms(),
                 block_store,
             ) {
                 Ok(rep) => MeshWireResponse::EvictionOrderAck {
@@ -1643,5 +1341,278 @@ pub fn handle_seed_wire_request(
                 },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bootstrap::{
+        BlindedShardTombstone, LiteStripeSyndicationBundle, PersonalDeviceCert,
+    };
+    use crate::config::ErasureTier;
+    use crate::crypto::pqc::HybridPqSigningKeypair;
+    use crate::crypto::{MasterKey, PqRelayedShardEnvelope};
+    use crate::network::wan_rendezvous::{seal_public_tracker_card, WanPeerCard};
+    use crate::network::wot::DelegationChain;
+    use crate::por::{generate_multi_segment_por_challenge, generate_por_challenge};
+    use crate::storage::{
+        AnonymousQuotaVoucher, BlindedShardCapability, BlindedShardId, EvictionTarget,
+        FileManifest, ShardId, SignedDhtManifestEnvelope, VerifiableAbuseReport,
+    };
+
+    /// One request per variant (19), each paired with the response variant name it must
+    /// produce on rejection and whether that response carries the reason string.
+    fn all_requests() -> Vec<(MeshWireRequest, &'static str, bool)> {
+        let id = NodeIdentity::from_seed([7; 32]);
+        let shard_id = ShardId {
+            stripe_merkle_root: [1; 32],
+            shard_index: 0,
+            shard_hash: [2; 32],
+        };
+        let mk = MasterKey::from_bytes([3; 32]);
+        let bid = BlindedShardId::derive(&mk, &[4; 32], 0, b"x");
+        let (_, cap) = BlindedShardCapability::derive_keypair(&mk, &bid.locator);
+        let voucher = AnonymousQuotaVoucher::mint(&id, 64);
+        let kem = HybridKemKeypair::generate().unwrap();
+        let owner_pq = HybridPqSigningKeypair::generate().unwrap();
+        let manifest = FileManifest {
+            version: 1,
+            file_merkle_root: [5; 32],
+            file_salt: [6; 32],
+            original_file_size: 1,
+            stripe_size_bytes: 1024,
+            tier: ErasureTier::Homelab,
+            stripes: vec![],
+            witness_peers: vec![],
+        };
+        let card = WanPeerCard::new(&id, "u", "daemon", vec![], None, None, 60, 1).unwrap();
+        vec![
+            (
+                MeshWireRequest::HandshakeWoT {
+                    chain: DelegationChain { hops: vec![] },
+                    asn: None,
+                    region: None,
+                },
+                "HandshakeAck",
+                true,
+            ),
+            (
+                MeshWireRequest::PutShard {
+                    owner_peer_id: String::new(),
+                    shard_id,
+                    shard_bytes: vec![],
+                    session_key_commit: [0; 32],
+                    repair_grant: None,
+                },
+                "PutShardAck",
+                true,
+            ),
+            (
+                MeshWireRequest::PorAudit(generate_por_challenge(&[0; 32], shard_id, 64, 1)),
+                "PorAuditResult",
+                false,
+            ),
+            (
+                MeshWireRequest::GetCiphertextShard {
+                    shard_id,
+                    owner_signature: None,
+                    repair_proof: None,
+                },
+                "CiphertextShardResult",
+                true,
+            ),
+            (
+                MeshWireRequest::PutBlindedShard {
+                    blinded_id: bid,
+                    shard_bytes: vec![],
+                    capability: cap,
+                    voucher: voucher.clone(),
+                    current_epoch: 1,
+                    lease_duration_epochs: 1,
+                    delete_verifier: [0; 32],
+                },
+                "PutBlindedShardAck",
+                true,
+            ),
+            (
+                MeshWireRequest::GetBlindedShard {
+                    blinded_id: bid,
+                    capability: cap,
+                    timestamp_ms: 1,
+                    read_sig: vec![],
+                },
+                "BlindedShardResult",
+                true,
+            ),
+            (
+                MeshWireRequest::RenewBlindedLease {
+                    blinded_id: bid,
+                    current_epoch: 1,
+                    extension_epochs: 1,
+                },
+                "RenewBlindedLeaseAck",
+                false,
+            ),
+            (
+                MeshWireRequest::DeleteBlindedShardTombstone {
+                    blinded_id: bid,
+                    tombstone: BlindedShardTombstone::create(&[0; 32], bid.locator, [0; 16]),
+                },
+                "DeleteBlindedShardAck",
+                true,
+            ),
+            (
+                MeshWireRequest::MultiSegmentPorAudit(generate_multi_segment_por_challenge(
+                    &[0; 32], shard_id, 64, 2, 10, 1,
+                )),
+                "MultiSegmentPorAuditResult",
+                false,
+            ),
+            (
+                MeshWireRequest::RelayPqOnionEnvelope {
+                    target_peer_addr: None,
+                    envelope: PqRelayedShardEnvelope::seal_pq(
+                        &kem.public_key(),
+                        "r",
+                        &bid,
+                        b"x",
+                        0,
+                    )
+                    .unwrap(),
+                    capability: cap,
+                    voucher: voucher.clone(),
+                    current_epoch: 1,
+                    lease_duration_epochs: 1,
+                    delete_verifier: [0; 32],
+                },
+                "RelayPqOnionAck",
+                true,
+            ),
+            (
+                MeshWireRequest::SyndicateLiteStripe {
+                    cert: PersonalDeviceCert::issue(&owner_pq, "dev", "label", 1).unwrap(),
+                    bundle: LiteStripeSyndicationBundle {
+                        stripe_index: 0,
+                        tier: ErasureTier::Homelab,
+                        ciphertext_bytes: vec![],
+                        expected_stripe_merkle_root: [0; 32],
+                        expected_shard_hashes: vec![],
+                    },
+                    repair_grant: None,
+                },
+                "SyndicateLiteStripeAck",
+                true,
+            ),
+            (
+                MeshWireRequest::PutDhtEnvelope(DhtWireEnvelope::ClassicalManifest(
+                    SignedDhtManifestEnvelope::seal(&mk, &id, &manifest, 1, 1).unwrap(),
+                )),
+                "PutDhtEnvelopeAck",
+                true,
+            ),
+            (
+                MeshWireRequest::GetDhtEnvelope {
+                    dht_key: [0; 32],
+                    kind: DhtEnvelopeKind::VaultCatalog,
+                },
+                "GetDhtEnvelopeResult",
+                true,
+            ),
+            (
+                MeshWireRequest::DeleteShard {
+                    shard_id,
+                    owner_signature: ([0; 32], vec![], [0; 32], [0; 32]),
+                },
+                "DeleteShardAck",
+                true,
+            ),
+            (MeshWireRequest::QueryNodeStatus, "NodeStatusResult", false),
+            (
+                MeshWireRequest::RegisterWanRendezvous {
+                    slot_key: PUBLIC_COMMONS_SWARM_SLOT,
+                    entry: seal_public_tracker_card(&card, &id).unwrap(),
+                },
+                "RegisterWanRendezvousAck",
+                true,
+            ),
+            (
+                MeshWireRequest::LookupWanRendezvous { slot_key: [0; 32] },
+                "LookupWanRendezvousResult",
+                false,
+            ),
+            (
+                MeshWireRequest::SubmitAbuseTakedownReport(VerifiableAbuseReport::submit_signed(
+                    &id,
+                    "r",
+                    "d",
+                    None,
+                    manifest,
+                    MasterKey::generate().to_hex(),
+                    0,
+                    vec![],
+                    1,
+                )),
+                "SubmitAbuseTakedownAck",
+                true,
+            ),
+            (
+                MeshWireRequest::BroadcastEvictionOrder(SignedBadActorEvictionOrder::issue(
+                    &id,
+                    EvictionTarget::BlindedLocator([9; 32]),
+                    "t",
+                    1,
+                    0,
+                )),
+                "EvictionOrderAck",
+                true,
+            ),
+        ]
+    }
+
+    #[test]
+    fn reject_response_matches_each_variant() {
+        let reqs = all_requests();
+        assert_eq!(reqs.len(), 19);
+        for (req, expected, carries_reason) in &reqs {
+            let resp = format!("{:?}", reject_response(req, "admission-denied".into()));
+            assert!(resp.starts_with(expected), "{expected}: {resp}");
+            assert_eq!(
+                resp.contains("admission-denied"),
+                *carries_reason,
+                "{expected}: {resp}"
+            );
+            assert!(
+                !resp.contains("accepted: true")
+                    && !resp.contains("stored: true")
+                    && !resp.contains("deleted: true")
+            );
+        }
+    }
+
+    #[test]
+    fn admission_class_keeps_pre_admission_paths_open() {
+        let classes: Vec<AdmissionClass> = all_requests()
+            .iter()
+            .map(|(r, _, _)| admission_class(r))
+            .collect();
+        let pre = classes
+            .iter()
+            .filter(|c| **c == AdmissionClass::PreAdmission)
+            .count();
+        assert_eq!(pre, 4, "handshake, status, rendezvous register and lookup");
+        assert_eq!(
+            admission_class(&MeshWireRequest::QueryNodeStatus),
+            AdmissionClass::PreAdmission
+        );
+    }
+
+    #[test]
+    fn shard_owner_rule_is_unchanged() {
+        let peer = WirePeer::new("remote-peer", None);
+        for claim in [None, Some(""), Some("local"), Some("self")] {
+            assert_eq!(shard_owner(&peer, claim), "remote-peer");
+        }
+        assert_eq!(shard_owner(&peer, Some("alice")), "alice");
     }
 }
