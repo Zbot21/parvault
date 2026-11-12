@@ -11,7 +11,14 @@
 
 # --- Crate-wide blast radius -> full -----------------------------------------
 src/lib.rs                      full    # module tree, crate attrs, cfg(kani)
-src/main.rs                     full    # CLI composition root for every subsystem
+# Binary-only code (main.rs, src/cli/*): cannot change a Kani or TLC result; it is
+# gated by the suites that spawn `parvault` (clippy runs only in full mode).
+src/main.rs                     test    gateway_bus_and_plugin_security
+src/main.rs                     test    sync_daemon_usability_and_cli_regression_tests
+src/main.rs                     test    zero_config_lan_and_router_soc_tests
+src/cli/*                       test    gateway_bus_and_plugin_security
+src/cli/*                       test    sync_daemon_usability_and_cli_regression_tests
+src/cli/*                       test    zero_config_lan_and_router_soc_tests
 src/config.rs                   full    # Cli, ErasureTier, stripe layout used crate-wide
 src/crypto/*                    full    # crypto paths
 src/os_sys.rs                   full    # sole unsafe FFI boundary; needs clippy
@@ -398,6 +405,8 @@ src/main.rs                     doc     QUICKSTART.md
 src/main.rs                     doc     docs/USER_AND_CLI_GUIDE.md
 src/main.rs                     doc     docs/SAFETY_AND_LINT_AUDIT.md
 src/main.rs                     doc     docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md
+src/cli/*                       doc     AGENTS.md
+src/cli/*                       doc     docs/USER_AND_CLI_GUIDE.md
 src/network/*                   doc     AGENTS.md
 src/network/behaviour.rs        doc     docs/adr/ADR-06-hybrid-locality-and-70-30-placement.md
 src/network/behaviour.rs        doc     docs/adr/ADR-08-noise-xx-transport-and-bounded-wire-framing.md
