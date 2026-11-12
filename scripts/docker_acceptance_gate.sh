@@ -11,6 +11,8 @@ CONTAINERS=(
     parvault-soc-store
     parvault-soc-restore
     parvault-soc-extract
+    parvault-invitee
+    parvault-outsider
 )
 for i in $(seq 1 11); do
     CONTAINERS+=("parvault-node-$i")
@@ -117,6 +119,50 @@ if [ "$CLIENT_MOUNTS" != "[]" ] && [ "$CLIENT_MOUNTS" != "null" ]; then
     echo "ERROR: parvault-client has volume mounts: $CLIENT_MOUNTS"
     exit 1
 fi
+
+echo "=== [3b/12] Ring membership: an invited node serves the ring; a non-member is refused ==="
+# The invitee never holds the ring secret: it joins with 'wot invite' (on a ring member) and
+# 'wot install-chain', then runs a daemon that stores a ring member's file.
+docker run -d --name parvault-invitee \
+    --network parvault-acceptance-net --ip 172.28.0.40 \
+    parvault:acceptance \
+    sleep 3600
+INVITEE_KEY="$(docker exec parvault-invitee /usr/local/bin/parvault --data-dir /var/lib/invitee --no-lan-discovery identity \
+    | awk -F': ' '/Ed25519 Public Key/ {print $2}')"
+RING_TOKEN="$(docker exec parvault-node-1 /usr/local/bin/parvault --data-dir /tmp/ring-inviter --no-lan-discovery \
+    wot invite --peer "$INVITEE_KEY")"
+docker exec parvault-invitee /usr/local/bin/parvault --data-dir /var/lib/invitee --no-lan-discovery \
+    wot install-chain --token "$RING_TOKEN"
+if docker exec parvault-invitee test -e /var/lib/invitee/ring_genesis.seed; then
+    echo "ERROR: the invitee holds a ring genesis secret"
+    exit 1
+fi
+docker exec -d parvault-invitee /usr/local/bin/parvault --data-dir /var/lib/invitee --no-lan-discovery \
+    daemon start --listen /ip4/0.0.0.0/tcp/4001
+sleep 3
+docker exec parvault-client sh -cex '
+    mkdir -p /tmp/ring-check
+    echo "stored on an invited ring member" > /tmp/ring-check/doc.txt
+    /usr/local/bin/parvault --data-dir /tmp/ring-check/data --no-lan-discovery \
+        --peers /ip4/172.28.0.40/tcp/4001 file store --path /tmp/ring-check/doc.txt
+'
+# The outsider runs its own ring: its credential does not admit it to this ring.
+docker run -d --name parvault-outsider \
+    --network parvault-acceptance-net --ip 172.28.0.41 \
+    parvault:acceptance \
+    sleep 3600
+docker exec parvault-outsider /usr/local/bin/parvault --data-dir /var/lib/outsider --no-lan-discovery wot init
+docker exec parvault-outsider sh -c 'echo "outsider data" > /tmp/outsider.txt'
+if docker exec parvault-outsider /usr/local/bin/parvault --data-dir /var/lib/outsider --no-lan-discovery \
+    --peers /ip4/172.28.0.11/tcp/4001 file store --path /tmp/outsider.txt; then
+    echo "ERROR: a non-member stored data on a ring node"
+    exit 1
+fi
+if ! docker logs parvault-node-1 2>&1 | grep -q "reject.peer_not_admitted"; then
+    echo "ERROR: the ring node did not log the refusal"
+    exit 1
+fi
+echo "Ring membership verified: invitee served the ring, outsider refused."
 
 echo "=== [4/12] Zero-IP Home LAN Auto-Discovery ('parvault discover') over 172.28.0.0/24 Bridge ==="
 DISCOVER_TABLE="$(docker exec parvault-client /usr/local/bin/parvault --data-dir /tmp/zero-ip-discover discover --timeout-ms 1200)"
@@ -466,7 +512,7 @@ echo "==========================================================================
 echo " PARVAULT v0.3.0 MULTI-CONTAINER & ROUTER-SOC DOCKER ACCEPTANCE SUMMARY"
 echo "================================================================================"
 echo " Base Image             : ${BASE_IMAGE}"
-echo " Containers Deployed    : 14 (1 parvault-seed + 11 daemon + 1 router-soc + 1 client)"
+echo " Containers Deployed    : 16 (1 parvault-seed + 11 daemon + 1 router-soc + 1 client + 1 invitee + 1 outsider)"
 echo " Client Shared Volumes  : ${CLIENT_MOUNTS} (strictly isolated)"
 echo " Zero-IP LAN Discovery  : PASS (${DISCOVERED_COUNT} daemons auto-discovered with 0 IPs)"
 echo " Initial Sync (v1)      : ${TOTAL_SHARDS_V1} shards across 10 nodes (${SYNC_V1_SECS}s)"
