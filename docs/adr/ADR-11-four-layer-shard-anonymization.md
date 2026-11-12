@@ -31,7 +31,9 @@ $$
 
 ## `v0.5.0` Enforcement
 
-- Vouchers are self-certifying in `v0.5.0` (the receiver trusts the issuer the voucher names; issuer policy is item 2c, F-24). Until then a `PutBlindedShard` and an onion final delivery also need an admitted sender: the last hop. A relay forwards under its own identity, so the originator is never asked to identify itself.
+- Vouchers are self-certifying in `v0.5.0` (the receiver trusts the issuer the voucher names; issuer policy is item 2c, F-24). Until then an onion final delivery needs an admitted sender: the last hop.
+- Originators send through `OnionOriginator`, which has no access to an admission credential and never handshakes, so the entry relay does not learn that the originator is a ring member. The relay forwards to the final target under its own identity and presents its own chain.
+- A direct `PutBlindedShard` is a hand-off between ring members (graceful leave), not anonymous origination, and needs an admitted sender.
 
 ## Consequences & Verification
 

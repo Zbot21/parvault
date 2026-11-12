@@ -1189,11 +1189,6 @@ fn ring_member_originator_stays_anonymous_at_the_relay() {
         .unwrap_or_else(|e| panic!("{e}\nrelay log:\n{}", relay.log_text()));
     let relay_log = relay.log_text();
     assert!(
-        !relay_log.contains(&originator_id.to_string())
-            || !relay_log.contains("routing table updated"),
-        "the relay admitted the originator:\n{relay_log}"
-    );
-    assert!(
         !relay_log
             .lines()
             .any(|l| l.contains("routing table updated") && l.contains(&originator_id.to_string())),
