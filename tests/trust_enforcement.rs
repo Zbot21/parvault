@@ -766,6 +766,43 @@ fn f04_gateway_lanes_send_as_owner() {
     gate_ran("trust_enforcement::f04_gateway_lanes_send_as_owner");
 }
 
+// --- PoR session commits ---------------------------------------------------------------------------------
+
+/// A refused put of an existing shard id (foreign owner claim) must not replace the owner's PoR
+/// session key: the owner's audit with its own key is still answered.
+#[test]
+fn refused_put_keeps_por_session_key() {
+    let node = spawn_daemon("por-session");
+    let owner = key(0xA7);
+    let (sid, bytes) = shard(0x17, 2048);
+    let session = [0x5E; 32];
+    assert!(stored(&send(
+        &owner,
+        &node,
+        put_shard("", sid, bytes.clone(), None)
+    )));
+    let attacker = key(0xA8);
+    let refused = send(
+        &attacker,
+        &node,
+        MeshWireRequest::PutShard {
+            owner_peer_id: "invented-owner".into(),
+            shard_id: sid,
+            shard_bytes: bytes.clone(),
+            session_key_commit: [0x66; 32],
+            repair_grant: None,
+        },
+    );
+    assert!(!stored(&refused), "{refused:?}");
+    let chal = parvault::por::generate_por_challenge(&session, sid, bytes.len() as u64, now_ms());
+    let resp = send(&owner, &node, MeshWireRequest::PorAudit(chal));
+    assert!(
+        matches!(resp, MeshWireResponse::PorAuditResult(Some(_))),
+        "the owner's session key survives a refused put: {resp:?}"
+    );
+    gate_ran("trust_enforcement::refused_put_keeps_por_session_key");
+}
+
 // --- F-02: repair grants -----------------------------------------------------------------------------
 
 /// Stores a shard of stripe `root` (index 0) with a grant by `owner` naming `witnesses`.

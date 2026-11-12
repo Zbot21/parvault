@@ -815,7 +815,6 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                     error: Some(reason),
                 };
             }
-            por_verifier.register_shard_session(&shard_id, session_key_commit);
             let Some(effective_owner) = shard_owner(peer, Some(owner_peer_id.as_str())) else {
                 return MeshWireResponse::PutShardAck {
                     stored: false,
@@ -825,6 +824,9 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
             let effective_owner = effective_owner.as_str();
             match block_store.put_shard(effective_owner, &shard_id, &shard_bytes) {
                 Ok(_) => {
+                    // The PoR session commit, like the grant, registers only after the owner
+                    // decision and a successful store (a refused put must not replace it).
+                    por_verifier.register_shard_session(&shard_id, session_key_commit);
                     // F-02a: a grant registers only after the shard is stored, for its stripe.
                     if let Some(grant) = repair_grant {
                         if let Err(code) = por_verifier
