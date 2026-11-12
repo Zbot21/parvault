@@ -354,6 +354,8 @@ tests/wire_handler_equivalence.rs                        test    wire_handler_eq
 tests/zero_config_lan_and_router_soc_tests.rs            test    zero_config_lan_and_router_soc_tests
 tests/zero_trust_adversarial.rs                          test    zero_trust_adversarial
 tests/trust_enforcement.rs                               test    trust_enforcement
+tests/common/*                                           test    trust_enforcement
+tests/common/*                                           test    gateway_bus_and_plugin_security
 tests/docker_acceptance_gate.rs                          test    docker_acceptance_gate   # SKIPPED unless PARVAULT_DOCKER_GATE=1 or the enforcement runner
 
 # --- TLA+ specs: one spec per line; flags match verify_formal_proofs.sh ------
