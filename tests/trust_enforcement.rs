@@ -222,9 +222,17 @@ fn spawn_public_daemon(label: &str) -> Node {
 /// `parvault-seed start --mode homelab-vault` on loopback, provisioned with the ring genesis. Its
 /// owner key is the PQ keypair in its data directory (pre-created by `prepare`).
 fn spawn_seed(label: &str) -> Node {
+    spawn_seed_with_peers(label, &[])
+}
+
+/// `spawn_seed` with `--peers` (the mesh peers it syndicates to).
+fn spawn_seed_with_peers(label: &str, peers: &[&str]) -> Node {
     let (root, dir, reg, log) = prepare(label);
     let port = free_port();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault-seed"));
+    if !peers.is_empty() {
+        cmd.arg("--peers").arg(peers.join(","));
+    }
     cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
         .args([
             "start",
@@ -587,19 +595,175 @@ fn f21_handshake_chain_leaf_not_sender_refused() {
 
 // --- F-04: the claimed owner is not bound to the sender --------------------------------------------
 
+/// F-04 accept: a put claiming the sender's own device id is stored.
 #[test]
-fn repro_f04_invented_owner_claim_accepted() {
-    let node = spawn_daemon("f04");
+fn f04_owner_claim_of_sender_stored() {
+    let node = spawn_daemon("f04-a");
     let sender = key(0xC1);
-    for (i, owner) in ["invented-owner-1", "invented-owner-2"].iter().enumerate() {
-        let (sid, bytes) = shard(0x20 + i as u8, 1024);
-        let resp = send(&sender, &node, put_shard(owner, sid, bytes, None));
+    let (sid, bytes) = shard(0x20, 1024);
+    let resp = send(
+        &sender,
+        &node,
+        put_shard(&sender.device_peer_id(), sid, bytes, None),
+    );
+    assert!(stored(&resp), "{resp:?}");
+    gate_ran("trust_enforcement::f04_owner_claim_of_sender_stored");
+}
+
+/// F-04 reject: the same put claiming an invented owner is refused.
+#[test]
+fn f04_invented_owner_claim_refused() {
+    let node = spawn_daemon("f04-r");
+    let sender = key(0xC1);
+    let (sid, bytes) = shard(0x20, 1024);
+    let resp = send(
+        &sender,
+        &node,
+        put_shard("invented-owner-1", sid, bytes, None),
+    );
+    assert_eq!(
+        refusal_text(&resp).as_deref(),
+        Some("owner claim does not match the sender"),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.owner_not_sender");
+    gate_ran("trust_enforcement::f04_invented_owner_claim_refused");
+}
+
+fn shard_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir.join("shards"))
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "shard"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// F-04 (graceful leave): a departing node hands its shards to a ring peer under its own device
+/// id, sent as its own key, and the peer accepts them.
+#[test]
+fn f04_graceful_leave_handoff_accepted() {
+    let target = spawn_daemon("f04-leave-target");
+    let root = temp_root("f04-leave");
+    let dir = root.path().join("departing");
+    let file = root.path().join("doc.bin");
+    std::fs::write(&file, vec![0x42; 64 * 1024]).unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+            .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+            .env("PARVAULT_LAN_REGISTRY_DIR", root.path().join("reg"))
+            .env_remove("PARVAULT_PEERS")
+            .arg("--data-dir")
+            .arg(&dir)
+            .arg("--no-lan-discovery")
+            .args(args)
+            .output()
+            .unwrap();
         assert!(
-            stored(&resp),
-            "gap: a PutShard claiming {owner} is stored: {resp:?}"
+            out.status.success(),
+            "{args:?}: stdout={}\nstderr={}\ntarget log:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+            target.log_text()
         );
+    };
+    run(&["file", "store", "--path", file.to_str().unwrap()]);
+    let local = shard_files(&dir);
+    assert!(local > 0, "the departing node holds shards");
+    run(&["leave", "--handoff-to", &target.addr]);
+    assert!(
+        shard_files(&target.dir) >= local,
+        "every shard handed off: target log:\n{}",
+        target.log_text()
+    );
+    assert!(
+        !target.log_text().contains("reject."),
+        "{}",
+        target.log_text()
+    );
+    gate_ran("trust_enforcement::f04_graceful_leave_handoff_accepted");
+}
+
+/// F-04 (syndication): a seed syndicates a device's stripe to its mesh peer with an empty owner
+/// claim (accounted to the seed), and the peer accepts every shard.
+#[test]
+fn f04_seed_syndication_accounted_to_seed() {
+    let peer = spawn_daemon("f04-synd-peer");
+    let seed = spawn_seed_with_peers("f04-synd-seed", &[&peer.addr]);
+    let device = key(0xC8);
+    let cert =
+        PersonalDeviceCert::issue(&seed.owner_pq(), &device.device_peer_id(), "laptop", 1).unwrap();
+    let ct = vec![0x3D; 32 * 1024];
+    let set = encode_ciphertext_stripe(0, &ct, ErasureTier::Homelab).unwrap();
+    let bundle = LiteStripeSyndicationBundle {
+        stripe_index: 0,
+        tier: ErasureTier::Homelab,
+        ciphertext_bytes: ct,
+        expected_stripe_merkle_root: set.stripe_merkle_root,
+        expected_shard_hashes: set.shard_hashes.clone(),
+    };
+    let resp = send(
+        &device,
+        &seed,
+        MeshWireRequest::SyndicateLiteStripe {
+            cert,
+            bundle,
+            repair_grant: None,
+        },
+    );
+    match resp {
+        MeshWireResponse::SyndicateLiteStripeAck {
+            receipt: Some(r), ..
+        } => assert_eq!(
+            r.mesh_peers_populated,
+            set.shard_hashes.len(),
+            "every shard reached the peer: peer log:\n{}",
+            peer.log_text()
+        ),
+        other => panic!("{other:?}\nseed log:\n{}", seed.log_text()),
     }
-    gate_ran("trust_enforcement::repro_f04_invented_owner_claim_accepted");
+    assert!(!peer.log_text().contains("reject."), "{}", peer.log_text());
+    gate_ran("trust_enforcement::f04_seed_syndication_accounted_to_seed");
+}
+
+/// F-04 (gateway): the gateway engine's 40 lanes all send as the owner identity, so one PeerId
+/// holds 40 connections to the storage peer, which accepts every shard.
+#[test]
+fn f04_gateway_lanes_send_as_owner() {
+    // In-process lanes take their credential from the process-wide source (the ring genesis).
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| std::env::set_var("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED)));
+    let peer = spawn_daemon("f04-lanes-peer");
+    let root = temp_root("f04-lanes");
+    let engine = parvault::gateway::GatewayEngine::new(
+        root.path().join("gw"),
+        MasterKey::from_bytes([0x61; 32]),
+        parvault::gateway::GatewayConfig {
+            stripe_size_bytes: 1024 * 1024,
+            tier: ErasureTier::Homelab,
+            peers: vec![peer.addr.clone()],
+            macaroon_root_key: None,
+            strict_allowed_peer_uids: None,
+            require_sealed_ingest_memfd: false,
+        },
+    )
+    .unwrap();
+    let payload = vec![0x5C; 3 * 1024 * 1024];
+    let path = root.path().join("payload.bin");
+    std::fs::write(&path, &payload).unwrap();
+    let fd: std::os::fd::OwnedFd = std::fs::File::open(&path).unwrap().into();
+    let manifest = engine
+        .store_from_owned_fd(
+            fd,
+            payload.len() as u64,
+            parvault::gateway::RetentionPolicy::Persistent,
+        )
+        .unwrap_or_else(|e| panic!("{e}\npeer log:\n{}", peer.log_text()));
+    assert_eq!(manifest.total_size, payload.len() as u64);
+    assert!(shard_files(&peer.dir) >= 20, "{}", peer.log_text());
+    assert!(!peer.log_text().contains("reject."), "{}", peer.log_text());
+    gate_ran("trust_enforcement::f04_gateway_lanes_send_as_owner");
 }
 
 // --- F-02: repair grants -----------------------------------------------------------------------------

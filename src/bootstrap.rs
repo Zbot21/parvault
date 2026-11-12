@@ -1322,7 +1322,9 @@ impl ZeroTrustSeedServer {
                         if client
                             .put_shard(
                                 target_addr,
-                                &self.server_peer_id,
+                                // Accounted to the sender (v0.5.0 owner rule); the server id
+                                // is a label such as "parvault-seed-homelab-vault", not a key.
+                                "",
                                 shard_id,
                                 shard_bytes.clone(),
                                 session_key,

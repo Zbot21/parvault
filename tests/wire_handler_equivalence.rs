@@ -748,34 +748,28 @@ fn put_shard() {
     let mut t = Trio::new("put");
     let peer = Peer::new(0x61, "198.51.100.2");
     t.admit(&peer);
-    for (owner, seed) in [("", 1u8), ("alice-owner", 2u8)] {
+    // v0.5.0 owner rule: an empty claim and the sender's own device id both account the shard to
+    // the sender's device id.
+    let device = peer.ident.device_peer_id();
+    for (owner, seed) in [("", 1u8), (device.as_str(), 2u8)] {
         let (sid, bytes) = shard(seed, 2048);
-        let before: Vec<(u64, u64)> =
-            t.fx.iter()
-                .map(|f| (f.hosted(&peer.id), f.hosted("alice-owner")))
-                .collect();
+        let before: Vec<u64> = t.fx.iter().map(|f| f.hosted(&device)).collect();
         let o = t.run(&peer, &put_shard_req(owner, sid, bytes, [seed; 32]));
         assert!(o[0].resp.contains("stored: true"), "{}", o[0].resp);
         assert!(o[0].quota_delta > 0);
-        // Absolute: the shard is stored and charged to the effective owner (empty claim -> the
-        // remote peer; explicit claim -> that owner), on every role.
-        for (fx, (peer_before, alice_before)) in t.fx.iter().zip(before) {
+        // Absolute: the shard is stored and charged to the sender's device id on every role.
+        for (fx, before) in t.fx.iter().zip(before) {
             assert!(fx.store.has_shard(&sid), "{:?}: shard stored", fx.role);
-            let (charged, other) = if owner.is_empty() {
-                (
-                    fx.hosted(&peer.id) - peer_before,
-                    fx.hosted("alice-owner") - alice_before,
-                )
-            } else {
-                (
-                    fx.hosted("alice-owner") - alice_before,
-                    fx.hosted(&peer.id) - peer_before,
-                )
-            };
             assert_eq!(
-                (charged, other),
-                (2048, 0),
-                "{:?}: quota charged to {owner:?}",
+                fx.hosted(&device) - before,
+                2048,
+                "{:?}: quota charged to the sender for claim {owner:?}",
+                fx.role
+            );
+            assert_eq!(
+                fx.hosted(&peer.id),
+                0,
+                "{:?}: nothing under the PeerId",
                 fx.role
             );
         }
@@ -808,6 +802,19 @@ fn put_shard() {
             "seed must persist an extra admission record on PutShard"
         );
         assert!(!eviction_files(&o[1].changed).is_empty());
+    }
+    // A claim naming anyone else is refused identically, with nothing stored or charged.
+    let (sid, bytes) = shard(28, 1024);
+    let o = t.run(&peer, &put_shard_req("alice-owner", sid, bytes, [28; 32]));
+    assert!(
+        o[0].resp.contains("owner claim does not match the sender"),
+        "{}",
+        o[0].resp
+    );
+    assert_identical(&o);
+    for fx in &t.fx {
+        assert!(!fx.store.has_shard(&sid));
+        assert_eq!(fx.hosted("alice-owner"), 0);
     }
     // Error path: shard hash mismatch.
     let (mut sid, bytes) = shard(3, 1024);
@@ -850,6 +857,7 @@ fn delete_shard() {
     let mut t = Trio::new("del");
     let peer = Peer::new(0x62, "198.51.100.3");
     t.admit(&peer);
+    let device = peer.ident.device_peer_id();
     let (sid, bytes) = shard(5, 1024);
     t.run(&peer, &put_shard_req("", sid, bytes, [5; 32]));
     let (pub_, payload, sig) =
@@ -872,7 +880,7 @@ fn delete_shard() {
     assert!(t
         .fx
         .iter()
-        .all(|f| f.store.has_shard(&sid) && f.hosted(&peer.id) == 1024));
+        .all(|f| f.store.has_shard(&sid) && f.hosted(&device) == 1024));
     let o = t.run(
         &peer,
         &MeshWireRequest::DeleteShard {
@@ -882,20 +890,17 @@ fn delete_shard() {
     );
     assert!(o[0].resp.contains("deleted: true"), "{}", o[0].resp);
     assert_identical(&o);
-    // Absolute: the shard is gone and its quota is released under the deleting peer.
+    // Absolute: the shard is gone and its quota is released under the sender's device id.
     for fx in &t.fx {
         assert!(!fx.store.has_shard(&sid), "{:?}: shard deleted", fx.role);
-        assert_eq!(fx.hosted(&peer.id), 0, "{:?}: quota released", fx.role);
+        assert_eq!(fx.hosted(&device), 0, "{:?}: quota released", fx.role);
     }
-    // Explicit claimed owner: PutShard charges the claim, DeleteShard releases under the remote
-    // peer (it sends no claim), so the claimed owner's account keeps the bytes. Pinned as today's
-    // behaviour; item 2b's owner rule (accounted owner = sender) removes the split.
+    // Explicit claim of the sender's own device id: put and delete account to the same key, so
+    // the release empties the account (2a pinned a split here: a claim of another owner kept
+    // that owner charged after the sender's delete; the v0.5.0 owner rule refuses such claims).
     let (sid2, bytes2) = shard(26, 1024);
-    t.run(&peer, &put_shard_req("alice-owner", sid2, bytes2, [26; 32]));
-    assert!(t
-        .fx
-        .iter()
-        .all(|f| f.hosted("alice-owner") == 1024 && f.hosted(&peer.id) == 0));
+    t.run(&peer, &put_shard_req(&device, sid2, bytes2, [26; 32]));
+    assert!(t.fx.iter().all(|f| f.hosted(&device) == 1024));
     let (pub2, payload2, sig2) =
         PorVerifierEngine::sign_owner_shard_delete_token(&peer.ident, &sid2, now_ms());
     let mut r2 = [0u8; 32];
@@ -913,12 +918,7 @@ fn delete_shard() {
     assert_identical(&o);
     for fx in &t.fx {
         assert!(!fx.store.has_shard(&sid2), "{:?}: shard deleted", fx.role);
-        assert_eq!(
-            (fx.hosted("alice-owner"), fx.hosted(&peer.id)),
-            (1024, 0),
-            "{:?}: release goes to the remote peer, not the claimed owner",
-            fx.role
-        );
+        assert_eq!(fx.hosted(&device), 0, "{:?}: released in full", fx.role);
     }
 }
 

@@ -512,15 +512,60 @@ fn admit(
         .then(|| reject_response(request, NOT_ADMITTED_TEXT.to_string()))
 }
 
-/// The single quota-identity decision for shard ownership. `claimed` is the owner named in the
-/// request (`PutShard`), or `None` where none is sent (`DeleteShard`). Today's rule: an empty,
-/// `local` or `self` claim, or no claim, means the remote peer.
-fn shard_owner<'r>(peer: &WirePeer<'r>, claimed: Option<&'r str>) -> &'r str {
-    match claimed {
-        Some(owner) if !(owner.is_empty() || owner == "local" || owner == "self") => owner,
-        _ => peer.peer_id,
+/// What the shard-owner decision needs to know about one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerFacts<'a> {
+    /// The owner named in the request (`PutShard`), or `None` where none is sent (`DeleteShard`).
+    pub claimed: Option<&'a str>,
+    /// The sender's device peer id, if its transport identity carries an Ed25519 key.
+    pub sender_device_id: Option<&'a str>,
+    /// The sender's libp2p `PeerId` string.
+    pub sender_peer_id: &'a str,
+}
+
+/// The single quota-identity decision (F-04): the accounted owner is always the sender's device
+/// id. A claim may only name the sender (empty, `local`, `self`, its device id or its `PeerId`).
+pub fn shard_owner_decision<'a>(facts: &OwnerFacts<'a>) -> Result<&'a str, &'static str> {
+    let Some(device) = facts.sender_device_id else {
+        return Err("reject.owner_not_sender");
+    };
+    match facts.claimed {
+        None => Ok(device),
+        Some(c)
+            if c.is_empty()
+                || c == "local"
+                || c == "self"
+                || c == device
+                || c == facts.sender_peer_id =>
+        {
+            Ok(device)
+        }
+        Some(_) => Err("reject.owner_not_sender"),
     }
 }
+
+/// The accounted owner for a request from `peer`, or `None` (logged) when the claim does not
+/// name the sender.
+fn shard_owner(peer: &WirePeer<'_>, claimed: Option<&str>) -> Option<String> {
+    let device = peer
+        .pubkey
+        .map(|pk| NodeIdentity::device_peer_id_for_pubkey(&pk));
+    let facts = OwnerFacts {
+        claimed,
+        sender_device_id: device.as_deref(),
+        sender_peer_id: peer.peer_id,
+    };
+    match shard_owner_decision(&facts) {
+        Ok(owner) => Some(owner.to_string()),
+        Err(code) => {
+            warn!(code, peer = %peer.peer_id, "refused an owner claim that does not name the sender");
+            None
+        }
+    }
+}
+
+/// The refusal text for an owner claim that does not name the sender.
+const OWNER_NOT_SENDER_TEXT: &str = "owner claim does not match the sender";
 
 /// The negative acknowledgement for `request` carrying `reason` (for use by `admit`).
 pub fn reject_response(request: &MeshWireRequest, reason: String) -> MeshWireResponse {
@@ -761,7 +806,13 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                 por_verifier.register_repair_grant(grant);
             }
             por_verifier.register_shard_session(&shard_id, session_key_commit);
-            let effective_owner = shard_owner(peer, Some(owner_peer_id.as_str()));
+            let Some(effective_owner) = shard_owner(peer, Some(owner_peer_id.as_str())) else {
+                return MeshWireResponse::PutShardAck {
+                    stored: false,
+                    error: Some(OWNER_NOT_SENDER_TEXT.to_string()),
+                };
+            };
+            let effective_owner = effective_owner.as_str();
             match block_store.put_shard(effective_owner, &shard_id, &shard_bytes) {
                 Ok(_) => {
                     let _ = eviction.record_regular_shard_ingress(
@@ -805,7 +856,13 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                     error: Some("unauthorized owner shard delete signature".to_string()),
                 };
             }
-            match block_store.delete_shard(shard_owner(peer, None), &shard_id) {
+            let Some(owner) = shard_owner(peer, None) else {
+                return MeshWireResponse::DeleteShardAck {
+                    deleted: false,
+                    error: Some(OWNER_NOT_SENDER_TEXT.to_string()),
+                };
+            };
+            match block_store.delete_shard(&owner, &shard_id) {
                 Ok(deleted) => MeshWireResponse::DeleteShardAck {
                     deleted,
                     error: None,
@@ -1776,11 +1833,39 @@ mod tests {
     }
 
     #[test]
-    fn shard_owner_rule_is_unchanged() {
-        let peer = WirePeer::new("remote-peer", None);
-        for claim in [None, Some(""), Some("local"), Some("self")] {
-            assert_eq!(shard_owner(&peer, claim), "remote-peer");
+    fn shard_owner_rule_binds_the_sender() {
+        let facts = |claimed| OwnerFacts {
+            claimed,
+            sender_device_id: Some("parvault-peer-0011223344556677"),
+            sender_peer_id: "12D3KooWsender",
+        };
+        for claim in [
+            None,
+            Some(""),
+            Some("local"),
+            Some("self"),
+            Some("parvault-peer-0011223344556677"),
+            Some("12D3KooWsender"),
+        ] {
+            assert_eq!(
+                shard_owner_decision(&facts(claim)),
+                Ok("parvault-peer-0011223344556677"),
+                "{claim:?}"
+            );
         }
-        assert_eq!(shard_owner(&peer, Some("alice")), "alice");
+        assert_eq!(
+            shard_owner_decision(&facts(Some("alice"))),
+            Err("reject.owner_not_sender")
+        );
+        let keyless = OwnerFacts {
+            claimed: None,
+            sender_device_id: None,
+            sender_peer_id: "remote-peer",
+        };
+        assert_eq!(
+            shard_owner_decision(&keyless),
+            Err("reject.owner_not_sender"),
+            "a sender without an Ed25519 key fails closed"
+        );
     }
 }

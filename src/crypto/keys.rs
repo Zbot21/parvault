@@ -433,10 +433,12 @@ impl NodeIdentity {
 
     /// Returns a human-readable deterministic peer identifier derived from the node's Ed25519 public key.
     pub fn device_peer_id(&self) -> String {
-        format!(
-            "parvault-peer-{}",
-            &hex::encode(self.public_key_bytes())[..16]
-        )
+        Self::device_peer_id_for_pubkey(&self.public_key_bytes())
+    }
+
+    /// The device peer id of the identity with Ed25519 public key `pubkey`.
+    pub fn device_peer_id_for_pubkey(pubkey: &[u8; 32]) -> String {
+        format!("parvault-peer-{}", &hex::encode(pubkey)[..16])
     }
 
     /// Returns the 32-byte master seed from which both Ed25519 and X25519 keys are derived (`B2`).
