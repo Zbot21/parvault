@@ -77,7 +77,7 @@ parvault watch-folder --folder ~/Documents --public --tracker /ip4/<YOUR_SEED_IP
 
 Discovery and pairing find and pin peers; storing data needs ring membership. A node outside the ring is refused with `peer not admitted; v0.5.0 requires ring admission`, and a node with no ring prints how to start or join one (`parvault wot init` or `parvault wot install-chain`).
 
-With one paired router, all 20 shards of every stripe sit on that one machine: erasure coding protects against bit rot there, not against losing the router. Add more ring members to spread shards. Recovery after losing the laptop works only for folders backed up with a phrase (step 6): `PARVAULT_SEED_PHRASE="<phrase>" parvault recover-from-seed --vault-namespace laptop --out-dir ~/Recovered` on any ring member. Folders served by `parvault up --folder` have no phrase recovery.
+With one paired router, all 20 shards of every stripe sit on that one machine: erasure coding protects against bit rot there, not against losing the router. Add more ring members to spread shards. Recovery after losing the laptop works only for folders backed up with a phrase (step 6): `PARVAULT_SEED_PHRASE="<phrase>" parvault recover-from-seed --vault-namespace laptop --out-dir ~/Recovered` on any machine that can reach the ring's nodes (ring membership is not needed: ring members serve the encrypted catalog and shards to any node, and only the phrase decrypts them). Folders served by `parvault up --folder` have no phrase recovery.
 
 ---
 
@@ -95,7 +95,7 @@ flowchart LR
     subgraph Anon["2. Placement (anonymization layers: seed/lite path and planned)"]
         RS --> BLIND["Blinded Locators (HMAC) +\nPer-Shard Cap Keys (V_i)\n(seed/lite path only)"]
         BLIND --> ONION["2-Layer PQ Onion Relay\n(nodes relay; CLI upload planned)"]
-        ONION --> SPLIT{"70% Intra-ASN (<=5ms)\n30% Cross-Region DR\n<=4 Shards per /24"}
+        ONION --> SPLIT{"70% Intra-ASN (<=5ms)\n30% Cross-Region DR\n(<=4 per /24: planned)"}
     end
 
     subgraph Audit["3. Stateless PoR & Zero-Knowledge Repair"]
@@ -131,7 +131,9 @@ flowchart LR
 - **Erasure coding:** fixed per run with `--tier` (default `homelab`, 16-of-20). Earned standing does not change it yet.
 - **One router:** with a single paired storage node, every shard is on that node.
 - **Recovery:** `recover-from-seed` restores only folders backed up with `watch-folder` and a phrase (`PARVAULT_SEED_PHRASE` or `--seed-phrase`) and the same `--vault-namespace`, while peers holding the shards are reachable. `parvault init` prints no phrase; `parvault new-seed-phrase` makes one. Folders served by `parvault up --folder` have no phrase recovery.
-- **Built-in VFS seed folder (W-04):** `up --vfs-seed-dir` stores the folder on the node's pinned ring peers, or locally only when it has none. If its pinned peers are offline at start, the folder is not stored (the daemon prints a warning and keeps serving); there is no local fallback yet.
+- **Placement:** stores go to the node's pinned peers that accept them (ring members); peers of other rings or offline peers are skipped, and when none accepts, the stripe is kept locally (with a warning), as with no peers at all. The 70/30 latency split is applied; the `<= 4 shards per /24` cap is planned (not applied on the CLI store path).
+- **Built-in VFS seed folder (W-04):** if the seed folder cannot be stored at all, the daemon prints a warning and keeps serving without it.
+- **Personal device rings:** the "zero storage quota tax" for linked devices is planned; nothing charges or waives quota by device certificate yet.
 - **Public tracker:** none is hosted; `--public` needs your own `parvault-seed`.
 - **RAM:** `< 32 MiB` is a design target; the evidence is a 48 MiB cgroup Docker stage and `parvault-bench`.
 
@@ -170,9 +172,8 @@ parvault-sync --socket "$SOCK" --catalog ./gw-catalog.bin push --folder ~/Docume
 parvault-sync --socket "$SOCK" --catalog ./gw-catalog.bin --macaroon "$TOKEN" pull --output /tmp/restored
 
 # Or host WebDAV VFS built-in (=y) inside parvault with --no-socket (zero .sock file on disk!).
-# Needs `parvault init` and ring membership. The seed folder is stored like other data: on the
-# node's pinned ring peers, or locally if it has none; if those peers are offline at start, the
-# daemon prints a warning and serves without it.
+# Needs `parvault init` and ring membership. The seed folder is stored like other data: on pinned
+# ring peers that accept it, else locally (peers of other rings and offline peers are skipped).
 parvault up --no-socket --vfs-seed-dir /mnt/usb-nas/shared --vfs-webdav-listen 127.0.0.1:8088
 
 # Execute the empirical cryptography, Reed-Solomon, and /proc/self/status memory benchmark suite (see docs/BENCHMARKS.md)

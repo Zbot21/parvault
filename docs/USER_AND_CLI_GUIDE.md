@@ -188,7 +188,7 @@ Master Key Fingerprint  : sha256:4b19e8f021a7c6d4
 
 ### 4.2 Issuing & Sharing a Post-Quantum `PersonalDeviceCert` (`.json` or `PARVAULT-CERT-V1:` Token)
 
-To link your laptop (`parvault`) and your closet NAS (`parvault-seed --mode homelab-vault`) into a **Day-1 Personal Device Ring** with **zero reciprocity quota tax (`0.00x`)**:
+To link your laptop (`parvault`) and your closet NAS (`parvault-seed --mode homelab-vault`) into a **Day-1 Personal Device Ring** (the zero reciprocity quota tax for linked devices is planned, not applied yet):
 
 1. **On your laptop (`parvault`), get your `Device Peer ID` and `Owner PQ Public Key Hex`:**
    ```bash
