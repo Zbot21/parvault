@@ -117,6 +117,8 @@ pub struct AnonymousTelemetryBeacon {
     /// Node role (`PersonalDevice`, `OrganicCommunityPeer`, or `FoundationSeedAnchor`).
     pub role: PeerRole,
     /// Current cryptographically earned redundancy standing (`ADR-13`).
+    /// Self-reported by the sender (F-07): nothing verifies it, and the MAC only binds it to the
+    /// beacon.
     pub earned_standing: EarnedStanding,
     /// Committed disk capacity rounded to a power-of-two GiB bucket (`round_to_pow2_gib`).
     pub committed_capacity_bucket_gib: u64,

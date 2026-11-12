@@ -65,7 +65,7 @@ pub(crate) async fn status(env: CliEnv, command: Commands) -> anyhow::Result<()>
         "Bandwidth Rate Limits : upload={} Mbps, download={} Mbps (0 = unlimited)",
         cfg.max_upload_mbps, cfg.max_download_mbps
     );
-    println!("\nEarned Standing Progression Ladder (ADR-12):");
+    println!("\nStanding tiers (planned; standing is self-reported and does not change erasure coding yet):");
     println!(
         "  SoloPersonalVault -> PersonalDeviceRing -> BuddyMicroCluster -> ProbationaryConsumerPool -> EarnedVerifiedMixedPool -> EarnedHomelabAnchorPool"
     );

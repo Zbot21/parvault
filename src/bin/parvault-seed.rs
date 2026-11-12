@@ -1368,10 +1368,10 @@ fn print_status_report(
         report.active_blinded_leases
     );
     println!(
-        "Earned Trust Level        : {:?}",
+        "Trust Level (self-reported): {:?}",
         report.earned_trust_level
     );
-    println!("Earned Redundancy Standing: {:?}", report.earned_standing);
+    println!("Standing (self-reported)  : {:?}", report.earned_standing);
     println!(
         "PoR Audits Passed / SLA   : {} passes ({:.2}% SLA)",
         report.por_passes,

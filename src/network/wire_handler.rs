@@ -262,7 +262,6 @@ pub struct WireState<'a> {
 /// | Row | Variant | Daemon | Seed |
 /// | :-- | :-- | :-- | :-- |
 /// | 2 | `PutShard` | no extra record | also `record_peer_admission_ip(ip, pubkey)` |
-/// | 4, 10 | `PorAudit`, `MultiSegmentPorAudit` | no heartbeat | `record_por_heartbeat(true)` on success |
 /// | 6, 11 | `PutBlindedShard`, onion final delivery | no size limit | `max_probationary_lease_bytes` (0 = off) |
 /// | 9 | `DeleteBlindedShardTombstone` | `BlockStore` error text | via the seed server: "Seed server storage error: " prefix |
 /// | 15 | `QueryNodeStatus` | region `local-neighborhood` | region `seed-anchor` |
@@ -273,8 +272,6 @@ pub struct WireState<'a> {
 pub trait WireRolePolicy {
     /// Row 2.
     fn record_put_shard_admission_ip(&self) -> bool;
-    /// Rows 4 and 10: called after a PoR challenge passes.
-    fn on_por_pass(&self, server: &mut ZeroTrustSeedServer);
     /// Rows 6 and 11: blinded shards longer than this are refused; 0 disables the check.
     fn max_probationary_lease_bytes(&self) -> u64;
     /// Row 9: route tombstones through the seed server (changes only the error text).
@@ -316,7 +313,6 @@ impl WireRolePolicy for DaemonWirePolicy<'_> {
     fn record_put_shard_admission_ip(&self) -> bool {
         false
     }
-    fn on_por_pass(&self, _server: &mut ZeroTrustSeedServer) {}
     fn max_probationary_lease_bytes(&self) -> u64 {
         0
     }
@@ -361,9 +357,6 @@ impl WireRolePolicy for DaemonWirePolicy<'_> {
 impl WireRolePolicy for SeedWirePolicy<'_> {
     fn record_put_shard_admission_ip(&self) -> bool {
         true
-    }
-    fn on_por_pass(&self, server: &mut ZeroTrustSeedServer) {
-        server.record_por_heartbeat(true);
     }
     fn max_probationary_lease_bytes(&self) -> u64 {
         self.max_probationary_lease_bytes
@@ -942,10 +935,9 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
         MeshWireRequest::PorAudit(challenge) => {
             let now_ms = now_unix_ms();
             match por_verifier.handle_incoming_challenge(&challenge, now_ms, block_store) {
-                Ok(resp) => {
-                    policy.on_por_pass(server);
-                    MeshWireResponse::PorAuditResult(Some(resp))
-                }
+                // Answering a challenge earns the prover nothing (F-07): only a verifier's
+                // own checks may credit a host.
+                Ok(resp) => MeshWireResponse::PorAuditResult(Some(resp)),
                 Err(e) => {
                     warn!(peer = remote_peer_id, error = %e, "Dropped PoR challenge in RAM pre-check");
                     MeshWireResponse::PorAuditResult(None)
@@ -1140,10 +1132,7 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
         MeshWireRequest::MultiSegmentPorAudit(challenge) => {
             let now_ms = now_unix_ms();
             match por_verifier.handle_multi_segment_challenge(&challenge, now_ms, block_store) {
-                Ok(resp) => {
-                    policy.on_por_pass(server);
-                    MeshWireResponse::MultiSegmentPorAuditResult(Some(resp))
-                }
+                Ok(resp) => MeshWireResponse::MultiSegmentPorAuditResult(Some(resp)),
                 Err(e) => {
                     warn!(peer = remote_peer_id, error = %e, "Dropped MultiSegmentPorAudit in RAM pre-check");
                     MeshWireResponse::MultiSegmentPorAuditResult(None)

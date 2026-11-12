@@ -20,13 +20,11 @@
 //! Mutation record (each mutant is a one-line change, in `src/network/wire_handler.rs` unless
 //! the file is named; run with a dedicated `CARGO_TARGET_DIR` so a mutated library is never
 //! reused by another run). Each run covers `--lib`, this suite and `tests/trust_enforcement.rs`;
-//! `lib:` marks a library unit test. Last run: item 2b, 42 mutants, all detected.
+//! `lib:` marks a library unit test. Last run: item 2b, 42 mutants, all detected; item 2c removed the `on_por_pass` hook and its two rows (F-07).
 //!
 //! | Mutant | Kind | Failing test(s) |
 //! | :-- | :-- | :-- |
 //! | `record_put_shard_admission_ip`: seed returns `false` | hook | `put_shard` |
-//! | `on_por_pass`: seed does nothing | hook | `por_audit`, `multi_segment_por_audit` |
-//! | `on_por_pass`: daemon records a heartbeat | hook | `por_audit`, `multi_segment_por_audit` |
 //! | `max_probationary_lease_bytes`: seed returns `0` | hook | `put_blinded_shard`, `relay_pq_onion_over_seed_lease_limit` |
 //! | `tombstone_via_seed_server`: seed returns `false` | hook | `delete_blinded_tombstone` |
 //! | `status_region`: seed returns the daemon text | hook | `query_node_status` |
@@ -987,7 +985,7 @@ fn delete_shard() {
     }
 }
 
-// --- 4 / 10. PoR audits (seed records a heartbeat on success) ------------------------------------
+// --- 4 / 10. PoR audits (identical: answering earns no credit, F-07) -----------------------------
 
 #[test]
 fn por_audit() {
@@ -1001,8 +999,9 @@ fn por_audit() {
     let chal = generate_por_challenge(&session, sid, bytes.len() as u64, now_ms());
     let o = t.run(&peer, &MeshWireRequest::PorAudit(chal.clone()));
     assert!(o[0].resp.contains("PorAuditResult(Some"), "{}", o[0].resp);
-    // Hook on_por_pass: seed counts the pass, daemon does not.
-    assert_eq!((o[0].por_delta, o[1].por_delta, o[2].por_delta), (0, 1, 1));
+    // F-07: answering earns no credit on any role.
+    assert_eq!((o[0].por_delta, o[1].por_delta, o[2].por_delta), (0, 0, 0));
+    assert_identical(&o);
     // Replay: rejected in RAM, no heartbeat anywhere.
     let o = t.run(&peer, &MeshWireRequest::PorAudit(chal));
     assert!(o[0].resp.contains("PorAuditResult(None)"));
@@ -1026,7 +1025,8 @@ fn multi_segment_por_audit() {
         "{}",
         o[0].resp
     );
-    assert_eq!((o[0].por_delta, o[1].por_delta, o[2].por_delta), (0, 1, 1));
+    assert_eq!((o[0].por_delta, o[1].por_delta, o[2].por_delta), (0, 0, 0));
+    assert_identical(&o);
     let o = t.run(&peer, &MeshWireRequest::MultiSegmentPorAudit(chal));
     assert!(o[0].resp.contains("MultiSegmentPorAuditResult(None)"));
     assert_eq!((o[0].por_delta, o[1].por_delta, o[2].por_delta), (0, 0, 0));

@@ -1379,8 +1379,9 @@ impl ZeroTrustSeedServer {
         self.reachable_seed_anchors = seed_anchors;
     }
 
-    /// Records a Proof-of-Retrievability (`PoR`) heartbeat outcome on this dedicated server,
-    /// advancing its earned `TrustLevel` toward `HighUptimeAnchor` (`16-of-20`).
+    /// Records a Proof-of-Retrievability (`PoR`) outcome in this server's own ledger. No network
+    /// path calls it: a node never credits itself for answering a challenge (F-07), so earned
+    /// standing is self-reported. Used by `simulate_por_heartbeats` for self-tests.
     pub fn record_por_heartbeat(&mut self, passed: bool) {
         if passed {
             self.server_credit_account.por_passes =
@@ -1389,15 +1390,13 @@ impl ZeroTrustSeedServer {
             self.server_credit_account.por_failures =
                 self.server_credit_account.por_failures.saturating_add(1);
         }
-        if self.reachable_organic_peers == 0 {
-            self.reachable_organic_peers = 20;
-        }
         if let Ok(mut q) = self.block_store.quota().lock() {
             q.record_por_outcome(&self.server_peer_id, passed);
         }
     }
 
     /// Simulates `count` consecutive passed PoR heartbeats with `reachable_organic_peers` neighbors.
+    /// Self-test and test fixture only: no network path calls it (F-07).
     pub fn simulate_por_heartbeats(&mut self, count: u64, reachable_organic_peers: usize) {
         self.reachable_organic_peers = reachable_organic_peers;
         for _ in 0..count {
@@ -1441,7 +1440,7 @@ impl ZeroTrustSeedServer {
             timestamp_ms,
             read_sig,
         )?;
-        self.record_por_heartbeat(true);
+        // No self-credit for answering (F-07).
         Ok(compute_salted_commitment(challenge_nonce, &bytes))
     }
 

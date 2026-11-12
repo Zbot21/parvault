@@ -22,7 +22,7 @@ Status values:
 | F-04 | High | `PutShard` takes a caller-supplied `owner_peer_id`; each invented id gets a fresh account with bootstrap grace. | 2b | Fixed (QA pending): `shard_owner_decision`, claim F-04; leave, seed syndication and 40 gateway lanes tested |
 | F-05 | High | Public-commons PoW admission has no wire carrier and no production caller. | 2b | Fixed (QA pending): `AdmitPublicTicket`, `public_ticket_decision`, claim F-05 |
 | F-06 | High | The PoR audit loop is not wired: nothing issues challenges or verifies responses. | 2c | Read |
-| F-07 | High | Earned tiers are self-credited by the seed answering its own challenges. | 2c | Read |
+| F-07 | High | Earned tiers are self-credited by the seed answering its own challenges. | 2c | Fixed (QA pending): no network path credits a node for answering (the `on_por_pass` hook, the blinded-read credit and the fabricated peer count are gone); standing is self-reported in status and telemetry (L-29). `simulate_por_heartbeats` remains for the self-test only |
 | F-08 | High | The eviction council is local TOFU state with no membership epoch; quorum can be configured below majority. | 2c | Reported |
 | F-09 | Medium | Eviction orders: `issued_at_ms` unchecked, expiry `0` permanent, replay FIFO rolls over. | 2c | Reported |
 | F-10 | Medium | The DHT reader does not bind `owner_pubkey` (a squatted `u64::MAX` wins); a raw Kademlia `put` bypasses the monotonic store. | 2b | Fixed (QA pending): reader bound to its own identity (`dht_candidate_decision`, claim F-10a; post-quantum manifests are not owner-bound, no reader uses them); Kademlia records filtered (`kad_record_decision`, claim F-10b) |
