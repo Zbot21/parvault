@@ -2567,3 +2567,91 @@ fn w03_missing_folder_fails() {
     assert!(!out.status.success(), "{text}");
     assert!(text.contains("does not exist"), "{text}");
 }
+
+// --- 2c reproductions: each asserts today's gap; its fix rewrites it into a claim pair ----------
+
+fn order_accepted(resp: &MeshWireResponse) -> bool {
+    matches!(
+        resp,
+        MeshWireResponse::EvictionOrderAck { accepted: true, .. }
+    )
+}
+
+fn ban_ip(last: u8) -> parvault::storage::EvictionTarget {
+    parvault::storage::EvictionTarget::IpAddress(format!("192.0.2.{last}").parse().unwrap())
+}
+
+/// F-09 gap: a ring-genesis order issued 400 days ago with no expiry (`expires_at_ms = 0`,
+/// permanent) is accepted.
+#[test]
+fn repro_f09_stale_permanent_order_accepted() {
+    let node = spawn_daemon("f09");
+    let issued = now_ms() - 400 * 24 * 3600 * 1000;
+    let order = parvault::storage::SignedBadActorEvictionOrder::issue(
+        &genesis(),
+        ban_ip(91),
+        "stale",
+        issued,
+        0,
+    );
+    let resp = send(
+        &key(0x91),
+        &node,
+        MeshWireRequest::BroadcastEvictionOrder(order),
+    );
+    assert!(
+        order_accepted(&resp),
+        "gap: stale permanent order accepted: {resp:?}"
+    );
+    gate_ran("trust_enforcement::repro_f09_stale_permanent_order_accepted");
+}
+
+/// F-08 gap: with three configured eviction authorities and the quorum set to 1 (below a
+/// majority), an order signed by one authority alone is accepted.
+#[test]
+fn repro_f08_quorum_below_majority_accepted() {
+    let members = [key(0x81), key(0x82), key(0x83)];
+    let list: Vec<String> = members
+        .iter()
+        .map(|m| hex::encode(m.public_key_bytes()))
+        .collect();
+    let (root, dir, reg, log) = prepare("f08");
+    let port = free_port();
+    let mut cmd = daemon_command(&dir, &reg, port);
+    cmd.env("PARVAULT_EVICTION_AUTHORITIES", list.join(","))
+        .env("PARVAULT_TRACKER_EVICTION_QUORUM", "1");
+    let node = spawn(cmd, root, dir, log, port);
+    let order = parvault::storage::SignedBadActorEvictionOrder::issue(
+        &members[0],
+        ban_ip(81),
+        "one of three",
+        now_ms(),
+        now_ms() + 3_600_000,
+    );
+    let resp = send(
+        &key(0x84),
+        &node,
+        MeshWireRequest::BroadcastEvictionOrder(order),
+    );
+    assert!(
+        order_accepted(&resp),
+        "gap: 1-of-3 order accepted: {resp:?}"
+    );
+    gate_ran("trust_enforcement::repro_f08_quorum_below_majority_accepted");
+}
+
+/// F-24 gap (issuer policy): an admitted sender's blinded put is accepted with a voucher minted
+/// by a key the receiver does not know (the receiver trusts whichever issuer the voucher names).
+#[test]
+fn repro_f24_stranger_issued_voucher_stored() {
+    let node = spawn_daemon("f24-issuer");
+    let sender = key(0xA8);
+    let stranger_issuer = key(0xA9);
+    let b = blinded(0x5A, 512);
+    let resp = send(&sender, &node, blinded_put(&b, &stranger_issuer));
+    assert!(
+        format!("{resp:?}").contains("stored: true"),
+        "gap: stranger-issued voucher accepted: {resp:?}"
+    );
+    gate_ran("trust_enforcement::repro_f24_stranger_issued_voucher_stored");
+}

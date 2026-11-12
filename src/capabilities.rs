@@ -786,6 +786,19 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    /// F-17 gap: `GatewayIdentityStatement::verify` accepts a statement signed by any authority
+    /// (nothing pins the expected one) and treats expiry `0` as permanent.
+    #[test]
+    fn repro_f17_statement_authority_unpinned_and_permanent() {
+        let rogue = HybridPqSigningKeypair::generate().unwrap();
+        let stmt =
+            GatewayIdentityStatement::issue(&rogue, "gw-1", [0x11; 32], [0x22; 32], 1, 0).unwrap();
+        assert!(
+            stmt.verify(u64::MAX / 2),
+            "gap: a rogue authority's never-expiring statement verifies"
+        );
+    }
+
     #[test]
     fn test_macaroon_sub_millisecond_ram_verification_and_attenuation() {
         let root_key = [0x42u8; 32];

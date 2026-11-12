@@ -434,6 +434,35 @@ pub fn combinatorial_reconstruction_entropy_bits(
 mod tests {
     use super::*;
 
+    /// Voucher-rollover gap (plan 2c fact 5): once `MAX_VOUCHER_NULLIFIER_ENTRIES` other vouchers
+    /// are redeemed, the first spent voucher is accepted again (FIFO eviction, no expiry).
+    #[test]
+    fn repro_spent_voucher_redeemable_after_rollover() {
+        let issuer = NodeIdentity::from_seed([0x2C; 32]);
+        let mut ledger = VoucherNullifierLedger::new(issuer.public_key_bytes());
+        let first = AnonymousQuotaVoucher::mint(&issuer, 4096);
+        ledger.redeem_voucher(&first, 1024).unwrap();
+        assert!(
+            ledger.redeem_voucher(&first, 1024).is_err(),
+            "double spend refused"
+        );
+        // Fill the ledger to capacity behind `first` (state setup only: distinct nonces, no
+        // signing), then redeem one real voucher: the ledger's own FIFO evicts `first`.
+        for i in 1..MAX_VOUCHER_NULLIFIER_ENTRIES {
+            let mut nonce = [0xEEu8; 32];
+            nonce[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            ledger.spent_nonces.insert(nonce);
+            ledger.spent_fifo.push_back(nonce);
+        }
+        assert_eq!(ledger.spent_nonces.len(), MAX_VOUCHER_NULLIFIER_ENTRIES);
+        let next = AnonymousQuotaVoucher::mint(&issuer, 4096);
+        ledger.redeem_voucher(&next, 1024).unwrap();
+        assert!(
+            ledger.redeem_voucher(&first, 1024).is_ok(),
+            "gap: the spent voucher is redeemable again after rollover"
+        );
+    }
+
     #[test]
     fn test_ephemeral_blinded_vouchers_and_uniform_shard_bucket_padding() {
         let epoch_seed = [0x77u8; 32];
