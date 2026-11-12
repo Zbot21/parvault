@@ -19,10 +19,11 @@ COPY src ./src
 
 ENV RUST_MIN_STACK=33554432
 
-RUN cargo build --release --target ${TARGET_ARCH} --bin parvault \
-    && cargo build --release --target ${TARGET_ARCH} --bin parvault-seed \
-    && cp target/${TARGET_ARCH}/release/parvault /build/parvault-static \
-    && cp target/${TARGET_ARCH}/release/parvault-seed /build/parvault-seed-static \
+# Same profile as .github/workflows/release.yml (--profile soc).
+RUN cargo build --profile soc --target ${TARGET_ARCH} --bin parvault \
+    && cargo build --profile soc --target ${TARGET_ARCH} --bin parvault-seed \
+    && cp target/${TARGET_ARCH}/soc/parvault /build/parvault-static \
+    && cp target/${TARGET_ARCH}/soc/parvault-seed /build/parvault-seed-static \
     && strip /build/parvault-static /build/parvault-seed-static
 
 # Runtime container (includes iproute2 for 10-node tc netem validation runs)
