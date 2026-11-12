@@ -33,7 +33,8 @@ pub use transport::{build_mesh_client_swarm, build_mesh_swarm};
 pub use wan_rendezvous::*;
 pub use wot::{
     DelegationChain, InvitationHop, PublicCommonsTicket, SlashingEvidence, SlashingReason,
-    TrustPoolMode, WebOfTrustError, WebOfTrustRegistry, WotError, DEFAULT_PUBLIC_WOT_POW_BITS,
-    DEFAULT_SUBTREE_SLASH_LIMIT, MAX_LEAF_FAILURES, MAX_PUBLIC_COMMONS_PEERS,
-    MAX_SEEN_SLASHING_NONCES, PUBLIC_COMMONS_GENESIS_SEED_DOMAIN, PUBLIC_COMMONS_POW_DOMAIN,
+    TicketFacts, TrustPoolMode, WebOfTrustError, WebOfTrustRegistry, WotError,
+    DEFAULT_PUBLIC_WOT_POW_BITS, DEFAULT_SUBTREE_SLASH_LIMIT, MAX_LEAF_FAILURES,
+    MAX_PUBLIC_COMMONS_PEERS, MAX_SEEN_SLASHING_NONCES, PUBLIC_COMMONS_GENESIS_SEED_DOMAIN,
+    PUBLIC_COMMONS_POW_DOMAIN,
 };

@@ -13,7 +13,9 @@
 
 use crate::crypto::NodeIdentity;
 use crate::network::behaviour::MeshWireRequest;
-use crate::network::wot::{DelegationChain, InvitationHop};
+use crate::network::wot::{
+    DelegationChain, InvitationHop, PublicCommonsTicket, DEFAULT_PUBLIC_WOT_POW_BITS,
+};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,6 +28,17 @@ pub const CHAIN_DIR_NAME: &str = "wot_chains";
 pub struct AdmissionSource {
     chain_dir: Option<PathBuf>,
     genesis: Option<NodeIdentity>,
+    /// In public-commons or hybrid mode, the PoW bits of a ticket minted when no chain exists.
+    public_ticket_bits: Option<u8>,
+}
+
+/// What a client presents to be admitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionCredential {
+    /// A ring member's delegation chain (`HandshakeWoT`).
+    Chain(DelegationChain),
+    /// A probationary public-commons ticket (`AdmitPublicTicket`).
+    Ticket(PublicCommonsTicket),
 }
 
 impl std::fmt::Debug for AdmissionSource {
@@ -33,6 +46,7 @@ impl std::fmt::Debug for AdmissionSource {
         f.debug_struct("AdmissionSource")
             .field("chain_dir", &self.chain_dir)
             .field("holds_genesis", &self.genesis.is_some())
+            .field("public_ticket_bits", &self.public_ticket_bits)
             .finish()
     }
 }
@@ -40,9 +54,14 @@ impl std::fmt::Debug for AdmissionSource {
 static PROCESS_SOURCE: OnceLock<AdmissionSource> = OnceLock::new();
 
 /// Sets the process-wide source from `data_dir` (first call wins). Binaries call this once at
-/// startup; every `MeshClient` without an explicit source uses it.
-pub fn install_process_source(data_dir: &Path) {
-    let _ = PROCESS_SOURCE.set(AdmissionSource::from_data_dir(data_dir));
+/// startup; every `MeshClient` without an explicit source uses it. `public_commons` lets the
+/// process fall back to a public-commons ticket when it holds no chain.
+pub fn install_process_source(data_dir: &Path, public_commons: bool) {
+    let mut source = AdmissionSource::from_data_dir(data_dir);
+    if public_commons {
+        source = source.with_public_tickets(DEFAULT_PUBLIC_WOT_POW_BITS);
+    }
+    let _ = PROCESS_SOURCE.set(source);
 }
 
 /// The process-wide source: the one a binary installed, else (first use) a source that only
@@ -51,6 +70,7 @@ pub fn process_source() -> Option<&'static AdmissionSource> {
     Some(PROCESS_SOURCE.get_or_init(|| AdmissionSource {
         chain_dir: None,
         genesis: held_genesis(None),
+        public_ticket_bits: None,
     }))
 }
 
@@ -86,6 +106,7 @@ impl AdmissionSource {
         Self {
             chain_dir: Some(data_dir.join(CHAIN_DIR_NAME)),
             genesis: held_genesis(Some(data_dir)),
+            public_ticket_bits: None,
         }
     }
 
@@ -94,6 +115,7 @@ impl AdmissionSource {
         Self {
             chain_dir: None,
             genesis: Some(genesis),
+            public_ticket_bits: None,
         }
     }
 
@@ -102,7 +124,30 @@ impl AdmissionSource {
         Self {
             chain_dir: Some(dir),
             genesis: None,
+            public_ticket_bits: None,
         }
+    }
+
+    /// Falls back to a public-commons ticket of `pow_bits` when no chain is available.
+    pub fn with_public_tickets(mut self, pow_bits: u8) -> Self {
+        self.public_ticket_bits = Some(pow_bits);
+        self
+    }
+
+    /// The one place a client chooses how to be admitted: a chain when it has one, else a
+    /// public-commons ticket when the process runs in public or hybrid mode.
+    pub fn credential(&self, identity: &NodeIdentity) -> Option<AdmissionCredential> {
+        if let Some(chain) = self.credential_for(identity) {
+            return Some(AdmissionCredential::Chain(chain));
+        }
+        let bits = self.public_ticket_bits?;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        Some(AdmissionCredential::Ticket(PublicCommonsTicket::mint(
+            identity, now_ms, bits,
+        )))
     }
 
     /// Whether this source holds the ring genesis (can self-issue and invite).

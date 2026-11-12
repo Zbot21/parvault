@@ -1028,22 +1028,27 @@ impl MeshClient {
         {
             return;
         }
-        let chain = match self.admission.as_deref() {
-            Some(source) => source.credential_for(&self.identity),
+        use crate::network::admission::AdmissionCredential;
+        let credential = match self.admission.as_deref() {
+            Some(source) => source.credential(&self.identity),
             None => crate::network::admission::process_source()
-                .and_then(|source| source.credential_for(&self.identity)),
+                .and_then(|source| source.credential(&self.identity)),
         };
-        let Some(chain) = chain else {
-            return;
-        };
-        if let Ok(MeshWireResponse::HandshakeAck { accepted: true, .. }) = self.send_request(
-            peer_addr,
-            MeshWireRequest::HandshakeWoT {
+        let request = match credential {
+            Some(AdmissionCredential::Chain(chain)) => MeshWireRequest::HandshakeWoT {
                 chain,
                 asn: None,
                 region: None,
             },
-        ) {
+            Some(AdmissionCredential::Ticket(ticket)) => MeshWireRequest::AdmitPublicTicket(ticket),
+            None => return,
+        };
+        let admitted = matches!(
+            self.send_request(peer_addr, request),
+            Ok(MeshWireResponse::HandshakeAck { accepted: true, .. })
+                | Ok(MeshWireResponse::AdmitPublicTicketAck { admitted: true, .. })
+        );
+        if admitted {
             if let Ok(mut s) = self.admitted_at.lock() {
                 s.insert(key);
             }

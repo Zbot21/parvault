@@ -49,8 +49,9 @@ use parvault::network::wire_handler::{
 use parvault::network::{
     derive_slot_key_from_code, node_identity_libp2p_peer_id, seal_public_tracker_card,
     seal_wan_peer_card, DelegationChain, DhtEnvelopeKind, DhtWireEnvelope, InvitationHop,
-    KnownPeersStore, MeshWireRequest, MeshWireResponse, WanPeerCard, WanRendezvousRegistry,
-    WebOfTrustRegistry, PUBLIC_COMMONS_SWARM_SLOT,
+    KnownPeersStore, MeshWireRequest, MeshWireResponse, PublicCommonsTicket, TrustPoolMode,
+    WanPeerCard, WanRendezvousRegistry, WebOfTrustRegistry, DEFAULT_PUBLIC_WOT_POW_BITS,
+    PUBLIC_COMMONS_SWARM_SLOT,
 };
 use parvault::por::{
     generate_multi_segment_por_challenge, generate_por_challenge, PorVerifierEngine, RepairGrant,
@@ -624,7 +625,7 @@ fn wan_card(id: &NodeIdentity, addrs: &[&str]) -> WanPeerCard {
 
 // --- the exhaustive variant guard ---------------------------------------------------------------
 
-/// Names the case that covers each variant. No wildcard: a 20th variant fails to compile here.
+/// Names the case that covers each variant. No wildcard: a new variant fails to compile here.
 fn covering_case(req: &MeshWireRequest) -> &'static str {
     match req {
         MeshWireRequest::HandshakeWoT { .. } => "handshake_wot",
@@ -646,6 +647,7 @@ fn covering_case(req: &MeshWireRequest) -> &'static str {
         MeshWireRequest::LookupWanRendezvous { .. } => "lookup_wan_rendezvous",
         MeshWireRequest::SubmitAbuseTakedownReport(_) => "submit_abuse_takedown",
         MeshWireRequest::BroadcastEvictionOrder(_) => "broadcast_eviction_order",
+        MeshWireRequest::AdmitPublicTicket(_) => "admit_public_ticket",
     }
 }
 
@@ -2135,4 +2137,46 @@ fn seed_server_shares_the_handler_store() {
         !store.renew_blinded_shard_lease(&b.id, 3, 1),
         "deletion via the server is visible in the store"
     );
+}
+
+// --- 20. AdmitPublicTicket (appended in v0.5.0; identical) ---------------------------------------
+
+#[test]
+fn admit_public_ticket() {
+    let _g = env_guard();
+    let mut t = Trio::new("ticket");
+    let peer = Peer::new(0x77, "198.51.100.22");
+    let ticket = PublicCommonsTicket::mint(&peer.ident, now_ms(), DEFAULT_PUBLIC_WOT_POW_BITS);
+    // Private ring (the fixtures' mode): refused by every role, no state change.
+    let o = t.run(&peer, &MeshWireRequest::AdmitPublicTicket(ticket.clone()));
+    assert!(o[0].resp.contains("admitted: false"), "{}", o[0].resp);
+    assert_identical(&o);
+    assert!(o[0].changed.is_empty());
+    // Public commons: admitted by every role.
+    t.each(|fx, _| {
+        fx.wot
+            .set_trust_pool_mode(TrustPoolMode::PublicCommons, DEFAULT_PUBLIC_WOT_POW_BITS)
+    });
+    let o = t.run(&peer, &MeshWireRequest::AdmitPublicTicket(ticket));
+    assert!(o[0].resp.contains("admitted: true"), "{}", o[0].resp);
+    assert_identical(&o);
+    let pk = peer.ident.public_key_bytes();
+    for fx in &t.fx {
+        assert!(
+            fx.wot.is_public_commons_peer(&pk),
+            "{:?}: admitted",
+            fx.role
+        );
+        assert!(
+            fx.admitted_at(peer.ip).contains(&pk),
+            "{:?}: admission IP",
+            fx.role
+        );
+    }
+    // A ticket for another key is refused even in public commons.
+    let other = Peer::new(0x78, "198.51.100.23");
+    let foreign = PublicCommonsTicket::mint(&peer.ident, now_ms(), DEFAULT_PUBLIC_WOT_POW_BITS);
+    let o = t.run(&other, &MeshWireRequest::AdmitPublicTicket(foreign));
+    assert!(o[0].resp.contains("admitted: false"), "{}", o[0].resp);
+    assert_identical(&o);
 }

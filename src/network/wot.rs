@@ -310,6 +310,17 @@ impl InvitationHop {
     }
 }
 
+/// What [`WebOfTrustRegistry::public_ticket_decision`] needs to know about one ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TicketFacts {
+    /// The node runs in public-commons or hybrid mode.
+    pub public_commons_allowed: bool,
+    /// The ticket's key is the sender's transport key.
+    pub ticket_is_sender: bool,
+    /// The ticket meets the node's PoW bits and its signature verifies.
+    pub ticket_valid: bool,
+}
+
 /// Complete certificate chain (`Genesis -> ... -> Inviter -> Leaf Peer`) exchanged on handshake.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DelegationChain {
@@ -548,6 +559,34 @@ impl WebOfTrustRegistry {
 
     pub fn seen_slashing_nonces_count(&self) -> usize {
         self.seen_slashing_nonces.len()
+    }
+
+    /// The public-commons admission decision (F-05) for a ticket presented on the wire.
+    pub fn public_ticket_decision(facts: &TicketFacts) -> Result<(), &'static str> {
+        if !facts.public_commons_allowed {
+            return Err("reject.public_commons_disabled");
+        }
+        if !facts.ticket_is_sender {
+            return Err("reject.ticket_not_sender");
+        }
+        if !facts.ticket_valid {
+            // PoW below the node's required bits, or a bad ticket signature.
+            return Err("reject.ticket_insufficient_pow");
+        }
+        Ok(())
+    }
+
+    /// Facts for [`Self::public_ticket_decision`] about `ticket` sent by `sender_pubkey`.
+    pub fn ticket_facts(
+        &self,
+        ticket: &PublicCommonsTicket,
+        sender_pubkey: Option<[u8; 32]>,
+    ) -> TicketFacts {
+        TicketFacts {
+            public_commons_allowed: self.trust_pool_mode.allows_public_commons(),
+            ticket_is_sender: sender_pubkey == Some(ticket.peer_pubkey),
+            ticket_valid: ticket.verify(self.min_public_pow_bits),
+        }
     }
 
     /// The handshake binding (F-21): a chain admits only the key at its leaf, so the sender's

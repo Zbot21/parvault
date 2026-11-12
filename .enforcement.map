@@ -19,7 +19,6 @@ open       D-ADR     expect=completeness by=v0.5.0 ref=docs/security/TRUST_FINDI
 # --- Reach: checks that exist but are not called on the wire path ----------------------------------
 reach      F-03      sym=src/network/wire_handler.rs::admission_decision from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
 reach      F-05      sym=src/network/wot.rs::verify_and_admit_public_ticket from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
-open       F-05      expect=reach by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 reach      F-06      sym=src/por/verifier.rs::verify_audit_response from=src/cli/daemon.rs::run_daemon ref=docs/security/TRUST_FINDINGS.md
 open       F-06      expect=reach by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 reach      F-15      sym=src/bootstrap.rs::verify_weather_quorum from=src/bin/parvault-seed.rs::run_seed_listener_loop ref=docs/security/TRUST_FINDINGS.md
@@ -45,6 +44,7 @@ open       P-01      expect=completeness by=v0.5.0 ref=docs/security/TRUST_FINDI
 # --- Claims ----------------------------------------------------------------------------------------
 claim      F-03      sym=src/network/wire_handler.rs::admission_decision accept=trust_enforcement::f03_admitted_put_shard_stored_daemon reject=trust_enforcement::f03_unadmitted_put_shard_refused_daemon code=reject.peer_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-05-recursive-wot-and-subtree-slashing.md covers=MeshWireRequest::PutShard
 claim      F-03-SEED sym=src/network/wire_handler.rs::admission_decision accept=trust_enforcement::f03_admitted_put_shard_stored_seed reject=trust_enforcement::f03_unadmitted_put_shard_refused_seed code=reject.peer_not_admitted bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::PutShard
+claim      F-05      sym=src/network/wot.rs::public_ticket_decision accept=trust_enforcement::f05_public_ticket_at_required_bits_admits reject=trust_enforcement::f05_public_ticket_one_bit_short_refused code=reject.ticket_insufficient_pow bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-24-public-commons-pow-swarm-mode.md covers=MeshWireRequest::AdmitPublicTicket
 claim      F-21      sym=src/network/wot.rs::chain_leaf_decision accept=trust_enforcement::f21_handshake_own_chain_accepted reject=trust_enforcement::f21_handshake_chain_leaf_not_sender_refused code=reject.chain_leaf_not_sender bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::HandshakeWoT
 claim      F-24      sym=src/network/wire_handler.rs::admission_decision accept=trust_enforcement::f24_admitted_blinded_put_stored reject=trust_enforcement::f24_unadmitted_blinded_put_refused code=reject.peer_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-11-four-layer-shard-anonymization.md covers=MeshWireRequest::PutBlindedShard
 claim      F-24-ONION sym=src/network/wire_handler.rs::admission_decision accept=trust_enforcement::f24_admitted_onion_final_delivered reject=trust_enforcement::f24_unadmitted_onion_final_refused code=reject.peer_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::RelayPqOnionEnvelope
@@ -55,4 +55,4 @@ claim      F-25-DHT  sym=src/network/wire_handler.rs::admission_decision accept=
 # Findings with no line yet (no check function exists to name): F-07, F-08, F-09, F-12, F-17
 #   (2c); F-22, F-23, F-26 (2c); F-24 issuer policy (2c).
 
-ratchet    R         open=11 waive=0
+ratchet    R         open=10 waive=0

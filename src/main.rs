@@ -255,12 +255,12 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let cfg = NodeConfig::load_for_cli(cli.config.as_ref(), cli.data_dir.as_deref(), cli.profile)?;
-    parvault::network::admission::install_process_source(&cfg.data_dir);
 
     let lan_port = cfg.effective_lan_discovery_port(cli.lan_discovery_port);
     let lan_enabled = cfg.effective_lan_discovery_enabled(cli.no_lan_discovery);
     let trust_mode = cfg.effective_trust_mode(cli.public, &cli.trackers);
     let public_mode = trust_mode.allows_public_commons();
+    parvault::network::admission::install_process_source(&cfg.data_dir, public_mode);
     let public_trackers =
         cfg.effective_public_trackers(&cli.trackers, cli.seed_addr.as_deref(), public_mode);
     let wan_seeds = cfg.effective_wan_rendezvous_seeds(cli.seed_addr.as_deref());

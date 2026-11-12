@@ -477,6 +477,7 @@ fn admitted(peer: &WirePeer<'_>, class: AdmissionClass, wot: &WebOfTrustRegistry
 pub const fn admission_class(request: &MeshWireRequest) -> AdmissionClass {
     match request {
         MeshWireRequest::HandshakeWoT { .. }
+        | MeshWireRequest::AdmitPublicTicket(_)
         | MeshWireRequest::QueryNodeStatus
         | MeshWireRequest::RegisterWanRendezvous { .. }
         | MeshWireRequest::LookupWanRendezvous { .. } => AdmissionClass::PreAdmission,
@@ -526,6 +527,10 @@ pub fn reject_response(request: &MeshWireRequest, reason: String) -> MeshWireRes
     match request {
         MeshWireRequest::HandshakeWoT { .. } => MeshWireResponse::HandshakeAck {
             accepted: false,
+            reason: Some(reason),
+        },
+        MeshWireRequest::AdmitPublicTicket(_) => MeshWireResponse::AdmitPublicTicketAck {
+            admitted: false,
             reason: Some(reason),
         },
         MeshWireRequest::PutShard { .. } => MeshWireResponse::PutShardAck {
@@ -694,6 +699,43 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                         reason: Some(e.to_string()),
                     }
                 }
+            }
+        }
+        MeshWireRequest::AdmitPublicTicket(ticket) => {
+            if let Some(reason) = eviction.is_ingress_blocked(
+                remote_ip,
+                Some(remote_peer_id),
+                Some(&ticket.peer_pubkey),
+                None,
+                None,
+            ) {
+                return MeshWireResponse::AdmitPublicTicketAck {
+                    admitted: false,
+                    reason: Some(reason),
+                };
+            }
+            let facts = wot.ticket_facts(&ticket, remote_pubkey);
+            if let Err(code) = WebOfTrustRegistry::public_ticket_decision(&facts) {
+                warn!(code, peer = %remote_peer_id, "refused a public-commons ticket");
+                return MeshWireResponse::AdmitPublicTicketAck {
+                    admitted: false,
+                    reason: Some("public-commons ticket refused".to_string()),
+                };
+            }
+            match wot.verify_and_admit_public_ticket(&ticket) {
+                Ok(()) => {
+                    if let Some(ip) = remote_ip {
+                        let _ = eviction.record_peer_admission_ip(ip, ticket.peer_pubkey);
+                    }
+                    MeshWireResponse::AdmitPublicTicketAck {
+                        admitted: true,
+                        reason: None,
+                    }
+                }
+                Err(e) => MeshWireResponse::AdmitPublicTicketAck {
+                    admitted: false,
+                    reason: Some(e.to_string()),
+                },
             }
         }
         MeshWireRequest::PutShard {
@@ -1642,13 +1684,20 @@ mod tests {
                 "EvictionOrderAck",
                 true,
             ),
+            (
+                MeshWireRequest::AdmitPublicTicket(crate::network::wot::PublicCommonsTicket::mint(
+                    &id, 1, 1,
+                )),
+                "AdmitPublicTicketAck",
+                true,
+            ),
         ]
     }
 
     #[test]
     fn reject_response_matches_each_variant() {
         let reqs = all_requests();
-        assert_eq!(reqs.len(), 19);
+        assert_eq!(reqs.len(), 20);
         for (req, expected, carries_reason) in &reqs {
             let resp = format!("{:?}", reject_response(req, "admission-denied".into()));
             assert!(resp.starts_with(expected), "{expected}: {resp}");
@@ -1706,7 +1755,10 @@ mod tests {
             .iter()
             .filter(|c| **c == AdmissionClass::PreAdmission)
             .count();
-        assert_eq!(pre, 4, "handshake, status, rendezvous register and lookup");
+        assert_eq!(
+            pre, 5,
+            "handshake, public ticket, status, rendezvous register and lookup"
+        );
         let admitted: Vec<&str> = all_requests()
             .iter()
             .filter(|(r, _, _)| admission_class(r) == AdmissionClass::AdmittedPeer)

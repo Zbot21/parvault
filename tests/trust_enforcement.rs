@@ -19,8 +19,8 @@ use parvault::network::admission::AdmissionSource;
 use parvault::network::{
     build_mesh_client_swarm, derive_slot_key_from_code, node_identity_libp2p_peer_id,
     seal_wan_peer_card, DelegationChain, DhtWireEnvelope, InvitationHop, MeshClient,
-    MeshNetworkBehaviour, MeshWireRequest, MeshWireResponse, SlashingEvidence, SlashingReason,
-    WanPeerCard,
+    MeshNetworkBehaviour, MeshWireRequest, MeshWireResponse, PublicCommonsTicket, SlashingEvidence,
+    SlashingReason, WanPeerCard, DEFAULT_PUBLIC_WOT_POW_BITS,
 };
 use parvault::por::{RepairGrant, WitnessFailureReceipt};
 use parvault::sharding::encode_ciphertext_stripe;
@@ -192,6 +192,25 @@ fn spawn_daemon(label: &str) -> Node {
         .arg(&dir)
         .args([
             "--no-lan-discovery",
+            "daemon",
+            "start",
+            "--listen",
+            &format!("/ip4/127.0.0.1/tcp/{port}"),
+        ]);
+    spawn(cmd, root, dir, log, port)
+}
+
+/// `parvault --public daemon start`: public-commons mode (tickets admit strangers).
+fn spawn_public_daemon(label: &str) -> Node {
+    let (root, dir, reg, log) = prepare(label);
+    let port = free_port();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .arg("--data-dir")
+        .arg(&dir)
+        .args([
+            "--no-lan-discovery",
+            "--public",
             "daemon",
             "start",
             "--listen",
@@ -455,6 +474,91 @@ fn f03_unadmitted_put_shard_refused_seed() {
     );
     assert_logged(&node, "reject.peer_not_admitted");
     gate_ran("trust_enforcement::f03_unadmitted_put_shard_refused_seed");
+}
+
+// --- F-05: public-commons tickets on the wire ---------------------------------------------------------
+
+fn admit_ticket(node: &Node, sender: &NodeIdentity, bits: u8) -> MeshWireResponse {
+    send_as_stranger(
+        sender,
+        node,
+        MeshWireRequest::AdmitPublicTicket(PublicCommonsTicket::mint(sender, now_ms(), bits)),
+    )
+}
+
+/// F-05 accept: in public-commons mode a ticket at the required bits admits a stranger, whose
+/// shard is then stored.
+#[test]
+fn f05_public_ticket_at_required_bits_admits() {
+    let node = spawn_public_daemon("f05-a");
+    let stranger = key(0xA5);
+    let resp = admit_ticket(&node, &stranger, DEFAULT_PUBLIC_WOT_POW_BITS);
+    assert!(
+        matches!(
+            resp,
+            MeshWireResponse::AdmitPublicTicketAck { admitted: true, .. }
+        ),
+        "{resp:?}"
+    );
+    let (sid, bytes) = shard(0x15, 1024);
+    let put = send_as_stranger(&stranger, &node, put_shard("", sid, bytes, None));
+    assert!(stored(&put), "{put:?}");
+    gate_ran("trust_enforcement::f05_public_ticket_at_required_bits_admits");
+}
+
+/// F-05 reject: a ticket one bit short is refused, and the stranger's shard with it.
+#[test]
+fn f05_public_ticket_one_bit_short_refused() {
+    let node = spawn_public_daemon("f05-r");
+    let stranger = key(0xA5);
+    let resp = admit_ticket(&node, &stranger, DEFAULT_PUBLIC_WOT_POW_BITS - 1);
+    assert!(
+        matches!(
+            resp,
+            MeshWireResponse::AdmitPublicTicketAck {
+                admitted: false,
+                ..
+            }
+        ),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.ticket_insufficient_pow");
+    let (sid, bytes) = shard(0x15, 1024);
+    let put = send_as_stranger(&stranger, &node, put_shard("", sid, bytes, None));
+    assert_eq!(refusal_text(&put).as_deref(), Some(NOT_ADMITTED), "{put:?}");
+    gate_ran("trust_enforcement::f05_public_ticket_one_bit_short_refused");
+}
+
+/// F-05 (CLI): a client without any chain stores a file on a public-commons daemon through
+/// `parvault --public file store`, which mints and presents a ticket on its own.
+#[test]
+fn f05_public_cli_store_via_ticket() {
+    let node = spawn_public_daemon("f05-cli");
+    let root = temp_root("f05-cli-client");
+    let file = root.path().join("doc.txt");
+    std::fs::write(&file, b"public commons ticket admission").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env_remove("PARVAULT_GENESIS_SEED_HEX")
+        .env("PARVAULT_LAN_REGISTRY_DIR", root.path().join("reg"))
+        .env("PARVAULT_PEERS", &node.addr)
+        .arg("--data-dir")
+        .arg(root.path().join("client"))
+        .args(["--no-lan-discovery", "--public", "file", "store", "--path"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stdout={}\nstderr={}\nnode log:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+        node.log_text()
+    );
+    // Admitted by ticket: the client holds no ring genesis and installed no chain.
+    let client_dir = root.path().join("client");
+    assert!(!client_dir.join("genesis_root.seed").exists());
+    assert!(!client_dir.join("wot_chains").exists());
+    gate_ran("trust_enforcement::f05_public_cli_store_via_ticket");
 }
 
 // --- F-21: the handshake does not bind the chain leaf to the sender --------------------------------

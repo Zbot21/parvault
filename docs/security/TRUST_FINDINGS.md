@@ -20,7 +20,7 @@ Status values:
 | F-02 | High | A repair read (Case B) is not bound to the registered grant; `PutShard` registers any self-signed grant, before the put succeeds, overwriting the existing one. | 2b | Reproduced (F-02a, F-02b) |
 | F-03 | High | Web-of-trust admission is never consulted on the wire request path. | 2b | Fixed (QA pending): `admission_decision`, claims F-03 and F-03-SEED |
 | F-04 | High | `PutShard` takes a caller-supplied `owner_peer_id`; each invented id gets a fresh account with bootstrap grace. | 2b | Reproduced |
-| F-05 | High | Public-commons PoW admission has no wire carrier and no production caller. | 2b | Static |
+| F-05 | High | Public-commons PoW admission has no wire carrier and no production caller. | 2b | Fixed (QA pending): `AdmitPublicTicket`, `public_ticket_decision`, claim F-05 |
 | F-06 | High | The PoR audit loop is not wired: nothing issues challenges or verifies responses. | 2c | Read |
 | F-07 | High | Earned tiers are self-credited by the seed answering its own challenges. | 2c | Read |
 | F-08 | High | The eviction council is local TOFU state with no membership epoch; quorum can be configured below majority. | 2c | Reported |
