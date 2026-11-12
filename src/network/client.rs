@@ -1001,6 +1001,22 @@ impl OnionOriginator {
     }
 }
 
+/// How long a client waits after a refused handshake before presenting its credential again.
+pub const ADMISSION_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Whether `resp` is the server's "not admitted" refusal.
+fn is_not_admitted_refusal(resp: &MeshWireResponse) -> bool {
+    let text = crate::network::wire_handler::NOT_ADMITTED_TEXT;
+    match resp {
+        MeshWireResponse::PutShardAck { error, .. }
+        | MeshWireResponse::PutBlindedShardAck { error, .. }
+        | MeshWireResponse::RelayPqOnionAck { error, .. }
+        | MeshWireResponse::PutDhtEnvelopeAck { error, .. }
+        | MeshWireResponse::SyndicateLiteStripeAck { error, .. } => error.as_deref() == Some(text),
+        _ => false,
+    }
+}
+
 /// A (sender public key, peer address) pair that accepted this process's handshake.
 type AdmittedAt = ([u8; 32], String);
 
@@ -1025,6 +1041,8 @@ pub struct MeshClient {
     admission: Option<Arc<crate::network::admission::AdmissionSource>>,
     /// (sender pubkey, peer address) pairs that accepted this process's handshake.
     admitted_at: Arc<Mutex<HashSet<AdmittedAt>>>,
+    /// When a handshake with (sender, peer) was last refused (backoff).
+    admission_refused_at: Arc<Mutex<HashMap<AdmittedAt, Instant>>>,
 }
 
 impl MeshClient {
@@ -1067,6 +1085,7 @@ impl MeshClient {
             worker: Arc::new(Mutex::new(None)),
             admission: None,
             admitted_at: Arc::new(Mutex::new(HashSet::new())),
+            admission_refused_at: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1085,6 +1104,16 @@ impl MeshClient {
             .lock()
             .map(|s| s.contains(&key))
             .unwrap_or(false)
+        {
+            return;
+        }
+        // After a refused handshake, do not handshake again until the backoff has passed.
+        if self
+            .admission_refused_at
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&key).copied())
+            .is_some_and(|t| t.elapsed() < ADMISSION_RETRY_BACKOFF)
         {
             return;
         }
@@ -1109,9 +1138,14 @@ impl MeshClient {
                 | Ok(MeshWireResponse::AdmitPublicTicketAck { admitted: true, .. })
         );
         if admitted {
+            if let Ok(mut m) = self.admission_refused_at.lock() {
+                m.remove(&key);
+            }
             if let Ok(mut s) = self.admitted_at.lock() {
                 s.insert(key);
             }
+        } else if let Ok(mut m) = self.admission_refused_at.lock() {
+            m.insert(key, Instant::now());
         }
     }
 
@@ -1487,10 +1521,44 @@ impl MeshClient {
         if trimmed.is_empty() {
             return Err(MeshClientError::InvalidAddress("empty peer address".into()).into());
         }
-        if present_credential && crate::network::admission::requires_admitted_sender(&request) {
-            self.ensure_admitted(trimmed);
+        let needs_admission =
+            present_credential && crate::network::admission::requires_admitted_sender(&request);
+        if !needs_admission {
+            return self.send_request_transport(trimmed, request);
         }
+        self.ensure_admitted(trimmed);
+        let key = (self.identity.public_key_bytes(), trimmed.to_string());
+        let was_admitted = self
+            .admitted_at
+            .lock()
+            .map(|s| s.contains(&key))
+            .unwrap_or(false);
+        let resp = self.send_request_transport(trimmed, request.clone())?;
+        // A peer that admitted us before but now answers "not admitted" lost our admission (for
+        // example, a restart): forget it, handshake once more, and resend once.
+        if was_admitted && is_not_admitted_refusal(&resp) {
+            if let Ok(mut s) = self.admitted_at.lock() {
+                s.remove(&key);
+            }
+            self.ensure_admitted(trimmed);
+            let readmitted = self
+                .admitted_at
+                .lock()
+                .map(|s| s.contains(&key))
+                .unwrap_or(false);
+            if readmitted {
+                return self.send_request_transport(trimmed, request);
+            }
+        }
+        Ok(resp)
+    }
 
+    /// Sends one request over the transport, with dead-peer healing and LAN refresh.
+    fn send_request_transport(
+        &self,
+        trimmed: &str,
+        request: MeshWireRequest,
+    ) -> anyhow::Result<MeshWireResponse> {
         // If `trimmed` was already marked dead and we know a newer verified endpoint for the
         // exact same `/p2p/<PeerId>`, dial the healed endpoint directly.
         if self.is_peer_marked_dead(trimmed) {

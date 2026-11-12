@@ -183,13 +183,11 @@ fn spawn(mut cmd: Command, root: TempDir, dir: PathBuf, log: PathBuf, port: u16)
 }
 
 /// `parvault daemon start` on loopback with LAN discovery off, provisioned with the ring genesis.
-fn spawn_daemon(label: &str) -> Node {
-    let (root, dir, reg, log) = prepare(label);
-    let port = free_port();
+fn daemon_command(dir: &Path, reg: &Path, port: u16) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
-    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", reg)
         .arg("--data-dir")
-        .arg(&dir)
+        .arg(dir)
         .args([
             "--no-lan-discovery",
             "daemon",
@@ -197,7 +195,44 @@ fn spawn_daemon(label: &str) -> Node {
             "--listen",
             &format!("/ip4/127.0.0.1/tcp/{port}"),
         ]);
+    cmd
+}
+
+fn spawn_daemon(label: &str) -> Node {
+    let (root, dir, reg, log) = prepare(label);
+    let port = free_port();
+    let cmd = daemon_command(&dir, &reg, port);
     spawn(cmd, root, dir, log, port)
+}
+
+impl Node {
+    /// Restarts this daemon on the same data directory and port, first deleting its persisted
+    /// Web-of-Trust state (as if its admissions were lost).
+    fn restart_daemon_without_wot_state(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(self.dir.join("wot_state.bin"));
+        let port: u16 = self.addr.rsplit('/').next().unwrap().parse().unwrap();
+        let reg = self.dir.parent().unwrap().join("lan-registry");
+        let log_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.log)
+            .unwrap();
+        self.child = daemon_command(&self.dir, &reg, port)
+            .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+            .env("RUST_LOG", "info")
+            .env("NO_COLOR", "1")
+            .stdout(Stdio::from(log_file.try_clone().unwrap()))
+            .stderr(Stdio::from(log_file))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "daemon did not come back");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
 }
 
 /// `parvault --public daemon start`: public-commons mode (tickets admit strangers).
@@ -1856,4 +1891,53 @@ fn f29_unadmitted_source_record_refused() {
     assert_logged(&node, "reject.dht_record_source_not_admitted");
     assert_eq!(kad_get(&node, dht_key.to_vec()), None);
     gate_ran("trust_enforcement::f29_unadmitted_source_record_refused");
+}
+
+// --- Client admission: backoff and re-handshake ----------------------------------------------------
+
+/// A client whose credential a node refuses presents it once, not before every request.
+#[test]
+fn refused_credential_is_not_presented_on_every_request() {
+    let node = spawn_daemon("backoff");
+    let outsider_genesis = NodeIdentity::from_seed([0x48; 32]);
+    let c = MeshClient::new(key(0xAB), Vec::new(), None)
+        .with_admission(AdmissionSource::from_genesis(outsider_genesis));
+    for i in 0..3u8 {
+        let (sid, bytes) = shard(0x30 + i, 512);
+        let resp = c
+            .send_request(&node.addr, put_shard("", sid, bytes, None))
+            .unwrap();
+        assert_eq!(
+            refusal_text(&resp).as_deref(),
+            Some(NOT_ADMITTED),
+            "{resp:?}"
+        );
+    }
+    let handshakes = node
+        .log_text()
+        .lines()
+        .filter(|l| l.contains("refused a handshake"))
+        .count();
+    assert_eq!(handshakes, 1, "{}", node.log_text());
+    gate_ran("trust_enforcement::refused_credential_is_not_presented_on_every_request");
+}
+
+/// A node that lost a member's admission (restart without its WoT state) answers "not admitted";
+/// the client handshakes once more and the put is stored.
+#[test]
+fn client_rehandshakes_after_lost_admission() {
+    let mut node = spawn_daemon("rehandshake");
+    let c = client(&key(0xAC));
+    let (sid, bytes) = shard(0x34, 512);
+    assert!(stored(
+        &c.send_request(&node.addr, put_shard("", sid, bytes, None))
+            .unwrap()
+    ));
+    node.restart_daemon_without_wot_state();
+    let (sid, bytes) = shard(0x35, 512);
+    let resp = c
+        .send_request(&node.addr, put_shard("", sid, bytes, None))
+        .unwrap();
+    assert!(stored(&resp), "{resp:?}\n{}", node.log_text());
+    gate_ran("trust_enforcement::client_rehandshakes_after_lost_admission");
 }
