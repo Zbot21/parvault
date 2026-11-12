@@ -50,6 +50,7 @@ src/storage/*                   test    sync_daemon_usability_and_cli_regression
 src/storage/*                   test    vfs_lazy_stream
 src/storage/*                   test    zero_config_lan_and_router_soc_tests
 src/storage/*                   test    zero_trust_adversarial
+src/storage/*                   test    wire_handler_equivalence
 src/storage/anonymity.rs        tla     specs/ParVaultAnonymity.tla
 src/storage/quota.rs            tla     specs/ParVaultConfidentialityAndTrust.tla
 src/storage/quota.rs            tla     specs/ParVaultBootstrapAndEarnedTier.tla
@@ -90,6 +91,7 @@ src/bootstrap.rs                test    tla_formal_proofs_integration
 src/bootstrap.rs                test    vfs_lazy_stream
 src/bootstrap.rs                test    zero_config_lan_and_router_soc_tests
 src/bootstrap.rs                test    zero_trust_adversarial
+src/bootstrap.rs                test    wire_handler_equivalence
 src/bootstrap.rs                tla     specs/ParVaultBootstrapAndEarnedTier.tla
 src/bootstrap.rs                tla     specs/ParVaultLiteClientAndSeedFailover.tla
 
@@ -122,6 +124,7 @@ src/sharding/*                  test    sync_daemon_usability_and_cli_regression
 src/sharding/*                  test    vfs_lazy_stream
 src/sharding/*                  test    zero_config_lan_and_router_soc_tests
 src/sharding/*                  test    zero_trust_adversarial
+src/sharding/*                  test    wire_handler_equivalence
 src/sharding/*                  tla     specs/ParVaultProtocol.tla
 src/sharding/*                  tla     specs/ParVaultConfidentialityAndTrust.tla
 src/sharding/reed_solomon.rs    kani    proof_gf256_field_axioms_and_shard_bounds
@@ -150,6 +153,7 @@ src/por/*                       test    seed_server_integration
 src/por/*                       test    sync_daemon_usability_and_cli_regression_tests
 src/por/*                       test    zero_config_lan_and_router_soc_tests
 src/por/*                       test    zero_trust_adversarial
+src/por/*                       test    wire_handler_equivalence
 src/por/*                       tla     specs/ParVaultProtocol.tla
 src/por/*                       tla     specs/ParVaultConfidentialityAndTrust.tla
 
@@ -174,6 +178,7 @@ src/network/*                   test    red_team_hardening_tests
 src/network/*                   test    sync_daemon_usability_and_cli_regression_tests
 src/network/*                   test    zero_config_lan_and_router_soc_tests
 src/network/*                   test    zero_trust_adversarial
+src/network/*                   test    wire_handler_equivalence
 src/network/wot.rs              tla     specs/ParVaultProtocol.tla
 src/network/wire_handler.rs     tla     specs/ParVaultProtocol.tla              # HandshakeWoT, no framing slashes
 src/network/wire_handler.rs     tla     specs/ParVaultZeroKeyAdminAndQuorum.tla # seed eviction council
@@ -313,6 +318,7 @@ tests/seed_server_integration.rs                         test    seed_server_int
 tests/sync_daemon_usability_and_cli_regression_tests.rs  test    sync_daemon_usability_and_cli_regression_tests
 tests/tla_formal_proofs_integration.rs                   test    tla_formal_proofs_integration   # runs all 7 specs
 tests/vfs_lazy_stream.rs                                 test    vfs_lazy_stream
+tests/wire_handler_equivalence.rs                        test    wire_handler_equivalence
 tests/zero_config_lan_and_router_soc_tests.rs            test    zero_config_lan_and_router_soc_tests
 tests/zero_trust_adversarial.rs                          test    zero_trust_adversarial
 
