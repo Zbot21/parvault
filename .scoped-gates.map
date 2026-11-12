@@ -13,6 +13,10 @@
 src/lib.rs                      full    # module tree, crate attrs, cfg(kani)
 # Binary-only code (main.rs, src/cli/*): cannot change a Kani or TLC result; it is
 # gated by the suites that spawn `parvault` (clippy runs only in full mode).
+# Until the runner has a scoped clippy step, a scoped run on these paths must be
+# followed by `cargo clippy --all-targets -- -D warnings`.
+# Every `Commands` subcommand is spawned by one of these suites except `evict` and
+# `list-snapshot`, which no suite runs (compile only).
 src/main.rs                     test    gateway_bus_and_plugin_security
 src/main.rs                     test    sync_daemon_usability_and_cli_regression_tests
 src/main.rs                     test    zero_config_lan_and_router_soc_tests
