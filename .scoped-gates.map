@@ -481,6 +481,12 @@ tests/gateway_ipc_benchmark.rs  doc     docs/BENCHMARKS.md
 tests/tla_formal_proofs_integration.rs  doc  AGENTS.md
 scripts/install.sh              doc     QUICKSTART.md
 scripts/gen_metrics.sh          doc     docs/metrics.txt
+src/network/placement.rs        doc     docs/adr/ADR-06-hybrid-locality-and-70-30-placement.md
+src/network/wire_handler.rs     doc     docs/SECURITY_AND_CRYPTOGRAPHY.md
+src/network/wire_handler.rs     doc     docs/adr/ADR-26-verifiable-abuse-and-council-quorum-governance.md
+src/network/wire_handler.rs     doc     CHANGELOG.md
+src/network/server_events.rs    doc     CHANGELOG.md
+src/cli/daemon.rs               doc     docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md
 scripts/install.sh              doc     website/install.sh
 website/install.sh              doc     scripts/install.sh
 deploy/*                        doc     docs/ROUTER_SOC_HARDWARE_GUIDE.md

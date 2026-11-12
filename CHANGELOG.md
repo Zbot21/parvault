@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [Unreleased]
+
+### Changed
+- **Shared wire handler (`#codehealth`):** the daemon and `parvault-seed` now serve every `MeshWireRequest` through one `handle_mesh_wire_request` in `src/network/wire_handler.rs`; the nine role differences are explicit `WireRolePolicy` hooks. Behaviour and wire format are unchanged (pinned by `tests/wire_handler_equivalence.rs`).
+- **Log targets:** the seed's wire-handler warnings now log under `parvault::network::wire_handler` instead of `parvault_seed`, and the daemon's mDNS discovery line under `parvault::network::server_events`. The default filters (`parvault=info`) still print them; a custom `RUST_LOG` that names `parvault_seed` will not.
+- `parvault` command implementations moved from `src/main.rs` into `src/cli/`; `PlacementEngine` and `TokenBucketRateLimiter` moved to `network::placement` / `network::rate_limit` (re-exported at their old paths).
+- Crate version `0.5.0`; `deploy/Dockerfile.musl` builds `--profile soc` like the release workflow.
+
+---
+
 ## [`0.4.0`] - 2026-11-11
 
 ### Added

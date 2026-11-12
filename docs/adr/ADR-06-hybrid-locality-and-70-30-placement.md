@@ -1,7 +1,7 @@
 # ADR-06: Hybrid Offline Locality Probing & 70/30 Intra-ASN / Cross-Region Placement
 
 - **Status:** Accepted
-- **Subsystem:** `network::behaviour` / `network::client`
+- **Subsystem:** `network::placement` / `network::client`
 - **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
 
 ---

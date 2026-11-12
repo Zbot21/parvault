@@ -14,7 +14,7 @@
 | **[`ADR-03`](adr/ADR-03-stateless-witness-por-auditing.md)** | `por::challenger` / `por::verifier` | Stateless RAM-Verified Proof-of-Retrievability (PoR) Auditing | Accepted (Extended) |
 | **[`ADR-04`](adr/ADR-04-repair-grant-ciphertext-reconstruction.md)** | `por::verifier` / `sharding::reed_solomon` | Authenticated `RepairGrant` & Witness Threshold Ciphertext Reconstruction | Accepted |
 | **[`ADR-05`](adr/ADR-05-recursive-wot-and-subtree-slashing.md)** | `network::wot` | Recursive Ed25519 Web-of-Trust Delegation & Subtree Slashing | Accepted (Extended) |
-| **[`ADR-06`](adr/ADR-06-hybrid-locality-and-70-30-placement.md)** | `network::behaviour` / `network::client` | Hybrid Offline Locality Probing & 70/30 Intra-ASN / Cross-Region Placement | Accepted |
+| **[`ADR-06`](adr/ADR-06-hybrid-locality-and-70-30-placement.md)** | `network::placement` / `network::client` | Hybrid Offline Locality Probing & 70/30 Intra-ASN / Cross-Region Placement | Accepted |
 | **[`ADR-07`](adr/ADR-07-tier-weighted-reciprocity-ledger.md)** | `storage::quota` | Tier-Weighted Byte-Hour Reciprocity Credit Ledger & Bootstrap Grace Quota | Accepted (Extended) |
 | **[`ADR-08`](adr/ADR-08-noise-xx-transport-and-bounded-wire-framing.md)** | `network::transport` / `network::behaviour` | Primary `TCP + Noise XX + Yamux` Transport & Pre-Auth Bounded `bincode` Framing | Accepted |
 | **[`ADR-09`](adr/ADR-09-byzantine-merkle-quarantine-and-egress-slashing.md)** | `sharding::reed_solomon` / `por::challenger` / `storage::quota` | Pre-Decoding Merkle Quarantine & Byzantine Egress-Withholding Slashing | Accepted (Extended) |
