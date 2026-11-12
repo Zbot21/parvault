@@ -1167,38 +1167,35 @@ fn repro_f22_unadmitted_rendezvous_register_stored() {
 
 // --- F-25: syndication cert not bound to the sender; self-signed DHT records from strangers -------------
 
-/// F-25 (cert): a device cert issued by the seed's owner for one device is replayed by an
-/// unrelated key and the seed syndicates the stripe.
-#[test]
-fn repro_f25_device_cert_replayed_by_other_key() {
-    let node = spawn_seed("f25c");
-    let device = key(0xC5);
+fn syndicate(seed: &Node, cert_device: &NodeIdentity) -> MeshWireRequest {
     let cert = PersonalDeviceCert::issue(
-        &node.owner_pq(),
-        &device.device_peer_id(),
+        &seed.owner_pq(),
+        &cert_device.device_peer_id(),
         "laptop",
         1_700_000_000,
     )
     .unwrap();
     let ct = vec![0x3C; 32 * 1024];
     let set = encode_ciphertext_stripe(0, &ct, ErasureTier::Homelab).unwrap();
-    let bundle = LiteStripeSyndicationBundle {
-        stripe_index: 0,
-        tier: ErasureTier::Homelab,
-        ciphertext_bytes: ct,
-        expected_stripe_merkle_root: set.stripe_merkle_root,
-        expected_shard_hashes: set.shard_hashes.clone(),
-    };
-    let replayer = key(0xC6);
-    let resp = send(
-        &replayer,
-        &node,
-        MeshWireRequest::SyndicateLiteStripe {
-            cert,
-            bundle,
-            repair_grant: None,
+    MeshWireRequest::SyndicateLiteStripe {
+        cert,
+        bundle: LiteStripeSyndicationBundle {
+            stripe_index: 0,
+            tier: ErasureTier::Homelab,
+            ciphertext_bytes: ct,
+            expected_stripe_merkle_root: set.stripe_merkle_root,
+            expected_shard_hashes: set.shard_hashes.clone(),
         },
-    );
+        repair_grant: None,
+    }
+}
+
+/// F-25 accept: the device a cert names syndicates its stripe.
+#[test]
+fn f25_device_cert_of_sender_accepted() {
+    let node = spawn_seed("f25c-a");
+    let device = key(0xC5);
+    let resp = send(&device, &node, syndicate(&node, &device));
     assert!(
         matches!(
             resp,
@@ -1207,9 +1204,25 @@ fn repro_f25_device_cert_replayed_by_other_key() {
                 ..
             }
         ),
-        "gap: another key's cert is accepted: {resp:?}"
+        "{resp:?}"
     );
-    gate_ran("trust_enforcement::repro_f25_device_cert_replayed_by_other_key");
+    gate_ran("trust_enforcement::f25_device_cert_of_sender_accepted");
+}
+
+/// F-25 reject: the same cert replayed by another admitted key is refused.
+#[test]
+fn f25_device_cert_replayed_by_other_key_refused() {
+    let node = spawn_seed("f25c-r");
+    let device = key(0xC5);
+    let replayer = key(0xC6);
+    let resp = send(&replayer, &node, syndicate(&node, &device));
+    assert_eq!(
+        refusal_text(&resp).as_deref(),
+        Some("device cert does not name the sender"),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.device_cert_not_sender");
+    gate_ran("trust_enforcement::f25_device_cert_replayed_by_other_key_refused");
 }
 
 /// F-25 accept (DHT put): an admitted sender stores a self-signed envelope.

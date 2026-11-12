@@ -564,6 +564,19 @@ fn shard_owner(peer: &WirePeer<'_>, claimed: Option<&str>) -> Option<String> {
     }
 }
 
+/// The syndication binding (F-25): a personal-device cert authorises only the device it names,
+/// so it must name the sender. Fails closed when the sender has no Ed25519 key.
+pub fn device_cert_decision(
+    cert_device_id: &str,
+    sender_device_id: Option<&str>,
+) -> Result<(), &'static str> {
+    if sender_device_id == Some(cert_device_id) {
+        Ok(())
+    } else {
+        Err("reject.device_cert_not_sender")
+    }
+}
+
 /// The refusal text for an owner claim that does not name the sender.
 const OWNER_NOT_SENDER_TEXT: &str = "owner claim does not match the sender";
 
@@ -1309,6 +1322,17 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                     receipt: None,
                     syndicated_peers: Vec::new(),
                     error: Some(reason),
+                };
+            }
+            let sender_device =
+                remote_pubkey.map(|pk| NodeIdentity::device_peer_id_for_pubkey(&pk));
+            if let Err(code) = device_cert_decision(&cert.device_peer_id, sender_device.as_deref())
+            {
+                warn!(code, peer = %remote_peer_id, "refused a device cert issued to another device");
+                return MeshWireResponse::SyndicateLiteStripeAck {
+                    receipt: None,
+                    syndicated_peers: Vec::new(),
+                    error: Some("device cert does not name the sender".to_string()),
                 };
             }
             let grant_to_register = repair_grant.clone();

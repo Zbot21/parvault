@@ -1530,7 +1530,8 @@ fn syndicate_lite_stripe() {
     let mut t = Trio::new("synd");
     let peer = Peer::new(0x6B, "198.51.100.12");
     t.admit(&peer);
-    let laptop = NodeIdentity::from_seed([0x6C; 32]);
+    // v0.5.0: a cert authorises only the device it names, so the sender is that device.
+    let laptop = peer.ident.clone();
     let cert = PersonalDeviceCert::issue(
         &t.keys.owner_pq,
         &laptop.device_peer_id(),
