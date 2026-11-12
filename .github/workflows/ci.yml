@@ -167,6 +167,8 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
+      - name: Doc metrics drift check (docs/metrics.txt vs. marked Markdown)
+        run: bash scripts/sync_doc_metrics.sh --check --generate .
       - name: Download TLA+ Tools (tla2tools.jar) for Rust TLA+ Integration Tests
         run: |
           curl --proto '=https' --tlsv1.2 -fsSL \

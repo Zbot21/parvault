@@ -29,5 +29,5 @@ AAD_i          = "parvault-stripe-aad-v1:" || u64_be(i)
 
 ## Consequences & Verification
 
-- **Consequences:** Resident memory remains strictly decoupled from total file size (`9.72–9.74 MiB` peak `VmHWM` on `1 MiB` stripes; `57.91 MiB` on `16 MiB` stripes across arbitrarily large files), and storage peers never observe plaintext or unauthenticated shards.
+- **Consequences:** Resident memory remains strictly decoupled from total file size (<!-- metric:bench.soc.vmhwm -->`9.72–9.74 MiB`<!-- /metric --> peak `VmHWM` on `1 MiB` stripes; <!-- metric:bench.desktop.vmhwm -->`57.91 MiB`<!-- /metric --> on `16 MiB` stripes across arbitrarily large files), and storage peers never observe plaintext or unauthenticated shards.
 - **Verification:** Kani harnesses `proof_streaming_stripe_layout_all_u64_file_sizes_and_profiles`, `proof_stripe_nonce_injectivity_and_no_panic`, and `proof_gf256_field_axioms_and_shard_bounds`; `specs/ParVaultProtocol.tla`; `tests/formal_verification.rs` (`16,777,216` $GF(2^8)^3$ triples).

@@ -54,7 +54,7 @@ This document is the authoritative architectural, security, and verification man
 | `src/capabilities.rs` | Stateless `HMAC-SHA256` `CapabilityMacaroon` minting, offline caveat attenuation (`AllowedManifest`, `ByteRange`, `ExpiresAtUnixMs`, `ReadOnly`, `AllowedPeerUid`), `PARVAULT-MAC-V1:` compact binary/hex encoding, `MacaroonSliceView`, and `< 1 ms` zero-DB RAM verification (`ct_eq_32`). | [`ADR-28`](docs/adr/ADR-28-stateless-macaroon-capability-attenuation.md), [`ADR-32`](docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md) |
 | `src/vfs.rs` | Pure-Rust Linux `/dev/fuse` (`ABI 7.31`, `0` `unsafe` `parse_fuse_in_header` / `parse_fuse_read_in`), dual-mode `VirtualVaultFs` (`with_bus` / `with_bus_and_block_size`, `.parvaultignore`-aware `ingest_local_directory`), `VfsStubNode`, `LruBlockCache`, `--macaroon` attenuation pass-through, and RAII `VfsWebdavServerHandle` (`spawn_webdav_server`) + blocking HTTP `206` / WebDAV `PROPFIND` server. | [`ADR-29`](docs/adr/ADR-29-pure-rust-fuse-and-webdav-lazy-vfs.md), [`ADR-32`](docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md), [`ADR-33`](docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md) |
 | `src/admin_rpc.rs` | Forward-secret `X25519 + ChaCha20-Poly1305` + `Ed25519` challenge-authenticated TCP control channel for zero-private-key-on-VPS seed administration (`MAX_ADMIN_RPC_FRAME_BYTES`, `±60s` anti-replay window). | [`ADR-26`](docs/adr/ADR-26-verifiable-abuse-and-council-quorum-governance.md) |
-| `src/kani_proofs.rs` | `14` Kani Rust Bounded Model Checking symbolic harnesses (`#[cfg(kani)]`; `17` total across the crate including `capabilities`, `crypto::aes`, and `sharding::reed_solomon`). | [`ADR-01`–`ADR-33`](docs/ADR.md) |
+| `src/kani_proofs.rs` | <!-- metric:kani_harnesses_module -->`14`<!-- /metric --> Kani Rust Bounded Model Checking symbolic harnesses (`#[cfg(kani)]`; <!-- metric:kani_harnesses -->`17`<!-- /metric --> total across the crate including `capabilities`, `crypto::aes`, and `sharding::reed_solomon`). | [`ADR-01`–<!-- metric:adr_last -->`ADR-33`<!-- /metric -->](docs/ADR.md) |
 | `src/bootstrap.rs` | `EarnedStanding`, `ElasticBootstrapEngine`, `PersonalDeviceCert` (including compact `PARVAULT-CERT-V1:` token encoding), `BlindedShardTombstone` (generation-scoped), `ZeroTrustSeedServer`, `CorrelatedOutageController`, and `/32` IPv6 + RFC 6598 CGNAT Sybil subnet normalization. | `ADR-13`, `ADR-14`, `ADR-15`, `ADR-16`, `ADR-17` |
 | `src/sync.rs` | Key-bearing `FolderSyncEngine`, zero-key `GatewayFolderSync` & `GatewayFolderCatalog` (`ADR-33`), `sanitize_sync_relative_path` (`sanitize_sync_relative_path_into`), `FolderSnapshotManifest`, `EncryptedVaultCatalogEnvelope`, `.parvaultignore` matcher (`ParvaultIgnore`), `FolderSyncDiff` (`diff_folder`), `prune_deleted_file_shards` (local + remote `DeleteShard` GC), selective restore (`restore_single_file`, `restore_selective_subset`), and zero-local-state seed recovery (`recover_folder_from_seed_phrase`). | `ADR-10`, `ADR-15`, `ADR-16`, `ADR-17`, [`ADR-33`](docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md) |
 | `src/telemetry.rs` | `AnonymousTelemetryBeacon` (rotating epoch nullifier + Hashcash PoW + power-of-two GiB bucketing capped at 64 TiB) and `NetworkCensusAggregator` (Tukey IQR outlier trimming + capture-recapture population estimate). | `ADR-14`, `ADR-15` |
@@ -68,7 +68,7 @@ Every code change or PR **must** preserve these 7 invariants:
 1. **Encrypt-Before-Shard Ordering (`ADR-01` / `ADR-12`):**
    Plaintext must always be padded (`pad_plaintext_iso_bucket`) and encrypted client-side with `AES-256-GCM` (`MasterKey::stripe_aead_subkey`) or dual-cipher cascaded `PqVaultMasterKey` (`AES-256-GCM` + `ChaCha20-Poly1305`) **before** Reed-Solomon encoding over $GF(2^8)$. Never pass unencrypted bytes into `sharding::reed_solomon`.
 2. **Bounded `< 32 MiB` Streaming I/O & Tiny-SoC 1 MiB Profile (`ADR-01`, `ADR-16`, `ADR-18`):**
-   Never call `std::fs::read` on user backup files or restored staging files. Always use `compute_file_sha256_streaming` (64 KiB buffer) and `store_file_streaming` / `restore_file_streaming`. With `--profile router-soc` (`1 MiB` stripes), peak working set `VmHWM` is guaranteed `< 16 MiB` (`9.72–9.74 MiB` measured) inside a 32–48 MiB cgroup. All stripe profiles (`1 MiB`, `4 MiB`, `16 MiB`) are 100% wire- and manifest-interoperable.
+   Never call `std::fs::read` on user backup files or restored staging files. Always use `compute_file_sha256_streaming` (64 KiB buffer) and `store_file_streaming` / `restore_file_streaming`. With `--profile router-soc` (`1 MiB` stripes), peak working set `VmHWM` is guaranteed `< 16 MiB` (<!-- metric:bench.soc.vmhwm -->`9.72–9.74 MiB`<!-- /metric --> measured) inside a 32–48 MiB cgroup. All stripe profiles (`1 MiB`, `4 MiB`, `16 MiB`) are 100% wire- and manifest-interoperable.
 3. **Pre-Authentication Wire Allocation Bounds (`ADR-15` / `ADR-16`):**
    All network deserialization in `BincodeWireCodec` must use `bincode::DefaultOptions::new().with_fixint_encoding().allow_trailing_bytes().with_limit(buf.len() as u64)` after enforcing `MAX_WIRE_FRAME_BYTES` (`32 MiB`, with 64 KiB initial read reservation against Slowloris attacks), and all replay/nullifier caches (`PorVerifierEngine`, `VoucherNullifierLedger`) must remain strictly bounded in capacity (`65,536` entries) with FIFO eviction.
 4. **Crash-Safe Atomic Persistence (`ADR-15`):**
@@ -91,7 +91,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo check --no-default-features --bin parvault --bin parvault-seed --bin parvault-sync
 
-# Run all 133 unit, integration, Stateright, TLA+ TLC, GatewayBus, VFS, GatewayFolderSync, and live localhost TCP P2P tests
+# Run all unit, integration, Stateright, TLA+ TLC, GatewayBus, VFS, GatewayFolderSync, and live localhost TCP P2P tests
 TLA2TOOLS_JAR=/root/tla2tools.jar cargo test --release
 
 # Run built-in self-tests for seed, zero-copy IPC gateway, lazy VFS, and zero-key folder sync
@@ -107,22 +107,23 @@ cargo run --release --bin parvault-bench -- run --payload-mib 64
 bash scripts/docker_acceptance_gate.sh
 ```
 
+- **Numbers in docs:** marked values (`<!-- metric:KEY -->…<!-- /metric -->`) come from `docs/metrics.txt`; never hand-edit them. Change the metrics file (measured keys only after re-measuring; `scripts/gen_metrics.sh --measured` covers sizes and TLC states), then run `bash scripts/sync_doc_metrics.sh --generate .`.
 - **Change-scoped gates during iteration:** `.scoped-gates.map` maps each path to its `--lib` filter, test suites, Kani harnesses, TLA+ specs, and docs; run it with the swarm skill's `run_scoped_gates.sh` (unmapped paths escalate to the full gate run).
 
 ### Static `musl` Cross-Compilation (`x86_64` & `aarch64`, `--profile soc`)
 ```bash
-# x86_64 static musl build (3.63-7.76 MiB stripped)
+# x86_64 static musl build (stripped sizes: docs/BENCHMARKS.md section 4)
 cargo build --profile soc --target x86_64-unknown-linux-musl \
   --bin parvault --bin parvault-seed --bin parvault-fuse --bin parvault-sync
 
-# ARM64 static musl build (2.94-6.08 MiB stripped: OpenWrt / prplOS LXC / RPi)
+# ARM64 static musl build (OpenWrt / prplOS LXC / RPi; sizes: docs/BENCHMARKS.md section 4)
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
   cargo build --profile soc --target aarch64-unknown-linux-musl \
   --bin parvault --bin parvault-seed --bin parvault-fuse --bin parvault-sync
 ```
 
-### Kani Bounded Model Checking (`17` Harnesses) & TLA+ TLC Formal Model Checking (`7` Specs)
-All **17** Kani symbolic harnesses (`cargo kani`) and all **7** TLA+ specifications in `specs/` must complete with **0 errors** (see [`docs/SAFETY_AND_LINT_AUDIT.md`](docs/SAFETY_AND_LINT_AUDIT.md)):
+### Kani Bounded Model Checking (<!-- metric:kani_harnesses -->`17`<!-- /metric --> Harnesses) & TLA+ TLC Formal Model Checking (<!-- metric:tla_specs -->`7`<!-- /metric --> Specs)
+All **<!-- metric:kani_harnesses -->17<!-- /metric -->** Kani symbolic harnesses (`cargo kani`) and all **<!-- metric:tla_specs -->7<!-- /metric -->** TLA+ specifications in `specs/` must complete with **0 errors** (see [`docs/SAFETY_AND_LINT_AUDIT.md`](docs/SAFETY_AND_LINT_AUDIT.md)):
 ```bash
 bash scripts/verify_formal_proofs.sh
 
@@ -135,4 +136,4 @@ java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config specs/ParVaultBootstr
 java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config specs/ParVaultLiteClientAndSeedFailover.cfg specs/ParVaultLiteClientAndSeedFailover.tla
 java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config specs/ParVaultZeroKeyAdminAndQuorum.cfg specs/ParVaultZeroKeyAdminAndQuorum.tla
 ```
-- **Automatic TLA+ Execution in `cargo test` (`tests/tla_formal_proofs_integration.rs`):** Setting `TLA2TOOLS_JAR=/path/to/tla2tools.jar` (configured automatically in `.github/workflows/ci.yml`) runs all **7** TLA+ formal specifications directly inside `cargo test --release`.
+- **Automatic TLA+ Execution in `cargo test` (`tests/tla_formal_proofs_integration.rs`):** Setting `TLA2TOOLS_JAR=/path/to/tla2tools.jar` (configured automatically in `.github/workflows/ci.yml`) runs all **<!-- metric:tla_specs -->7<!-- /metric -->** TLA+ formal specifications directly inside `cargo test --release`.

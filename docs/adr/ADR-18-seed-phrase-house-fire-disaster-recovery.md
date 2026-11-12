@@ -12,7 +12,7 @@ If a user's home burns down destroying every laptop, phone, and local `.manifest
 
 ## Decision
 
-1. **BIP-39 Checksum Validation & Memory-Hard `Argon2id` Stretching:** `MasterKey::from_recovery_seed_phrase` and `PqVaultMasterKey::from_recovery_seed_phrase` normalize mnemonics via Unicode NFKD, verify BIP-39 wordlist membership and SHA-256 checksum bits, and stretch entropy with **`Argon2id` (`m = 64 MiB [65,536 KiB], t = 3, p = 4`)** (`138.77–143.65 ms`) followed by domain-separated `HKDF-SHA256` / `HKDF-SHA512` to deterministically reconstruct `MasterKey`, `PqVaultMasterKey`, `NodeIdentity`, and `derive_vault_root_dht_key(vault_namespace)`.
+1. **BIP-39 Checksum Validation & Memory-Hard `Argon2id` Stretching:** `MasterKey::from_recovery_seed_phrase` and `PqVaultMasterKey::from_recovery_seed_phrase` normalize mnemonics via Unicode NFKD, verify BIP-39 wordlist membership and SHA-256 checksum bits, and stretch entropy with **`Argon2id` (`m = 64 MiB [65,536 KiB], t = 3, p = 4`)** (<!-- metric:argon2.derive -->`138.77–143.65 ms`<!-- /metric -->) followed by domain-separated `HKDF-SHA256` / `HKDF-SHA512` to deterministically reconstruct `MasterKey`, `PqVaultMasterKey`, `NodeIdentity`, and `derive_vault_root_dht_key(vault_namespace)`.
 2. **Dual-Sealed Root Superblock Catalog (`EncryptedVaultCatalogEnvelope`):** `FolderSyncEngine::export_encrypted_vault_catalog` seals `FolderSnapshotManifest` under both `MasterKey` and 512-bit cascaded `PqVaultMasterKey`, signed by the derived `NodeIdentity`, enabling `parvault recover-from-seed` to discover the highest-version catalog over `libp2p` and restore all files with **zero prior local state**.
 
 ## Consequences & Verification

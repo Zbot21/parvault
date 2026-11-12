@@ -21,8 +21,8 @@ info     = "parvault-hybrid-x25519-mlkem768-v2:" || pk_recip_x25519 || SHA-256(e
 K_hybrid = HKDF-SHA512(salt = salt, ikm = ikm, info = info)
 ```
 
-   Session encapsulation (`PqRelayedShardEnvelope`, `PqInnerStorageEnvelope`) remains IND-CCA2 secure unless *both* `X25519` and `ML-KEM-768` are simultaneously broken (`100.4–117.8 µs` encapsulate / `99.4–106.9 µs` decapsulate).
-2. **Composite Hybrid Digital Signatures (`HybridPqSigningKeypair`: `Ed25519 + NIST FIPS 204 ML-DSA-65`):** Long-lived `PersonalDeviceCert`s, `PqSignedDhtManifestEnvelope`s, and `GatewayIdentityStatement`s sign over both `Ed25519` (`64 B`) and `ML-DSA-65` (`3,309 B`, context `"parvault-pq-hybrid-dsa65-v1"`). Verification requires `Ed25519::verify` **AND** `ML-DSA-65::verify` to succeed (`475.6–477.3 µs` sign / `152.1–159.2 µs` verify).
+   Session encapsulation (`PqRelayedShardEnvelope`, `PqInnerStorageEnvelope`) remains IND-CCA2 secure unless *both* `X25519` and `ML-KEM-768` are simultaneously broken (<!-- metric:kem.encap -->`100.4–117.8 µs`<!-- /metric --> encapsulate / <!-- metric:kem.decap -->`99.4–106.9 µs`<!-- /metric --> decapsulate).
+2. **Composite Hybrid Digital Signatures (`HybridPqSigningKeypair`: `Ed25519 + NIST FIPS 204 ML-DSA-65`):** Long-lived `PersonalDeviceCert`s, `PqSignedDhtManifestEnvelope`s, and `GatewayIdentityStatement`s sign over both `Ed25519` (`64 B`) and `ML-DSA-65` (`3,309 B`, context `"parvault-pq-hybrid-dsa65-v1"`). Verification requires `Ed25519::verify` **AND** `ML-DSA-65::verify` to succeed (<!-- metric:sig.sign -->`475.6–477.3 µs`<!-- /metric --> sign / <!-- metric:sig.verify -->`152.1–159.2 µs`<!-- /metric --> verify).
 
 ## Consequences & Verification
 

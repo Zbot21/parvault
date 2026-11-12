@@ -1,6 +1,6 @@
 # Security Architecture, Cryptographic Proofs & Formal Verification (`SECURITY_AND_CRYPTOGRAPHY.md`)
 
-This document details the mathematical, cryptographic, game-theoretic, and formal-verification foundations of **`parvault`** (`parvault`, `parvault-seed`, `parvault-fuse`, and `parvault-sync`), covering the single-concern Architectural Decision Records [`ADR-01` through `ADR-33`](ADR.md) in [`docs/adr/`](adr/) and `v0.5.0` formal verification (`17` Kani Rust Bounded Model Checking symbolic harnesses + `7` TLA+ TLC specifications).
+This document details the mathematical, cryptographic, game-theoretic, and formal-verification foundations of **`parvault`** (`parvault`, `parvault-seed`, `parvault-fuse`, and `parvault-sync`), covering the single-concern Architectural Decision Records [`ADR-01` through `ADR-33`](ADR.md) in [`docs/adr/`](adr/) and `v0.5.0` formal verification (<!-- metric:kani_harnesses -->`17`<!-- /metric --> Kani Rust Bounded Model Checking symbolic harnesses + <!-- metric:tla_specs -->`7`<!-- /metric --> TLA+ TLC specifications).
 
 ---
 
@@ -11,7 +11,7 @@ This document details the mathematical, cryptographic, game-theoretic, and forma
 4. [Post-Quantum Hybrid Cryptography (`ADR-12` — Harvest-Now, Decrypt-Later Immunity)](#4-post-quantum-hybrid-cryptography-adr-12--harvest-now-decrypt-later-immunity)
 5. [Elastic Bootstrap, Earned Standing & Correlated Outage Survival (`ADR-13` – `ADR-15`)](#5-elastic-bootstrap-earned-standing--correlated-outage-survival-adr-13--adr-15)
 6. [Multi-Domain Red-Team Hardening Summary (`ADR-15` – `ADR-17`)](#6-multi-domain-red-team-hardening-summary-adr-15--adr-17)
-7. [Machine-Checked Formal Verification (`cargo kani` + `7` TLA+ Specs) & Test Suite Matrix](#7-machine-checked-formal-verification--test-suite-matrix)
+7. [Machine-Checked Formal Verification (`cargo kani` + <!-- metric:tla_specs -->`7`<!-- /metric --> TLA+ Specs) & Test Suite Matrix](#7-machine-checked-formal-verification--test-suite-matrix)
 8. [Live Multi-Container Docker P2P Regression Report](#8-live-multi-container-docker-p2p-regression-report-v020)
 9. [Empirical Cryptography, Reed-Solomon & Memory Telemetry (`parvault-bench`)](#9-empirical-cryptography-reed-solomon--memory-telemetry-parvault-bench)
 10. [Zero-IP Signed LAN Auto-Discovery & 4-Word SAS Pairing Cryptography (`ADR-18`)](#10-zero-ip-signed-lan-auto-discovery--4-word-sas-pairing-cryptography-adr-18)
@@ -97,7 +97,7 @@ To protect long-lived backup shards and P2P envelopes against **Harvest-Now, Dec
 | :--- | :--- | :--- | :--- | :--- |
 | **X-Wing Style Hybrid KEM (`HybridKemKeypair`)** | **X25519** ECDH (`32 B` public key) | **ML-KEM-768** (`NIST FIPS 203`, Module-LWE, `1,184 B` ek, `1,088 B` ct) | `K_hybrid = HKDF-SHA512(salt = pk_ephem \|\| SHA256(ct_PQ), ikm = ss_X25519 \|\| ss_PQ, info = "parvault-hybrid-x25519-mlkem768-v2:" \|\| pk_recip \|\| SHA256(ek_recip))` | **Shor's Algorithm** on ECDLP & multi-target PK substitution (`A2`, `B10`); session key remains IND-CCA2 secure unless *both* X25519 and ML-KEM-768 are broken |
 | **Hybrid Digital Signatures (`HybridPqSigningKeypair`)** | **Ed25519** (`32 B` vk, `64 B` sig) | **ML-DSA-65** (`NIST FIPS 204`, Module-LWE/SIS, `1,952 B` vk, `3,309 B` sig) | Composite dual verification (`Ed25519::verify` $\wedge$ `ML-DSA-65::verify` over `ML_DSA_65_CONTEXT`) | **Shor's Algorithm** signature forgery on `PersonalDeviceCert`s, `PqSignedDhtManifestEnvelope`s, and `GatewayIdentityStatement`s |
-| **Standard Streaming Stripe AEAD (`MasterKey`)** | **AES-256-GCM** (`256-bit` HKDF subkeys) | **NIST Category 5 Grover Floor (`128-bit PQ`)** | Single-pass `AES-256-GCM` (`encrypt_stripe` / `encrypt_manifest`) | **Grover's Algorithm** quadratic bound ($\mathcal{O}(2^{n/2})$) leaves full `128-bit` post-quantum security at `496.5–589.2 MiB/s` |
+| **Standard Streaming Stripe AEAD (`MasterKey`)** | **AES-256-GCM** (`256-bit` HKDF subkeys) | **NIST Category 5 Grover Floor (`128-bit PQ`)** | Single-pass `AES-256-GCM` (`encrypt_stripe` / `encrypt_manifest`) | **Grover's Algorithm** quadratic bound ($\mathcal{O}(2^{n/2})$) leaves full `128-bit` post-quantum security at <!-- metric:aes.enc.span -->`496.5–589.2 MiB/s`<!-- /metric --> |
 | **Dual-Cipher Cascaded Vault Encryption (`PqVaultMasterKey`)** | **AES-256-GCM** (`256-bit` inner) + **ChaCha20-Poly1305** (`256-bit` outer) | **NIST Category 5 Grover Floor (`128-bit PQ`)** + **Cipher Diversity** | Cascaded dual-cipher AEAD encryption (inner `AES-256-GCM` pass under $K_1$, outer `ChaCha20-Poly1305` pass under $K_2$) with independent HKDF nonces | **Grover's Algorithm** (`128-bit` PQ security floor) + **Algebraic Cipher Diversity** (`B8`: SPN/$GF(2^{128})$ + ARX/$2^{130}-5$; secure unless *both* ciphers break) |
 | **2-Layer Post-Quantum Onion Envelopes (`PqRelayedShardEnvelope`)** | **X25519** ephemeral ECDH (2 hops) | **ML-KEM-768** (`1,088 B` ct per hop) + `AES-256-GCM` | Outer relay layer + inner storage layer (`PqInnerStorageEnvelope`) each sealed under recipient's `HybridKemPublicKey` | Prevents HNDL quantum decryption of relay hops, capabilities, vouchers, and telemetry beacons even over classical `libp2p` `Noise XX` TCP sessions |
 
@@ -164,9 +164,9 @@ To protect long-lived backup shards and P2P envelopes against **Harvest-Now, Dec
 bash scripts/verify_formal_proofs.sh
 ```
 
-### 7.2 Kani Rust Bounded Model Checking Matrix (`17` Symbolic Harnesses)
+### 7.2 Kani Rust Bounded Model Checking Matrix (<!-- metric:kani_harnesses -->`17`<!-- /metric --> Symbolic Harnesses)
 
-All 17 harnesses exercise real production code with symbolic `kani::any()` inputs (`cargo kani` $\to$ `VERIFICATION:- SUCCESSFUL`). Non-vacuity is independently verified by mutating the quorum assertion (`tally < min_quorum` $\to$ `tally + 1 < min_quorum`) in `proof_eviction_quorum_sub_threshold_and_duplicate_signer_rejected` and confirming CBMC emits a concrete counterexample (`VERIFICATION:- FAILED`) before restoring the invariant.
+All <!-- metric:kani_harnesses -->17<!-- /metric --> harnesses exercise real production code with symbolic `kani::any()` inputs (`cargo kani` $\to$ `VERIFICATION:- SUCCESSFUL`). Non-vacuity is independently verified by mutating the quorum assertion (`tally < min_quorum` $\to$ `tally + 1 < min_quorum`) in `proof_eviction_quorum_sub_threshold_and_duplicate_signer_rejected` and confirming CBMC emits a concrete counterexample (`VERIFICATION:- FAILED`) before restoring the invariant.
 
 | Kani Proof Harness | Target Production Module / Function | Symbolic Property Verified (`kani::any()`) | CBMC Result |
 | :--- | :--- | :--- | :---: |
@@ -188,9 +188,9 @@ All 17 harnesses exercise real production code with symbolic `kani::any()` input
 | `crypto::aes::kani_proofs::proof_stripe_nonce_injectivity_and_no_panic` | `crypto::aes::{format_stripe_nonce_info, format_stripe_aad, derive_stripe_nonce_with}` | Bijective `stripe_index` domain encoding across all `0..=u64::MAX` in both HKDF `info` (`30 B`) and AES-GCM `aad` (`24 B`), zero panics or slice overflows | **`SUCCESSFUL`** |
 | `sharding::reed_solomon::kani_proofs::proof_gf256_field_axioms_and_shard_bounds` | `reed_solomon_erasure::galois_8::Field::{add, mul}` & `sharding::reed_solomon::compute_reed_solomon_shard_len` | Bit-precise $GF(2^8)$ polynomial `0x11d` additive self-inverse, commutativity, associativity, multiplicative absorbing zero, and multiplicative identity across all symbolic bytes `(a, b, c)`, plus tight Reed-Solomon shard ceiling bounds across all 4 SLA tiers | **`SUCCESSFUL`** |
 
-### 7.3 TLA+ Protocol Specifications (`7` Exhaustive Specs) & Integration Matrix
+### 7.3 TLA+ Protocol Specifications (<!-- metric:tla_specs -->`7`<!-- /metric --> Exhaustive Specs) & Integration Matrix
 
-Every invariant of `parvault` is model-checked and tested across **7 TLA+ TLC protocol specifications** (`specs/*.tla`) and **automated Rust unit, integration, mathematical-proof, Stateright, zero-copy UDS IPC, lazy VFS, live `libp2p` TCP, and Red-Team test suites** (`tests/*.rs` + `src/`):
+Every invariant of `parvault` is model-checked and tested across **<!-- metric:tla_specs -->7<!-- /metric --> TLA+ TLC protocol specifications** (`specs/*.tla`) and **automated Rust unit, integration, mathematical-proof, Stateright, zero-copy UDS IPC, lazy VFS, live `libp2p` TCP, and Red-Team test suites** (`tests/*.rs` + `src/`):
 
 | Verification Suite | Artifact / Location | Method & Scope | Verified Result |
 | :--- | :--- | :--- | :---: |
@@ -203,13 +203,13 @@ Every invariant of `parvault` is model-checked and tested across **7 TLA+ TLC pr
 | **TLA+ Zero-Key `admin_rpc` & `M-of-N` Federated Council Quorum (`ADR-19`)** | [`specs/ParVaultZeroKeyAdminAndQuorum.tla`](../specs/ParVaultZeroKeyAdminAndQuorum.tla)<br>[`specs/ParVaultZeroKeyAdminAndQuorum.cfg`](../specs/ParVaultZeroKeyAdminAndQuorum.cfg) | Exhaustive TLC model checking (`2,325` states generated, `480` distinct states, depth `14`) of zero-private-key-on-VPS `admin_rpc` seed governance, air-gapped hardware signing, $M$-of-$N$ ($2$-of-$3$) council co-signing, full VPS root/disk compromise (`vpsCompromised = TRUE`), duplicate-signer replay, stale-timestamp/nonce replay, and $M - 1$ Byzantine councilors | **0 Errors** (`Safety_ZeroPrivateKeyOnSeedDisk`, `Safety_NoSubQuorumEviction`, `Safety_NoAdminRpcReplay`, `Safety_PrivateRingImmuneToTrackerCouncil`, `Liveness_HonestQuorumExecutesEviction`) |
 | **Zero-Copy `100 MiB` `memfd` UDS Gateway, `< 1 ms` Macaroons & `--no-fs` Seed Gate** | [`tests/gateway_ipc_benchmark.rs`](../tests/gateway_ipc_benchmark.rs) | `100 MiB` `memfd_create` + `SCM_RIGHTS` UDS streaming round-trip (`VmRSS` delta `< 16 MiB`), sub-millisecond RAM `CapabilityMacaroon` enforcement, and `parvault-seed --no-fs --in-memory-mb` zero-disk + `0x00` RAM-wipe verification | **100% PASS** |
 | **Lazy-Streaming `10 GiB` Sparse VFS, Dual-Mode `GatewayBus` & Zero-Key `GatewayFolderSync` Gate** | [`tests/vfs_lazy_stream.rs`](../tests/vfs_lazy_stream.rs)<br>[`tests/gateway_bus_and_plugin_security.rs`](../tests/gateway_bus_and_plugin_security.rs)<br>[`tests/m3_dual_mode_vfs_and_gateway_sync.rs`](../tests/m3_dual_mode_vfs_and_gateway_sync.rs) | `10 GiB` (`10,240` stripes) virtual vault stub mount (`TTFB < 50 ms`), `InProcess` (`--no-socket`) vs `UnixSocket` parity, `SO_PEERCRED` + `F_ADD_SEALS` enforcement, live `spawn_webdav_server` HTTP `206` Range streaming, zero-key `GatewayFolderSync` incremental delta/tombstone/`--filter` restore, and tampered catalog `../escape` rejection | **100% PASS** |
-| **Stateright Async Actor Model & Exhaustive $GF(2^8)^3$ Field Axioms** | [`tests/formal_verification.rs`](../tests/formal_verification.rs)<br>[`tests/tla_formal_proofs_integration.rs`](../tests/tla_formal_proofs_integration.rs) | Stateright BFS model checking of non-vacuous Sybil/slashing state machine + exhaustive verification of all $256^3 = 16,777,216$ triples $(a, b, c) \in GF(2^8)^3$ + automated TLC runner for all 7 `.tla` specs | **0 Invariant Violations**; **16,777,216 / 16,777,216 field triples verified** |
+| **Stateright Async Actor Model & Exhaustive $GF(2^8)^3$ Field Axioms** | [`tests/formal_verification.rs`](../tests/formal_verification.rs)<br>[`tests/tla_formal_proofs_integration.rs`](../tests/tla_formal_proofs_integration.rs) | Stateright BFS model checking of non-vacuous Sybil/slashing state machine + exhaustive verification of all $256^3 = 16,777,216$ triples $(a, b, c) \in GF(2^8)^3$ + automated TLC runner for all <!-- metric:tla_specs -->7<!-- /metric --> `.tla` specs | **0 Invariant Violations**; **16,777,216 / 16,777,216 field triples verified** |
 | **Empirical Ciphertext Sanity & Non-Degeneracy Checks (`D3`) & Dynamic Trust Proofs** | [`tests/confidentiality_and_trust_proofs.rs`](../tests/confidentiality_and_trust_proofs.rs) | Empirical byte-level Shannon entropy $H(X) = -\sum p_i \log_2 p_i$ and Strict Avalanche Criterion (SAC) bit-flip sanity checks verifying absence of unencrypted header/padding leakage, plus dynamic trust subnet cap enforcement | **Shannon Entropy** `> 7.98 bits/byte`; **SAC $\approx 50.0\%$ bit-flip ratio** |
 | **Byzantine Quarantine, Multi-Stratum PoR & Egress Slashing (`ADR-09`)** | [`tests/zero_trust_adversarial.rs`](../tests/zero_trust_adversarial.rs) | Pre-decoding Merkle quarantine of poisoned shards, 8-stratum scatter-gather PoR + RTT ceiling, monotonic DHT envelopes, and egress-withholding credit burn | **All Byzantine & selfish attacks defeated** |
 | **4-Layer Anonymity & 8-Profile Degraded Network Recovery (`ADR-11`)** | [`tests/anonymity_and_degraded_net_tests.rs`](../tests/anonymity_and_degraded_net_tests.rs) | Verification of `> 224-bit` combinatorial locator wall, per-shard capabilities, voucher nullifiers, 1-hop onion routing, and hedged $K$-of-$N$ recovery across 8 degraded profiles | **100% PASS (`0 bytes` lost across all 8 profiles)** |
 | **Post-Quantum Hybrid Cryptography Proofs (`ADR-12`)** | [`tests/post_quantum_security_proofs.rs`](../tests/post_quantum_security_proofs.rs) | NIST FIPS 203 `ML-KEM-768` + `X25519` Shor resilience, FIPS 204 `ML-DSA-65` + `Ed25519` unforgeability, and 512-bit `PqVaultMasterKey` (`AES-256-GCM` + `ChaCha20-Poly1305`) Grover resistance | **100% PASS** |
 | **Elastic Bootstrap, Seed Server, Lite-Client & Anonymous Telemetry (`ADR-13`–`ADR-17`)** | [`tests/bootstrap_and_earned_tier_tests.rs`](../tests/bootstrap_and_earned_tier_tests.rs)<br>[`tests/seed_server_integration.rs`](../tests/seed_server_integration.rs)<br>[`tests/sync_daemon_usability_and_cli_regression_tests.rs`](../tests/sync_daemon_usability_and_cli_regression_tests.rs)<br>[`tests/anonymous_telemetry_tests.rs`](../tests/anonymous_telemetry_tests.rs) | Day-1 Personal Ring, Foundation Seed Anchor auto-drain, zero-knowledge elastic re-sharding, `ZeroTrustSeedServer`, Lite-Client `1.0x` syndication & NAS-death failover, and rotating-nullifier census beacons | **100% PASS** |
-| **5-Domain Red-Team Suite (`ADR-15`) & Live `libp2p` TCP Multi-Daemon Regression (`ADR-16`–`ADR-17`)** | [`tests/red_team_hardening_tests.rs`](../tests/red_team_hardening_tests.rs)<br>[`tests/sync_daemon_usability_and_cli_regression_tests.rs`](../tests/sync_daemon_usability_and_cli_regression_tests.rs)<br>[`tests/phase1_to_4_integration.rs`](../tests/phase1_to_4_integration.rs) | House-fire seed recovery, capability pinning, NTP skew, generation-scoped tombstones, `with_limit` OOM defense, Hashcash PoW + IQR trimming, path-traversal blocking, and live `libp2p` TCP multi-daemon sync/prune/recovery | **100% PASS (133 / 133 total tests)** |
+| **5-Domain Red-Team Suite (`ADR-15`) & Live `libp2p` TCP Multi-Daemon Regression (`ADR-16`–`ADR-17`)** | [`tests/red_team_hardening_tests.rs`](../tests/red_team_hardening_tests.rs)<br>[`tests/sync_daemon_usability_and_cli_regression_tests.rs`](../tests/sync_daemon_usability_and_cli_regression_tests.rs)<br>[`tests/phase1_to_4_integration.rs`](../tests/phase1_to_4_integration.rs) | House-fire seed recovery, capability pinning, NTP skew, generation-scoped tombstones, `with_limit` OOM defense, Hashcash PoW + IQR trimming, path-traversal blocking, and live `libp2p` TCP multi-daemon sync/prune/recovery | **100% PASS (<!-- metric:tests_pass -->133 / 133<!-- /metric --> total tests)** |
 
 ---
 
@@ -241,52 +241,52 @@ Measured directly on WSL2 Linux (`x86_64`) via `cargo run --release --bin parvau
 #### Comparative Overview
 | Profile | Stripe Size | Stripes | Baseline RSS | Peak VmHWM | SoC < 32 MiB Gate | Store Speed | Restore Speed |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Router-SoC** | `1 MiB` | `64` | `4.15–4.16 MiB` | **`9.72–9.74 MiB`** (`9,956–9,972 KiB`) | **PASS (< 32 MiB)** | **`75.9–82.1 MiB/s`** | **`127.1–127.4 MiB/s`** |
-| **Desktop / Homelab-NAS** | `16 MiB` | `4` | `9.80 MiB` | **`57.91 MiB`** (`59,296 KiB`) | Desktop Target | **`121.7 MiB/s`** | **`117.3 MiB/s`** |
+| **Router-SoC** | `1 MiB` | `64` | <!-- metric:bench.soc.baseline_rss -->`4.15–4.16 MiB`<!-- /metric --> | **<!-- metric:bench.soc.vmhwm -->`9.72–9.74 MiB`<!-- /metric -->** (<!-- metric:bench.soc.vmhwm_kib -->`9,956–9,972 KiB`<!-- /metric -->) | **PASS (< 32 MiB)** | **<!-- metric:bench.soc.store -->`75.9–82.1 MiB/s`<!-- /metric -->** | **<!-- metric:bench.soc.restore -->`127.1–127.4 MiB/s`<!-- /metric -->** |
+| **Desktop / Homelab-NAS** | `16 MiB` | `4` | <!-- metric:bench.desktop.baseline_rss -->`9.80 MiB`<!-- /metric --> | **<!-- metric:bench.desktop.vmhwm -->`57.91 MiB`<!-- /metric -->** (<!-- metric:bench.desktop.vmhwm_kib -->`59,296 KiB`<!-- /metric -->) | Desktop Target | **<!-- metric:bench.desktop.store -->`121.7 MiB/s`<!-- /metric -->** | **<!-- metric:bench.desktop.restore -->`117.3 MiB/s`<!-- /metric -->** |
 
 #### Checkpoint Breakdown: Router-SoC (`1 MiB` Stripes)
 | Measurement Checkpoint | `VmRSS` (Resident) | `VmHWM` (Peak) | Throughput |
 | :--- | :---: | :---: | :---: |
-| **Process Baseline (Startup)** | `4.15 MiB` (`4,248 KiB`) | `4.15 MiB` (`4,248 KiB`) | — |
-| **After `64 MiB` Chunked Setup** | `4.28 MiB` (`4,384 KiB`) | `4.28 MiB` (`4,384 KiB`) | — |
-| **After `store_file_streaming` (`64 x 1 MiB`, `16-of-20`)** | `9.72 MiB` (`9,956 KiB`) | **`9.72 MiB`** (`9,956 KiB`) | **`75.9–82.1 MiB/s`** |
-| **After `restore_file_streaming` + SHA-256 Verify** | `9.74 MiB` (`9,972 KiB`) | `9.74 MiB` (`9,972 KiB`) | **`127.1–127.4 MiB/s`** |
+| **Process Baseline (Startup)** | <!-- metric:bench.soc.baseline_rss_min -->`4.15 MiB`<!-- /metric --> (<!-- metric:bench.soc.baseline_rss_kib -->`4,248 KiB`<!-- /metric -->) | <!-- metric:bench.soc.baseline_rss_min -->`4.15 MiB`<!-- /metric --> (<!-- metric:bench.soc.baseline_rss_kib -->`4,248 KiB`<!-- /metric -->) | — |
+| **After `64 MiB` Chunked Setup** | <!-- metric:bench.soc.setup_rss -->`4.28 MiB`<!-- /metric --> (<!-- metric:bench.soc.setup_rss_kib -->`4,384 KiB`<!-- /metric -->) | <!-- metric:bench.soc.setup_rss -->`4.28 MiB`<!-- /metric --> (<!-- metric:bench.soc.setup_rss_kib -->`4,384 KiB`<!-- /metric -->) | — |
+| **After `store_file_streaming` (`64 x 1 MiB`, `16-of-20`)** | <!-- metric:bench.soc.vmrss_store -->`9.72 MiB`<!-- /metric --> (<!-- metric:bench.soc.vmrss_store_kib -->`9,956 KiB`<!-- /metric -->) | **<!-- metric:bench.soc.vmhwm_store -->`9.72 MiB`<!-- /metric -->** (<!-- metric:bench.soc.vmhwm_store_kib -->`9,956 KiB`<!-- /metric -->) | **<!-- metric:bench.soc.store -->`75.9–82.1 MiB/s`<!-- /metric -->** |
+| **After `restore_file_streaming` + SHA-256 Verify** | <!-- metric:bench.soc.vmrss_restore -->`9.74 MiB`<!-- /metric --> (<!-- metric:bench.soc.vmrss_restore_kib -->`9,972 KiB`<!-- /metric -->) | <!-- metric:bench.soc.vmhwm_restore -->`9.74 MiB`<!-- /metric --> (<!-- metric:bench.soc.vmhwm_restore_kib -->`9,972 KiB`<!-- /metric -->) | **<!-- metric:bench.soc.restore -->`127.1–127.4 MiB/s`<!-- /metric -->** |
 
 #### Checkpoint Breakdown: Desktop / Homelab-NAS (`16 MiB` Stripes)
 | Measurement Checkpoint | `VmRSS` (Resident) | `VmHWM` (Peak) | Throughput |
 | :--- | :---: | :---: | :---: |
-| **Process Baseline (Startup)** | `9.80 MiB` (`10,040 KiB`) | `9.80 MiB` (`10,040 KiB`) | — |
-| **After `64 MiB` Chunked Setup** | `9.80 MiB` (`10,040 KiB`) | `9.80 MiB` (`10,040 KiB`) | — |
-| **After `store_file_streaming` (`4 x 16 MiB`, `16-of-20`)** | `25.26 MiB` (`25,864 KiB`) | **`57.91 MiB`** (`59,296 KiB`) | **`121.7 MiB/s`** |
-| **After `restore_file_streaming` + SHA-256 Verify** | `9.26 MiB` (`9,480 KiB`) | `57.91 MiB` (`59,296 KiB`) | **`117.3 MiB/s`** |
+| **Process Baseline (Startup)** | <!-- metric:bench.desktop.baseline_rss -->`9.80 MiB`<!-- /metric --> (<!-- metric:bench.desktop.baseline_rss_kib -->`10,040 KiB`<!-- /metric -->) | <!-- metric:bench.desktop.baseline_rss -->`9.80 MiB`<!-- /metric --> (<!-- metric:bench.desktop.baseline_rss_kib -->`10,040 KiB`<!-- /metric -->) | — |
+| **After `64 MiB` Chunked Setup** | <!-- metric:bench.desktop.setup_rss -->`9.80 MiB`<!-- /metric --> (<!-- metric:bench.desktop.setup_rss_kib -->`10,040 KiB`<!-- /metric -->) | <!-- metric:bench.desktop.setup_rss -->`9.80 MiB`<!-- /metric --> (<!-- metric:bench.desktop.setup_rss_kib -->`10,040 KiB`<!-- /metric -->) | — |
+| **After `store_file_streaming` (`4 x 16 MiB`, `16-of-20`)** | <!-- metric:bench.desktop.vmrss_store -->`25.26 MiB`<!-- /metric --> (<!-- metric:bench.desktop.vmrss_store_kib -->`25,864 KiB`<!-- /metric -->) | **<!-- metric:bench.desktop.vmhwm -->`57.91 MiB`<!-- /metric -->** (<!-- metric:bench.desktop.vmhwm_kib -->`59,296 KiB`<!-- /metric -->) | **<!-- metric:bench.desktop.store -->`121.7 MiB/s`<!-- /metric -->** |
+| **After `restore_file_streaming` + SHA-256 Verify** | <!-- metric:bench.desktop.vmrss_restore -->`9.26 MiB`<!-- /metric --> (<!-- metric:bench.desktop.vmrss_restore_kib -->`9,480 KiB`<!-- /metric -->) | <!-- metric:bench.desktop.vmhwm -->`57.91 MiB`<!-- /metric --> (<!-- metric:bench.desktop.vmhwm_kib -->`59,296 KiB`<!-- /metric -->) | **<!-- metric:bench.desktop.restore -->`117.3 MiB/s`<!-- /metric -->** |
 
 ### 9.2 Cryptographic & Reed-Solomon Primitive Benchmarks (Empirical Wall-Clock)
 | Subsystem / Operation | Parameters / Construction | Measured Throughput / Latency |
 | :--- | :--- | :---: |
-| **`Argon2id` + `HKDF-SHA256` Seed Derivation** | `m = 64 MiB (65,536 KiB), t = 3, p = 4` (BIP-39 12-word) | **`138.77–143.65 ms`** |
-| **`AES-256-GCM` Stripe Encryption (Router-SoC)** | `1 MiB` stripe + HKDF per-purpose subkey/nonce | **`583.9–589.2 MiB/s`** |
-| **`AES-256-GCM` Stripe Decryption (Router-SoC)** | `1 MiB` stripe + tag verification | **`559.5–610.3 MiB/s`** |
-| **`AES-256-GCM` Stripe Encryption (Desktop)** | `16 MiB` stripe + HKDF per-purpose subkey/nonce | **`496.5–497.0 MiB/s`** |
-| **`AES-256-GCM` Stripe Decryption (Desktop)** | `16 MiB` stripe + tag verification | **`488.7–497.9 MiB/s`** |
-| **`PqVaultMasterKey` Dual-Cipher Encryption** | `16 MiB` (`AES-256-GCM` inner + `ChaCha20-Poly1305` outer) | **`248.4–261.4 MiB/s`** |
-| **`PqVaultMasterKey` Dual-Cipher Decryption** | `16 MiB` (`ChaCha20-Poly1305` outer + `AES-256-GCM` inner) | **`256.8–258.1 MiB/s`** |
-| **`HybridKemKeypair::encapsulate` (X-Wing)** | `X25519 + NIST FIPS 203 ML-KEM-768` (`HKDF-SHA512`) | **`100.4–117.8 us`** |
-| **`HybridKemKeypair::decapsulate` (X-Wing)** | `X25519 + NIST FIPS 203 ML-KEM-768` (`HKDF-SHA512`) | **`99.4–106.9 us`** |
-| **`HybridPqSigningKeypair::sign`** | `Ed25519 + NIST FIPS 204 ML-DSA-65` | **`475.6–477.3 us`** |
-| **`HybridPqSigningKeypair::verify`** | `Ed25519 + NIST FIPS 204 ML-DSA-65` | **`152.1–159.2 us`** |
-| **Reed-Solomon $GF(2^8)$ Encode (`Router-SoC 16-of-20`)** | `1 MiB` stripe $\to$ `20 x 64 KiB` shards + Merkle tree | **`304.8–334.6 MiB/s`** |
-| **Reed-Solomon $GF(2^8)$ Reconstruct (`Router-SoC 16-of-20`)** | 4 erasures + pre-decoding Merkle quarantine | **`145.2–145.3 MiB/s`** |
-| **Reed-Solomon $GF(2^8)$ Encode (`Consumer 10-of-20`)** | `16 MiB` stripe $\to$ `20 x 1.6 MiB` shards + Merkle tree | **`158.1–159.3 MiB/s`** |
-| **Reed-Solomon $GF(2^8)$ Reconstruct (`Consumer 10-of-20`)** | 4 erasures + pre-decoding Merkle quarantine | **`90.4–95.4 MiB/s`** |
-| **Reed-Solomon $GF(2^8)$ Encode (`Homelab 16-of-20`)** | `16 MiB` stripe $\to$ `20 x 1.0 MiB` shards + Merkle tree | **`286.3–301.3 MiB/s`** |
-| **Reed-Solomon $GF(2^8)$ Reconstruct (`Homelab 16-of-20`)** | 4 erasures + pre-decoding Merkle quarantine | **`142.2–143.4 MiB/s`** |
+| **`Argon2id` + `HKDF-SHA256` Seed Derivation** | `m = 64 MiB (65,536 KiB), t = 3, p = 4` (BIP-39 12-word) | **<!-- metric:argon2.derive -->`138.77–143.65 ms`<!-- /metric -->** |
+| **`AES-256-GCM` Stripe Encryption (Router-SoC)** | `1 MiB` stripe + HKDF per-purpose subkey/nonce | **<!-- metric:aes.enc.soc -->`583.9–589.2 MiB/s`<!-- /metric -->** |
+| **`AES-256-GCM` Stripe Decryption (Router-SoC)** | `1 MiB` stripe + tag verification | **<!-- metric:aes.dec.soc -->`559.5–610.3 MiB/s`<!-- /metric -->** |
+| **`AES-256-GCM` Stripe Encryption (Desktop)** | `16 MiB` stripe + HKDF per-purpose subkey/nonce | **<!-- metric:aes.enc.desktop -->`496.5–497.0 MiB/s`<!-- /metric -->** |
+| **`AES-256-GCM` Stripe Decryption (Desktop)** | `16 MiB` stripe + tag verification | **<!-- metric:aes.dec.desktop -->`488.7–497.9 MiB/s`<!-- /metric -->** |
+| **`PqVaultMasterKey` Dual-Cipher Encryption** | `16 MiB` (`AES-256-GCM` inner + `ChaCha20-Poly1305` outer) | **<!-- metric:pq.enc -->`248.4–261.4 MiB/s`<!-- /metric -->** |
+| **`PqVaultMasterKey` Dual-Cipher Decryption** | `16 MiB` (`ChaCha20-Poly1305` outer + `AES-256-GCM` inner) | **<!-- metric:pq.dec -->`256.8–258.1 MiB/s`<!-- /metric -->** |
+| **`HybridKemKeypair::encapsulate` (X-Wing)** | `X25519 + NIST FIPS 203 ML-KEM-768` (`HKDF-SHA512`) | **<!-- metric:kem.encap -->`100.4–117.8 µs`<!-- /metric -->** |
+| **`HybridKemKeypair::decapsulate` (X-Wing)** | `X25519 + NIST FIPS 203 ML-KEM-768` (`HKDF-SHA512`) | **<!-- metric:kem.decap -->`99.4–106.9 µs`<!-- /metric -->** |
+| **`HybridPqSigningKeypair::sign`** | `Ed25519 + NIST FIPS 204 ML-DSA-65` | **<!-- metric:sig.sign -->`475.6–477.3 µs`<!-- /metric -->** |
+| **`HybridPqSigningKeypair::verify`** | `Ed25519 + NIST FIPS 204 ML-DSA-65` | **<!-- metric:sig.verify -->`152.1–159.2 µs`<!-- /metric -->** |
+| **Reed-Solomon $GF(2^8)$ Encode (`Router-SoC 16-of-20`)** | `1 MiB` stripe $\to$ `20 x 64 KiB` shards + Merkle tree | **<!-- metric:rs.soc.encode -->`304.8–334.6 MiB/s`<!-- /metric -->** |
+| **Reed-Solomon $GF(2^8)$ Reconstruct (`Router-SoC 16-of-20`)** | 4 erasures + pre-decoding Merkle quarantine | **<!-- metric:rs.soc.reconstruct -->`145.2–145.3 MiB/s`<!-- /metric -->** |
+| **Reed-Solomon $GF(2^8)$ Encode (`Consumer 10-of-20`)** | `16 MiB` stripe $\to$ `20 x 1.6 MiB` shards + Merkle tree | **<!-- metric:rs.consumer.encode -->`158.1–159.3 MiB/s`<!-- /metric -->** |
+| **Reed-Solomon $GF(2^8)$ Reconstruct (`Consumer 10-of-20`)** | 4 erasures + pre-decoding Merkle quarantine | **<!-- metric:rs.consumer.reconstruct -->`90.4–95.4 MiB/s`<!-- /metric -->** |
+| **Reed-Solomon $GF(2^8)$ Encode (`Homelab 16-of-20`)** | `16 MiB` stripe $\to$ `20 x 1.0 MiB` shards + Merkle tree | **<!-- metric:rs.homelab.encode -->`286.3–301.3 MiB/s`<!-- /metric -->** |
+| **Reed-Solomon $GF(2^8)$ Reconstruct (`Homelab 16-of-20`)** | 4 erasures + pre-decoding Merkle quarantine | **<!-- metric:rs.homelab.reconstruct -->`142.2–143.4 MiB/s`<!-- /metric -->** |
 
 ### 9.3 Hardware Profile Comparison: Desktop (`16 MiB`) vs. Router-SoC (`1 MiB`)
 | Hardware Profile | Stripe Size | Transient Peak `VmHWM` | Active `VmRSS` | Target Device Class | Safe cgroup RAM Limit |
 | :--- | :---: | :---: | :---: | :--- | :---: |
-| **`--profile desktop`** | `16 MiB` (`16,777,216 B`) | `57.91 MiB` | `9.26 MiB` | Workstations, Gaming PCs, High-RAM Servers | $\ge 128\text{ MiB}$ |
-| **`--profile homelab-nas`** | `4 MiB` (`4,194,304 B`) | `22.40 MiB` | `5.72 MiB` | Homelab NAS, Raspberry Pi 4/5, Unraid | $\ge 64\text{ MiB}$ |
-| **`--profile router-soc`** | `1 MiB` (`1,048,576 B`) | **`9.72–9.74 MiB`** | **`9.72 MiB`** | OpenWrt / prplOS Routers, Filogic, NanoPi | **`32 – 48 MiB`** |
+| **`--profile desktop`** | `16 MiB` (`16,777,216 B`) | <!-- metric:bench.desktop.vmhwm -->`57.91 MiB`<!-- /metric --> | <!-- metric:bench.desktop.vmrss_restore -->`9.26 MiB`<!-- /metric --> | Workstations, Gaming PCs, High-RAM Servers | $\ge 128\text{ MiB}$ |
+| **`--profile homelab-nas`** | `4 MiB` (`4,194,304 B`) | <!-- metric:bench.homelab.vmhwm -->`22.40 MiB`<!-- /metric --> | <!-- metric:bench.homelab.vmrss -->`5.72 MiB`<!-- /metric --> | Homelab NAS, Raspberry Pi 4/5, Unraid | $\ge 64\text{ MiB}$ |
+| **`--profile router-soc`** | `1 MiB` (`1,048,576 B`) | **<!-- metric:bench.soc.vmhwm -->`9.72–9.74 MiB`<!-- /metric -->** | **<!-- metric:bench.soc.vmrss_store -->`9.72 MiB`<!-- /metric -->** | OpenWrt / prplOS Routers, Filogic, NanoPi | **`32 – 48 MiB`** |
 
 ---
 
@@ -427,7 +427,7 @@ ValidSigners(Order) = ({issuer_pubkey} union {cosigner_k}) intersect TrustedCoun
    - Out-of-process plugins (`parvault-fuse`, zero-key `parvault-sync`, `parvault-suite` daemons) communicate with `parvault up --ipc-socket /var/run/parvault.sock` (`0600` POSIX permissions) via `GatewayBus::UnixSocket` using length-bounded `bincode` control headers (`MAX_IPC_FRAME_BYTES = 16 MiB`) paired with Linux `memfd_create` file descriptors passed via `sendmsg` / `recvmsg` `SCM_RIGHTS`, while built-in `=y` callers (`parvault up --no-socket --vfs-webdav-listen ...`) share the same `Arc<GatewayEngine>` over `GatewayBus::InProcess` (`0` `.sock` files on disk).
    - `GatewayFolderSync` (`parvault-sync`) holds **zero** `MasterKey` and **zero** `NodeIdentity` secrets in process memory or `GatewayFolderCatalog` state, validating every relative restore path through `sanitize_sync_relative_path` (Kani-verified `proof_sanitize_sync_relative_path_no_traversal`) and verifying end-to-end streaming `SHA-256` digests before atomic placement.
    - With `--require-sealed-memfd`, `StorePayload` verifies `F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW` (`fcntl(F_GET_SEALS)`) before hashing or encrypting a single byte, defeating shared-memory TOCTOU races. With `--strict-plugins --allow-peer-uid <UID>`, `GatewayIpcServer` inspects kernel `getsockopt(SO_PEERCRED)` at `accept()` time and drops unauthorized OS UIDs before deserializing any frame.
-   - `StorePayload`, `FetchPayload`, and `FetchRange` stream through fixed `1 MiB` (`RouterSoc`) stripes directly over the shared kernel `shmem` descriptor backed by a `40`-lane (`128 KiB`-stack) single-wave shard worker pool and `PinnedRingBudget<SLOTS>` — keeping gateway peak `VmHWM` at `10.98 MiB` (`< 16 MiB`) even while streaming `64–100+ MiB` payloads.
+   - `StorePayload`, `FetchPayload`, and `FetchRange` stream through fixed `1 MiB` (`RouterSoc`) stripes directly over the shared kernel `shmem` descriptor backed by a `40`-lane (`128 KiB`-stack) single-wave shard worker pool and `PinnedRingBudget<SLOTS>` — keeping gateway peak `VmHWM` at <!-- metric:gw.ipc.gateway_vmhwm -->`10.98 MiB`<!-- /metric --> (`< 16 MiB`) even while streaming `64–100+ MiB` payloads.
 2. **Stateless HMAC-Chained `CapabilityMacaroon` Attenuation (`src/capabilities.rs`, `parvault token`, [`ADR-28`](adr/ADR-28-stateless-macaroon-capability-attenuation.md), [`ADR-32`](adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md)):**
    - Root capability tokens (`PARVAULT-MAC-V1:`) and offline caveat attenuations (`AllowedManifest`, `ByteRange { offset, length }`, `ExpiresAtUnixMs`, `ReadOnly`, `AllowedPeerUid(u32)`) chain via domain-separated `HMAC-SHA256` (rejecting all-zero root keys):
 

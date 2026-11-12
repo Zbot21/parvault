@@ -1,0 +1,161 @@
+# docs/metrics.txt: single source for every number in the Markdown docs that
+# can go stale. Docs mark them as <!-- metric:KEY -->VALUE<!-- /metric -->.
+# Sync: bash scripts/sync_doc_metrics.sh --generate .   (CI: --check --generate)
+#
+# Static keys below are MEASURED values. Never hand-edit one unless you
+# re-measured it; update the provenance comment of its group when you do.
+# Provenance for every group not stated otherwise: recorded in
+# docs/BENCHMARKS.md (table of record) at commit 21eee6a (2026-11-11, v0.5.0-M3).
+# Ranges (a–b) are min-max over repeated runs of the stated command.
+
+# --- parvault-bench streaming (BENCHMARKS.md section 1) -------------------------
+# cargo run --release --bin parvault-bench -- --profile router-soc run --payload-mib 64
+# (checkpoint keys *_kib, setup_*, vmrss_*: recorded in
+#  docs/SECURITY_AND_CRYPTOGRAPHY.md section 9.1 at 21eee6a)
+bench.soc.baseline_rss = 4.15–4.16 MiB
+bench.soc.baseline_rss_kib = 4,248 KiB
+bench.soc.setup_rss = 4.28 MiB
+bench.soc.setup_rss_kib = 4,384 KiB
+bench.soc.vmhwm_store = 9.72 MiB
+bench.soc.vmhwm_restore = 9.74 MiB
+bench.soc.vmhwm_store_kib = 9,956 KiB
+bench.soc.vmhwm_restore_kib = 9,972 KiB
+bench.soc.vmrss_store = 9.72 MiB
+bench.soc.vmrss_store_kib = 9,956 KiB
+bench.soc.vmrss_restore = 9.74 MiB
+bench.soc.vmrss_restore_kib = 9,972 KiB
+bench.soc.store = 75.9–82.1 MiB/s
+bench.soc.restore = 127.1–127.4 MiB/s
+# cargo run --release --bin parvault-bench -- run --payload-mib 64
+# (checkpoint keys *_kib, setup_*, vmrss_*: recorded in
+#  docs/SECURITY_AND_CRYPTOGRAPHY.md section 9.1 at 21eee6a)
+bench.desktop.baseline_rss = 9.80 MiB
+bench.desktop.baseline_rss_kib = 10,040 KiB
+bench.desktop.setup_rss = 9.80 MiB
+bench.desktop.setup_rss_kib = 10,040 KiB
+bench.desktop.vmhwm = 57.91 MiB
+bench.desktop.vmhwm_kib = 59,296 KiB
+bench.desktop.vmrss_store = 25.26 MiB
+bench.desktop.vmrss_store_kib = 25,864 KiB
+bench.desktop.vmrss_restore = 9.26 MiB
+bench.desktop.vmrss_restore_kib = 9,480 KiB
+bench.desktop.store = 121.7 MiB/s
+bench.desktop.restore = 117.3 MiB/s
+# cargo run --release --bin parvault-bench -- --profile homelab-nas run --payload-mib 64
+# (recorded in docs/SECURITY_AND_CRYPTOGRAPHY.md section 9.3 at 21eee6a)
+bench.homelab.vmhwm = 22.40 MiB
+bench.homelab.vmrss = 5.72 MiB
+
+# --- Gateway, VFS and sync self-tests (BENCHMARKS.md section 2) -----------------
+# cargo run --release --bin parvault -- gateway ipc-roundtrip (64 MiB payload)
+gw.ipc.ttfb = 12.13 ms
+gw.ipc.upload = 1,141.21 ms
+gw.ipc.upload_rate = 56.08 MiB/s
+gw.ipc.restore = 736.03 ms
+gw.ipc.restore_rate = 86.95 MiB/s
+gw.ipc.gateway_vmhwm = 10.98 MiB
+gw.ipc.gateway_vmhwm_kib = 11,240 KiB
+gw.ipc.client_rss = 6.59 MiB
+gw.ipc.client_rss_bytes = 6,905,856 B
+# cargo run --release --bin parvault -- gateway self-test (static musl / glibc)
+gw.selftest.rss_musl = 10.04 MiB
+gw.selftest.rss_glibc = 13.14 MiB
+# cargo run --release --bin parvault-fuse -- self-test (glibc / static musl)
+fuse.ttfb = 12.33 ms
+fuse.ttfb_musl = 19.25 ms
+# cargo run --release --bin parvault-sync -- self-test (glibc / static musl)
+sync.selftest = 94.58 ms
+sync.selftest_musl = 133.08 ms
+sync.rss_musl = 6.15 MiB
+sync.rss_glibc = 9.21 MiB
+
+# --- Crypto, PQC and Reed-Solomon microbenchmarks (BENCHMARKS.md section 3) -----
+# cargo run --release --bin parvault-bench -- run --payload-mib 64
+argon2.derive = 138.77–143.65 ms
+aes.enc.soc = 583.9–589.2 MiB/s
+aes.dec.soc = 559.5–610.3 MiB/s
+aes.enc.desktop = 496.5–497.0 MiB/s
+aes.dec.desktop = 488.7–497.9 MiB/s
+pq.enc = 248.4–261.4 MiB/s
+pq.dec = 256.8–258.1 MiB/s
+kem.encap = 100.4–117.8 µs
+kem.decap = 99.4–106.9 µs
+sig.sign = 475.6–477.3 µs
+sig.verify = 152.1–159.2 µs
+rs.soc.encode = 304.8–334.6 MiB/s
+rs.soc.reconstruct = 145.2–145.3 MiB/s
+rs.consumer.encode = 158.1–159.3 MiB/s
+rs.consumer.reconstruct = 90.4–95.4 MiB/s
+rs.homelab.encode = 286.3–301.3 MiB/s
+rs.homelab.reconstruct = 142.2–143.4 MiB/s
+
+# --- Static musl binaries and container (BENCHMARKS.md section 4) ---------------
+# bash scripts/gen_metrics.sh --measured (cargo build --profile soc --target <t>; stat -c %s)
+# MiB sizes and ranges are generated from these bytes.
+# Re-measured 2026-11-11 at 94fb695 with rustc 1.99.1: aarch64 bytes identical
+# to the 21eee6a record; x86_64 bytes updated to the re-measured values.
+size.parvault.aarch64.bytes = 6,376,448 B
+size.parvault-seed.aarch64.bytes = 4,404,584 B
+size.parvault-fuse.aarch64.bytes = 3,084,816 B
+size.parvault-sync.aarch64.bytes = 3,084,840 B
+size.parvault.x86_64.bytes = 8,146,472 B
+size.parvault-seed.x86_64.bytes = 5,617,576 B
+size.parvault-fuse.x86_64.bytes = 3,810,344 B
+size.parvault-sync.x86_64.bytes = 3,830,856 B
+size.vfs_builtin_overhead.aarch64 = +64 KiB
+# bash scripts/docker_acceptance_gate.sh (deploy/Dockerfile.router-soc image, 48m cgroup)
+docker.compressed = 6.13 MB
+docker.unpacked = 19.6 MB
+docker.live_rss = 8.63 MiB
+
+# --- TLA+ TLC state counts (BENCHMARKS.md section 5) ----------------------------
+# bash scripts/gen_metrics.sh --measured (TLC -workers auto on every specs/*.tla)
+# tlc.distinct (the sum) is generated from the per-spec counts.
+# Re-measured 2026-11-11 at 94fb695 (tla2tools v1.8.0): identical to the record.
+tlc.generated = 17,054
+tlc.distinct.ParVaultProtocol = 800
+tlc.distinct.ParVaultConfidentialityAndTrust = 944
+tlc.distinct.ParVaultAnonymity = 861
+tlc.distinct.ParVaultPostQuantum = 927
+tlc.distinct.ParVaultBootstrapAndEarnedTier = 360
+tlc.distinct.ParVaultLiteClientAndSeedFailover = 95
+tlc.distinct.ParVaultZeroKeyAdminAndQuorum = 480
+
+# >>> generated by sync_doc_metrics.sh --generate; do not edit
+crate_version = 0.4.0
+kani_harnesses = 17
+kani_harnesses_module = 14
+kani_pass = 17 / 17
+kani_pass_compact = 17/17
+kani_harnesses.capabilities = 1
+kani_harnesses.aes = 1
+kani_harnesses.reed_solomon = 1
+tla_specs = 7
+tla_pass = 7 / 7
+adr_count = 33
+adr_last = ADR-33
+integration_suites = 17
+tests_unit = 48
+tests_integration = 85
+tests_total = 133
+tests_pass = 133 / 133
+size.parvault.aarch64 = 6.08 MiB
+size.parvault-seed.aarch64 = 4.20 MiB
+size.parvault-fuse.aarch64 = 2.94 MiB
+size.parvault-sync.aarch64 = 2.94 MiB
+size.parvault.x86_64 = 7.77 MiB
+size.parvault-seed.x86_64 = 5.36 MiB
+size.parvault-fuse.x86_64 = 3.63 MiB
+size.parvault-sync.x86_64 = 3.65 MiB
+size.aarch64.range = 2.94–6.08 MiB
+size.x86_64.range = 3.63–7.77 MiB
+size.all.range = 2.94–7.77 MiB
+bench.soc.vmhwm = 9.72–9.74 MiB
+bench.soc.vmhwm_kib = 9,956–9,972 KiB
+bench.soc.baseline_rss_min = 4.15 MiB
+bench.soc.headroom_32m = 22.26 MiB
+bench.soc.headroom_48m = 38.26 MiB
+bench.soc.vmhwm_reduction = 5.9x
+aes.enc.span = 496.5–589.2 MiB/s
+tlc.distinct = 4,467
+# <<< end generated

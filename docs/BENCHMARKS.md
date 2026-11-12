@@ -10,8 +10,8 @@ Measured via `cargo run --release --bin parvault-bench -- --profile router-soc r
 
 | Profile | Stripe Size | Stripes | Baseline RSS | Peak `VmHWM` | SoC `< 32 MiB` Gate | Store Speed | Restore Speed |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Router-SoC** | `1 MiB` | `64` | `4.15–4.16 MiB` | **`9.72–9.74 MiB`** (`9,956–9,972 KiB`) | **PASS (`< 32 MiB`)** | **`75.9–82.1 MiB/s`** | **`127.1–127.4 MiB/s`** |
-| **Desktop / Homelab-NAS** | `16 MiB` | `4` | `9.80 MiB` | **`57.91 MiB`** (`59,296 KiB`) | Desktop Target | **`121.7 MiB/s`** | **`117.3 MiB/s`** |
+| **Router-SoC** | `1 MiB` | `64` | <!-- metric:bench.soc.baseline_rss -->`4.15–4.16 MiB`<!-- /metric --> | **<!-- metric:bench.soc.vmhwm -->`9.72–9.74 MiB`<!-- /metric -->** (<!-- metric:bench.soc.vmhwm_kib -->`9,956–9,972 KiB`<!-- /metric -->) | **PASS (`< 32 MiB`)** | **<!-- metric:bench.soc.store -->`75.9–82.1 MiB/s`<!-- /metric -->** | **<!-- metric:bench.soc.restore -->`127.1–127.4 MiB/s`<!-- /metric -->** |
+| **Desktop / Homelab-NAS** | `16 MiB` | `4` | <!-- metric:bench.desktop.baseline_rss -->`9.80 MiB`<!-- /metric --> | **<!-- metric:bench.desktop.vmhwm -->`57.91 MiB`<!-- /metric -->** (<!-- metric:bench.desktop.vmhwm_kib -->`59,296 KiB`<!-- /metric -->) | Desktop Target | **<!-- metric:bench.desktop.store -->`121.7 MiB/s`<!-- /metric -->** | **<!-- metric:bench.desktop.restore -->`117.3 MiB/s`<!-- /metric -->** |
 
 ---
 
@@ -21,10 +21,10 @@ Measured against a live `parvault` Unix Domain Socket listener (`/var/run/parvau
 
 | Harness / Pipeline | Payload / Configuration | Latency / Throughput | Measured RSS / `VmHWM` |
 | :--- | :--- | :---: | :---: |
-| **`parvault gateway ipc-roundtrip`** (`64 MiB`) | `1,280` shards via `memfd_create` + `SCM_RIGHTS` (`512 KiB` gateway stripes, `40`-lane `128 KiB`-stack pool) | **`12.13 ms` TTFB** (`64 KiB` range)<br/>`1,141.21 ms` upload (`56.08 MiB/s`)<br/>`736.03 ms` restore (`86.95 MiB/s`) | Gateway `VmHWM`: **`10.98 MiB`** (`11,240 KiB`)<br/>Client `VmRSS`: **`6.59 MiB`** (`6,905,856 B`) |
-| **`parvault gateway self-test`** (`static-musl`) | `2 MiB` zero-copy sealed `memfd` (`F_ADD_SEALS`) + `SCM_RIGHTS` + `SO_PEERCRED` round-trip | Bit-for-bit SHA-256 verified | **`10.04 MiB`** RSS (`13.14 MiB` glibc) |
-| **`parvault-fuse self-test`** | Lazy byte-range hydration over UDS + `2 MiB` bounded LRU block cache (`1` eviction) | **`12.33 ms` TTFB** (`19.25 ms` `musl`, `< 50 ms`) | Bounded `2,097,152 B` cache |
-| **`parvault-sync self-test`** | Zero-key sealed-`memfd` initial `push` + edit/add/delete `diff` + incremental `push` + attenuated `PARVAULT-MAC-V1:` `pull` + streaming SHA-256 verify | **`94.58 ms`** (`133.08 ms` `musl`, `2` files, `catalog_v=2`) | **`6.15 MiB`** RSS `musl` (`9.21 MiB` glibc) |
+| **`parvault gateway ipc-roundtrip`** (`64 MiB`) | `1,280` shards via `memfd_create` + `SCM_RIGHTS` (`512 KiB` gateway stripes, `40`-lane `128 KiB`-stack pool) | **<!-- metric:gw.ipc.ttfb -->`12.13 ms`<!-- /metric --> TTFB** (`64 KiB` range)<br/><!-- metric:gw.ipc.upload -->`1,141.21 ms`<!-- /metric --> upload (<!-- metric:gw.ipc.upload_rate -->`56.08 MiB/s`<!-- /metric -->)<br/><!-- metric:gw.ipc.restore -->`736.03 ms`<!-- /metric --> restore (<!-- metric:gw.ipc.restore_rate -->`86.95 MiB/s`<!-- /metric -->) | Gateway `VmHWM`: **<!-- metric:gw.ipc.gateway_vmhwm -->`10.98 MiB`<!-- /metric -->** (<!-- metric:gw.ipc.gateway_vmhwm_kib -->`11,240 KiB`<!-- /metric -->)<br/>Client `VmRSS`: **<!-- metric:gw.ipc.client_rss -->`6.59 MiB`<!-- /metric -->** (<!-- metric:gw.ipc.client_rss_bytes -->`6,905,856 B`<!-- /metric -->) |
+| **`parvault gateway self-test`** (`static-musl`) | `2 MiB` zero-copy sealed `memfd` (`F_ADD_SEALS`) + `SCM_RIGHTS` + `SO_PEERCRED` round-trip | Bit-for-bit SHA-256 verified | **<!-- metric:gw.selftest.rss_musl -->`10.04 MiB`<!-- /metric -->** RSS (<!-- metric:gw.selftest.rss_glibc -->`13.14 MiB`<!-- /metric --> glibc) |
+| **`parvault-fuse self-test`** | Lazy byte-range hydration over UDS + `2 MiB` bounded LRU block cache (`1` eviction) | **<!-- metric:fuse.ttfb -->`12.33 ms`<!-- /metric --> TTFB** (<!-- metric:fuse.ttfb_musl -->`19.25 ms`<!-- /metric --> `musl`, `< 50 ms`) | Bounded `2,097,152 B` cache |
+| **`parvault-sync self-test`** | Zero-key sealed-`memfd` initial `push` + edit/add/delete `diff` + incremental `push` + attenuated `PARVAULT-MAC-V1:` `pull` + streaming SHA-256 verify | **<!-- metric:sync.selftest -->`94.58 ms`<!-- /metric -->** (<!-- metric:sync.selftest_musl -->`133.08 ms`<!-- /metric --> `musl`, `2` files, `catalog_v=2`) | **<!-- metric:sync.rss_musl -->`6.15 MiB`<!-- /metric -->** RSS `musl` (<!-- metric:sync.rss_glibc -->`9.21 MiB`<!-- /metric --> glibc) |
 | **`parvault-seed start --no-fs`** | `--mode public-bootstrap --no-fs --in-memory-mb 16` | Live `Noise_XX + Yamux` TCP listener | **`0` files / `0` dirs** created on disk |
 
 ---
@@ -33,44 +33,44 @@ Measured against a live `parvault` Unix Domain Socket listener (`/var/run/parvau
 
 | Subsystem / Operation | Parameters / Construction | Measured Throughput / Latency |
 | :--- | :--- | :---: |
-| **`Argon2id` + `HKDF-SHA256` Seed Derivation** | `m = 64 MiB (65,536 KiB), t = 3, p = 4` (BIP-39 12/24-word) | **`138.77–143.65 ms`** |
-| **`AES-256-GCM` Stripe Encryption (`Router-SoC`)** | `1 MiB` stripe + HKDF per-purpose subkey/nonce | **`583.9–589.2 MiB/s`** |
-| **`AES-256-GCM` Stripe Decryption (`Router-SoC`)** | `1 MiB` stripe + authentication tag verification | **`559.5–610.3 MiB/s`** |
-| **`AES-256-GCM` Stripe Encryption (`Desktop`)** | `16 MiB` stripe + HKDF per-purpose subkey/nonce | **`496.5–497.0 MiB/s`** |
-| **`AES-256-GCM` Stripe Decryption (`Desktop`)** | `16 MiB` stripe + authentication tag verification | **`488.7–497.9 MiB/s`** |
-| **`PqVaultMasterKey` Dual-Cipher Encryption** | `16 MiB` (`AES-256-GCM` inner + `ChaCha20-Poly1305` outer) | **`248.4–261.4 MiB/s`** |
-| **`PqVaultMasterKey` Dual-Cipher Decryption** | `16 MiB` (`ChaCha20-Poly1305` outer + `AES-256-GCM` inner) | **`256.8–258.1 MiB/s`** |
-| **`HybridKemKeypair` Encapsulate / Decapsulate (X-Wing)** | `X25519 + NIST FIPS 203 ML-KEM-768` (`HKDF-SHA512`) | **`100.4–117.8 us` / `99.4–106.9 us`** |
-| **`HybridPqSigningKeypair` Sign / Verify** | `Ed25519 + NIST FIPS 204 ML-DSA-65` | **`475.6–477.3 us` / `152.1–159.2 us`** |
-| **Reed-Solomon $GF(2^8)$ `Router-SoC (16-of-20)` Encode / Reconstruct** | `1 MiB` stripe $\to$ `20 x 64 KiB` shards + Merkle quarantine | **`304.8–334.6 MiB/s` / `145.2–145.3 MiB/s`** |
-| **Reed-Solomon $GF(2^8)$ `Consumer (10-of-20)` Encode / Reconstruct** | `16 MiB` stripe $\to$ `20 x 1.6 MiB` shards + Merkle quarantine | **`158.1–159.3 MiB/s` / `90.4–95.4 MiB/s`** |
-| **Reed-Solomon $GF(2^8)$ `Homelab (16-of-20)` Encode / Reconstruct** | `16 MiB` stripe $\to$ `20 x 1.0 MiB` shards + Merkle quarantine | **`286.3–301.3 MiB/s` / `142.2–143.4 MiB/s`** |
+| **`Argon2id` + `HKDF-SHA256` Seed Derivation** | `m = 64 MiB (65,536 KiB), t = 3, p = 4` (BIP-39 12/24-word) | **<!-- metric:argon2.derive -->`138.77–143.65 ms`<!-- /metric -->** |
+| **`AES-256-GCM` Stripe Encryption (`Router-SoC`)** | `1 MiB` stripe + HKDF per-purpose subkey/nonce | **<!-- metric:aes.enc.soc -->`583.9–589.2 MiB/s`<!-- /metric -->** |
+| **`AES-256-GCM` Stripe Decryption (`Router-SoC`)** | `1 MiB` stripe + authentication tag verification | **<!-- metric:aes.dec.soc -->`559.5–610.3 MiB/s`<!-- /metric -->** |
+| **`AES-256-GCM` Stripe Encryption (`Desktop`)** | `16 MiB` stripe + HKDF per-purpose subkey/nonce | **<!-- metric:aes.enc.desktop -->`496.5–497.0 MiB/s`<!-- /metric -->** |
+| **`AES-256-GCM` Stripe Decryption (`Desktop`)** | `16 MiB` stripe + authentication tag verification | **<!-- metric:aes.dec.desktop -->`488.7–497.9 MiB/s`<!-- /metric -->** |
+| **`PqVaultMasterKey` Dual-Cipher Encryption** | `16 MiB` (`AES-256-GCM` inner + `ChaCha20-Poly1305` outer) | **<!-- metric:pq.enc -->`248.4–261.4 MiB/s`<!-- /metric -->** |
+| **`PqVaultMasterKey` Dual-Cipher Decryption** | `16 MiB` (`ChaCha20-Poly1305` outer + `AES-256-GCM` inner) | **<!-- metric:pq.dec -->`256.8–258.1 MiB/s`<!-- /metric -->** |
+| **`HybridKemKeypair` Encapsulate / Decapsulate (X-Wing)** | `X25519 + NIST FIPS 203 ML-KEM-768` (`HKDF-SHA512`) | **<!-- metric:kem.encap -->`100.4–117.8 µs`<!-- /metric --> / <!-- metric:kem.decap -->`99.4–106.9 µs`<!-- /metric -->** |
+| **`HybridPqSigningKeypair` Sign / Verify** | `Ed25519 + NIST FIPS 204 ML-DSA-65` | **<!-- metric:sig.sign -->`475.6–477.3 µs`<!-- /metric --> / <!-- metric:sig.verify -->`152.1–159.2 µs`<!-- /metric -->** |
+| **Reed-Solomon $GF(2^8)$ `Router-SoC (16-of-20)` Encode / Reconstruct** | `1 MiB` stripe $\to$ `20 x 64 KiB` shards + Merkle quarantine | **<!-- metric:rs.soc.encode -->`304.8–334.6 MiB/s`<!-- /metric --> / <!-- metric:rs.soc.reconstruct -->`145.2–145.3 MiB/s`<!-- /metric -->** |
+| **Reed-Solomon $GF(2^8)$ `Consumer (10-of-20)` Encode / Reconstruct** | `16 MiB` stripe $\to$ `20 x 1.6 MiB` shards + Merkle quarantine | **<!-- metric:rs.consumer.encode -->`158.1–159.3 MiB/s`<!-- /metric --> / <!-- metric:rs.consumer.reconstruct -->`90.4–95.4 MiB/s`<!-- /metric -->** |
+| **Reed-Solomon $GF(2^8)$ `Homelab (16-of-20)` Encode / Reconstruct** | `16 MiB` stripe $\to$ `20 x 1.0 MiB` shards + Merkle quarantine | **<!-- metric:rs.homelab.encode -->`286.3–301.3 MiB/s`<!-- /metric --> / <!-- metric:rs.homelab.reconstruct -->`142.2–143.4 MiB/s`<!-- /metric -->** |
 
 ---
 
 ## 4. Static `musl` Binary & Container Footprint (`v0.5.0-M3` Dual-Mode VFS & Sibling Plugins)
 
-Built with `--profile soc` (`opt-level = "z"`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`). Hosting built-in `=y` `VirtualVaultFs` (`--vfs-webdav-listen` / `--vfs-fuse-fd`) inside `parvault` adds only `+64 KiB` on ARM64, while `parvault-fuse` (`2.94 MiB` ARM64) and zero-key `parvault-sync` (`2.94 MiB` ARM64) ship as ultra-compact out-of-process `=m` plugins:
+Built with `--profile soc` (`opt-level = "z"`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`). Hosting built-in `=y` `VirtualVaultFs` (`--vfs-webdav-listen` / `--vfs-fuse-fd`) inside `parvault` adds only <!-- metric:size.vfs_builtin_overhead.aarch64 -->`+64 KiB`<!-- /metric --> on ARM64, while `parvault-fuse` (<!-- metric:size.parvault-fuse.aarch64 -->`2.94 MiB`<!-- /metric --> ARM64) and zero-key `parvault-sync` (<!-- metric:size.parvault-sync.aarch64 -->`2.94 MiB`<!-- /metric --> ARM64) ship as ultra-compact out-of-process `=m` plugins:
 
 | Artifact / Target | Profile | Exact Bytes | Stripped Size | Notes |
 | :--- | :---: | :---: | :---: | :--- |
-| `parvault` (`aarch64-unknown-linux-musl`) | `--profile soc` | `6,376,448 B` | **`6.08 MiB`** | Zero dynamic deps; full ARM64 P2P daemon, built-in `=y` VFS, UDS gateway & `token` CLI |
-| `parvault-seed` (`aarch64-unknown-linux-musl`) | `--profile soc` | `4,404,584 B` | **`4.20 MiB`** | Headless ARM64 gateway / RPi seed server (supports `--no-fs`) |
-| `parvault-fuse` (`aarch64-unknown-linux-musl`) | `--profile soc` | `3,084,816 B` | **`2.94 MiB`** | Pure-Rust ARM64 `/dev/fuse` (`ABI 7.31`) + WebDAV reference plugin |
-| `parvault-sync` (`aarch64-unknown-linux-musl`) | `--profile soc` | `3,084,840 B` | **`2.94 MiB`** | Zero-key ARM64 incremental folder sync plugin (`diff`, `push`, `watch`, `pull`, `list`) |
-| `parvault` (`x86_64-unknown-linux-musl`) | `--profile soc` | `8,134,184 B` | **`7.76 MiB`** | Static `x86_64` P2P daemon, built-in `=y` VFS, UDS gateway, `token` CLI & folder sync |
-| `parvault-seed` (`x86_64-unknown-linux-musl`) | `--profile soc` | `5,609,384 B` | **`5.35 MiB`** | Static `x86_64` headless seed & bootstrap server |
-| `parvault-fuse` (`x86_64-unknown-linux-musl`) | `--profile soc` | `3,806,248 B` | **`3.63 MiB`** | Static `x86_64` `/dev/fuse` + HTTP `Range` / WebDAV reference plugin |
-| `parvault-sync` (`x86_64-unknown-linux-musl`) | `--profile soc` | `3,826,760 B` | **`3.65 MiB`** | Static `x86_64` zero-key incremental folder sync plugin (`GatewayFolderSync`) |
-| `parvault:router-soc` (`deploy/Dockerfile.router-soc`) | `FROM scratch` | — | **`6.13 MB` compressed** (`19.6 MB` unpacked) | Verified inside `--memory=48m --memory-swap=48m` cgroup at **`8.63 MiB`** live RSS (`0` OOM kills) |
+| `parvault` (`aarch64-unknown-linux-musl`) | `--profile soc` | <!-- metric:size.parvault.aarch64.bytes -->`6,376,448 B`<!-- /metric --> | **<!-- metric:size.parvault.aarch64 -->`6.08 MiB`<!-- /metric -->** | Zero dynamic deps; full ARM64 P2P daemon, built-in `=y` VFS, UDS gateway & `token` CLI |
+| `parvault-seed` (`aarch64-unknown-linux-musl`) | `--profile soc` | <!-- metric:size.parvault-seed.aarch64.bytes -->`4,404,584 B`<!-- /metric --> | **<!-- metric:size.parvault-seed.aarch64 -->`4.20 MiB`<!-- /metric -->** | Headless ARM64 gateway / RPi seed server (supports `--no-fs`) |
+| `parvault-fuse` (`aarch64-unknown-linux-musl`) | `--profile soc` | <!-- metric:size.parvault-fuse.aarch64.bytes -->`3,084,816 B`<!-- /metric --> | **<!-- metric:size.parvault-fuse.aarch64 -->`2.94 MiB`<!-- /metric -->** | Pure-Rust ARM64 `/dev/fuse` (`ABI 7.31`) + WebDAV reference plugin |
+| `parvault-sync` (`aarch64-unknown-linux-musl`) | `--profile soc` | <!-- metric:size.parvault-sync.aarch64.bytes -->`3,084,840 B`<!-- /metric --> | **<!-- metric:size.parvault-sync.aarch64 -->`2.94 MiB`<!-- /metric -->** | Zero-key ARM64 incremental folder sync plugin (`diff`, `push`, `watch`, `pull`, `list`) |
+| `parvault` (`x86_64-unknown-linux-musl`) | `--profile soc` | <!-- metric:size.parvault.x86_64.bytes -->`8,146,472 B`<!-- /metric --> | **<!-- metric:size.parvault.x86_64 -->`7.77 MiB`<!-- /metric -->** | Static `x86_64` P2P daemon, built-in `=y` VFS, UDS gateway, `token` CLI & folder sync |
+| `parvault-seed` (`x86_64-unknown-linux-musl`) | `--profile soc` | <!-- metric:size.parvault-seed.x86_64.bytes -->`5,617,576 B`<!-- /metric --> | **<!-- metric:size.parvault-seed.x86_64 -->`5.36 MiB`<!-- /metric -->** | Static `x86_64` headless seed & bootstrap server |
+| `parvault-fuse` (`x86_64-unknown-linux-musl`) | `--profile soc` | <!-- metric:size.parvault-fuse.x86_64.bytes -->`3,810,344 B`<!-- /metric --> | **<!-- metric:size.parvault-fuse.x86_64 -->`3.63 MiB`<!-- /metric -->** | Static `x86_64` `/dev/fuse` + HTTP `Range` / WebDAV reference plugin |
+| `parvault-sync` (`x86_64-unknown-linux-musl`) | `--profile soc` | <!-- metric:size.parvault-sync.x86_64.bytes -->`3,830,856 B`<!-- /metric --> | **<!-- metric:size.parvault-sync.x86_64 -->`3.65 MiB`<!-- /metric -->** | Static `x86_64` zero-key incremental folder sync plugin (`GatewayFolderSync`) |
+| `parvault:router-soc` (`deploy/Dockerfile.router-soc`) | `FROM scratch` | — | **<!-- metric:docker.compressed -->`6.13 MB`<!-- /metric --> compressed** (<!-- metric:docker.unpacked -->`19.6 MB`<!-- /metric --> unpacked) | Verified inside `--memory=48m --memory-swap=48m` cgroup at **<!-- metric:docker.live_rss -->`8.63 MiB`<!-- /metric -->** live RSS (`0` OOM kills) |
 
 ---
 
 ## 5. Formal Verification & Automated Test Summary (`v0.5.0-M3`)
 
-- **Kani Rust Bounded Model Checking (`cargo kani`)**: **`17 / 17` symbolic harnesses verified (`0` failures)** across `src/kani_proofs.rs` (`14` harnesses including `proof_pinned_ring_capacity_invariant`, `proof_fuse_header_parser_no_panic`, and `proof_sanitize_sync_relative_path_no_traversal`), `src/capabilities.rs` (`1`: `proof_macaroon_peer_uid_and_compact_roundtrip`), `src/crypto/aes.rs` (`1`), and `src/sharding/reed_solomon.rs` (`1`).
-- **TLA+ TLC Model Checking (`specs/*.tla`)**: **`7 / 7` protocol specifications verified (`0` errors)** across `17,054` generated states (`4,467` distinct states: `ParVaultProtocol` `800`, `ParVaultConfidentialityAndTrust` `944`, `ParVaultAnonymity` `861`, `ParVaultPostQuantum` `927`, `ParVaultBootstrapAndEarnedTier` `360`, `ParVaultLiteClientAndSeedFailover` `95`, `ParVaultZeroKeyAdminAndQuorum` `480`).
-- **Automated Release Test Suite (`cargo test --release`)**: **`133 / 133` tests passing (`0` failures)** across `48` unit tests and `85` integration, live `libp2p`, Stateright, TLA+ TLC, `GatewayBus` (`InProcess` & `UnixSocket`), dual-mode `VirtualVaultFs` (`--no-socket` & WebDAV `206`), zero-key `GatewayFolderSync`, sealed `memfd` IPC, `SO_PEERCRED` UID enforcement, and Byzantine red-team tests.
+- **Kani Rust Bounded Model Checking (`cargo kani`)**: **<!-- metric:kani_pass -->`17 / 17`<!-- /metric --> symbolic harnesses verified (`0` failures)** across `src/kani_proofs.rs` (<!-- metric:kani_harnesses_module -->`14`<!-- /metric --> harnesses including `proof_pinned_ring_capacity_invariant`, `proof_fuse_header_parser_no_panic`, and `proof_sanitize_sync_relative_path_no_traversal`), `src/capabilities.rs` (<!-- metric:kani_harnesses.capabilities -->`1`<!-- /metric -->: `proof_macaroon_peer_uid_and_compact_roundtrip`), `src/crypto/aes.rs` (<!-- metric:kani_harnesses.aes -->`1`<!-- /metric -->), and `src/sharding/reed_solomon.rs` (<!-- metric:kani_harnesses.reed_solomon -->`1`<!-- /metric -->).
+- **TLA+ TLC Model Checking (`specs/*.tla`)**: **<!-- metric:tla_pass -->`7 / 7`<!-- /metric --> protocol specifications verified (`0` errors)** across <!-- metric:tlc.generated -->`17,054`<!-- /metric --> generated states (<!-- metric:tlc.distinct -->`4,467`<!-- /metric --> distinct states: `ParVaultProtocol` <!-- metric:tlc.distinct.ParVaultProtocol -->`800`<!-- /metric -->, `ParVaultConfidentialityAndTrust` <!-- metric:tlc.distinct.ParVaultConfidentialityAndTrust -->`944`<!-- /metric -->, `ParVaultAnonymity` <!-- metric:tlc.distinct.ParVaultAnonymity -->`861`<!-- /metric -->, `ParVaultPostQuantum` <!-- metric:tlc.distinct.ParVaultPostQuantum -->`927`<!-- /metric -->, `ParVaultBootstrapAndEarnedTier` <!-- metric:tlc.distinct.ParVaultBootstrapAndEarnedTier -->`360`<!-- /metric -->, `ParVaultLiteClientAndSeedFailover` <!-- metric:tlc.distinct.ParVaultLiteClientAndSeedFailover -->`95`<!-- /metric -->, `ParVaultZeroKeyAdminAndQuorum` <!-- metric:tlc.distinct.ParVaultZeroKeyAdminAndQuorum -->`480`<!-- /metric -->).
+- **Automated Release Test Suite (`cargo test --release`)**: **<!-- metric:tests_pass -->`133 / 133`<!-- /metric --> tests passing (`0` failures)** across <!-- metric:tests_unit -->`48`<!-- /metric --> unit tests and <!-- metric:tests_integration -->`85`<!-- /metric --> integration, live `libp2p`, Stateright, TLA+ TLC, `GatewayBus` (`InProcess` & `UnixSocket`), dual-mode `VirtualVaultFs` (`--no-socket` & WebDAV `206`), zero-key `GatewayFolderSync`, sealed `memfd` IPC, `SO_PEERCRED` UID enforcement, and Byzantine red-team tests.
 
 ---
 
@@ -88,7 +88,7 @@ cargo run --release --bin parvault -- gateway self-test
 cargo run --release --bin parvault-fuse -- self-test
 cargo run --release --bin parvault-sync -- self-test
 
-# 4. Run all 17 Kani symbolic harnesses + all 7 TLA+ TLC formal specifications
+# 4. Run all Kani symbolic harnesses + all TLA+ TLC formal specifications
 bash scripts/verify_formal_proofs.sh
 
 # 5. Run the 8-profile degraded network & Byzantine poisoner matrix

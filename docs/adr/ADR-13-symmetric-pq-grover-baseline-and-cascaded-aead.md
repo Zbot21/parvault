@@ -12,8 +12,8 @@ Engineers auditing a post-quantum codebase frequently ask why `parvault` continu
 
 ## Decision
 
-1. **Single-Pass `AES-256-GCM` Already Satisfies NIST Post-Quantum Category 5 (`128-Bit PQ`):** Halving a 256-bit key space under Grover's $\mathcal{O}(2^{n/2})$ bound leaves $2^{128}$ sequential quantum oracle evaluations—matching **NIST Post-Quantum Security Category 5** (the highest NIST PQ tier). Standard `MasterKey` stripe encryption (`encrypt_stripe`, `496.5–589.2 MiB/s`), manifest encryption (`encrypt_manifest`), `PqRelayedShardEnvelope` payload sealing, and 256-bit `HMAC-SHA256` PRFs are therefore **already post-quantum secure** without lattice overhead.
-2. **Dual-Cipher Cascaded AEAD for Algebraic Cipher Diversity (`PqVaultMasterKey`):** For root vault superblocks (`EncryptedVaultCatalogEnvelope`) and maximum-assurance vault sealing (`248.4–261.4 MiB/s`), `PqVaultMasterKey` derives two independent 256-bit keys $(K_1, K_2)$ via `Argon2id` + `HKDF-SHA256` and cascades two algebraically orthogonal AEAD designs:
+1. **Single-Pass `AES-256-GCM` Already Satisfies NIST Post-Quantum Category 5 (`128-Bit PQ`):** Halving a 256-bit key space under Grover's $\mathcal{O}(2^{n/2})$ bound leaves $2^{128}$ sequential quantum oracle evaluations—matching **NIST Post-Quantum Security Category 5** (the highest NIST PQ tier). Standard `MasterKey` stripe encryption (`encrypt_stripe`, <!-- metric:aes.enc.span -->`496.5–589.2 MiB/s`<!-- /metric -->), manifest encryption (`encrypt_manifest`), `PqRelayedShardEnvelope` payload sealing, and 256-bit `HMAC-SHA256` PRFs are therefore **already post-quantum secure** without lattice overhead.
+2. **Dual-Cipher Cascaded AEAD for Algebraic Cipher Diversity (`PqVaultMasterKey`):** For root vault superblocks (`EncryptedVaultCatalogEnvelope`) and maximum-assurance vault sealing (<!-- metric:pq.enc -->`248.4–261.4 MiB/s`<!-- /metric -->), `PqVaultMasterKey` derives two independent 256-bit keys $(K_1, K_2)$ via `Argon2id` + `HKDF-SHA256` and cascades two algebraically orthogonal AEAD designs:
 
 ```text
 Inner Pass : C_inner = AES-256-GCM_Encrypt(key = K_1, nonce = Nonce_1, plaintext = P)

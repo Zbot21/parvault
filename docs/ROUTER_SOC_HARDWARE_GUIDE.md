@@ -17,8 +17,8 @@ However, embedding modern distributed storage on consumer and enterprise router 
 3. **Zero-IP Consumer Usability:** Homeowners and non-technical users cannot be expected to look up DHCP leases, configure static IPv4 subnets, or type `/ip4/192.168.1.142/tcp/4001/p2p/...` addresses.
 
 `parvault` v0.4.0 solves all three constraints:
-- **`--profile router-soc`:** Enforces **1 MiB streaming Reed-Solomon stripes** (`ROUTER_SOC_STRIPE_SIZE_BYTES = 1,048,576`), dropping transient peak heap allocations (`VmHWM`) from `57.91 MiB` to **`9.72–9.74 MiB`** (`< 16 MiB`), operating safely inside a `32–48 MiB` container or cgroup ceiling while retaining 100% wire and manifest compatibility with desktop and NAS nodes.
-- **Static Zero-Dependency `musl` & `FROM scratch` Containers:** Stripped standalone binaries (`2.94–6.08 MiB` ARM64, `3.63–7.76 MiB` x86_64 across `parvault`, `parvault-seed`, `parvault-fuse`, and `parvault-sync` — with the zero-copy Unix socket gateway and optional built-in `=y` VFS folded directly into `parvault`) and minimal `FROM scratch` Docker/OCI images under 20 MiB.
+- **`--profile router-soc`:** Enforces **1 MiB streaming Reed-Solomon stripes** (`ROUTER_SOC_STRIPE_SIZE_BYTES = 1,048,576`), dropping transient peak heap allocations (`VmHWM`) from <!-- metric:bench.desktop.vmhwm -->`57.91 MiB`<!-- /metric --> to **<!-- metric:bench.soc.vmhwm -->`9.72–9.74 MiB`<!-- /metric -->** (`< 16 MiB`), operating safely inside a `32–48 MiB` container or cgroup ceiling while retaining 100% wire and manifest compatibility with desktop and NAS nodes.
+- **Static Zero-Dependency `musl` & `FROM scratch` Containers:** Stripped standalone binaries (<!-- metric:size.aarch64.range -->`2.94–6.08 MiB`<!-- /metric --> ARM64, <!-- metric:size.x86_64.range -->`3.63–7.77 MiB`<!-- /metric --> x86_64 across `parvault`, `parvault-seed`, `parvault-fuse`, and `parvault-sync` — with the zero-copy Unix socket gateway and optional built-in `=y` VFS folded directly into `parvault`) and minimal `FROM scratch` Docker/OCI images under 20 MiB.
 - **Cryptographic Zero-IP LAN Discovery & 4-Word SAS Pairing:** Fully automated LAN beaconing over UDP port `4009` with Ed25519-signed identity binding, 4-word BIP-39 pairing codes, and DHCP self-healing.
 - **Turnkey Appliance Mode (`parvault up`):** Launches P2P daemon, signed discovery beacon, embedded status webserver, and background folder sync with a single command.
 
@@ -56,11 +56,11 @@ flowchart TD
 
 ### Flash / Disk Footprint
 - **Static `musl` stripped binaries (`soc` profile `opt-level = "z"`, `lto = "fat"`):**
-  - `parvault`: **`6.08 MiB`** (`6,376,448 B` `aarch64`) / **`7.76 MiB`** (`8,134,184 B` `x86_64`) — includes built-in `parvault up --ipc-socket`, built-in `=y` VFS (`--vfs-webdav-listen` / `--vfs-fuse-fd`), `parvault gateway`, and `parvault token`
-  - `parvault-seed`: **`4.20 MiB`** (`4,404,584 B` `aarch64`) / **`5.35 MiB`** (`5,609,384 B` `x86_64`)
-  - `parvault-fuse`: **`2.94 MiB`** (`3,084,816 B` `aarch64`) / **`3.63 MiB`** (`3,806,248 B` `x86_64`)
-  - `parvault-sync`: **`2.94 MiB`** (`3,084,840 B` `aarch64`) / **`3.65 MiB`** (`3,826,760 B` `x86_64`) — zero-key incremental folder sync plugin (`GatewayFolderSync`)
-- **OCI / Docker `FROM scratch` container image (`parvault:router-soc`):** **`19.6 MB`** total uncompressed disk usage (**`6.13 MB`** compressed content size, stripped binaries + `router.toml` configuration, 0 OS overhead).
+  - `parvault`: **<!-- metric:size.parvault.aarch64 -->`6.08 MiB`<!-- /metric -->** (<!-- metric:size.parvault.aarch64.bytes -->`6,376,448 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault.x86_64 -->`7.77 MiB`<!-- /metric -->** (<!-- metric:size.parvault.x86_64.bytes -->`8,146,472 B`<!-- /metric --> `x86_64`) — includes built-in `parvault up --ipc-socket`, built-in `=y` VFS (`--vfs-webdav-listen` / `--vfs-fuse-fd`), `parvault gateway`, and `parvault token`
+  - `parvault-seed`: **<!-- metric:size.parvault-seed.aarch64 -->`4.20 MiB`<!-- /metric -->** (<!-- metric:size.parvault-seed.aarch64.bytes -->`4,404,584 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-seed.x86_64 -->`5.36 MiB`<!-- /metric -->** (<!-- metric:size.parvault-seed.x86_64.bytes -->`5,617,576 B`<!-- /metric --> `x86_64`)
+  - `parvault-fuse`: **<!-- metric:size.parvault-fuse.aarch64 -->`2.94 MiB`<!-- /metric -->** (<!-- metric:size.parvault-fuse.aarch64.bytes -->`3,084,816 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-fuse.x86_64 -->`3.63 MiB`<!-- /metric -->** (<!-- metric:size.parvault-fuse.x86_64.bytes -->`3,810,344 B`<!-- /metric --> `x86_64`)
+  - `parvault-sync`: **<!-- metric:size.parvault-sync.aarch64 -->`2.94 MiB`<!-- /metric -->** (<!-- metric:size.parvault-sync.aarch64.bytes -->`3,084,840 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-sync.x86_64 -->`3.65 MiB`<!-- /metric -->** (<!-- metric:size.parvault-sync.x86_64.bytes -->`3,830,856 B`<!-- /metric --> `x86_64`) — zero-key incremental folder sync plugin (`GatewayFolderSync`)
+- **OCI / Docker `FROM scratch` container image (`parvault:router-soc`):** **<!-- metric:docker.unpacked -->`19.6 MB`<!-- /metric -->** total uncompressed disk usage (**<!-- metric:docker.compressed -->`6.13 MB`<!-- /metric -->** compressed content size, stripped binaries + `router.toml` configuration, 0 OS overhead).
 - **Minimum Free Disk Reserve (`min_free_disk_bytes`):**
   - `--profile router-soc`: `64 MiB` (`67,108,864` bytes), allowing deployment on small USB flash drives or flash partitions.
   - `--profile homelab-nas`: `1 GiB` (`1,073,741,824` bytes).
@@ -72,15 +72,15 @@ Measured on real Linux 6.x kernels via `/proc/self/status` during 64 MiB multi-s
 
 | Execution Checkpoint | Desktop Profile (`16 MiB` Stripes) | Router-SoC Profile (`1 MiB` Stripes) |
 | :--- | :---: | :---: |
-| **Process Startup & Baseline** | `9.80 MiB` VmRSS | `4.15 MiB` VmRSS |
-| **After 64 MiB Chunked Setup** | `9.80 MiB` VmRSS | `4.28 MiB` VmRSS |
-| **Active 64 MiB File Streaming Store** | `25.26 MiB` VmRSS / **`57.91 MiB` VmHWM** (`121.7 MiB/s`) | **`9.72 MiB` VmRSS / `9.72 MiB` VmHWM** (`75.9–82.1 MiB/s`) |
-| **Active 64 MiB File Streaming Restore**| `9.26 MiB` VmRSS / **`57.91 MiB` VmHWM** (`117.3 MiB/s`) | **`9.74 MiB` VmRSS / `9.74 MiB` VmHWM** (`127.1–127.4 MiB/s`) |
-| **Peak Working Set Margin in 32 MiB cgroup**| **Exceeds limit (OOM kill risk)** | **Ideal (`22.26 MiB` headroom, ~70% free!)** |
-| **Peak Working Set Margin in 48 MiB cgroup**| Exceeds limit | **Bulletproof (`38.26 MiB` headroom, ~80% free!)** |
+| **Process Startup & Baseline** | <!-- metric:bench.desktop.baseline_rss -->`9.80 MiB`<!-- /metric --> VmRSS | <!-- metric:bench.soc.baseline_rss_min -->`4.15 MiB`<!-- /metric --> VmRSS |
+| **After 64 MiB Chunked Setup** | <!-- metric:bench.desktop.setup_rss -->`9.80 MiB`<!-- /metric --> VmRSS | <!-- metric:bench.soc.setup_rss -->`4.28 MiB`<!-- /metric --> VmRSS |
+| **Active 64 MiB File Streaming Store** | <!-- metric:bench.desktop.vmrss_store -->`25.26 MiB`<!-- /metric --> VmRSS / **<!-- metric:bench.desktop.vmhwm -->`57.91 MiB`<!-- /metric --> VmHWM** (<!-- metric:bench.desktop.store -->`121.7 MiB/s`<!-- /metric -->) | **<!-- metric:bench.soc.vmrss_store -->`9.72 MiB`<!-- /metric --> VmRSS / <!-- metric:bench.soc.vmhwm_store -->`9.72 MiB`<!-- /metric --> VmHWM** (<!-- metric:bench.soc.store -->`75.9–82.1 MiB/s`<!-- /metric -->) |
+| **Active 64 MiB File Streaming Restore**| <!-- metric:bench.desktop.vmrss_restore -->`9.26 MiB`<!-- /metric --> VmRSS / **<!-- metric:bench.desktop.vmhwm -->`57.91 MiB`<!-- /metric --> VmHWM** (<!-- metric:bench.desktop.restore -->`117.3 MiB/s`<!-- /metric -->) | **<!-- metric:bench.soc.vmrss_restore -->`9.74 MiB`<!-- /metric --> VmRSS / <!-- metric:bench.soc.vmhwm_restore -->`9.74 MiB`<!-- /metric --> VmHWM** (<!-- metric:bench.soc.restore -->`127.1–127.4 MiB/s`<!-- /metric -->) |
+| **Peak Working Set Margin in 32 MiB cgroup**| **Exceeds limit (OOM kill risk)** | **Ideal (<!-- metric:bench.soc.headroom_32m -->`22.26 MiB`<!-- /metric --> headroom, ~70% free!)** |
+| **Peak Working Set Margin in 48 MiB cgroup**| Exceeds limit | **Bulletproof (<!-- metric:bench.soc.headroom_48m -->`38.26 MiB`<!-- /metric --> headroom, ~80% free!)** |
 
 > [!IMPORTANT]
-> The `router-soc` profile reduces transient peak memory allocations (`VmHWM`) during Reed-Solomon $GF(2^8)$ matrix encoding and reconstruction from `57.91 MiB` down to **`9.72–9.74 MiB`** (a **5.9x reduction**), well inside even the tightest 32 MiB router container limit without sacrificing encryption strength, erasure resilience, or wire compatibility.
+> The `router-soc` profile reduces transient peak memory allocations (`VmHWM`) during Reed-Solomon $GF(2^8)$ matrix encoding and reconstruction from <!-- metric:bench.desktop.vmhwm -->`57.91 MiB`<!-- /metric --> down to **<!-- metric:bench.soc.vmhwm -->`9.72–9.74 MiB`<!-- /metric -->** (a **<!-- metric:bench.soc.vmhwm_reduction -->5.9x<!-- /metric --> reduction**), well inside even the tightest 32 MiB router container limit without sacrificing encryption strength, erasure resilience, or wire compatibility.
 
 ---
 

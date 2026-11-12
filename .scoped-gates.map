@@ -325,6 +325,9 @@ specs/ParVaultZeroKeyAdminAndQuorum.*       tla     specs/ParVaultZeroKeyAdminAn
 
 # --- Scripts, CI, deploy, misc -----------------------------------------------
 scripts/verify_formal_proofs.sh     full    # the formal gate itself (kani + all TLC)
+scripts/gen_metrics.sh             none    # the Markdown gate runs sync --check --generate on every plan
+scripts/sync_doc_metrics.sh        none    # vendored, byte-identical (VENDORED.md); CI runs it
+scripts/VENDORED.md                none
 .github/workflows/*                 full    # CI defines the release gates; an edit can drop one
 scripts/docker_acceptance_gate.sh   none    # Docker gate, run by hand; not one of the 6 gates
 scripts/install.sh                  none
@@ -456,6 +459,7 @@ src/bin/parvault-sync.rs        doc     docs/adr/ADR-33-dual-mode-vfs-and-siblin
 tests/gateway_ipc_benchmark.rs  doc     docs/BENCHMARKS.md
 tests/tla_formal_proofs_integration.rs  doc  AGENTS.md
 scripts/install.sh              doc     QUICKSTART.md
+scripts/gen_metrics.sh          doc     docs/metrics.txt
 scripts/install.sh              doc     website/install.sh
 website/install.sh              doc     scripts/install.sh
 deploy/*                        doc     docs/ROUTER_SOC_HARDWARE_GUIDE.md
