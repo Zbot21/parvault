@@ -107,6 +107,9 @@ tla_specs="${#specs[@]}";                                        positive tla_sp
 adr_count="${#adrs[@]}";                                         positive adr_count "$adr_count"
 adr_last="${adrs[adr_count - 1]}"
 [[ "$adr_last" =~ ^ADR-[0-9]+$ ]] || fail "adr_last is '$adr_last'"
+[[ -f src/network/behaviour.rs ]] || fail "missing file: src/network/behaviour.rs"
+wire_variants="$(awk '/^pub enum MeshWireRequest \{/{p=1;next} p&&/^\}/{exit} p' src/network/behaviour.rs | grep -cE '^    [A-Z][A-Za-z0-9]*\b' || true)"
+positive wire_request_variants "$wire_variants"
 tests_unit="$(count "$test_re" "${src_rs[@]}")";                 positive tests_unit "$tests_unit"
 tests_int="$(count "$test_re" "${test_rs[@]}")";                 positive tests_integration "$tests_int"
 tests_total=$((tests_unit + tests_int))
@@ -123,6 +126,7 @@ kani_harnesses.capabilities = $kani_caps
 kani_harnesses.aes = $kani_aes
 kani_harnesses.reed_solomon = $kani_rs
 tla_specs = $tla_specs
+wire_request_variants = $wire_variants
 tla_pass = $tla_specs / $tla_specs
 adr_count = $adr_count
 adr_last = $adr_last

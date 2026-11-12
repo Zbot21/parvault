@@ -45,7 +45,7 @@
 
 ---
 
-## 1.1 Active `v0.4.0` Cryptographic Suite & Classical-to-Post-Quantum Evolution Guide
+## 1.1 Active <!-- metric:crate_version_tag -->`v0.5.0`<!-- /metric --> Cryptographic Suite & Classical-to-Post-Quantum Evolution Guide
 
 A recurring question when reading historical `v0.1` ADRs ([`ADR-01`](adr/ADR-01-streaming-stripes-and-encrypt-before-shard.md), [`ADR-02`](adr/ADR-02-dht-encrypted-manifests.md), [`ADR-05`](adr/ADR-05-recursive-wot-and-subtree-slashing.md), [`ADR-09`](adr/ADR-09-byzantine-merkle-quarantine-and-egress-slashing.md)) alongside the post-quantum ADRs ([`ADR-12`](adr/ADR-12-asymmetric-post-quantum-hybrids.md) and [`ADR-13`](adr/ADR-13-symmetric-pq-grover-baseline-and-cascaded-aead.md)) is **why symmetric `AES-256-GCM` and Post-Quantum Cryptography (PQC) coexist in `v0.4.0`**:
 
@@ -60,7 +60,7 @@ A recurring question when reading historical `v0.1` ADRs ([`ADR-01`](adr/ADR-01-
 4. **Point-to-Point Wire Transport (`Noise XX`) vs. End-to-End HNDL Payload Confidentiality ([`ADR-08`](adr/ADR-08-noise-xx-transport-and-bounded-wire-framing.md)):**
    - `libp2p` point-to-point TCP connections use `Noise_XX_25519_ChaChaPoly_SHA256` (`Yamux`) strictly for live peer authentication, `/p2p/<PeerId>` pinning, and outer RPC framing. End-to-end HNDL confidentiality **never** depends on the outer transport session because every file stripe, manifest, and 2-layer `PqRelayedShardEnvelope` is encrypted client-side (`AES-256-GCM` / `PqVaultMasterKey`) and/or encapsulated under `X25519 + ML-KEM-768` *before* touching the wire.
 
-### Subsystem-by-Subsystem `v0.4.0` Cryptographic Map
+### Subsystem-by-Subsystem <!-- metric:crate_version_tag -->`v0.5.0`<!-- /metric --> Cryptographic Map
 
 | Subsystem & Rust Type | Active Primitive Construction | Classical / PQ Security Rationale | Governing ADR |
 | :--- | :--- | :--- | :--- |

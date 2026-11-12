@@ -140,6 +140,7 @@ kani_harnesses.capabilities = 1
 kani_harnesses.aes = 1
 kani_harnesses.reed_solomon = 1
 tla_specs = 7
+wire_request_variants = 19
 tla_pass = 7 / 7
 adr_count = 33
 adr_last = ADR-33

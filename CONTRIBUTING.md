@@ -21,7 +21,7 @@ Thank you for contributing to **Neighborhood Cloud (`parvault`)**! Because `parv
 
 Before writing code, please read:
 - **[`AGENTS.md`](AGENTS.md):** Module-by-module source map (`src/`) and the **7 Non-Negotiable Zero-Trust & Memory-Safety Rules**.
-- **[`docs/ADR.md`](docs/ADR.md) & [`docs/adr/`](docs/adr/):** Master Architectural Decision Record Index, Active `v0.4.0` Cryptographic Suite Guide, and **31 strictly single-concern ADRs (`ADR-01` through `ADR-31`)**.
+- **[`docs/ADR.md`](docs/ADR.md) & [`docs/adr/`](docs/adr/):** Master Architectural Decision Record Index, Active <!-- metric:crate_version_tag -->`v0.5.0`<!-- /metric --> Cryptographic Suite Guide, and **<!-- metric:adr_count -->33<!-- /metric --> strictly single-concern ADRs (`ADR-01` through <!-- metric:adr_last -->`ADR-33`<!-- /metric -->)**.
 - **[`docs/SAFETY_AND_LINT_AUDIT.md`](docs/SAFETY_AND_LINT_AUDIT.md):** `#![deny/forbid(unsafe_code)]` posture, `src/os_sys.rs` POSIX syscall `SAFETY` proofs, and full `#[allow(...)]` lint audit.
 - **[`docs/SECURITY_AND_CRYPTOGRAPHY.md`](docs/SECURITY_AND_CRYPTOGRAPHY.md):** Mathematical proofs, combinatorial anonymity bounds, post-quantum hybrid combiners, and Kani/TLA+ invariants.
 - **[`docs/USER_AND_CLI_GUIDE.md`](docs/USER_AND_CLI_GUIDE.md):** Complete CLI flag reference and operational workflows for `parvault` and `parvault-seed`.
