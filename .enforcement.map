@@ -1,0 +1,37 @@
+# .enforcement.map: enforcement-coverage gates (run_enforcement_gates.sh, quota-aware-verified-swarm
+# skill, references/enforcement_gates.md). Register: docs/security/TRUST_FINDINGS.md.
+# kind     id        keys
+
+# --- No silent skips ------------------------------------------------------------------------------
+skips      K-1       path=tests/*.rs
+suite      S-DOCKER  test=docker_acceptance_gate::docker_acceptance_gate needs=docker
+
+# --- Artifact provenance (A-DOCKER: the gate copies from the build directory; convert before item 7)
+artifact   A-DOCKER  script=scripts/docker_acceptance_gate.sh bin=parvault suite=docker_acceptance_gate::docker_acceptance_gate
+open       A-DOCKER  expect=artifact by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+
+# --- Completeness ---------------------------------------------------------------------------------
+enum       E-WIRE    sym=src/network/behaviour.rs::MeshWireRequest
+open       E-WIRE    expect=completeness by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+adr        D-ADR     path=docs/adr/*.md
+open       D-ADR     expect=completeness by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+
+# --- Reach: checks that exist but are not called on the wire path ----------------------------------
+reach      F-03      sym=src/network/wot.rs::is_peer_trusted from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
+open       F-03      expect=reach by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+reach      F-05      sym=src/network/wot.rs::verify_and_admit_public_ticket from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
+open       F-05      expect=reach by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+reach      F-06      sym=src/por/verifier.rs::verify_audit_response from=src/cli/daemon.rs::run_daemon ref=docs/security/TRUST_FINDINGS.md
+open       F-06      expect=reach by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+reach      F-15      sym=src/bootstrap.rs::verify_weather_quorum from=src/bin/parvault-seed.rs::run_seed_listener_loop ref=docs/security/TRUST_FINDINGS.md
+open       F-15      expect=reach by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+
+# --- Not expressible with this skill snapshot (add when the kinds are available) -------------------
+# claim-missing: one per 2b check function until its pair exists. 2b adds real claim lines as each
+#   fix lands (F-01 guard, F-02a, F-02b, F-03, F-04, F-05, F-10a, F-10b, F-11, F-21, F-24 admission,
+#   F-25).
+# Findings with no line yet (no check function exists to name): F-07, F-08, F-09, F-12, F-17,
+#   F-18 (2c); F-22, F-23, F-26 (2c); F-24 issuer policy (2c).
+# kani / tla-mutant / no-blocking / xref: P-01 to P-05 (2d-beta).
+
+ratchet    R         open=7 waive=0
