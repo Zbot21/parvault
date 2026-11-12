@@ -41,6 +41,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tempfile::TempDir;
 
 /// Serialises cases that read or set the eviction-council environment variables.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -109,17 +110,12 @@ impl Peer {
     }
 }
 
-fn unique_dir(label: &str) -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+/// A fresh temp root, removed when the returned guard drops (on success and on panic).
+fn unique_dir(label: &str) -> TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("parvault-wire-eq-{label}-"))
+        .tempdir()
         .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "parvault-wire-eq-{label}-{}-{n}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 fn copy_dir(src: &Path, dst: &Path) {
@@ -136,8 +132,9 @@ fn copy_dir(src: &Path, dst: &Path) {
 }
 
 /// Builds every persisted secret once, so each role loads identical state from its copy.
-fn template(keys: &Keys) -> PathBuf {
-    let dir = unique_dir("template");
+fn template(keys: &Keys) -> TempDir {
+    let root = unique_dir("template");
+    let dir = root.path().to_path_buf();
     let genesis = keys.genesis.public_key_bytes();
     let _ = BlockStore::new(&dir, QuotaManager::new(512 * 1024 * 1024, 64 * 1024 * 1024)).unwrap();
     let _ = WebOfTrustRegistry::with_persistence_dir(genesis, 3, &dir);
@@ -146,7 +143,7 @@ fn template(keys: &Keys) -> PathBuf {
     let _ = HybridKemKeypair::load_or_generate_in_dir(&dir).unwrap();
     let _ = PrivacyPreservingEvictionEngine::load_or_init(&dir).unwrap();
     let _ = PublicTrackerTakedownQueue::load_or_init(&dir).unwrap();
-    dir
+    root
 }
 
 struct Fx {
@@ -167,11 +164,14 @@ struct Fx {
     takedown: PublicTrackerTakedownQueue,
     admin_pk: [u8; 32],
     max_lease: u64,
+    /// Owns `dir`; declared last so the fixture's state drops before the directory is removed.
+    _root: TempDir,
 }
 
 impl Fx {
     fn new(role: Role, keys: &Keys, tpl: &Path, label: &str) -> Self {
-        let dir = unique_dir(&format!("{label}-{role:?}"));
+        let root = unique_dir(&format!("{label}-{role:?}"));
+        let dir = root.path().to_path_buf();
         copy_dir(tpl, &dir);
         let genesis = keys.genesis.public_key_bytes();
         let store =
@@ -209,6 +209,7 @@ impl Fx {
             takedown: PublicTrackerTakedownQueue::load_or_init(&dir).unwrap(),
             admin_pk: keys.admin.public_key_bytes(),
             max_lease: SEED_DEFAULT_LEASE_LIMIT,
+            _root: root,
             store,
             server,
             dir,
@@ -389,7 +390,7 @@ impl Trio {
         let tpl = template(&keys);
         let fx = ROLES
             .iter()
-            .map(|r| Fx::new(*r, &keys, &tpl, label))
+            .map(|r| Fx::new(*r, &keys, tpl.path(), label))
             .collect();
         Self { keys, fx }
     }
@@ -1600,7 +1601,8 @@ const DAEMON_TRUSTS_GENESIS: bool = true;
 /// `block_store.clone()`. Rows 8 and 9 rely on both acting on the same store.
 #[test]
 fn seed_server_shares_the_handler_store() {
-    let dir = unique_dir("shared");
+    let root = unique_dir("shared");
+    let dir = root.path().to_path_buf();
     let store =
         BlockStore::new(&dir, QuotaManager::new(64 * 1024 * 1024, 8 * 1024 * 1024)).unwrap();
     let owner = HybridPqSigningKeypair::generate().unwrap();
