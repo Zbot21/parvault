@@ -18,6 +18,10 @@ done
 
 SOC_VOL_NAME="parvault-soc-nas-vol"
 
+# v0.5.0 ring admission: every container shares one ring genesis (fresh per gate run), so the
+# nodes, the seed and the clients admit each other.
+RING_GENESIS_SEED_HEX="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+
 cleanup() {
     if [ "${KEEP_CONTAINERS:-0}" != "1" ]; then
         docker rm -f "${CONTAINERS[@]}" >/dev/null 2>&1 || true
@@ -74,6 +78,7 @@ NODE11_MULTIADDR="/ip4/172.28.0.21/tcp/4001"
 
 echo "=== [3/12] Starting parvault-seed-0 + 11 parvault daemon containers + 1 isolated client container ==="
 docker run -d --name parvault-seed-0 \
+    -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     --network parvault-acceptance-net --ip 172.28.0.10 \
     parvault:acceptance \
     /usr/local/bin/parvault-seed \
@@ -86,6 +91,7 @@ docker run -d --name parvault-seed-0 \
 for i in $(seq 1 11); do
     IP="172.28.0.$((10 + i))"
     docker run -d --name "parvault-node-$i" \
+        -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
         --network parvault-acceptance-net --ip "$IP" \
         -w /var/lib/parvault \
         parvault:acceptance \
@@ -97,6 +103,7 @@ done
 
 # Start isolated client container with ZERO volume mounts
 docker run -d --name parvault-client \
+    -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     --network parvault-acceptance-net --ip 172.28.0.50 \
     parvault:acceptance \
     sleep 3600
@@ -364,6 +371,7 @@ echo "Total parvault:router-soc (FROM scratch) image size : ${ROUTER_SOC_IMAGE_S
 
 # Start a live `parvault:router-soc` appliance container constrained to --memory=48m --memory-swap=48m
 docker run -d --name parvault-router-soc \
+    -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     --network parvault-acceptance-net --ip 172.28.0.60 \
     --memory=48m --memory-swap=48m \
     parvault:router-soc
@@ -398,6 +406,7 @@ SOC_EXPECTED_SHA256="$(docker run --rm -v "$SOC_VOL_NAME:/mnt/nas" parvault:acce
 ')"
 
 SOC_STORE_OUT="$(docker run --name parvault-soc-store \
+    -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     --network parvault-acceptance-net \
     --memory=48m --memory-swap=48m \
     -v "$SOC_VOL_NAME:/mnt/nas" \
@@ -423,6 +432,7 @@ SOC_KEY="$(echo "$SOC_STORE_OUT" | awk '/Master Key/ {print $5}')"
 docker run --rm -v "$SOC_VOL_NAME:/mnt/nas" parvault:acceptance rm -rf /mnt/nas/store-data
 
 SOC_RESTORE_OUT="$(docker run --name parvault-soc-restore \
+    -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     --network parvault-acceptance-net \
     --memory=48m --memory-swap=48m \
     -v "$SOC_VOL_NAME:/mnt/nas" \
