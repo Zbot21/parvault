@@ -1,8 +1,11 @@
 //! Characterisation suite for the inbound wire handlers (`network::wire_handler`).
 //!
-//! Pins today's behaviour of the `parvault` daemon handler and the `parvault-seed` handler
-//! (homelab-vault and public-bootstrapper modes) for every `MeshWireRequest` variant and branch,
-//! so the handlers can be merged into one shared implementation without a behaviour change.
+//! Pins the behaviour of the shared handler for the `parvault` daemon and the `parvault-seed`
+//! handler (homelab-vault and public-bootstrapper modes) for every `MeshWireRequest` variant and
+//! branch. Item 2a used it to merge the two handlers without a behaviour change; since item 2b it
+//! also pins the v0.5.0 trust rules where they touch the handler (admission, owner rule, ticket
+//! binding, handshake refusal text), each change justified in its commit message. The wire-level
+//! claims for those rules live in `tests/trust_enforcement.rs`.
 //!
 //! Each case runs the same request on three fixtures built from one template directory (same
 //! keys and secrets) and compares the full response, the full data-directory tree (path, length,
@@ -732,14 +735,14 @@ fn handshake_wot() {
     let pk = peer.ident.public_key_bytes();
     t.each(|fx, k| fx.ban(k, EvictionTarget::PeerOrIssuerPubkey(pk)));
     let o = t.run(&peer, &good);
-    // F-28: a blocked peer gets the same fixed text as any other refused handshake.
+    // F-30: a blocked peer gets the same fixed text as any other refused handshake.
     assert!(
         o[0].resp.contains("accepted: false") && o[0].resp.contains("handshake refused"),
         "{}",
         o[0].resp
     );
     assert_identical(&o);
-    // F-28: the handshake is not a quarantine oracle. A forged hop (rogue inviter) for a
+    // F-30: the handshake is not a quarantine oracle. A forged hop (rogue inviter) for a
     // quarantined key and for an ordinary key gets the same response on every role.
     let quarantined = Peer::new(0x54, "198.51.100.32");
     let ordinary = Peer::new(0x55, "198.51.100.33");
@@ -2218,4 +2221,19 @@ fn admit_public_ticket() {
     let o = t.run(&other, &MeshWireRequest::AdmitPublicTicket(foreign));
     assert!(o[0].resp.contains("admitted: false"), "{}", o[0].resp);
     assert_identical(&o);
+    // State, not only text: the sender gains nothing and no admission IP is recorded for it.
+    let other_pk = other.ident.public_key_bytes();
+    assert!(o[0].changed.is_empty(), "{:?}", o[0].changed);
+    for fx in &t.fx {
+        assert!(
+            !fx.wot.is_peer_trusted(&other_pk),
+            "{:?}: sender not admitted",
+            fx.role
+        );
+        assert!(
+            fx.admitted_at(other.ip).is_empty(),
+            "{:?}: no admission IP",
+            fx.role
+        );
+    }
 }

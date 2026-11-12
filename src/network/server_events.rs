@@ -41,7 +41,7 @@ type RecordIdentity = (Vec<u8>, u64);
 /// What the Kademlia record decision needs to know (F-10b).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KadRecordFacts {
-    /// The record's source was admitted on this node (handshake or ticket accepted, F-29).
+    /// The record's source was admitted on this node (handshake or ticket accepted, F-31).
     pub source_admitted: bool,
     /// The inbound record, if it is a self-consistent signed DHT envelope for its key.
     pub candidate: Option<RecordIdentity>,
@@ -97,7 +97,7 @@ pub type MeshSwarmEvent = SwarmEvent<MeshNetworkBehaviourEvent>;
 pub struct ServerSwarmEvents {
     peer_remote_addrs: HashMap<String, Multiaddr>,
     log_mdns_discoveries: bool,
-    /// Peers whose handshake or ticket this node accepted since start (F-11 routing, F-29
+    /// Peers whose handshake or ticket this node accepted since start (F-11 routing, F-31
     /// Kademlia records). In memory: a peer handshakes again after a restart.
     admitted_peers: std::collections::HashSet<libp2p::PeerId>,
 }

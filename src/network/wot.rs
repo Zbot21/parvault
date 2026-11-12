@@ -21,19 +21,19 @@ pub const MAX_SEEN_SLASHING_NONCES: usize = 65_536;
 /// Maximum number of probationary Public Commons peer tickets retained in bounded RAM.
 pub const MAX_PUBLIC_COMMONS_PEERS: usize = 65_536;
 
-/// How many keys one member (not the genesis) may sub-invite (F-30).
+/// How many keys one member (not the genesis) may sub-invite (F-32).
 pub const MAX_SUBINVITES_PER_INVITER: usize = 64;
 
-/// How many delegation chains a node keeps (F-30).
+/// How many delegation chains a node keeps (F-32).
 pub const MAX_ADMITTED_CHAINS: usize = 65_536;
 
-/// How long a public-commons ticket admission lasts (F-27): 24 hours from the ticket's timestamp.
+/// How long a public-commons ticket admission lasts (F-29): 24 hours from the ticket's timestamp.
 pub const PUBLIC_COMMONS_ADMISSION_TTL_MS: u64 = 24 * 3600 * 1000;
 
-/// How far a ticket's timestamp may be from the verifier's clock (F-27).
+/// How far a ticket's timestamp may be from the verifier's clock (F-29).
 pub const TICKET_FRESHNESS_WINDOW_MS: u64 = 10 * 60 * 1000;
 
-/// Ticket admissions allowed per source subnet: a burst of 8, then 8 per minute (F-27).
+/// Ticket admissions allowed per source subnet: a burst of 8, then 8 per minute (F-29).
 pub const TICKET_ADMISSIONS_PER_SUBNET_BURST: u64 = 8;
 
 /// The number of source subnets whose ticket rate is tracked at once.
@@ -156,7 +156,7 @@ pub type WotError = WebOfTrustError;
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PublicCommonsTicket {
     pub peer_pubkey: [u8; 32],
-    /// The node this ticket is for (F-27): a ticket admits its key at one verifier only.
+    /// The node this ticket is for (F-29): a ticket admits its key at one verifier only.
     pub verifier_pubkey: [u8; 32],
     pub timestamp_ms: u64,
     pub pow_bits: u8,
@@ -408,7 +408,7 @@ impl SubnetTicketBudget {
     }
 }
 
-/// What [`WebOfTrustRegistry::chain_admission_decision`] needs to know (F-30).
+/// What [`WebOfTrustRegistry::chain_admission_decision`] needs to know (F-32).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChainAdmissionFacts {
     /// The leaf's inviter (the last hop's signer) is the genesis.
@@ -582,10 +582,10 @@ pub struct WebOfTrustRegistry {
     /// startup (not persisted).
     #[serde(skip)]
     protected_keys: HashSet<[u8; 32]>,
-    /// Admission changes not yet written (F-27, F-30): admissions are flushed in batches.
+    /// Admission changes not yet written (F-29, F-32): admissions are flushed in batches.
     #[serde(skip)]
     dirty: bool,
-    /// Ticket admissions per source subnet (F-27), not persisted.
+    /// Ticket admissions per source subnet (F-29), not persisted.
     #[serde(skip)]
     ticket_rate: HashMap<String, SubnetTicketBudget>,
     /// Capacity of `public_commons_peers` (defaults to `MAX_PUBLIC_COMMONS_PEERS`).
@@ -735,7 +735,7 @@ impl WebOfTrustRegistry {
         self.seen_slashing_nonces.len()
     }
 
-    /// The public-commons admission decision (F-05, F-27) for a ticket presented on the wire.
+    /// The public-commons admission decision (F-05, F-29) for a ticket presented on the wire.
     pub fn public_ticket_decision(facts: &TicketFacts) -> Result<(), &'static str> {
         if !facts.public_commons_allowed {
             return Err("reject.public_commons_disabled");
@@ -878,7 +878,7 @@ impl WebOfTrustRegistry {
         }
 
         // Links and signatures first: quarantine state is consulted only for a chain that is
-        // otherwise valid, so a forged probe cannot learn whether a key is quarantined (F-28).
+        // otherwise valid, so a forged probe cannot learn whether a key is quarantined (F-30).
         for (idx, hop) in chain.hops.iter().enumerate() {
             if idx > 0 && hop.inviter_pubkey != chain.hops[idx - 1].invitee_pubkey {
                 return Err(WebOfTrustError::BrokenChainLink(idx));
@@ -895,7 +895,7 @@ impl WebOfTrustRegistry {
         }
 
         let leaf = chain.leaf_pubkey().expect("checked non-empty");
-        // Re-sending the chain already on record is a no-op that writes nothing (F-30).
+        // Re-sending the chain already on record is a no-op that writes nothing (F-32).
         if self.admitted_chains.get(&leaf) == Some(chain) {
             return Ok(leaf);
         }
@@ -923,7 +923,7 @@ impl WebOfTrustRegistry {
         Ok(leaf)
     }
 
-    /// Bounds chain admissions (F-30): a member (not the genesis) may sub-invite at most
+    /// Bounds chain admissions (F-32): a member (not the genesis) may sub-invite at most
     /// `MAX_SUBINVITES_PER_INVITER` keys, and the store holds at most `capacity` chains. When
     /// full, new leaves are refused; admitted chains are never evicted.
     pub fn chain_admission_decision(facts: &ChainAdmissionFacts) -> Result<(), &'static str> {
@@ -957,13 +957,13 @@ impl WebOfTrustRegistry {
             return Err(WotError::InsufficientPublicPow);
         }
 
-        // Already admitted: a cheap no-op that writes nothing (F-27).
+        // Already admitted: a cheap no-op that writes nothing (F-29).
         if self.is_private_ring_peer(&ticket.peer_pubkey)
             || self.public_commons_peers.contains_key(&ticket.peer_pubkey)
         {
             return Ok(());
         }
-        // Full: expired admissions make room; a live admission is never evicted (F-27).
+        // Full: expired admissions make room; a live admission is never evicted (F-29).
         if self.public_commons_peers.len() >= self.public_commons_capacity() {
             self.prune_expired_public_commons(now_unix_ms());
         }
@@ -1192,7 +1192,7 @@ impl WebOfTrustRegistry {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn f30_subinvites_and_chain_store_are_bounded() {
+    fn f32_subinvites_and_chain_store_are_bounded() {
         let genesis = NodeIdentity::from_seed([0x47; 32]);
         let member = NodeIdentity::from_seed([0x48; 32]);
         let mut reg = WebOfTrustRegistry::new(genesis.public_key_bytes(), 3);
@@ -1279,7 +1279,7 @@ mod tests {
     }
 
     #[test]
-    fn f27_resent_ticket_is_a_no_op_that_writes_nothing() {
+    fn f29_resent_ticket_is_a_no_op_that_writes_nothing() {
         let mut reg = public_registry(10);
         let me = NodeIdentity::from_seed([0x61; 32]);
         let verifier = [0x22; 32];
@@ -1309,7 +1309,7 @@ mod tests {
     }
 
     #[test]
-    fn f27_ticket_rules() {
+    fn f29_ticket_rules() {
         let verifier = [0x22; 32];
         let now = 1_800_000_000_000;
         let facts = |reg: &mut WebOfTrustRegistry, seed: u8, ts: u64, v: [u8; 32], subnet: &str| {
@@ -1349,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn f27_full_registry_refuses_and_never_evicts_a_live_admission() {
+    fn f29_full_registry_refuses_and_never_evicts_a_live_admission() {
         let mut reg = public_registry(2);
         let now = now_unix_ms();
         let verifier = [0x22; 32];
@@ -1685,7 +1685,7 @@ mod tests {
                 dir.path(),
             );
             wot.verify_and_admit_public_ticket(&ticket).unwrap();
-            // Admissions are written in batches (F-27): nothing is on disk until a flush.
+            // Admissions are written in batches (F-29): nothing is on disk until a flush.
             assert!(wot.has_pending_writes());
             wot.flush();
         }

@@ -322,7 +322,7 @@ pub(crate) async fn run_daemon(
                 }
             }
             _ = telemetry_interval.tick() => {
-                // Admissions are written in batches (F-27, F-30).
+                // Admissions are written in batches (F-29, F-32).
                 wot.flush();
                 let (used_b, max_b) = {
                     let q = block_store.quota();

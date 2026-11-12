@@ -50,8 +50,8 @@ claim      F-10a     sym=src/network/client.rs::dht_candidate_decision accept=tr
 claim      F-10b     sym=src/network/server_events.rs::kad_record_decision accept=trust_enforcement::f10b_signed_envelope_record_stored reject=trust_enforcement::f10b_unsigned_record_refused code=reject.dht_record_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md
 claim      F-11      sym=src/network/server_events.rs::kad_routing_decision accept=trust_enforcement::f11_admitted_peer_enters_routing_table reject=trust_enforcement::f11_unadmitted_peer_not_routed code=reject.kad_peer_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md
 claim      F-26      sym=src/por/verifier.rs::grant_owner_decision accept=trust_enforcement::f26_owner_reads_after_root_squat reject=trust_enforcement::f26_squatter_cannot_read_owner_shard code=reject.grant_owner_not_shard_owner bin=parvault ref=docs/security/TRUST_FINDINGS.md
-claim      F-27      sym=src/network/wot.rs::public_ticket_decision accept=trust_enforcement::f05_public_ticket_at_required_bits_admits reject=trust_enforcement::f27_stale_ticket_refused code=reject.ticket_stale bin=parvault ref=docs/security/TRUST_FINDINGS.md
-claim      F-29      sym=src/network/server_events.rs::kad_record_decision accept=trust_enforcement::f10b_signed_envelope_record_stored reject=trust_enforcement::f29_unadmitted_source_record_refused code=reject.dht_record_source_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md
+claim      F-29      sym=src/network/wot.rs::public_ticket_decision accept=trust_enforcement::f05_public_ticket_at_required_bits_admits reject=trust_enforcement::f29_stale_ticket_refused code=reject.ticket_stale bin=parvault ref=docs/security/TRUST_FINDINGS.md
+claim      F-31      sym=src/network/server_events.rs::kad_record_decision accept=trust_enforcement::f10b_signed_envelope_record_stored reject=trust_enforcement::f31_unadmitted_source_record_refused code=reject.dht_record_source_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md
 claim      F-21      sym=src/network/wot.rs::chain_leaf_decision accept=trust_enforcement::f21_handshake_own_chain_accepted reject=trust_enforcement::f21_handshake_chain_leaf_not_sender_refused code=reject.chain_leaf_not_sender bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::HandshakeWoT
 claim      F-24      sym=src/network/wire_handler.rs::admission_decision accept=trust_enforcement::f24_admitted_blinded_put_stored reject=trust_enforcement::f24_unadmitted_blinded_put_refused code=reject.peer_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-11-four-layer-shard-anonymization.md covers=MeshWireRequest::PutBlindedShard
 claim      F-24-ONION sym=src/network/wire_handler.rs::admission_decision accept=trust_enforcement::f24_admitted_onion_final_delivered reject=trust_enforcement::f24_unadmitted_onion_final_refused code=reject.peer_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::RelayPqOnionEnvelope
@@ -64,13 +64,13 @@ claim      F-25-DHT  sym=src/network/wire_handler.rs::admission_decision accept=
 # Findings with no line yet (no check function exists to name): F-07, F-08, F-09, F-12, F-17
 #   (2c); F-22, F-23, F-26 (2c); F-24 issuer policy (2c).
 
-claim      F-32      sym=src/por/verifier.rs::shard_delete_decision accept=trust_enforcement::f32_storer_deletes_its_shard reject=trust_enforcement::f32_other_key_cannot_delete_shard code=reject.delete_not_shard_owner bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::DeleteShard
+claim      F-36      sym=src/por/verifier.rs::shard_delete_decision accept=trust_enforcement::f36_storer_deletes_its_shard reject=trust_enforcement::f36_other_key_cannot_delete_shard code=reject.delete_not_shard_owner bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::DeleteShard
 # --- Deferred to 2c: declared claims whose pairs do not exist yet (expect=claim-missing) ------------
 claim      F-22      sym=src/network/wan_rendezvous.rs::register accept=trust_enforcement::f22_rendezvous_within_quota_stored reject=trust_enforcement::f22_rendezvous_over_quota_refused code=reject.rendezvous_quota bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::RegisterWanRendezvous
 open       F-22      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 claim      F-23      sym=src/storage/block_store.rs::renew_blinded_shard_lease accept=trust_enforcement::f23_capability_holder_renews reject=trust_enforcement::f23_stranger_renew_refused code=reject.renew_capability_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::RenewBlindedLease
 open       F-23      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
-claim      F-31      sym=src/network/wire_handler.rs::handle_mesh_wire_request accept=trust_enforcement::f31_admitted_originator_relayed reject=trust_enforcement::f31_relay_budget_exceeded_refused code=reject.onion_relay_budget bin=parvault ref=docs/security/TRUST_FINDINGS.md
-open       F-31      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+claim      F-33      sym=src/network/wire_handler.rs::handle_mesh_wire_request accept=trust_enforcement::f33_admitted_originator_relayed reject=trust_enforcement::f33_relay_budget_exceeded_refused code=reject.onion_relay_budget bin=parvault ref=docs/security/TRUST_FINDINGS.md
+open       F-33      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 
 ratchet    R         open=12 waive=0

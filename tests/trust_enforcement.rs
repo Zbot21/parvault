@@ -593,9 +593,9 @@ fn f05_public_ticket_one_bit_short_refused() {
     gate_ran("trust_enforcement::f05_public_ticket_one_bit_short_refused");
 }
 
-/// F-27 reject: a ticket at the required bits but 20 minutes old is refused (freshness window).
+/// F-29 reject: a ticket at the required bits but 20 minutes old is refused (freshness window).
 #[test]
-fn f27_stale_ticket_refused() {
+fn f29_stale_ticket_refused() {
     let node = spawn_public_daemon("f27-stale");
     let stranger = key(0xA6);
     let resp = send_as_stranger(
@@ -619,7 +619,7 @@ fn f27_stale_ticket_refused() {
         "{resp:?}"
     );
     assert_logged(&node, "reject.ticket_stale");
-    gate_ran("trust_enforcement::f27_stale_ticket_refused");
+    gate_ran("trust_enforcement::f29_stale_ticket_refused");
 }
 
 /// F-05 (CLI): a client without any chain stores a file on a public-commons daemon through
@@ -887,7 +887,7 @@ fn refused_put_keeps_por_session_key() {
     gate_ran("trust_enforcement::refused_put_keeps_por_session_key");
 }
 
-// --- F-32: owner-signed deletes ----------------------------------------------------------------------
+// --- F-36: owner-signed deletes ----------------------------------------------------------------------
 
 fn delete_req(signer: &NodeIdentity, sid: ShardId) -> MeshWireRequest {
     let (pub_, payload, sig) =
@@ -906,9 +906,9 @@ fn deleted(resp: &MeshWireResponse) -> bool {
     matches!(resp, MeshWireResponse::DeleteShardAck { deleted: true, .. })
 }
 
-/// F-32 accept: the key that stored a shard (no grant) deletes it.
+/// F-36 accept: the key that stored a shard (no grant) deletes it.
 #[test]
-fn f32_storer_deletes_its_shard() {
+fn f36_storer_deletes_its_shard() {
     let node = spawn_daemon("f32-a");
     let storer = key(0xE7);
     let (sid, bytes) = shard(0x47, 512);
@@ -919,12 +919,12 @@ fn f32_storer_deletes_its_shard() {
     )));
     let resp = send(&storer, &node, delete_req(&storer, sid));
     assert!(deleted(&resp), "{resp:?}");
-    gate_ran("trust_enforcement::f32_storer_deletes_its_shard");
+    gate_ran("trust_enforcement::f36_storer_deletes_its_shard");
 }
 
-/// F-32 reject: another admitted key's signed delete of that shard is refused.
+/// F-36 reject: another admitted key's signed delete of that shard is refused.
 #[test]
-fn f32_other_key_cannot_delete_shard() {
+fn f36_other_key_cannot_delete_shard() {
     let node = spawn_daemon("f32-r");
     let storer = key(0xE7);
     let other = key(0xE8);
@@ -937,7 +937,7 @@ fn f32_other_key_cannot_delete_shard() {
     let resp = send(&other, &node, delete_req(&other, sid));
     assert!(!deleted(&resp), "{resp:?}");
     assert_logged(&node, "reject.delete_not_shard_owner");
-    gate_ran("trust_enforcement::f32_other_key_cannot_delete_shard");
+    gate_ran("trust_enforcement::f36_other_key_cannot_delete_shard");
 }
 
 // --- F-02: repair grants -----------------------------------------------------------------------------
@@ -1356,7 +1356,7 @@ fn provision_process_genesis() {
     ONCE.call_once(|| std::env::set_var("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED)));
 }
 
-/// ADR-11 / QA B1: a ring member that originates a layered onion through a relay is neither
+/// F-27 (ADR-11): a ring member that originates a layered onion through a relay is neither
 /// admitted at nor identified to the relay (the originator path cannot present a credential,
 /// although one is reachable in this process); the relay's last hop to the target is admitted.
 #[test]
@@ -2046,18 +2046,18 @@ fn f11_unadmitted_peer_not_routed() {
     gate_ran("trust_enforcement::f11_unadmitted_peer_not_routed");
 }
 
-// --- F-29: inbound Kademlia records need an admitted source ----------------------------------------
+// --- F-31: inbound Kademlia records need an admitted source ----------------------------------------
 
-/// F-29 reject: the same valid signed record from a source that never handshook is refused.
+/// F-31 reject: the same valid signed record from a source that never handshook is refused.
 #[test]
-fn f29_unadmitted_source_record_refused() {
+fn f31_unadmitted_source_record_refused() {
     let node = spawn_daemon("f29-r");
     let dht_key = [0x5A; 32];
     let (record, _) = signed_record(dht_key);
     kad_put_as(&node, 0x9B, false, record);
     assert_logged(&node, "reject.dht_record_source_not_admitted");
     assert_eq!(kad_get(&node, dht_key.to_vec()), None);
-    gate_ran("trust_enforcement::f29_unadmitted_source_record_refused");
+    gate_ran("trust_enforcement::f31_unadmitted_source_record_refused");
 }
 
 // --- Client admission: backoff and re-handshake ----------------------------------------------------
@@ -2109,7 +2109,7 @@ fn client_rehandshakes_after_lost_admission() {
     gate_ran("trust_enforcement::client_rehandshakes_after_lost_admission");
 }
 
-// --- QA B2: joining a ring by invitation; no silent genesis ------------------------------------------
+// --- F-28: joining a ring by invitation; no silent genesis ------------------------------------------
 
 /// Runs `parvault --data-dir <dir> --no-lan-discovery <args>` with no ring genesis in the
 /// environment (unless `ring_env`).

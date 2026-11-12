@@ -577,7 +577,7 @@ pub fn device_cert_decision(
     }
 }
 
-/// The one refusal text for every failed handshake (F-28): the reason stays in the local log.
+/// The one refusal text for every failed handshake (F-30): the reason stays in the local log.
 pub const HANDSHAKE_REFUSED_TEXT: &str = "handshake refused";
 
 /// The local reason code for a failed handshake (never sent on the wire).

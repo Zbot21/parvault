@@ -51,7 +51,7 @@ pub fn grant_owner_decision(
     }
 }
 
-/// What the shard-delete decision needs to know (F-32).
+/// What the shard-delete decision needs to know (F-36).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardDeleteFacts {
     /// The owner of the grant the shard was stored with, if any.
@@ -63,7 +63,7 @@ pub struct ShardDeleteFacts {
 }
 
 /// A shard may be deleted by the owner of the grant it was stored with, or, without a grant, by
-/// the key that stored it (F-32).
+/// the key that stored it (F-36).
 pub fn shard_delete_decision(facts: &ShardDeleteFacts) -> Result<(), &'static str> {
     let allowed = match facts.grant_owner {
         Some(owner) => owner == facts.signer,
