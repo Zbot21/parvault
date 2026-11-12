@@ -71,5 +71,6 @@ Claim lines in `.enforcement.map` use the finding id, or the finding id with a s
 | F-03-SEED | F-03 on `parvault-seed`. |
 | F-10a | F-10, the DHT reader. |
 | F-10b | F-10, inbound Kademlia records. |
-| F-24-ONION | F-24 admission at onion final delivery (forwarding needs no admission). |
+| F-24-ONION | F-24 admission at onion final delivery, single-layer branch (forwarding needs no admission). |
+| F-24-LAYERED | F-24 admission at onion final delivery, layered branch (`open_final_target_pq`). |
 | F-25-DHT | F-25 admission for `PutDhtEnvelope`. |

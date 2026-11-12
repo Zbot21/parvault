@@ -953,6 +953,86 @@ fn onion_final(node: &Node, b: &Blinded, voucher_issuer: &NodeIdentity) -> MeshW
     }
 }
 
+/// A layered onion's inner envelope for `node` (the final-target branch, `open_final_target_pq`):
+/// sealed for a test relay, peeled here, and sent to `node` as the relay would.
+fn onion_layered_final(node: &Node, b: &Blinded, voucher_issuer: &NodeIdentity) -> MeshWireRequest {
+    let relay_kem = HybridKemKeypair::generate().unwrap();
+    let bundle = parvault::crypto::pqc::PqOnionFinalBundle {
+        blinded_id: b.id,
+        shard_bytes: b.bytes.clone(),
+        capability: b.cap,
+        voucher: AnonymousQuotaVoucher::mint(voucher_issuer, 8192),
+        current_epoch: 1,
+        lease_duration_epochs: 30,
+        delete_verifier: b.delete_verifier,
+    };
+    let layered = PqRelayedShardEnvelope::seal_layered_pq(
+        &relay_kem.public_key(),
+        "relay",
+        &node.kem_public(),
+        node.addr.clone(),
+        &bundle,
+        0,
+        0,
+    )
+    .unwrap();
+    let inner = layered
+        .peel_relay_hop_pq(&relay_kem)
+        .unwrap()
+        .inner_envelope;
+    MeshWireRequest::RelayPqOnionEnvelope {
+        target_peer_addr: None,
+        envelope: inner,
+        capability: b.cap,
+        voucher: AnonymousQuotaVoucher::mint(voucher_issuer, 8192),
+        current_epoch: 1,
+        lease_duration_epochs: 30,
+        delete_verifier: b.delete_verifier,
+    }
+}
+
+/// F-24 accept (layered final delivery): an admitted last hop delivers a layered onion.
+#[test]
+fn f24_admitted_layered_final_delivered() {
+    let node = spawn_daemon("f24l-a");
+    let relay = key(0xF6);
+    let resp = send(
+        &relay,
+        &node,
+        onion_layered_final(&node, &blinded(0x56, 512), &relay),
+    );
+    assert!(
+        matches!(
+            resp,
+            MeshWireResponse::RelayPqOnionAck {
+                delivered: true,
+                ..
+            }
+        ),
+        "{resp:?}"
+    );
+    gate_ran("trust_enforcement::f24_admitted_layered_final_delivered");
+}
+
+/// F-24 reject (layered final delivery): the same from a last hop without a chain is refused.
+#[test]
+fn f24_unadmitted_layered_final_refused() {
+    let node = spawn_daemon("f24l-r");
+    let relay = key(0xF6);
+    let resp = send_as_stranger(
+        &relay,
+        &node,
+        onion_layered_final(&node, &blinded(0x56, 512), &relay),
+    );
+    assert_eq!(
+        refusal_text(&resp).as_deref(),
+        Some(NOT_ADMITTED),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.peer_not_admitted");
+    gate_ran("trust_enforcement::f24_unadmitted_layered_final_refused");
+}
+
 /// F-24 accept (blinded put): an admitted sender with a voucher stores a blinded shard. The
 /// voucher is still self-certifying (issuer policy: 2c).
 #[test]
