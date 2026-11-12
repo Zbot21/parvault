@@ -1597,3 +1597,58 @@ fn wot_invite_and_install_chain() {
     assert_eq!(chain.hops[0].inviter_pubkey, genesis().public_key_bytes());
     gate_ran("trust_enforcement::wot_invite_and_install_chain");
 }
+
+// --- F-11: mDNS never feeds Kademlia; admission does ---------------------------------------------------
+
+/// Keeps a server-mode swarm for `ident` connected to `node` for a few seconds (long enough for
+/// protocol negotiation and Kademlia's routing decision).
+fn connect_server_peer(node: &Node, ident: &NodeIdentity) {
+    let addr: Multiaddr = node.addr.parse().unwrap();
+    let kp = ident.to_libp2p_keypair().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async move {
+        let mut sw = parvault::network::build_mesh_server_swarm(kp, false, false).unwrap();
+        sw.dial(addr).unwrap();
+        let until = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < until {
+            tokio::select! {
+                _ = sw.select_next_some() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+    });
+}
+
+fn routing_updated(node: &Node, peer: &PeerId) -> bool {
+    node.log_text()
+        .lines()
+        .any(|l| l.contains("Kademlia routing table updated") && l.contains(&peer.to_string()))
+}
+
+/// F-11 accept: a server-mode peer that is admitted enters the node's Kademlia routing table.
+#[test]
+fn f11_admitted_peer_enters_routing_table() {
+    let node = spawn_daemon("f11-a");
+    let member = key(0xB5);
+    let member_id = node_identity_libp2p_peer_id(&member).unwrap();
+    connect_server_peer(&node, &member);
+    assert!(accepted(&handshake(&member, &node, chain_for(&member))));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !routing_updated(&node, &member_id) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(routing_updated(&node, &member_id), "{}", node.log_text());
+    gate_ran("trust_enforcement::f11_admitted_peer_enters_routing_table");
+}
+
+/// F-11 reject: the same server-mode peer, never admitted, is not added.
+#[test]
+fn f11_unadmitted_peer_not_routed() {
+    let node = spawn_daemon("f11-r");
+    let stranger = key(0xB5);
+    let stranger_id = node_identity_libp2p_peer_id(&stranger).unwrap();
+    connect_server_peer(&node, &stranger);
+    assert_logged(&node, "reject.kad_peer_not_admitted");
+    assert!(!routing_updated(&node, &stranger_id), "{}", node.log_text());
+    gate_ran("trust_enforcement::f11_unadmitted_peer_not_routed");
+}

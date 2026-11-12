@@ -69,7 +69,7 @@ pub(crate) async fn run_daemon(
     let mut takedown_queue = PublicTrackerTakedownQueue::load_or_init(&cfg.data_dir)?;
     let mut server_events = ServerSwarmEvents::new(true);
 
-    let mut swarm = build_mesh_swarm(keypair, cfg.enable_quic)?;
+    let mut swarm = build_mesh_server_swarm(keypair, cfg.enable_quic, opts.lan_discovery_enabled)?;
     let tcp_addr: Multiaddr = cfg.listen_tcp.parse()?;
     swarm.listen_on(tcp_addr.clone())?;
 

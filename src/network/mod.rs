@@ -29,7 +29,7 @@ pub use discovery::{
 };
 pub use placement::{PeerTopologyMetrics, PlacementEngine, ShardPlacementPlan};
 pub use rate_limit::TokenBucketRateLimiter;
-pub use transport::{build_mesh_client_swarm, build_mesh_swarm};
+pub use transport::{build_mesh_client_swarm, build_mesh_server_swarm, build_mesh_swarm};
 pub use wan_rendezvous::*;
 pub use wot::{
     DelegationChain, InvitationHop, PublicCommonsTicket, SlashingEvidence, SlashingReason,

@@ -16,6 +16,25 @@ use libp2p::{mdns, Multiaddr, Swarm};
 use std::collections::HashMap;
 use tracing::{info, warn};
 
+/// The routing-table rule (F-11): mDNS never feeds Kademlia; admission does. A peer enters the
+/// table only when its handshake or public-commons ticket was accepted.
+pub fn kad_routing_decision(admitted: bool) -> Result<(), &'static str> {
+    if admitted {
+        Ok(())
+    } else {
+        Err("reject.kad_peer_not_admitted")
+    }
+}
+
+/// Whether `response` admitted its sender.
+fn admits_sender(response: &MeshWireResponse) -> bool {
+    matches!(
+        response,
+        MeshWireResponse::HandshakeAck { accepted: true, .. }
+            | MeshWireResponse::AdmitPublicTicketAck { admitted: true, .. }
+    )
+}
+
 /// (owner identity bytes, monotonic version) of a valid DHT envelope record.
 type RecordIdentity = (Vec<u8>, u64);
 
@@ -117,14 +136,27 @@ impl ServerSwarmEvents {
             SwarmEvent::Behaviour(MeshNetworkBehaviourEvent::Mdns(mdns::Event::Discovered(
                 list,
             ))) => {
+                // Logged only: mDNS never feeds the Kademlia routing table (F-11).
                 for (peer_id, multiaddr) in list {
                     if self.log_mdns_discoveries {
                         info!(%peer_id, %multiaddr, "Discovered LAN peer via mDNS");
                     }
-                    swarm
-                        .behaviour_mut()
-                        .kademlia
-                        .add_address(&peer_id, multiaddr);
+                }
+                None
+            }
+            SwarmEvent::Behaviour(MeshNetworkBehaviourEvent::Kademlia(
+                kad::Event::RoutingUpdated { peer, .. },
+            )) => {
+                info!(%peer, "Kademlia routing table updated");
+                None
+            }
+            SwarmEvent::Behaviour(MeshNetworkBehaviourEvent::Kademlia(
+                kad::Event::RoutablePeer { peer, .. }
+                | kad::Event::PendingRoutablePeer { peer, .. }
+                | kad::Event::UnroutablePeer { peer },
+            )) => {
+                if let Err(code) = kad_routing_decision(false) {
+                    info!(code, %peer, "peer not added to the Kademlia routing table");
                 }
                 None
             }
@@ -170,8 +202,13 @@ impl ServerSwarmEvents {
                 },
             )) => {
                 let peer_str = peer.to_string();
-                let remote_addr = self.peer_remote_addrs.get(&peer_str);
-                let response = on_request(&peer_str, remote_addr, request);
+                let remote_addr = self.peer_remote_addrs.get(&peer_str).cloned();
+                let response = on_request(&peer_str, remote_addr.as_ref(), request);
+                if let (Ok(()), Some(addr)) =
+                    (kad_routing_decision(admits_sender(&response)), remote_addr)
+                {
+                    swarm.behaviour_mut().kademlia.add_address(&peer, addr);
+                }
                 let _ = swarm
                     .behaviour_mut()
                     .req_resp
@@ -186,6 +223,15 @@ impl ServerSwarmEvents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kad_routing_requires_admission() {
+        assert_eq!(kad_routing_decision(true), Ok(()));
+        assert_eq!(
+            kad_routing_decision(false),
+            Err("reject.kad_peer_not_admitted")
+        );
+    }
 
     #[test]
     fn kad_record_decision_rules() {

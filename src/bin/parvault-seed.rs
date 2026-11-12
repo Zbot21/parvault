@@ -32,7 +32,7 @@ use parvault::{
         MasterKey, NodeIdentity,
     },
     network::{
-        build_mesh_swarm, derive_4word_pairing_sas, extract_listen_port_and_ip,
+        build_mesh_server_swarm, derive_4word_pairing_sas, extract_listen_port_and_ip,
         open_public_tracker_card, resolve_zero_config_peers, KnownPeersStore, LanBeaconConfig,
         LanBeaconResponder, MeshClient, TrustPoolMode, WanRendezvousRegistry, WebOfTrustRegistry,
         DEFAULT_LAN_DISCOVERY_PORT, DEFAULT_LAN_PAIRING_NONCE, DEFAULT_PUBLIC_WOT_POW_BITS,
@@ -1806,7 +1806,8 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
     };
     let mut server_events = ServerSwarmEvents::new(false);
 
-    let mut swarm = build_mesh_swarm(keypair, false)?;
+    let mut swarm =
+        build_mesh_server_swarm(keypair, false, resolve_seed_lan_enabled(no_lan_discovery))?;
     let tcp_addr: Multiaddr = listen.parse()?;
     swarm.listen_on(tcp_addr.clone())?;
 

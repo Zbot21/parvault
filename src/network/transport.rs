@@ -13,7 +13,18 @@ pub fn build_mesh_swarm(
     keypair: libp2p::identity::Keypair,
     enable_quic: bool,
 ) -> anyhow::Result<Swarm<MeshNetworkBehaviour>> {
-    build_mesh_swarm_with_mdns(keypair, enable_quic, true)
+    build_mesh_server_swarm(keypair, enable_quic, true)
+}
+
+/// Builds a server swarm (Kademlia server mode). `enable_mdns` only controls LAN multicast
+/// discovery (off under `--no-lan-discovery`); it never changes the Kademlia mode. The routing
+/// table takes no automatic inserts: a peer is added when it is admitted (F-11).
+pub fn build_mesh_server_swarm(
+    keypair: libp2p::identity::Keypair,
+    enable_quic: bool,
+    enable_mdns: bool,
+) -> anyhow::Result<Swarm<MeshNetworkBehaviour>> {
+    build_swarm(keypair, enable_quic, enable_mdns, true)
 }
 
 /// Builds a lightweight client `libp2p::Swarm` for outbound RPCs without binding a multicast mDNS listener.
@@ -21,13 +32,14 @@ pub fn build_mesh_client_swarm(
     keypair: libp2p::identity::Keypair,
     enable_quic: bool,
 ) -> anyhow::Result<Swarm<MeshNetworkBehaviour>> {
-    build_mesh_swarm_with_mdns(keypair, enable_quic, false)
+    build_swarm(keypair, enable_quic, false, false)
 }
 
-fn build_mesh_swarm_with_mdns(
+fn build_swarm(
     keypair: libp2p::identity::Keypair,
     enable_quic: bool,
     enable_mdns: bool,
+    kad_server: bool,
 ) -> anyhow::Result<Swarm<MeshNetworkBehaviour>> {
     let builder = SwarmBuilder::with_existing_identity(keypair).with_tokio();
 
@@ -40,12 +52,12 @@ fn build_mesh_swarm_with_mdns(
     let swarm = if enable_quic {
         builder
             .with_quic()
-            .with_behaviour(|key| construct_behaviour(key, enable_mdns))?
+            .with_behaviour(|key| construct_behaviour(key, enable_mdns, kad_server))?
             .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
             .build()
     } else {
         builder
-            .with_behaviour(|key| construct_behaviour(key, enable_mdns))?
+            .with_behaviour(|key| construct_behaviour(key, enable_mdns, kad_server))?
             .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
             .build()
     };
@@ -56,6 +68,7 @@ fn build_mesh_swarm_with_mdns(
 fn construct_behaviour(
     key: &libp2p::identity::Keypair,
     enable_mdns: bool,
+    kad_server: bool,
 ) -> Result<MeshNetworkBehaviour, Box<dyn std::error::Error + Send + Sync>> {
     let local_peer_id = key.public().to_peer_id();
 
@@ -71,8 +84,12 @@ fn construct_behaviour(
     // F-10b: inbound records (and provider records) are handed to the application, which stores
     // a record only if it is a valid signed DHT envelope for its key (`server_events`).
     kad_config.set_record_filtering(kad::StoreInserts::FilterBoth);
+    if kad_server {
+        // F-11: connected or discovered peers never enter the routing table on their own.
+        kad_config.set_kbucket_inserts(kad::BucketInserts::Manual);
+    }
     let mut kademlia = kad::Behaviour::with_config(local_peer_id, store, kad_config);
-    kademlia.set_mode(Some(if enable_mdns {
+    kademlia.set_mode(Some(if kad_server {
         kad::Mode::Server
     } else {
         kad::Mode::Client
