@@ -41,6 +41,8 @@ type RecordIdentity = (Vec<u8>, u64);
 /// What the Kademlia record decision needs to know (F-10b).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KadRecordFacts {
+    /// The record's source was admitted on this node (handshake or ticket accepted, F-29).
+    pub source_admitted: bool,
     /// The inbound record, if it is a self-consistent signed DHT envelope for its key.
     pub candidate: Option<RecordIdentity>,
     /// The record already stored under that key, if any.
@@ -51,6 +53,9 @@ pub struct KadRecordFacts {
 /// replace another owner's record, and does not roll back its version (the same rules as the
 /// `ZeroTrustDhtStore` behind `PutDhtEnvelope`).
 pub fn kad_record_decision(facts: &KadRecordFacts) -> Result<(), &'static str> {
+    if !facts.source_admitted {
+        return Err("reject.dht_record_source_not_admitted");
+    }
     let Some((owner, version)) = &facts.candidate else {
         return Err("reject.dht_record_invalid");
     };
@@ -92,6 +97,9 @@ pub type MeshSwarmEvent = SwarmEvent<MeshNetworkBehaviourEvent>;
 pub struct ServerSwarmEvents {
     peer_remote_addrs: HashMap<String, Multiaddr>,
     log_mdns_discoveries: bool,
+    /// Peers whose handshake or ticket this node accepted since start (F-11 routing, F-29
+    /// Kademlia records). In memory: a peer handshakes again after a restart.
+    admitted_peers: std::collections::HashSet<libp2p::PeerId>,
 }
 
 impl ServerSwarmEvents {
@@ -100,6 +108,7 @@ impl ServerSwarmEvents {
         Self {
             peer_remote_addrs: HashMap::new(),
             log_mdns_discoveries,
+            admitted_peers: std::collections::HashSet::new(),
         }
     }
 
@@ -172,6 +181,7 @@ impl ServerSwarmEvents {
                         let store = swarm.behaviour_mut().kademlia.store_mut();
                         let existing = store.get(&record.key).and_then(|r| record_identity(&r));
                         let facts = KadRecordFacts {
+                            source_admitted: self.admitted_peers.contains(&source),
                             candidate: record_identity(&record),
                             existing,
                         };
@@ -204,10 +214,11 @@ impl ServerSwarmEvents {
                 let peer_str = peer.to_string();
                 let remote_addr = self.peer_remote_addrs.get(&peer_str).cloned();
                 let response = on_request(&peer_str, remote_addr.as_ref(), request);
-                if let (Ok(()), Some(addr)) =
-                    (kad_routing_decision(admits_sender(&response)), remote_addr)
-                {
-                    swarm.behaviour_mut().kademlia.add_address(&peer, addr);
+                if kad_routing_decision(admits_sender(&response)).is_ok() {
+                    self.admitted_peers.insert(peer);
+                    if let Some(addr) = remote_addr {
+                        swarm.behaviour_mut().kademlia.add_address(&peer, addr);
+                    }
                 }
                 let _ = swarm
                     .behaviour_mut()
@@ -237,6 +248,7 @@ mod tests {
     fn kad_record_decision_rules() {
         let facts =
             |candidate: Option<RecordIdentity>, existing: Option<RecordIdentity>| KadRecordFacts {
+                source_admitted: true,
                 candidate,
                 existing,
             };
@@ -259,6 +271,14 @@ mod tests {
         assert_eq!(
             kad_record_decision(&facts(a(1), a(2))),
             Err("reject.dht_record_rollback")
+        );
+        assert_eq!(
+            kad_record_decision(&KadRecordFacts {
+                source_admitted: false,
+                candidate: a(2),
+                existing: None,
+            }),
+            Err("reject.dht_record_source_not_admitted")
         );
     }
 }

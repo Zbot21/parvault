@@ -40,7 +40,7 @@ Status values:
 | F-26 | Low | First-wins grant registration lets an admitted holder of one shard squat a stripe root on other nodes (residual after F-02). | 2c | Read |
 | F-27 | High | Public-commons ticket admission amplifies: every accepted ticket rewrote the whole registry, a ticket was reusable (no freshness, not bound to the verifier), and a sybil could flush legitimate peers from the FIFO (QA 2b B4). | 2b | Read |
 | F-28 | Medium | The handshake was a quarantine oracle: quarantine was checked before signatures and the raw error was returned on the wire (QA candidate 1). | 2b | Fixed (QA pending): chain verified before quarantine; one fixed refusal text ("handshake refused"), code in the local log |
-| F-29 | Medium | Inbound Kademlia `PutRecord` had no admission check, a route around F-25-DHT (QA candidate 2). | 2b | Read |
+| F-29 | Medium | Inbound Kademlia `PutRecord` had no admission check, a route around F-25-DHT (QA candidate 2). | 2b | Fixed (QA pending): `kad_record_decision` requires an admitted source, claim F-29 |
 | F-30 | Medium | An admitted member could sub-invite unlimited keys, `admitted_chains` was unbounded and rewritten in full on every handshake (QA candidate 3). | 2b | Read |
 | F-31 | Medium | Onion forwarding is an open relay for unadmitted originators (pre-existing; accepted in the verdict; an amplification vector). A per-source relay budget is planned. | 2c | Read |
 

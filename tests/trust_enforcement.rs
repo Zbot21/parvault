@@ -1555,8 +1555,16 @@ fn kad_query(
     })
 }
 
-fn kad_put(node: &Node, record: kad::Record) {
-    let result = kad_query(node, 0x9B, move |sw| {
+/// Raw Kademlia PUT from the key `seed`; `admitted` first handshakes that key with the node.
+fn kad_put_as(node: &Node, seed: u8, admitted: bool, record: kad::Record) {
+    if admitted {
+        assert!(accepted(&handshake(
+            &key(seed),
+            node,
+            chain_for(&key(seed))
+        )));
+    }
+    let result = kad_query(node, seed, move |sw| {
         sw.behaviour_mut()
             .kademlia
             .put_record(record, kad::Quorum::One)
@@ -1581,15 +1589,20 @@ fn kad_get(node: &Node, key: Vec<u8>) -> Option<Vec<u8>> {
     }
 }
 
-/// F-10b accept: a raw Kademlia PUT of a valid signed envelope at its own key is stored.
+fn signed_record(dht_key: [u8; 32]) -> (kad::Record, Vec<u8>) {
+    let signer = key(0x9D);
+    let env = DhtWireEnvelope::VaultCatalog(squat_catalog(&signer, dht_key, 3));
+    let value = bincode::serialize(&env).unwrap();
+    (kad::Record::new(dht_key.to_vec(), value.clone()), value)
+}
+
+/// F-10b accept: an admitted source's raw Kademlia PUT of a valid signed envelope is stored.
 #[test]
 fn f10b_signed_envelope_record_stored() {
     let node = spawn_daemon("f10b-a");
-    let signer = key(0x9D);
     let dht_key = [0x5A; 32];
-    let env = DhtWireEnvelope::VaultCatalog(squat_catalog(&signer, dht_key, 3));
-    let value = bincode::serialize(&env).unwrap();
-    kad_put(&node, kad::Record::new(dht_key.to_vec(), value.clone()));
+    let (record, value) = signed_record(dht_key);
+    kad_put_as(&node, 0x9B, true, record);
     assert_eq!(
         kad_get(&node, dht_key.to_vec()),
         Some(value),
@@ -1604,8 +1617,10 @@ fn f10b_signed_envelope_record_stored() {
 fn f10b_unsigned_record_refused() {
     let node = spawn_daemon("f10b-r");
     let dht_key = [0x5A; 32];
-    kad_put(
+    kad_put_as(
         &node,
+        0x9B,
+        true,
         kad::Record::new(dht_key.to_vec(), b"unsigned junk".to_vec()),
     );
     assert_logged(&node, "reject.dht_record_invalid");
@@ -1768,4 +1783,18 @@ fn f11_unadmitted_peer_not_routed() {
     assert_logged(&node, "reject.kad_peer_not_admitted");
     assert!(!routing_updated(&node, &stranger_id), "{}", node.log_text());
     gate_ran("trust_enforcement::f11_unadmitted_peer_not_routed");
+}
+
+// --- F-29: inbound Kademlia records need an admitted source ----------------------------------------
+
+/// F-29 reject: the same valid signed record from a source that never handshook is refused.
+#[test]
+fn f29_unadmitted_source_record_refused() {
+    let node = spawn_daemon("f29-r");
+    let dht_key = [0x5A; 32];
+    let (record, _) = signed_record(dht_key);
+    kad_put_as(&node, 0x9B, false, record);
+    assert_logged(&node, "reject.dht_record_source_not_admitted");
+    assert_eq!(kad_get(&node, dht_key.to_vec()), None);
+    gate_ran("trust_enforcement::f29_unadmitted_source_record_refused");
 }
