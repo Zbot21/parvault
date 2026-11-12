@@ -99,86 +99,18 @@ pub(crate) async fn run_daemon(
     let (mut bound_tcp_port, init_explicit_ip) =
         extract_listen_port_and_ip(&tcp_addr).unwrap_or((4001, None));
 
-    let beacon_handle = if opts.lan_discovery_enabled {
-        let (used, max_b) = {
-            let q = block_store.quota();
-            let g = q.lock().expect("quota lock");
-            (g.used_storage_bytes(), g.max_storage_bytes())
-        };
-        let beacon_cfg = LanBeaconConfig::new(node_label.clone(), beacon_role, bound_tcp_port)
-            .with_discovery_port(opts.lan_discovery_port)
-            .with_explicit_listen_ip(init_explicit_ip)
-            .with_available_bytes(max_b.saturating_sub(used))
-            .with_owner_pq_fingerprint(Some(pq_fp.clone()))
-            .with_pairing_sas_commitment(Some(sas.commitment));
-        match LanBeaconResponder::spawn(node_identity.clone(), beacon_cfg) {
-            Ok(h) => {
-                info!(
-                    port = opts.lan_discovery_port,
-                    role = beacon_role,
-                    "LAN Beacon Responder active on UDP"
-                );
-                Some(h)
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to bind LAN Beacon Responder; continuing without LAN UDP beacon");
-                None
-            }
-        }
-    } else {
-        None
+    let local = DaemonLocal {
+        node_identity: &node_identity,
+        node_label: &node_label,
+        local_pid_str: &local_pid_str,
+        pq_fp: &pq_fp,
+        sas: &sas,
+        beacon_role,
     };
+    let beacon_handle = spawn_beacon(&opts, &block_store, local, bound_tcp_port, init_explicit_ip);
 
-    let status_state_and_handle = if let Some(ref bind_str) = opts.status_http_bind {
-        let sock_addr: SocketAddr = bind_str.parse()?;
-        let (used_b, max_b) = {
-            let q = block_store.quota();
-            let g = q.lock().expect("quota lock");
-            (g.used_storage_bytes(), g.max_storage_bytes())
-        };
-        let known_peers = KnownPeersStore::load(&cfg.data_dir);
-        let initial_lan_peers: Vec<RouterNasPeerEntry> = known_peers
-            .peers
-            .values()
-            .map(|r| RouterNasPeerEntry {
-                peer_id: r.libp2p_peer_id.clone(),
-                label: r.node_label.clone(),
-                role: r.role.clone(),
-                multiaddr: r.multiaddr.clone(),
-                available_bytes: r.available_bytes,
-            })
-            .collect();
-        let mut snap = RouterNasLiveSnapshot {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            node_label: node_label.clone(),
-            hardware_profile: cfg.hardware_profile.to_string(),
-            device_peer_id: node_identity.device_peer_id(),
-            libp2p_peer_id: local_pid_str.clone(),
-            owner_pq_fingerprint: pq_fp.clone(),
-            stripe_size_bytes: cfg.stripe_size_bytes,
-            watched_folder: opts.watch_folder.as_ref().map(|p| p.display().to_string()),
-            pairing_sas_code: Some(sas.code.clone()),
-            sla_tier: format!("{:?}", opts.sync_tier),
-            used_storage_bytes: used_b,
-            max_storage_bytes: max_b,
-            rss_kib: 0,
-            hwm_kib: 0,
-            uptime_secs: 0,
-            lan_peers: initial_lan_peers,
-        };
-        snap.update_telemetry(start_instant);
-        let shared = Arc::new(RwLock::new(snap));
-        let (bound_http, handle) =
-            RouterNasStatusServer::bind_and_spawn(sock_addr, shared.clone()).await?;
-        println!(
-            "[parvault] Embedded Status Server listening on http://{}",
-            bound_http
-        );
-        info!(%bound_http, "RouterNasStatusServer active");
-        Some((shared, handle))
-    } else {
-        None
-    };
+    let status_state_and_handle =
+        spawn_status_server(&opts, &cfg, &block_store, local, start_instant).await?;
 
     #[cfg(unix)]
     let builtin_vfs_requested = opts.vfs_webdav_listen.is_some()
@@ -300,50 +232,7 @@ pub(crate) async fn run_daemon(
         }
     }
 
-    if let Some(ref folder_path) = opts.watch_folder {
-        let _ = std::fs::create_dir_all(folder_path);
-        let sync_folder = folder_path.clone();
-        let sync_data_dir = cfg.data_dir.clone();
-        let sync_passphrase = cfg.device_sealing_passphrase.clone();
-        let sync_store = block_store.clone();
-        let sync_tier = opts.sync_tier;
-        let sync_interval = opts.sync_interval_secs.max(1);
-        info!(folder = %sync_folder.display(), interval_secs = sync_interval, "Starting background continuous folder sync");
-        tokio::spawn(async move {
-            let snap_path = sync_data_dir.join("appliance_folder_snapshot.manifest.bin");
-            loop {
-                let folder_cl = sync_folder.clone();
-                let data_dir_cl = sync_data_dir.clone();
-                let pass_cl = sync_passphrase.clone();
-                let store_cl = sync_store.clone();
-                let snap_cl = snap_path.clone();
-                let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                    let mk = resolve_master_key(&data_dir_cl, None, pass_cl.as_deref())?;
-                    let owner_id = NodeIdentity::from_master_key(&mk);
-                    let store_owner = if let Some(mc) = store_cl.mesh_client().cloned() {
-                        store_cl.with_mesh_client(mc.with_identity(owner_id.clone()))
-                    } else {
-                        store_cl
-                    };
-                    let mut engine = FolderSyncEngine::new(store_owner, mk, owner_id, sync_tier);
-                    if snap_cl.exists() {
-                        if let Ok(raw) = std::fs::read(&snap_cl) {
-                            if let Ok(prev) = bincode::deserialize::<FolderSnapshotManifest>(&raw) {
-                                engine.load_previous_snapshot(&prev);
-                            }
-                        }
-                    }
-                    let updated = engine.sync_folder_once(&folder_cl)?;
-                    if let Ok(bytes) = bincode::serialize(&updated) {
-                        let _ = BlockStore::atomic_write_file(&snap_cl, &bytes);
-                    }
-                    Ok(())
-                })
-                .await;
-                tokio::time::sleep(Duration::from_secs(sync_interval)).await;
-            }
-        });
-    }
+    spawn_folder_sync(&opts, &cfg, &block_store);
 
     let slash_topic = gossipsub::IdentTopic::new("parvault-wot-slashing");
     swarm.behaviour_mut().gossipsub.subscribe(&slash_topic)?;
@@ -528,6 +417,185 @@ pub(crate) async fn run_daemon(
     }
 
     Ok(())
+}
+
+/// Identity values of the running daemon shared by its setup phases.
+#[derive(Clone, Copy)]
+struct DaemonLocal<'a> {
+    node_identity: &'a NodeIdentity,
+    node_label: &'a String,
+    local_pid_str: &'a String,
+    pq_fp: &'a String,
+    sas: &'a parvault::network::LanPairingCode,
+    beacon_role: &'static str,
+}
+
+/// Starts the LAN beacon responder when LAN discovery is enabled.
+fn spawn_beacon(
+    opts: &DaemonLaunchOptions,
+    block_store: &BlockStore,
+    local: DaemonLocal<'_>,
+    bound_tcp_port: u16,
+    init_explicit_ip: Option<String>,
+) -> Option<parvault::network::LanBeaconHandle> {
+    let DaemonLocal {
+        node_identity,
+        node_label,
+        pq_fp,
+        sas,
+        beacon_role,
+        ..
+    } = local;
+    if opts.lan_discovery_enabled {
+        let (used, max_b) = {
+            let q = block_store.quota();
+            let g = q.lock().expect("quota lock");
+            (g.used_storage_bytes(), g.max_storage_bytes())
+        };
+        let beacon_cfg = LanBeaconConfig::new(node_label.clone(), beacon_role, bound_tcp_port)
+            .with_discovery_port(opts.lan_discovery_port)
+            .with_explicit_listen_ip(init_explicit_ip)
+            .with_available_bytes(max_b.saturating_sub(used))
+            .with_owner_pq_fingerprint(Some(pq_fp.clone()))
+            .with_pairing_sas_commitment(Some(sas.commitment));
+        match LanBeaconResponder::spawn(node_identity.clone(), beacon_cfg) {
+            Ok(h) => {
+                info!(
+                    port = opts.lan_discovery_port,
+                    role = beacon_role,
+                    "LAN Beacon Responder active on UDP"
+                );
+                Some(h)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to bind LAN Beacon Responder; continuing without LAN UDP beacon");
+                None
+            }
+        }
+    } else {
+        None
+    }
+}
+
+/// Starts the embedded router/NAS status HTTP server when `--status-http-bind` is set.
+async fn spawn_status_server(
+    opts: &DaemonLaunchOptions,
+    cfg: &NodeConfig,
+    block_store: &BlockStore,
+    local: DaemonLocal<'_>,
+    start_instant: Instant,
+) -> anyhow::Result<
+    Option<(
+        Arc<RwLock<RouterNasLiveSnapshot>>,
+        parvault::router_nas::RouterNasServerHandle,
+    )>,
+> {
+    let DaemonLocal {
+        node_identity,
+        node_label,
+        local_pid_str,
+        pq_fp,
+        sas,
+        ..
+    } = local;
+    Ok(if let Some(ref bind_str) = opts.status_http_bind {
+        let sock_addr: SocketAddr = bind_str.parse()?;
+        let (used_b, max_b) = {
+            let q = block_store.quota();
+            let g = q.lock().expect("quota lock");
+            (g.used_storage_bytes(), g.max_storage_bytes())
+        };
+        let known_peers = KnownPeersStore::load(&cfg.data_dir);
+        let initial_lan_peers: Vec<RouterNasPeerEntry> = known_peers
+            .peers
+            .values()
+            .map(|r| RouterNasPeerEntry {
+                peer_id: r.libp2p_peer_id.clone(),
+                label: r.node_label.clone(),
+                role: r.role.clone(),
+                multiaddr: r.multiaddr.clone(),
+                available_bytes: r.available_bytes,
+            })
+            .collect();
+        let mut snap = RouterNasLiveSnapshot {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            node_label: node_label.clone(),
+            hardware_profile: cfg.hardware_profile.to_string(),
+            device_peer_id: node_identity.device_peer_id(),
+            libp2p_peer_id: local_pid_str.clone(),
+            owner_pq_fingerprint: pq_fp.clone(),
+            stripe_size_bytes: cfg.stripe_size_bytes,
+            watched_folder: opts.watch_folder.as_ref().map(|p| p.display().to_string()),
+            pairing_sas_code: Some(sas.code.clone()),
+            sla_tier: format!("{:?}", opts.sync_tier),
+            used_storage_bytes: used_b,
+            max_storage_bytes: max_b,
+            rss_kib: 0,
+            hwm_kib: 0,
+            uptime_secs: 0,
+            lan_peers: initial_lan_peers,
+        };
+        snap.update_telemetry(start_instant);
+        let shared = Arc::new(RwLock::new(snap));
+        let (bound_http, handle) =
+            RouterNasStatusServer::bind_and_spawn(sock_addr, shared.clone()).await?;
+        println!(
+            "[parvault] Embedded Status Server listening on http://{}",
+            bound_http
+        );
+        info!(%bound_http, "RouterNasStatusServer active");
+        Some((shared, handle))
+    } else {
+        None
+    })
+}
+
+/// Starts the background continuous folder sync for `--watch-folder`.
+fn spawn_folder_sync(opts: &DaemonLaunchOptions, cfg: &NodeConfig, block_store: &BlockStore) {
+    if let Some(ref folder_path) = opts.watch_folder {
+        let _ = std::fs::create_dir_all(folder_path);
+        let sync_folder = folder_path.clone();
+        let sync_data_dir = cfg.data_dir.clone();
+        let sync_passphrase = cfg.device_sealing_passphrase.clone();
+        let sync_store = block_store.clone();
+        let sync_tier = opts.sync_tier;
+        let sync_interval = opts.sync_interval_secs.max(1);
+        info!(folder = %sync_folder.display(), interval_secs = sync_interval, "Starting background continuous folder sync");
+        tokio::spawn(async move {
+            let snap_path = sync_data_dir.join("appliance_folder_snapshot.manifest.bin");
+            loop {
+                let folder_cl = sync_folder.clone();
+                let data_dir_cl = sync_data_dir.clone();
+                let pass_cl = sync_passphrase.clone();
+                let store_cl = sync_store.clone();
+                let snap_cl = snap_path.clone();
+                let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let mk = resolve_master_key(&data_dir_cl, None, pass_cl.as_deref())?;
+                    let owner_id = NodeIdentity::from_master_key(&mk);
+                    let store_owner = if let Some(mc) = store_cl.mesh_client().cloned() {
+                        store_cl.with_mesh_client(mc.with_identity(owner_id.clone()))
+                    } else {
+                        store_cl
+                    };
+                    let mut engine = FolderSyncEngine::new(store_owner, mk, owner_id, sync_tier);
+                    if snap_cl.exists() {
+                        if let Ok(raw) = std::fs::read(&snap_cl) {
+                            if let Ok(prev) = bincode::deserialize::<FolderSnapshotManifest>(&raw) {
+                                engine.load_previous_snapshot(&prev);
+                            }
+                        }
+                    }
+                    let updated = engine.sync_folder_once(&folder_cl)?;
+                    if let Ok(bytes) = bincode::serialize(&updated) {
+                        let _ = BlockStore::atomic_write_file(&snap_cl, &bytes);
+                    }
+                    Ok(())
+                })
+                .await;
+                tokio::time::sleep(Duration::from_secs(sync_interval)).await;
+            }
+        });
+    }
 }
 
 pub(crate) struct WanAnnounceTaskConfig {
