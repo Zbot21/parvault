@@ -485,6 +485,7 @@ async fn main() -> anyhow::Result<()> {
                 NodeIdentity::load_or_generate_in_dir(&data_dir)?
             };
 
+            parvault::network::admission::install_process_source(&data_dir);
             let seed_peers =
                 if effective_peers.is_empty() && lan_enabled && !once && !in_memory_mode {
                     resolve_zero_config_peers(

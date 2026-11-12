@@ -905,3 +905,49 @@ fn repro_f01_gossip_evidence_quarantines_genesis() {
     );
     gate_ran("trust_enforcement::repro_f01_gossip_evidence_quarantines_genesis");
 }
+
+// --- Admission plumbing (bootstrap option A) ------------------------------------------------------
+
+/// `parvault wot invite` on a genesis holder prints a token; `parvault wot install-chain` on a
+/// node without the genesis stores it, and that node's client then holds a chain for its key.
+#[test]
+fn wot_invite_and_install_chain() {
+    let root = temp_root("wot-cli");
+    let holder = root.path().join("holder");
+    let invitee = root.path().join("invitee");
+    std::fs::create_dir_all(&invitee).unwrap();
+    let invitee_key = NodeIdentity::load_or_generate_in_dir(&invitee).unwrap();
+    let invite = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+        .env("PARVAULT_LAN_REGISTRY_DIR", root.path().join("reg"))
+        .arg("--data-dir")
+        .arg(&holder)
+        .args(["--no-lan-discovery", "wot", "invite", "--peer"])
+        .arg(hex::encode(invitee_key.public_key_bytes()))
+        .output()
+        .unwrap();
+    assert!(invite.status.success(), "{invite:?}");
+    let token = String::from_utf8(invite.stdout).unwrap().trim().to_string();
+    let install = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env_remove("PARVAULT_GENESIS_SEED_HEX")
+        .env("PARVAULT_LAN_REGISTRY_DIR", root.path().join("reg"))
+        .arg("--data-dir")
+        .arg(&invitee)
+        .args([
+            "--no-lan-discovery",
+            "wot",
+            "install-chain",
+            "--token",
+            &token,
+        ])
+        .output()
+        .unwrap();
+    assert!(install.status.success(), "{install:?}");
+    assert!(String::from_utf8_lossy(&install.stdout).contains("this node's key"));
+    let source = parvault::network::admission::AdmissionSource::from_data_dir(&invitee);
+    let chain = source
+        .credential_for(&invitee_key)
+        .expect("installed chain");
+    assert_eq!(chain.hops[0].inviter_pubkey, genesis().public_key_bytes());
+    gate_ran("trust_enforcement::wot_invite_and_install_chain");
+}

@@ -1,4 +1,22 @@
 use clap::{Parser, Subcommand, ValueEnum};
+
+/// `parvault wot` subcommands (ring admission, bootstrap option A).
+#[derive(Debug, Clone, Subcommand)]
+pub enum WotAction {
+    /// Print a chain token admitting `--peer` to this ring. Needs the ring genesis seed
+    /// (`PARVAULT_GENESIS_SEED_HEX` or `<data_dir>/genesis_root.seed`).
+    Invite {
+        /// The invitee's 32-byte Ed25519 public key (64 hex characters, from `parvault identity`).
+        #[arg(long)]
+        peer: String,
+    },
+    /// Install a chain token (from `parvault wot invite`) into `<data_dir>/wot_chains/`.
+    InstallChain {
+        /// The hex chain token.
+        #[arg(long)]
+        token: String,
+    },
+}
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -685,6 +703,12 @@ pub enum Commands {
         /// Keep local shard copies on disk after handoff (default: false — removes evacuated shards when `--handoff-to` is provided).
         #[arg(long, default_value_t = false)]
         keep_local: bool,
+    },
+    /// Ring admission (`ADR-05`): issue (`invite`) or install (`install-chain`) a Web-of-Trust
+    /// delegation chain. A node needs a chain for every key it stores data as.
+    Wot {
+        #[command(subcommand)]
+        action: WotAction,
     },
     /// Mint, offline-attenuate, and inspect `PARVAULT-MAC-V1:` capability macaroons (`ADR-32`).
     Token {

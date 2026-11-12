@@ -137,6 +137,7 @@ fn command_needs_network_discovery(cmd: &Commands) -> bool {
             | Commands::ListSnapshot { .. }
             | Commands::Scrub
             | Commands::Token { .. }
+            | Commands::Wot { .. }
             | Commands::Gateway { .. }
     )
 }
@@ -254,6 +255,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let cfg = NodeConfig::load_for_cli(cli.config.as_ref(), cli.data_dir.as_deref(), cli.profile)?;
+    parvault::network::admission::install_process_source(&cfg.data_dir);
 
     let lan_port = cfg.effective_lan_discovery_port(cli.lan_discovery_port);
     let lan_enabled = cfg.effective_lan_discovery_enabled(cli.no_lan_discovery);
@@ -267,6 +269,10 @@ async fn main() -> anyhow::Result<()> {
     // Handle `parvault init` first before pre-creating default keys so we can print initialization cleanly
     if matches!(cli.command, Commands::Init { .. }) {
         return cli::early::init(cfg, cli, external_addrs);
+    }
+
+    if let Commands::Wot { action } = cli.command {
+        return cli::wot::run(action, &cfg.data_dir);
     }
 
     if let Commands::Token { action } = cli.command {
@@ -347,7 +353,10 @@ async fn main() -> anyhow::Result<()> {
         },
     };
     match cli.command {
-        Commands::Init { .. } | Commands::Token { .. } | Commands::Gateway { .. } => {
+        Commands::Init { .. }
+        | Commands::Token { .. }
+        | Commands::Wot { .. }
+        | Commands::Gateway { .. } => {
             unreachable!("handled above")
         }
 

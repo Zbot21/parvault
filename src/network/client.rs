@@ -941,6 +941,9 @@ fn spawn_swarm_worker(
 /// Live `libp2p` Mesh Client (TCP + Noise XX + Yamux + Kademlia DHT + `/parvault/wire/1.0.0`)
 /// backed by a persistent background `Swarm` actor that reuses encrypted connections, enforces
 /// TOFU / explicit `PeerId` pinning, and records live RTT & topology telemetry.
+/// A (sender public key, peer address) pair that accepted this process's handshake.
+type AdmittedAt = ([u8; 32], String);
+
 #[derive(Clone, Debug)]
 pub struct MeshClient {
     identity: NodeIdentity,
@@ -958,6 +961,10 @@ pub struct MeshClient {
     peer_status_cache: Arc<Mutex<HashMap<String, CachedNodeStatus>>>,
     discovered_peers: Arc<Mutex<HashSet<String>>>,
     worker: Arc<Mutex<Option<SwarmWorkerHandle>>>,
+    /// Explicit admission source; `None` falls back to the process-wide one.
+    admission: Option<Arc<crate::network::admission::AdmissionSource>>,
+    /// (sender pubkey, peer address) pairs that accepted this process's handshake.
+    admitted_at: Arc<Mutex<HashSet<AdmittedAt>>>,
 }
 
 impl MeshClient {
@@ -998,6 +1005,48 @@ impl MeshClient {
             peer_status_cache: Arc::new(Mutex::new(HashMap::new())),
             discovered_peers: Arc::new(Mutex::new(HashSet::new())),
             worker: Arc::new(Mutex::new(None)),
+            admission: None,
+            admitted_at: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// Uses `source` for ring admission instead of the process-wide source.
+    pub fn with_admission(mut self, source: crate::network::admission::AdmissionSource) -> Self {
+        self.admission = Some(Arc::new(source));
+        self
+    }
+
+    /// Presents this identity's chain to `peer_addr` once, before the first request that needs an
+    /// admitted sender. Without a credential nothing is sent and the peer decides.
+    fn ensure_admitted(&self, peer_addr: &str) {
+        let key = (self.identity.public_key_bytes(), peer_addr.to_string());
+        if self
+            .admitted_at
+            .lock()
+            .map(|s| s.contains(&key))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let chain = match self.admission.as_deref() {
+            Some(source) => source.credential_for(&self.identity),
+            None => crate::network::admission::process_source()
+                .and_then(|source| source.credential_for(&self.identity)),
+        };
+        let Some(chain) = chain else {
+            return;
+        };
+        if let Ok(MeshWireResponse::HandshakeAck { accepted: true, .. }) = self.send_request(
+            peer_addr,
+            MeshWireRequest::HandshakeWoT {
+                chain,
+                asn: None,
+                region: None,
+            },
+        ) {
+            if let Ok(mut s) = self.admitted_at.lock() {
+                s.insert(key);
+            }
         }
     }
 
@@ -1361,6 +1410,9 @@ impl MeshClient {
         let trimmed = peer_addr.trim();
         if trimmed.is_empty() {
             return Err(MeshClientError::InvalidAddress("empty peer address".into()).into());
+        }
+        if crate::network::admission::requires_admitted_sender(&request) {
+            self.ensure_admitted(trimmed);
         }
 
         // If `trimmed` was already marked dead and we know a newer verified endpoint for the

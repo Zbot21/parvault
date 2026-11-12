@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod behaviour;
 pub mod client;
 pub mod discovery;

@@ -20,9 +20,11 @@ src/lib.rs                      full    # module tree, crate attrs, cfg(kani)
 src/main.rs                     test    gateway_bus_and_plugin_security
 src/main.rs                     test    sync_daemon_usability_and_cli_regression_tests
 src/main.rs                     test    zero_config_lan_and_router_soc_tests
+src/main.rs                     test    trust_enforcement
 src/cli/*                       test    gateway_bus_and_plugin_security
 src/cli/*                       test    sync_daemon_usability_and_cli_regression_tests
 src/cli/*                       test    zero_config_lan_and_router_soc_tests
+src/cli/*                       test    trust_enforcement
 src/config.rs                   full    # Cli, ErasureTier, stripe layout used crate-wide
 src/crypto/*                    full    # crypto paths
 src/os_sys.rs                   full    # sole unsafe FFI boundary; needs clippy
@@ -61,6 +63,7 @@ src/storage/*                   test    seed_server_integration
 src/storage/*                   test    sync_daemon_usability_and_cli_regression_tests
 src/storage/*                   test    vfs_lazy_stream
 src/storage/*                   test    zero_config_lan_and_router_soc_tests
+src/storage/*                   test    trust_enforcement
 src/storage/*                   test    zero_trust_adversarial
 src/storage/*                   test    wire_handler_equivalence
 src/storage/anonymity.rs        tla     specs/ParVaultAnonymity.tla
@@ -103,6 +106,7 @@ src/bootstrap.rs                test    sync_daemon_usability_and_cli_regression
 src/bootstrap.rs                test    tla_formal_proofs_integration
 src/bootstrap.rs                test    vfs_lazy_stream
 src/bootstrap.rs                test    zero_config_lan_and_router_soc_tests
+src/bootstrap.rs                test    trust_enforcement
 src/bootstrap.rs                test    zero_trust_adversarial
 src/bootstrap.rs                test    wire_handler_equivalence
 src/bootstrap.rs                tla     specs/ParVaultBootstrapAndEarnedTier.tla
@@ -136,6 +140,7 @@ src/sharding/*                  test    seed_server_integration
 src/sharding/*                  test    sync_daemon_usability_and_cli_regression_tests
 src/sharding/*                  test    vfs_lazy_stream
 src/sharding/*                  test    zero_config_lan_and_router_soc_tests
+src/sharding/*                  test    trust_enforcement
 src/sharding/*                  test    zero_trust_adversarial
 src/sharding/*                  test    wire_handler_equivalence
 src/sharding/*                  tla     specs/ParVaultProtocol.tla
@@ -166,6 +171,7 @@ src/por/*                       test    red_team_hardening_tests
 src/por/*                       test    seed_server_integration
 src/por/*                       test    sync_daemon_usability_and_cli_regression_tests
 src/por/*                       test    zero_config_lan_and_router_soc_tests
+src/por/*                       test    trust_enforcement
 src/por/*                       test    zero_trust_adversarial
 src/por/*                       test    wire_handler_equivalence
 src/por/*                       tla     specs/ParVaultProtocol.tla
@@ -180,6 +186,7 @@ src/network/*                   lib     network::client::
 src/network/*                   lib     network::discovery::
 src/network/*                   lib     network::wan_rendezvous::
 src/network/*                   lib     network::wot::
+src/network/*                   lib     network::admission::
 src/network/*                   lib     sharding::reed_solomon::
 src/network/*                   lib     storage::anonymity::
 src/network/*                   lib     storage::block_store::
@@ -192,6 +199,7 @@ src/network/*                   test    phase1_to_4_integration
 src/network/*                   test    red_team_hardening_tests
 src/network/*                   test    sync_daemon_usability_and_cli_regression_tests
 src/network/*                   test    zero_config_lan_and_router_soc_tests
+src/network/*                   test    trust_enforcement
 src/network/*                   test    zero_trust_adversarial
 src/network/*                   test    wire_handler_equivalence
 src/network/wot.rs              tla     specs/ParVaultProtocol.tla
@@ -218,6 +226,7 @@ src/gateway/*                   test    m3_dual_mode_vfs_and_gateway_sync
 src/gateway/*                   test    sync_daemon_usability_and_cli_regression_tests  # spawns main
 src/gateway/*                   test    vfs_lazy_stream
 src/gateway/*                   test    zero_config_lan_and_router_soc_tests            # spawns main
+src/gateway/*                   test    trust_enforcement
 src/gateway/engine.rs           kani    proof_pinned_ring_capacity_invariant
 src/gateway/ipc.rs              kani    proof_gateway_ipc_frame_header_bounds
 
@@ -241,6 +250,7 @@ src/capabilities.rs             test    m3_dual_mode_vfs_and_gateway_sync
 src/capabilities.rs             test    sync_daemon_usability_and_cli_regression_tests  # spawns main
 src/capabilities.rs             test    vfs_lazy_stream
 src/capabilities.rs             test    zero_config_lan_and_router_soc_tests            # spawns main
+src/capabilities.rs             test    trust_enforcement
 src/capabilities.rs             kani    proof_macaroon_peer_uid_and_compact_roundtrip
 src/capabilities.rs             kani    proof_macaroon_caveat_attenuation_monotonic_and_zero_key_rejected
 src/vfs.rs                      test    gateway_bus_and_plugin_security
@@ -248,6 +258,7 @@ src/vfs.rs                      test    m3_dual_mode_vfs_and_gateway_sync
 src/vfs.rs                      test    sync_daemon_usability_and_cli_regression_tests  # spawns main
 src/vfs.rs                      test    vfs_lazy_stream
 src/vfs.rs                      test    zero_config_lan_and_router_soc_tests            # spawns main
+src/vfs.rs                      test    trust_enforcement
 src/vfs.rs                      kani    proof_vfs_block_window_power_of_two_and_zero_bounds
 src/vfs.rs                      kani    proof_fuse_header_parser_no_panic
 src/sync.rs                     lib     admin_rpc::
@@ -272,6 +283,7 @@ src/sync.rs                     test    sync_daemon_usability_and_cli_regression
 src/sync.rs                     test    tla_formal_proofs_integration
 src/sync.rs                     test    vfs_lazy_stream
 src/sync.rs                     test    zero_config_lan_and_router_soc_tests            # spawns main
+src/sync.rs                     test    trust_enforcement
 src/sync.rs                     kani    proof_sanitize_sync_relative_path_no_traversal
 src/sync.rs                     tla     specs/ParVaultLiteClientAndSeedFailover.tla
 
@@ -280,6 +292,7 @@ src/admin_rpc.rs                lib     admin_rpc::
 src/admin_rpc.rs                test    gateway_ipc_benchmark                           # spawns parvault-seed
 src/admin_rpc.rs                test    sync_daemon_usability_and_cli_regression_tests  # spawns parvault-seed
 src/admin_rpc.rs                test    zero_config_lan_and_router_soc_tests            # spawns parvault-seed
+src/admin_rpc.rs                test    trust_enforcement
 src/admin_rpc.rs                kani    proof_admin_rpc_wire_frame_header_no_panic_or_unbounded_alloc
 src/admin_rpc.rs                kani    proof_admin_rpc_replay_window_challenge_and_zero_key_rejection
 src/admin_rpc.rs                tla     specs/ParVaultZeroKeyAdminAndQuorum.tla
@@ -290,11 +303,13 @@ src/router_nas.rs               test    gateway_bus_and_plugin_security         
 src/router_nas.rs               test    gateway_ipc_benchmark                           # spawns parvault-seed
 src/router_nas.rs               test    sync_daemon_usability_and_cli_regression_tests  # spawns main
 src/router_nas.rs               test    zero_config_lan_and_router_soc_tests
+src/router_nas.rs               test    trust_enforcement
 
 # --- Binaries (cargo builds every bin for any --test run) --------------------
 src/bin/parvault-seed.rs        test    gateway_ipc_benchmark
 src/bin/parvault-seed.rs        test    sync_daemon_usability_and_cli_regression_tests
 src/bin/parvault-seed.rs        test    zero_config_lan_and_router_soc_tests
+src/bin/parvault-seed.rs        test    trust_enforcement
 src/bin/parvault-seed.rs        tla     specs/ParVaultZeroKeyAdminAndQuorum.tla
 src/bin/parvault-sync.rs        test    m3_dual_mode_vfs_and_gateway_sync               # GatewayFolderSync; self-test not a map kind
 src/bin/parvault-fuse.rs        test    m3_dual_mode_vfs_and_gateway_sync
@@ -336,6 +351,8 @@ tests/vfs_lazy_stream.rs                                 test    vfs_lazy_stream
 tests/wire_handler_equivalence.rs                        test    wire_handler_equivalence
 tests/zero_config_lan_and_router_soc_tests.rs            test    zero_config_lan_and_router_soc_tests
 tests/zero_trust_adversarial.rs                          test    zero_trust_adversarial
+tests/trust_enforcement.rs                               test    trust_enforcement
+tests/docker_acceptance_gate.rs                          test    docker_acceptance_gate   # SKIPPED unless PARVAULT_DOCKER_GATE=1 or the enforcement runner
 
 # --- TLA+ specs: one spec per line; flags match verify_formal_proofs.sh ------
 specs/ParVaultProtocol.*                    tla     specs/ParVaultProtocol.tla
