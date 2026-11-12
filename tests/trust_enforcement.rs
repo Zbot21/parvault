@@ -2138,6 +2138,32 @@ fn out_text(out: &std::process::Output) -> String {
     )
 }
 
+/// How long a daemon that must refuse to start may run before the test fails.
+const REFUSAL_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Runs a `daemon start` that must refuse, and fails if it is still running at the deadline
+/// (a daemon that starts would otherwise keep the test waiting forever).
+fn refusal_output(cmd: &mut Command) -> std::process::Output {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() >= REFUSAL_DEADLINE {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "daemon did not refuse within {}s",
+                REFUSAL_DEADLINE.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    child.wait_with_output().unwrap()
+}
+
 /// An invitee joins by `wot invite` / `wot install-chain` (it never holds the genesis secret),
 /// runs as a server, stores a ring member's shard and refuses a stranger's.
 #[test]
@@ -2195,16 +2221,16 @@ fn invitee_serves_the_ring() {
 #[test]
 fn daemon_without_ring_refuses_to_start() {
     let root = temp_root("b2-fresh-daemon");
-    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
-        .env_remove("PARVAULT_GENESIS_SEED_HEX")
-        .env_remove("PARVAULT_GENESIS_PUBKEY_HEX")
-        .env("PARVAULT_LAN_REGISTRY_DIR", root.path().join("reg"))
-        .arg("--data-dir")
-        .arg(root.path().join("d"))
-        .args(["--no-lan-discovery", "daemon", "start", "--listen"])
-        .arg(format!("/ip4/127.0.0.1/tcp/{}", free_port()))
-        .output()
-        .unwrap();
+    let out = refusal_output(
+        Command::new(env!("CARGO_BIN_EXE_parvault"))
+            .env_remove("PARVAULT_GENESIS_SEED_HEX")
+            .env_remove("PARVAULT_GENESIS_PUBKEY_HEX")
+            .env("PARVAULT_LAN_REGISTRY_DIR", root.path().join("reg"))
+            .arg("--data-dir")
+            .arg(root.path().join("d"))
+            .args(["--no-lan-discovery", "daemon", "start", "--listen"])
+            .arg(format!("/ip4/127.0.0.1/tcp/{}", free_port())),
+    );
     let text = out_text(&out);
     assert!(!out.status.success(), "{text}");
     assert!(
@@ -2264,16 +2290,16 @@ fn conflicting_genesis_sources_refuse_to_start() {
     let root = temp_root("b2-conflict");
     let dir = root.path().join("n");
     assert!(parvault_cli(&dir, false, &["wot", "init"]).status.success());
-    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
-        .env("PARVAULT_GENESIS_PUBKEY_HEX", hex::encode([0x11u8; 32]))
-        .env_remove("PARVAULT_GENESIS_SEED_HEX")
-        .env("PARVAULT_LAN_REGISTRY_DIR", root.path().join("reg"))
-        .arg("--data-dir")
-        .arg(&dir)
-        .args(["--no-lan-discovery", "daemon", "start", "--listen"])
-        .arg(format!("/ip4/127.0.0.1/tcp/{}", free_port()))
-        .output()
-        .unwrap();
+    let out = refusal_output(
+        Command::new(env!("CARGO_BIN_EXE_parvault"))
+            .env("PARVAULT_GENESIS_PUBKEY_HEX", hex::encode([0x11u8; 32]))
+            .env_remove("PARVAULT_GENESIS_SEED_HEX")
+            .env("PARVAULT_LAN_REGISTRY_DIR", root.path().join("reg"))
+            .arg("--data-dir")
+            .arg(&dir)
+            .args(["--no-lan-discovery", "daemon", "start", "--listen"])
+            .arg(format!("/ip4/127.0.0.1/tcp/{}", free_port())),
+    );
     let text = out_text(&out);
     assert!(!out.status.success(), "{text}");
     assert!(text.contains("conflicting ring genesis sources"), "{text}");
