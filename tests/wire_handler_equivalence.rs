@@ -9,6 +9,32 @@
 //! SHA-256), quota usage, seed-server PoR counters and rendezvous contents. Rows that are
 //! identical across roles must produce identical outcomes; divergent rows assert the exact
 //! difference.
+//!
+//! Cross-role comparison alone misses a change that hits every role equally, so each variant
+//! also asserts its absolute effect (response fields and the state change, read through the
+//! store, quota, eviction, rendezvous and takedown APIs).
+//!
+//! Mutation record (each mutant is a one-line change in `src/network/wire_handler.rs`; run with
+//! a dedicated `CARGO_TARGET_DIR` so a mutated library is never reused by another run):
+//!
+//! | Mutant | Kind | Failing test(s) |
+//! | :-- | :-- | :-- |
+//! | `record_put_shard_admission_ip`: seed returns `false` | hook | `put_shard` |
+//! | `on_por_pass`: seed does nothing | hook | `por_audit`, `multi_segment_por_audit` |
+//! | `on_por_pass`: daemon records a heartbeat | hook | `por_audit`, `multi_segment_por_audit` |
+//! | `max_probationary_lease_bytes`: seed returns `0` | hook | `put_blinded_shard`, `relay_pq_onion_over_seed_lease_limit` |
+//! | `tombstone_via_seed_server`: seed returns `false` | hook | `delete_blinded_tombstone` |
+//! | `status_region`: seed returns the daemon text | hook | `query_node_status` |
+//! | `tracker_admin_pubkey`: seed returns `None` | hook | `register_wan_rendezvous`, `lookup_wan_rendezvous` |
+//! | `record_public_card_ips`: seed returns `false` | hook | `register_wan_rendezvous` |
+//! | `takedown_gate`: seed always open | hook | `submit_abuse_takedown` |
+//! | `eviction_council`: seed drops its local tracker admin | hook | `broadcast_eviction_order` |
+//! | `shard_owner` ignores the claimed owner | symmetric | `put_shard`, `delete_shard` |
+//! | `PutBlindedShard` drops `record_peer_admission_ip` | symmetric | `put_blinded_shard` |
+//! | `RenewBlindedLease` ignores `extension_epochs` | symmetric | `renew_blinded_lease` |
+//! | `PutShard` skips `register_repair_grant` | symmetric | `get_ciphertext_shard` |
+//!
+//! The four symmetric mutants passed the suite before the absolute assertions were added.
 
 use libp2p::Multiaddr;
 use parvault::bootstrap::{
@@ -27,7 +53,7 @@ use parvault::network::{
     WebOfTrustRegistry, PUBLIC_COMMONS_SWARM_SLOT,
 };
 use parvault::por::{
-    generate_multi_segment_por_challenge, generate_por_challenge, PorVerifierEngine,
+    generate_multi_segment_por_challenge, generate_por_challenge, PorVerifierEngine, RepairGrant,
 };
 use parvault::sharding::encode_ciphertext_stripe;
 use parvault::storage::{
@@ -99,6 +125,7 @@ struct Peer {
     ident: NodeIdentity,
     id: String,
     addr: Multiaddr,
+    ip: std::net::IpAddr,
 }
 
 impl Peer {
@@ -106,7 +133,13 @@ impl Peer {
         let ident = NodeIdentity::from_seed([seed; 32]);
         let id = node_identity_libp2p_peer_id(&ident).unwrap().to_string();
         let addr: Multiaddr = format!("/ip4/{ip}/tcp/4001").parse().unwrap();
-        Self { ident, id, addr }
+        let ip = ip.parse().unwrap();
+        Self {
+            ident,
+            id,
+            addr,
+            ip,
+        }
     }
 }
 
@@ -284,6 +317,29 @@ impl Fx {
             .unwrap();
     }
 
+    /// Bytes the quota manager charges to `owner` (absolute, per account).
+    fn hosted(&self, owner: &str) -> u64 {
+        self.store
+            .quota()
+            .lock()
+            .unwrap()
+            .peer_account(owner)
+            .map(|a| a.bytes_hosted_for_peer)
+            .unwrap_or(0)
+    }
+
+    /// Public keys the eviction engine has recorded as admitted from `ip`.
+    fn admitted_at(&self, ip: std::net::IpAddr) -> Vec<[u8; 32]> {
+        self.eviction.resolve_pubkeys_for_ip(ip)
+    }
+
+    /// Whether ingress from `ip` is blocked by the eviction engine.
+    fn blocked(&self, ip: std::net::IpAddr) -> bool {
+        self.eviction
+            .is_ingress_blocked(Some(ip), None, None, None, None)
+            .is_some()
+    }
+
     fn tree(&self) -> BTreeMap<String, (u64, String)> {
         fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, (u64, String)>) {
             for e in std::fs::read_dir(dir).unwrap().flatten() {
@@ -399,6 +455,32 @@ impl Trio {
         for fx in &mut self.fx {
             f(fx, &self.keys);
         }
+    }
+    /// Like `run`, also returning the typed responses for absolute checks.
+    fn run_resp(
+        &mut self,
+        peer: &Peer,
+        req: &MeshWireRequest,
+    ) -> ([Outcome; 3], Vec<MeshWireResponse>) {
+        let mut outs = Vec::new();
+        let mut resps = Vec::new();
+        for f in &mut self.fx {
+            let before = f.snapshot();
+            let resp = f.call(peer, req.clone());
+            let after = f.snapshot();
+            outs.push(Outcome {
+                resp: format!("{resp:?}"),
+                changed: diff(&before, &after),
+                quota_delta: after.quota_used as i128 - before.quota_used as i128,
+                por_delta: after.por_passes as i128 - before.por_passes as i128,
+                leases_delta: after.leases as i128 - before.leases as i128,
+                public_swarm_changed: (after.public_swarm != before.public_swarm)
+                    .then_some(after.public_swarm),
+            });
+            resps.push(resp);
+        }
+        let [a, b, c]: [Outcome; 3] = outs.try_into().unwrap();
+        ([a, b, c], resps)
     }
     /// Runs the same request (built once, cloned) on all three roles.
     fn run(&mut self, peer: &Peer, req: &MeshWireRequest) -> [Outcome; 3] {
@@ -576,6 +658,19 @@ fn handshake_wot() {
     let o = t.run(&peer, &good);
     assert!(o[0].resp.contains("accepted: true"), "{}", o[0].resp);
     assert_identical(&o);
+    let pk0 = peer.ident.public_key_bytes();
+    for fx in &t.fx {
+        assert!(
+            fx.wot.is_private_ring_peer(&pk0),
+            "{:?}: leaf admitted",
+            fx.role
+        );
+        assert!(
+            fx.admitted_at(peer.ip).contains(&pk0),
+            "{:?}: admission IP recorded",
+            fx.role
+        );
+    }
 
     let rogue = NodeIdentity::from_seed([0x52; 32]);
     let bad_hop = InvitationHop::issue(&rogue, peer.ident.public_key_bytes(), 1, 100);
@@ -589,6 +684,33 @@ fn handshake_wot() {
     let o = t.run(&peer, &bad);
     assert!(o[0].resp.contains("accepted: false"));
     assert_identical(&o);
+    let rogue_leaf_peer = Peer::new(0x53, "198.51.100.31");
+    let bad_only = MeshWireRequest::HandshakeWoT {
+        chain: DelegationChain {
+            hops: vec![InvitationHop::issue(
+                &rogue,
+                rogue_leaf_peer.ident.public_key_bytes(),
+                1,
+                100,
+            )],
+        },
+        asn: None,
+        region: None,
+    };
+    t.run(&rogue_leaf_peer, &bad_only);
+    for fx in &t.fx {
+        let k = rogue_leaf_peer.ident.public_key_bytes();
+        assert!(
+            !fx.wot.is_private_ring_peer(&k),
+            "{:?}: bad chain not admitted",
+            fx.role
+        );
+        assert!(
+            fx.admitted_at(rogue_leaf_peer.ip).is_empty(),
+            "{:?}: no admission IP",
+            fx.role
+        );
+    }
 
     let pk = peer.ident.public_key_bytes();
     t.each(|fx, k| fx.ban(k, EvictionTarget::PeerOrIssuerPubkey(pk)));
@@ -610,9 +732,49 @@ fn put_shard() {
     let peer = Peer::new(0x61, "198.51.100.2");
     for (owner, seed) in [("", 1u8), ("alice-owner", 2u8)] {
         let (sid, bytes) = shard(seed, 2048);
+        let before: Vec<(u64, u64)> =
+            t.fx.iter()
+                .map(|f| (f.hosted(&peer.id), f.hosted("alice-owner")))
+                .collect();
         let o = t.run(&peer, &put_shard_req(owner, sid, bytes, [seed; 32]));
         assert!(o[0].resp.contains("stored: true"), "{}", o[0].resp);
         assert!(o[0].quota_delta > 0);
+        // Absolute: the shard is stored and charged to the effective owner (empty claim -> the
+        // remote peer; explicit claim -> that owner), on every role.
+        for (fx, (peer_before, alice_before)) in t.fx.iter().zip(before) {
+            assert!(fx.store.has_shard(&sid), "{:?}: shard stored", fx.role);
+            let (charged, other) = if owner.is_empty() {
+                (
+                    fx.hosted(&peer.id) - peer_before,
+                    fx.hosted("alice-owner") - alice_before,
+                )
+            } else {
+                (
+                    fx.hosted("alice-owner") - alice_before,
+                    fx.hosted(&peer.id) - peer_before,
+                )
+            };
+            assert_eq!(
+                (charged, other),
+                (2048, 0),
+                "{:?}: quota charged to {owner:?}",
+                fx.role
+            );
+        }
+        // Hook record_put_shard_admission_ip, checked through the eviction API.
+        let pk = peer.ident.public_key_bytes();
+        assert!(
+            !t.fx[0].admitted_at(peer.ip).contains(&pk),
+            "daemon records no admission IP"
+        );
+        assert!(
+            t.fx[1].admitted_at(peer.ip).contains(&pk),
+            "seed records the admission IP"
+        );
+        assert!(
+            t.fx[2].admitted_at(peer.ip).contains(&pk),
+            "seed records the admission IP"
+        );
         assert_eq!(o[1], o[2]);
         assert_same_except_eviction(&o[0], &o[1]);
         // Hook record_put_shard_admission_ip: the seed's eviction index records the peer IP.
@@ -635,6 +797,7 @@ fn put_shard() {
     let o = t.run(&peer, &put_shard_req("", sid, bytes, [3; 32]));
     assert!(o[0].resp.contains("stored: false"), "{}", o[0].resp);
     assert_identical(&o);
+    assert!(t.fx.iter().all(|f| !f.store.has_shard(&sid)));
     // Ingress-blocked by stripe root.
     let (sid, bytes) = shard(4, 1024);
     t.each(|fx, k| fx.ban(k, EvictionTarget::StripeMerkleRoot(sid.stripe_merkle_root)));
@@ -645,6 +808,7 @@ fn put_shard() {
         o[0].resp
     );
     assert_identical(&o);
+    assert!(t.fx.iter().all(|f| !f.store.has_shard(&sid)));
 }
 
 // --- 3. DeleteShard (identical) -----------------------------------------------------------------
@@ -673,6 +837,10 @@ fn delete_shard() {
     );
     assert!(o[0].resp.contains("unauthorized"), "{}", o[0].resp);
     assert_identical(&o);
+    assert!(t
+        .fx
+        .iter()
+        .all(|f| f.store.has_shard(&sid) && f.hosted(&peer.id) == 1024));
     let o = t.run(
         &peer,
         &MeshWireRequest::DeleteShard {
@@ -680,8 +848,46 @@ fn delete_shard() {
             owner_signature: (pub_, payload, r, s),
         },
     );
-    assert!(o[0].resp.contains("DeleteShardAck"), "{}", o[0].resp);
+    assert!(o[0].resp.contains("deleted: true"), "{}", o[0].resp);
     assert_identical(&o);
+    // Absolute: the shard is gone and its quota is released under the deleting peer.
+    for fx in &t.fx {
+        assert!(!fx.store.has_shard(&sid), "{:?}: shard deleted", fx.role);
+        assert_eq!(fx.hosted(&peer.id), 0, "{:?}: quota released", fx.role);
+    }
+    // Explicit claimed owner: PutShard charges the claim, DeleteShard releases under the remote
+    // peer (it sends no claim), so the claimed owner's account keeps the bytes. Pinned as today's
+    // behaviour; item 2b's owner rule (accounted owner = sender) removes the split.
+    let (sid2, bytes2) = shard(26, 1024);
+    t.run(&peer, &put_shard_req("alice-owner", sid2, bytes2, [26; 32]));
+    assert!(t
+        .fx
+        .iter()
+        .all(|f| f.hosted("alice-owner") == 1024 && f.hosted(&peer.id) == 0));
+    let (pub2, payload2, sig2) =
+        PorVerifierEngine::sign_owner_shard_delete_token(&peer.ident, &sid2, now_ms());
+    let mut r2 = [0u8; 32];
+    let mut s2 = [0u8; 32];
+    r2.copy_from_slice(&sig2[..32]);
+    s2.copy_from_slice(&sig2[32..]);
+    let o = t.run(
+        &peer,
+        &MeshWireRequest::DeleteShard {
+            shard_id: sid2,
+            owner_signature: (pub2, payload2, r2, s2),
+        },
+    );
+    assert!(o[0].resp.contains("deleted: true"), "{}", o[0].resp);
+    assert_identical(&o);
+    for fx in &t.fx {
+        assert!(!fx.store.has_shard(&sid2), "{:?}: shard deleted", fx.role);
+        assert_eq!(
+            (fx.hosted("alice-owner"), fx.hosted(&peer.id)),
+            (1024, 0),
+            "{:?}: release goes to the remote peer, not the claimed owner",
+            fx.role
+        );
+    }
 }
 
 // --- 4 / 10. PoR audits (seed records a heartbeat on success) ------------------------------------
@@ -760,7 +966,55 @@ fn get_ciphertext_shard() {
             repair_proof: None,
         },
     );
+    assert!(
+        o[0].resp.contains("shard_bytes: None"),
+        "no grant registered: {}",
+        o[0].resp
+    );
     assert_identical(&o);
+
+    // Owner-signed read of a shard stored with the owner's RepairGrant returns the exact bytes.
+    let (sid2, bytes2) = shard(9, 1024);
+    let grant = RepairGrant::issue(
+        &peer.ident,
+        sid2.stripe_merkle_root,
+        vec![],
+        ErasureTier::Homelab,
+    );
+    t.run(
+        &peer,
+        &MeshWireRequest::PutShard {
+            owner_peer_id: String::new(),
+            shard_id: sid2,
+            shard_bytes: bytes2.clone(),
+            session_key_commit: [9; 32],
+            repair_grant: Some(grant),
+        },
+    );
+    let (pub2, payload2, sig2) =
+        PorVerifierEngine::sign_owner_shard_read_token(&peer.ident, &sid2, now_ms());
+    let mut r2 = [0u8; 32];
+    let mut s2 = [0u8; 32];
+    r2.copy_from_slice(&sig2[..32]);
+    s2.copy_from_slice(&sig2[32..]);
+    let (o, resps) = t.run_resp(
+        &peer,
+        &MeshWireRequest::GetCiphertextShard {
+            shard_id: sid2,
+            owner_signature: Some((pub2, payload2, r2, s2)),
+            repair_proof: None,
+        },
+    );
+    assert_identical(&o);
+    for r in resps {
+        match r {
+            MeshWireResponse::CiphertextShardResult {
+                shard_bytes: Some(b),
+                error: None,
+            } => assert_eq!(b, bytes2),
+            other => panic!("expected the shard bytes, got {other:?}"),
+        }
+    }
 }
 
 // --- 6. PutBlindedShard (seed enforces the probationary lease limit) -----------------------------
@@ -773,9 +1027,34 @@ fn put_blinded_shard() {
     let peer = Peer::new(0x66, "198.51.100.7");
     let b = blinded(9, 4096);
     let v = AnonymousQuotaVoucher::mint(&issuer, 8192);
-    let o = t.run(&peer, &put_blinded(&b, v));
+    let o = t.run(&peer, &put_blinded(&b, v.clone()));
     assert!(o[0].resp.contains("stored: true"), "{}", o[0].resp);
     assert_identical(&o);
+    // Absolute: stored on disk, one lease, and the voucher issuer recorded as admitted from the
+    // sender's IP (checked through the eviction API, not file length).
+    let issuer_pk = issuer.public_key_bytes();
+    assert_eq!(o[0].leases_delta, 1);
+    for fx in &t.fx {
+        assert!(
+            fx.store.has_blinded_shard_on_disk(&b.id),
+            "{:?}: stored",
+            fx.role
+        );
+        assert!(
+            fx.admitted_at(peer.ip).contains(&issuer_pk),
+            "{:?}: issuer admitted at IP",
+            fx.role
+        );
+    }
+    // Absolute: a spent voucher cannot be redeemed again (nullifier).
+    let b_replay = blinded(24, 1024);
+    let o = t.run(&peer, &put_blinded(&b_replay, v));
+    assert!(o[0].resp.contains("stored: false"), "{}", o[0].resp);
+    assert_identical(&o);
+    assert!(t
+        .fx
+        .iter()
+        .all(|f| !f.store.has_blinded_shard_on_disk(&b_replay.id)));
 
     // Hook max_probationary_lease_bytes, read per request: lowering the limit (as the admin RPC
     // does) makes the seed reject the next PutBlindedShard; the daemon has no limit.
@@ -812,6 +1091,10 @@ fn put_blinded_shard() {
     );
     assert!(o[0].resp.contains("stored: false"));
     assert_identical(&o);
+    assert!(t
+        .fx
+        .iter()
+        .all(|f| !f.store.has_blinded_shard_on_disk(&b4.id)));
 }
 
 // --- 7. GetBlindedShard (identical) -------------------------------------------------------------
@@ -840,7 +1123,7 @@ fn get_blinded_shard() {
     assert_identical(&o);
     let ts = now_ms();
     let sig = BlindedShardCapability::sign_read_token(&b.cap_ident, &b.id.locator, ts);
-    let o = t.run(
+    let (o, resps) = t.run_resp(
         &peer,
         &MeshWireRequest::GetBlindedShard {
             blinded_id: b.id,
@@ -849,8 +1132,16 @@ fn get_blinded_shard() {
             read_sig: sig.to_vec(),
         },
     );
-    assert!(o[0].resp.contains("shard_bytes: Some"), "{}", o[0].resp);
     assert_identical(&o);
+    for r in resps {
+        match r {
+            MeshWireResponse::BlindedShardResult {
+                shard_bytes: Some(bytes),
+                error: None,
+            } => assert_eq!(bytes, b.bytes),
+            other => panic!("expected the blinded shard bytes, got {other:?}"),
+        }
+    }
 }
 
 // --- 8. RenewBlindedLease (same effect via the seed server's shared store) -----------------------
@@ -890,6 +1181,37 @@ fn renew_blinded_lease() {
     let o = t.run(&peer, &req);
     assert!(o[0].resp.contains("renewed: false"));
     assert_identical(&o);
+    // Absolute (on an unbanned shard): renewal sets the expiry to current + extension
+    // (2 + 10 = 12, shortening the original 1 + 30), so with the store's 2-epoch grace the shard
+    // survives a sweep at 13 and is removed at 14; without the renewal it would survive until 33.
+    let b2 = blinded(25, 1024);
+    t.run(
+        &peer,
+        &put_blinded(&b2, AnonymousQuotaVoucher::mint(&issuer, 8192)),
+    );
+    let o = t.run(
+        &peer,
+        &MeshWireRequest::RenewBlindedLease {
+            blinded_id: b2.id,
+            current_epoch: 2,
+            extension_epochs: 10,
+        },
+    );
+    assert!(o[0].resp.contains("renewed: true"), "{}", o[0].resp);
+    for fx in &t.fx {
+        let _ = fx.store.sweep_expired_blinded_shards(13);
+        assert!(
+            fx.store.has_blinded_shard_on_disk(&b2.id),
+            "{:?}: kept at 13",
+            fx.role
+        );
+        let _ = fx.store.sweep_expired_blinded_shards(14);
+        assert!(
+            !fx.store.has_blinded_shard_on_disk(&b2.id),
+            "{:?}: swept at 14",
+            fx.role
+        );
+    }
 }
 
 // --- 9. DeleteBlindedShardTombstone (seed error text carries a prefix) ---------------------------
@@ -966,6 +1288,11 @@ fn delete_blinded_tombstone() {
     );
     assert!(o[0].resp.contains("deleted: true"), "{}", o[0].resp);
     assert_identical(&o);
+    assert_eq!(o[0].leases_delta, -1);
+    assert!(t
+        .fx
+        .iter()
+        .all(|f| !f.store.has_blinded_shard_on_disk(&b.id)));
 }
 
 // --- 11. RelayPqOnionEnvelope (seed enforces the lease limit on final delivery) ------------------
@@ -1028,6 +1355,10 @@ fn relay_pq_onion() {
     let o = t.run(&peer, &relay_req(env, None, &b, v()));
     assert!(o[0].resp.contains("delivered: true"), "{}", o[0].resp);
     assert_identical(&o);
+    assert!(t
+        .fx
+        .iter()
+        .all(|f| f.store.has_blinded_shard_on_disk(&b.id)));
 
     // (c) Layered final-target delivery (open_final_target_pq).
     let relay_kem = HybridKemKeypair::generate().unwrap();
@@ -1049,6 +1380,10 @@ fn relay_pq_onion() {
     let o = t.run(&peer, &relay_req(inner, None, &fb, v()));
     assert!(o[0].resp.contains("delivered: true"), "{}", o[0].resp);
     assert_identical(&o);
+    assert!(t
+        .fx
+        .iter()
+        .all(|f| f.store.has_blinded_shard_on_disk(&fb.id)));
 
     // (d) We are the relay hop: peeled, then no MeshClient for the second hop.
     let fb = blinded(21, 256);
@@ -1070,6 +1405,10 @@ fn relay_pq_onion() {
         o[0].resp
     );
     assert_identical(&o);
+    assert!(t
+        .fx
+        .iter()
+        .all(|f| !f.store.has_blinded_shard_on_disk(&fb.id)));
 
     // (e) Undecryptable envelope.
     let env = PqRelayedShardEnvelope::seal_pq(&other.public_key(), "relay", &fb.id, &fb.bytes, 0)
@@ -1077,6 +1416,10 @@ fn relay_pq_onion() {
     let o = t.run(&peer, &relay_req(env, None, &fb, v()));
     assert!(o[0].resp.contains("delivered: false"));
     assert_identical(&o);
+    assert!(t
+        .fx
+        .iter()
+        .all(|f| !f.store.has_blinded_shard_on_disk(&fb.id)));
 
     // (f) Ingress-blocked remote peer.
     let pk = peer.ident.public_key_bytes();
@@ -1170,6 +1513,23 @@ fn syndicate_lite_stripe() {
     let o = t.run(&peer, &req);
     assert!(o[0].resp.contains("receipt: Some"), "{}", o[0].resp);
     assert_eq!(o[0], o[1], "daemon and seed homelab vault behave the same");
+    // Absolute: all 20 Reed-Solomon shards are stored on the homelab-vault roles, none on the
+    // public bootstrapper.
+    let shard_ids: Vec<ShardId> = (0..set.shard_hashes.len())
+        .map(|i| ShardId {
+            stripe_merkle_root: set.stripe_merkle_root,
+            shard_index: i as u32,
+            shard_hash: set.shard_hashes[i],
+        })
+        .collect();
+    assert_eq!(shard_ids.len(), 20);
+    for (fx, expect) in t.fx.iter().zip([true, true, false]) {
+        assert!(
+            shard_ids.iter().all(|id| fx.store.has_shard(id) == expect),
+            "{:?}: shards stored = {expect}",
+            fx.role
+        );
+    }
     assert!(
         o[2].resp.contains("receipt: None"),
         "public bootstrapper has no owner: {}",
@@ -1222,6 +1582,16 @@ fn dht_envelopes() {
     );
     assert!(o[0].resp.contains("stored: true"), "{}", o[0].resp);
     assert_identical(&o);
+    for fx in &t.fx {
+        let stored = fx
+            .store
+            .get_dht_manifest_envelope(&key)
+            .expect("stored envelope");
+        assert_eq!(
+            (stored.owner_pubkey, stored.monotonic_version),
+            (owner.public_key_bytes(), 1)
+        );
+    }
     let o = t.run(
         &peer,
         &MeshWireRequest::GetDhtEnvelope {
@@ -1255,7 +1625,25 @@ fn query_node_status() {
     let _g = env_guard();
     let mut t = Trio::new("status");
     let peer = Peer::new(0x70, "198.51.100.14");
-    let o = t.run(&peer, &MeshWireRequest::QueryNodeStatus);
+    let (o, resps) = t.run_resp(&peer, &MeshWireRequest::QueryNodeStatus);
+    // Absolute fields on every role.
+    for (fx, r) in t.fx.iter().zip(resps) {
+        match r {
+            MeshWireResponse::NodeStatusResult {
+                peer_id,
+                asn,
+                pq_kem_pubkey,
+                ..
+            } => {
+                assert_eq!((peer_id.as_str(), asn), ("server-peer", 64512));
+                assert_eq!(
+                    format!("{:?}", pq_kem_pubkey),
+                    format!("{:?}", Some(fx.kem.public_key()))
+                );
+            }
+            other => panic!("expected NodeStatusResult, got {other:?}"),
+        }
+    }
     // Hook status_region.
     assert!(
         o[0].resp.contains("region: \"local-neighborhood\""),
@@ -1321,6 +1709,21 @@ fn register_wan_rendezvous() {
         )
     );
     assert_eq!(o[2].changed, o[0].changed);
+    // Absolute: the entry is retrievable and the signer is admitted at the sender's IP.
+    let pk_priv = peer.ident.public_key_bytes();
+    for fx in &mut t.fx {
+        assert_eq!(
+            fx.wan.lookup(&slot, now_ms()).len(),
+            1,
+            "{:?}: entry stored",
+            fx.role
+        );
+        assert!(
+            fx.admitted_at(peer.ip).contains(&pk_priv),
+            "{:?}: signer admitted",
+            fx.role
+        );
+    }
 
     // Slot mismatch -> registry error.
     let o = t.run(
@@ -1364,6 +1767,23 @@ fn register_wan_rendezvous() {
     );
     assert_same_except_eviction(&o[0], &o[1]);
     assert_eq!(o[1].changed, o[2].changed);
+    // Absolute (through the eviction API): every role records the sender's IP; only the seed
+    // roles also record the IPs advertised in the card.
+    let pk_pub = pub_peer.ident.public_key_bytes();
+    let card_ip: std::net::IpAddr = "203.0.113.77".parse().unwrap();
+    for (fx, seed) in t.fx.iter().zip([false, true, true]) {
+        assert!(
+            fx.admitted_at(pub_peer.ip).contains(&pk_pub),
+            "{:?}: sender IP",
+            fx.role
+        );
+        assert_eq!(
+            fx.admitted_at(card_ip).contains(&pk_pub),
+            seed,
+            "{:?}: card IP",
+            fx.role
+        );
+    }
 
     // Ingress-blocked signer.
     let pk = peer.ident.public_key_bytes();
@@ -1413,6 +1833,7 @@ fn lookup_wan_rendezvous() {
             "{}",
             o[0].resp
         );
+        assert!(o[0].resp.contains("entries: []"), "{}", o[0].resp);
         assert_eq!(o[0], o[1]);
         assert_eq!(
             o[2].resp,
@@ -1421,6 +1842,30 @@ fn lookup_wan_rendezvous() {
                 &format!("tracker_admin_pubkey: {admin_dbg}")
             )
         );
+    }
+    // Absolute: a registered entry is returned by lookup on every role.
+    let code = "lookup-alpha-bravo-charlie";
+    let entry = seal_wan_peer_card(code, &wan_card(&peer.ident, &[]), &peer.ident).unwrap();
+    let slot = derive_slot_key_from_code(code);
+    t.run(
+        &peer,
+        &MeshWireRequest::RegisterWanRendezvous {
+            slot_key: slot,
+            entry: entry.clone(),
+        },
+    );
+    let (_, resps) = t.run_resp(
+        &peer,
+        &MeshWireRequest::LookupWanRendezvous { slot_key: slot },
+    );
+    for r in resps {
+        match r {
+            MeshWireResponse::LookupWanRendezvousResult { entries, .. } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].ed25519_pubkey, entry.ed25519_pubkey);
+            }
+            other => panic!("expected LookupWanRendezvousResult, got {other:?}"),
+        }
     }
 }
 
@@ -1467,6 +1912,8 @@ fn submit_abuse_takedown() {
         o[1].resp
     );
     assert!(!o[0].resp.contains("homelab-vault private mode"));
+    // Absolute: an unverifiable report is never queued, on any role.
+    assert!(t.fx.iter().all(|f| f.takedown.list_entries().is_empty()));
 }
 
 // --- 19. BroadcastEvictionOrder (council sources differ) ----------------------------------------
@@ -1491,6 +1938,12 @@ fn broadcast_eviction_order() {
     );
     assert!(o.iter().all(accepted), "{o:?}");
     assert_identical(&o);
+    // Absolute: the accepted order blocks the target IP.
+    let target_ip: std::net::IpAddr = "192.0.2.200".parse().unwrap();
+    assert!(
+        t.fx.iter().all(|f| f.blocked(target_ip)),
+        "IP blocked after the order"
+    );
     // Replay is rejected everywhere.
     let o = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(order));
     assert!(!o.iter().any(accepted));
@@ -1505,6 +1958,14 @@ fn broadcast_eviction_order() {
         o.iter().map(accepted).collect::<Vec<_>>(),
         vec![false, false, true],
         "{o:?}"
+    );
+    let target_ip: std::net::IpAddr = "192.0.2.200".parse().unwrap();
+    assert_eq!(
+        t.fx.iter()
+            .map(|f| f.blocked(target_ip))
+            .collect::<Vec<_>>(),
+        vec![false, false, true],
+        "only an accepted order blocks"
     );
 
     // Genesis key: trusted by the homelab seed (and by the daemon's own council resolver).
