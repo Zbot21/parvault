@@ -188,6 +188,7 @@ src/network/*                   lib     network::discovery::
 src/network/*                   lib     network::wan_rendezvous::
 src/network/*                   lib     network::wot::
 src/network/*                   lib     network::admission::
+src/network/*                   lib     network::server_events::
 src/network/*                   lib     sharding::reed_solomon::
 src/network/*                   lib     storage::anonymity::
 src/network/*                   lib     storage::block_store::

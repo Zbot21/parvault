@@ -1309,12 +1309,11 @@ fn squat_catalog(
 
 const PHRASE: &str = "legal winner thank year wave sausage worth useful legal winner thank yellow";
 
-/// F-10a: with the owner's catalog on one seed and a squatter's `u64::MAX` envelope at the same
-/// key on another, `recover-from-seed` picks the squatter and fails.
-#[test]
-fn repro_f10a_squatted_catalog_wins_recover() {
-    let honest_seed = spawn_seed("f10a-h");
-    let squat_seed = spawn_seed("f10a-s");
+/// Publishes the owner's vault catalog on one seed and, if `squat`, a squatter's `u64::MAX`
+/// envelope at the same key on another, then runs `parvault recover-from-seed` against both.
+fn recover_with(label: &str, squat: bool) -> std::process::Output {
+    let honest_seed = spawn_seed(&format!("{label}-h"));
+    let other_seed = spawn_seed(&format!("{label}-s"));
     let canonical = parvault::crypto::validate_recovery_seed_phrase_or_passphrase(PHRASE).unwrap();
     let mk = MasterKey::from_recovery_seed_phrase(&canonical, "default");
     let pq = PqVaultMasterKey::from_recovery_seed_phrase(&canonical, "default");
@@ -1347,20 +1346,24 @@ fn repro_f10a_squatted_catalog_wins_recover() {
         );
     };
     put(&honest_seed, &owner, honest);
-    let squatter = key(0x9A);
-    put(
-        &squat_seed,
-        &squatter,
-        squat_catalog(&squatter, dht_key, u64::MAX),
-    );
-
-    let root = temp_root("f10a-client");
-    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+    if squat {
+        let squatter = key(0x9A);
+        put(
+            &other_seed,
+            &squatter,
+            squat_catalog(&squatter, dht_key, u64::MAX),
+        );
+    }
+    let root = temp_root(&format!("{label}-client"));
+    Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
         .env("PARVAULT_LAN_REGISTRY_DIR", root.path().join("reg"))
         .env(
             "PARVAULT_PEERS",
-            format!("{},{}", honest_seed.addr, squat_seed.addr),
+            format!("{},{}", honest_seed.addr, other_seed.addr),
         )
+        .env("RUST_LOG", "info")
+        .env("NO_COLOR", "1")
         .arg("--data-dir")
         .arg(root.path().join("client"))
         .args([
@@ -1372,52 +1375,125 @@ fn repro_f10a_squatted_catalog_wins_recover() {
         ])
         .arg(root.path().join("out"))
         .output()
-        .expect("run recover-from-seed");
-    assert!(
-        !out.status.success(),
-        "gap: the squatted envelope wins and recovery fails; stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    gate_ran("trust_enforcement::repro_f10a_squatted_catalog_wins_recover");
+        .expect("run recover-from-seed")
 }
 
-/// F-10b: a raw Kademlia PUT of arbitrary bytes is stored by the daemon's DHT store.
+fn combined(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// F-10a accept: the owner's catalog is recovered.
 #[test]
-fn repro_f10b_raw_kad_put_stored() {
-    let node = spawn_daemon("f10b");
+fn f10a_owner_catalog_recovered() {
+    let out = recover_with("f10a-a", false);
+    assert!(out.status.success(), "{}", combined(&out));
+    gate_ran("trust_enforcement::f10a_owner_catalog_recovered");
+}
+
+/// F-10a reject: a squatter's `u64::MAX` envelope at the same key is ignored (logged) and the
+/// owner's catalog is still recovered.
+#[test]
+fn f10a_squatted_catalog_ignored() {
+    let out = recover_with("f10a-r", true);
+    let log = combined(&out);
+    assert!(out.status.success(), "{log}");
+    assert!(log.contains("reject.dht_owner_mismatch"), "{log}");
+    gate_ran("trust_enforcement::f10a_squatted_catalog_ignored");
+}
+
+/// Runs one Kademlia query from a fresh client swarm against `node` and returns its result.
+fn kad_query(
+    node: &Node,
+    seed: u8,
+    start: impl FnOnce(&mut libp2p::Swarm<MeshNetworkBehaviour>) + Send + 'static,
+) -> Option<kad::QueryResult> {
     let target = node.peer_id();
     let addr: Multiaddr = node.addr.parse().unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let ok = rt.block_on(async move {
-        let kp = key(0x9B).to_libp2p_keypair().unwrap();
+    rt.block_on(async move {
+        let kp = key(seed).to_libp2p_keypair().unwrap();
         let mut swarm: libp2p::Swarm<MeshNetworkBehaviour> =
             build_mesh_client_swarm(kp, false).unwrap();
         swarm.behaviour_mut().kademlia.add_address(&target, addr);
-        let record = kad::Record::new(b"junk-key".to_vec(), b"unsigned junk".to_vec());
-        swarm
-            .behaviour_mut()
-            .kademlia
-            .put_record(record, kad::Quorum::One)
-            .unwrap();
+        start(&mut swarm);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         let mut outcome = None;
-        while outcome.is_none() {
+        while outcome.is_none() && tokio::time::Instant::now() < deadline {
             tokio::select! {
                 ev = swarm.select_next_some() => {
                     if let SwarmEvent::Behaviour(parvault::network::behaviour::MeshNetworkBehaviourEvent::Kademlia(
-                        kad::Event::OutboundQueryProgressed { result: kad::QueryResult::PutRecord(r), .. },
+                        kad::Event::OutboundQueryProgressed { result, .. },
                     )) = ev {
-                        outcome = Some(r.is_ok());
+                        outcome = Some(result);
                     }
                 }
-                _ = tokio::time::sleep_until(deadline) => outcome = Some(false),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
         }
-        outcome.unwrap()
+        outcome
+    })
+}
+
+fn kad_put(node: &Node, record: kad::Record) {
+    let result = kad_query(node, 0x9B, move |sw| {
+        sw.behaviour_mut()
+            .kademlia
+            .put_record(record, kad::Quorum::One)
+            .unwrap();
     });
-    assert!(ok, "gap: the daemon stores a raw unsigned Kademlia record");
-    gate_ran("trust_enforcement::repro_f10b_raw_kad_put_stored");
+    assert!(
+        matches!(result, Some(kad::QueryResult::PutRecord(_))),
+        "{result:?}"
+    );
+}
+
+fn kad_get(node: &Node, key: Vec<u8>) -> Option<Vec<u8>> {
+    match kad_query(node, 0x9C, move |sw| {
+        sw.behaviour_mut()
+            .kademlia
+            .get_record(kad::RecordKey::new(&key));
+    }) {
+        Some(kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(r)))) => {
+            Some(r.record.value)
+        }
+        _ => None,
+    }
+}
+
+/// F-10b accept: a raw Kademlia PUT of a valid signed envelope at its own key is stored.
+#[test]
+fn f10b_signed_envelope_record_stored() {
+    let node = spawn_daemon("f10b-a");
+    let signer = key(0x9D);
+    let dht_key = [0x5A; 32];
+    let env = DhtWireEnvelope::VaultCatalog(squat_catalog(&signer, dht_key, 3));
+    let value = bincode::serialize(&env).unwrap();
+    kad_put(&node, kad::Record::new(dht_key.to_vec(), value.clone()));
+    assert_eq!(
+        kad_get(&node, dht_key.to_vec()),
+        Some(value),
+        "{}",
+        node.log_text()
+    );
+    gate_ran("trust_enforcement::f10b_signed_envelope_record_stored");
+}
+
+/// F-10b reject: a raw Kademlia PUT of unsigned bytes is refused and cannot be read back.
+#[test]
+fn f10b_unsigned_record_refused() {
+    let node = spawn_daemon("f10b-r");
+    let dht_key = [0x5A; 32];
+    kad_put(
+        &node,
+        kad::Record::new(dht_key.to_vec(), b"unsigned junk".to_vec()),
+    );
+    assert_logged(&node, "reject.dht_record_invalid");
+    assert_eq!(kad_get(&node, dht_key.to_vec()), None);
+    gate_ran("trust_enforcement::f10b_unsigned_record_refused");
 }
 
 // --- F-01: gossip slashing quarantines the genesis ----------------------------------------------------------

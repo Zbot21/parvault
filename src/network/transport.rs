@@ -68,6 +68,9 @@ fn construct_behaviour(
     let mut kad_config = kad::Config::new(StreamProtocol::new("/parvault/kad/1.0.0"));
     kad_config.set_query_timeout(Duration::from_secs(10));
     kad_config.set_max_packet_size(2 * 1024 * 1024);
+    // F-10b: inbound records (and provider records) are handed to the application, which stores
+    // a record only if it is a valid signed DHT envelope for its key (`server_events`).
+    kad_config.set_record_filtering(kad::StoreInserts::FilterBoth);
     let mut kademlia = kad::Behaviour::with_config(local_peer_id, store, kad_config);
     kademlia.set_mode(Some(if enable_mdns {
         kad::Mode::Server

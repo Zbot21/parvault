@@ -941,6 +941,19 @@ fn spawn_swarm_worker(
 /// Live `libp2p` Mesh Client (TCP + Noise XX + Yamux + Kademlia DHT + `/parvault/wire/1.0.0`)
 /// backed by a persistent background `Swarm` actor that reuses encrypted connections, enforces
 /// TOFU / explicit `PeerId` pinning, and records live RTT & topology telemetry.
+/// The DHT reader's owner binding (F-10a): a candidate counts only if the reading identity
+/// sealed it.
+pub fn dht_candidate_decision(
+    candidate_owner: [u8; 32],
+    expected_owner: [u8; 32],
+) -> Result<(), &'static str> {
+    if candidate_owner == expected_owner {
+        Ok(())
+    } else {
+        Err("reject.dht_owner_mismatch")
+    }
+}
+
 /// A (sender public key, peer address) pair that accepted this process's handshake.
 type AdmittedAt = ([u8; 32], String);
 
@@ -2411,6 +2424,31 @@ impl MeshClient {
     }
 
     fn validate_dht_candidate(
+        &self,
+        dht_key: &[u8; 32],
+        kind: DhtEnvelopeKind,
+        env: &DhtWireEnvelope,
+    ) -> Option<u64> {
+        let version = Self::self_consistent_version(dht_key, kind, env)?;
+        // F-10a: classical manifests and vault catalogs are sealed by the identity that reads
+        // them back; a self-consistent envelope signed by anyone else is a squat.
+        let owner = match env {
+            DhtWireEnvelope::ClassicalManifest(m) => Some(m.owner_pubkey),
+            DhtWireEnvelope::VaultCatalog(m) => Some(m.owner_pubkey),
+            DhtWireEnvelope::PostQuantumManifest(_) => None,
+        };
+        if let Some(owner) = owner {
+            if let Err(code) = dht_candidate_decision(owner, self.identity.public_key_bytes()) {
+                warn!(code, owner = %hex::encode(owner), "ignored a DHT envelope from another owner");
+                return None;
+            }
+        }
+        Some(version)
+    }
+
+    /// The monotonic version of `env` if it is a self-consistent envelope of `kind` at `dht_key`
+    /// (key match and owner signature), else `None`.
+    pub(crate) fn self_consistent_version(
         dht_key: &[u8; 32],
         kind: DhtEnvelopeKind,
         env: &DhtWireEnvelope,
@@ -2463,7 +2501,7 @@ impl MeshClient {
                 if let Ok(raw_records) = reply_rx.recv_timeout(kad_wait) {
                     for raw in raw_records {
                         if let Ok(env) = bincode::deserialize::<DhtWireEnvelope>(&raw) {
-                            if let Some(ver) = Self::validate_dht_candidate(dht_key, kind, &env) {
+                            if let Some(ver) = self.validate_dht_candidate(dht_key, kind, &env) {
                                 if best.as_ref().is_none_or(|(best_v, _)| ver > *best_v) {
                                     best = Some((ver, env));
                                 }
@@ -2489,7 +2527,7 @@ impl MeshClient {
                     kind,
                 },
             ) {
-                if let Some(ver) = Self::validate_dht_candidate(dht_key, kind, &env) {
+                if let Some(ver) = self.validate_dht_candidate(dht_key, kind, &env) {
                     if best.as_ref().is_none_or(|(best_v, _)| ver > *best_v) {
                         best = Some((ver, env));
                     }
@@ -2509,7 +2547,7 @@ impl MeshClient {
                         kind,
                     },
                 ) {
-                    if let Some(ver) = Self::validate_dht_candidate(dht_key, kind, &env) {
+                    if let Some(ver) = self.validate_dht_candidate(dht_key, kind, &env) {
                         if best.as_ref().is_none_or(|(best_v, _)| ver > *best_v) {
                             best = Some((ver, env));
                         }
