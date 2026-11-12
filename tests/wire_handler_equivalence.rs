@@ -17,8 +17,10 @@
 //! also asserts its absolute effect (response fields and the state change, read through the
 //! store, quota, eviction, rendezvous and takedown APIs).
 //!
-//! Mutation record (each mutant is a one-line change in `src/network/wire_handler.rs`; run with
-//! a dedicated `CARGO_TARGET_DIR` so a mutated library is never reused by another run):
+//! Mutation record (each mutant is a one-line change, in `src/network/wire_handler.rs` unless
+//! the file is named; run with a dedicated `CARGO_TARGET_DIR` so a mutated library is never
+//! reused by another run). Each run covers `--lib`, this suite and `tests/trust_enforcement.rs`;
+//! `lib:` marks a library unit test. Last run: item 2b, 42 mutants, all detected.
 //!
 //! | Mutant | Kind | Failing test(s) |
 //! | :-- | :-- | :-- |
@@ -32,12 +34,44 @@
 //! | `record_public_card_ips`: seed returns `false` | hook | `register_wan_rendezvous` |
 //! | `takedown_gate`: seed always open | hook | `submit_abuse_takedown` |
 //! | `eviction_council`: seed drops its local tracker admin | hook | `broadcast_eviction_order` |
-//! | `shard_owner` ignores the claimed owner | symmetric | `put_shard`, `delete_shard` |
+//! | `shard_owner` accepts a foreign claim | symmetric | `put_shard`, `refused_put_keeps_por_session_key`, `f04_invented_owner_claim_refused`, lib: `shard_owner_rule_binds_the_sender` |
 //! | `PutBlindedShard` drops `record_peer_admission_ip` | symmetric | `put_blinded_shard` |
 //! | `RenewBlindedLease` ignores `extension_epochs` | symmetric | `renew_blinded_lease` |
-//! | `PutShard` skips `register_repair_grant` | symmetric | `get_ciphertext_shard` |
+//! | `PutShard` registers its grant for no shard | symmetric | `get_ciphertext_shard`, `f02a_grant_for_other_stripe_not_registered`, `f02a_owner_grant_update_registered`, `f02a_rejected_put_registers_nothing`, `f02b_registered_grant_repair_read`, `f26_owner_reads_after_root_squat` |
+//! | `admission_decision` admits strangers | decision | `put_shard`, `f03_unadmitted_put_shard_refused_daemon`, `f03_unadmitted_put_shard_refused_seed`, `f05_public_ticket_one_bit_short_refused`, `f24_unadmitted_blinded_put_refused`, `f24_unadmitted_layered_final_refused`, `f24_unadmitted_onion_final_refused`, `f25_unadmitted_dht_put_refused`, `invitee_serves_the_ring`, `refused_credential_is_not_presented_on_every_request`, lib: `admission_decision_rules` |
+//! | `chain_leaf_decision` ignores the sender (F-21, `wot.rs`) | decision | `f21_handshake_chain_leaf_not_sender_refused`, lib: `chain_leaf_decision_binds_the_sender` |
+//! | Ticket PoW unchecked (F-05, `wot.rs`) | decision | `f05_public_ticket_one_bit_short_refused` |
+//! | Grant with a mismatched root registered (F-02a, `por/verifier.rs`) | decision | `f02a_grant_for_other_stripe_not_registered`, lib: `grant_and_repair_read_decisions` |
+//! | Repair read not bound to a registered grant (F-02b, `por/verifier.rs`) | decision | `f02b_foreign_grant_repair_read_refused`, lib: `grant_and_repair_read_decisions` |
+//! | Device cert not bound to the sender (F-25) | decision | `f25_device_cert_replayed_by_other_key_refused` |
+//! | Kademlia record validity unchecked (F-10b, `server_events.rs`) | decision | `f10b_unsigned_record_refused`, lib: `kad_record_decision_rules` |
+//! | DHT reader does not bind the owner (F-10a, `client.rs`) | decision | `f10a_squatted_catalog_ignored` |
+//! | Kademlia routing without admission (F-11, `server_events.rs`) | decision | `f11_unadmitted_peer_not_routed`, `ring_member_originator_stays_anonymous_at_the_relay`, lib: `kad_routing_requires_admission` |
+//! | Single-layer onion final delivery unchecked (F-24) | decision | `f24_unadmitted_onion_final_refused` |
+//! | Layered onion final delivery unchecked (QA B3) | decision | `f24_unadmitted_layered_final_refused` |
+//! | Grant owner not bound to the shard (F-26, `por/verifier.rs`) | rule | `f26_squatter_cannot_read_owner_shard`, lib: `grant_and_repair_read_decisions` |
+//! | Stale ticket accepted (F-29, `wot.rs`) | rule | `f29_stale_ticket_refused`, lib: `f29_ticket_rules` |
+//! | Ticket not bound to the verifier (F-29, `wot.rs`) | rule | lib: `f29_ticket_rules` |
+//! | No per-subnet ticket rate (F-29, `wot.rs`) | rule | lib: `f29_ticket_rules` |
+//! | Re-sent ticket rewrites the registry (F-29, `wot.rs`) | rule | lib: `f29_resent_ticket_is_a_no_op_that_writes_nothing` |
+//! | Full ticket registry still admits (F-29, `wot.rs`) | rule | lib: `f29_full_registry_refuses_and_never_evicts_a_live_admission` |
+//! | Raw handshake error sent on the wire (F-30) | rule | `handshake_wot` |
+//! | Kademlia record source unchecked (F-31, `server_events.rs`) | rule | `f31_unadmitted_source_record_refused`, lib: `kad_record_decision_rules` |
+//! | No sub-invite limit (F-32, `wot.rs`) | rule | lib: `f32_subinvites_and_chain_store_are_bounded` |
+//! | Any key deletes a grant-less shard (F-36, `por/verifier.rs`) | rule | `f36_other_key_cannot_delete_shard`, lib: `grant_and_repair_read_decisions` |
+//! | Slash guard off for the genesis and own keys (F-01, `wot.rs`) | rule | lib: `genesis_and_own_keys_are_never_slashed` |
+//! | Originator presents its credential to the relay (QA B1, `client.rs`) | rule | `ring_member_originator_stays_anonymous_at_the_relay` |
+//! | No backoff after a refused handshake (`client.rs`) | rule | `refused_credential_is_not_presented_on_every_request` |
+//! | No re-handshake after lost admission (`client.rs`) | rule | `client_rehandshakes_after_lost_admission` |
+//! | PoR session committed before the owner decision | rule | `refused_put_keeps_por_session_key` |
+//! | Private daemon without a ring starts ticket-only (QA B2, `admission.rs`) | rule | `daemon_without_ring_refuses_to_start` (hangs: the mutated daemon keeps running; detected once it was killed) |
+//! | `install-chain` does not pin the ring genesis (QA B2, `cli/wot.rs`) | rule | `invitee_serves_the_ring` |
 //!
-//! The four symmetric mutants passed the suite before the absolute assertions were added.
+//! The four symmetric mutants passed the suite before the absolute assertions were added. In the
+//! 2b run, `f04_gateway_lanes_send_as_owner`, `f04_graceful_leave_handoff_accepted` and
+//! `f04_seed_syndication_accounted_to_seed` also failed for three consecutive mutants (full
+//! ticket registry, raw handshake error, sub-invite limit) that do not touch their paths; they are
+//! not counted above.
 
 use libp2p::Multiaddr;
 use parvault::bootstrap::{
