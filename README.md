@@ -65,7 +65,7 @@ parvault wot install-chain --token <TOKEN>          # laptop
 # 6. Incrementally back up files to the paired router
 parvault watch-folder --folder ~/Documents --once
 
-# 6. Optional: connect to a self-hosted or community-initialized public tracker (--public):
+# 7. Optional: connect to a self-hosted or community-initialized public tracker (--public):
 #    (No official public tracker is currently hosted; supply your own parvault-seed multiaddr)
 parvault watch-folder --folder ~/Documents --public --tracker /ip4/<YOUR_SEED_IP>/tcp/4002/p2p/<SEED_PEER_ID> --once
 ```
