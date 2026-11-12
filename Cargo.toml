@@ -1,6 +1,6 @@
 [package]
 name = "parvault"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "ParVault — Zero-knowledge post-quantum erasure-coded backup utility and P2P storage daemon with Noise transport, Web-of-Trust, and Proof of Retrievability (PoR) auditing."

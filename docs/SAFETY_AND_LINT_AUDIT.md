@@ -1,6 +1,6 @@
-# Memory Safety, `unsafe` OS-FFI Proofs & Lint-Suppression Audit (`parvault` v0.5.0)
+# Memory Safety, `unsafe` OS-FFI Proofs & Lint-Suppression Audit (`parvault` <!-- metric:crate_version_tag -->v0.5.0<!-- /metric -->)
 
-This document records the complete memory-safety posture, lint-suppression inventory, and POSIX/Linux OS-FFI safety proofs for `parvault` (`v0.5.0`), verified automatically by `audit_workspace_hardening.sh`, `cargo clippy --all-targets -- -D warnings`, `cargo kani` (<!-- metric:kani_pass_compact -->`17/17`<!-- /metric --> symbolic harnesses), and the full release test suite.
+This document records the complete memory-safety posture, lint-suppression inventory, and POSIX/Linux OS-FFI safety proofs for `parvault` (<!-- metric:crate_version_tag -->`v0.5.0`<!-- /metric -->), verified automatically by `audit_workspace_hardening.sh`, `cargo clippy --all-targets -- -D warnings`, `cargo kani` (<!-- metric:kani_pass_compact -->`17/17`<!-- /metric --> symbolic harnesses), and the full release test suite.
 
 ---
 

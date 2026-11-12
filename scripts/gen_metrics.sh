@@ -111,7 +111,11 @@ tests_unit="$(count "$test_re" "${src_rs[@]}")";                 positive tests_
 tests_int="$(count "$test_re" "${test_rs[@]}")";                 positive tests_integration "$tests_int"
 tests_total=$((tests_unit + tests_int))
 
-counts="kani_harnesses = $kani_total
+version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+].*)?$ ]] || fail "crate version is '$version'"
+
+counts="crate_version_tag = v$version
+kani_harnesses = $kani_total
 kani_harnesses_module = $kani_module
 kani_pass = $kani_total / $kani_total
 kani_pass_compact = $kani_total/$kani_total

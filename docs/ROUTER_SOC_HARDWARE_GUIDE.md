@@ -16,7 +16,7 @@ However, embedding modern distributed storage on consumer and enterprise router 
 2. **Flash Storage Constraints:** Embedded NOR/NAND or eMMC partitions for router operating systems require ultra-compact static binaries (`< 15 MiB`) with zero external dynamic runtime dependencies (glibc, libssl, Python, or node.js).
 3. **Zero-IP Consumer Usability:** Homeowners and non-technical users cannot be expected to look up DHCP leases, configure static IPv4 subnets, or type `/ip4/192.168.1.142/tcp/4001/p2p/...` addresses.
 
-`parvault` v0.4.0 solves all three constraints:
+`parvault` <!-- metric:crate_version_tag -->v0.5.0<!-- /metric --> solves all three constraints:
 - **`--profile router-soc`:** Enforces **1 MiB streaming Reed-Solomon stripes** (`ROUTER_SOC_STRIPE_SIZE_BYTES = 1,048,576`), dropping transient peak heap allocations (`VmHWM`) from <!-- metric:bench.desktop.vmhwm -->`57.91 MiB`<!-- /metric --> to **<!-- metric:bench.soc.vmhwm -->`9.72–9.74 MiB`<!-- /metric -->** (`< 16 MiB`), operating safely inside a `32–48 MiB` container or cgroup ceiling while retaining 100% wire and manifest compatibility with desktop and NAS nodes.
 - **Static Zero-Dependency `musl` & `FROM scratch` Containers:** Stripped standalone binaries (<!-- metric:size.aarch64.range -->`2.94–6.08 MiB`<!-- /metric --> ARM64, <!-- metric:size.x86_64.range -->`3.63–7.77 MiB`<!-- /metric --> x86_64 across `parvault`, `parvault-seed`, `parvault-fuse`, and `parvault-sync` — with the zero-copy Unix socket gateway and optional built-in `=y` VFS folded directly into `parvault`) and minimal `FROM scratch` Docker/OCI images under 20 MiB.
 - **Cryptographic Zero-IP LAN Discovery & 4-Word SAS Pairing:** Fully automated LAN beaconing over UDP port `4009` with Ed25519-signed identity binding, 4-word BIP-39 pairing codes, and DHCP self-healing.
@@ -224,7 +224,7 @@ sequenceDiagram
 
 ## 6. Zero-Pairing BitTorrent-Style Public Commons Mode (`--public --tracker ...`)
 
-For users and router operators who do not wish to manage private join codes, device certificates, or invitation lists, `parvault` v0.4.0 supports **Public Commons Mode** (`--public`), analogous to joining a public BitTorrent swarm:
+For users and router operators who do not wish to manage private join codes, device certificates, or invitation lists, `parvault` <!-- metric:crate_version_tag -->v0.5.0<!-- /metric --> supports **Public Commons Mode** (`--public`), analogous to joining a public BitTorrent swarm:
 
 ```bash
 # Launch Router Cloud-NAS connecting directly to the Public Commons tracker:
@@ -251,7 +251,7 @@ parvault up \
 ### Binary Installation
 ```bash
 # 1. Download static aarch64 or x86_64 musl binary
-wget -O /usr/bin/parvault https://github.com/Zbot21/parvault/releases/download/v0.4.0/parvault-aarch64-unknown-linux-musl
+wget -O /usr/bin/parvault https://github.com/Zbot21/parvault/releases/download/v0.5.0/parvault-aarch64-unknown-linux-musl
 chmod +x /usr/bin/parvault
 
 # 2. Create runtime directories
@@ -261,7 +261,7 @@ mkdir -p /etc/parvault /mnt/nas/.parvault-data /mnt/nas/shared
 ### Configuration File (`/etc/parvault/router.toml`)
 Copy `deploy/router-soc/parvault-router.toml`:
 ```toml
-# ParVault v0.4.0 Turnkey Router Cloud-NAS Configuration (ADR-18)
+# ParVault v0.5.0 Turnkey Router Cloud-NAS Configuration (ADR-18)
 # Designed for OpenWrt / prplOS / ARM64 & x86_64 Gateway SoCs (<= 32-48 MiB cgroup RAM)
 
 hardware_profile = "router-soc"
@@ -373,7 +373,7 @@ For carrier and broadband gateway environments running `prplOS`, deploy `parvaul
   "schema_version": "1.0",
   "container_name": "parvault-router-nas",
   "vendor": "Neighborhood Cloud / Project ParVault",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "license": "AGPL-3.0-only",
   "target_platforms": [
     "aarch64-unknown-linux-musl",
@@ -442,7 +442,7 @@ prplos-lxc-ctl start parvault-router-nas
 - **`GET /api/v1/health`:** Returns real-time health, RAM telemetry, storage quotas, uptime, and SAS pairing code in JSON:
   ```json
   {
-    "version": "0.4.0",
+    "version": "0.5.0",
     "node_label": "OpenWrt-CloudNAS",
     "hardware_profile": "router-soc",
     "device_peer_id": "12D3KooWSDu7w4v...",

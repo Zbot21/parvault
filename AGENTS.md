@@ -1,6 +1,6 @@
 # AI Agent & Systems Engineer Guide (`AGENTS.md`)
 
-This document is the authoritative architectural, security, and verification manual for AI coding agents and human systems engineers working on **`parvault`** (`v0.5.0`, library crate `parvault`, binaries `parvault`, `parvault-seed`, `parvault-fuse`, `parvault-sync`, and `parvault-bench`).
+This document is the authoritative architectural, security, and verification manual for AI coding agents and human systems engineers working on **`parvault`** (<!-- metric:crate_version_tag -->`v0.5.0`<!-- /metric -->, library crate `parvault`, binaries `parvault`, `parvault-seed`, `parvault-fuse`, `parvault-sync`, and `parvault-bench`).
 
 ---
 

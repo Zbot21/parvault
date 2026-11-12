@@ -2,7 +2,7 @@
   "schema_version": "1.0",
   "container_name": "parvault-daemon",
   "vendor": "Neighborhood Cloud / Project ParVault",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "license": "AGPL-3.0-only",
   "target_platforms": [
     "aarch64-unknown-linux-musl",

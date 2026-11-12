@@ -1,4 +1,4 @@
-# ParVault Zero-Copy Unix Socket & `GatewayBus` Plugin Protocol Specification (`v0.5.0`)
+# ParVault Zero-Copy Unix Socket & `GatewayBus` Plugin Protocol Specification (<!-- metric:crate_version_tag -->`v0.5.0`<!-- /metric -->)
 
 - **Governing ADRs:** [`ADR-27`](adr/ADR-27-zero-copy-uds-gateway-and-hedged-pool.md), [`ADR-28`](adr/ADR-28-stateless-macaroon-capability-attenuation.md), [`ADR-29`](adr/ADR-29-pure-rust-fuse-and-webdav-lazy-vfs.md), [`ADR-31`](adr/ADR-31-unsafe-remediation-and-os-sys-ffi-boundary.md), [`ADR-32`](adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md), [`ADR-33`](adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md)
 - **Canonical Reference Plugins:** [`src/bin/parvault-fuse.rs`](../src/bin/parvault-fuse.rs) (`parvault-fuse`) & [`src/bin/parvault-sync.rs`](../src/bin/parvault-sync.rs) (`parvault-sync`)
@@ -8,7 +8,7 @@
 
 ## 1. Architecture Overview: Single Core Daemon + Dual-Mode Plugins
 
-In `v0.5.0`, **`parvault up --ipc-socket /var/run/parvault.sock`** is the canonical single-daemon host. One `parvault` process simultaneously runs:
+In <!-- metric:crate_version_tag -->`v0.5.0`<!-- /metric -->, **`parvault up --ipc-socket /var/run/parvault.sock`** is the canonical single-daemon host. One `parvault` process simultaneously runs:
 
 1. Inbound + outbound reciprocal `libp2p` (`TCP + Noise XX + Yamux`) shard storage, Proof-of-Retrievability (`PoR`) auditing, 30-second bit-rot scrubbing, and zero-IP LAN/WAN discovery;
 2. Optional background POSIX folder backup (`--watch` / `FolderSyncEngine`);

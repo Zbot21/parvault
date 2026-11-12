@@ -1,4 +1,4 @@
-# ParVault v0.3.0 Turnkey Router Cloud-NAS Configuration (ADR-18)
+# ParVault v0.5.0 Turnkey Router Cloud-NAS Configuration (ADR-18)
 # Designed for OpenWrt / prplOS / ARM64 & x86_64 Gateway SoCs (<= 32-48 MiB cgroup RAM)
 
 hardware_profile = "router-soc"

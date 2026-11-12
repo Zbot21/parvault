@@ -1,6 +1,6 @@
 # Security Architecture, Cryptographic Proofs & Formal Verification (`SECURITY_AND_CRYPTOGRAPHY.md`)
 
-This document details the mathematical, cryptographic, game-theoretic, and formal-verification foundations of **`parvault`** (`parvault`, `parvault-seed`, `parvault-fuse`, and `parvault-sync`), covering the single-concern Architectural Decision Records [`ADR-01` through `ADR-33`](ADR.md) in [`docs/adr/`](adr/) and `v0.5.0` formal verification (<!-- metric:kani_harnesses -->`17`<!-- /metric --> Kani Rust Bounded Model Checking symbolic harnesses + <!-- metric:tla_specs -->`7`<!-- /metric --> TLA+ TLC specifications).
+This document details the mathematical, cryptographic, game-theoretic, and formal-verification foundations of **`parvault`** (`parvault`, `parvault-seed`, `parvault-fuse`, and `parvault-sync`), covering the single-concern Architectural Decision Records [`ADR-01` through `ADR-33`](ADR.md) in [`docs/adr/`](adr/) and <!-- metric:crate_version_tag -->`v0.5.0`<!-- /metric --> formal verification (<!-- metric:kani_harnesses -->`17`<!-- /metric --> Kani Rust Bounded Model Checking symbolic harnesses + <!-- metric:tla_specs -->`7`<!-- /metric --> TLA+ TLC specifications).
 
 ---
 
