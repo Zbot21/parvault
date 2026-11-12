@@ -105,6 +105,16 @@ python3 - "$REPO" "$METRICS" "$MODE" "$GENERATE" "$WORKDIR/generated" "$GENERATO
 import os
 import re
 import sys
+import tempfile
+
+
+def _fail_closed(exc_type, exc, tb):
+    # Any unexpected exception is an error (exit 2), never drift (exit 1).
+    print(f"ERROR: internal failure: {exc_type.__name__}: {exc}", file=sys.stderr)
+    sys.exit(2)
+
+
+sys.excepthook = _fail_closed
 
 repo, metrics_path, mode, generate, gen_out, generator, md_list = sys.argv[1:8]
 generate = generate == "1"
@@ -119,7 +129,7 @@ OPEN_RE = re.compile(rf"^\s*metric:({KEY})\s*$")
 CLOSE_RE = re.compile(r"^\s*/metric\s*$")
 LOOKS_LIKE_MARKER = re.compile(r"^\s*/?\s*metric\b")
 UNCLOSED_RE = re.compile(r"<!--\s*/?\s*metric\b")
-FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 CODE_FORM_RE = re.compile(r"(`+)([^`](?:.*[^`])?)\1")
 PLAIN_ESCAPES = set("\\`*_[]<>|~$&")
 
@@ -129,6 +139,16 @@ warnings = []
 
 def rel(path):
     return os.path.relpath(path, repo)
+
+
+def split_lines(body):
+    # Split on "\n" only (keeping it), so U+2028, NEL, and form feeds never
+    # shift line numbers. A "\r" before "\n" stays part of the line ending.
+    parts = body.split("\n")
+    out = [part + "\n" for part in parts[:-1]]
+    if parts[-1]:
+        out.append(parts[-1])
+    return out
 
 
 def read_text(path):
@@ -161,7 +181,7 @@ def parse_entries(lines, src, first_lineno=1, skip=()):
 # ---------------------------------------------------------------------------
 metrics_rel = rel(metrics_path)
 text = read_text(metrics_path) if os.path.exists(metrics_path) else None
-lines = text.splitlines(keepends=True) if text is not None else []
+lines = split_lines(text) if text is not None else []
 eol = "\r\n" if text is not None and "\r\n" in text else "\n"
 stripped = [ln.rstrip("\r\n") for ln in lines]
 begins = [i for i, s in enumerate(stripped) if s == GEN_BEGIN]
@@ -176,7 +196,7 @@ if begins or ends:
 stale_block = False
 if generate and not errors:
     with open(gen_out, encoding="utf-8") as fh:
-        gen_lines = fh.read().splitlines()
+        gen_lines = [ln.rstrip("\r\n") for ln in split_lines(fh.read())]
     gen_entries = parse_entries(gen_lines, f"{rel(generator)} output")
     new_block = [GEN_BEGIN + eol] + [f"{k} = {v}{eol}" for k, v, _ in gen_entries] + [GEN_END + eol]
     if block is not None:
@@ -219,8 +239,16 @@ def render(value, content, table_row, where, key):
     return "".join("\\" + ch if ch in PLAIN_ESCAPES else ch for ch in value)
 
 
+md_files = set()
 with open(md_list, "rb") as fh:
-    md_files = sorted({p.decode("utf-8") for p in fh.read().split(b"\0") if p})
+    for raw_name in fh.read().split(b"\0"):
+        if not raw_name:
+            continue
+        try:
+            md_files.add(raw_name.decode("utf-8"))
+        except UnicodeDecodeError:
+            errors.append(f"{raw_name!r}: Markdown file name is not valid UTF-8")
+md_files = sorted(md_files)
 
 markers = []  # (file, lineno, key, content)
 edits = {}  # path -> list of lines (with EOL) after replacement
@@ -232,9 +260,9 @@ for md in md_files:
     body = read_text(path)
     if body is None:
         continue
-    md_lines = body.splitlines(keepends=True)
+    md_lines = split_lines(body)
     out_lines = list(md_lines)
-    in_fence, fence_char, fence_len = False, "", 0
+    in_fence, fence_char, fence_len, fence_line = False, "", 0, 0
     for idx, raw in enumerate(md_lines):
         lineno = idx + 1
         where = f"{md}:{lineno}"
@@ -244,7 +272,7 @@ for md in md_files:
         if fm:
             marker, rest = fm.group(1), fm.group(2)
             if not in_fence and (marker[0] == "~" or "`" not in rest):
-                in_fence, fence_char, fence_len = True, marker[0], len(marker)
+                in_fence, fence_char, fence_len, fence_line = True, marker[0], len(marker), lineno
                 continue
             if in_fence and marker[0] == fence_char and len(marker) >= fence_len and not rest.strip():
                 in_fence = False
@@ -308,6 +336,8 @@ for md in md_files:
                     print(f"{where}: metric '{key}' is '{content}', expected '{expected}'")
                 new_line = new_line[:start] + expected + new_line[end:]
         out_lines[idx] = new_line + eol_part
+    if in_fence:
+        errors.append(f"{md}:{fence_line}: fenced code block is never closed (markers after it would be skipped)")
     if out_lines != md_lines:
         edits[path] = out_lines
 
@@ -346,14 +376,43 @@ if mode == "check":
     print(f"[PASS] {len(markers)} metric marker(s) in sync with {metrics_rel if text is not None else 'no metrics file'}.")
     sys.exit(0)
 
+# Write phase: prepare every output, check every target is writable, then
+# replace each file through a temp file in the same directory (os.replace).
+outputs = []
 if stale_block:
-    os.makedirs(os.path.dirname(metrics_path), exist_ok=True)
-    with open(metrics_path, "w", encoding="utf-8", newline="") as fh:
-        fh.write(text)
-    print(f"[SYNC] {metrics_rel}: generated block refreshed")
+    outputs.append((metrics_path, text, f"{metrics_rel}: generated block refreshed"))
 for path, out_lines in sorted(edits.items()):
-    with open(path, "w", encoding="utf-8", newline="") as fh:
-        fh.write("".join(out_lines))
-    print(f"[SYNC] {rel(path)}")
+    outputs.append((path, "".join(out_lines), rel(path)))
+blocked = []
+for path, _, _ in outputs:
+    parent = os.path.dirname(path)
+    if os.path.exists(path) and not os.access(path, os.W_OK):
+        blocked.append(f"{rel(path)}: file is not writable")
+    elif os.path.isdir(parent) and not os.access(parent, os.W_OK | os.X_OK):
+        blocked.append(f"{rel(path)}: directory is not writable")
+if blocked:
+    for b in blocked:
+        print(f"ERROR: {b}", file=sys.stderr)
+    print(f">>> DOC METRICS: {len(blocked)} unwritable target(s); nothing written <<<", file=sys.stderr)
+    sys.exit(2)
+for path, content, label in outputs:
+    parent = os.path.dirname(path)
+    try:
+        os.makedirs(parent, exist_ok=True)
+        mode_bits = os.stat(path).st_mode & 0o7777 if os.path.exists(path) else 0o644
+        fd, tmp = tempfile.mkstemp(prefix=".metrics-sync-", dir=parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+                fh.write(content)
+            os.chmod(tmp, mode_bits)
+            os.replace(tmp, path)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+    except OSError as exc:
+        print(f"ERROR: {rel(path)}: write failed: {exc}", file=sys.stderr)
+        sys.exit(2)
+    print(f"[SYNC] {label}")
 print(f"[PASS] {len(markers)} metric marker(s); {len(edits)} file(s) rewritten.")
 PY
