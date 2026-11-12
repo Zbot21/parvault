@@ -416,6 +416,61 @@ pub enum AdmissionClass {
     CouncilSigned,
     /// Requires an admitted peer.
     AdmittedPeer,
+    /// An onion relay: forwarding needs no admission (the originator stays hidden); a final
+    /// delivery requires the last hop's sender to be admitted, checked inside the arm.
+    RelayCarried,
+}
+
+/// The refusal text sent to a sender that is not admitted (the reason code stays in the log).
+pub const NOT_ADMITTED_TEXT: &str = "peer not admitted; v0.5.0 requires ring admission";
+
+/// What the admission decision needs to know about one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionFacts {
+    pub class: AdmissionClass,
+    /// The sender's Ed25519 key from its transport identity, if it has one.
+    pub sender_pubkey: Option<[u8; 32]>,
+    /// The sender is admitted (genesis, an unquarantined ring chain, or a public ticket) and not
+    /// quarantined.
+    pub sender_trusted: bool,
+}
+
+/// The single admission decision (F-03). `Err` carries the reason code for the local log.
+pub fn admission_decision(facts: &AdmissionFacts) -> Result<(), &'static str> {
+    if facts.class != AdmissionClass::AdmittedPeer {
+        return Ok(());
+    }
+    if facts.sender_pubkey.is_none() {
+        return Err("reject.peer_key_unknown");
+    }
+    if !facts.sender_trusted {
+        return Err("reject.peer_not_admitted");
+    }
+    Ok(())
+}
+
+/// Facts for `class` about the sender of this request.
+fn admission_facts(
+    peer: &WirePeer<'_>,
+    class: AdmissionClass,
+    wot: &WebOfTrustRegistry,
+) -> AdmissionFacts {
+    AdmissionFacts {
+        class,
+        sender_pubkey: peer.pubkey,
+        sender_trusted: peer.pubkey.is_some_and(|pk| wot.is_peer_trusted(&pk)),
+    }
+}
+
+/// Runs the decision and logs a refusal; `true` admits.
+fn admitted(peer: &WirePeer<'_>, class: AdmissionClass, wot: &WebOfTrustRegistry) -> bool {
+    match admission_decision(&admission_facts(peer, class, wot)) {
+        Ok(()) => true,
+        Err(code) => {
+            warn!(code, peer = %peer.peer_id, "refused a request from a peer that is not admitted");
+            false
+        }
+    }
 }
 
 /// Classifies a request for admission.
@@ -425,34 +480,35 @@ pub const fn admission_class(request: &MeshWireRequest) -> AdmissionClass {
         | MeshWireRequest::QueryNodeStatus
         | MeshWireRequest::RegisterWanRendezvous { .. }
         | MeshWireRequest::LookupWanRendezvous { .. } => AdmissionClass::PreAdmission,
-        MeshWireRequest::PutBlindedShard { .. }
-        | MeshWireRequest::GetBlindedShard { .. }
+        MeshWireRequest::GetBlindedShard { .. }
         | MeshWireRequest::RenewBlindedLease { .. }
         | MeshWireRequest::DeleteBlindedShardTombstone { .. }
-        | MeshWireRequest::RelayPqOnionEnvelope { .. }
         | MeshWireRequest::GetCiphertextShard { .. }
         | MeshWireRequest::DeleteShard { .. }
         | MeshWireRequest::PorAudit(_)
         | MeshWireRequest::MultiSegmentPorAudit(_)
-        | MeshWireRequest::PutDhtEnvelope(_)
         | MeshWireRequest::GetDhtEnvelope { .. } => AdmissionClass::SelfAuthorised,
+        MeshWireRequest::RelayPqOnionEnvelope { .. } => AdmissionClass::RelayCarried,
         MeshWireRequest::SubmitAbuseTakedownReport(_)
         | MeshWireRequest::BroadcastEvictionOrder(_) => AdmissionClass::CouncilSigned,
-        MeshWireRequest::PutShard { .. } | MeshWireRequest::SyndicateLiteStripe { .. } => {
-            AdmissionClass::AdmittedPeer
-        }
+        // v0.5.0: blinded-shard vouchers are self-certifying (F-24), so a blinded put needs an
+        // admitted sender as well as its voucher.
+        MeshWireRequest::PutShard { .. }
+        | MeshWireRequest::SyndicateLiteStripe { .. }
+        | MeshWireRequest::PutDhtEnvelope(_)
+        | MeshWireRequest::PutBlindedShard { .. } => AdmissionClass::AdmittedPeer,
     }
 }
 
 /// The single admission check: `Some(rejection)` refuses the request before dispatch.
-/// Always admits in 2a (today's behaviour).
 fn admit(
-    _peer: &WirePeer<'_>,
-    _request: &MeshWireRequest,
-    _class: AdmissionClass,
-    _st: &mut WireState<'_>,
+    peer: &WirePeer<'_>,
+    request: &MeshWireRequest,
+    class: AdmissionClass,
+    st: &mut WireState<'_>,
 ) -> Option<MeshWireResponse> {
-    None
+    (!admitted(peer, class, st.wot))
+        .then(|| reject_response(request, NOT_ADMITTED_TEXT.to_string()))
 }
 
 /// The single quota-identity decision for shard ownership. `claimed` is the owner named in the
@@ -998,6 +1054,12 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                     }
                 }
             } else if let Ok(bundle) = envelope.open_final_target_pq(pq_kem) {
+                if !admitted(peer, AdmissionClass::AdmittedPeer, wot) {
+                    return MeshWireResponse::RelayPqOnionAck {
+                        delivered: false,
+                        error: Some(NOT_ADMITTED_TEXT.to_string()),
+                    };
+                }
                 if let Some(reason) = eviction.is_ingress_blocked(
                     remote_ip,
                     Some(remote_peer_id),
@@ -1054,6 +1116,12 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
             } else {
                 match envelope.open_pq(pq_kem) {
                     Ok((blinded_id, shard_bytes)) => {
+                        if !admitted(peer, AdmissionClass::AdmittedPeer, wot) {
+                            return MeshWireResponse::RelayPqOnionAck {
+                                delivered: false,
+                                error: Some(NOT_ADMITTED_TEXT.to_string()),
+                            };
+                        }
                         if let Some(reason) = eviction.is_ingress_blocked(
                             remote_ip,
                             Some(remote_peer_id),
@@ -1591,6 +1659,37 @@ mod tests {
     }
 
     #[test]
+    fn admission_decision_rules() {
+        let facts = |class, sender_pubkey, sender_trusted| AdmissionFacts {
+            class,
+            sender_pubkey,
+            sender_trusted,
+        };
+        let admitted = AdmissionClass::AdmittedPeer;
+        assert_eq!(
+            admission_decision(&facts(admitted, Some([1; 32]), true)),
+            Ok(())
+        );
+        assert_eq!(
+            admission_decision(&facts(admitted, Some([1; 32]), false)),
+            Err("reject.peer_not_admitted")
+        );
+        // Fail closed when the transport identity carries no Ed25519 key.
+        assert_eq!(
+            admission_decision(&facts(admitted, None, true)),
+            Err("reject.peer_key_unknown")
+        );
+        for class in [
+            AdmissionClass::PreAdmission,
+            AdmissionClass::SelfAuthorised,
+            AdmissionClass::CouncilSigned,
+            AdmissionClass::RelayCarried,
+        ] {
+            assert_eq!(admission_decision(&facts(class, None, false)), Ok(()));
+        }
+    }
+
+    #[test]
     fn admission_class_keeps_pre_admission_paths_open() {
         let classes: Vec<AdmissionClass> = all_requests()
             .iter()
@@ -1601,6 +1700,16 @@ mod tests {
             .filter(|c| **c == AdmissionClass::PreAdmission)
             .count();
         assert_eq!(pre, 4, "handshake, status, rendezvous register and lookup");
+        let admitted: Vec<&str> = all_requests()
+            .iter()
+            .filter(|(r, _, _)| admission_class(r) == AdmissionClass::AdmittedPeer)
+            .map(|(_, name, _)| *name)
+            .collect();
+        assert_eq!(
+            admitted.len(),
+            4,
+            "PutShard, SyndicateLiteStripe, PutDhtEnvelope, PutBlindedShard: {admitted:?}"
+        );
         assert_eq!(
             admission_class(&MeshWireRequest::QueryNodeStatus),
             AdmissionClass::PreAdmission

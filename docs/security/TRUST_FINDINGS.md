@@ -18,7 +18,7 @@ Status values:
 | :--- | :--- | :--- | :--- | :--- |
 | F-01 | Blocker | Gossip `SlashingEvidence` quarantines on one trusted reporter's accusation, with no guard for genesis or self. | 2b | Reproduced |
 | F-02 | High | A repair read (Case B) is not bound to the registered grant; `PutShard` registers any self-signed grant, before the put succeeds, overwriting the existing one. | 2b | Reproduced (F-02a, F-02b) |
-| F-03 | High | Web-of-trust admission is never consulted on the wire request path. | 2b | Reproduced |
+| F-03 | High | Web-of-trust admission is never consulted on the wire request path. | 2b | Fixed (QA pending): `admission_decision`, claims F-03 and F-03-SEED |
 | F-04 | High | `PutShard` takes a caller-supplied `owner_peer_id`; each invented id gets a fresh account with bootstrap grace. | 2b | Reproduced |
 | F-05 | High | Public-commons PoW admission has no wire carrier and no production caller. | 2b | Static |
 | F-06 | High | The PoR audit loop is not wired: nothing issues challenges or verifies responses. | 2c | Read |
@@ -31,12 +31,12 @@ Status values:
 | F-15 | Low | `verify_weather_quorum` has no caller, but `docs/SECURITY_AND_CRYPTOGRAPHY.md` claims it. | 2b | Static |
 | F-17 | Medium | `GatewayIdentityStatement` verification does not pin the signing authority; expiry `0` is permanent. | 2c | Reported |
 | F-18 | Medium | Onion relay jitter is a blocking `std::thread::sleep` on the swarm task. | 2c | Reported |
-| F-20 | High | No production path admits a peer (no handshake caller, no invitation issuer, self-generated genesis). | 2b | Read |
+| F-20 | High | No production path admits a peer (no handshake caller, no invitation issuer, self-generated genesis). | 2b | Fixed for option A (QA pending): self-issue from the ring genesis, `wot invite` / `install-chain` |
 | F-21 | Medium | `HandshakeWoT` does not bind the chain leaf to the sender's transport key. | 2b | Reproduced |
 | F-22 | Medium | `RegisterWanRendezvous` lets an unadmitted peer store about `512 MiB` and write the admission-IP map. | 2c | Reproduced |
 | F-23 | Medium | `RenewBlindedLease` carries no credential. | 2c | Reproduced |
-| F-24 | Medium | Blinded-shard vouchers are self-certifying (the receiver trusts the issuer the voucher names). | 2b (admission), 2c (issuer policy) | Reproduced (blinded put, onion final delivery) |
-| F-25 | Medium | `SyndicateLiteStripe` accepts a `PersonalDeviceCert` not bound to the sender (any key that holds a valid cert can replay it) and re-uploads under a constant owner; `PutDhtEnvelope` writes self-signed records into uncapped maps. | 2b | Reproduced (cert replay by another key; unadmitted DHT put) |
+| F-24 | Medium | Blinded-shard vouchers are self-certifying (the receiver trusts the issuer the voucher names). | 2b (admission), 2c (issuer policy) | Admission fixed (QA pending): claims F-24, F-24-ONION; issuer policy open (2c) |
+| F-25 | Medium | `SyndicateLiteStripe` accepts a `PersonalDeviceCert` not bound to the sender (any key that holds a valid cert can replay it) and re-uploads under a constant owner; `PutDhtEnvelope` writes self-signed records into uncapped maps. | 2b | DHT admission fixed (QA pending): claim F-25-DHT; cert binding pending |
 | F-26 | Low | First-wins grant registration lets an admitted holder of one shard squat a stripe root on other nodes (residual after F-02). | 2c | Read |
 
 ## Proof gaps
@@ -59,3 +59,13 @@ Status values:
 | B-DISC | `src/network/discovery.rs` has three `std::thread::sleep` calls (LAN beacon and probe loops); review whether any runs on the async runtime. | Open (2c). |
 | T-SPECS | Every spec passes the non-vacuity lint and every `INVARIANT` has a QA-authored mutant (P-02, P-04). | Open (2d-β). |
 | X-ADR, X-ADR-DOC | Every `ADR-NN` reference in code and docs names an existing ADR file. | Enforced. |
+
+## Claim ids
+
+Claim lines in `.enforcement.map` use the finding id, or the finding id with a suffix when one finding has several pairs.
+
+| ID | Pair |
+| :--- | :--- |
+| F-03-SEED | F-03 on `parvault-seed`. |
+| F-24-ONION | F-24 admission at onion final delivery (forwarding needs no admission). |
+| F-25-DHT | F-25 admission for `PutDhtEnvelope`. |

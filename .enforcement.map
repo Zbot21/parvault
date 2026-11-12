@@ -17,8 +17,7 @@ adr        D-ADR     path=docs/adr/*.md
 open       D-ADR     expect=completeness by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 
 # --- Reach: checks that exist but are not called on the wire path ----------------------------------
-reach      F-03      sym=src/network/wot.rs::is_peer_trusted from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
-open       F-03      expect=reach by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+reach      F-03      sym=src/network/wire_handler.rs::admission_decision from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
 reach      F-05      sym=src/network/wot.rs::verify_and_admit_public_ticket from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
 open       F-05      expect=reach by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 reach      F-06      sym=src/por/verifier.rs::verify_audit_response from=src/cli/daemon.rs::run_daemon ref=docs/security/TRUST_FINDINGS.md
@@ -44,10 +43,15 @@ module     P-01      path=src/network/wot.rs pattern=^(verify_and_admit_|is_peer
 open       P-01      expect=completeness by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 
 # --- Claims ----------------------------------------------------------------------------------------
+claim      F-03      sym=src/network/wire_handler.rs::admission_decision accept=trust_enforcement::f03_admitted_put_shard_stored_daemon reject=trust_enforcement::f03_unadmitted_put_shard_refused_daemon code=reject.peer_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-05-recursive-wot-and-subtree-slashing.md covers=MeshWireRequest::PutShard
+claim      F-03-SEED sym=src/network/wire_handler.rs::admission_decision accept=trust_enforcement::f03_admitted_put_shard_stored_seed reject=trust_enforcement::f03_unadmitted_put_shard_refused_seed code=reject.peer_not_admitted bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::PutShard
+claim      F-24      sym=src/network/wire_handler.rs::admission_decision accept=trust_enforcement::f24_admitted_blinded_put_stored reject=trust_enforcement::f24_unadmitted_blinded_put_refused code=reject.peer_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-11-four-layer-shard-anonymization.md covers=MeshWireRequest::PutBlindedShard
+claim      F-24-ONION sym=src/network/wire_handler.rs::admission_decision accept=trust_enforcement::f24_admitted_onion_final_delivered reject=trust_enforcement::f24_unadmitted_onion_final_refused code=reject.peer_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::RelayPqOnionEnvelope
+claim      F-25-DHT  sym=src/network/wire_handler.rs::admission_decision accept=trust_enforcement::f25_admitted_dht_put_stored reject=trust_enforcement::f25_unadmitted_dht_put_refused code=reject.peer_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-02-dht-encrypted-manifests.md covers=MeshWireRequest::PutDhtEnvelope
 # Each 2b fix adds its claim line (a differential pair rewritten from its reproduction in
 # tests/trust_enforcement.rs) in the same commit. A claim cannot be declared before its check
 # function exists (an unknown sym is an error even under expect=claim-missing).
 # Findings with no line yet (no check function exists to name): F-07, F-08, F-09, F-12, F-17
 #   (2c); F-22, F-23, F-26 (2c); F-24 issuer policy (2c).
 
-ratchet    R         open=12 waive=0
+ratchet    R         open=11 waive=0

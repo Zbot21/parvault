@@ -450,6 +450,21 @@ impl Trio {
             .collect();
         Self { keys, fx }
     }
+    /// Admits `peer` into every fixture's ring (a genesis-issued chain), as a v0.5.0 handshake
+    /// would. Requests that need an admitted sender are refused without it.
+    fn admit(&mut self, peer: &Peer) {
+        let chain = DelegationChain {
+            hops: vec![InvitationHop::issue(
+                &self.keys.genesis,
+                peer.ident.public_key_bytes(),
+                1,
+                100,
+            )],
+        };
+        for fx in &mut self.fx {
+            fx.wot.verify_and_admit_chain(&chain).unwrap();
+        }
+    }
     /// Applies `f` to every fixture (setup).
     fn each(&mut self, mut f: impl FnMut(&mut Fx, &Keys)) {
         for fx in &mut self.fx {
@@ -730,6 +745,7 @@ fn put_shard() {
     let _g = env_guard();
     let mut t = Trio::new("put");
     let peer = Peer::new(0x61, "198.51.100.2");
+    t.admit(&peer);
     for (owner, seed) in [("", 1u8), ("alice-owner", 2u8)] {
         let (sid, bytes) = shard(seed, 2048);
         let before: Vec<(u64, u64)> =
@@ -809,6 +825,19 @@ fn put_shard() {
     );
     assert_identical(&o);
     assert!(t.fx.iter().all(|f| !f.store.has_shard(&sid)));
+    // v0.5.0 admission: a sender without a ring chain is refused identically by every role,
+    // with no state change.
+    let stranger = Peer::new(0x60, "198.51.100.40");
+    let (sid, bytes) = shard(27, 1024);
+    let o = t.run(&stranger, &put_shard_req("", sid, bytes, [27; 32]));
+    assert!(
+        o[0].resp
+            .contains("peer not admitted; v0.5.0 requires ring admission"),
+        "{}",
+        o[0].resp
+    );
+    assert_identical(&o);
+    assert!(o[0].changed.is_empty() && o[0].quota_delta == 0);
 }
 
 // --- 3. DeleteShard (identical) -----------------------------------------------------------------
@@ -818,6 +847,7 @@ fn delete_shard() {
     let _g = env_guard();
     let mut t = Trio::new("del");
     let peer = Peer::new(0x62, "198.51.100.3");
+    t.admit(&peer);
     let (sid, bytes) = shard(5, 1024);
     t.run(&peer, &put_shard_req("", sid, bytes, [5; 32]));
     let (pub_, payload, sig) =
@@ -897,6 +927,7 @@ fn por_audit() {
     let _g = env_guard();
     let mut t = Trio::new("por");
     let peer = Peer::new(0x63, "198.51.100.4");
+    t.admit(&peer);
     let (sid, bytes) = shard(6, 4096);
     let session = [0x99; 32];
     t.run(&peer, &put_shard_req("", sid, bytes.clone(), session));
@@ -916,6 +947,7 @@ fn multi_segment_por_audit() {
     let _g = env_guard();
     let mut t = Trio::new("mpor");
     let peer = Peer::new(0x64, "198.51.100.5");
+    t.admit(&peer);
     let (sid, bytes) = shard(7, 64 * 1024);
     let session = [0x98; 32];
     t.run(&peer, &put_shard_req("", sid, bytes.clone(), session));
@@ -940,6 +972,7 @@ fn get_ciphertext_shard() {
     let _g = env_guard();
     let mut t = Trio::new("getct");
     let peer = Peer::new(0x65, "198.51.100.6");
+    t.admit(&peer);
     let (sid, bytes) = shard(8, 1024);
     t.run(&peer, &put_shard_req("", sid, bytes, [8; 32]));
     let o = t.run(
@@ -1025,6 +1058,7 @@ fn put_blinded_shard() {
     let mut t = Trio::new("pb");
     let issuer = t.keys.voucher_issuer.clone();
     let peer = Peer::new(0x66, "198.51.100.7");
+    t.admit(&peer);
     let b = blinded(9, 4096);
     let v = AnonymousQuotaVoucher::mint(&issuer, 8192);
     let o = t.run(&peer, &put_blinded(&b, v.clone()));
@@ -1105,6 +1139,7 @@ fn get_blinded_shard() {
     let mut t = Trio::new("gb");
     let issuer = t.keys.voucher_issuer.clone();
     let peer = Peer::new(0x67, "198.51.100.8");
+    t.admit(&peer);
     let b = blinded(13, 2048);
     t.run(
         &peer,
@@ -1152,6 +1187,7 @@ fn renew_blinded_lease() {
     let mut t = Trio::new("renew");
     let issuer = t.keys.voucher_issuer.clone();
     let peer = Peer::new(0x68, "198.51.100.9");
+    t.admit(&peer);
     let b = blinded(14, 2048);
     t.run(
         &peer,
@@ -1222,6 +1258,7 @@ fn delete_blinded_tombstone() {
     let mut t = Trio::new("tomb");
     let issuer = t.keys.voucher_issuer.clone();
     let peer = Peer::new(0x69, "198.51.100.10");
+    t.admit(&peer);
     let b = blinded(16, 2048);
     t.run(
         &peer,
@@ -1332,6 +1369,7 @@ fn relay_pq_onion() {
     let mut t = Trio::new("onion");
     let issuer = t.keys.voucher_issuer.clone();
     let peer = Peer::new(0x6A, "198.51.100.11");
+    t.admit(&peer);
     let our_kem_pub = t.fx[0].kem.public_key();
     let v = || AnonymousQuotaVoucher::mint(&issuer, 8192);
 
@@ -1442,6 +1480,7 @@ fn relay_pq_onion_over_seed_lease_limit() {
     let peer = Peer::new(0x6B, "198.51.100.21");
     for layered_case in [false, true] {
         let mut t = Trio::new("onion-limit");
+        t.admit(&peer);
         let issuer = t.keys.voucher_issuer.clone();
         let our_kem_pub = t.fx[0].kem.public_key();
         t.each(|fx, _| fx.max_lease = 512);
@@ -1488,6 +1527,7 @@ fn syndicate_lite_stripe() {
     let _g = env_guard();
     let mut t = Trio::new("synd");
     let peer = Peer::new(0x6B, "198.51.100.12");
+    t.admit(&peer);
     let laptop = NodeIdentity::from_seed([0x6C; 32]);
     let cert = PersonalDeviceCert::issue(
         &t.keys.owner_pq,
@@ -1553,6 +1593,7 @@ fn dht_envelopes() {
     let _g = env_guard();
     let mut t = Trio::new("dht");
     let peer = Peer::new(0x6D, "198.51.100.13");
+    t.admit(&peer);
     let owner = NodeIdentity::from_seed([0x6E; 32]);
     let mk = MasterKey::from_bytes([0x6F; 32]);
     let manifest = FileManifest {

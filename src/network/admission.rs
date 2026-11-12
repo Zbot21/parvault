@@ -45,9 +45,13 @@ pub fn install_process_source(data_dir: &Path) {
     let _ = PROCESS_SOURCE.set(AdmissionSource::from_data_dir(data_dir));
 }
 
-/// The process-wide source, if a binary installed one.
+/// The process-wide source: the one a binary installed, else (first use) a source that only
+/// self-issues from `PARVAULT_GENESIS_SEED_HEX`.
 pub fn process_source() -> Option<&'static AdmissionSource> {
-    PROCESS_SOURCE.get()
+    Some(PROCESS_SOURCE.get_or_init(|| AdmissionSource {
+        chain_dir: None,
+        genesis: held_genesis(None),
+    }))
 }
 
 fn unix_secs() -> u64 {

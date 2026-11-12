@@ -15,6 +15,7 @@ use parvault::crypto::pqc::HybridPqSigningKeypair;
 use parvault::crypto::{
     HybridKemKeypair, MasterKey, NodeIdentity, PqRelayedShardEnvelope, PqVaultMasterKey,
 };
+use parvault::network::admission::AdmissionSource;
 use parvault::network::{
     build_mesh_client_swarm, derive_slot_key_from_code, node_identity_libp2p_peer_id,
     seal_wan_peer_card, DelegationChain, DhtWireEnvelope, InvitationHop, MeshClient,
@@ -145,20 +146,40 @@ fn spawn(mut cmd: Command, root: TempDir, dir: PathBuf, log: PathBuf, port: u16)
     let child = cmd
         .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
         .env("RUST_LOG", "info")
+        .env("NO_COLOR", "1")
         .env_remove("PARVAULT_PEERS")
         .env_remove("PARVAULT_GENESIS_PUBKEY_HEX")
-        .stdout(Stdio::null())
+        .stdout(Stdio::from(log_file.try_clone().unwrap()))
         .stderr(Stdio::from(log_file))
         .spawn()
         .expect("spawn binary");
-    wait_for_port(port);
-    Node {
+    let mut node = Node {
         child,
         dir,
         log,
         addr: format!("/ip4/127.0.0.1/tcp/{port}"),
         _root: root,
+    };
+    // Ready when the binary itself reports listening on its address (an open port alone may
+    // belong to another process).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let log = node.log_text();
+        if log.contains("istening on") && log.contains(&node.addr) {
+            break;
+        }
+        if let Ok(Some(status)) = node.child.try_wait() {
+            panic!("binary exited ({status}) before listening:\n{log}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "binary not listening on {}:\n{log}",
+            node.addr
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
+    wait_for_port(port);
+    node
 }
 
 /// `parvault daemon start` on loopback with LAN discovery off, provisioned with the ring genesis.
@@ -199,13 +220,70 @@ fn spawn_seed(label: &str) -> Node {
     spawn(cmd, root, dir, log, port)
 }
 
-/// An in-process wire client speaking as `ident` (one Noise connection per request).
+/// An in-process wire client speaking as `ident`, a ring member: it self-issues its chain from
+/// the ring genesis and handshakes before requests that need an admitted sender.
 fn client(ident: &NodeIdentity) -> MeshClient {
     MeshClient::new(ident.clone(), Vec::new(), None)
+        .with_admission(AdmissionSource::from_genesis(genesis()))
+}
+
+/// A client with no admission credential (a stranger to the ring).
+fn stranger_client(ident: &NodeIdentity) -> MeshClient {
+    MeshClient::new(ident.clone(), Vec::new(), None).with_admission(AdmissionSource::default())
 }
 
 fn send(ident: &NodeIdentity, node: &Node, req: MeshWireRequest) -> MeshWireResponse {
-    match client(ident).send_request(&node.addr, req) {
+    send_with(client(ident), node, req)
+}
+
+fn send_as_stranger(ident: &NodeIdentity, node: &Node, req: MeshWireRequest) -> MeshWireResponse {
+    send_with(stranger_client(ident), node, req)
+}
+
+/// Waits until the node's log contains `code` (the reason code of a refusal).
+fn assert_logged(node: &Node, code: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if node.log_text().contains(code) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("{code} not in the node log:\n{}", node.log_text());
+}
+
+/// The refusal text a sender that is not admitted receives.
+const NOT_ADMITTED: &str = "peer not admitted; v0.5.0 requires ring admission";
+
+fn refusal_text(resp: &MeshWireResponse) -> Option<String> {
+    match resp {
+        MeshWireResponse::PutShardAck {
+            stored: false,
+            error,
+        }
+        | MeshWireResponse::PutBlindedShardAck {
+            stored: false,
+            error,
+        }
+        | MeshWireResponse::RelayPqOnionAck {
+            delivered: false,
+            error,
+        }
+        | MeshWireResponse::PutDhtEnvelopeAck {
+            stored: false,
+            error,
+        }
+        | MeshWireResponse::SyndicateLiteStripeAck {
+            receipt: None,
+            error,
+            ..
+        } => error.clone(),
+        _ => None,
+    }
+}
+
+fn send_with(c: MeshClient, node: &Node, req: MeshWireRequest) -> MeshWireResponse {
+    match c.send_request(&node.addr, req) {
         Ok(resp) => resp,
         Err(e) => panic!(
             "wire request to {}: {e}\nnode log:\n{}",
@@ -325,32 +403,58 @@ fn blinded(seed: u8, len: usize) -> Blinded {
 
 // --- F-03 / F-20: no admission on the wire request path --------------------------------------------
 
-/// F-03 (daemon): a peer that never handshook stores a shard.
+/// F-03 accept (daemon): an admitted ring member stores a shard.
 #[test]
-fn repro_f03_unadmitted_put_shard_stored_daemon() {
-    let node = spawn_daemon("f03d");
-    let stranger = key(0xA1);
+fn f03_admitted_put_shard_stored_daemon() {
+    let node = spawn_daemon("f03d-a");
+    let member = key(0xA1);
     let (sid, bytes) = shard(0x11, 1024);
-    let resp = send(&stranger, &node, put_shard("", sid, bytes, None));
-    assert!(
-        stored(&resp),
-        "gap: unadmitted PutShard is stored: {resp:?}"
-    );
-    gate_ran("trust_enforcement::repro_f03_unadmitted_put_shard_stored_daemon");
+    let resp = send(&member, &node, put_shard("", sid, bytes, None));
+    assert!(stored(&resp), "{resp:?}");
+    gate_ran("trust_enforcement::f03_admitted_put_shard_stored_daemon");
 }
 
-/// F-03 (seed): the same on `parvault-seed`.
+/// F-03 reject (daemon): the same put from a key without a chain is refused.
 #[test]
-fn repro_f03_unadmitted_put_shard_stored_seed() {
-    let node = spawn_seed("f03s");
+fn f03_unadmitted_put_shard_refused_daemon() {
+    let node = spawn_daemon("f03d-r");
+    let stranger = key(0xA1);
+    let (sid, bytes) = shard(0x11, 1024);
+    let resp = send_as_stranger(&stranger, &node, put_shard("", sid, bytes, None));
+    assert_eq!(
+        refusal_text(&resp).as_deref(),
+        Some(NOT_ADMITTED),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.peer_not_admitted");
+    gate_ran("trust_enforcement::f03_unadmitted_put_shard_refused_daemon");
+}
+
+/// F-03 accept (seed).
+#[test]
+fn f03_admitted_put_shard_stored_seed() {
+    let node = spawn_seed("f03s-a");
+    let member = key(0xA2);
+    let (sid, bytes) = shard(0x12, 1024);
+    let resp = send(&member, &node, put_shard("", sid, bytes, None));
+    assert!(stored(&resp), "{resp:?}");
+    gate_ran("trust_enforcement::f03_admitted_put_shard_stored_seed");
+}
+
+/// F-03 reject (seed).
+#[test]
+fn f03_unadmitted_put_shard_refused_seed() {
+    let node = spawn_seed("f03s-r");
     let stranger = key(0xA2);
     let (sid, bytes) = shard(0x12, 1024);
-    let resp = send(&stranger, &node, put_shard("", sid, bytes, None));
-    assert!(
-        stored(&resp),
-        "gap: unadmitted PutShard is stored: {resp:?}"
+    let resp = send_as_stranger(&stranger, &node, put_shard("", sid, bytes, None));
+    assert_eq!(
+        refusal_text(&resp).as_deref(),
+        Some(NOT_ADMITTED),
+        "{resp:?}"
     );
-    gate_ran("trust_enforcement::repro_f03_unadmitted_put_shard_stored_seed");
+    assert_logged(&node, "reject.peer_not_admitted");
+    gate_ran("trust_enforcement::f03_unadmitted_put_shard_refused_seed");
 }
 
 // --- F-21: the handshake does not bind the chain leaf to the sender --------------------------------
@@ -480,51 +584,145 @@ fn repro_f02a_rejected_put_replaces_owner_grant() {
 
 // --- F-24: self-certifying vouchers --------------------------------------------------------------------
 
-/// F-24: a voucher minted by an arbitrary key stores a blinded shard from an unadmitted sender.
+fn blinded_put(b: &Blinded, voucher_issuer: &NodeIdentity) -> MeshWireRequest {
+    MeshWireRequest::PutBlindedShard {
+        blinded_id: b.id,
+        shard_bytes: b.bytes.clone(),
+        capability: b.cap,
+        voucher: AnonymousQuotaVoucher::mint(voucher_issuer, 8192),
+        current_epoch: 1,
+        lease_duration_epochs: 30,
+        delete_verifier: b.delete_verifier,
+    }
+}
+
+fn onion_final(node: &Node, b: &Blinded, voucher_issuer: &NodeIdentity) -> MeshWireRequest {
+    MeshWireRequest::RelayPqOnionEnvelope {
+        target_peer_addr: None,
+        envelope: PqRelayedShardEnvelope::seal_pq(&node.kem_public(), "relay", &b.id, &b.bytes, 0)
+            .unwrap(),
+        capability: b.cap,
+        voucher: AnonymousQuotaVoucher::mint(voucher_issuer, 8192),
+        current_epoch: 1,
+        lease_duration_epochs: 30,
+        delete_verifier: b.delete_verifier,
+    }
+}
+
+/// F-24 accept (blinded put): an admitted sender with a voucher stores a blinded shard. The
+/// voucher is still self-certifying (issuer policy: 2c).
 #[test]
-fn repro_f24_self_minted_voucher_stores_blinded_shard() {
-    let node = spawn_daemon("f24");
-    let stranger = key(0xF1);
-    let b = blinded(0x51, 1024);
-    let resp = send(
-        &stranger,
-        &node,
-        MeshWireRequest::PutBlindedShard {
-            blinded_id: b.id,
-            shard_bytes: b.bytes.clone(),
-            capability: b.cap,
-            voucher: AnonymousQuotaVoucher::mint(&stranger, 8192),
-            current_epoch: 1,
-            lease_duration_epochs: 30,
-            delete_verifier: b.delete_verifier,
-        },
-    );
+fn f24_admitted_blinded_put_stored() {
+    let node = spawn_daemon("f24-a");
+    let member = key(0xF1);
+    let resp = send(&member, &node, blinded_put(&blinded(0x51, 1024), &member));
     assert!(
         matches!(
             resp,
             MeshWireResponse::PutBlindedShardAck { stored: true, .. }
         ),
-        "gap: self-minted voucher accepted: {resp:?}"
+        "{resp:?}"
     );
-    gate_ran("trust_enforcement::repro_f24_self_minted_voucher_stores_blinded_shard");
+    gate_ran("trust_enforcement::f24_admitted_blinded_put_stored");
 }
 
-/// F-24 (onion final delivery): the same through a 1-hop `RelayPqOnionEnvelope`.
+/// F-24 reject (blinded put): the same from a sender without a chain is refused.
 #[test]
-fn repro_f24_self_minted_voucher_onion_delivered() {
-    let node = spawn_daemon("f24o");
-    let stranger = key(0xF2);
-    let b = blinded(0x52, 512);
-    let env =
-        PqRelayedShardEnvelope::seal_pq(&node.kem_public(), "relay", &b.id, &b.bytes, 0).unwrap();
-    let resp = send(
+fn f24_unadmitted_blinded_put_refused() {
+    let node = spawn_daemon("f24-r");
+    let stranger = key(0xF1);
+    let resp = send_as_stranger(
         &stranger,
         &node,
+        blinded_put(&blinded(0x51, 1024), &stranger),
+    );
+    assert_eq!(
+        refusal_text(&resp).as_deref(),
+        Some(NOT_ADMITTED),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.peer_not_admitted");
+    gate_ran("trust_enforcement::f24_unadmitted_blinded_put_refused");
+}
+
+/// F-24 accept (onion final delivery): an admitted last hop delivers.
+#[test]
+fn f24_admitted_onion_final_delivered() {
+    let node = spawn_daemon("f24o-a");
+    let relay = key(0xF2);
+    let resp = send(
+        &relay,
+        &node,
+        onion_final(&node, &blinded(0x52, 512), &relay),
+    );
+    assert!(
+        matches!(
+            resp,
+            MeshWireResponse::RelayPqOnionAck {
+                delivered: true,
+                ..
+            }
+        ),
+        "{resp:?}"
+    );
+    gate_ran("trust_enforcement::f24_admitted_onion_final_delivered");
+}
+
+/// F-24 reject (onion final delivery): a last hop without a chain is refused at final delivery.
+#[test]
+fn f24_unadmitted_onion_final_refused() {
+    let node = spawn_daemon("f24o-r");
+    let relay = key(0xF2);
+    let resp = send_as_stranger(
+        &relay,
+        &node,
+        onion_final(&node, &blinded(0x52, 512), &relay),
+    );
+    assert_eq!(
+        refusal_text(&resp).as_deref(),
+        Some(NOT_ADMITTED),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.peer_not_admitted");
+    gate_ran("trust_enforcement::f24_unadmitted_onion_final_refused");
+}
+
+/// F-24 (relay): an originator without a chain sends a 2-layer onion through an admitted relay;
+/// the relay peels its layer and forwards under its own identity, and the target delivers. Only
+/// the last hop's sender is checked, so the originator is never asked to identify itself.
+#[test]
+fn f24_onion_relay_forwards_for_unadmitted_originator() {
+    let relay = spawn_daemon("f24-relay");
+    let target = spawn_daemon("f24-target");
+    let originator = key(0xF3);
+    let b = blinded(0x54, 512);
+    let bundle = parvault::crypto::pqc::PqOnionFinalBundle {
+        blinded_id: b.id,
+        shard_bytes: b.bytes.clone(),
+        capability: b.cap,
+        voucher: AnonymousQuotaVoucher::mint(&originator, 8192),
+        current_epoch: 1,
+        lease_duration_epochs: 30,
+        delete_verifier: b.delete_verifier,
+    };
+    let layered = PqRelayedShardEnvelope::seal_layered_pq(
+        &relay.kem_public(),
+        "relay",
+        &target.kem_public(),
+        target.addr.clone(),
+        &bundle,
+        0,
+        0,
+    )
+    .unwrap();
+    let resp = send_as_stranger(
+        &originator,
+        &relay,
         MeshWireRequest::RelayPqOnionEnvelope {
             target_peer_addr: None,
-            envelope: env,
+            envelope: layered,
             capability: b.cap,
-            voucher: AnonymousQuotaVoucher::mint(&stranger, 8192),
+            voucher: AnonymousQuotaVoucher::mint(&originator, 8192),
             current_epoch: 1,
             lease_duration_epochs: 30,
             delete_verifier: b.delete_verifier,
@@ -538,9 +736,12 @@ fn repro_f24_self_minted_voucher_onion_delivered() {
                 ..
             }
         ),
-        "gap: onion final delivery with a self-minted voucher: {resp:?}"
+        "{resp:?}\nrelay log:\n{}\ntarget log:\n{}",
+        relay.log_text(),
+        target.log_text()
     );
-    gate_ran("trust_enforcement::repro_f24_self_minted_voucher_onion_delivered");
+    assert!(!target.log_text().contains("reject.peer_not_admitted"));
+    gate_ran("trust_enforcement::f24_onion_relay_forwards_for_unadmitted_originator");
 }
 
 // --- F-23: lease renewal carries no credential -----------------------------------------------------------
@@ -667,14 +868,14 @@ fn repro_f25_device_cert_replayed_by_other_key() {
     gate_ran("trust_enforcement::repro_f25_device_cert_replayed_by_other_key");
 }
 
-/// F-25 (DHT): an unadmitted key stores a self-signed envelope.
+/// F-25 accept (DHT put): an admitted sender stores a self-signed envelope.
 #[test]
-fn repro_f25_unadmitted_dht_put_stored() {
-    let node = spawn_daemon("f25d");
-    let stranger = key(0xC7);
-    let env = squat_catalog(&stranger, [0x77; 32], 1);
+fn f25_admitted_dht_put_stored() {
+    let node = spawn_daemon("f25d-a");
+    let member = key(0xC7);
+    let env = squat_catalog(&member, [0x77; 32], 1);
     let resp = send(
-        &stranger,
+        &member,
         &node,
         MeshWireRequest::PutDhtEnvelope(DhtWireEnvelope::VaultCatalog(env)),
     );
@@ -683,9 +884,29 @@ fn repro_f25_unadmitted_dht_put_stored() {
             resp,
             MeshWireResponse::PutDhtEnvelopeAck { stored: true, .. }
         ),
-        "gap: unadmitted DHT put stored: {resp:?}"
+        "{resp:?}"
     );
-    gate_ran("trust_enforcement::repro_f25_unadmitted_dht_put_stored");
+    gate_ran("trust_enforcement::f25_admitted_dht_put_stored");
+}
+
+/// F-25 reject (DHT put): the same from a sender without a chain is refused.
+#[test]
+fn f25_unadmitted_dht_put_refused() {
+    let node = spawn_daemon("f25d-r");
+    let stranger = key(0xC7);
+    let env = squat_catalog(&stranger, [0x77; 32], 1);
+    let resp = send_as_stranger(
+        &stranger,
+        &node,
+        MeshWireRequest::PutDhtEnvelope(DhtWireEnvelope::VaultCatalog(env)),
+    );
+    assert_eq!(
+        refusal_text(&resp).as_deref(),
+        Some(NOT_ADMITTED),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.peer_not_admitted");
+    gate_ran("trust_enforcement::f25_unadmitted_dht_put_refused");
 }
 
 // --- F-10: DHT readers and raw Kademlia --------------------------------------------------------------------
