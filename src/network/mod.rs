@@ -1,6 +1,8 @@
 pub mod behaviour;
 pub mod client;
 pub mod discovery;
+pub mod placement;
+pub mod rate_limit;
 pub mod transport;
 pub mod wan_rendezvous;
 pub mod wot;
@@ -8,8 +10,7 @@ pub mod wot;
 pub use behaviour::{
     classify_ip_asn, effective_kademlia_distance, ipv4_same_slash24, ipv6_same_slash48,
     is_routable_public_ip, DhtEnvelopeKind, DhtWireEnvelope, MeshNetworkBehaviour, MeshWireRequest,
-    MeshWireResponse, PeerTopologyMetrics, PlacementEngine, ShardPlacementPlan,
-    TokenBucketRateLimiter,
+    MeshWireResponse,
 };
 pub use client::{is_network_peer_addr, parse_peer_multiaddr, MeshClient};
 pub use discovery::{
@@ -23,6 +24,8 @@ pub use discovery::{
     LAN_DISCOVER_PROBE_MAGIC, LAN_MULTICAST_ADDR_STR, LAN_MULTICAST_GROUP, LAN_REGISTRY_ENV_VAR,
     MAX_LAN_BEACON_AGE_MS,
 };
+pub use placement::{PeerTopologyMetrics, PlacementEngine, ShardPlacementPlan};
+pub use rate_limit::TokenBucketRateLimiter;
 pub use transport::{build_mesh_client_swarm, build_mesh_swarm};
 pub use wan_rendezvous::*;
 pub use wot::{
