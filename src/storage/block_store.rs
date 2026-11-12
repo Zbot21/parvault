@@ -1804,32 +1804,8 @@ impl BlockStore {
             stripe_roots.push(shard_set.stripe_merkle_root);
 
             // 3. Distribute shards over libp2p via MeshClient if network peers are configured, else local BlockStore.
-            let assigned_peers = if use_network {
-                let client = self.mesh_client.as_ref().expect("checked use_network");
-                let session_key = client
-                    .identity()
-                    .derive_stripe_por_session_key(&shard_set.stripe_merkle_root);
-                client
-                    .distribute_stripe_shards(
-                        client.identity(),
-                        owner_peer_id,
-                        &shard_set,
-                        tier,
-                        session_key,
-                    )
-                    .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?
-            } else {
-                for (idx, shard_bytes) in shard_set.shards.iter().enumerate() {
-                    let shard_id = ShardId {
-                        stripe_merkle_root: shard_set.stripe_merkle_root,
-                        shard_index: idx as u32,
-                        shard_hash: shard_set.shard_hashes[idx],
-                    };
-                    self.put_shard(owner_peer_id, &shard_id, shard_bytes)?;
-                }
-                let (_, _, n_total) = tier.params();
-                vec![owner_peer_id.to_string(); n_total]
-            };
+            let (assigned_peers, _) =
+                self.place_stripe(owner_peer_id, &shard_set, tier, use_network, false)?;
 
             stripes.push(StripeManifestEntry {
                 stripe_index,
@@ -1927,33 +1903,9 @@ impl BlockStore {
             let shard_set = encode_ciphertext_stripe(stripe_index, &ciphertext, tier)?;
             stripe_roots.push(shard_set.stripe_merkle_root);
 
-            let assigned_peers = if use_network {
-                let client = self.mesh_client.as_ref().expect("checked use_network");
-                let session_key = client
-                    .identity()
-                    .derive_stripe_por_session_key(&shard_set.stripe_merkle_root);
-                client
-                    .distribute_stripe_shards(
-                        client.identity(),
-                        owner_peer_id,
-                        &shard_set,
-                        tier,
-                        session_key,
-                    )
-                    .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?
-            } else {
-                wrote_local_batch = true;
-                for (idx, shard_bytes) in shard_set.shards.iter().enumerate() {
-                    let shard_id = ShardId {
-                        stripe_merkle_root: shard_set.stripe_merkle_root,
-                        shard_index: idx as u32,
-                        shard_hash: shard_set.shard_hashes[idx],
-                    };
-                    self.put_shard_deferred_flush(owner_peer_id, &shard_id, shard_bytes)?;
-                }
-                let (_, _, n_total) = tier.params();
-                vec![owner_peer_id.to_string(); n_total]
-            };
+            let (assigned_peers, local) =
+                self.place_stripe(owner_peer_id, &shard_set, tier, use_network, true)?;
+            wrote_local_batch |= local;
 
             stripes.push(StripeManifestEntry {
                 stripe_index,
@@ -1993,6 +1945,53 @@ impl BlockStore {
 
         self.save_manifest(master_key, &manifest)?;
         Ok(manifest)
+    }
+
+    /// Places one stripe's shards (the one placement path for file and folder stores): on ring
+    /// peers through the mesh client, skipping peers that refuse or are unreachable; or locally
+    /// when there is no mesh client or no peer accepts (for example only nodes of other rings are
+    /// pinned, D1). Returns the assigned hosts and whether anything was written locally.
+    fn place_stripe(
+        &self,
+        owner_peer_id: &str,
+        shard_set: &crate::sharding::StripeShardSet,
+        tier: ErasureTier,
+        use_network: bool,
+        deferred_flush: bool,
+    ) -> Result<(Vec<String>, bool), StorageError> {
+        if use_network {
+            let client = self.mesh_client.as_ref().expect("checked use_network");
+            let session_key = client
+                .identity()
+                .derive_stripe_por_session_key(&shard_set.stripe_merkle_root);
+            match client.distribute_stripe_shards(
+                client.identity(),
+                owner_peer_id,
+                shard_set,
+                tier,
+                session_key,
+            ) {
+                Ok(assigned) => return Ok((assigned, false)),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "no ring peer accepted the stripe; storing it locally"
+                ),
+            }
+        }
+        for (idx, shard_bytes) in shard_set.shards.iter().enumerate() {
+            let shard_id = ShardId {
+                stripe_merkle_root: shard_set.stripe_merkle_root,
+                shard_index: idx as u32,
+                shard_hash: shard_set.shard_hashes[idx],
+            };
+            if deferred_flush {
+                self.put_shard_deferred_flush(owner_peer_id, &shard_id, shard_bytes)?;
+            } else {
+                self.put_shard(owner_peer_id, &shard_id, shard_bytes)?;
+            }
+        }
+        let (_, _, n_total) = tier.params();
+        Ok((vec![owner_peer_id.to_string(); n_total], true))
     }
 
     fn put_shard_deferred_flush(

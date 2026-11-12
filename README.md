@@ -10,7 +10,7 @@
 
 > [!TIP]
 > **Built-In (`=y`) vs. Split-Plugin (`=m`) Architecture (<!-- metric:crate_version_tag -->`v0.5.0`<!-- /metric -->, [`ADR-32`](docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md), [`ADR-33`](docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md)):**
-> - **`parvault` (this repository, `AGPL-3.0-only`):** Unified single-daemon core (`parvault up` with `--no-socket` + built-in `=y` `--vfs-webdav-listen` / `--vfs-fuse-fd` `GatewayBus::InProcess` mode or `--ipc-socket /var/run/parvault.sock` plugin-host mode, `parvault token {mint,attenuate,inspect}`, `parvault-seed --no-fs`, and canonical open-source sibling plugins `parvault-fuse` & zero-key `parvault-sync`), post-quantum cryptography, $GF(2^8)$ Reed-Solomon sharding, and formal verification (<!-- metric:kani_harnesses -->`17`<!-- /metric --> `cargo kani` harnesses + <!-- metric:tla_specs -->`7`<!-- /metric --> TLA+ TLC specs + <!-- metric:tests_total -->`235`<!-- /metric --> release tests).
+> - **`parvault` (this repository, `AGPL-3.0-only`):** Unified single-daemon core (`parvault up` with `--no-socket` + built-in `=y` `--vfs-webdav-listen` / `--vfs-fuse-fd` `GatewayBus::InProcess` mode or `--ipc-socket /var/run/parvault.sock` plugin-host mode, `parvault token {mint,attenuate,inspect}`, `parvault-seed --no-fs`, and canonical open-source sibling plugins `parvault-fuse` & zero-key `parvault-sync`), post-quantum cryptography, $GF(2^8)$ Reed-Solomon sharding, and formal verification (<!-- metric:kani_harnesses -->`17`<!-- /metric --> `cargo kani` harnesses + <!-- metric:tla_specs -->`7`<!-- /metric --> TLA+ TLC specs + <!-- metric:tests_total -->`243`<!-- /metric --> release tests).
 > - **Hardened Out-of-Process Plugin Boundary ([`docs/GATEWAY_SOCKET_PROTOCOL.md`](docs/GATEWAY_SOCKET_PROTOCOL.md)):** `parvault-fuse`, zero-key `parvault-sync`, and downstream companion appliances (`parvault-suite`: `parvault-auth-broker`, `parvault-media-daemon`, `parvault-isp-agent`; and `parvault-control`) connect over `/var/run/parvault.sock` with kernel `SO_PEERCRED` UID allowlisting (`--strict-plugins --allow-peer-uid <UID>`), `F_ADD_SEALS` immutable `memfd` TOCTOU protection (`--require-sealed-memfd`), and offline-attenuated `PARVAULT-MAC-V1:` tokens without bloating or sharing `MasterKey` memory with the core daemon.
 
 Designed to run identically on multi-terabyte homelab NAS servers and memory-constrained residential gateways (`prplOS` / `OpenWrt` LXC containers with a **`< 32 MiB` active RAM** target), `parvault` combines **16 MiB streaming `AES-256-GCM` encryption of file data** (the folder catalog and manifest are also sealed with the dual-cipher `PqVaultMasterKey` cascade, `AES-256-GCM` + `ChaCha20-Poly1305`), **Reed-Solomon erasure coding over $GF(2^8)$** (fixed per run with `--tier`, default 16-of-20), and **Stateless Stratified Proof-of-Retrievability (PoR)**, so that **no storage peer, witness node, or DHT router is trusted with plaintext.** Shard anonymization (blinded shard ids, onion upload) and earned uptime tiers are partly built; see [Known Limits](#known-limits-v050).
@@ -77,7 +77,7 @@ parvault watch-folder --folder ~/Documents --public --tracker /ip4/<YOUR_SEED_IP
 
 Discovery and pairing find and pin peers; storing data needs ring membership. A node outside the ring is refused with `peer not admitted; v0.5.0 requires ring admission`, and a node with no ring prints how to start or join one (`parvault wot init` or `parvault wot install-chain`).
 
-With one paired router, all 20 shards of every stripe sit on that one machine: erasure coding protects against bit rot there, not against losing the router. Add more ring members to spread shards. Recovery after losing the laptop works only for folders backed up with a phrase (step 6): `PARVAULT_SEED_PHRASE="<phrase>" parvault recover-from-seed --vault-namespace laptop --out-dir ~/Recovered` on any ring member. Folders served by `parvault up --folder` have no phrase recovery.
+With one paired router, all 20 shards of every stripe sit on that one machine: erasure coding protects against bit rot there, not against losing the router. Add more ring members to spread shards. Recovery after losing the laptop works only for folders backed up with a phrase (step 6): `PARVAULT_SEED_PHRASE="<phrase>" parvault recover-from-seed --vault-namespace laptop --out-dir ~/Recovered` on any machine that can reach the ring's nodes (ring membership is not needed: ring members serve the encrypted catalog and shards to any node, and only the phrase decrypts them). Folders served by `parvault up --folder` have no phrase recovery.
 
 ---
 
@@ -95,7 +95,7 @@ flowchart LR
     subgraph Anon["2. Placement (anonymization layers: seed/lite path and planned)"]
         RS --> BLIND["Blinded Locators (HMAC) +\nPer-Shard Cap Keys (V_i)\n(seed/lite path only)"]
         BLIND --> ONION["2-Layer PQ Onion Relay\n(nodes relay; CLI upload planned)"]
-        ONION --> SPLIT{"70% Intra-ASN (<=5ms)\n30% Cross-Region DR\n<=4 Shards per /24"}
+        ONION --> SPLIT{"70% Intra-ASN (<=5ms)\n30% Cross-Region DR\n(<=4 per /24: planned)"}
     end
 
     subgraph Audit["3. Stateless PoR & Zero-Knowledge Repair"]
@@ -119,7 +119,7 @@ flowchart LR
 | **Zero-Filesystem Bounded RAM Mode (`parvault-seed --no-fs`)** | Pure in-memory seed/bootstrap execution (`--no-fs --in-memory-mb <MiB>`, `--identity-env` / `--identity-file`) with **zero persistent directories or files** created, hard RAM byte-cap enforcement, and `0x00` `zeroize()` memory wiping on eviction/drop | [`ADR-30`](docs/adr/ADR-30-filesystem-free-in-memory-seed-mode.md) |
 | **Transport-Agnostic `GatewayBus`, Sealed `memfd` & UID-Bound Macaroons** | Unified `GatewayBus` (`InProcess` `--no-socket` vs. `UnixSocket` `/var/run/parvault.sock`), `SCM_RIGHTS` zero-copy IPC with `F_ADD_SEALS` (`--require-sealed-memfd`) anti-TOCTOU protection, kernel `SO_PEERCRED` peer UID gating (`--strict-plugins --allow-peer-uid`), and offline `PARVAULT-MAC-V1:` caveats (`AllowedManifest`, `ByteRange`, `ExpiresAtUnixMs`, `ReadOnly`, `AllowedPeerUid`) | [`ADR-27`](docs/adr/ADR-27-zero-copy-uds-gateway-and-hedged-pool.md), [`ADR-28`](docs/adr/ADR-28-stateless-macaroon-capability-attenuation.md), [`ADR-32`](docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md) |
 | **Dual-Mode VFS (`=y` / `=m`) & Zero-Key Folder Sync (`parvault-fuse`, `parvault-sync`)** | Built-in `=y` (`parvault up --no-socket --vfs-webdav-listen`) or out-of-process `=m` (`parvault-fuse`) pure-Rust `/dev/fuse` (`ABI 7.31`, `0` C `libfuse3`, `0` `unsafe`, <!-- metric:fuse.ttfb -->`12.33 ms`<!-- /metric --> TTFB `< 50 ms`) + zero-key `parvault-sync` (`GatewayFolderSync` holding zero `MasterKey`/`NodeIdentity` secrets, `--macaroon` selective `pull`, Kani-verified path sanitizer) | [`ADR-29`](docs/adr/ADR-29-pure-rust-fuse-and-webdav-lazy-vfs.md), [`ADR-32`](docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md), [`ADR-33`](docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md) |
-| **Machine-Checked Formal Verification (`cargo kani` + <!-- metric:tla_specs -->`7`<!-- /metric --> TLA+ Specs)** | **<!-- metric:kani_harnesses -->17<!-- /metric --> Kani Rust Bounded Model Checking symbolic harnesses** (`src/kani_proofs.rs`, `capabilities.rs`, `aes.rs`, `reed_solomon.rs`) + **<!-- metric:tla_specs -->7<!-- /metric --> exhaustive TLA+ TLC specifications** (`specs/*.tla`, <!-- metric:tlc.distinct -->`4,467`<!-- /metric --> distinct states, `0` errors) + <!-- metric:tests_pass -->`235 / 235`<!-- /metric --> release tests + `#![deny(unsafe_code)]` / `#![forbid(unsafe_code)]` | [`ADR-31`](docs/adr/ADR-31-unsafe-remediation-and-os-sys-ffi-boundary.md), [`ADR-01`–<!-- metric:adr_last -->`ADR-33`<!-- /metric -->](docs/ADR.md) |
+| **Machine-Checked Formal Verification (`cargo kani` + <!-- metric:tla_specs -->`7`<!-- /metric --> TLA+ Specs)** | **<!-- metric:kani_harnesses -->17<!-- /metric --> Kani Rust Bounded Model Checking symbolic harnesses** (`src/kani_proofs.rs`, `capabilities.rs`, `aes.rs`, `reed_solomon.rs`) + **<!-- metric:tla_specs -->7<!-- /metric --> exhaustive TLA+ TLC specifications** (`specs/*.tla`, <!-- metric:tlc.distinct -->`4,467`<!-- /metric --> distinct states, `0` errors) + <!-- metric:tests_pass -->`243 / 243`<!-- /metric --> release tests + `#![deny(unsafe_code)]` / `#![forbid(unsafe_code)]` | [`ADR-31`](docs/adr/ADR-31-unsafe-remediation-and-os-sys-ffi-boundary.md), [`ADR-01`–<!-- metric:adr_last -->`ADR-33`<!-- /metric -->](docs/ADR.md) |
 
 ---
 
@@ -131,7 +131,9 @@ flowchart LR
 - **Erasure coding:** fixed per run with `--tier` (default `homelab`, 16-of-20). Earned standing does not change it yet.
 - **One router:** with a single paired storage node, every shard is on that node.
 - **Recovery:** `recover-from-seed` restores only folders backed up with `watch-folder` and a phrase (`PARVAULT_SEED_PHRASE` or `--seed-phrase`) and the same `--vault-namespace`, while peers holding the shards are reachable. `parvault init` prints no phrase; `parvault new-seed-phrase` makes one. Folders served by `parvault up --folder` have no phrase recovery.
-- **Built-in VFS seed folder (W-04):** `up --vfs-seed-dir` stores the folder on the node's pinned ring peers, or locally only when it has none. If its pinned peers are offline at start, the folder is not stored (the daemon prints a warning and keeps serving); there is no local fallback yet.
+- **Placement:** stores go to the node's pinned peers that accept them (ring members); peers of other rings or offline peers are skipped, and when none accepts, the stripe is kept locally (with a warning), as with no peers at all. The 70/30 latency split is applied; the `<= 4 shards per /24` cap is planned (not applied on the CLI store path).
+- **Built-in VFS seed folder (W-04):** if the seed folder cannot be stored at all, the daemon prints a warning and keeps serving without it.
+- **Personal device rings:** the "zero storage quota tax" for linked devices is planned; nothing charges or waives quota by device certificate yet.
 - **Public tracker:** none is hosted; `--public` needs your own `parvault-seed`.
 - **RAM:** `< 32 MiB` is a design target; the evidence is a 48 MiB cgroup Docker stage and `parvault-bench`.
 
@@ -170,9 +172,8 @@ parvault-sync --socket "$SOCK" --catalog ./gw-catalog.bin push --folder ~/Docume
 parvault-sync --socket "$SOCK" --catalog ./gw-catalog.bin --macaroon "$TOKEN" pull --output /tmp/restored
 
 # Or host WebDAV VFS built-in (=y) inside parvault with --no-socket (zero .sock file on disk!).
-# Needs `parvault init` and ring membership. The seed folder is stored like other data: on the
-# node's pinned ring peers, or locally if it has none; if those peers are offline at start, the
-# daemon prints a warning and serves without it.
+# Needs `parvault init` and ring membership. The seed folder is stored like other data: on pinned
+# ring peers that accept it, else locally (peers of other rings and offline peers are skipped).
 parvault up --no-socket --vfs-seed-dir /mnt/usb-nas/shared --vfs-webdav-listen 127.0.0.1:8088
 
 # Execute the empirical cryptography, Reed-Solomon, and /proc/self/status memory benchmark suite (see docs/BENCHMARKS.md)

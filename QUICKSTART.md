@@ -193,7 +193,7 @@ What if your laptop is lost or destroyed? A folder can be recovered on a new mac
 export PARVAULT_SEED_PHRASE="$(parvault new-seed-phrase)"; echo "$PARVAULT_SEED_PHRASE"
 parvault watch-folder --folder ~/Documents --vault-namespace documents --once
 ```
-2. On the new machine, join the ring (Step 3b), then recover with the same phrase and namespace:
+2. On the new machine (it needs to reach the ring's nodes, not to be a ring member: ring members serve the encrypted catalog and pieces to any node, and only your phrase decrypts them), recover with the same phrase and namespace:
 ```bash
 export PARVAULT_SEED_PHRASE="<your 24 words>"
 parvault recover-from-seed --vault-namespace documents --out-dir ./recovered-after-fire
@@ -205,7 +205,7 @@ For example, the BIP-39 test vector `legal winner thank year wave sausage worth 
 ---
 
 ### Recipe B: Link Personal Devices with Zero Reciprocity Tax (`issue-device-cert`)
-To link machines into a private Day-1 Personal Ring with **zero storage quota tax (`0.00x`)**:
+To link machines into a private Day-1 Personal Ring (the planned zero storage quota tax for linked devices is not applied yet):
 ```bash
 # 1. On your laptop, issue a certificate for your desktop or NAS:
 parvault issue-device-cert \
@@ -240,7 +240,9 @@ If a spammer or illegal content is detected, administrators can purge matching s
 parvault evict --ip 203.0.113.42 --reason "Spam flood"
 
 # Purge and permanently block an illegal content stripe across mesh peers:
-parvault evict --merkle-root <MERKLE_ROOT_HEX> --propagate
+# --merkle-root takes a stripe Merkle root (each shard file name starts with its first 16 hex
+# characters); a folder Merkle root matches no shard.
+parvault evict --merkle-root <STRIPE_MERKLE_ROOT_HEX> --propagate
 ```
 
 ---

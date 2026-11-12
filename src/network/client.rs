@@ -1029,6 +1029,8 @@ pub struct MeshClient {
     discovery_data_dir: Option<PathBuf>,
     lan_discovery_port: u16,
     last_lan_refresh: Arc<Mutex<Option<Instant>>>,
+    /// `false` with `--no-lan-discovery`: `refresh_lan_peers` neither scans nor pins.
+    lan_discovery_enabled: bool,
     healed_peer_addrs: Arc<Mutex<HashMap<PeerId, String>>>,
     tracker_admin_pubkeys: Arc<Mutex<HashMap<String, [u8; 32]>>>,
     dead_peers: Arc<Mutex<HashSet<String>>>,
@@ -1075,6 +1077,7 @@ impl MeshClient {
             discovery_data_dir: None,
             lan_discovery_port: DEFAULT_LAN_DISCOVERY_PORT,
             last_lan_refresh: Arc::new(Mutex::new(None)),
+            lan_discovery_enabled: true,
             healed_peer_addrs: Arc::new(Mutex::new(initial_healed)),
             tracker_admin_pubkeys: Arc::new(Mutex::new(HashMap::new())),
             dead_peers: Arc::new(Mutex::new(HashSet::new())),
@@ -1218,7 +1221,16 @@ impl MeshClient {
     /// Actively scans the local network via `discover_lan_peers`, persists updated endpoints to
     /// `<data_dir>/known_peers.json` (if configured), updates DHCP-healed `PeerId -> Multiaddr`
     /// mappings, and returns all active discovered peer Multiaddrs.
+    /// Turns LAN scanning and pinning off (`--no-lan-discovery`); pinned peers are still used.
+    pub fn with_lan_discovery(mut self, enabled: bool) -> Self {
+        self.lan_discovery_enabled = enabled;
+        self
+    }
+
     pub fn refresh_lan_peers(&self) -> Vec<String> {
+        if !self.lan_discovery_enabled {
+            return Vec::new();
+        }
         let found = discover_lan_peers(Duration::from_millis(220), self.lan_discovery_port);
         if let Ok(mut ts) = self.last_lan_refresh.lock() {
             *ts = Some(Instant::now());
