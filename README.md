@@ -168,7 +168,10 @@ parvault-fuse --socket "$SOCK" --macaroon "$TOKEN" \
 parvault-sync --socket "$SOCK" --catalog ./gw-catalog.bin push --folder ~/Documents
 parvault-sync --socket "$SOCK" --catalog ./gw-catalog.bin --macaroon "$TOKEN" pull --output /tmp/restored
 
-# Or host WebDAV VFS built-in (=y) inside parvault with --no-socket (zero .sock file on disk!)
+# Or host WebDAV VFS built-in (=y) inside parvault with --no-socket (zero .sock file on disk!).
+# Needs `parvault init` and ring membership. The seed folder is stored like other data: on the
+# node's pinned ring peers, or locally if it has none; if those peers are offline at start, the
+# daemon prints a warning and serves without it.
 parvault up --no-socket --vfs-seed-dir /mnt/usb-nas/shared --vfs-webdav-listen 127.0.0.1:8088
 
 # Execute the empirical cryptography, Reed-Solomon, and /proc/self/status memory benchmark suite (see docs/BENCHMARKS.md)

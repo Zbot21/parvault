@@ -105,12 +105,13 @@ parvault discover
 ```
 Output:
 ```text
-DISCOVERED HOME LAN PEERS (Zero-IP Configuration)
-------------------------------------------------------------------------------------------------------
-Label           Role        Multiaddr (Pinned Peer ID)                           Available    Status
-------------------------------------------------------------------------------------------------------
-Home-NAS        router-nas  /ip4/192.168.1.1/tcp/4001/p2p/12D3KooWSDu...        476.2 GiB    Online
-------------------------------------------------------------------------------------------------------
+DISCOVERED PARVAULT PEERS (Zero-IP Configuration)
+----------------------------------------------------------------------------------------------------------
+Label              | Role         | Multiaddr (Pinned PeerId)                              | Free Space
+----------------------------------------------------------------------------------------------------------
+Home-NAS           | router-nas   | /ip4/192.168.1.1/tcp/4001/p2p/12D3KooWBPqPNYp6...      | 32.0 GiB
+----------------------------------------------------------------------------------------------------------
+Discovered 1 verified peer(s). Pinned in .parvault-data/known_peers.json.
 ```
 
 ```bash
@@ -119,8 +120,8 @@ parvault join --code shield-copper-alpine-matrix
 ```
 Output:
 ```text
-[parvault] Verified signed beacon from 'Home-NAS' (12D3KooWSDu...)!
-[parvault] Successfully paired and pinned in known_peers.json! Zero-IP config ready.
+Paired with Home-NAS (12D3KooWBPqPNYp6...) — zero IP config ready!
+Pinned Multiaddr: /ip4/192.168.1.1/tcp/4001/p2p/12D3KooWBPqPNYp6...
 ```
 
 ---
@@ -155,9 +156,11 @@ parvault watch-folder \
   --prune-deleted \
   --once
 
-# Restore a single file or the whole directory tree on another machine
+# Restore a single file or the whole directory tree (keep PARVAULT_SEED_PHRASE set and pass the
+# same namespace if you backed up with a phrase; without one, omit --vault-namespace)
 parvault restore-folder \
   --snapshot ./documents.manifest.bin \
+  --vault-namespace documents \
   --out-dir ./restored-docs \
   --file "tax-return.pdf"
 ```
@@ -211,7 +214,7 @@ parvault issue-device-cert \
 
 # 2. Verify it on the destination machine against the issuer's owner key
 #    ("Owner PQ Public Key Hex" in `parvault identity` on the issuing laptop):
-parvault-seed --data-dir /mnt/nas/parvault-seed verify-device-cert \
+parvault-seed verify-device-cert --data-dir /mnt/nas/parvault-seed \
   --cert "PARVAULT-CERT-V1:<hex>" \
   --owner-pq-pubkey-hex <ISSUER_OWNER_PQ_PUBLIC_KEY_HEX>
 ```
