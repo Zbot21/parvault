@@ -167,12 +167,23 @@ pub(crate) async fn run_daemon(
             cache_bytes,
         )?;
         if let Some(ref seed_dir) = opts.vfs_seed_dir {
-            let seeded = vfs.ingest_local_directory(seed_dir)?;
-            info!(
-                seed_dir = %seed_dir.display(),
-                seeded,
-                "Ingested built-in VFS seed directory"
-            );
+            // The seed directory is stored like any other data: on the node's pinned ring peers,
+            // or locally when it has none. If its peers are unreachable the ingest fails; the
+            // daemon keeps serving instead of exiting (W-04).
+            match vfs.ingest_local_directory(seed_dir) {
+                Ok(seeded) => info!(
+                    seed_dir = %seed_dir.display(),
+                    seeded,
+                    "Ingested built-in VFS seed directory"
+                ),
+                Err(e) => {
+                    warn!(seed_dir = %seed_dir.display(), error = %e, "built-in VFS seed directory not ingested");
+                    eprintln!(
+                        "[parvault] warning: --vfs-seed-dir {} not ingested: {e}",
+                        seed_dir.display()
+                    );
+                }
+            }
         }
         if let Some(fuse_fd) = opts.vfs_fuse_fd {
             let fuse_dev = parvault::os_sys::adopt_fuse_dev_fd(fuse_fd)?;
