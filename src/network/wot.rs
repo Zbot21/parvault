@@ -310,6 +310,14 @@ impl InvitationHop {
     }
 }
 
+/// What [`WebOfTrustRegistry::slash_target_decision`] needs to know about one slash target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlashTargetFacts {
+    pub is_genesis: bool,
+    /// One of the local node's own keys.
+    pub is_protected: bool,
+}
+
 /// What [`WebOfTrustRegistry::public_ticket_decision`] needs to know about one ticket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TicketFacts {
@@ -449,6 +457,10 @@ pub struct WebOfTrustRegistry {
     public_commons_fifo: VecDeque<[u8; 32]>,
     #[serde(skip)]
     persistence_path: Option<std::path::PathBuf>,
+    /// Keys that can never be slashed besides the genesis: the local node's own keys, set at
+    /// startup (not persisted).
+    #[serde(skip)]
+    protected_keys: HashSet<[u8; 32]>,
 }
 
 impl WebOfTrustRegistry {
@@ -476,6 +488,7 @@ impl WebOfTrustRegistry {
             public_commons_peers: HashMap::new(),
             public_commons_fifo: VecDeque::new(),
             persistence_path: None,
+            protected_keys: HashSet::new(),
         }
     }
 
@@ -586,6 +599,34 @@ impl WebOfTrustRegistry {
             public_commons_allowed: self.trust_pool_mode.allows_public_commons(),
             ticket_is_sender: sender_pubkey == Some(ticket.peer_pubkey),
             ticket_valid: ticket.verify(self.min_public_pow_bits),
+        }
+    }
+
+    /// Marks `pubkey` (the local node's own key) as never slashable.
+    pub fn protect_key(&mut self, pubkey: [u8; 32]) {
+        self.protected_keys.insert(pubkey);
+    }
+
+    /// The slash guard (F-01): the genesis and the node's own keys are never slash targets.
+    pub fn slash_target_decision(facts: &SlashTargetFacts) -> Result<(), &'static str> {
+        if facts.is_genesis || facts.is_protected {
+            return Err("reject.slash_protected_target");
+        }
+        Ok(())
+    }
+
+    /// Runs the slash guard for `target`; logs and returns `false` for a protected key.
+    fn may_slash(&self, target: [u8; 32]) -> bool {
+        let facts = SlashTargetFacts {
+            is_genesis: target == self.genesis_pubkey,
+            is_protected: self.protected_keys.contains(&target),
+        };
+        match Self::slash_target_decision(&facts) {
+            Ok(()) => true,
+            Err(code) => {
+                tracing::warn!(code, target = %hex::encode(target), "refused to slash a protected key");
+                false
+            }
         }
     }
 
@@ -728,6 +769,9 @@ impl WebOfTrustRegistry {
     /// When `leaf_failures >= 3` (`MAX_LEAF_FAILURES`), immediately isolates the node and propagates
     /// a slash penalty up its parent inviter chain, pruning ancestor branches that hit `max_subtree_slashes`.
     pub fn record_failure(&mut self, offender_pubkey: [u8; 32]) -> bool {
+        if !self.may_slash(offender_pubkey) {
+            return false;
+        }
         if self.quarantined_keys.contains(&offender_pubkey) {
             return true;
         }
@@ -747,7 +791,8 @@ impl WebOfTrustRegistry {
                     }
                     let branch_slashes = self.branch_slash_counts.entry(parent).or_insert(0);
                     *branch_slashes += 1;
-                    if *branch_slashes >= self.max_subtree_slashes {
+                    let branch_hit = *branch_slashes >= self.max_subtree_slashes;
+                    if branch_hit && self.may_slash(parent) {
                         self.quarantined_keys.insert(parent);
                     }
                 }
@@ -763,6 +808,9 @@ impl WebOfTrustRegistry {
     /// (shard poisoning, egress withholding, or proxy cheating) and propagates a slash penalty
     /// up its parent inviter chain.
     pub fn slash_immediately(&mut self, offender_pubkey: [u8; 32]) -> bool {
+        if !self.may_slash(offender_pubkey) {
+            return false;
+        }
         if self.quarantined_keys.contains(&offender_pubkey) {
             return true;
         }
@@ -779,7 +827,8 @@ impl WebOfTrustRegistry {
                 }
                 let branch_slashes = self.branch_slash_counts.entry(parent).or_insert(0);
                 *branch_slashes += 1;
-                if *branch_slashes >= self.max_subtree_slashes {
+                let branch_hit = *branch_slashes >= self.max_subtree_slashes;
+                if branch_hit && self.may_slash(parent) {
                     self.quarantined_keys.insert(parent);
                 }
             }
@@ -862,6 +911,59 @@ impl WebOfTrustRegistry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn genesis_and_own_keys_are_never_slashed() {
+        let genesis = NodeIdentity::from_seed([0x47; 32]);
+        let own = [0x0A; 32];
+        let mut reg = WebOfTrustRegistry::new(genesis.public_key_bytes(), 3);
+        reg.protect_key(own);
+        for target in [genesis.public_key_bytes(), own] {
+            assert!(!reg.slash_immediately(target));
+            for _ in 0..MAX_LEAF_FAILURES {
+                assert!(!reg.record_failure(target));
+            }
+            assert!(!reg.is_peer_quarantined(&target));
+        }
+        assert_eq!(
+            WebOfTrustRegistry::slash_target_decision(&SlashTargetFacts {
+                is_genesis: true,
+                is_protected: false,
+            }),
+            Err("reject.slash_protected_target")
+        );
+        // An ordinary key is still slashable.
+        assert!(reg.slash_immediately([0x0B; 32]));
+        // A genesis chain stays valid after evidence names the genesis.
+        let reporter = NodeIdentity::from_seed([0x81; 32]);
+        reg.verify_and_admit_chain(&DelegationChain {
+            hops: vec![InvitationHop::issue(
+                &genesis,
+                reporter.public_key_bytes(),
+                1,
+                1,
+            )],
+        })
+        .unwrap();
+        let evidence = SlashingEvidence::issue(
+            &reporter,
+            genesis.public_key_bytes(),
+            SlashingReason::ByzantineShardPoisoning,
+            1,
+        );
+        assert!(!reg.apply_slashing_evidence(&evidence));
+        let newcomer = NodeIdentity::from_seed([0x83; 32]);
+        assert!(reg
+            .verify_and_admit_chain(&DelegationChain {
+                hops: vec![InvitationHop::issue(
+                    &genesis,
+                    newcomer.public_key_bytes(),
+                    1,
+                    1
+                )],
+            })
+            .is_ok());
+    }
+
     #[test]
     fn chain_leaf_decision_binds_the_sender() {
         let leaf = Some([1u8; 32]);

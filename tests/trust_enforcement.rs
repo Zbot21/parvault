@@ -1409,15 +1409,14 @@ fn repro_f10b_raw_kad_put_stored() {
 
 // --- F-01: gossip slashing quarantines the genesis ----------------------------------------------------------
 
-/// F-01: an admitted reporter gossips `SlashingEvidence` naming the genesis; the daemon quarantines
-/// it, and a valid chain for a new peer is refused afterwards.
+/// F-01: an admitted reporter gossips `SlashingEvidence` naming the genesis. The daemon does not
+/// subscribe to the slashing topic (gossip evidence is not applied until it is proof-carrying, 2c),
+/// so the evidence has no effect and a valid chain for a new peer is still accepted.
 #[test]
-fn repro_f01_gossip_evidence_quarantines_genesis() {
+fn f01_gossip_evidence_has_no_effect() {
     let node = spawn_daemon("f01");
     let reporter = key(0x81);
     assert!(accepted(&handshake(&reporter, &node, chain_for(&reporter))));
-    let before = key(0x82);
-    assert!(accepted(&handshake(&before, &node, chain_for(&before))));
 
     let target = node.peer_id();
     let addr: Multiaddr = node.addr.parse().unwrap();
@@ -1429,46 +1428,39 @@ fn repro_f01_gossip_evidence_quarantines_genesis() {
     );
     let data = bincode::serialize(&evidence).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async move {
+    let daemon_subscribed = rt.block_on(async move {
         let kp = reporter.to_libp2p_keypair().unwrap();
         let mut swarm: libp2p::Swarm<MeshNetworkBehaviour> =
             build_mesh_client_swarm(kp, false).unwrap();
         let topic = gossipsub::IdentTopic::new("parvault-wot-slashing");
         swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
         swarm.dial(addr).unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        let mut published = false;
-        let mut published_at = None;
-        loop {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        let mut subscribed = false;
+        while tokio::time::Instant::now() < deadline {
             tokio::select! {
                 ev = swarm.select_next_some() => {
                     if let SwarmEvent::Behaviour(parvault::network::behaviour::MeshNetworkBehaviourEvent::Gossipsub(
                         gossipsub::Event::Subscribed { peer_id, .. },
                     )) = ev {
-                        if peer_id == target && !published {
-                            swarm.behaviour_mut().gossipsub.publish(topic.clone(), data.clone()).unwrap();
-                            published = true;
-                            published_at = Some(tokio::time::Instant::now());
-                        }
+                        subscribed |= peer_id == target;
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
-            if let Some(t) = published_at {
-                if t.elapsed() > Duration::from_secs(2) {
-                    break;
-                }
-            }
-            assert!(tokio::time::Instant::now() < deadline, "gossip publish timed out");
         }
+        // Publishing anyway reaches no subscriber.
+        let _ = swarm.behaviour_mut().gossipsub.publish(topic, data);
+        subscribed
     });
+    assert!(
+        !daemon_subscribed,
+        "the daemon must not subscribe to slashing gossip"
+    );
     let after = key(0x83);
     let resp = handshake(&after, &node, chain_for(&after));
-    assert!(
-        !accepted(&resp),
-        "gap: after the gossip, a valid genesis chain is refused: {resp:?}"
-    );
-    gate_ran("trust_enforcement::repro_f01_gossip_evidence_quarantines_genesis");
+    assert!(accepted(&resp), "the genesis is not quarantined: {resp:?}");
+    gate_ran("trust_enforcement::f01_gossip_evidence_has_no_effect");
 }
 
 // --- Admission plumbing (bootstrap option A) ------------------------------------------------------

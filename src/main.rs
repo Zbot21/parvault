@@ -3,7 +3,7 @@
 mod cli;
 use clap::Parser;
 use cli::daemon::{run_daemon, DaemonLaunchOptions};
-use libp2p::{futures::StreamExt, gossipsub, swarm::SwarmEvent, Multiaddr};
+use libp2p::{futures::StreamExt, swarm::SwarmEvent, Multiaddr};
 use parvault::network::server_events::ServerSwarmEvents;
 use parvault::network::wire_handler::{handle_daemon_wire_request, DaemonWireHandlerCtx};
 use parvault::{
@@ -17,7 +17,7 @@ use parvault::{
         LocalFileKeystore, MasterKey, NodeIdentity,
     },
     network::{
-        behaviour::{DhtEnvelopeKind, DhtWireEnvelope, MeshNetworkBehaviourEvent},
+        behaviour::{DhtEnvelopeKind, DhtWireEnvelope},
         build_mesh_swarm, derive_4word_pairing_sas, derive_slot_key_from_code, discover_lan_peers,
         extract_listen_port_and_ip, is_network_peer_addr, node_identity_libp2p_peer_id,
         reflect_observed_wan_multiaddr, resolve_zero_config_peers_with_wan,

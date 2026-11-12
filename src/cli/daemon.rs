@@ -48,6 +48,7 @@ pub(crate) async fn run_daemon(
         &cfg.data_dir,
     );
     wot.set_trust_pool_mode(opts.trust_mode, DEFAULT_PUBLIC_WOT_POW_BITS);
+    wot.protect_key(node_identity.public_key_bytes());
 
     let mut por_verifier =
         PorVerifierEngine::with_persistence_dir(cfg.por_timeout_ms, &cfg.data_dir);
@@ -234,8 +235,8 @@ pub(crate) async fn run_daemon(
 
     spawn_folder_sync(&opts, &cfg, &block_store);
 
-    let slash_topic = gossipsub::IdentTopic::new("parvault-wot-slashing");
-    swarm.behaviour_mut().gossipsub.subscribe(&slash_topic)?;
+    // No gossip topic is subscribed: slashing evidence is not applied from gossip until it is
+    // proof-carrying (item 2c). A single reporter's accusation must never quarantine a key (F-01).
 
     if let Some(client) = block_store.mesh_client() {
         for peer_str in client.all_network_endpoints() {
@@ -287,53 +288,36 @@ pub(crate) async fn run_daemon(
                     )
                 });
                 let Some(event) = unhandled else { continue };
-                match event {
-                    SwarmEvent::NewListenAddr { address, .. } => {
-                        info!(%address, "Listening on mesh transport address");
-                        if let Some((p, ip_opt)) = extract_listen_port_and_ip(&address) {
-                            bound_tcp_port = p;
-                            if let Some(ref beacon) = beacon_handle {
-                                beacon.update_listen_endpoint(p, ip_opt);
-                            }
-                        }
-                        if !announced_wan_once
-                            && ((opts.public_mode && !opts.public_trackers.is_empty())
-                                || (opts.wan_announce && !opts.wan_seeds.is_empty()))
-                        {
-                            announced_wan_once = true;
-                            spawn_wan_and_tracker_announce(WanAnnounceTaskConfig {
-                                mesh_client_opt: block_store.mesh_client().cloned(),
-                                identity: node_identity.clone(),
-                                label: node_label.clone(),
-                                role: beacon_role.to_string(),
-                                external_addrs: opts.external_addrs.clone(),
-                                bound_tcp_port,
-                                local_pid: local_pid_str.clone(),
-                                pq_fp: pq_fp.clone(),
-                                sas_code: sas.code.clone(),
-                                publish_pair_code: opts.print_pairing_banner,
-                                public_mode: opts.public_mode,
-                                public_trackers: opts.public_trackers.clone(),
-                                wan_announce: opts.wan_announce,
-                                wan_seeds: opts.wan_seeds.clone(),
-                            });
+                if let SwarmEvent::NewListenAddr { address, .. } = event {
+                    info!(%address, "Listening on mesh transport address");
+                    if let Some((p, ip_opt)) = extract_listen_port_and_ip(&address) {
+                        bound_tcp_port = p;
+                        if let Some(ref beacon) = beacon_handle {
+                            beacon.update_listen_endpoint(p, ip_opt);
                         }
                     }
-                    SwarmEvent::Behaviour(MeshNetworkBehaviourEvent::Gossipsub(
-                        gossipsub::Event::Message { message, .. },
-                    )) => {
-                        if let Ok(ev) =
-                            bincode::deserialize::<parvault::network::SlashingEvidence>(&message.data)
-                        {
-                            if wot.apply_slashing_evidence(&ev) {
-                                warn!(
-                                    offender = %hex::encode(ev.offender_pubkey),
-                                    "Applied Gossipsub SlashingEvidence and quarantined offender"
-                                );
-                            }
-                        }
+                    if !announced_wan_once
+                        && ((opts.public_mode && !opts.public_trackers.is_empty())
+                            || (opts.wan_announce && !opts.wan_seeds.is_empty()))
+                    {
+                        announced_wan_once = true;
+                        spawn_wan_and_tracker_announce(WanAnnounceTaskConfig {
+                            mesh_client_opt: block_store.mesh_client().cloned(),
+                            identity: node_identity.clone(),
+                            label: node_label.clone(),
+                            role: beacon_role.to_string(),
+                            external_addrs: opts.external_addrs.clone(),
+                            bound_tcp_port,
+                            local_pid: local_pid_str.clone(),
+                            pq_fp: pq_fp.clone(),
+                            sas_code: sas.code.clone(),
+                            publish_pair_code: opts.print_pairing_banner,
+                            public_mode: opts.public_mode,
+                            public_trackers: opts.public_trackers.clone(),
+                            wan_announce: opts.wan_announce,
+                            wan_seeds: opts.wan_seeds.clone(),
+                        });
                     }
-                    _ => {}
                 }
             }
             _ = telemetry_interval.tick() => {

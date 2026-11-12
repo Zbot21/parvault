@@ -1773,6 +1773,7 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
     if server.mode() == SeedServerMode::PublicNetworkBootstrapper {
         wot.set_trust_pool_mode(TrustPoolMode::Hybrid, DEFAULT_PUBLIC_WOT_POW_BITS);
     }
+    wot.protect_key(node_identity.public_key_bytes());
     let por_verifier = if in_memory_mode {
         PorVerifierEngine::new(300)
     } else {
