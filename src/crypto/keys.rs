@@ -24,6 +24,32 @@ pub const ARGON2_P_COST: u32 = 4;
 /// Atomically writes secret key material to `path` via a sibling `.tmp.<nonce>` file,
 /// enforcing `0o600` (`rw-------`) owner-only file permissions on Unix before/after write
 /// and calling `File::sync_all()` prior to atomic `rename` (`B4`).
+/// The ring genesis secret written by `parvault wot init` (0600).
+pub const RING_GENESIS_SEED_FILE: &str = "ring_genesis.seed";
+/// The pinned ring genesis public key (hex).
+pub const RING_GENESIS_PUB_FILE: &str = "ring_genesis.pub";
+/// The error a node outside any ring reports.
+pub const NOT_IN_RING_MESSAGE: &str = "this node is not in a ring: run `parvault wot init` to start one, or `parvault wot install-chain --token <TOKEN>` with a token from `parvault wot invite` on a ring member";
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|s| !s.trim().is_empty())
+}
+
+fn parse_hex32(hex_str: &str, what: &str) -> Result<[u8; 32], CryptoError> {
+    let mut raw =
+        hex::decode(hex_str.trim()).map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
+    if raw.len() != 32 {
+        raw.zeroize();
+        return Err(CryptoError::InvalidKeyMaterial(format!(
+            "{what} must be 32 bytes (64 hex characters)"
+        )));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&raw);
+    raw.zeroize();
+    Ok(out)
+}
+
 pub fn write_secret_file_atomic_0600(path: &Path, data: &[u8]) -> Result<(), CryptoError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -349,86 +375,136 @@ impl NodeIdentity {
         }
     }
 
-    /// Resolves the Web-of-Trust Genesis Root Ed25519 public key from configuration (`configured_pubkey_hex`
-    /// or `PARVAULT_GENESIS_PUBKEY_HEX`), or from `PARVAULT_GENESIS_SEED_HEX` / `data_dir/genesis_root.seed`.
+    /// Resolves the ring genesis public key from every source, never generating one:
+    /// `configured_pubkey_hex` (config), `PARVAULT_GENESIS_PUBKEY_HEX`, `PARVAULT_GENESIS_SEED_HEX`,
+    /// `<data_dir>/ring_genesis.seed` (written only by `parvault wot init`) and
+    /// `<data_dir>/ring_genesis.pub` (pinned by `parvault wot install-chain`). Sources that name
+    /// different keys are a conflict; no source means this node is not in a ring.
     pub fn resolve_genesis_root_pubkey_in_dir(
         data_dir: &Path,
         configured_pubkey_hex: Option<&str>,
     ) -> Result<[u8; 32], KeyError> {
-        let env_pub = std::env::var("PARVAULT_GENESIS_PUBKEY_HEX").ok();
-        if let Some(hex_str) = configured_pubkey_hex
-            .or(env_pub.as_deref())
+        let mut found: Vec<(&'static str, [u8; 32])> = Vec::new();
+        if let Some(h) = configured_pubkey_hex
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            let raw =
-                hex::decode(hex_str).map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
-            if raw.len() != 32 {
-                return Err(CryptoError::InvalidKeyMaterial(format!(
-                    "expected 32-byte genesis_root_pubkey_hex, got {} bytes",
-                    raw.len()
-                )));
-            }
-            let mut pubkey = [0u8; 32];
-            pubkey.copy_from_slice(&raw);
-            return Ok(pubkey);
+            found.push((
+                "config genesis_root_pubkey_hex",
+                parse_hex32(h, "genesis pubkey")?,
+            ));
         }
-
-        let genesis_id = Self::load_or_generate_genesis_identity_in_dir(data_dir, None)?;
-        Ok(genesis_id.public_key_bytes())
+        if let Some(h) = env_nonempty("PARVAULT_GENESIS_PUBKEY_HEX") {
+            found.push((
+                "PARVAULT_GENESIS_PUBKEY_HEX",
+                parse_hex32(&h, "genesis pubkey")?,
+            ));
+        }
+        if let Some(id) = Self::load_ring_genesis_identity_in_dir(data_dir)? {
+            found.push(("the ring genesis seed", id.public_key_bytes()));
+        }
+        let pinned = data_dir.join(RING_GENESIS_PUB_FILE);
+        if pinned.exists() {
+            let text = std::fs::read_to_string(&pinned)
+                .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
+            found.push((
+                RING_GENESIS_PUB_FILE,
+                parse_hex32(text.trim(), "pinned genesis")?,
+            ));
+        }
+        let Some(&(_, first)) = found.first() else {
+            return Err(CryptoError::InvalidKeyMaterial(
+                NOT_IN_RING_MESSAGE.to_string(),
+            ));
+        };
+        if found.iter().any(|(_, pk)| *pk != first) {
+            let list: Vec<String> = found
+                .iter()
+                .map(|(src, pk)| format!("{src}={}", hex::encode(pk)))
+                .collect();
+            return Err(CryptoError::InvalidKeyMaterial(format!(
+                "conflicting ring genesis sources: {}",
+                list.join(", ")
+            )));
+        }
+        Ok(first)
     }
 
-    /// Loads or generates the Genesis Authority `NodeIdentity` from `configured_seed_hex`,
-    /// `PARVAULT_GENESIS_SEED_HEX`, or `data_dir/genesis_root.seed` using OS CSPRNG.
-    pub fn load_or_generate_genesis_identity_in_dir(
-        data_dir: &Path,
-        configured_seed_hex: Option<&str>,
-    ) -> Result<Self, KeyError> {
-        let env_seed = std::env::var("PARVAULT_GENESIS_SEED_HEX").ok();
-        if let Some(hex_str) = configured_seed_hex
-            .or(env_seed.as_deref())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let mut raw =
-                hex::decode(hex_str).map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
-            if raw.len() != 32 {
-                raw.zeroize();
-                return Err(CryptoError::InvalidKeyMaterial(format!(
-                    "expected 32-byte genesis seed hex, got {} bytes",
-                    raw.len()
-                )));
-            }
-            let mut seed = [0u8; 32];
-            seed.copy_from_slice(&raw);
-            raw.zeroize();
+    /// The ring genesis secret, if this node holds it: `PARVAULT_GENESIS_SEED_HEX`, or
+    /// `<data_dir>/ring_genesis.seed` from `parvault wot init`. Never generates one.
+    pub fn load_ring_genesis_identity_in_dir(data_dir: &Path) -> Result<Option<Self>, KeyError> {
+        if let Some(h) = env_nonempty("PARVAULT_GENESIS_SEED_HEX") {
+            let mut seed = parse_hex32(&h, "genesis seed")?;
             let id = Self::from_seed(seed);
             seed.zeroize();
-            return Ok(id);
+            return Ok(Some(id));
         }
-
-        std::fs::create_dir_all(data_dir)
-            .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
-        let seed_path = data_dir.join("genesis_root.seed");
-        if seed_path.exists() {
-            let mut raw = std::fs::read(&seed_path)
-                .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
-            if raw.len() == 32 {
-                let mut seed = [0u8; 32];
-                seed.copy_from_slice(&raw);
-                raw.zeroize();
-                let id = Self::from_seed(seed);
-                seed.zeroize();
-                return Ok(id);
-            }
+        let path = data_dir.join(RING_GENESIS_SEED_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let mut raw =
+            std::fs::read(&path).map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
+        if raw.len() != 32 {
             raw.zeroize();
+            return Err(CryptoError::InvalidKeyMaterial(format!(
+                "{} must hold 32 bytes",
+                path.display()
+            )));
         }
         let mut seed = [0u8; 32];
-        OsRng.fill_bytes(&mut seed);
-        write_secret_file_atomic_0600(&seed_path, &seed)?;
+        seed.copy_from_slice(&raw);
+        raw.zeroize();
         let id = Self::from_seed(seed);
         seed.zeroize();
+        Ok(Some(id))
+    }
+
+    /// The explicit first-node action (`parvault wot init`): creates a new ring genesis in
+    /// `<data_dir>/ring_genesis.seed` (0600) and pins its public key. Refuses if this node already
+    /// has any ring genesis source.
+    pub fn init_ring_genesis_in_dir(data_dir: &Path) -> Result<Self, KeyError> {
+        if let Ok(pk) = Self::resolve_genesis_root_pubkey_in_dir(data_dir, None) {
+            return Err(CryptoError::InvalidKeyMaterial(format!(
+                "this node is already in the ring {}",
+                hex::encode(pk)
+            )));
+        }
+        std::fs::create_dir_all(data_dir)
+            .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        write_secret_file_atomic_0600(&data_dir.join(RING_GENESIS_SEED_FILE), &seed)?;
+        let id = Self::from_seed(seed);
+        seed.zeroize();
+        Self::pin_ring_genesis_pubkey_in_dir(data_dir, id.public_key_bytes())?;
         Ok(id)
+    }
+
+    /// Pins the ring genesis public key (`parvault wot install-chain`, `wot init`). Refuses to
+    /// replace a different pinned key.
+    pub fn pin_ring_genesis_pubkey_in_dir(
+        data_dir: &Path,
+        pubkey: [u8; 32],
+    ) -> Result<(), KeyError> {
+        let path = data_dir.join(RING_GENESIS_PUB_FILE);
+        if path.exists() {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
+            let pinned = parse_hex32(text.trim(), "pinned genesis")?;
+            if pinned != pubkey {
+                return Err(CryptoError::InvalidKeyMaterial(format!(
+                    "this node is pinned to the ring {}, not {}",
+                    hex::encode(pinned),
+                    hex::encode(pubkey)
+                )));
+            }
+            return Ok(());
+        }
+        std::fs::create_dir_all(data_dir)
+            .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
+        crate::storage::BlockStore::atomic_write_file(&path, hex::encode(pubkey).as_bytes())
+            .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))
     }
 
     /// Returns a human-readable deterministic peer identifier derived from the node's Ed25519 public key.

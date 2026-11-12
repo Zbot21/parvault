@@ -39,6 +39,15 @@ pub(crate) async fn file(env: CliEnv, command: Commands) -> anyhow::Result<()> {
             )?;
             let owner_identity = NodeIdentity::from_master_key(&master_key);
             let owner_peer_id = owner_identity.device_peer_id();
+            // v0.5.0: storing on ring peers needs a ring credential; say so instead of failing
+            // on every shard.
+            if !mesh_client.all_network_endpoints().is_empty()
+                && parvault::network::admission::process_source()
+                    .and_then(|source| source.credential(&owner_identity))
+                    .is_none()
+            {
+                anyhow::bail!("{}", parvault::crypto::keys::NOT_IN_RING_MESSAGE);
+            }
             let store_with_owner = block_store
                 .clone()
                 .with_mesh_client(mesh_client.with_identity(owner_identity));

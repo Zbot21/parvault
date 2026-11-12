@@ -694,8 +694,8 @@ fn test_rt6_review_remediation_bip39_subkeys_0600_and_2layer_pq_onion() {
     // 4. [B4 / B5] Secret key files written with 0600 permissions + LocalFileKeystore sealing
     let key_dir = tempdir().expect("key tempdir");
     let _loaded_node = NodeIdentity::load_or_generate_in_dir(key_dir.path()).unwrap();
-    let _loaded_genesis =
-        NodeIdentity::resolve_genesis_root_pubkey_in_dir(key_dir.path(), None).unwrap();
+    // v0.5.0: a ring genesis exists only after the explicit `parvault wot init` action.
+    let _loaded_genesis = NodeIdentity::init_ring_genesis_in_dir(key_dir.path()).unwrap();
     let _loaded_kem = HybridKemKeypair::load_or_generate_in_dir(key_dir.path()).unwrap();
     let _loaded_pq = HybridPqSigningKeypair::load_or_generate_in_dir(key_dir.path()).unwrap();
     let keystore = LocalFileKeystore::from_passphrase_or_csprng_in_dir(
@@ -718,7 +718,7 @@ fn test_rt6_review_remediation_bip39_subkeys_0600_and_2layer_pq_onion() {
         use std::os::unix::fs::PermissionsExt;
         for secret_file in [
             "node_identity.seed",
-            "genesis_root.seed",
+            "ring_genesis.seed",
             "node_pq_kem.bin",
             "owner_pq_keypair.bin",
             "enclave_sealing.seed",

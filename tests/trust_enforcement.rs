@@ -142,9 +142,25 @@ fn prepare(label: &str) -> (TempDir, PathBuf, PathBuf, PathBuf) {
 }
 
 fn spawn(mut cmd: Command, root: TempDir, dir: PathBuf, log: PathBuf, port: u16) -> Node {
+    cmd.env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED));
+    spawn_as_is(cmd, root, dir, log, port)
+}
+
+/// Like `spawn`, but the binary gets no ring genesis from the environment.
+fn spawn_without_ring_env(
+    mut cmd: Command,
+    root: TempDir,
+    dir: PathBuf,
+    log: PathBuf,
+    port: u16,
+) -> Node {
+    cmd.env_remove("PARVAULT_GENESIS_SEED_HEX");
+    spawn_as_is(cmd, root, dir, log, port)
+}
+
+fn spawn_as_is(mut cmd: Command, root: TempDir, dir: PathBuf, log: PathBuf, port: u16) -> Node {
     let log_file = std::fs::File::create(&log).unwrap();
     let child = cmd
-        .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
         .env("RUST_LOG", "info")
         .env("NO_COLOR", "1")
         .env_remove("PARVAULT_PEERS")
@@ -599,7 +615,7 @@ fn f05_public_cli_store_via_ticket() {
     );
     // Admitted by ticket: the client holds no ring genesis and installed no chain.
     let client_dir = root.path().join("client");
-    assert!(!client_dir.join("genesis_root.seed").exists());
+    assert!(!client_dir.join("ring_genesis.seed").exists());
     assert!(!client_dir.join("wot_chains").exists());
     gate_ran("trust_enforcement::f05_public_cli_store_via_ticket");
 }
@@ -1940,4 +1956,175 @@ fn client_rehandshakes_after_lost_admission() {
         .unwrap();
     assert!(stored(&resp), "{resp:?}\n{}", node.log_text());
     gate_ran("trust_enforcement::client_rehandshakes_after_lost_admission");
+}
+
+// --- QA B2: joining a ring by invitation; no silent genesis ------------------------------------------
+
+/// Runs `parvault --data-dir <dir> --no-lan-discovery <args>` with no ring genesis in the
+/// environment (unless `ring_env`).
+fn parvault_cli(dir: &Path, ring_env: bool, args: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    if ring_env {
+        cmd.env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED));
+    } else {
+        cmd.env_remove("PARVAULT_GENESIS_SEED_HEX");
+    }
+    cmd.env_remove("PARVAULT_GENESIS_PUBKEY_HEX")
+        .env("PARVAULT_LAN_REGISTRY_DIR", dir.join("lan-registry"))
+        .arg("--data-dir")
+        .arg(dir)
+        .arg("--no-lan-discovery")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn out_text(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// An invitee joins by `wot invite` / `wot install-chain` (it never holds the genesis secret),
+/// runs as a server, stores a ring member's shard and refuses a stranger's.
+#[test]
+fn invitee_serves_the_ring() {
+    let root = temp_root("b2-invitee");
+    let holder = root.path().join("holder");
+    let (inv_root, inv_dir, reg, log) = prepare("b2-invitee-node");
+    let inv_key = NodeIdentity::load_or_generate_in_dir(&inv_dir).unwrap();
+    let invite = parvault_cli(
+        &holder,
+        true,
+        &[
+            "wot",
+            "invite",
+            "--peer",
+            &hex::encode(inv_key.public_key_bytes()),
+        ],
+    );
+    assert!(invite.status.success(), "{}", out_text(&invite));
+    let token = String::from_utf8_lossy(&invite.stdout).trim().to_string();
+    let install = parvault_cli(
+        &inv_dir,
+        false,
+        &["wot", "install-chain", "--token", &token],
+    );
+    assert!(install.status.success(), "{}", out_text(&install));
+    assert!(inv_dir.join("ring_genesis.pub").exists());
+    assert!(!inv_dir.join("ring_genesis.seed").exists());
+    let port = free_port();
+    let node = spawn_without_ring_env(
+        daemon_command(&inv_dir, &reg, port),
+        inv_root,
+        inv_dir,
+        log,
+        port,
+    );
+    let (sid, bytes) = shard(0x41, 512);
+    let member = send(&key(0xD8), &node, put_shard("", sid, bytes, None));
+    assert!(stored(&member), "{member:?}\n{}", node.log_text());
+    let (sid, bytes) = shard(0x42, 512);
+    let stranger = send_as_stranger(&key(0xD9), &node, put_shard("", sid, bytes, None));
+    assert_eq!(
+        refusal_text(&stranger).as_deref(),
+        Some(NOT_ADMITTED),
+        "{stranger:?}"
+    );
+    assert!(
+        !node.dir.join("ring_genesis.seed").exists(),
+        "no genesis was generated"
+    );
+    gate_ran("trust_enforcement::invitee_serves_the_ring");
+}
+
+/// A node with no ring refuses to start its daemon, with the message that says what to do.
+#[test]
+fn daemon_without_ring_refuses_to_start() {
+    let root = temp_root("b2-fresh-daemon");
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env_remove("PARVAULT_GENESIS_SEED_HEX")
+        .env_remove("PARVAULT_GENESIS_PUBKEY_HEX")
+        .env("PARVAULT_LAN_REGISTRY_DIR", root.path().join("reg"))
+        .arg("--data-dir")
+        .arg(root.path().join("d"))
+        .args(["--no-lan-discovery", "daemon", "start", "--listen"])
+        .arg(format!("/ip4/127.0.0.1/tcp/{}", free_port()))
+        .output()
+        .unwrap();
+    let text = out_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("not in a ring") && text.contains("parvault wot init"),
+        "{text}"
+    );
+    assert!(!root.path().join("d/ring_genesis.seed").exists());
+    gate_ran("trust_enforcement::daemon_without_ring_refuses_to_start");
+}
+
+/// `file store` on a node with no ring credential stops with the same message instead of
+/// failing on every shard.
+#[test]
+fn file_store_without_ring_says_so() {
+    let node = spawn_daemon("b2-fresh-client-target");
+    let root = temp_root("b2-fresh-client");
+    let file = root.path().join("doc.txt");
+    std::fs::write(&file, b"no ring yet").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env_remove("PARVAULT_GENESIS_SEED_HEX")
+        .env("PARVAULT_LAN_REGISTRY_DIR", root.path().join("reg"))
+        .env("PARVAULT_PEERS", &node.addr)
+        .arg("--data-dir")
+        .arg(root.path().join("client"))
+        .args(["--no-lan-discovery", "file", "store", "--path"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    let text = out_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("not in a ring"), "{text}");
+    gate_ran("trust_enforcement::file_store_without_ring_says_so");
+}
+
+/// `wot invite` needs a genesis from an explicit `wot init`; `wot init` runs once.
+#[test]
+fn wot_invite_needs_an_initialised_ring() {
+    let root = temp_root("b2-init");
+    let dir = root.path().join("n");
+    let peer = hex::encode(key(0xDA).public_key_bytes());
+    let no_ring = parvault_cli(&dir, false, &["wot", "invite", "--peer", &peer]);
+    assert!(!no_ring.status.success(), "{}", out_text(&no_ring));
+    assert!(out_text(&no_ring).contains("does not hold a ring genesis"));
+    let init = parvault_cli(&dir, false, &["wot", "init"]);
+    assert!(init.status.success(), "{}", out_text(&init));
+    let again = parvault_cli(&dir, false, &["wot", "init"]);
+    assert!(!again.status.success(), "{}", out_text(&again));
+    let invite = parvault_cli(&dir, false, &["wot", "invite", "--peer", &peer]);
+    assert!(invite.status.success(), "{}", out_text(&invite));
+    gate_ran("trust_enforcement::wot_invite_needs_an_initialised_ring");
+}
+
+/// A daemon whose genesis sources disagree (a pinned ring and another key in the environment)
+/// refuses to start.
+#[test]
+fn conflicting_genesis_sources_refuse_to_start() {
+    let root = temp_root("b2-conflict");
+    let dir = root.path().join("n");
+    assert!(parvault_cli(&dir, false, &["wot", "init"]).status.success());
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env("PARVAULT_GENESIS_PUBKEY_HEX", hex::encode([0x11u8; 32]))
+        .env_remove("PARVAULT_GENESIS_SEED_HEX")
+        .env("PARVAULT_LAN_REGISTRY_DIR", root.path().join("reg"))
+        .arg("--data-dir")
+        .arg(&dir)
+        .args(["--no-lan-discovery", "daemon", "start", "--listen"])
+        .arg(format!("/ip4/127.0.0.1/tcp/{}", free_port()))
+        .output()
+        .unwrap();
+    let text = out_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("conflicting ring genesis sources"), "{text}");
+    gate_ran("trust_enforcement::conflicting_genesis_sources_refuse_to_start");
 }

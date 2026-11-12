@@ -37,9 +37,10 @@ pub(crate) async fn run_daemon(
     let keypair = node_identity.to_libp2p_keypair()?;
     let local_peer_id = keypair.public().to_peer_id();
     let local_pid_str = local_peer_id.to_string();
-    let genesis_pubkey = NodeIdentity::resolve_genesis_root_pubkey_in_dir(
+    let genesis_pubkey = parvault::network::admission::server_ring_genesis(
         &cfg.data_dir,
         cfg.genesis_root_pubkey_hex.as_deref(),
+        opts.trust_mode.allows_public_commons(),
     )?;
 
     let mut wot = WebOfTrustRegistry::with_persistence_dir(

@@ -579,7 +579,7 @@ async fn main() -> anyhow::Result<()> {
                             node_identity.public_key_bytes()
                         }
                     } else {
-                        NodeIdentity::resolve_genesis_root_pubkey_in_dir(&data_dir, None)?
+                        parvault::network::admission::server_ring_genesis(&data_dir, None, true)?
                     };
                     info!(
                         lease_epochs,
@@ -724,7 +724,7 @@ async fn main() -> anyhow::Result<()> {
                 ),
                 CliSeedMode::PublicBootstrap => {
                     let genesis_pubkey =
-                        NodeIdentity::resolve_genesis_root_pubkey_in_dir(&data_dir, None)?;
+                        parvault::network::admission::server_ring_genesis(&data_dir, None, true)?;
                     ZeroTrustSeedServer::new_public_bootstrapper(
                         "parvault-seed-public-bootstrapper",
                         block_store,
@@ -747,7 +747,8 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let quota = QuotaManager::new(500 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
             let block_store = BlockStore::new(&data_dir, quota)?;
-            let genesis_pubkey = NodeIdentity::resolve_genesis_root_pubkey_in_dir(&data_dir, None)?;
+            let genesis_pubkey =
+                parvault::network::admission::server_ring_genesis(&data_dir, None, true)?;
             let server = ZeroTrustSeedServer::new_public_bootstrapper(
                 "parvault-seed-public-bootstrapper",
                 block_store,
@@ -1270,7 +1271,8 @@ async fn main() -> anyhow::Result<()> {
                 let quota = QuotaManager::new(500 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
                 let block_store = BlockStore::new(&data_dir, quota)?;
                 let mut eviction = PrivacyPreservingEvictionEngine::load_or_init(&data_dir)?;
-                let genesis_pk = NodeIdentity::resolve_genesis_root_pubkey_in_dir(&data_dir, None)?;
+                let genesis_pk =
+                    parvault::network::admission::server_ring_genesis(&data_dir, None, true)?;
                 let (council, min_quorum) = resolve_seed_council_and_quorum(
                     &data_dir,
                     SeedServerMode::PublicNetworkBootstrapper,
@@ -1758,7 +1760,11 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
             node_identity.public_key_bytes()
         }
     } else {
-        NodeIdentity::resolve_genesis_root_pubkey_in_dir(&data_dir, None)?
+        parvault::network::admission::server_ring_genesis(
+            &data_dir,
+            None,
+            server.mode() == SeedServerMode::PublicNetworkBootstrapper,
+        )?
     };
 
     let mut wot = if in_memory_mode {

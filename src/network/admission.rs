@@ -1,10 +1,12 @@
 //! Client-side ring admission (v0.5.0, bootstrap option A).
 //!
-//! A ring is one Web-of-Trust genesis. A process that holds the genesis seed
-//! (`PARVAULT_GENESIS_SEED_HEX`, or `data_dir/genesis_root.seed`) self-issues a one-hop
-//! `DelegationChain` for any identity it sends as. Every other process installs a chain
-//! issued for it (`parvault wot invite` on a seed holder, `parvault wot install-chain` on the
-//! invitee); installed chains live in `data_dir/wot_chains/<leaf-pubkey-hex>.bin`.
+//! A ring is one Web-of-Trust genesis, created by an explicit `parvault wot init` (or provided as
+//! `PARVAULT_GENESIS_SEED_HEX`). A process that holds the genesis secret self-issues a one-hop
+//! `DelegationChain` for any identity it sends as. Every other node installs a ring invitation
+//! (`parvault wot invite` on a holder, `parvault wot install-chain` on the invitee): the chain for
+//! its node key, stored in `data_dir/wot_chains/<leaf-pubkey-hex>.bin`, and the ring's genesis
+//! public key, pinned in `data_dir/ring_genesis.pub`. Its other keys (the owner key) get a
+//! one-hop extension signed by the node key.
 //!
 //! `MeshClient` presents the chain in a `HandshakeWoT` once per (identity, peer address) before
 //! the first request that needs an admitted sender ([`requires_admitted_sender`]). The same chain
@@ -28,6 +30,8 @@ pub const CHAIN_DIR_NAME: &str = "wot_chains";
 pub struct AdmissionSource {
     chain_dir: Option<PathBuf>,
     genesis: Option<NodeIdentity>,
+    /// The node key, which extends its installed chain by one hop for the node's other keys.
+    node: Option<NodeIdentity>,
     /// In public-commons or hybrid mode, the PoW bits of a ticket minted when no chain exists.
     public_ticket_bits: Option<u8>,
 }
@@ -70,6 +74,7 @@ pub fn process_source() -> Option<&'static AdmissionSource> {
     Some(PROCESS_SOURCE.get_or_init(|| AdmissionSource {
         chain_dir: None,
         genesis: held_genesis(None),
+        node: None,
         public_ticket_bits: None,
     }))
 }
@@ -81,23 +86,75 @@ fn unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Loads the genesis identity without generating one: `PARVAULT_GENESIS_SEED_HEX`, else an
-/// existing `data_dir/genesis_root.seed`.
+/// The genesis secret this process holds, if any (never generated).
 fn held_genesis(data_dir: Option<&Path>) -> Option<NodeIdentity> {
-    let env_seed = std::env::var("PARVAULT_GENESIS_SEED_HEX")
+    let dir = data_dir.map(Path::to_path_buf).unwrap_or_else(|| {
+        // No data directory: only the environment can provide the secret.
+        std::env::temp_dir().join("parvault-no-data-dir")
+    });
+    NodeIdentity::load_ring_genesis_identity_in_dir(&dir)
         .ok()
-        .filter(|s| !s.trim().is_empty());
-    if env_seed.is_none() {
-        let dir = data_dir?;
-        if !dir.join("genesis_root.seed").exists() {
-            return None;
+        .flatten()
+}
+
+/// The node identity in `data_dir`, if one exists (never generated here).
+fn existing_node_identity(data_dir: &Path) -> Option<NodeIdentity> {
+    data_dir
+        .join("node_identity.seed")
+        .exists()
+        .then(|| NodeIdentity::load_or_generate_in_dir(data_dir).ok())
+        .flatten()
+}
+
+/// The genesis of a node outside any private ring in public-commons mode: no key signs for it, so
+/// no chain can verify and peers are admitted by public-commons ticket only.
+pub const TICKET_ONLY_GENESIS: [u8; 32] = [0u8; 32];
+
+/// The ring genesis a server runs with. Conflicting sources are always an error; a node with no
+/// source runs ticket-only in public-commons mode and otherwise refuses to start.
+pub fn server_ring_genesis(
+    data_dir: &Path,
+    configured_pubkey_hex: Option<&str>,
+    public_commons: bool,
+) -> anyhow::Result<[u8; 32]> {
+    match NodeIdentity::resolve_genesis_root_pubkey_in_dir(data_dir, configured_pubkey_hex) {
+        Ok(pk) => Ok(pk),
+        Err(e) => {
+            let msg = e.to_string();
+            if public_commons && msg.contains(crate::crypto::keys::NOT_IN_RING_MESSAGE) {
+                tracing::info!(
+                    "not in a private ring: admitting peers by public-commons ticket only"
+                );
+                Ok(TICKET_ONLY_GENESIS)
+            } else {
+                anyhow::bail!("{msg}")
+            }
         }
-        return NodeIdentity::load_or_generate_genesis_identity_in_dir(dir, None).ok();
     }
-    let dir = data_dir
-        .map(Path::to_path_buf)
-        .unwrap_or_else(std::env::temp_dir);
-    NodeIdentity::load_or_generate_genesis_identity_in_dir(&dir, None).ok()
+}
+
+/// What `parvault wot invite` hands to an invitee: the ring's genesis public key and the chain
+/// for the invitee's key.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RingInvitation {
+    pub genesis_pubkey: [u8; 32],
+    pub chain: DelegationChain,
+}
+
+impl RingInvitation {
+    pub fn encode_hex(&self) -> anyhow::Result<String> {
+        Ok(hex::encode(bincode::serialize(self)?))
+    }
+
+    pub fn decode_hex(token: &str) -> anyhow::Result<Self> {
+        use bincode::Options;
+        let bytes = hex::decode(token.trim())?;
+        Ok(bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(64 * 1024)
+            .deserialize(&bytes)?)
+    }
 }
 
 impl AdmissionSource {
@@ -106,6 +163,7 @@ impl AdmissionSource {
         Self {
             chain_dir: Some(data_dir.join(CHAIN_DIR_NAME)),
             genesis: held_genesis(Some(data_dir)),
+            node: existing_node_identity(data_dir),
             public_ticket_bits: None,
         }
     }
@@ -115,6 +173,7 @@ impl AdmissionSource {
         Self {
             chain_dir: None,
             genesis: Some(genesis),
+            node: None,
             public_ticket_bits: None,
         }
     }
@@ -124,6 +183,7 @@ impl AdmissionSource {
         Self {
             chain_dir: Some(dir),
             genesis: None,
+            node: None,
             public_ticket_bits: None,
         }
     }
@@ -173,7 +233,43 @@ impl AdmissionSource {
                 }
             }
         }
-        self.genesis.as_ref().map(|g| issue_invitation(g, leaf))
+        if let Some(g) = self.genesis.as_ref() {
+            return Some(issue_invitation(g, leaf));
+        }
+        // A member node extends its own chain by one hop for its other keys (the owner key).
+        let node = self.node.as_ref()?;
+        if node.public_key_bytes() == leaf {
+            return None;
+        }
+        let mut chain = self.installed_chain(&node.public_key_bytes())?;
+        let depth = chain.hops.len() as u32 + 1;
+        chain
+            .hops
+            .push(InvitationHop::issue(node, leaf, depth, unix_secs()));
+        Some(chain)
+    }
+
+    fn installed_chain(&self, leaf: &[u8; 32]) -> Option<DelegationChain> {
+        let bytes = std::fs::read(self.chain_path(leaf)?).ok()?;
+        let chain = decode_chain(&bytes).ok()?;
+        (chain.leaf_pubkey() == Some(*leaf)).then_some(chain)
+    }
+
+    /// Checks a chain's links and signatures; returns its leaf key.
+    pub fn check_chain(&self, chain: &DelegationChain) -> anyhow::Result<[u8; 32]> {
+        let leaf = chain
+            .leaf_pubkey()
+            .ok_or_else(|| anyhow::anyhow!("empty delegation chain"))?;
+        for (idx, hop) in chain.hops.iter().enumerate() {
+            anyhow::ensure!(hop.verify_signature(), "invalid hop signature at {idx}");
+            if idx > 0 {
+                anyhow::ensure!(
+                    hop.inviter_pubkey == chain.hops[idx - 1].invitee_pubkey,
+                    "broken chain link at {idx}"
+                );
+            }
+        }
+        Ok(leaf)
     }
 
     /// Installs `chain` (its leaf names the file). Returns the leaf key.

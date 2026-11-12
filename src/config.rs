@@ -3,14 +3,19 @@ use clap::{Parser, Subcommand, ValueEnum};
 /// `parvault wot` subcommands (ring admission, bootstrap option A).
 #[derive(Debug, Clone, Subcommand)]
 pub enum WotAction {
-    /// Print a chain token admitting `--peer` to this ring. Needs the ring genesis seed
-    /// (`PARVAULT_GENESIS_SEED_HEX` or `<data_dir>/genesis_root.seed`).
+    /// Start a new ring on this node: creates the ring genesis secret
+    /// (`<data_dir>/ring_genesis.seed`, 0600). The only way a node creates a genesis; refused if
+    /// the node is already in a ring.
+    Init,
+    /// Print a ring invitation token admitting `--peer`. Needs the ring genesis secret (from
+    /// `parvault wot init` on this node, or `PARVAULT_GENESIS_SEED_HEX`).
     Invite {
         /// The invitee's 32-byte Ed25519 public key (64 hex characters, from `parvault identity`).
         #[arg(long)]
         peer: String,
     },
-    /// Install a chain token (from `parvault wot invite`) into `<data_dir>/wot_chains/`.
+    /// Install a ring invitation token (from `parvault wot invite`): verifies the chain against the
+    /// ring's genesis key, pins that key (`<data_dir>/ring_genesis.pub`) and stores the chain.
     InstallChain {
         /// The hex chain token.
         #[arg(long)]
