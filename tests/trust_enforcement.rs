@@ -2567,3 +2567,86 @@ fn w03_missing_folder_fails() {
     assert!(!out.status.success(), "{text}");
     assert!(text.contains("does not exist"), "{text}");
 }
+
+// --- D1 (2e round 2): gateway stores with a non-ring peer configured ------------------------------
+
+fn other_ring_daemon(label: &str) -> Node {
+    let (root, dir, reg, log) = prepare(label);
+    let port = free_port();
+    let mut cmd = daemon_command(&dir, &reg, port);
+    cmd.env("PARVAULT_GENESIS_SEED_HEX", hex::encode([0x99u8; 32]));
+    spawn_as_is(cmd, root, dir, log, port)
+}
+
+/// Runs a ring node's `up --no-socket --vfs-seed-dir` with `pins` pinned (in that order, as LAN
+/// discovery pins them) and waits until the seed folder is ingested.
+fn d1_up_with_pins(label: &str, pins: &[&Node]) -> Node {
+    let (root, dir, reg, log) = prepare(label);
+    let seed_dir = root.path().join("shared");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    std::fs::write(
+        seed_dir.join("a.txt"),
+        b"gateway store with a non-ring peer",
+    )
+    .unwrap();
+    let mut store = parvault::network::KnownPeersStore::load(&dir);
+    for n in pins {
+        let pid = n.peer_id().to_string();
+        store.upsert_pinned_multiaddr(&pid, &format!("{}/p2p/{pid}", n.addr), None, Some("daemon"));
+    }
+    store.save(&dir).unwrap();
+    let port = free_port();
+    let webdav = free_port();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .arg("--data-dir")
+        .arg(&dir)
+        .args([
+            "--no-lan-discovery",
+            "up",
+            "--no-socket",
+            "--listen",
+            &format!("/ip4/127.0.0.1/tcp/{port}"),
+            "--vfs-webdav-listen",
+            &format!("127.0.0.1:{webdav}"),
+            "--vfs-seed-dir",
+        ])
+        .arg(&seed_dir);
+    let node = spawn(cmd, root, dir, log, port);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let text = node.log_text();
+        if text.contains("Ingested built-in VFS seed directory") {
+            return node;
+        }
+        assert!(
+            !text.contains("not ingested") && Instant::now() < deadline,
+            "seed folder not stored:\n{text}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// D1: with one pinned non-ring peer (first) and one admitted ring peer, the gateway path stores
+/// on the ring peer: the refusal means "try the next peer".
+#[test]
+fn d1_gateway_store_skips_non_ring_peer() {
+    let ring_peer = spawn_daemon("d1-ring");
+    let other = other_ring_daemon("d1-other");
+    let _node = d1_up_with_pins("d1-node", &[&other, &ring_peer]);
+    assert!(
+        shard_files(&ring_peer.dir) > 0,
+        "shards on the admitted ring peer"
+    );
+    assert_eq!(shard_files(&other.dir), 0, "nothing on the non-ring peer");
+}
+
+/// D1: with only a non-ring peer pinned (a fresh ring node on a LAN with other rings), the
+/// gateway path keeps the stripe locally instead of failing.
+#[test]
+fn d1_gateway_store_with_only_non_ring_peers_stays_local() {
+    let other = other_ring_daemon("d1-only-other");
+    let node = d1_up_with_pins("d1-only-node", &[&other]);
+    assert!(shard_files(&node.dir) > 0, "stored locally");
+    assert_eq!(shard_files(&other.dir), 0, "nothing on the non-ring peer");
+}

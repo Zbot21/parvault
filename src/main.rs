@@ -324,7 +324,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mesh_client = MeshClient::new(node_identity.clone(), resolved_peers, effective_seed)
-        .with_data_dir_discovery(cfg.data_dir.clone(), lan_port);
+        .with_data_dir_discovery(cfg.data_dir.clone(), lan_port)
+        .with_lan_discovery(lan_enabled);
 
     if public_mode && command_needs_network_discovery(&cli.command) {
         for tracker in &public_trackers {
