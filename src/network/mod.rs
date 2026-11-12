@@ -5,6 +5,7 @@ pub mod placement;
 pub mod rate_limit;
 pub mod transport;
 pub mod wan_rendezvous;
+pub mod wire_handler;
 pub mod wot;
 
 pub use behaviour::{

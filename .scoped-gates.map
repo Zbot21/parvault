@@ -175,6 +175,8 @@ src/network/*                   test    sync_daemon_usability_and_cli_regression
 src/network/*                   test    zero_config_lan_and_router_soc_tests
 src/network/*                   test    zero_trust_adversarial
 src/network/wot.rs              tla     specs/ParVaultProtocol.tla
+src/network/wire_handler.rs     tla     specs/ParVaultProtocol.tla              # HandshakeWoT, no framing slashes
+src/network/wire_handler.rs     tla     specs/ParVaultZeroKeyAdminAndQuorum.tla # seed eviction council
 
 # --- gateway/* ---------------------------------------------------------------
 src/gateway/*                   lib     admin_rpc::
