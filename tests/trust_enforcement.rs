@@ -887,6 +887,59 @@ fn refused_put_keeps_por_session_key() {
     gate_ran("trust_enforcement::refused_put_keeps_por_session_key");
 }
 
+// --- F-32: owner-signed deletes ----------------------------------------------------------------------
+
+fn delete_req(signer: &NodeIdentity, sid: ShardId) -> MeshWireRequest {
+    let (pub_, payload, sig) =
+        parvault::por::PorVerifierEngine::sign_owner_shard_delete_token(signer, &sid, now_ms());
+    let mut r = [0u8; 32];
+    let mut s = [0u8; 32];
+    r.copy_from_slice(&sig[..32]);
+    s.copy_from_slice(&sig[32..]);
+    MeshWireRequest::DeleteShard {
+        shard_id: sid,
+        owner_signature: (pub_, payload, r, s),
+    }
+}
+
+fn deleted(resp: &MeshWireResponse) -> bool {
+    matches!(resp, MeshWireResponse::DeleteShardAck { deleted: true, .. })
+}
+
+/// F-32 accept: the key that stored a shard (no grant) deletes it.
+#[test]
+fn f32_storer_deletes_its_shard() {
+    let node = spawn_daemon("f32-a");
+    let storer = key(0xE7);
+    let (sid, bytes) = shard(0x47, 512);
+    assert!(stored(&send(
+        &storer,
+        &node,
+        put_shard("", sid, bytes, None)
+    )));
+    let resp = send(&storer, &node, delete_req(&storer, sid));
+    assert!(deleted(&resp), "{resp:?}");
+    gate_ran("trust_enforcement::f32_storer_deletes_its_shard");
+}
+
+/// F-32 reject: another admitted key's signed delete of that shard is refused.
+#[test]
+fn f32_other_key_cannot_delete_shard() {
+    let node = spawn_daemon("f32-r");
+    let storer = key(0xE7);
+    let other = key(0xE8);
+    let (sid, bytes) = shard(0x47, 512);
+    assert!(stored(&send(
+        &storer,
+        &node,
+        put_shard("", sid, bytes, None)
+    )));
+    let resp = send(&other, &node, delete_req(&other, sid));
+    assert!(!deleted(&resp), "{resp:?}");
+    assert_logged(&node, "reject.delete_not_shard_owner");
+    gate_ran("trust_enforcement::f32_other_key_cannot_delete_shard");
+}
+
 // --- F-02: repair grants -----------------------------------------------------------------------------
 
 /// Stores a shard of stripe `root` (index 0) with a grant by `owner` naming `witnesses`.

@@ -64,6 +64,7 @@ claim      F-25-DHT  sym=src/network/wire_handler.rs::admission_decision accept=
 # Findings with no line yet (no check function exists to name): F-07, F-08, F-09, F-12, F-17
 #   (2c); F-22, F-23, F-26 (2c); F-24 issuer policy (2c).
 
+claim      F-32      sym=src/por/verifier.rs::shard_delete_decision accept=trust_enforcement::f32_storer_deletes_its_shard reject=trust_enforcement::f32_other_key_cannot_delete_shard code=reject.delete_not_shard_owner bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::DeleteShard
 # --- Deferred to 2c: declared claims whose pairs do not exist yet (expect=claim-missing) ------------
 claim      F-22      sym=src/network/wan_rendezvous.rs::register accept=trust_enforcement::f22_rendezvous_within_quota_stored reject=trust_enforcement::f22_rendezvous_over_quota_refused code=reject.rendezvous_quota bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::RegisterWanRendezvous
 open       F-22      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md

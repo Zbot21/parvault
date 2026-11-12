@@ -51,6 +51,31 @@ pub fn grant_owner_decision(
     }
 }
 
+/// What the shard-delete decision needs to know (F-32).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardDeleteFacts {
+    /// The owner of the grant the shard was stored with, if any.
+    pub grant_owner: Option<[u8; 32]>,
+    /// The key that signed the delete token.
+    pub signer: [u8; 32],
+    /// The signer's device id is the one the shard is accounted to (it stored the shard).
+    pub signer_is_accounted_owner: bool,
+}
+
+/// A shard may be deleted by the owner of the grant it was stored with, or, without a grant, by
+/// the key that stored it (F-32).
+pub fn shard_delete_decision(facts: &ShardDeleteFacts) -> Result<(), &'static str> {
+    let allowed = match facts.grant_owner {
+        Some(owner) => owner == facts.signer,
+        None => facts.signer_is_accounted_owner,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err("reject.delete_not_shard_owner")
+    }
+}
+
 /// What the repair-read decision needs to know (F-02b).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RepairReadFacts {
@@ -468,12 +493,15 @@ impl PorVerifierEngine {
     }
 
     /// Verifies an owner-signed unblinded shard deletion request against the stripe's `RepairGrant.owner_pubkey`.
+    ///
+    /// `accounted_owner` is the device id the shard is accounted to (the key that stored it).
     pub fn authorize_owner_shard_delete(
         &mut self,
         shard_id: &ShardId,
         owner_pub: &[u8; 32],
         signed_payload: &[u8],
         sig: &[u8; 64],
+        accounted_owner: Option<&str>,
     ) -> bool {
         const DOMAIN_PREFIX: &[u8] = b"parvault-owner-shard-delete-v1:";
         let expected_min_len = DOMAIN_PREFIX.len() + 32 + 4 + 8;
@@ -486,12 +514,21 @@ impl PorVerifierEngine {
         {
             return false;
         }
-        let authorized = match self.grant_for_shard(shard_id) {
-            Some(grant) => {
-                grant.owner_pubkey == *owner_pub
-                    && NodeIdentity::verify_with_pubkey(owner_pub, signed_payload, sig)
+        if !NodeIdentity::verify_with_pubkey(owner_pub, signed_payload, sig) {
+            return false;
+        }
+        let facts = ShardDeleteFacts {
+            grant_owner: self.grant_for_shard(shard_id).map(|g| g.owner_pubkey),
+            signer: *owner_pub,
+            signer_is_accounted_owner: accounted_owner
+                == Some(NodeIdentity::device_peer_id_for_pubkey(owner_pub).as_str()),
+        };
+        let authorized = match shard_delete_decision(&facts) {
+            Ok(()) => true,
+            Err(code) => {
+                tracing::warn!(code, "refused a shard delete signed by another key");
+                false
             }
-            None => NodeIdentity::verify_with_pubkey(owner_pub, signed_payload, sig),
         };
         if authorized {
             self.session_keys_ram.remove(&shard_id.file_key());
@@ -994,6 +1031,20 @@ mod decision_tests {
             })
         };
         assert_eq!(read(true, 2), Ok(()));
+        let del = |grant_owner, signer_is_accounted_owner| {
+            shard_delete_decision(&ShardDeleteFacts {
+                grant_owner,
+                signer: [1; 32],
+                signer_is_accounted_owner,
+            })
+        };
+        assert_eq!(del(Some([1; 32]), false), Ok(()));
+        assert_eq!(
+            del(Some([2; 32]), true),
+            Err("reject.delete_not_shard_owner")
+        );
+        assert_eq!(del(None, true), Ok(()));
+        assert_eq!(del(None, false), Err("reject.delete_not_shard_owner"));
         assert_eq!(read(false, 2), Err("reject.repair_grant_unregistered"));
         assert_eq!(read(true, 1), Err("reject.repair_witness_quorum"));
     }

@@ -43,6 +43,7 @@ Status values:
 | F-29 | Medium | Inbound Kademlia `PutRecord` had no admission check, a route around F-25-DHT (QA candidate 2). | 2b | Fixed (QA pending): `kad_record_decision` requires an admitted source, claim F-29 |
 | F-30 | Medium | An admitted member could sub-invite unlimited keys, `admitted_chains` was unbounded and rewritten in full on every handshake (QA candidate 3). | 2b | Fixed (QA pending): a member sub-invites at most 64 keys; at most 65,536 chains, new leaves refused when full (never evicted); a re-sent chain writes nothing; writes batched (F-27). Unit-tested |
 | F-31 | Medium | Onion forwarding is an open relay for unadmitted originators (pre-existing; accepted in the verdict; an amplification vector). A per-source relay budget is planned. | 2c | Read |
+| F-32 | High | An owner-signed `DeleteShard` for a shard stored without a grant was accepted from any key, so an admitted peer could delete another peer's shards by id (found during 2b QA fixes). | 2b | Fixed (QA pending): `shard_delete_decision` (grant owner, or else the key that stored the shard), claim F-32 |
 
 ## Proof gaps
 

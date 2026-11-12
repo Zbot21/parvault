@@ -905,11 +905,17 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
             let mut sig64 = [0u8; 64];
             sig64[..32].copy_from_slice(&r);
             sig64[32..].copy_from_slice(&s);
+            let accounted_owner = block_store
+                .quota()
+                .lock()
+                .ok()
+                .and_then(|q| q.shard_owner(&shard_id.file_key()).map(str::to_string));
             if !por_verifier.authorize_owner_shard_delete(
                 &shard_id,
                 &owner_pub,
                 payload.as_slice(),
                 &sig64,
+                accounted_owner.as_deref(),
             ) {
                 return MeshWireResponse::DeleteShardAck {
                     deleted: false,
