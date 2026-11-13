@@ -166,14 +166,14 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                 PersonalDeviceCert::from_shareable_token(&raw_cert)
                     .or_else(|_| PersonalDeviceCert::from_json_str(&raw_cert))?
             } else {
-                let node_id = NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?;
+                // F-38: the cert must name the identity this client sends as (the vault owner).
                 let issued_at = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
                 PersonalDeviceCert::issue(
                     &pq_kp,
-                    &node_id.device_peer_id(),
+                    &owner_identity.device_peer_id(),
                     "lite-client",
                     issued_at,
                 )?

@@ -3186,3 +3186,74 @@ fn f38_invited_client_syndicates_as_vault_key() {
     assert!(synd_stored(&resp), "{resp:?}");
     assert!(read_bytes(&send_as_stranger(&vault, &node, owner_read(&vault, sid))).is_some());
 }
+
+/// F-38 (QA r3): with no `--device-cert`, `watch-folder` self-issues its cert for the identity
+/// it sends as, the vault key. The client holds the seed's owner key, so the seed accepts the
+/// stripe, and the vault key then reads its shard back as owner.
+#[test]
+fn f38_lite_client_without_device_cert_syndicates() {
+    let seed = spawn_seed("f38-nocert");
+    let root = temp_root("f38-nocert-client");
+    let client_dir = root.path().join("data");
+    let folder = root.path().join("folder");
+    std::fs::create_dir_all(&client_dir).unwrap();
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::copy(
+        seed.dir.join("owner_pq_keypair.bin"),
+        client_dir.join("owner_pq_keypair.bin"),
+    )
+    .unwrap();
+    std::fs::write(folder.join("a.txt"), vec![0x5A; 4096]).unwrap();
+    let snap = root.path().join("snap.bin");
+    let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+    let ns = "f38-nocert";
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+        .env("PARVAULT_LAN_REGISTRY_DIR", root.path().join("reg"))
+        .env_remove("PARVAULT_PEERS")
+        .env_remove("PARVAULT_SEED_PHRASE")
+        .arg("--data-dir")
+        .arg(&client_dir)
+        .args(["--no-lan-discovery", "watch-folder", "--folder"])
+        .arg(&folder)
+        .arg("--snapshot-out")
+        .arg(&snap)
+        .args([
+            "--tier",
+            "homelab",
+            "--seed-phrase",
+            phrase,
+            "--vault-namespace",
+            ns,
+        ])
+        .args(["--lite-seed-dir", &seed.addr, "--once"])
+        .output()
+        .unwrap();
+    let client_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{client_log}");
+    assert!(
+        !seed.log_text().contains("reject.device_cert_not_sender"),
+        "seed refused the self-issued cert:\n{}",
+        seed.log_text()
+    );
+    let snapshot: FolderSnapshotManifest =
+        bincode::deserialize(&std::fs::read(&snap).unwrap()).unwrap();
+    let stripe = &snapshot.files.values().next().unwrap().manifest.stripes[0];
+    let sid = ShardId {
+        stripe_merkle_root: stripe.stripe_merkle_root,
+        shard_index: 0,
+        shard_hash: stripe.shard_hashes[0],
+    };
+    let canonical = parvault::crypto::validate_recovery_seed_phrase_or_passphrase(phrase).unwrap();
+    let vault = NodeIdentity::from_recovery_seed_phrase(&canonical, ns);
+    assert!(
+        read_bytes(&send(&vault, &seed, owner_read(&vault, sid))).is_some(),
+        "owner read failed; client:\n{client_log}\nseed:\n{}",
+        seed.log_text()
+    );
+    gate_ran("trust_enforcement::f38_lite_client_without_device_cert_syndicates");
+}
