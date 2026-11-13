@@ -7,7 +7,7 @@ pub use challenger::{
     ByteSegment, MultiSegmentPorChallenge, PorChallenge, PorResponse,
 };
 pub use verifier::{
-    AuditOutcome, EgressWithholdingEvidence, PorError, PorVerifierEngine, RepairGrant,
-    WitnessFailureReceipt, MAX_POR_RANGE_BYTES, MAX_SEEN_NONCES_RAM,
-    MIN_WITNESS_SIGNATURES_FOR_REPAIR,
+    shard_rebind_decision, AuditOutcome, EgressWithholdingEvidence, PorError, PorVerifierEngine,
+    RepairGrant, ShardBinding, ShardRebindFacts, WitnessFailureReceipt, MAX_POR_RANGE_BYTES,
+    MAX_SEEN_NONCES_RAM, MIN_WITNESS_SIGNATURES_FOR_REPAIR, SHARD_BOUND_TO_ANOTHER_OWNER,
 };

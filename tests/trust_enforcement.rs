@@ -3259,3 +3259,203 @@ fn f38_lite_client_without_device_cert_syndicates() {
     );
     gate_ran("trust_enforcement::f38_lite_client_without_device_cert_syndicates");
 }
+
+// --- F-38-GRANT (L-41): first-writer-wins shard binding -----------------------------------------
+
+const F38G_CODE: &str = "reject.shard_bound_to_another_owner";
+
+fn put_with_commit(
+    sid: ShardId,
+    bytes: Vec<u8>,
+    commit: u8,
+    grant: Option<RepairGrant>,
+) -> MeshWireRequest {
+    MeshWireRequest::PutShard {
+        owner_peer_id: String::new(),
+        shard_id: sid,
+        shard_bytes: bytes,
+        session_key_commit: [commit; 32],
+        repair_grant: grant,
+    }
+}
+
+fn self_grant(owner: &NodeIdentity, sid: &ShardId) -> RepairGrant {
+    RepairGrant::issue(owner, sid.stripe_merkle_root, vec![], ErasureTier::Homelab)
+}
+
+/// The PoR audit under the session commit `put_shard` registers (`[0x5E; 32]`) is answered.
+fn audit_ok(asker: &NodeIdentity, node: &Node, sid: ShardId, len: usize) -> bool {
+    let chal = parvault::por::generate_por_challenge(&[0x5E; 32], sid, len as u64, now_ms());
+    matches!(
+        send(asker, node, MeshWireRequest::PorAudit(chal)),
+        MeshWireResponse::PorAuditResult(Some(_))
+    )
+}
+
+/// F-38-GRANT reject (reproduced before the fix: M became the grant and accounted owner): an
+/// admitted peer holding a shard's bytes re-puts it with its own grant. Refused; the victim
+/// keeps read, delete and its session commit; M can neither read nor delete.
+#[test]
+fn f38g_takeover_with_own_grant_refused() {
+    let node = spawn_daemon("f38g-grant");
+    let victim = key(0xD1);
+    let m = key(0xD2);
+    let (sid, bytes) = shard(0x61, 2048);
+    let ok = send(
+        &victim,
+        &node,
+        put_shard("", sid, bytes.clone(), Some(self_grant(&victim, &sid))),
+    );
+    assert!(stored(&ok), "{ok:?}");
+    let resp = send(
+        &m,
+        &node,
+        put_with_commit(sid, bytes.clone(), 0x66, Some(self_grant(&m, &sid))),
+    );
+    assert!(!stored(&resp), "{resp:?}");
+    assert_logged(&node, F38G_CODE);
+    assert!(read_bytes(&send(&m, &node, owner_read(&m, sid))).is_none());
+    assert!(!deleted(&send(&m, &node, delete_req(&m, sid))));
+    assert!(
+        audit_ok(&victim, &node, sid, bytes.len()),
+        "session commit replaced"
+    );
+    assert_eq!(
+        read_bytes(&send(&victim, &node, owner_read(&victim, sid))),
+        Some(bytes)
+    );
+    assert!(deleted(&send(&victim, &node, delete_req(&victim, sid))));
+    gate_ran("trust_enforcement::f38g_takeover_with_own_grant_refused");
+}
+
+/// F-38-GRANT reject: a re-put with no grant onto an ungranted shard (accounted-owner takeover)
+/// is refused; M cannot delete, the storer still can.
+#[test]
+fn f38g_takeover_without_grant_refused() {
+    let node = spawn_daemon("f38g-nogrant");
+    let victim = key(0xD3);
+    let m = key(0xD4);
+    let (sid, bytes) = shard(0x62, 1024);
+    assert!(stored(&send(
+        &victim,
+        &node,
+        put_shard("", sid, bytes.clone(), None)
+    )));
+    let resp = send(&m, &node, put_with_commit(sid, bytes.clone(), 0x66, None));
+    assert!(!stored(&resp), "{resp:?}");
+    assert_logged(&node, F38G_CODE);
+    assert!(!deleted(&send(&m, &node, delete_req(&m, sid))));
+    assert!(
+        audit_ok(&victim, &node, sid, bytes.len()),
+        "session commit replaced"
+    );
+    assert!(deleted(&send(&victim, &node, delete_req(&victim, sid))));
+}
+
+/// F-38-GRANT accept: the owner re-puts its own shard with its grant (idempotent `Bind`).
+#[test]
+fn f38g_same_owner_reput_accepted() {
+    let node = spawn_daemon("f38g-same");
+    let owner = key(0xD5);
+    let (sid, bytes) = shard(0x63, 1024);
+    for _ in 0..2 {
+        let r = send(
+            &owner,
+            &node,
+            put_shard("", sid, bytes.clone(), Some(self_grant(&owner, &sid))),
+        );
+        assert!(stored(&r), "{r:?}");
+    }
+    assert_eq!(
+        read_bytes(&send(&owner, &node, owner_read(&owner, sid))),
+        Some(bytes)
+    );
+    gate_ran("trust_enforcement::f38g_same_owner_reput_accepted");
+}
+
+/// F-38-GRANT accept (`Keep`): a third party re-puts with the owner's grant (repair, handoff,
+/// seed re-forward). Acked as stored; nothing changes: session commit, read and delete stay
+/// the owner's.
+#[test]
+fn f38g_third_party_with_owner_grant_kept() {
+    let node = spawn_daemon("f38g-keep");
+    let owner = key(0xD6);
+    let third = key(0xD7);
+    let (sid, bytes) = shard(0x64, 1024);
+    let grant = self_grant(&owner, &sid);
+    assert!(stored(&send(
+        &owner,
+        &node,
+        put_shard("", sid, bytes.clone(), Some(grant.clone()))
+    )));
+    let r = send(
+        &third,
+        &node,
+        put_with_commit(sid, bytes.clone(), 0x66, Some(grant)),
+    );
+    assert!(stored(&r), "{r:?}");
+    assert!(
+        audit_ok(&owner, &node, sid, bytes.len()),
+        "session commit replaced"
+    );
+    assert!(!deleted(&send(&third, &node, delete_req(&third, sid))));
+    assert!(deleted(&send(&owner, &node, delete_req(&owner, sid))));
+}
+
+/// F-38-GRANT accept: after the owner deletes its shard, a new owner may store it; the old
+/// owner's stale grant binding gives it nothing over the new owner's shard.
+#[test]
+fn f38g_delete_then_new_owner_rebinds() {
+    let node = spawn_daemon("f38g-rebind");
+    let old = key(0xD8);
+    let new = key(0xD9);
+    let (sid, bytes) = shard(0x65, 1024);
+    assert!(stored(&send(
+        &old,
+        &node,
+        put_shard("", sid, bytes.clone(), Some(self_grant(&old, &sid)))
+    )));
+    assert!(deleted(&send(&old, &node, delete_req(&old, sid))));
+    let r = send(
+        &new,
+        &node,
+        put_shard("", sid, bytes.clone(), Some(self_grant(&new, &sid))),
+    );
+    assert!(stored(&r), "{r:?}");
+    assert_eq!(
+        read_bytes(&send(&new, &node, owner_read(&new, sid))),
+        Some(bytes)
+    );
+    assert!(read_bytes(&send(&old, &node, owner_read(&old, sid))).is_none());
+    assert!(!deleted(&send(&old, &node, delete_req(&old, sid))));
+}
+
+/// F-38-GRANT seed accept: the vault key re-syndicates the same stripe (rule 2).
+#[test]
+fn f38g_seed_vault_resyndication_accepted() {
+    let node = spawn_seed("f38g-resynd");
+    let vault = key(0xDA);
+    for _ in 0..2 {
+        let (req, _) = f38_syndicate(&node, &vault, Some(&vault));
+        let resp = send(&vault, &node, req);
+        assert!(synd_stored(&resp), "{resp:?}");
+    }
+}
+
+/// F-38-GRANT seed reject: a second key syndicating the identical bundle under its own cert
+/// and grant is refused; nothing is re-registered, so it reads nothing.
+#[test]
+fn f38g_seed_second_key_same_bundle_refused() {
+    let node = spawn_seed("f38g-second");
+    let vault = key(0xDB);
+    let other = key(0xDC);
+    let (req, sid) = f38_syndicate(&node, &vault, Some(&vault));
+    assert!(synd_stored(&send(&vault, &node, req)));
+    let (req2, _) = f38_syndicate(&node, &other, Some(&other));
+    let resp = send(&other, &node, req2);
+    assert!(!synd_stored(&resp), "{resp:?}");
+    assert_logged(&node, F38G_CODE);
+    assert!(read_bytes(&send(&other, &node, owner_read(&other, sid))).is_none());
+    assert!(read_bytes(&send(&vault, &node, owner_read(&vault, sid))).is_some());
+    gate_ran("trust_enforcement::f38g_seed_second_key_same_bundle_refused");
+}
