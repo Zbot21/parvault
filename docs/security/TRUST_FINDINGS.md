@@ -79,7 +79,7 @@ Status values:
 
 | ID | Sev | Finding | Item | Status |
 | :--- | :--- | :--- | :--- | :--- |
-| P-01 | High | No Kani harness touches `src/network/*`. | 2d-β | Reported |
+| P-01 | High | No Kani harness touches `src/network/*`. | 2d-β | Fixed (QA pending; Kani not yet run): `wot.rs` decisions `is_peer_trust_decision`, `verify_and_admit_chain_shape_decision`, `verify_and_admit_public_ticket_decision` with Kani harnesses and reject covers, plus `slash_target_decision` (S-GUARD); reach lines from `handle_mesh_wire_request`; `record_failure` and `slash_immediately` are test-only (no production caller since F-01). Waive 11→16 approved by Lead: 4 stateful wire-path wrappers over Kani-proven decisions, plus the slash guard with no production caller. |
 | P-02 | High | Specs hardcode the properties they claim to check. | 2d-β | Reported |
 | P-03 | Medium | `ParVaultZeroKeyAdminAndQuorum`: tautological replay guard; Byzantine count fixed by `ASSUME`. | 2d-β | Reported |
 | P-04 | Medium | Earned-tier invariants are near-tautologies; no spec models pairing, rendezvous or PoW admission. | 2d-β | Reported |

@@ -44,7 +44,20 @@ tla-spec   T-SPECS   path=specs/*.tla
 open       T-SPECS   expect=tla-lint by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 open       T-SPECS   expect=completeness by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 module     P-01      path=src/network/wot.rs pattern=^(verify_and_admit_|is_peer_|apply_slashing_|slash_|record_failure) kani=required
-open       P-01      expect=completeness by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+reach      P-01      sym=src/network/wot.rs::is_peer_trusted from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
+reach      P-01      sym=src/network/wot.rs::is_peer_trust_decision from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
+reach      P-01      sym=src/network/wot.rs::is_peer_quarantined from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
+reach      P-01      sym=src/network/wot.rs::verify_and_admit_chain from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
+reach      P-01      sym=src/network/wot.rs::verify_and_admit_chain_shape_decision from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
+reach      P-01      sym=src/network/wot.rs::verify_and_admit_public_ticket_decision from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
+kani       P-01      sym=src/network/wot.rs::is_peer_trust_decision harness=proof_peer_trust_never_quarantined cover=quarantined peer refused
+kani       P-01      sym=src/network/wot.rs::verify_and_admit_chain_shape_decision harness=proof_chain_shape_bounded_and_rooted cover=too deep or empty refused
+kani       P-01      sym=src/network/wot.rs::verify_and_admit_public_ticket_decision harness=proof_public_ticket_admission cover=revoked ticket refused
+waive      P-01      sym=src/network/wot.rs::is_peer_trusted reason=stateful wrapper over is_peer_trust_decision (kani proof_peer_trust_never_quarantined); registry HashMaps are outside CBMC
+waive      P-01      sym=src/network/wot.rs::is_peer_quarantined reason=set lookup with no decision; its use in trust is proven by proof_peer_trust_never_quarantined
+waive      P-01      sym=src/network/wot.rs::verify_and_admit_chain reason=stateful wrapper over verify_and_admit_chain_shape_decision (kani proof_chain_shape_bounded_and_rooted) and chain_admission_decision; Ed25519 hop signatures are outside CBMC
+waive      P-01      sym=src/network/wot.rs::verify_and_admit_public_ticket reason=stateful wrapper over verify_and_admit_public_ticket_decision (kani proof_public_ticket_admission); PoW hashing is outside CBMC
+waive      P-01      sym=src/network/wot.rs::slash_target_decision reason=the slash guard (genesis and own keys never slashed), proven by kani S-GUARD; no production slasher in v0.5.0 (record_failure and slash_immediately are test-only since F-01)
 
 # --- Claims ----------------------------------------------------------------------------------------
 claim      F-02a     sym=src/por/verifier.rs::grant_registration_decision accept=trust_enforcement::f02a_owner_grant_update_registered reject=trust_enforcement::f02a_grant_for_other_stripe_not_registered code=reject.repair_grant_root_mismatch bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-04-repair-grant-ciphertext-reconstruction.md
@@ -154,4 +167,4 @@ kani       S-SANITIZE sym=src/sync.rs::sanitize_sync_relative_path_into harness=
 claim      B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision accept=trust_enforcement::bseed_second_sender_accepted_while_one_job_runs reject=trust_enforcement::bseed_third_job_refused_busy code=reject.syndication_busy bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe
 kani       B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision harness=proof_syndication_fanout_budget cover=syndication over budget
 
-ratchet    R         open=7 waive=11
+ratchet    R         open=6 waive=16

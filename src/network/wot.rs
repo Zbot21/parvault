@@ -887,6 +887,7 @@ impl WebOfTrustRegistry {
     }
 
     /// Runs the slash guard for `target`; logs and returns `false` for a protected key.
+    #[cfg(test)]
     fn may_slash(&self, target: [u8; 32]) -> bool {
         let facts = SlashTargetFacts {
             is_genesis: self.genesis_pubkey == Some(target),
@@ -922,21 +923,41 @@ impl WebOfTrustRegistry {
         genesis.ok_or("reject.handshake_no_ring")
     }
 
+    /// P-01: a delegation chain's shape: not empty, at most `MAX_DELEGATION_DEPTH` hops, and
+    /// rooted at the ring genesis (`root_is_genesis`). Signatures and links are checked separately.
+    pub fn verify_and_admit_chain_shape_decision(
+        hops_len: usize,
+        root_is_genesis: bool,
+    ) -> Result<(), &'static str> {
+        if hops_len == 0 {
+            return Err("reject.chain_empty");
+        }
+        if hops_len as u64 > MAX_DELEGATION_DEPTH as u64 {
+            return Err("reject.chain_too_deep");
+        }
+        if !root_is_genesis {
+            return Err("reject.chain_untrusted_root");
+        }
+        Ok(())
+    }
+
     pub fn verify_and_admit_chain(
         &mut self,
         chain: &DelegationChain,
     ) -> Result<[u8; 32], WebOfTrustError> {
-        if chain.hops.is_empty() {
-            return Err(WebOfTrustError::EmptyChain);
-        }
-        if chain.hops.len() as u32 > MAX_DELEGATION_DEPTH {
-            return Err(WebOfTrustError::MaxDepthExceeded(chain.hops.len() as u32));
-        }
+        let len = chain.hops.len();
+        let shape = |root_ok| {
+            Self::verify_and_admit_chain_shape_decision(len, root_ok).map_err(|code| match code {
+                "reject.chain_empty" => WebOfTrustError::EmptyChain,
+                "reject.chain_too_deep" => WebOfTrustError::MaxDepthExceeded(len as u32),
+                _ => WebOfTrustError::UntrustedGenesisRoot,
+            })
+        };
+        // P-01: shape first (empty, depth), then the ring, then the root, as before.
+        shape(true)?;
         let genesis = Self::ring_handshake_decision(self.genesis_pubkey)
             .map_err(|_| WebOfTrustError::NoRing)?;
-        if chain.hops[0].inviter_pubkey != genesis {
-            return Err(WebOfTrustError::UntrustedGenesisRoot);
-        }
+        shape(chain.hops[0].inviter_pubkey == genesis)?;
 
         // Links and signatures first: quarantine state is consulted only for a chain that is
         // otherwise valid, so a forged probe cannot learn whether a key is quarantined (F-30).
@@ -1004,19 +1025,42 @@ impl WebOfTrustRegistry {
 
     /// Verifies and admits a stranger peer's self-signed Hashcash `PublicCommonsTicket` when
     /// operating in `PublicCommons` or `Hybrid` mode (`ADR-18`).
+    /// P-01: a public-commons ticket is admitted only outside private-ring mode, for a key that
+    /// is not quarantined, with valid proof of work.
+    pub fn verify_and_admit_public_ticket_decision(
+        private_ring_mode: bool,
+        quarantined: bool,
+        pow_ok: bool,
+    ) -> Result<(), &'static str> {
+        if private_ring_mode {
+            return Err("reject.public_commons_disabled");
+        }
+        if quarantined {
+            return Err("reject.public_peer_revoked");
+        }
+        if !pow_ok {
+            return Err("reject.public_pow_insufficient");
+        }
+        Ok(())
+    }
+
     pub fn verify_and_admit_public_ticket(
         &mut self,
         ticket: &PublicCommonsTicket,
     ) -> Result<(), WotError> {
-        if self.trust_pool_mode == TrustPoolMode::PrivateRing {
-            return Err(WotError::PublicCommonsDisabled);
-        }
-        if self.quarantined_keys.contains(&ticket.peer_pubkey) {
-            return Err(WotError::RevokedPeer);
-        }
-        if !ticket.verify(self.min_public_pow_bits) {
-            return Err(WotError::InsufficientPublicPow);
-        }
+        let private_ring = self.trust_pool_mode == TrustPoolMode::PrivateRing;
+        let quarantined = self.quarantined_keys.contains(&ticket.peer_pubkey);
+        let to_err = |code| match code {
+            "reject.public_commons_disabled" => WotError::PublicCommonsDisabled,
+            "reject.public_peer_revoked" => WotError::RevokedPeer,
+            _ => WotError::InsufficientPublicPow,
+        };
+        // P-01: mode and revocation first, so a refused ticket costs no PoW verification.
+        Self::verify_and_admit_public_ticket_decision(private_ring, quarantined, true)
+            .map_err(to_err)?;
+        let pow_ok = ticket.verify(self.min_public_pow_bits);
+        Self::verify_and_admit_public_ticket_decision(private_ring, quarantined, pow_ok)
+            .map_err(to_err)?;
 
         // Already admitted: a cheap no-op that writes nothing (F-29).
         if self.is_private_ring_peer(&ticket.peer_pubkey)
@@ -1093,22 +1137,32 @@ impl WebOfTrustRegistry {
 
     /// Checks whether a peer is currently admitted (via `genesis_pubkey`, unquarantined
     /// `PrivateRing` `DelegationChain`, or active `PublicCommonsTicket`) and not slashed.
+    /// P-01: a quarantined key is never trusted (not even the genesis); otherwise the genesis,
+    /// a private-ring member or a public-commons member is.
+    pub fn is_peer_trust_decision(
+        is_genesis: bool,
+        quarantined: bool,
+        private_member: bool,
+        public_member: bool,
+    ) -> bool {
+        !quarantined && (is_genesis || private_member || public_member)
+    }
+
     pub fn is_peer_trusted(&self, peer_pubkey: &[u8; 32]) -> bool {
-        if self.genesis_pubkey == Some(*peer_pubkey) {
-            return !self.quarantined_keys.contains(peer_pubkey);
-        }
-        if self.quarantined_keys.contains(peer_pubkey) {
-            return false;
-        }
-        if self.is_private_ring_peer(peer_pubkey) {
-            return true;
-        }
-        self.is_public_commons_peer(peer_pubkey)
+        let quarantined = self.quarantined_keys.contains(peer_pubkey);
+        let is_genesis = self.genesis_pubkey == Some(*peer_pubkey);
+        Self::is_peer_trust_decision(
+            is_genesis,
+            quarantined,
+            !quarantined && !is_genesis && self.is_private_ring_peer(peer_pubkey),
+            !quarantined && !is_genesis && self.is_public_commons_peer(peer_pubkey),
+        )
     }
 
     /// Records a handshake or PoR failure for `offender_pubkey`.
     /// When `leaf_failures >= 3` (`MAX_LEAF_FAILURES`), immediately isolates the node and propagates
     /// a slash penalty up its parent inviter chain, pruning ancestor branches that hit `max_subtree_slashes`.
+    #[cfg(test)] // P-01: no production caller since F-01 (slashing is local and test-only in v0.5.0).
     pub fn record_failure(&mut self, offender_pubkey: [u8; 32]) -> bool {
         if !self.may_slash(offender_pubkey) {
             return false;
@@ -1148,6 +1202,7 @@ impl WebOfTrustRegistry {
     /// Immediately quarantines an offender leaf node on the first provable Byzantine offense
     /// (shard poisoning, egress withholding, or proxy cheating) and propagates a slash penalty
     /// up its parent inviter chain.
+    #[cfg(test)] // P-01: no production caller since F-01.
     pub fn slash_immediately(&mut self, offender_pubkey: [u8; 32]) -> bool {
         if !self.may_slash(offender_pubkey) {
             return false;
@@ -1254,10 +1309,84 @@ impl WebOfTrustRegistry {
 
 #[cfg(test)]
 mod tests {
+    /// Moved from tests/phase1_to_4_integration.rs (P-01: record_failure is test-only). Verifies ADR-05: Web-of-Trust recursive delegation chains and subtree slashing within <= 3 failures.
+    #[test]
+    fn test_wot_delegation_and_subtree_slashing() {
+        let genesis = NodeIdentity::generate();
+        let inviter = NodeIdentity::generate();
+        let honest_leaf = NodeIdentity::generate();
+        let bad_leaf_1 = NodeIdentity::generate();
+        let bad_leaf_2 = NodeIdentity::generate();
+
+        let mut wot = WebOfTrustRegistry::new(genesis.public_key_bytes(), 2);
+
+        let hop0 = InvitationHop::issue(&genesis, inviter.public_key_bytes(), 1, 100);
+        let chain_honest = DelegationChain {
+            hops: vec![
+                hop0.clone(),
+                InvitationHop::issue(&inviter, honest_leaf.public_key_bytes(), 2, 101),
+            ],
+        };
+        let chain_bad1 = DelegationChain {
+            hops: vec![
+                hop0.clone(),
+                InvitationHop::issue(&inviter, bad_leaf_1.public_key_bytes(), 2, 102),
+            ],
+        };
+        let chain_bad2 = DelegationChain {
+            hops: vec![
+                hop0,
+                InvitationHop::issue(&inviter, bad_leaf_2.public_key_bytes(), 2, 103),
+            ],
+        };
+
+        wot.verify_and_admit_chain(&chain_honest).unwrap();
+        wot.verify_and_admit_chain(&chain_bad1).unwrap();
+        wot.verify_and_admit_chain(&chain_bad2).unwrap();
+
+        // 3 failures isolate bad_leaf_1.
+        assert!(!wot.record_failure(bad_leaf_1.public_key_bytes()));
+        assert!(!wot.record_failure(bad_leaf_1.public_key_bytes()));
+        assert!(wot.record_failure(bad_leaf_1.public_key_bytes()));
+        assert!(!wot.is_peer_trusted(&bad_leaf_1.public_key_bytes()));
+        // Honest sibling is still trusted after 1 slashed sibling (subtree limit = 2).
+        assert!(wot.is_peer_trusted(&honest_leaf.public_key_bytes()));
+
+        // 3 failures on bad_leaf_2 crosses inviter's subtree slash threshold (M=2), pruning the entire branch!
+        wot.record_failure(bad_leaf_2.public_key_bytes());
+        wot.record_failure(bad_leaf_2.public_key_bytes());
+        wot.record_failure(bad_leaf_2.public_key_bytes());
+        assert!(!wot.is_peer_trusted(&inviter.public_key_bytes()));
+        assert!(!wot.is_peer_trusted(&honest_leaf.public_key_bytes()));
+    }
+
+    /// F-30 at the registry (moved from wire_handler_equivalence, P-01): a forged hop for a
+    /// quarantined key and for an ordinary key are refused with the same error, so the handshake
+    /// is not a quarantine oracle.
+    #[test]
+    fn f30_forged_hop_is_not_a_quarantine_oracle() {
+        let genesis = NodeIdentity::generate();
+        let rogue = NodeIdentity::generate();
+        let quarantined = NodeIdentity::generate();
+        let ordinary = NodeIdentity::generate();
+        let mut wot = WebOfTrustRegistry::new(genesis.public_key_bytes(), 3);
+        assert!(wot.slash_immediately(quarantined.public_key_bytes()));
+        let forged = |leaf: &NodeIdentity| {
+            let mut hop = InvitationHop::issue(&rogue, leaf.public_key_bytes(), 1, 100);
+            hop.inviter_pubkey = genesis.public_key_bytes();
+            DelegationChain { hops: vec![hop] }
+        };
+        let eq = wot.verify_and_admit_chain(&forged(&quarantined));
+        let eo = wot.verify_and_admit_chain(&forged(&ordinary));
+        assert!(eq.is_err());
+        assert_eq!(format!("{eq:?}"), format!("{eo:?}"));
+    }
+
     /// QA 2c R2: a node may require at most what a default client re-mints (16 bits).
     #[test]
     fn required_pow_bits_are_capped() {
         use super::*;
+
         assert_eq!(required_pow_bits_decision(16), Ok(()));
         assert_eq!(
             required_pow_bits_decision(17),
