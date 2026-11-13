@@ -207,6 +207,26 @@ jobs:
       - name: Run 13-Container Docker P2P Regression & Disaster Recovery Gate
         run: USE_GLIBC_IMAGE=1 bash scripts/docker_acceptance_gate.sh
 
+  docs-commands:
+    # L-34 (plan-7 section 3): every command block in README.md and QUICKSTART.md runs against
+    # the release binaries in fresh ubuntu:24.04 containers (no Rust toolchain), or carries a
+    # reasoned skip counted by docs/doc-commands.ratchet. Also tests install.sh against these
+    # binaries served locally, and checks the claim labels.
+    name: L-34 Docs Commands (README & QUICKSTART run verbatim)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: docs/doc-commands.txt is current, blocks are annotated, skip ratchet matches
+        run: bash scripts/doc_commands.sh check
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binaries (each with its own features)
+        run: bash scripts/build_bins.sh --profile release --out dist
+      - name: Run every documented command block
+        run: bash scripts/doc_commands.sh run dist
+      - name: install.sh installs its default version from release-style assets
+        run: bash scripts/test_install.sh dist
+
   kani-bounded-model-check:
     name: Kani Rust Bounded Model Checking (17 Symbolic Harnesses)
     runs-on: ubuntu-24.04

@@ -41,6 +41,7 @@ Designed to run identically on multi-terabyte homelab NAS servers and memory-con
 
 ## 60-Second Quickstart (Zero-IP Home Network & Cloud-NAS)
 
+<!-- doc-cmd: skip reason="router and laptop on two machines; QUICKSTART steps 1-4 run the same commands across two containers" -->
 ```bash
 # 1. Initialize keys and a config.toml on the router
 parvault init --profile router-soc --watch /mnt/usb-nas/shared --label "Router-NAS"
@@ -116,8 +117,8 @@ flowchart LR
 | **Online WAN Rendezvous & DDNS** | STUN-over-Noise address reflection, blinded rendezvous mailbox, dynamic-IP presence across ISP rotations | `ADR-23` |
 | **Public Commons Swarm Mode** | Zero-pairing BitTorrent-style public tracker (`--public`), self-signed Hashcash PoW (`PublicCommonsTicket`) | `ADR-24` |
 | **Post-Quantum Hybrids** | X-Wing `X25519 + ML-KEM-768` (FIPS 203), `Ed25519 + ML-DSA-65` (FIPS 204), and dual-cipher `PqVaultMasterKey` (`AES-256-GCM` + `ChaCha20-Poly1305`) for the folder catalog and manifest. File data is `AES-256-GCM` only. | `ADR-12` |
-| **Shard Anonymization (partial)** | Keyed 256-bit `BlindedShardId`, per-shard capability keys $V_i$ and bearer quota vouchers on the seed/lite path; nodes relay 2-layer PQ onions. **Planned:** onion upload from the CLI. Regular `.shard` names reveal which shards share a stripe (W-05). | `ADR-11` |
-| **Earned Standing (planned for erasure coding)** | `PersonalDeviceCert` rings, `FoundationSeedAnchor`s and `HighUptimeAnchor` standing exist in the library; the CLI does not yet pick erasure parameters from standing. `watch-folder` and `up` use `--tier` (default `homelab`, 16-of-20). | `ADR-15`, `ADR-14` |
+| **Shard Anonymization (partial)** | Keyed 256-bit `BlindedShardId`, per-shard capability keys $V_i$ and bearer quota vouchers on the seed/lite path; nodes relay 2-layer PQ onions. <!-- claim: planned -->(planned) Onion upload from the CLI. Regular `.shard` names reveal which shards share a stripe (W-05). | `ADR-11` |
+| **Earned Standing (planned for erasure coding)** | `PersonalDeviceCert` rings, `FoundationSeedAnchor`s and `HighUptimeAnchor` standing exist in the library; <!-- claim: planned -->(planned) the CLI does not yet pick erasure parameters from standing. `watch-folder` and `up` use `--tier` (default `homelab`, 16-of-20). | `ADR-15`, `ADR-14` |
 | **Byzantine & Red-Team Hardening** | Pre-decoding Merkle quarantine, bounded `with_limit` wire framing (`32 MiB`), atomic `fsync`+`rename`, path-traversal blocking, and BIP-39 12/24-word seed recovery for folders backed up with `--seed-phrase` | `ADR-09`, `ADR-18` |
 | **Privacy-Preserving Eviction Engine** | 4-vector bad-actor/content eviction (`parvault evict`), zero plaintext IPs on disk (`eviction_index.bin` HMAC tags), multi-pass `0x00` shredding, $M$-of-$N$ Public Tracker Council quorum (`cosign-eviction`), cryptographic reporter burden-of-proof (`parvault report-abuse`) | `ADR-19` |
 | **Zero-Filesystem Bounded RAM Mode (`parvault-seed --no-fs`)** | Pure in-memory seed/bootstrap execution (`--no-fs --in-memory-mb <MiB>`, `--identity-env` / `--identity-file`) with **zero persistent directories or files** created, hard RAM byte-cap enforcement, and `0x00` `zeroize()` memory wiping on eviction/drop | [`ADR-30`](docs/adr/ADR-30-filesystem-free-in-memory-seed-mode.md) |
@@ -131,7 +132,7 @@ flowchart LR
 
 - **Pre-release:** no installer or binary download; build from source. Multi-node behaviour is tested only in Docker and on one host, not on router hardware.
 - **Encryption:** file data is `AES-256-GCM`. The post-quantum `PqVaultMasterKey` cascade covers only the folder catalog and manifest.
-- **Anonymity:** the CLI uploads shards directly to ring peers; onion upload is planned (nodes already relay onions). Regular shard file names start with the stripe's Merkle-root prefix and shard index, so a storage node can tell which shards share a stripe and count stripes (W-05, [`docs/security/TRUST_FINDINGS.md`](docs/security/TRUST_FINDINGS.md)). Blinded `.bshard` storage exists only on the seed/lite path. A storage voucher names its issuer, and the target accepts only issuers it trusts, so an onion upload hides the originator from the target only if someone else (for example the relay) issued the voucher; unlinkable vouchers are planned for v0.6.0.
+- **Anonymity:** the CLI uploads shards directly to ring peers; <!-- claim: planned -->(planned) onion upload (nodes already relay onions). Regular shard file names start with the stripe's Merkle-root prefix and shard index, so a storage node can tell which shards share a stripe and count stripes (W-05, [`docs/security/TRUST_FINDINGS.md`](docs/security/TRUST_FINDINGS.md)). Blinded `.bshard` storage exists only on the seed/lite path. A storage voucher names its issuer, and the target accepts only issuers it trusts, so an onion upload hides the originator from the target only if someone else (for example the relay) issued the voucher; unlinkable vouchers are planned for v0.6.0.
 - **Erasure coding:** fixed per run with `--tier` (default `homelab`, 16-of-20). Earned standing does not change it yet.
 - **One router:** with a single paired storage node, every shard is on that node.
 - **Recovery:** `recover-from-seed` restores only folders backed up with `watch-folder` and a phrase (`PARVAULT_SEED_PHRASE` or `--seed-phrase`) and the same `--vault-namespace`, while peers holding the shards are reachable. `parvault init` prints no phrase; `parvault new-seed-phrase` makes one. Folders served by `parvault up --folder` have no phrase recovery.
@@ -139,7 +140,7 @@ flowchart LR
 - **Re-syndicating a partly placed stripe:** `watch-folder` with a lite seed re-sends the whole stripe, so shards that an earlier pass already placed on peers stay there unreferenced (they use those peers' quota until evicted).
 - **Built-in VFS seed folder (W-04):** if the seed folder cannot be stored at all, the daemon prints a warning and keeps serving without it.
 - **Storage audits:** new manifests (version 2) record a chunk Merkle root per shard, but the audit loop does not issue challenges yet. Manifests written before version 2 have no chunk roots and cannot be audited; re-store the file to add them.
-- **Personal device rings:** the "zero storage quota tax" for linked devices is planned; nothing charges or waives quota by device certificate yet.
+- **Personal device rings:** <!-- claim: planned -->(planned) the "zero storage quota tax" for linked devices; nothing charges or waives quota by device certificate yet.
 - **Slow links:** each shard upload or fetch must finish within 1.2 s (about 7 Mbit/s for a 1 MiB shard); fine on a LAN, but a seed forwarding to WAN peers or a restore over a slow uplink can time out (T-SHARD-TIMEOUT). Lite syndication to the seed waits up to 30 s.
 - **Lost quota state:** if a node's `quota_state.bin` is deleted or unreadable, it starts with empty accounting, so a shard stored without a repair grant can no longer be re-put or deleted by its owner there (shards stored with a grant are unaffected; F-38-GRANT-QUOTA).
 - **WebDAV auth (F-43):** every request needs a read-only `parvault token mint` token, as `Authorization: Bearer` or as the Basic-auth password. There is no TLS in `v0.5.0` (planned for `v0.6.0`): on loopback nothing leaves the machine, but **over a LAN the token travels in clear** and can be replayed until it expires, so keep `--ttl-secs` short. Windows' WebDAV client sends Basic over plain HTTP only after `reg add HKLM\SYSTEM\CurrentControlSet\Services\WebClient\Parameters /v BasicAuthLevel /t REG_DWORD /d 2 /f` and a `WebClient` service restart. Tokens can be scoped to one file (`--manifest-hex`) but not to a folder, and are revoked only by rotating `macaroon_root.key` (which also invalidates plugin tokens).
@@ -152,6 +153,7 @@ flowchart LR
 
 ## Build & Verification Commands
 
+<!-- doc-cmd: skip reason="needs the Rust toolchain and this repository; CI's rust-tests job runs these" -->
 ```bash
 # Run all unit, integration, mathematical proof, Stateright, TLA+ TLC, GatewayBus, VFS & GatewayFolderSync tests
 # (the TLA+ tests need tla2tools.jar; point TLA2TOOLS_JAR at your copy)
@@ -165,37 +167,80 @@ cargo run --release --bin parvault-seed -- self-test
 cargo run --release --bin parvault -- gateway self-test
 # Plugin self-tests are client-only: this starts a standalone gateway, mints a token, runs both
 bash scripts/build_bins.sh --profile release --out dist && bash scripts/plugin_self_test.sh dist/parvault dist/parvault-fuse dist/parvault-sync
+```
 
-# Launch a zero-filesystem, RAM-capped seed node (zero directories or files created on disk)
+Launch a zero-filesystem, RAM-capped seed node (zero directories or files created on disk):
+<!-- doc-cmd: node seed -->
+<!-- doc-cmd: background ready="Zero-Trust Seed & Redundancy Server Status Report" -->
+```bash
 parvault-seed start --no-fs --in-memory-mb 256 --mode public-bootstrap --listen /ip4/0.0.0.0/tcp/4002
+```
 
-# Launch single-daemon Cloud-NAS + hardened UDS plugin host, mint an offline-attenuatable token, and run =m plugins.
-# Needs `parvault init` and `parvault wot init` (or a chain from `wot install-chain`) first.
-# /var/run needs root; any directory you can write works for the socket.
+Launch single-daemon Cloud-NAS + hardened UDS plugin host, mint an offline-attenuatable token, and run `=m` plugins. The daemon needs a node and a ring first; `/var/run` needs root, but any directory you can write works for the socket:
+<!-- doc-cmd: node plugins -->
+```bash
+parvault init
+parvault wot init        # or join an existing ring with `parvault wot install-chain`
 SOCK=/var/run/parvault.sock
+```
+<!-- doc-cmd: node plugins -->
+<!-- doc-cmd: background ready="Zero-Copy IPC Gateway listening" -->
+```bash
 parvault up --folder /mnt/usb-nas/shared --ipc-socket "$SOCK" \
   --strict-plugins --allow-peer-uid "$(id -u)" --require-sealed-memfd
+```
+<!-- doc-cmd: node plugins -->
+```bash
 # WebDAV clients present this token (or an offline `parvault token attenuate` of it) on every
 # request (F-43). No --allow-peer-uid: a peer-UID caveat cannot be checked over TCP, and
 # --strict-plugins already pins the plugin's UID on the socket.
 TOKEN=$(parvault token mint --read-only --ttl-secs 3600)
 ( umask 077; printf '%s\n' "$TOKEN" > ./plugin.token )   # --macaroon-file: not visible in the process list
+```
+<!-- doc-cmd: node plugins -->
+<!-- doc-cmd: background ready="serving HTTP-Range / WebDAV VFS" -->
+```bash
 # The WebDAV view lists what parvault-fuse itself ingests, not folders pushed with parvault-sync
 parvault-fuse --socket "$SOCK" --macaroon-file ./plugin.token \
   --cache-dir /tmp/pv-cache --cache-mib 512 webdav --listen 127.0.0.1:8088
+```
+<!-- doc-cmd: node plugins -->
+```bash
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
+```
+With no ring peer to take the data, `push` keeps it on this machine and exits with code 3 ("N stripe(s) kept only on this machine: NOT backed up"):
+<!-- doc-cmd: node plugins -->
+<!-- doc-cmd: expect-exit 3 -->
+```bash
+mkdir -p ~/Documents && echo "hello" > ~/Documents/hello.txt   # something to push
 parvault-sync --socket "$SOCK" --catalog ./gw-catalog.bin push --folder ~/Documents
+```
+<!-- doc-cmd: node plugins -->
+```bash
 parvault-sync --socket "$SOCK" --catalog ./gw-catalog.bin --macaroon-file ./plugin.token pull --output /tmp/restored
+```
 
-# Or host WebDAV VFS built-in (=y) inside parvault with --no-socket (zero .sock file on disk!).
-# Needs `parvault init` and ring membership. The seed folder is stored like other data: on pinned
-# ring peers that accept it, else locally (peers of other rings and offline peers are skipped).
+Or host WebDAV VFS built-in (`=y`) inside `parvault` with `--no-socket` (zero `.sock` file on disk). This needs a node and ring membership too. The seed folder is stored like other data: on pinned ring peers that accept it, else locally (peers of other rings and offline peers are skipped):
+<!-- doc-cmd: node vfs -->
+```bash
+parvault init && parvault wot init
+mkdir -p /mnt/usb-nas/shared
+```
+<!-- doc-cmd: node vfs -->
+<!-- doc-cmd: background ready="WebDAV" -->
+```bash
 parvault up --no-socket --vfs-seed-dir /mnt/usb-nas/shared --vfs-webdav-listen 127.0.0.1:8088
+```
+<!-- doc-cmd: node vfs -->
+```bash
 # Every WebDAV request needs a read-only token from this node's data dir (F-43):
 TOKEN="$(parvault token mint --read-only --ttl-secs 86400)"
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
 # Finder, davfs2: any user name, the token as the password. rclone: --webdav-bearer-token "$TOKEN".
+```
 
+<!-- doc-cmd: skip reason="needs the Rust toolchain, Docker, or cross linkers and this repository; CI's rust-tests and release jobs run these" -->
+```bash
 # Execute the empirical cryptography, Reed-Solomon, and /proc/self/status memory benchmark suite (see docs/BENCHMARKS.md)
 cargo run --release --bin parvault-bench -- run --payload-mib 64
 

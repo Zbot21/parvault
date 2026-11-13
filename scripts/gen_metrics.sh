@@ -122,6 +122,9 @@ tests_total=$((tests_unit + tests_int))
 
 version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+].*)?$ ]] || fail "crate version is '$version'"
+# install.sh's default version is the crate's tag (plan-7: no Latest release to resolve).
+install_version="$(sed -n 's/^VERSION="\${PARVAULT_VERSION:-\(v[^}]*\)}"$/\1/p' scripts/install.sh)"
+[[ "$install_version" == "v$version" ]] || fail "scripts/install.sh default version is '$install_version', Cargo.toml says v$version"
 
 counts="crate_version_tag = v$version
 kani_harnesses = $kani_total

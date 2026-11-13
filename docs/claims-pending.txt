@@ -1,0 +1,11 @@
+# Claims the docs-truth audit (parvault-docs architecture/plans/docs-truth-audit.md) found FALSE
+# or STUB that are labelled rather than fixed (plan-7 section 3). Each anchor's line must carry
+# <!-- claim: planned -->(planned) or <!-- claim: stubbed -->(stub). Remove a row when the code
+# delivers the claim and the label goes. Format: file | anchor | label | audit row
+README.md | Onion upload from the CLI. | planned | README "2-Layer PQ Onion Relay" (STUB)
+README.md | the CLI does not yet pick erasure parameters from standin | planned | README Reed-Solomon tiers by standing (PARTIAL)
+README.md | onion upload (nodes already relay onions) | planned | README onion relay (STUB)
+README.md | the "zero storage quota tax" for linked devices; | planned | QUICKSTART C9 / round 3 D2
+QUICKSTART.md | Hiding that (blinded names and relaying uploads through a neighbor) in the CLI. | planned | QUICKSTART C3 (FALSE)
+QUICKSTART.md | zero storage quota tax for linked devices: not applied yet | planned | QUICKSTART C9 / round 3 D2
+QUICKSTART.md | **Not active yet.** Today `watch-folder` | planned | QUICKSTART C4 ladder (FALSE)
