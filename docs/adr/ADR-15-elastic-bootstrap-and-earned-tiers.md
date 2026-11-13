@@ -28,4 +28,4 @@ Decentralized storage networks face two cold-start hazards: (1) a rigid 20-peer 
 
 ## v0.5.0: blinded deletes (F-41)
 
-Blinded shards are deleted only by a delete signed with the lease's capability key (ADR-11, `DeleteBlindedShardSigned`); `BlindedShardTombstone` MACs are refused. Leases stored without a registered capability key (`capability_pubkey: None`) cannot be deleted and expire by lease.
+Blinded shards are deleted only by a delete signed with the lease's capability key (ADR-11, `DeleteBlindedShardSigned`); `BlindedShardTombstone` MACs are refused. Leases stored without a registered capability key (`capability_pubkey: None`, legacy) can be neither read nor deleted (F-42, D-2: fail closed) and expire by lease.

@@ -4548,3 +4548,41 @@ fn f41_same_capability_reput_accepted() {
     put_blinded_ok(&node, &sender, &b);
     gate_ran("trust_enforcement::f41_same_capability_reput_accepted");
 }
+
+/// F-42 reject (D-2, fail closed): a lease stored before capability keys were registered (a
+/// legacy `blinded_leases.bin` entry with no key) is unreadable, even with a valid-looking
+/// capability; the registered case is `ewire_blinded_read_by_capability_holder_served`.
+#[test]
+fn f42_unregistered_lease_read_refused() {
+    let (root, dir, reg, log) = prepare("f42-legacy");
+    let b = blinded(0x64, 512);
+    let mut mgr = parvault::bootstrap::BlindedShardLeaseManager::new(1 << 30, 2);
+    let evicted = mgr.store_with_lease(b.id.locator, b.bytes.len() as u64, 1, 30, [0; 32]);
+    assert!(evicted.is_empty());
+    let mut ids = std::collections::HashMap::new();
+    ids.insert(b.id.locator, b.id);
+    std::fs::create_dir_all(dir.join("shards")).unwrap();
+    std::fs::write(
+        dir.join("shards")
+            .join(format!("{}.bshard", b.id.file_key())),
+        &b.bytes,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("blinded_leases.bin"),
+        bincode::serialize(&(&mgr, &ids)).unwrap(),
+    )
+    .unwrap();
+    let node = spawn(daemon_command(&dir, &reg), root, dir, log);
+    let resp = send(
+        &key(0xC3),
+        &node,
+        blinded_read(&b, &blinded_cap_identity(0x64, &b)),
+    );
+    assert!(
+        format!("{resp:?}").contains("shard_bytes: None"),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.blinded_read_no_capability");
+    gate_ran("trust_enforcement::f42_unregistered_lease_read_refused");
+}

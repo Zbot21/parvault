@@ -1452,7 +1452,9 @@ impl BlockStore {
                 .and_then(|e| e.capability_pubkey)
         });
         let facts = crate::storage::anonymity::BlindedReadFacts {
-            capability_registered: registered.is_none_or(|pk| pk == capability.capability_pubkey),
+            // F-42 (D-2, fail closed): a lease without a registered key is unreadable.
+            capability_known: registered.is_some(),
+            capability_registered: registered == Some(capability.capability_pubkey),
             locator_matches: capability.locator == blinded_id.locator,
             fresh: timestamp_ms.abs_diff(now_ms) <= crate::storage::MAX_CAPABILITY_CLOCK_SKEW_MS,
             sig_valid: capability.verify_read_token(timestamp_ms, read_sig),

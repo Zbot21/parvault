@@ -251,7 +251,9 @@ impl BlindedShardCapability {
 /// What a blinded-shard read knows about its capability and token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlindedReadFacts {
-    /// The capability key is the one registered with the lease (or none was registered).
+    /// The lease has a registered capability key (F-42: a lease without one is unreadable).
+    pub capability_known: bool,
+    /// The presented capability key is the registered one.
     pub capability_registered: bool,
     pub locator_matches: bool,
     /// The read token was signed within `MAX_CAPABILITY_CLOCK_SKEW_MS` of now.
@@ -262,6 +264,9 @@ pub struct BlindedReadFacts {
 /// ADR-11 / ADR-15 / E-WIRE GetBlindedShard: bytes are served only to the holder of the lease's
 /// capability key, for this locator, with a fresh signature (a captured token expires in 30 s).
 pub fn blinded_read_decision(f: &BlindedReadFacts) -> Result<(), &'static str> {
+    if !f.capability_known {
+        return Err("reject.blinded_read_no_capability");
+    }
     if !f.capability_registered || !f.locator_matches {
         return Err("reject.blinded_read_capability_mismatch");
     }
@@ -812,6 +817,7 @@ mod blinded_read_decision_tests {
     #[test]
     fn blinded_read_decision_rules() {
         let ok = BlindedReadFacts {
+            capability_known: true,
             capability_registered: true,
             locator_matches: true,
             fresh: true,
@@ -823,6 +829,10 @@ mod blinded_read_decision_tests {
             f(&mut x);
             blinded_read_decision(&x)
         };
+        assert_eq!(
+            with(&|f| f.capability_known = false),
+            Err("reject.blinded_read_no_capability")
+        );
         assert_eq!(
             with(&|f| f.capability_registered = false),
             Err("reject.blinded_read_capability_mismatch")
