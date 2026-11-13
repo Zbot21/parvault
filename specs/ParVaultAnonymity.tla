@@ -16,7 +16,9 @@ EXTENDS Naturals, Sequences, FiniteSets, TLC
 \*     Safety_NoVoucherDoubleSpend.
 \*   - Blinded locators and K_user never on the wire make pool grouping infeasible:
 \*     @structural blinded-locators (a `PutBlindedShard` carries no stripe root or shard index)
+\* @structural blinded-locators: holds by construction; traced to the compile-time type MeshWireRequest::PutBlindedShard, which carries a BlindedShardId and no stripe root or shard index
 \*     and @structural no-key-on-wire. Not model-checked; the former grouping action and
+\* @structural no-key-on-wire: holds by construction; traced to compile-time types: no MeshWireRequest variant carries a MasterKey
 \*     Safety_UnlinkableReconstructionHardness held by constant FALSE flags (P-02).
 
 CONSTANTS

@@ -92,6 +92,7 @@ ProactiveWitnessRepair ==
 \* and tries to read more: an owner read signed by one of its keys, or a witness repair read with
 \* receipts signed by its keys; and an uninvited handshake with a chain rooted at one of its keys.
 \* Key derivation needs the owner's phrase: @structural kdf-needs-phrase test=crypto::keys (the
+\* @structural kdf-needs-phrase: holds by construction; traced to test red_team_hardening_tests::test_rt1_zero_local_state_house_fire_recovery_from_seed_phrase_alone and the compile-time signature MasterKey::from_recovery_seed_phrase(seed_phrase, vault_namespace)
 \* adversary never derives K_user; not modelled as a variable).
 AdversaryCollusionAndAttackAttempt ==
     /\ ~parentBranchPruned

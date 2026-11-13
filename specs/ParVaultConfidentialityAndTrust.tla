@@ -135,6 +135,7 @@ Spec ==
 
 \* Zero-knowledge confidentiality: the adversary may collude every shard, and still never
 \* decrypts, because K_user never leaves the client: @structural ciphertext-only-egress. AES-256-GCM
+\* @structural ciphertext-only-egress: holds by construction; traced to compile-time types: no MeshWireRequest variant (src/network/behaviour.rs) carries a MasterKey, and encrypt_stripe precedes Reed-Solomon encoding (ADR-01)
 \* encryption precedes Reed-Solomon encoding (`encrypt_stripe`, ADR-01) and no wire message carries
 \* a key. Not model-checked (L-47 item 2); hasMasterKey and plaintextExposed were constant FALSE.
 

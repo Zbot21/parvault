@@ -130,7 +130,9 @@ TypeOK ==
     /\ selectiveRestoreComplete \in BOOLEAN
 
 \* Neither the seed nor mesh peers ever receive K_user: @structural client-strips-key and
+\* @structural client-strips-key: holds by construction; traced to the compile-time type LiteStripeSyndicationBundle (src/bootstrap.rs), which has no key field
 \* @structural seed-forwards-ciphertext. It holds by type, not by a modelled guard: the lite client sends a
+\* @structural seed-forwards-ciphertext: holds by construction; traced to compile-time code: ingest_lite_stripe and run_lite_fan_out (src/bootstrap.rs) handle only bundle.ciphertext_bytes and shards read back from the block store
 \* `LiteStripeSyndicationBundle` (`src/bootstrap.rs`), which has no key field, carrying the
 \* stripe already encrypted by `encrypt_stripe` (`src/cli/folder.rs`), and the seed forwards
 \* shards of that ciphertext. Not model-checked (L-47 item 2).

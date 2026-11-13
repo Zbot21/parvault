@@ -123,6 +123,7 @@ Init ==
     \* Zero-Private-Key-On-VPS: VPS disk holds transport & per-node HMAC keys ONLY;
     \* ZERO Council private keys (`PrivKey(c)`) exist on the VPS filesystem.
     \* @structural no-admin-key-persist: no code path writes a council key to the seed's disk
+    \* @structural no-admin-key-persist: holds by construction; traced to the code path in src/bin/parvault-seed.rs that never auto-generates tracker_admin.seed (no dedicated test)
     \* (`tracker_admin.seed` is never auto-generated); vpsDiskSecrets is fixed data.
     /\ vpsDiskSecrets = {<<"vps_secret", "transport_seed">>, <<"vps_secret", "eviction_hmac_seed">>}
     /\ vpsCompromised = FALSE
