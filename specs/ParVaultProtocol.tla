@@ -18,31 +18,52 @@ ASSUME
     /\ MaxLeafFailures > 0
     /\ MaxSubtreeSlashes > 0
 
+\* Keys (L-47): the adversary signs only with its own keys (`AdvKeys`); guards compare what it
+\* presents with honest state. That the adversary holds no honest key is an assumption.
+Owner == "owner"
+Genesis == "genesis"
+Self == "self"
+Leaf == "leaf"
+Witnesses == {"w1", "w2"}
+AdvKeys == {"adv1", "adv2"}
+\* `MIN_WITNESS_SIGNATURES_FOR_REPAIR` in `src/por/verifier.rs`.
+MinWitnessSignatures == 2
+ASSUME AdvKeys \cap ({Owner, Genesis, Self} \cup Witnesses) = {}   \* @assume adversary-holds-no-honest-key
+
+\* The guards: each compares a presented credential with honest state, and is used by both the
+\* adversary's attempts (it fails) and the honest access (it passes).
+OwnerReadOk(signer) == signer = Owner   \* @guard read-auth-owner sym=src/por/verifier.rs::grant_owner_decision
+RepairReadOk(receipts) == Cardinality(receipts \cap Witnesses) >= MinWitnessSignatures   \* @guard read-auth-repair sym=src/por/verifier.rs::repair_read_decision
+ChainAdmitted(root) == root = Genesis   \* @guard wot-admission sym=src/network/wot.rs::chain_admission_decision
+MayApplySlash(tgt) == tgt \notin {Genesis, Self}   \* @guard slash-target sym=src/network/wot.rs::slash_target_decision
+
 VARIABLES
     activeShards,           \* Number of currently healthy shards in the cohort (K..N)
     epochDrops,             \* Node failures accumulated in the current repair window
     adversaryShards,        \* Number of ciphertext shards held by an unauthenticated adversary
-    hasMasterKey,           \* Whether the adversary possesses K_user (always FALSE for remote peers)
     uninvitedRoutingEntries,\* Count of uninvited Sybil nodes admitted into Kademlia routing table
     offenderFailures,       \* Failed PoR / handshake count for current dishonest leaf node (0..MaxLeafFailures)
     offenderQuarantined,    \* Whether the current dishonest leaf node is isolated
     parentBranchSlashes,    \* Cumulative slashed leaf children under a suspicious parent inviter (0..MaxSubtreeSlashes)
-    parentBranchPruned      \* Whether the parent inviter's entire delegated subtree is pruned
+    parentBranchPruned,     \* Whether the parent inviter's entire delegated subtree is pruned
+    slashedTargets,         \* Keys slashed by applied evidence (the guard keeps genesis and self out)
+    honestServed            \* The owner's read, a witness repair and a ring member's handshake passed
 
-vars == <<activeShards, epochDrops, adversaryShards, hasMasterKey,
+vars == <<activeShards, epochDrops, adversaryShards,
           uninvitedRoutingEntries, offenderFailures, offenderQuarantined,
-          parentBranchSlashes, parentBranchPruned>>
+          parentBranchSlashes, parentBranchPruned, slashedTargets, honestServed>>
 
 Init ==
     /\ activeShards = N
     /\ epochDrops = 0
     /\ adversaryShards = 0
-    /\ hasMasterKey = FALSE
     /\ uninvitedRoutingEntries = 0
     /\ offenderFailures = 0
     /\ offenderQuarantined = FALSE
     /\ parentBranchSlashes = 0
     /\ parentBranchPruned = FALSE
+    /\ slashedTargets = {}
+    /\ honestServed = FALSE
 
 \* A storage node drops offline during the current repair window.
 NodeChurn ==
@@ -50,9 +71,9 @@ NodeChurn ==
     /\ activeShards > K
     /\ activeShards' = activeShards - 1
     /\ epochDrops' = epochDrops + 1
-    /\ UNCHANGED <<adversaryShards, hasMasterKey, uninvitedRoutingEntries,
+    /\ UNCHANGED <<adversaryShards, uninvitedRoutingEntries,
                    offenderFailures, offenderQuarantined,
-                   parentBranchSlashes, parentBranchPruned>>
+                   parentBranchSlashes, parentBranchPruned, slashedTargets, honestServed>>
 
 \* Delegated witnesses present RepairGrant + >= 2 failure receipts and reconstruct missing ciphertext shards.
 ProactiveWitnessRepair ==
@@ -60,41 +81,34 @@ ProactiveWitnessRepair ==
     /\ activeShards >= K
     /\ activeShards' = N
     /\ epochDrops' = 0
-    /\ UNCHANGED <<adversaryShards, hasMasterKey, uninvitedRoutingEntries,
+    /\ UNCHANGED <<adversaryShards, uninvitedRoutingEntries,
                    offenderFailures, offenderQuarantined,
-                   parentBranchSlashes, parentBranchPruned>>
+                   parentBranchSlashes, parentBranchPruned, slashedTargets, honestServed>>
 
-\* Adversary passively compromises storage nodes up to the Byzantine collusion bound (< K - 1),
-\* and attempts an unauthorized wire read (without owner signature and with < 2 witness receipts)
-\* plus master-key recovery and uninvited Sybil handshake admission.
+\* NodeChurn's bound `epochDrops < MaxEpochChurn` is the threat model's churn bound, not a Rust
+\* check: @assume bounded-epoch-churn (DurabilitySafetyInvariant rests on it).
+
+\* Adversary passively compromises storage nodes up to the Byzantine collusion bound (< K - 1)
+\* and tries to read more: an owner read signed by one of its keys, or a witness repair read with
+\* receipts signed by its keys; and an uninvited handshake with a chain rooted at one of its keys.
+\* Key derivation needs the owner's phrase: @structural kdf-needs-phrase test=crypto::keys (the
+\* adversary never derives K_user; not modelled as a variable).
 AdversaryCollusionAndAttackAttempt ==
     /\ ~parentBranchPruned
     /\ adversaryShards < K - 1
-    /\ LET passiveCompromiseShard == adversaryShards + 1
-           \* Adversary attempts GetCiphertextShard without owner_sig (FALSE) and only 1 witness receipt (< 2)
-           hasOwnerSig            == FALSE
-           witnessReceipts        == 1
-           wireReadAuthorized     == hasOwnerSig \/ (witnessReceipts >= 2)
-           nextAdversaryShards    == IF wireReadAuthorized
-                                     THEN passiveCompromiseShard + 1
-                                     ELSE passiveCompromiseShard
-           \* Adversary attempts to derive K_user without owner seed phrase
-           hasOwnerSeedPhrase     == FALSE
-           nextHasMasterKey       == (nextAdversaryShards >= K /\ hasOwnerSeedPhrase)
-           \* Adversary attempts HandshakeWoT without Genesis->Inviter signature chain
-           hasValidGenesisCert    == FALSE
-           sybilAdmitted          == (hasValidGenesisCert /\ ~parentBranchPruned)
-       IN /\ adversaryShards' = nextAdversaryShards
-          /\ hasMasterKey' = nextHasMasterKey
-          /\ uninvitedRoutingEntries' = IF sybilAdmitted
-                                        THEN uninvitedRoutingEntries + 1
-                                        ELSE uninvitedRoutingEntries
+    /\ \E signer \in AdvKeys, receipts \in SUBSET AdvKeys, root \in AdvKeys :
+        LET compromised == adversaryShards + 1
+        IN /\ adversaryShards' = IF OwnerReadOk(signer) \/ RepairReadOk(receipts)
+                                 THEN compromised + 1 ELSE compromised
+           /\ uninvitedRoutingEntries' = IF ChainAdmitted(root)
+                                         THEN uninvitedRoutingEntries + 1
+                                         ELSE uninvitedRoutingEntries
     /\ UNCHANGED <<activeShards, epochDrops, offenderFailures, offenderQuarantined,
-                   parentBranchSlashes, parentBranchPruned>>
+                   parentBranchSlashes, parentBranchPruned, slashedTargets, honestServed>>
 
-\* Dishonest leaf peer or Sybil node fails a PoR challenge or presents an invalid/uninvited Noise WoT handshake.
-\* Protocol guard rejects uninvited routing admission and increments leaf failure counter;
-\* upon hitting MaxLeafFailures (3), the leaf is quarantined and its parent inviter takes a slash penalty.
+\* A dishonest leaf fails a PoR audit (evidenced failure only; an unverified handshake is refused
+\* by `wot-admission` and never counts, L-47 item 5). At MaxLeafFailures (`MAX_LEAF_FAILURES`) the
+\* leaf is quarantined and its parent inviter takes a slash.
 RecordDishonestFailure ==
     /\ ~parentBranchPruned
     /\ ~offenderQuarantined
@@ -103,23 +117,29 @@ RecordDishonestFailure ==
            leafSlashed       == (nextLeafFails >= MaxLeafFailures)
            nextParentSlashes == IF leafSlashed THEN parentBranchSlashes + 1 ELSE parentBranchSlashes
            branchPruned      == (nextParentSlashes >= MaxSubtreeSlashes)
-           \* Uninvited/forged handshake during failure step is checked by WoT admission guard
-           hasValidGenesisCert == FALSE
-           sybilAdmitted     == (hasValidGenesisCert /\ ~branchPruned)
-           \* Unauthorized raw shard read attempt during dishonest step is checked by ADR-04 guard
-           unauthorizedReadGranted == FALSE
        IN /\ offenderFailures' = IF leafSlashed /\ ~branchPruned THEN 0 ELSE nextLeafFails
           /\ offenderQuarantined' = (leafSlashed /\ branchPruned)
           /\ parentBranchSlashes' = nextParentSlashes
           /\ parentBranchPruned' = branchPruned
-          /\ uninvitedRoutingEntries' = IF sybilAdmitted
-                                        THEN uninvitedRoutingEntries + 1
-                                        ELSE uninvitedRoutingEntries
-          /\ adversaryShards' = IF unauthorizedReadGranted
-                                THEN adversaryShards + 1
-                                ELSE adversaryShards
-          /\ hasMasterKey' = (adversaryShards' >= K /\ FALSE)
-    /\ UNCHANGED <<activeShards, epochDrops>>
+          /\ slashedTargets' = IF leafSlashed THEN slashedTargets \cup {Leaf} ELSE slashedTargets
+    /\ UNCHANGED <<activeShards, epochDrops, adversaryShards, uninvitedRoutingEntries, honestServed>>
+
+\* Evidence naming the genesis or this node itself is never applied (the slash guard).
+AttemptSlashProtected ==
+    /\ \E tgt \in {Genesis, Self, Leaf} :
+        slashedTargets' = IF MayApplySlash(tgt) THEN slashedTargets \cup {tgt} ELSE slashedTargets
+    /\ UNCHANGED <<activeShards, epochDrops, adversaryShards, uninvitedRoutingEntries,
+                   offenderFailures, offenderQuarantined, parentBranchSlashes, parentBranchPruned, honestServed>>
+
+\* Honest access through the same guards: the owner reads with its own key, witnesses repair with
+\* the registered witnesses' receipts, and a ring member's chain is rooted at the genesis.
+HonestAccess ==
+    /\ ~honestServed
+    /\ OwnerReadOk(Owner) /\ RepairReadOk(Witnesses) /\ ChainAdmitted(Genesis)
+    /\ honestServed' = TRUE
+    /\ UNCHANGED <<activeShards, epochDrops, adversaryShards, uninvitedRoutingEntries,
+                   offenderFailures, offenderQuarantined, parentBranchSlashes, parentBranchPruned,
+                   slashedTargets>>
 
 \* Terminal stuttering step once parent branch is pruned and cohort is healthy.
 Idle ==
@@ -132,6 +152,8 @@ Next ==
     \/ ProactiveWitnessRepair
     \/ AdversaryCollusionAndAttackAttempt
     \/ RecordDishonestFailure
+    \/ AttemptSlashProtected
+    \/ HonestAccess
     \/ Idle
 
 Spec ==
@@ -142,9 +164,7 @@ Spec ==
 
 \* SAFETY INVARIANT 1: Data Secrecy (adversary never accumulates >= K shards and never obtains K_user)
 DataSecrecyInvariant ==
-    /\ adversaryShards < K
-    /\ ~hasMasterKey
-    /\ ~(adversaryShards >= K /\ hasMasterKey)
+    adversaryShards < K
 
 \* SAFETY INVARIANT 2: Web-of-Trust Sybil Resistance (uninvited sub-graphs never enter routing tables)
 SybilResistanceInvariant ==
@@ -158,6 +178,10 @@ DurabilitySafetyInvariant ==
 SlashingBoundInvariant ==
     /\ (offenderFailures >= MaxLeafFailures => offenderQuarantined)
     /\ (parentBranchSlashes >= MaxSubtreeSlashes => parentBranchPruned)
+
+\* SAFETY INVARIANT 5: the genesis and this node itself are never slashed (F-01 guard)
+ProtectedKeysNeverSlashedInvariant ==
+    slashedTargets \cap {Genesis, Self} = {}
 
 \* LIVENESS INVARIANT 1: Eventually Retrievable Data (degraded cohorts self-heal back to N shards)
 EventuallyRepaired ==
