@@ -619,15 +619,18 @@ fn test_2_dhcp_ip_port_change_self_healing() {
     // The restarted daemons must come up on ports different from every phase-1 port (and from
     // each other); the kernel rarely reuses a just-freed ephemeral port, so retry a few times.
     let spawn_on_new_port = |dir: &Path, log: &str, used: &[u16]| -> (Child, u16) {
-        for _ in 0..5 {
-            let (mut child, port) = spawn_node(dir, log);
-            if !used.contains(&port) {
-                return (child, port);
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        panic!("phase2 daemon kept binding an already-used port {used:?}");
+        (0..5)
+            .find_map(|_| {
+                let (mut child, port) = spawn_node(dir, log);
+                if used.contains(&port) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    None
+                } else {
+                    Some((child, port))
+                }
+            })
+            .unwrap_or_else(|| panic!("phase2 daemon kept binding an already-used port {used:?}"))
     };
     let mut phase2_guards = ChildGuard::new();
     let (child_a2, port_a2) =
