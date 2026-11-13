@@ -15,7 +15,7 @@ pub(crate) async fn scrub(env: CliEnv, command: Commands) -> anyhow::Result<()> 
     let corrupted_quarantined_shards = report.quarantined_corrupted_shards.len()
         + report.quarantined_corrupted_blinded_locators.len();
     let total_shards_scanned = healthy_shards + corrupted_quarantined_shards;
-    println!("=== ParVault Local Bit-Rot Scrub Report (ADR-15) ===");
+    println!("=== ParVault Local Bit-Rot Scrub Report (ADR-19) ===");
     println!("Data Directory               : {}", cfg.data_dir.display());
     println!("total_shards_scanned         : {}", total_shards_scanned);
     println!(

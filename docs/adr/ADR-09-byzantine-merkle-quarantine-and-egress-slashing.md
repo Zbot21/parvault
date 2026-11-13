@@ -1,6 +1,7 @@
 # ADR-09: Pre-Decoding Merkle Quarantine & Byzantine Egress-Withholding Slashing
 
 - **Status:** Accepted — Extended by [ADR-11](ADR-11-four-layer-shard-anonymization.md) and [ADR-12](ADR-12-asymmetric-post-quantum-hybrids.md)
+- **Formal model:** `specs/ParVaultProtocol.tla`
 - **Subsystem:** `sharding::reed_solomon` / `por::challenger` / `storage::quota`
 - **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
 

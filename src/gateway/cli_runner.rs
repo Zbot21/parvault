@@ -116,6 +116,10 @@ pub enum TokenAction {
         #[arg(long, value_name = "UID")]
         peer_uid: Option<u32>,
 
+        /// Print the HMAC tag (the bearer secret). Redacted by default (F-43, L-44 item 8).
+        #[arg(long, default_value_t = false)]
+        show_tag: bool,
+
         /// Emit structured JSON output.
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -491,9 +495,16 @@ pub fn execute_token_cli(action: TokenAction, data_dir: &Path) -> anyhow::Result
             len,
             write,
             peer_uid,
+            show_tag,
             json,
         } => {
             let mac = CapabilityMacaroon::from_compact_token(&token)?;
+            // The tag is the bearer secret: redacted unless asked for (F-43, L-44 item 8).
+            let tag_text = if show_tag {
+                hex::encode(mac.tag)
+            } else {
+                "<redacted>".to_string()
+            };
             let manifest_root = match manifest_hex
                 .as_deref()
                 .map(str::trim)
@@ -539,7 +550,7 @@ pub fn execute_token_cli(action: TokenAction, data_dir: &Path) -> anyhow::Result
                 let mut obj = serde_json::json!({
                     "key_id": hex::encode(mac.issuer_fingerprint),
                     "nonce_id": hex::encode(mac.nonce_id),
-                    "tag": hex::encode(mac.tag),
+                    "tag": tag_text,
                     "caveat_count": mac.caveats.len(),
                     "caveats": mac.caveats.iter().map(describe_caveat_json).collect::<Vec<_>>(),
                 });
@@ -553,7 +564,7 @@ pub fn execute_token_cli(action: TokenAction, data_dir: &Path) -> anyhow::Result
             } else {
                 println!("key_id      : {}", hex::encode(mac.issuer_fingerprint));
                 println!("nonce_id    : {}", hex::encode(mac.nonce_id));
-                println!("tag         : {}", hex::encode(mac.tag));
+                println!("tag         : {tag_text}");
                 println!("caveats ({}) :", mac.caveats.len());
                 for (idx, c) in mac.caveats.iter().enumerate() {
                     println!("  [{idx}] {}", describe_caveat_text(c));

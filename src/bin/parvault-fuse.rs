@@ -14,7 +14,6 @@
 #![forbid(unsafe_code)]
 
 use clap::{Parser, Subcommand};
-use parvault::capabilities::CapabilityMacaroon;
 use parvault::gateway::ipc::DEFAULT_IPC_SOCKET_PATH;
 use std::path::PathBuf;
 
@@ -38,8 +37,13 @@ struct FuseCli {
     cache_mib: u64,
 
     /// Optional `PARVAULT-MAC-V1:` attenuated capability macaroon presented on lazy `FetchRange` reads.
+    /// Visible to every local user in the process list (`/proc/<pid>/cmdline`); prefer `--macaroon-file`.
     #[arg(long, global = true, value_name = "PARVAULT-MAC-V1:...")]
     macaroon: Option<String>,
+
+    /// File holding the token (mode 600; refused if group or others can read it).
+    #[arg(long, value_name = "PATH", global = true)]
+    macaroon_file: Option<PathBuf>,
 
     #[command(subcommand)]
     command: FuseCommand,
@@ -85,18 +89,11 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     let cli = FuseCli::parse();
-    let default_macaroon = match cli
-        .macaroon
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(raw) => Some(
-            CapabilityMacaroon::from_compact_token(raw)
-                .map_err(|e| anyhow::anyhow!("invalid --macaroon token: {e}"))?,
-        ),
-        None => None,
-    };
+    let default_macaroon = parvault::capabilities::token_from_args(
+        cli.macaroon.as_deref(),
+        cli.macaroon_file.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
 
     #[cfg(not(unix))]
     {

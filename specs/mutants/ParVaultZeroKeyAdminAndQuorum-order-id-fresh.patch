@@ -1,0 +1,13 @@
+diff --git a/specs/ParVaultZeroKeyAdminAndQuorum.tla b/specs/ParVaultZeroKeyAdminAndQuorum.tla
+index b423315..b3b488e 100644
+--- a/specs/ParVaultZeroKeyAdminAndQuorum.tla
++++ b/specs/ParVaultZeroKeyAdminAndQuorum.tla
+@@ -123,7 +123,7 @@ OrderMeetsCouncilQuorum(ord) ==
+ \* The admin RPC compares the request's nonce with the connection's single active challenge
+ \* (`validate_admin_rpc_slice_replay_and_auth_meta`, src/admin_rpc.rs).
+ ChallengeMatches(nonce) == activeChallenge > 0 /\ nonce = activeChallenge   \* @guard nonce-fresh sym=src/admin_rpc.rs::validate_admin_rpc_slice_replay_and_auth_meta
+-OrderIdFresh(id) == id \notin seenOrderIds   \* @guard order-id-fresh sym=src/storage/eviction.rs::replay_slot_check
++OrderIdFresh(id) == TRUE
+ 
+ \* A PrivateRing node resolves its order authority from the manifest whose scope root is its
+ \* genesis (owner) key (council_scope_root / council_from_manifest), never the public council.

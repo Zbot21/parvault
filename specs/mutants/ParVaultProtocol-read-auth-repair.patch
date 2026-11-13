@@ -1,0 +1,13 @@
+diff --git a/specs/ParVaultProtocol.tla b/specs/ParVaultProtocol.tla
+index a49c0e3..a21a495 100644
+--- a/specs/ParVaultProtocol.tla
++++ b/specs/ParVaultProtocol.tla
+@@ -44,7 +44,7 @@ ASSUME AdvKeys \cap ({Owner, Genesis, Self} \cup Witnesses) = {}   \* @assume ad
+ \* The guards: each compares a presented credential with honest state, and is used by both the
+ \* adversary's attempts (it fails) and the honest access (it passes).
+ OwnerReadOk(signer) == signer = Owner   \* @guard read-auth-owner sym=src/por/verifier.rs::grant_owner_decision
+-RepairReadOk(receipts) == Cardinality(receipts \cap Witnesses) >= MinWitnessSignatures   \* @guard read-auth-repair sym=src/por/verifier.rs::repair_read_decision
++RepairReadOk(receipts) == TRUE   \* @guard read-auth-repair sym=src/por/verifier.rs::repair_read_decision
+ ChainAdmitted(root) == root = Genesis   \* @guard wot-admission sym=src/network/wot.rs::chain_admission_decision
+ MayApplySlash(tgt) == tgt \notin {Genesis, Self}   \* @assume slash-target-not-run: wot.rs::slash_target_decision's only caller (may_slash) is #[cfg(test)]; no production slasher in v0.5.0 (ADR-09, N-09)
+ 

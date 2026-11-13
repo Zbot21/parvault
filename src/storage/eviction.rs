@@ -1,3 +1,4 @@
+//! Formal model: `specs/ParVaultZeroKeyAdminAndQuorum.tla` (guards `quorum-count`, `order-id-fresh`).
 use crate::crypto::aes::{
     compute_sha256, decrypt_manifest, decrypt_stripe, encrypt_manifest, CryptoError,
 };
@@ -33,7 +34,7 @@ pub const MAX_ORDER_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 pub const DEFAULT_ORDER_LIFETIME_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 /// Longest order lifetime (`expires - issued`); `0` (permanent) is refused, F-09.
 pub const MAX_ORDER_LIFETIME_MS: u64 = 365 * 24 * 60 * 60 * 1000;
-/// Domain separator for `VerifiableAbuseReport` reporter Ed25519 signatures (`ADR-19`).
+/// Domain separator for `VerifiableAbuseReport` reporter Ed25519 signatures (`ADR-26`).
 pub const ABUSE_REPORT_DOMAIN: &[u8] = b"parvault-verifiable-abuse-report-v1:";
 /// Maximum byte length of `SignedBadActorEvictionOrder::reason`.
 pub const MAX_EVICTION_REASON_BYTES: usize = 256;
@@ -56,7 +57,7 @@ const ZERO_SHRED_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_TARGET_STRING_BYTES: usize = 1024;
 
 /// Loads or atomically generates (`0600`) the Public Tracker Admin `NodeIdentity` at
-/// `<data_dir>/tracker_admin.seed` (`ADR-19`).
+/// `<data_dir>/tracker_admin.seed` (`ADR-26`).
 pub fn load_or_generate_tracker_admin_identity(
     data_dir: impl AsRef<Path>,
 ) -> Result<NodeIdentity, StorageError> {
@@ -177,7 +178,7 @@ impl SignedBadActorEvictionOrder {
         }
     }
 
-    /// Strict majority `M-of-N` quorum threshold for Federated Public Tracker Councils (`ADR-19`):
+    /// Strict majority `M-of-N` quorum threshold for Federated Public Tracker Councils (`ADR-26`):
     /// `1-of-1`, `2-of-2`, `2-of-3`, `3-of-4`, `3-of-5`, etc.
     pub const fn default_tracker_quorum_threshold(council_size: usize) -> usize {
         match council_size {
@@ -508,7 +509,7 @@ impl SignedBadActorEvictionOrder {
     }
 
     /// Verifies the primary signature, checks expiration, and requires at least `min_quorum.max(1)`
-    /// distinct valid council signers from `trusted_council_pubkeys` (`ADR-19` `M-of-N` quorum).
+    /// distinct valid council signers from `trusted_council_pubkeys` (`ADR-26` `M-of-N` quorum).
     pub fn verify_against_quorum(
         &self,
         trusted_council_pubkeys: &[[u8; 32]],
@@ -767,7 +768,7 @@ impl EvictionPurgeReport {
 }
 
 /// Cryptographic burden-of-proof verification result produced when a reporter proves possession
-/// of a valid `(FileManifest, disclosed_master_key_hex, sample_shards)` bundle (`ADR-19`).
+/// of a valid `(FileManifest, disclosed_master_key_hex, sample_shards)` bundle (`ADR-26`).
 /// Only the SHA-256 digest and byte length of the authenticated plaintext are retained; the
 /// transient decrypted plaintext buffer is immediately `Zeroize`d in RAM and never written to disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -800,7 +801,7 @@ pub fn abuse_report_decision(f: &AbuseReportFacts) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Signed abuse / illegal-content report carrying cryptographic burden-of-proof (`ADR-19`).
+/// Signed abuse / illegal-content report carrying cryptographic burden-of-proof (`ADR-26`).
 /// Because `ParVault` storage nodes and public trackers are zero-knowledge, the reporter bears
 /// the mathematical burden of proving what the encrypted network shards contain (via `AES-256-GCM`
 /// authentication tag verification under `disclosed_master_key_hex`) and stating the legal
@@ -881,7 +882,7 @@ impl VerifiableAbuseReport {
         NodeIdentity::verify_with_pubkey(&self.reporter_ed25519_pubkey, &msg, &sig)
     }
 
-    /// Verifies the complete cryptographic burden-of-proof (`ADR-19`):
+    /// Verifies the complete cryptographic burden-of-proof (`ADR-26`):
     /// 1. Reporter Ed25519 signature over the allegation and evidence bundle.
     /// 2. `FileManifest` internal Merkle consistency (`shard_hashes -> stripe_merkle_root -> file_merkle_root`).
     /// 3. Sample shard leaf digests (`hash_shard_leaf`) match `stripe.shard_hashes`.
@@ -1068,7 +1069,7 @@ impl VerifiableAbuseReport {
     }
 }
 
-/// Governance state of a cryptographically verified abuse report on a Public Tracker (`ADR-19`).
+/// Governance state of a cryptographically verified abuse report on a Public Tracker (`ADR-26`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TakedownReviewStatus {
     PendingAdminReview,
@@ -1094,7 +1095,7 @@ pub struct QueuedTakedownEntry {
 }
 
 /// Audit record for an emergency law-enforcement / warrant unilateral eviction action issued by
-/// a Public Tracker Admin (`ADR-19`). Contains ZERO plaintext IP addresses.
+/// a Public Tracker Admin (`ADR-26`). Contains ZERO plaintext IP addresses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmergencyAdminActionRecord {
     pub action_id: [u8; 32],
@@ -1112,7 +1113,7 @@ struct PersistedAdminTakedownState {
     emergency_actions: Vec<EmergencyAdminActionRecord>,
 }
 
-/// Admin-governed takedown review queue for `parvault-seed` Public Trackers (`ADR-19`).
+/// Admin-governed takedown review queue for `parvault-seed` Public Trackers (`ADR-26`).
 /// Enforces strict separation between **cryptographic verification** (on report submission, which
 /// queues as `PendingAdminReview` and NEVER auto-deletes shards) and **centralized Public Tracker
 /// Admin approval** (`approve_takedown`, which signs `SignedBadActorEvictionOrder`s under
@@ -1385,7 +1386,7 @@ impl PublicTrackerTakedownQueue {
 
     /// Records an external governance decision (`Approved` or `Rejected`) signed/authorized by an
     /// out-of-band `parvault-control` operator (`admin_pubkey`) without requiring `tracker_admin.seed`
-    /// private key material on the front-line VPS seed (`ADR-19`). Returns `Ok(true)` if the report
+    /// private key material on the front-line VPS seed (`ADR-26`). Returns `Ok(true)` if the report
     /// was present on this seed and updated, or `Ok(false)` if not queued locally.
     pub fn record_external_admin_decision(
         &mut self,
@@ -1431,7 +1432,7 @@ impl PublicTrackerTakedownQueue {
     }
 
     /// Issues an audited emergency law-enforcement / warrant unilateral eviction under the Public
-    /// Tracker Admin's `NodeIdentity` (`tracker_admin.seed`, `0600`, `ADR-19`):
+    /// Tracker Admin's `NodeIdentity` (`tracker_admin.seed`, `0600`, `ADR-26`):
     /// 1. Signs the primary `SignedBadActorEvictionOrder` for `target`.
     /// 2. If `target` is `IpAddress(ip)` (or `IpSubnet(cidr)`), also resolves any associated
     ///    `PublicCommonsTicket` / voucher Ed25519 pubkeys from `eviction_engine` and signs
@@ -1566,7 +1567,7 @@ struct RegularShardAttribution {
     sealed_owner_peer_id: Vec<u8>,
 }
 
-/// Zero-plaintext attribution entry for an anonymized `.bshard` file (`ADR-11` + `ADR-19`).
+/// Zero-plaintext attribution entry for an anonymized `.bshard` file (`ADR-11` + `ADR-25`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct BlindedShardAttribution {
     blinded_id: BlindedShardId,
@@ -2233,7 +2234,7 @@ impl PrivacyPreservingEvictionEngine {
         }
     }
 
-    /// Purely read-only dry-run impact estimator for `parvault-control` (`ADR-19`):
+    /// Purely read-only dry-run impact estimator for `parvault-control` (`ADR-26`):
     /// Computes `HMAC-SHA256(K_node_evict, ...)` strictly in RAM, resolves associated
     /// `PeerOrIssuerPubkey` cohorts, and counts matching local `.shard` and `.bshard` files and
     /// byte sizes **without modifying `self.index` or writing a single byte to disk**.

@@ -3,6 +3,8 @@
 //! shipped plugin binaries against it.
 #![cfg(unix)]
 
+mod common;
+
 use parvault::capabilities::CapabilityMacaroon;
 use parvault::config::HardwareProfile;
 use parvault::crypto::MasterKey;
@@ -55,7 +57,7 @@ fn root_token() -> String {
         .to_compact_token()
 }
 
-fn run(bin: &str, sock: &Path, token: Option<&str>, cwd: &Path) -> Output {
+fn run(bin: impl AsRef<std::ffi::OsStr>, sock: &Path, token: Option<&str>, cwd: &Path) -> Output {
     let mut cmd = Command::new(bin);
     cmd.current_dir(cwd).arg("--socket").arg(sock);
     if let Some(t) = token {
@@ -78,7 +80,7 @@ fn assert_pass(out: &Output, name: &str) {
 fn fuse_self_test_against_hosted_gateway() {
     let h = host("fuse");
     let out = run(
-        env!("CARGO_BIN_EXE_parvault-fuse"),
+        common::plugin_bin("parvault-fuse", env!("CARGO_BIN_EXE_parvault-fuse")),
         &h.sock,
         Some(&root_token()),
         &h.dir,
@@ -90,7 +92,7 @@ fn fuse_self_test_against_hosted_gateway() {
 fn sync_self_test_against_hosted_gateway() {
     let h = host("sync");
     let out = run(
-        env!("CARGO_BIN_EXE_parvault-sync"),
+        common::plugin_bin("parvault-sync", env!("CARGO_BIN_EXE_parvault-sync")),
         &h.sock,
         Some(&root_token()),
         &h.dir,
@@ -102,7 +104,12 @@ fn sync_self_test_against_hosted_gateway() {
 #[test]
 fn fuse_self_test_without_token_fails() {
     let h = host("fuse-notok");
-    let out = run(env!("CARGO_BIN_EXE_parvault-fuse"), &h.sock, None, &h.dir);
+    let out = run(
+        common::plugin_bin("parvault-fuse", env!("CARGO_BIN_EXE_parvault-fuse")),
+        &h.sock,
+        None,
+        &h.dir,
+    );
     assert!(!out.status.success());
 }
 
@@ -112,7 +119,7 @@ fn self_test_without_daemon_names_the_socket() {
     let dir = std::env::temp_dir().join(format!("pv-plugin-nodaemon-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let out = run(
-        env!("CARGO_BIN_EXE_parvault-fuse"),
+        common::plugin_bin("parvault-fuse", env!("CARGO_BIN_EXE_parvault-fuse")),
         &dir.join("absent.sock"),
         None,
         &dir,

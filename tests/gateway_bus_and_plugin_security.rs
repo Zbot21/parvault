@@ -519,6 +519,27 @@ async fn test_cli_mint_offline_attenuate_inspect_and_gateway_fetch_range_enforce
         inspect_ok_stdout.contains("verified: true"),
         "expected verified: true, got:\n{inspect_ok_stdout}"
     );
+    // The tag is the bearer secret: redacted by default, printed only with --show-tag.
+    let tag_hex = hex::encode(
+        parvault::capabilities::CapabilityMacaroon::from_compact_token(&attenuated_token)
+            .unwrap()
+            .tag,
+    );
+    assert!(inspect_ok_stdout.contains("tag         : <redacted>"));
+    assert!(!inspect_ok_stdout.contains(&tag_hex));
+    let shown = Command::new(parvault_bin)
+        .args([
+            "token",
+            "inspect",
+            "--token",
+            &attenuated_token,
+            "--show-tag",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(shown.status.success());
+    assert!(String::from_utf8_lossy(&shown.stdout).contains(&tag_hex));
 
     let inspect_bad_write = Command::new(parvault_bin)
         .args([

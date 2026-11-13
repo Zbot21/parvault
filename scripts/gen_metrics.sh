@@ -44,7 +44,7 @@ if [[ "${1:-}" == "--measured" ]]; then
     [[ -n "${CARGO_TARGET_DIR:-}" ]] || fail "--measured sizes needs CARGO_TARGET_DIR"
     for target in aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
       arch="${target%%-*}"
-      for bin in parvault parvault-seed parvault-fuse parvault-sync; do
+      for bin in parvault parvault-seed parvault-fuse parvault-sync parvault-status; do
         bash scripts/build_bins.sh --profile soc --target "$target" --out "$CARGO_TARGET_DIR/measured" "$bin" >&2
         bytes="$(stat -c %s "$CARGO_TARGET_DIR/measured/$bin-$target")"
         [[ "$bytes" =~ ^[1-9][0-9]*$ ]] || fail "no size for $bin ($target)"
@@ -104,6 +104,12 @@ kani_caps="$(count "$kani_re" src/capabilities.rs)";             positive kani_h
 kani_aes="$(count "$kani_re" src/crypto/aes.rs)";                positive kani_harnesses.aes "$kani_aes"
 kani_rs="$(count "$kani_re" src/sharding/reed_solomon.rs)";      positive kani_harnesses.reed_solomon "$kani_rs"
 tla_specs="${#specs[@]}";                                        positive tla_specs "$tla_specs"
+# L-47: distinct tagged ids in specs/*.tla (@guard = traced to one Rust decision, mutant-covered;
+# @structural = holds by construction, not model-checked; @assume = threat-model bound).
+tla_tag_count() { grep -ohE "@$1 [a-z0-9-]+" specs/*.tla | sort -u | wc -l | tr -d ' '; }
+tla_guards="$(tla_tag_count guard)";                             positive tla.guards "$tla_guards"
+tla_structural="$(tla_tag_count structural)";                    positive tla.structural "$tla_structural"
+tla_assumptions="$(tla_tag_count assume)";                       positive tla.assumptions "$tla_assumptions"
 adr_count="${#adrs[@]}";                                         positive adr_count "$adr_count"
 adr_last="${adrs[adr_count - 1]}"
 [[ "$adr_last" =~ ^ADR-[0-9]+$ ]] || fail "adr_last is '$adr_last'"
@@ -119,6 +125,9 @@ version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
 
 counts="crate_version_tag = v$version
 kani_harnesses = $kani_total
+tla.guards = $tla_guards
+tla.structural = $tla_structural
+tla.assumptions = $tla_assumptions
 kani_harnesses_module = $kani_module
 kani_pass = $kani_total / $kani_total
 kani_pass_compact = $kani_total/$kani_total
@@ -164,7 +173,7 @@ for k, v in static.items():
         mib = num(v) / 1048576
         sizes.setdefault(m.group(2), []).append(mib)
         out.append((f"size.{m.group(1)}.{m.group(2)}", f"{mib:.2f} MiB"))
-BINS = ("parvault", "parvault-seed", "parvault-fuse", "parvault-sync")
+BINS = ("parvault", "parvault-seed", "parvault-fuse", "parvault-sync", "parvault-status")
 missing = [f"size.{b}.{a}.bytes" for a in ("aarch64", "x86_64") for b in BINS
            if f"size.{b}.{a}.bytes" not in static]
 if missing:

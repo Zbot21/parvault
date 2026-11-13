@@ -13,6 +13,7 @@ CONTAINERS=(
     parvault-soc-extract
     parvault-invitee
     parvault-outsider
+    parvault-status-sidecar
 )
 for i in $(seq 1 11); do
     CONTAINERS+=("parvault-node-$i")
@@ -42,26 +43,34 @@ mkdir -p "$BUILD_CTX"
 # Capture before grepping: with pipefail, `cmd | grep -q` fails when grep exits early and cmd
 # gets SIGPIPE.
 INSTALLED_TARGETS="$(rustup target list --installed 2>/dev/null || true)"
+TDIR="${CARGO_TARGET_DIR:-target}"
 if [ "${USE_GLIBC_IMAGE:-0}" != "1" ] && grep -q "x86_64-unknown-linux-musl" <<<"$INSTALLED_TARGETS"; then
     cargo build --release --target x86_64-unknown-linux-musl --bin parvault --bin parvault-seed
-    cp target/x86_64-unknown-linux-musl/release/parvault "$BUILD_CTX/parvault"
-    cp target/x86_64-unknown-linux-musl/release/parvault-seed "$BUILD_CTX/parvault-seed"
+    cp "$TDIR/x86_64-unknown-linux-musl/release/parvault" "$BUILD_CTX/parvault"
+    cp "$TDIR/x86_64-unknown-linux-musl/release/parvault-seed" "$BUILD_CTX/parvault-seed"
     BASE_IMAGE="alpine:3.20"
+    STATUS_TARGET="--target x86_64-unknown-linux-musl"
 else
-    if [ ! -f target/release/parvault ] || [ ! -f target/release/parvault-seed ]; then
+    if [ ! -f "$TDIR/release/parvault" ] || [ ! -f "$TDIR/release/parvault-seed" ]; then
         cargo build --release --bin parvault --bin parvault-seed
     fi
-    cp target/release/parvault "$BUILD_CTX/parvault"
-    cp target/release/parvault-seed "$BUILD_CTX/parvault-seed"
+    cp "$TDIR/release/parvault" "$BUILD_CTX/parvault"
+    cp "$TDIR/release/parvault-seed" "$BUILD_CTX/parvault-seed"
     BASE_IMAGE="ubuntu:24.04"
+    STATUS_TARGET=""
 fi
-chmod +x "$BUILD_CTX/parvault" "$BUILD_CTX/parvault-seed"
+# The sidecar with its own feature set (no tokio, no libp2p), as releases build it.
+# shellcheck disable=SC2086
+bash scripts/build_bins.sh --profile release $STATUS_TARGET --out "$BUILD_CTX/sidecar" parvault-status
+cp "$BUILD_CTX"/sidecar/parvault-status* "$BUILD_CTX/parvault-status"
+chmod +x "$BUILD_CTX/parvault" "$BUILD_CTX/parvault-seed" "$BUILD_CTX/parvault-status"
 
 cat > "$BUILD_CTX/Dockerfile" <<EOF
 FROM ${BASE_IMAGE}
 RUN if command -v apt-get >/dev/null 2>&1; then (apt-get update -o Acquire::Retries=3 && apt-get install -y --no-install-recommends wget netcat-openbsd ca-certificates && rm -rf /var/lib/apt/lists/*) || true; fi
 COPY parvault /usr/local/bin/parvault
 COPY parvault-seed /usr/local/bin/parvault-seed
+COPY parvault-status /usr/local/bin/parvault-status
 EXPOSE 4001/tcp 4002/tcp 4009/udp 4080/tcp
 EOF
 
@@ -527,12 +536,33 @@ echo "Stripped parvault (--profile soc, musl) binary size: ${SOC_BIN_MIB} (${SOC
 echo "Total parvault:router-soc (FROM scratch) image size : ${ROUTER_SOC_IMAGE_SIZE}"
 
 # Start a live `parvault:router-soc` appliance container constrained to --memory=48m --memory-swap=48m
+# Item 3: the status page needs a read-only token; give the appliance a known gateway root key.
+SOC_STATUS_KEY="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
 docker run -d --name parvault-router-soc \
     -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     --network parvault-acceptance-net --ip 172.28.0.60 \
     --memory=48m --memory-swap=48m \
-    parvault:router-soc
+    parvault:router-soc \
+    up --profile router-soc --config /etc/parvault/router.toml --macaroon-root-key-hex "$SOC_STATUS_KEY"
 sleep 2
+mint_status_token() {
+    docker run --rm parvault:acceptance /usr/local/bin/parvault --data-dir /tmp/mint \
+        token mint --macaroon-key-hex "$1" --read-only | tr -d '\r\n'
+}
+SOC_STATUS_TOKEN="$(mint_status_token "$SOC_STATUS_KEY")"
+# status_get <url> [token] [host]: prints the status code then the body.
+status_get() {
+    docker exec parvault-client sh -c '
+        set -- "$1" "$2" "$3"
+        hdr=""
+        [ -n "$2" ] && hdr="--header=Authorization: Bearer $2"
+        hosthdr=""
+        [ -n "$3" ] && hosthdr="--header=Host: $3"
+        out="$(wget -q -S -O- ${hdr:+"$hdr"} ${hosthdr:+"$hosthdr"} "$1" 2>&1)"
+        printf "%s\n" "$out" | awk "/HTTP\\/1.1 [0-9]+/ {print \$2; exit}"
+        printf "%s\n" "$out"
+    ' sh "$1" "${2:-}" "${3:-}" || true
+}
 
 SOC_DAEMON_OOM="$(docker inspect -f '{{.State.OOMKilled}}' parvault-router-soc)"
 SOC_DAEMON_RUNNING="$(docker inspect -f '{{.State.Running}}' parvault-router-soc)"
@@ -543,13 +573,12 @@ if [ "$SOC_DAEMON_OOM" != "false" ] || [ "$SOC_DAEMON_RUNNING" != "true" ]; then
 fi
 
 # Verify embedded RouterNasStatusServer HTTP telemetry on 172.28.0.60:4080
-SOC_HEALTH_JSON="$(docker exec parvault-client sh -c '
-    if command -v wget >/dev/null 2>&1; then
-        wget -qO- http://172.28.0.60:4080/api/v1/health
-    else
-        bash -c '\''exec 3<>/dev/tcp/172.28.0.60/4080 && printf "GET /api/v1/health HTTP/1.0\r\nHost: 172.28.0.60\r\nConnection: close\r\n\r\n" >&3 && cat <&3'\'' | sed "1,/^\r\{0,1\}$/d"
-    fi
-' || true)"
+SOC_NO_TOKEN_CODE="$(status_get http://172.28.0.60:4080/api/v1/health | head -1)"
+if [ "$SOC_NO_TOKEN_CODE" != "401" ]; then
+    echo "ERROR: router-soc status page answered $SOC_NO_TOKEN_CODE without a token (want 401)"
+    exit 1
+fi
+SOC_HEALTH_JSON="$(status_get http://172.28.0.60:4080/api/v1/health "$SOC_STATUS_TOKEN")"
 echo "parvault-router-soc /api/v1/health: $SOC_HEALTH_JSON"
 echo "$SOC_HEALTH_JSON" | grep -Eq '"hardware_profile"[[:space:]]*:[[:space:]]*"router-soc"'
 
@@ -619,6 +648,53 @@ if [ "$SOC_DAEMON_OOM_AFTER" != "false" ]; then
     exit 1
 fi
 
+echo "=== [12b/12] parvault-status sidecar: no key, token-gated status over the gateway socket ==="
+SIDE_KEY="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+SIDE_TOKEN="$(mint_status_token "$SIDE_KEY")"
+docker run -d --name parvault-status-sidecar \
+    -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
+    -e SIDE_KEY="$SIDE_KEY" -e SIDE_TOKEN="$SIDE_TOKEN" \
+    --network parvault-acceptance-net --ip 172.28.0.61 \
+    --memory=48m --memory-swap=48m \
+    parvault:acceptance sh -c '
+        mkdir -p /run/pv /var/lib/parvault /tmp/sidecar-cwd
+        /usr/local/bin/parvault --data-dir /var/lib/parvault --no-lan-discovery up --profile router-soc \
+            --ipc-socket /run/pv/gw.sock --macaroon-root-key-hex "$SIDE_KEY" > /tmp/daemon.log 2>&1 &
+        i=0; while [ ! -S /run/pv/gw.sock ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i+1)); done
+        cd /tmp/sidecar-cwd
+        (umask 077; printf "%s\n" "$SIDE_TOKEN" > /run/pv/status.token)
+        exec /usr/local/bin/parvault-status --socket /run/pv/gw.sock --listen 0.0.0.0:4081 --macaroon-file /run/pv/status.token'
+SIDE_UP=0
+for _ in $(seq 1 100); do
+    if docker logs parvault-status-sidecar 2>&1 | grep -q "Status Server listening"; then SIDE_UP=1; break; fi
+    sleep 0.2
+done
+if [ "$SIDE_UP" != "1" ]; then
+    echo "ERROR: parvault-status did not start"; docker logs parvault-status-sidecar || true
+    docker exec parvault-status-sidecar cat /tmp/daemon.log || true
+    exit 1
+fi
+SIDE_OK="$(status_get http://172.28.0.61:4081/api/v1/health "$SIDE_TOKEN")"
+SIDE_NONE="$(status_get http://172.28.0.61:4081/api/v1/health | head -1)"
+SIDE_DNS="$(status_get http://172.28.0.61:4081/api/v1/health "$SIDE_TOKEN" rebind.example:4081 | head -1)"
+SIDE_QUERY="$(status_get "http://172.28.0.61:4081/api/v1/health?token=$SIDE_TOKEN" | head -1)"
+echo "sidecar: token=$(echo "$SIDE_OK" | head -1) none=$SIDE_NONE dns-host=$SIDE_DNS query-token=$SIDE_QUERY"
+if [ "$(echo "$SIDE_OK" | head -1)" != "200" ] || ! echo "$SIDE_OK" | grep -q '"version"' \
+    || [ "$SIDE_NONE" != "401" ] || [ "$SIDE_DNS" != "403" ] || [ "$SIDE_QUERY" != "401" ]; then
+    echo "ERROR: parvault-status sidecar answers wrong"; docker logs parvault-status-sidecar || true
+    exit 1
+fi
+SIDE_WRITTEN="$(docker exec parvault-status-sidecar sh -c 'ls -A /tmp/sidecar-cwd | wc -l')"
+if [ "$SIDE_WRITTEN" != "0" ]; then
+    echo "ERROR: parvault-status wrote files in its working directory"; exit 1
+fi
+if docker logs parvault-status-sidecar 2>&1 | grep -qF "$SIDE_TOKEN"; then
+    echo "ERROR: the status token is in the sidecar log"; exit 1
+fi
+SIDE_OOM="$(docker inspect -f '{{.State.OOMKilled}}' parvault-status-sidecar)"
+[ "$SIDE_OOM" = "false" ] || { echo "ERROR: sidecar container OOMKilled"; exit 1; }
+SIDE_BIN_BYTES="$(docker exec parvault-status-sidecar stat -c%s /usr/local/bin/parvault-status)"
+
 echo "================================================================================"
 echo " PARVAULT v0.3.0 MULTI-CONTAINER & ROUTER-SOC DOCKER ACCEPTANCE SUMMARY"
 echo "================================================================================"
@@ -637,5 +713,7 @@ echo " Cross-Machine File CLI : PASS (file store -> wipe -> file restore verifie
 echo " Router-SoC Binary      : ${SOC_BIN_MIB} stripped static musl (--profile soc)"
 echo " Router-SoC Image       : ${ROUTER_SOC_IMAGE_SIZE} (FROM scratch)"
 echo " 48 MiB Cgroup SoC Gate : PASS (5 x 1 MiB stripes store+restore, 0 OOM kills)"
+echo " Status page (item 3)   : PASS (router-soc: no token 401, read-only token 200)"
+echo " parvault-status sidecar: PASS (200 / 401 / DNS Host 403 / ?token= 401; no files; ${SIDE_BIN_BYTES} B)"
 echo "================================================================================"
 echo "=== ACCEPTANCE GATE PASSED ==="

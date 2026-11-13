@@ -3397,16 +3397,19 @@ fn r3_sync_push_local_only_exits_with_code() {
         std::thread::sleep(Duration::from_millis(100));
     }
     let push = |extra: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_parvault-sync"))
-            .arg("--socket")
-            .arg(&sock)
-            .arg("--catalog")
-            .arg(sock.with_file_name(format!("catalog{}.bin", extra.len())))
-            .args(["push", "--folder"])
-            .arg(&folder)
-            .args(extra)
-            .output()
-            .expect("run parvault-sync push")
+        Command::new(common::plugin_bin(
+            "parvault-sync",
+            env!("CARGO_BIN_EXE_parvault-sync"),
+        ))
+        .arg("--socket")
+        .arg(&sock)
+        .arg("--catalog")
+        .arg(sock.with_file_name(format!("catalog{}.bin", extra.len())))
+        .args(["push", "--folder"])
+        .arg(&folder)
+        .args(extra)
+        .output()
+        .expect("run parvault-sync push")
     };
     let out = push(&[]);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -5335,21 +5338,24 @@ fn f43_plugin_up(label: &str) -> F43Plugin {
         std::thread::sleep(Duration::from_millis(50));
     }
     let file = std::fs::File::create(&fuse_log).unwrap();
-    let mut fuse = Command::new(env!("CARGO_BIN_EXE_parvault-fuse"))
-        .arg("--socket")
-        .arg(&sock)
-        .arg("--cache-dir")
-        .arg(&cache)
-        .arg("--macaroon")
-        .arg(f43_plugin_parent().to_compact_token())
-        .args(["webdav", "--listen", "127.0.0.1:0", "--seed-dir"])
-        .arg(&seed)
-        .env("RUST_LOG", "info")
-        .env("NO_COLOR", "1")
-        .stdout(Stdio::from(file.try_clone().unwrap()))
-        .stderr(Stdio::from(file))
-        .spawn()
-        .unwrap();
+    let mut fuse = Command::new(common::plugin_bin(
+        "parvault-fuse",
+        env!("CARGO_BIN_EXE_parvault-fuse"),
+    ))
+    .arg("--socket")
+    .arg(&sock)
+    .arg("--cache-dir")
+    .arg(&cache)
+    .arg("--macaroon")
+    .arg(f43_plugin_parent().to_compact_token())
+    .args(["webdav", "--listen", "127.0.0.1:0", "--seed-dir"])
+    .arg(&seed)
+    .env("RUST_LOG", "info")
+    .env("NO_COLOR", "1")
+    .stdout(Stdio::from(file.try_clone().unwrap()))
+    .stderr(Stdio::from(file))
+    .spawn()
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let text = std::fs::read_to_string(&fuse_log).unwrap_or_default();
@@ -5438,12 +5444,15 @@ fn f43_plugin_child_missing_parent_caveat_unauthorized() {
 fn f43_plugin_requires_macaroon() {
     let root = temp_root("f43-plugin-nomac");
     let out = common::output_within_deadline(
-        Command::new(env!("CARGO_BIN_EXE_parvault-fuse"))
-            .arg("--socket")
-            .arg(root.path().join("none.sock"))
-            .arg("--cache-dir")
-            .arg(root.path().join("c"))
-            .args(["webdav", "--listen", "127.0.0.1:0"]),
+        Command::new(common::plugin_bin(
+            "parvault-fuse",
+            env!("CARGO_BIN_EXE_parvault-fuse"),
+        ))
+        .arg("--socket")
+        .arg(root.path().join("none.sock"))
+        .arg("--cache-dir")
+        .arg(root.path().join("c"))
+        .args(["webdav", "--listen", "127.0.0.1:0"]),
     );
     assert!(!out.status.success());
     assert!(
@@ -6190,6 +6199,53 @@ fn council_public_first_epoch_not_auto_installed() {
     assert!(!order_accepted(&r), "{r:?}");
 }
 
+/// L-47 @structural no-admin-key-persist: after an authenticated admin RPC session, no file under
+/// the seed's data dir holds the admin's secret key bytes, and no `tracker_admin.seed` is created.
+#[test]
+fn admin_key_never_persisted_on_seed() {
+    let admin_seed = [0xA7u8; 32];
+    let admin = NodeIdentity::from_seed(admin_seed);
+    let (seed, admin_addr) = bseed_seed("no-admin-key", &[], &admin);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let resp = rt.block_on(parvault::admin_rpc::send_admin_rpc_with_identity(
+        &admin_addr,
+        None,
+        &admin,
+        &parvault::admin_rpc::SeedAdminRequest::GetSeedTelemetry,
+    ));
+    assert!(resp.is_ok(), "{:?}", resp.err());
+    let mut stack = vec![seed.dir.clone()];
+    let mut scanned = 0;
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            assert_ne!(
+                p.file_name().unwrap(),
+                "tracker_admin.seed",
+                "{}",
+                p.display()
+            );
+            let bytes = std::fs::read(&p).unwrap_or_default();
+            scanned += 1;
+            assert!(
+                !bytes.windows(32).any(|w| w == admin_seed),
+                "admin secret key bytes found in {}",
+                p.display()
+            );
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains(&hex::encode(admin_seed)),
+                "admin secret key hex found in {}",
+                p.display()
+            );
+        }
+    }
+    assert!(scanned > 0, "the seed wrote no files to scan");
+}
+
 /// Architect 2c sign-off check: the blinded id map survives a daemon restart, so a signed delete
 /// works afterwards (no re-put needed).
 #[test]
@@ -6313,4 +6369,555 @@ fn status_ipc_without_root_key_refused() {
     let tok = gw_token(vec![parvault::capabilities::Caveat::ReadOnly]);
     assert!(status_client(&sock).query_status(Some(tok)).is_err());
     assert_logged(&node, "reject.status_unavailable");
+}
+
+// --- Item 3: the status page over HTTP (status_auth_decision at the shared edge) ----------------
+
+/// Starts `parvault up` with the status page on an ephemeral loopback port.
+fn status_up(label: &str, key: Option<[u8; 32]>) -> (Node, std::net::SocketAddr) {
+    let (root, dir, reg, log) = prepare(label);
+    if let Some(k) = key {
+        std::fs::write(dir.join("macaroon_root.key"), hex::encode(k)).unwrap();
+    }
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .arg("--data-dir")
+        .arg(&dir)
+        .args([
+            "--no-lan-discovery",
+            "up",
+            "--listen",
+            common::LOOPBACK_EPHEMERAL,
+            "--status-http",
+            "127.0.0.1:0",
+        ]);
+    let node = spawn(cmd, root, dir, log);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let text = node.log_text();
+        if let Some(rest) = text.split("Status Server listening on http://").nth(1) {
+            let addr = rest.split_whitespace().next().unwrap().parse().unwrap();
+            return (node, addr);
+        }
+        assert!(Instant::now() < deadline, "no status listener:\n{text}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn status_token(caveats: Vec<parvault::capabilities::Caveat>) -> String {
+    gw_token(caveats).to_compact_token()
+}
+
+fn ro_token() -> String {
+    status_token(vec![parvault::capabilities::Caveat::ReadOnly])
+}
+
+/// Sends `parts` as separate writes (50 ms apart) and returns the raw response.
+fn http_raw(addr: std::net::SocketAddr, parts: &[&[u8]]) -> Vec<u8> {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        s.write_all(p).unwrap();
+    }
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    out
+}
+
+fn status_get(addr: std::net::SocketAddr, host: &str, auth: Option<String>) -> (u16, Vec<u8>) {
+    let mut req = format!("GET /api/v1/health HTTP/1.1\r\nHost: {host}\r\n");
+    if let Some(a) = auth {
+        req.push_str(&format!("Authorization: {a}\r\n"));
+    }
+    req.push_str("\r\n");
+    let raw = http_raw(addr, &[req.as_bytes()]);
+    let code = String::from_utf8_lossy(&raw)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    (code, raw)
+}
+
+fn host_of(addr: std::net::SocketAddr) -> String {
+    addr.to_string()
+}
+
+/// STATUS-AUTH accept: a ReadOnly, unscoped Bearer token reads the status JSON.
+#[test]
+fn status_http_readonly_bearer_served() {
+    let (_node, addr) = status_up("sh-ok", Some(GW_KEY));
+    let (code, raw) = status_get(addr, &host_of(addr), Some(format!("Bearer {}", ro_token())));
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&raw));
+    assert!(String::from_utf8_lossy(&raw).contains(env!("CARGO_PKG_VERSION")));
+    gate_ran("trust_enforcement::status_http_readonly_bearer_served");
+}
+
+/// STATUS-AUTH reject: no token, the fixed 401 (F-46: the page was open to anyone who could reach it).
+#[test]
+fn status_http_no_token_unauthorized() {
+    let (node, addr) = status_up("sh-none", Some(GW_KEY));
+    let (code, raw) = status_get(addr, &host_of(addr), None);
+    assert_eq!(code, 401);
+    assert_eq!(raw, parvault::http_edge::STATUS_401);
+    assert_logged(&node, "reject.status_token_missing");
+    gate_ran("trust_enforcement::status_http_no_token_unauthorized");
+}
+
+/// STATUS-HOST accept: an IP-literal Host with a valid token is served.
+#[test]
+fn status_http_ip_literal_host_served() {
+    let (_node, addr) = status_up("sh-host-ok", Some(GW_KEY));
+    let host = format!("localhost:{}", addr.port());
+    let (code, _) = status_get(addr, &host, Some(format!("Bearer {}", ro_token())));
+    assert_eq!(code, 200);
+    let (code, _) = status_get(addr, &host_of(addr), Some(format!("Bearer {}", ro_token())));
+    assert_eq!(code, 200);
+    gate_ran("trust_enforcement::status_http_ip_literal_host_served");
+}
+
+/// STATUS-HOST reject: a DNS-name Host (DNS rebinding) is refused even with a valid token.
+#[test]
+fn status_http_dns_host_refused() {
+    let (node, addr) = status_up("sh-host-bad", Some(GW_KEY));
+    let host = format!("rebind.example:{}", addr.port());
+    let (code, _) = status_get(addr, &host, Some(format!("Bearer {}", ro_token())));
+    assert_eq!(code, 403);
+    assert_logged(&node, "reject.status_host_mismatch");
+    gate_ran("trust_enforcement::status_http_dns_host_refused");
+}
+
+/// L-45: the token as the Basic password works (a browser prompt), and never in the URL.
+#[test]
+fn status_http_basic_password_served() {
+    use base64::Engine as _;
+    let (_node, addr) = status_up("sh-basic", Some(GW_KEY));
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("status:{}", ro_token()));
+    let (code, _) = status_get(addr, &host_of(addr), Some(format!("Basic {basic}")));
+    assert_eq!(code, 200);
+}
+
+/// The other refusals: scoped (403), not ReadOnly and AllowedPeerUid over TCP (the same 401);
+/// the token text never reaches the log.
+#[test]
+fn status_http_token_refusals_and_no_token_in_log() {
+    use parvault::capabilities::Caveat;
+    let (node, addr) = status_up("sh-refuse", Some(GW_KEY));
+    let h = host_of(addr);
+    let scoped = status_token(vec![Caveat::ReadOnly, Caveat::AllowedManifest([3; 32])]);
+    assert_eq!(
+        status_get(addr, &h, Some(format!("Bearer {scoped}"))).0,
+        403
+    );
+    assert_logged(&node, "reject.status_token_scoped");
+    let rw = status_token(vec![]);
+    let (code, raw) = status_get(addr, &h, Some(format!("Bearer {rw}")));
+    assert_eq!(
+        (code, raw.as_slice()),
+        (401, parvault::http_edge::STATUS_401)
+    );
+    assert_logged(&node, "reject.status_not_readonly");
+    let uid = status_token(vec![Caveat::ReadOnly, Caveat::AllowedPeerUid(0)]);
+    let (code, raw) = status_get(addr, &h, Some(format!("Bearer {uid}")));
+    assert_eq!(
+        (code, raw.as_slice()),
+        (401, parvault::http_edge::STATUS_401)
+    );
+    assert_logged(&node, "reject.status_peer_uid");
+    let log = node.log_text();
+    for t in [&scoped, &rw, &uid, &ro_token()] {
+        assert!(!log.contains(t.as_str()), "token text in the node log");
+    }
+}
+
+/// The shared edge on the status port: 431 over 8 KiB, a head split across writes is served,
+/// a stalled head is dropped unanswered, and the 9th connection from one IP is dropped.
+#[test]
+fn status_http_edge_limits() {
+    let (_node, addr) = status_up("sh-edge", Some(GW_KEY));
+    let big = format!(
+        "GET /api/v1/health HTTP/1.1\r\nHost: {}\r\nX-Pad: {}\r\n\r\n",
+        host_of(addr),
+        "a".repeat(9000)
+    );
+    assert!(String::from_utf8_lossy(&http_raw(addr, &[big.as_bytes()])).starts_with("HTTP/1.1 431"));
+    let head = format!(
+        "GET /api/v1/health HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\n\r\n",
+        host_of(addr),
+        ro_token()
+    );
+    let (a, b) = head.as_bytes().split_at(20);
+    assert!(String::from_utf8_lossy(&http_raw(addr, &[a, b])).starts_with("HTTP/1.1 200"));
+    // Stalled: half a head, then nothing; the 5 s head deadline closes it with no bytes.
+    let t0 = Instant::now();
+    let stalled = http_raw(addr, &[b"GET / HTTP/1.1\r\n"]);
+    assert!(stalled.is_empty() && t0.elapsed() < Duration::from_secs(9));
+    // Eight idle connections hold every per-IP slot; the 9th is closed unanswered at once.
+    let held: Vec<_> = (0..8)
+        .map(|_| std::net::TcpStream::connect(addr).unwrap())
+        .collect();
+    std::thread::sleep(Duration::from_millis(200));
+    let t0 = Instant::now();
+    let ninth = http_raw(addr, &[head.as_bytes()]);
+    assert!(ninth.is_empty() && t0.elapsed() < Duration::from_secs(2));
+    drop(held);
+}
+
+/// No server without a verifier (L-44): with --status-http and no key, the daemon creates the
+/// gateway root key, verifies under it, and still refuses a request without a token.
+#[test]
+fn status_http_creates_root_key_and_verifies() {
+    let (node, addr) = status_up("sh-nokey", None);
+    let key_hex = std::fs::read_to_string(node.dir.join("macaroon_root.key")).unwrap();
+    let key: [u8; 32] = hex::decode(key_hex.trim()).unwrap().try_into().unwrap();
+    let tok = parvault::capabilities::CapabilityMacaroon::mint(
+        &key,
+        [5; 32],
+        [6; 32],
+        vec![parvault::capabilities::Caveat::ReadOnly],
+    )
+    .unwrap()
+    .to_compact_token();
+    assert_eq!(status_get(addr, &host_of(addr), None).0, 401);
+    assert_eq!(
+        status_get(addr, &host_of(addr), Some(format!("Bearer {tok}"))).0,
+        200
+    );
+}
+
+/// L-52: the token goes only in the Authorization header. A token in the query string (or
+/// path) is ignored, so the request gets the fixed 401, and the URL token is not logged.
+#[test]
+fn status_http_query_string_token_refused() {
+    let (node, addr) = status_up("sh-query", Some(GW_KEY));
+    let tok = ro_token();
+    for path in [
+        format!("/api/v1/health?token={tok}"),
+        format!("/?macaroon={tok}"),
+    ] {
+        let req = format!("GET {path} HTTP/1.1\r\nHost: {}\r\n\r\n", host_of(addr));
+        let raw = http_raw(addr, &[req.as_bytes()]);
+        assert_eq!(raw, parvault::http_edge::STATUS_401);
+    }
+    assert_logged(&node, "reject.status_token_missing");
+    assert!(
+        !node.log_text().contains(tok.as_str()),
+        "URL token in the node log"
+    );
+}
+
+// --- Item 3: the parvault-status sidecar (no key; pinned token; status over the socket) --------
+
+struct StatusSidecar {
+    _gateway: Node,
+    child: Child,
+    log: PathBuf,
+    addr: std::net::SocketAddr,
+}
+
+impl Drop for StatusSidecar {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn status_sidecar_log(s: &StatusSidecar) -> String {
+    std::fs::read_to_string(&s.log).unwrap_or_default()
+}
+
+/// A daemon with a gateway socket under GW_KEY, and `parvault-status` pinned to a ReadOnly root
+/// token, serving on an ephemeral loopback port.
+fn status_sidecar_up(label: &str) -> StatusSidecar {
+    status_sidecar_up_with(label, false)
+}
+
+/// Writes `token` to `dir/name` with `mode` (QA item 3, defect 1: tokens off argv).
+fn write_token_file(dir: &Path, name: &str, token: &str, mode: u32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join(name);
+    std::fs::write(&p, format!("{token}\n")).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+    p
+}
+
+fn status_sidecar_up_with(label: &str, token_file: bool) -> StatusSidecar {
+    let (gateway, sock) = gw_up(label, &[], Some(GW_KEY));
+    let log = gateway.dir.join("parvault-status.log");
+    let f = std::fs::File::create(&log).unwrap();
+    // Its own empty working directory: whatever it writes would show up here.
+    let cwd = gateway.dir.join("sidecar-cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let child = Command::new(common::plugin_bin(
+        "parvault-status",
+        env!("CARGO_BIN_EXE_parvault-status"),
+    ))
+    .current_dir(&cwd)
+    .args(["--listen", "127.0.0.1:0"])
+    .args(if token_file {
+        vec![
+            "--macaroon-file".to_string(),
+            write_token_file(&gateway.dir, "status.token", &ro_token(), 0o600)
+                .display()
+                .to_string(),
+        ]
+    } else {
+        vec!["--macaroon".to_string(), ro_token()]
+    })
+    .arg("--socket")
+    .arg(&sock)
+    .stdout(Stdio::from(f.try_clone().unwrap()))
+    .stderr(Stdio::from(f))
+    .spawn()
+    .unwrap();
+    let mut side = StatusSidecar {
+        _gateway: gateway,
+        child,
+        log,
+        addr: "127.0.0.1:1".parse().unwrap(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let text = status_sidecar_log(&side);
+        if let Some(rest) = text.split("Status Server listening on http://").nth(1) {
+            side.addr = rest.split_whitespace().next().unwrap().parse().unwrap();
+            return side;
+        }
+        assert!(Instant::now() < deadline, "no sidecar listener:\n{text}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// STATUS-AUTH accept (bin=parvault-status): the pinned token reads the daemon's status.
+#[test]
+fn status_sidecar_readonly_served() {
+    let s = status_sidecar_up("ss-ok");
+    let (code, raw) = status_get(
+        s.addr,
+        &host_of(s.addr),
+        Some(format!("Bearer {}", ro_token())),
+    );
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&raw));
+    assert!(String::from_utf8_lossy(&raw).contains(env!("CARGO_PKG_VERSION")));
+    gate_ran("trust_enforcement::status_sidecar_readonly_served");
+}
+
+/// STATUS-AUTH reject (bin=parvault-status): no token, the fixed 401.
+#[test]
+fn status_sidecar_no_token_unauthorized() {
+    let s = status_sidecar_up("ss-none");
+    let (code, raw) = status_get(s.addr, &host_of(s.addr), None);
+    assert_eq!(
+        (code, raw.as_slice()),
+        (401, parvault::http_edge::STATUS_401)
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !status_sidecar_log(&s).contains("reject.status_token_missing") {
+        assert!(Instant::now() < deadline, "{}", status_sidecar_log(&s));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    gate_ran("trust_enforcement::status_sidecar_no_token_unauthorized");
+}
+
+/// STATUS-HOST accept (bin=parvault-status).
+#[test]
+fn status_sidecar_ip_host_served() {
+    let s = status_sidecar_up("ss-host-ok");
+    let host = format!("localhost:{}", s.addr.port());
+    assert_eq!(
+        status_get(s.addr, &host, Some(format!("Bearer {}", ro_token()))).0,
+        200
+    );
+    gate_ran("trust_enforcement::status_sidecar_ip_host_served");
+}
+
+/// STATUS-HOST reject (bin=parvault-status): a DNS-name Host is refused with a valid token.
+#[test]
+fn status_sidecar_dns_host_refused() {
+    let s = status_sidecar_up("ss-host-bad");
+    let host = format!("rebind.example:{}", s.addr.port());
+    assert_eq!(
+        status_get(s.addr, &host, Some(format!("Bearer {}", ro_token()))).0,
+        403
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !status_sidecar_log(&s).contains("reject.status_host_mismatch") {
+        assert!(Instant::now() < deadline, "{}", status_sidecar_log(&s));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    gate_ran("trust_enforcement::status_sidecar_dns_host_refused");
+}
+
+/// The pinned parent: an offline attenuation is served; a sibling root token (valid under the
+/// daemon key, but not the pinned chain) is refused by the sidecar itself.
+#[test]
+fn status_sidecar_pinned_parent_chain() {
+    let s = status_sidecar_up("ss-chain");
+    let child = gw_token(vec![parvault::capabilities::Caveat::ReadOnly])
+        .attenuate(parvault::capabilities::Caveat::ExpiresAtUnixMs(
+            u64::MAX / 2,
+        ))
+        .unwrap()
+        .to_compact_token();
+    assert_eq!(
+        status_get(s.addr, &host_of(s.addr), Some(format!("Bearer {child}"))).0,
+        200
+    );
+    let sibling = parvault::capabilities::CapabilityMacaroon::mint(
+        &GW_KEY,
+        [9; 32],
+        [6; 32],
+        vec![parvault::capabilities::Caveat::ReadOnly],
+    )
+    .unwrap()
+    .to_compact_token();
+    assert_eq!(
+        status_get(s.addr, &host_of(s.addr), Some(format!("Bearer {sibling}"))).0,
+        401
+    );
+}
+
+/// The sidecar holds no key: its source never reads a root key or master key, and it runs from
+/// a directory with no key file.
+#[test]
+fn status_sidecar_holds_no_key() {
+    let src = include_str!("../src/bin/parvault-status.rs");
+    for banned in [
+        "macaroon_root",
+        "MasterKey",
+        "load_or_create",
+        "root_key",
+        "data_dir",
+    ] {
+        assert!(!src.contains(banned), "parvault-status mentions {banned}");
+    }
+    let s = status_sidecar_up("ss-nokey");
+    assert_eq!(
+        status_get(
+            s.addr,
+            &host_of(s.addr),
+            Some(format!("Bearer {}", ro_token()))
+        )
+        .0,
+        200
+    );
+    let written: Vec<_> = std::fs::read_dir(s._gateway.dir.join("sidecar-cwd"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
+    assert!(written.is_empty(), "the sidecar wrote {written:?}");
+}
+
+/// A new sidecar against a daemon older than v0.5.0 (which answers an unknown command with
+/// "invalid IPC command ...") exits with a clear message instead of serving.
+#[test]
+fn status_sidecar_old_daemon_clear_message() {
+    use bincode::Options;
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("old.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let _ = parvault::gateway::ipc::recv_frame_with_optional_fd(&mut stream);
+            let resp = parvault::gateway::ipc::IpcResponse::Error {
+                message: "invalid IPC command bincode: invalid value: integer `5`".into(),
+            };
+            let bytes = bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .allow_trailing_bytes()
+                .serialize(&resp)
+                .unwrap();
+            let _ = parvault::gateway::ipc::send_frame_with_optional_fd(&mut stream, &bytes, None);
+        }
+    });
+    let out = Command::new(common::plugin_bin(
+        "parvault-status",
+        env!("CARGO_BIN_EXE_parvault-status"),
+    ))
+    .args(["--listen", "127.0.0.1:0", "--macaroon", &ro_token()])
+    .arg("--socket")
+    .arg(&sock)
+    .output()
+    .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("predates v0.5.0"), "{err}");
+}
+
+/// QA item 3, defect 1: the sidecar reads its pinned token from a 0600 file, so it is not in
+/// /proc/<pid>/cmdline.
+#[test]
+fn status_sidecar_macaroon_file_served() {
+    let s = status_sidecar_up_with("ss-file", true);
+    let (code, _) = status_get(
+        s.addr,
+        &host_of(s.addr),
+        Some(format!("Bearer {}", ro_token())),
+    );
+    assert_eq!(code, 200);
+    let cmdline = std::fs::read(format!("/proc/{}/cmdline", s.child.id())).unwrap();
+    assert!(!String::from_utf8_lossy(&cmdline).contains(&ro_token()));
+}
+
+/// QA item 3, defect 1: every plugin refuses a token file that group or others can read,
+/// before it does anything else.
+#[test]
+fn plugin_macaroon_file_group_readable_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = write_token_file(dir.path(), "open.token", &ro_token(), 0o644);
+    let f = f.to_str().unwrap();
+    let runs: [(&str, std::path::PathBuf, Vec<&str>); 3] = [
+        (
+            "parvault-status",
+            common::plugin_bin("parvault-status", env!("CARGO_BIN_EXE_parvault-status")),
+            vec!["--listen", "127.0.0.1:0", "--macaroon-file", f],
+        ),
+        (
+            "parvault-fuse",
+            common::plugin_bin("parvault-fuse", env!("CARGO_BIN_EXE_parvault-fuse")),
+            vec!["--macaroon-file", f, "self-test"],
+        ),
+        (
+            "parvault-sync",
+            common::plugin_bin("parvault-sync", env!("CARGO_BIN_EXE_parvault-sync")),
+            vec!["--macaroon-file", f, "list"],
+        ),
+    ];
+    for (name, bin, args) in runs {
+        let out = Command::new(bin)
+            .current_dir(dir.path())
+            .args(&args)
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{name} accepted a 0644 token file");
+        assert!(err.contains("readable by group or others"), "{name}: {err}");
+    }
+}
+
+/// QA item 3, defect 2: status responses carry a restrictive CSP (no scripts, no framing) and
+/// nosniff.
+#[test]
+fn status_http_security_headers() {
+    let (_node, addr) = status_up("sh-csp", Some(GW_KEY));
+    for path in ["/", "/api/v1/health"] {
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\n\r\n",
+            host_of(addr),
+            ro_token()
+        );
+        let raw = String::from_utf8_lossy(&http_raw(addr, &[req.as_bytes()])).to_string();
+        let head = raw.split("\r\n\r\n").next().unwrap().to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 200"), "{head}");
+        assert!(
+            head.contains("content-security-policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"),
+            "{path}: {head}"
+        );
+        assert!(head.contains("x-content-type-options: nosniff"));
+    }
 }

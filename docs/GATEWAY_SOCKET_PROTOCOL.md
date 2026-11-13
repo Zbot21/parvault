@@ -158,6 +158,7 @@ PLUGIN_TOK="$(parvault token attenuate \
   --allow-peer-uid 1042)"
 
 # 3. Inspect caveats and optionally verify in < 1 ms RAM against a simulated request
+#    (the tag, the bearer secret, prints as <redacted> unless --show-tag is given)
 parvault token inspect \
   --token "${PLUGIN_TOK}" \
   --verify-key-hex "$(cat /var/lib/parvault/macaroon_root.key)" \
@@ -175,11 +176,13 @@ parvault --data-dir /var/lib/parvault up \
 
 # WebDAV clients must present ${PLUGIN_TOK} or an offline attenuation of it on every request
 # (F-43); a token with a peer-UID caveat is refused over TCP.
-parvault-fuse --socket /var/run/parvault.sock --macaroon "${PLUGIN_TOK}" webdav --listen 127.0.0.1:4918
+# Tokens go in a mode-600 file: --macaroon on argv is readable by any local user (/proc/<pid>/cmdline).
+( umask 077; printf '%s\n' "${PLUGIN_TOK}" > ./plugin.token )
+parvault-fuse --socket /var/run/parvault.sock --macaroon-file ./plugin.token webdav --listen 127.0.0.1:4918
 
 # 5. Zero-key incremental folder push & macaroon-attenuated selective pull via parvault-sync (=m)
 parvault-sync --socket /var/run/parvault.sock --catalog ./gw-catalog.bin push --folder /srv/project
-parvault-sync --socket /var/run/parvault.sock --catalog ./gw-catalog.bin --macaroon "${PLUGIN_TOK}" \
+parvault-sync --socket /var/run/parvault.sock --catalog ./gw-catalog.bin --macaroon-file ./plugin.token \
   pull --output /tmp/restored-docs --filter "docs/*"
 
 # 6. Or run built-in (=y) WebDAV VFS inside parvault with --no-socket (zero .sock file on disk!)

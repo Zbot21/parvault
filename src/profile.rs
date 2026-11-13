@@ -11,7 +11,7 @@ pub const DEFAULT_STRIPE_SIZE_BYTES: usize = 16 * 1024 * 1024;
 /// Balanced streaming stripe size (4 MiB) for 24/7 Homelab NAS nodes.
 pub const HOMELAB_NAS_STRIPE_SIZE_BYTES: usize = 4 * 1024 * 1024;
 
-/// Ultra-low-RAM streaming stripe size (1 MiB) for OpenWrt / prplOS / ARM64 Router SoCs (ADR-18).
+/// Ultra-low-RAM streaming stripe size (1 MiB) for OpenWrt / prplOS / ARM64 Router SoCs (ADR-21).
 pub const ROUTER_SOC_STRIPE_SIZE_BYTES: usize = 1024 * 1024;
 
 /// Minimum streaming stripe size floor (`64 KiB`).
@@ -20,7 +20,7 @@ pub const MIN_STRIPE_SIZE_BYTES: usize = 64 * 1024;
 /// Maximum logical file size supported by the streaming pipeline (`u64::MAX` bytes).
 pub const MAX_FILE_BYTES: u64 = u64::MAX;
 
-/// Strict Router-SoC peak concurrent per-stripe RAM ceiling (`32 MiB`, `ADR-01` / `ADR-18`).
+/// Strict Router-SoC peak concurrent per-stripe RAM ceiling (`32 MiB`, `ADR-01` / `ADR-21`).
 pub const ROUTER_SOC_MAX_STRIPE_MEMORY_BYTES: usize = 32 * 1024 * 1024;
 
 /// AES-256-GCM authentication tag overhead per encrypted stripe (`16` bytes).
@@ -79,7 +79,7 @@ pub const fn compute_stripe_layout_for_size(
     }
 }
 
-/// Hardware resource profiles tuning stripe sizing, disk safety guards, and peer fanout (`ADR-18`).
+/// Hardware resource profiles tuning stripe sizing, disk safety guards, and peer fanout (`ADR-21`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum, Default)]
 pub enum HardwareProfile {
     /// Workstation / laptop profile (`16 MiB` stripes, `5 GiB` disk guard, `128` max connections)

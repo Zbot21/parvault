@@ -810,6 +810,13 @@ mod unix_impl {
                 IpcResponse::StatusSnapshot(_) => {
                     Err(io::Error::other("QueryStatus: snapshot over its size caps"))
                 }
+                // A pre-v0.5.0 daemon cannot decode command 5 and says so.
+                IpcResponse::Error { message } if message.starts_with("invalid IPC command") => {
+                    Err(io::Error::other(format!(
+                        "the daemon on {} predates v0.5.0 and has no QueryStatus; upgrade it ({message})",
+                        self.socket_path.display()
+                    )))
+                }
                 IpcResponse::Error { message } => Err(io::Error::other(message)),
                 other => Err(io::Error::other(format!(
                     "unexpected QueryStatus response: {other:?}"
@@ -1231,6 +1238,21 @@ mod unix_impl {
                 Self::UnixSocket(client) => {
                     client.fetch_payload_bytes(ephemeral_shard_ids, macaroon)
                 }
+            }
+        }
+
+        /// `QueryStatus` (item 3) synchronously: in-process, the engine runs the same decision
+        /// with this process's UID; over the socket, the daemon does.
+        pub fn query_status_sync(
+            &self,
+            macaroon: Option<CapabilityMacaroon>,
+        ) -> io::Result<StatusSnapshot> {
+            match self {
+                #[cfg(feature = "daemon-runtime")]
+                Self::InProcess(engine) => engine
+                    .query_status(macaroon.as_ref(), Some(crate::os_sys::geteuid()))
+                    .map_err(|e| io::Error::other(e.to_string())),
+                Self::UnixSocket(client) => client.query_status(macaroon),
             }
         }
 

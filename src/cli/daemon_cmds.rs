@@ -49,19 +49,11 @@ pub(crate) async fn up(env: CliEnv, command: Commands) -> anyhow::Result<()> {
         strict_plugins,
         &allow_peer_uid,
     )?;
-    // F-43 (L-44): built-in WebDAV verifies every request against the root key, so one
-    // must exist when it is on (created like `parvault token mint` does).
-    let macaroon_root_key = if vfs_webdav_listen.is_some() {
-        Some(parvault::gateway::load_or_create_macaroon_root_key(
-            &cfg.data_dir,
-            macaroon_root_key_hex.as_deref(),
-        )?)
-    } else {
-        parvault::gateway::resolve_optional_macaroon_root_key(
-            &cfg.data_dir,
-            macaroon_root_key_hex.as_deref(),
-        )?
-    };
+    let macaroon_root_key = resolve_daemon_macaroon_root_key(
+        &cfg,
+        macaroon_root_key_hex.as_deref(),
+        vfs_webdav_listen.is_some() || status_http.is_some(),
+    )?;
     if let Some(listen_override) = listen {
         cfg.listen_tcp = listen_override;
     }
@@ -142,19 +134,11 @@ pub(crate) async fn daemon(env: CliEnv, command: Commands) -> anyhow::Result<()>
                 strict_plugins,
                 &allow_peer_uid,
             )?;
-            // F-43 (L-44): built-in WebDAV verifies every request against the root key, so one
-            // must exist when it is on (created like `parvault token mint` does).
-            let macaroon_root_key = if vfs_webdav_listen.is_some() {
-                Some(parvault::gateway::load_or_create_macaroon_root_key(
-                    &cfg.data_dir,
-                    macaroon_root_key_hex.as_deref(),
-                )?)
-            } else {
-                parvault::gateway::resolve_optional_macaroon_root_key(
-                    &cfg.data_dir,
-                    macaroon_root_key_hex.as_deref(),
-                )?
-            };
+            let macaroon_root_key = resolve_daemon_macaroon_root_key(
+                &cfg,
+                macaroon_root_key_hex.as_deref(),
+                vfs_webdav_listen.is_some() || status_http.is_some(),
+            )?;
             cfg.listen_tcp = listen;
             cfg.enable_quic = enable_quic;
             let opts = DaemonLaunchOptions {
@@ -184,4 +168,23 @@ pub(crate) async fn daemon(env: CliEnv, command: Commands) -> anyhow::Result<()>
         }
     }
     Ok(())
+}
+
+/// The gateway macaroon root key for `up` and `daemon start` (#codehealth: one copy). Built-in
+/// WebDAV (F-43, L-44) and the status page (item 3) verify every request against it, so when
+/// either is on (`needs_verifier`, or a status bind in the config) one must exist and is created
+/// like `parvault token mint` does; otherwise it is loaded only if present.
+fn resolve_daemon_macaroon_root_key(
+    cfg: &NodeConfig,
+    hex: Option<&str>,
+    needs_verifier: bool,
+) -> anyhow::Result<Option<[u8; 32]>> {
+    Ok(if needs_verifier || cfg.status_http_bind.is_some() {
+        Some(parvault::gateway::load_or_create_macaroon_root_key(
+            &cfg.data_dir,
+            hex,
+        )?)
+    } else {
+        parvault::gateway::resolve_optional_macaroon_root_key(&cfg.data_dir, hex)?
+    })
 }
