@@ -34,10 +34,10 @@ no-blocking B-DISC   path=src/cli/daemon.rs
 no-blocking B-SEED-SYND path=src/bootstrap.rs
 no-blocking B-SEED-SYND path=src/bin/parvault-seed.rs
 
-# --- ADR cross-references (existence only for now; F-16's keyword table is docs/adr/xref-keywords.txt,
-# switched on with expect= once the legacy-number citations are renumbered, 2d-beta) ---------------
-xref       X-ADR     path=src/**.rs pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md
-xref       X-ADR-DOC path=docs/**.md pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md
+# --- ADR cross-references (F-16): every ADR-NN citation resolves and names a topic of that ADR on the
+# same line (docs/adr/xref-keywords.txt) ------------------------------------------------------------
+xref       X-ADR     path=src/**.rs pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md expect=docs/adr/xref-keywords.txt
+xref       X-ADR-DOC path=docs/**.md pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md expect=docs/adr/xref-keywords.txt
 
 # --- Formal proofs (P-01 to P-05; mutants are authored by QA) --------------------------------------
 tla-spec   T-SPECS   path=specs/*.tla
