@@ -3078,3 +3078,49 @@ fn r3_partial_placement_keeps_remote_shards() {
             .unwrap_or_default();
     assert_eq!(listed.lines().count(), 1, "no new entry: {listed:?}");
 }
+
+/// Grant/cert owner binding (QA on 5f330a1), reproduction: an owner-certified device attaches a
+/// repair grant self-signed by an unrelated key X; checks whether X can then read a shard the
+/// seed stored. Today it can (open: the fix needs an architect ruling on which key a lite
+/// syndication grant must be bound to).
+#[test]
+fn repro_syndication_grant_from_foreign_owner() {
+    let node = spawn_seed("synd-grant-x");
+    let device = key(0xC7);
+    let stranger = key(0xC8);
+    let mut req = syndicate(&node, &device);
+    let (root, hashes) = match &req {
+        MeshWireRequest::SyndicateLiteStripe { bundle, .. } => (
+            bundle.expected_stripe_merkle_root,
+            bundle.expected_shard_hashes.clone(),
+        ),
+        _ => unreachable!(),
+    };
+    if let MeshWireRequest::SyndicateLiteStripe { repair_grant, .. } = &mut req {
+        *repair_grant = Some(parvault::por::RepairGrant::issue(
+            &stranger,
+            root,
+            Vec::new(),
+            ErasureTier::Homelab,
+        ));
+    }
+    let resp = send(&device, &node, req);
+    let stored = matches!(
+        resp,
+        MeshWireResponse::SyndicateLiteStripeAck {
+            receipt: Some(_),
+            ..
+        }
+    );
+    let sid = ShardId {
+        stripe_merkle_root: root,
+        shard_index: 0,
+        shard_hash: hashes[0],
+    };
+    let read = read_bytes(&send(&stranger, &node, owner_read(&stranger, sid)));
+    assert!(
+        stored && read.is_some(),
+        "gap: a foreign-owner grant is registered and its key reads the shard (stored={stored})"
+    );
+    gate_ran("trust_enforcement::repro_syndication_grant_from_foreign_owner");
+}
