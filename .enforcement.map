@@ -131,7 +131,6 @@ noenforce  N-13      adr=docs/adr/ADR-13-symmetric-pq-grover-baseline-and-cascad
 noenforce  N-14      adr=docs/adr/ADR-14-incremental-folder-sync-engine.md reason=client-side only
 noenforce  N-17      adr=docs/adr/ADR-17-anonymous-census-telemetry.md reason=client-side; the beacon is self-reported and labelled (F-07)
 noenforce  N-18      adr=docs/adr/ADR-18-seed-phrase-house-fire-disaster-recovery.md reason=client-side; catalogs read from untrusted peers are owner-bound by F-10a (dht_candidate_decision)
-noenforce  N-21      adr=docs/adr/ADR-21-router-soc-1mib-streaming-profile.md reason=performance profile
 noenforce  N-27      adr=docs/adr/ADR-27-zero-copy-uds-gateway-and-hedged-pool.md reason=the socket is a local trust boundary; its enforcement is the ADR-32 claim
 noenforce  N-30      adr=docs/adr/ADR-30-filesystem-free-in-memory-seed-mode.md reason=resource mode, no peer-facing promise; "0 files created" is checked by gateway_ipc_benchmark::test_parvault_seed_no_fs_zero_disk_and_ram_cap_enforcement
 noenforce  N-31      adr=docs/adr/ADR-31-unsafe-remediation-and-os-sys-ffi-boundary.md reason=enforced by audit_workspace_hardening.sh and crate attributes, not at runtime
@@ -146,6 +145,9 @@ kani       F-43      sym=src/vfs.rs::webdav_auth_decision harness=proof_webdav_a
 claim      G-MAC     sym=src/gateway/engine.rs::gateway_macaroon_decision accept=trust_enforcement::gmac_frame_inside_caveat_served reject=trust_enforcement::gmac_frame_outside_caveat_refused code=reject.gateway_macaroon_caveat bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-28-stateless-macaroon-capability-attenuation.md
 claim      G-PAY     sym=src/gateway/engine.rs::gateway_macaroon_decision accept=trust_enforcement::gpay_in_scope_token_fetches_file reject=trust_enforcement::gpay_other_manifest_token_refused code=reject.gateway_macaroon_caveat bin=parvault ref=docs/security/TRUST_FINDINGS.md
 claim      STATUS-IPC sym=src/http_edge.rs::status_auth_decision accept=trust_enforcement::status_ipc_readonly_token_served reject=trust_enforcement::status_ipc_missing_token_refused code=reject.status_token_missing bin=parvault ref=docs/security/TRUST_FINDINGS.md
+claim      STATUS-AUTH sym=src/http_edge.rs::status_auth_decision accept=trust_enforcement::status_http_readonly_bearer_served reject=trust_enforcement::status_http_no_token_unauthorized code=reject.status_token_missing bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-21-router-soc-1mib-streaming-profile.md
+claim      STATUS-HOST sym=src/http_edge.rs::status_auth_decision accept=trust_enforcement::status_http_ip_literal_host_served reject=trust_enforcement::status_http_dns_host_refused code=reject.status_host_mismatch bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-21-router-soc-1mib-streaming-profile.md
+kani       STATUS-K  sym=src/http_edge.rs::status_auth_decision harness=proof_status_auth_requires_readonly_unscoped_token_and_host cover=status refused
 claim      G-SEAL    sym=src/gateway/engine.rs::gateway_memfd_seal_decision accept=trust_enforcement::gseal_sealed_memfd_stored reject=trust_enforcement::gseal_unsealed_memfd_refused code=reject.gateway_memfd_unsealed bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md
 claim      G-UID     sym=src/gateway/engine.rs::gateway_peer_uid_decision accept=trust_enforcement::guid_allowed_peer_uid_served reject=trust_enforcement::guid_peer_uid_not_allowed_refused code=reject.gateway_peer_uid_not_allowed bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md
 kani       S-GUARD   sym=src/network/wot.rs::slash_target_decision harness=proof_slash_guard_protects_genesis_and_self cover=protected key not slashed
@@ -155,4 +157,4 @@ kani       S-SANITIZE sym=src/sync/common.rs::sanitize_sync_relative_path_into h
 claim      B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision accept=trust_enforcement::bseed_second_sender_accepted_while_one_job_runs reject=trust_enforcement::bseed_third_job_refused_busy code=reject.syndication_busy bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe
 kani       B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision harness=proof_syndication_fanout_budget cover=syndication over budget
 
-ratchet    R         open=7 waive=11
+ratchet    R         open=7 waive=10

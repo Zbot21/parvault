@@ -1234,6 +1234,21 @@ mod unix_impl {
             }
         }
 
+        /// `QueryStatus` (item 3) synchronously: in-process, the engine runs the same decision
+        /// with this process's UID; over the socket, the daemon does.
+        pub fn query_status_sync(
+            &self,
+            macaroon: Option<CapabilityMacaroon>,
+        ) -> io::Result<StatusSnapshot> {
+            match self {
+                #[cfg(feature = "daemon-runtime")]
+                Self::InProcess(engine) => engine
+                    .query_status(macaroon.as_ref(), Some(crate::os_sys::geteuid()))
+                    .map_err(|e| io::Error::other(e.to_string())),
+                Self::UnixSocket(client) => client.query_status(macaroon),
+            }
+        }
+
         /// Registers an existing or sparse virtual `FileManifest` synchronously.
         pub fn register_manifest_sync(
             &self,

@@ -18,7 +18,7 @@ pub mod network;
 pub mod os_sys;
 pub mod por;
 pub mod profile;
-#[cfg(feature = "daemon-runtime")]
+#[cfg(all(unix, feature = "status-ui"))]
 pub mod router_nas;
 pub mod sharding;
 pub mod storage;

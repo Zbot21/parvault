@@ -6314,3 +6314,221 @@ fn status_ipc_without_root_key_refused() {
     assert!(status_client(&sock).query_status(Some(tok)).is_err());
     assert_logged(&node, "reject.status_unavailable");
 }
+
+// --- Item 3: the status page over HTTP (status_auth_decision at the shared edge) ----------------
+
+/// Starts `parvault up` with the status page on an ephemeral loopback port.
+fn status_up(label: &str, key: Option<[u8; 32]>) -> (Node, std::net::SocketAddr) {
+    let (root, dir, reg, log) = prepare(label);
+    if let Some(k) = key {
+        std::fs::write(dir.join("macaroon_root.key"), hex::encode(k)).unwrap();
+    }
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .arg("--data-dir")
+        .arg(&dir)
+        .args([
+            "--no-lan-discovery",
+            "up",
+            "--listen",
+            common::LOOPBACK_EPHEMERAL,
+            "--status-http",
+            "127.0.0.1:0",
+        ]);
+    let node = spawn(cmd, root, dir, log);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let text = node.log_text();
+        if let Some(rest) = text.split("Status Server listening on http://").nth(1) {
+            let addr = rest.split_whitespace().next().unwrap().parse().unwrap();
+            return (node, addr);
+        }
+        assert!(Instant::now() < deadline, "no status listener:\n{text}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn status_token(caveats: Vec<parvault::capabilities::Caveat>) -> String {
+    gw_token(caveats).to_compact_token()
+}
+
+fn ro_token() -> String {
+    status_token(vec![parvault::capabilities::Caveat::ReadOnly])
+}
+
+/// Sends `parts` as separate writes (50 ms apart) and returns the raw response.
+fn http_raw(addr: std::net::SocketAddr, parts: &[&[u8]]) -> Vec<u8> {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        s.write_all(p).unwrap();
+    }
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    out
+}
+
+fn status_get(addr: std::net::SocketAddr, host: &str, auth: Option<String>) -> (u16, Vec<u8>) {
+    let mut req = format!("GET /api/v1/health HTTP/1.1\r\nHost: {host}\r\n");
+    if let Some(a) = auth {
+        req.push_str(&format!("Authorization: {a}\r\n"));
+    }
+    req.push_str("\r\n");
+    let raw = http_raw(addr, &[req.as_bytes()]);
+    let code = String::from_utf8_lossy(&raw)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    (code, raw)
+}
+
+fn host_of(addr: std::net::SocketAddr) -> String {
+    addr.to_string()
+}
+
+/// STATUS-AUTH accept: a ReadOnly, unscoped Bearer token reads the status JSON.
+#[test]
+fn status_http_readonly_bearer_served() {
+    let (_node, addr) = status_up("sh-ok", Some(GW_KEY));
+    let (code, raw) = status_get(addr, &host_of(addr), Some(format!("Bearer {}", ro_token())));
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&raw));
+    assert!(String::from_utf8_lossy(&raw).contains(env!("CARGO_PKG_VERSION")));
+    gate_ran("trust_enforcement::status_http_readonly_bearer_served");
+}
+
+/// STATUS-AUTH reject: no token, the fixed 401 (F-46: the page was open to anyone who could reach it).
+#[test]
+fn status_http_no_token_unauthorized() {
+    let (node, addr) = status_up("sh-none", Some(GW_KEY));
+    let (code, raw) = status_get(addr, &host_of(addr), None);
+    assert_eq!(code, 401);
+    assert_eq!(raw, parvault::http_edge::STATUS_401);
+    assert_logged(&node, "reject.status_token_missing");
+    gate_ran("trust_enforcement::status_http_no_token_unauthorized");
+}
+
+/// STATUS-HOST accept: an IP-literal Host with a valid token is served.
+#[test]
+fn status_http_ip_literal_host_served() {
+    let (_node, addr) = status_up("sh-host-ok", Some(GW_KEY));
+    let host = format!("localhost:{}", addr.port());
+    let (code, _) = status_get(addr, &host, Some(format!("Bearer {}", ro_token())));
+    assert_eq!(code, 200);
+    let (code, _) = status_get(addr, &host_of(addr), Some(format!("Bearer {}", ro_token())));
+    assert_eq!(code, 200);
+    gate_ran("trust_enforcement::status_http_ip_literal_host_served");
+}
+
+/// STATUS-HOST reject: a DNS-name Host (DNS rebinding) is refused even with a valid token.
+#[test]
+fn status_http_dns_host_refused() {
+    let (node, addr) = status_up("sh-host-bad", Some(GW_KEY));
+    let host = format!("rebind.example:{}", addr.port());
+    let (code, _) = status_get(addr, &host, Some(format!("Bearer {}", ro_token())));
+    assert_eq!(code, 403);
+    assert_logged(&node, "reject.status_host_mismatch");
+    gate_ran("trust_enforcement::status_http_dns_host_refused");
+}
+
+/// L-45: the token as the Basic password works (a browser prompt), and never in the URL.
+#[test]
+fn status_http_basic_password_served() {
+    use base64::Engine as _;
+    let (_node, addr) = status_up("sh-basic", Some(GW_KEY));
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("status:{}", ro_token()));
+    let (code, _) = status_get(addr, &host_of(addr), Some(format!("Basic {basic}")));
+    assert_eq!(code, 200);
+}
+
+/// The other refusals: scoped (403), not ReadOnly and AllowedPeerUid over TCP (the same 401);
+/// the token text never reaches the log.
+#[test]
+fn status_http_token_refusals_and_no_token_in_log() {
+    use parvault::capabilities::Caveat;
+    let (node, addr) = status_up("sh-refuse", Some(GW_KEY));
+    let h = host_of(addr);
+    let scoped = status_token(vec![Caveat::ReadOnly, Caveat::AllowedManifest([3; 32])]);
+    assert_eq!(
+        status_get(addr, &h, Some(format!("Bearer {scoped}"))).0,
+        403
+    );
+    assert_logged(&node, "reject.status_token_scoped");
+    let rw = status_token(vec![]);
+    let (code, raw) = status_get(addr, &h, Some(format!("Bearer {rw}")));
+    assert_eq!(
+        (code, raw.as_slice()),
+        (401, parvault::http_edge::STATUS_401)
+    );
+    assert_logged(&node, "reject.status_not_readonly");
+    let uid = status_token(vec![Caveat::ReadOnly, Caveat::AllowedPeerUid(0)]);
+    let (code, raw) = status_get(addr, &h, Some(format!("Bearer {uid}")));
+    assert_eq!(
+        (code, raw.as_slice()),
+        (401, parvault::http_edge::STATUS_401)
+    );
+    assert_logged(&node, "reject.status_peer_uid");
+    let log = node.log_text();
+    for t in [&scoped, &rw, &uid, &ro_token()] {
+        assert!(!log.contains(t.as_str()), "token text in the node log");
+    }
+}
+
+/// The shared edge on the status port: 431 over 8 KiB, a head split across writes is served,
+/// a stalled head is dropped unanswered, and the 9th connection from one IP is dropped.
+#[test]
+fn status_http_edge_limits() {
+    let (_node, addr) = status_up("sh-edge", Some(GW_KEY));
+    let big = format!(
+        "GET /api/v1/health HTTP/1.1\r\nHost: {}\r\nX-Pad: {}\r\n\r\n",
+        host_of(addr),
+        "a".repeat(9000)
+    );
+    assert!(String::from_utf8_lossy(&http_raw(addr, &[big.as_bytes()])).starts_with("HTTP/1.1 431"));
+    let head = format!(
+        "GET /api/v1/health HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\n\r\n",
+        host_of(addr),
+        ro_token()
+    );
+    let (a, b) = head.as_bytes().split_at(20);
+    assert!(String::from_utf8_lossy(&http_raw(addr, &[a, b])).starts_with("HTTP/1.1 200"));
+    // Stalled: half a head, then nothing; the 5 s head deadline closes it with no bytes.
+    let t0 = Instant::now();
+    let stalled = http_raw(addr, &[b"GET / HTTP/1.1\r\n"]);
+    assert!(stalled.is_empty() && t0.elapsed() < Duration::from_secs(9));
+    // Eight idle connections hold every per-IP slot; the 9th is closed unanswered at once.
+    let held: Vec<_> = (0..8)
+        .map(|_| std::net::TcpStream::connect(addr).unwrap())
+        .collect();
+    std::thread::sleep(Duration::from_millis(200));
+    let t0 = Instant::now();
+    let ninth = http_raw(addr, &[head.as_bytes()]);
+    assert!(ninth.is_empty() && t0.elapsed() < Duration::from_secs(2));
+    drop(held);
+}
+
+/// No server without a verifier (L-44): with --status-http and no key, the daemon creates the
+/// gateway root key, verifies under it, and still refuses a request without a token.
+#[test]
+fn status_http_creates_root_key_and_verifies() {
+    let (node, addr) = status_up("sh-nokey", None);
+    let key_hex = std::fs::read_to_string(node.dir.join("macaroon_root.key")).unwrap();
+    let key: [u8; 32] = hex::decode(key_hex.trim()).unwrap().try_into().unwrap();
+    let tok = parvault::capabilities::CapabilityMacaroon::mint(
+        &key,
+        [5; 32],
+        [6; 32],
+        vec![parvault::capabilities::Caveat::ReadOnly],
+    )
+    .unwrap()
+    .to_compact_token();
+    assert_eq!(status_get(addr, &host_of(addr), None).0, 401);
+    assert_eq!(
+        status_get(addr, &host_of(addr), Some(format!("Bearer {tok}"))).0,
+        200
+    );
+}

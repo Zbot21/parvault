@@ -1347,3 +1347,39 @@ fn proof_syndication_fanout_budget() {
         assert!(sender + 1 <= MAX_SYNDICATIONS_PER_SENDER);
     }
 }
+
+/// Item 3 (plan-3, F-46): `status_auth_decision` serves a status byte only when the node can
+/// verify and has a snapshot, a valid read-only unscoped token is present, every peer-UID
+/// caveat matches, and the Host is allowed. Each failing fact on its own refuses.
+#[kani::proof]
+fn proof_status_auth_requires_readonly_unscoped_token_and_host() {
+    let f = crate::http_edge::StatusAuthFacts {
+        verifier_present: kani::any(),
+        provider_present: kani::any(),
+        token_present: kani::any(),
+        token_valid: kani::any(),
+        read_only: kani::any(),
+        scoped: kani::any(),
+        peer_uid_ok: kani::any(),
+        host_allowed: kani::any(),
+    };
+    let decision = crate::http_edge::status_auth_decision(&f);
+    kani::cover!(decision.is_err(), "status refused");
+    kani::cover!(decision.is_ok(), "status served");
+    if decision.is_ok() {
+        assert!(f.verifier_present && f.provider_present);
+        assert!(f.token_present && f.token_valid && f.read_only && !f.scoped);
+        assert!(f.peer_uid_ok && f.host_allowed);
+    }
+    if f.verifier_present
+        && f.provider_present
+        && f.token_present
+        && f.token_valid
+        && f.read_only
+        && !f.scoped
+        && f.peer_uid_ok
+        && f.host_allowed
+    {
+        assert!(decision.is_ok());
+    }
+}

@@ -165,12 +165,15 @@ fn assert_cmd_ok(out: &Output, ctx: &str) -> String {
     stdout
 }
 
-fn http_get_raw(port: u16, path: &str) -> (u16, String, String) {
+/// GET with the status page's read-only token (item 3: every request presents one).
+fn http_get_raw(port: u16, path: &str, token: &str) -> (u16, String, String) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect HTTP status server");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set read timeout");
-    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
     stream
         .write_all(req.as_bytes())
         .expect("write HTTP request");
@@ -929,8 +932,21 @@ fn test_4_embedded_router_nas_status_server_http_and_html_dashboard() {
     );
 
     // 1. Verify `GET /api/v1/health`
+    // Item 3: the daemon created the gateway root key for --status-http; mint a read-only token.
+    let status_tok = {
+        let hex_key = std::fs::read_to_string(router_dir.join("macaroon_root.key")).unwrap();
+        let key: [u8; 32] = hex::decode(hex_key.trim()).unwrap().try_into().unwrap();
+        parvault::capabilities::CapabilityMacaroon::mint(
+            &key,
+            [1; 32],
+            [2; 32],
+            vec![parvault::capabilities::Caveat::ReadOnly],
+        )
+        .unwrap()
+        .to_compact_token()
+    };
     let (status_health, headers_health, body_health) =
-        http_get_raw(status_http_port, "/api/v1/health");
+        http_get_raw(status_http_port, "/api/v1/health", &status_tok);
     assert_eq!(status_health, 200);
     let headers_lower = headers_health.to_ascii_lowercase();
     assert!(headers_lower.contains("application/json"));
@@ -963,7 +979,7 @@ fn test_4_embedded_router_nas_status_server_http_and_html_dashboard() {
     // 2. Verify `GET /api/v1/peers` (poll briefly if background updater hasn't completed tick 1)
     let mut peers: Vec<RouterNasPeerEntry> = Vec::new();
     for _ in 0..20 {
-        let (st, _, b) = http_get_raw(status_http_port, "/api/v1/peers");
+        let (st, _, b) = http_get_raw(status_http_port, "/api/v1/peers", &status_tok);
         assert_eq!(st, 200);
         peers = serde_json::from_str(&b).expect("deserialize RouterNasPeerEntry vec");
         if !peers.is_empty() {
@@ -978,7 +994,7 @@ fn test_4_embedded_router_nas_status_server_http_and_html_dashboard() {
     assert!(peers[0].multiaddr.contains("/p2p/"));
 
     // 3. Verify `GET /` HTML dashboard (`< 6 KiB` target, VmRSS/VmHWM; item 3: no SAS code)
-    let (status_html, headers_html, body_html) = http_get_raw(status_http_port, "/");
+    let (status_html, headers_html, body_html) = http_get_raw(status_http_port, "/", &status_tok);
     assert_eq!(status_html, 200);
     assert!(headers_html.to_ascii_lowercase().contains("text/html"));
     assert!(
@@ -996,8 +1012,11 @@ fn test_4_embedded_router_nas_status_server_http_and_html_dashboard() {
     );
 
     // 4. Verify unknown path returns `404 Not Found` JSON
-    let (status_404, headers_404, body_404) =
-        http_get_raw(status_http_port, "/api/v1/nonexistent-endpoint");
+    let (status_404, headers_404, body_404) = http_get_raw(
+        status_http_port,
+        "/api/v1/nonexistent-endpoint",
+        &status_tok,
+    );
     assert_eq!(status_404, 404);
     assert!(headers_404
         .to_ascii_lowercase()

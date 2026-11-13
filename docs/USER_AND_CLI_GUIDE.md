@@ -138,6 +138,8 @@ parvault up \
 ```
 This prints a **4-word BIP-39 SAS pairing code** (e.g. `shield-copper-alpine-matrix`), launches the P2P daemon, responds to signed LAN discovery beacons on UDP `4009`, and serves the live web dashboard on port `4080`.
 
+The status page needs a read-only token on every request (v0.5.0): run `parvault token mint --read-only` on the node, open `http://<node-ip>:4080`, and enter the token as the password (any user name), or send `Authorization: Bearer <token>` to `/api/v1/health`. Use an IP address or `localhost`, not a host name: DNS names are refused (DNS rebinding). Without `--status-http` there is no status listener.
+
 #### 3. Zero-IP Auto-Discovery & Pairing on Laptops (`parvault discover` & `join`)
 On any other computer on your Wi-Fi/LAN:
 ```bash

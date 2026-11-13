@@ -7,7 +7,7 @@ set -euo pipefail
 cd "${1:-.}"
 CARGO=${CARGO:-cargo}
 # Plugin feature sets. A new plugin feature (e.g. status-ui) is added here and to the combined set.
-SETS=("ipc-client" "vfs" "ipc-client,vfs")
+SETS=("ipc-client" "vfs" "status-ui" "ipc-client,vfs" "vfs,status-ui" "ipc-client,vfs,status-ui")
 BANNED='^(tokio|libp2p[a-z0-9_-]*|mio|quinn[a-z0-9_-]*)$'
 fail=0
 for set in "${SETS[@]}"; do

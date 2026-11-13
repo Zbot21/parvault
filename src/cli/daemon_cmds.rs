@@ -51,17 +51,19 @@ pub(crate) async fn up(env: CliEnv, command: Commands) -> anyhow::Result<()> {
     )?;
     // F-43 (L-44): built-in WebDAV verifies every request against the root key, so one
     // must exist when it is on (created like `parvault token mint` does).
-    let macaroon_root_key = if vfs_webdav_listen.is_some() {
-        Some(parvault::gateway::load_or_create_macaroon_root_key(
-            &cfg.data_dir,
-            macaroon_root_key_hex.as_deref(),
-        )?)
-    } else {
-        parvault::gateway::resolve_optional_macaroon_root_key(
-            &cfg.data_dir,
-            macaroon_root_key_hex.as_deref(),
-        )?
-    };
+    // Item 3: the status page verifies every request too.
+    let macaroon_root_key =
+        if vfs_webdav_listen.is_some() || status_http.is_some() || cfg.status_http_bind.is_some() {
+            Some(parvault::gateway::load_or_create_macaroon_root_key(
+                &cfg.data_dir,
+                macaroon_root_key_hex.as_deref(),
+            )?)
+        } else {
+            parvault::gateway::resolve_optional_macaroon_root_key(
+                &cfg.data_dir,
+                macaroon_root_key_hex.as_deref(),
+            )?
+        };
     if let Some(listen_override) = listen {
         cfg.listen_tcp = listen_override;
     }
@@ -144,7 +146,11 @@ pub(crate) async fn daemon(env: CliEnv, command: Commands) -> anyhow::Result<()>
             )?;
             // F-43 (L-44): built-in WebDAV verifies every request against the root key, so one
             // must exist when it is on (created like `parvault token mint` does).
-            let macaroon_root_key = if vfs_webdav_listen.is_some() {
+            // Item 3: the status page verifies every request too.
+            let macaroon_root_key = if vfs_webdav_listen.is_some()
+                || status_http.is_some()
+                || cfg.status_http_bind.is_some()
+            {
                 Some(parvault::gateway::load_or_create_macaroon_root_key(
                     &cfg.data_dir,
                     macaroon_root_key_hex.as_deref(),
