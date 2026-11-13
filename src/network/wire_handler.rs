@@ -409,11 +409,9 @@ pub enum AdmissionClass {
     SelfAuthorised,
     /// Authorised by a council or reporter signature checked inside the arm.
     CouncilSigned,
-    /// Requires an admitted peer.
+    /// Requires an admitted peer. Onion relays are in this class (F-33, L-38): the originator
+    /// is admitted at the entry relay, and each relay's forward is admitted at the next hop.
     AdmittedPeer,
-    /// An onion relay: forwarding needs no admission (the originator stays hidden); a final
-    /// delivery requires the last hop's sender to be admitted, checked inside the arm.
-    RelayCarried,
 }
 
 /// The refusal text sent to a sender that is not admitted (the reason code stays in the log).
@@ -485,7 +483,7 @@ pub const fn admission_class(request: &MeshWireRequest) -> AdmissionClass {
         | MeshWireRequest::PorAudit(_)
         | MeshWireRequest::MultiSegmentPorAudit(_)
         | MeshWireRequest::GetDhtEnvelope { .. } => AdmissionClass::SelfAuthorised,
-        MeshWireRequest::RelayPqOnionEnvelope { .. } => AdmissionClass::RelayCarried,
+        MeshWireRequest::RelayPqOnionEnvelope { .. } => AdmissionClass::AdmittedPeer,
         MeshWireRequest::SubmitAbuseTakedownReport(_)
         | MeshWireRequest::BroadcastEvictionOrder(_) => AdmissionClass::CouncilSigned,
         // v0.5.0: blinded-shard vouchers are self-certifying (F-24), so a blinded put needs an
@@ -1388,12 +1386,6 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                     }
                 }
             } else if let Ok(bundle) = envelope.open_final_target_pq(pq_kem) {
-                if !admitted(peer, AdmissionClass::AdmittedPeer, wot) {
-                    return MeshWireResponse::RelayPqOnionAck {
-                        delivered: false,
-                        error: Some(NOT_ADMITTED_TEXT.to_string()),
-                    };
-                }
                 if let Some(reason) = eviction.is_ingress_blocked(
                     remote_ip,
                     Some(remote_peer_id),
@@ -1450,12 +1442,6 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
             } else {
                 match envelope.open_pq(pq_kem) {
                     Ok((blinded_id, shard_bytes)) => {
-                        if !admitted(peer, AdmissionClass::AdmittedPeer, wot) {
-                            return MeshWireResponse::RelayPqOnionAck {
-                                delivered: false,
-                                error: Some(NOT_ADMITTED_TEXT.to_string()),
-                            };
-                        }
                         if let Some(reason) = eviction.is_ingress_blocked(
                             remote_ip,
                             Some(remote_peer_id),
@@ -2044,7 +2030,6 @@ mod tests {
             AdmissionClass::PreAdmission,
             AdmissionClass::SelfAuthorised,
             AdmissionClass::CouncilSigned,
-            AdmissionClass::RelayCarried,
         ] {
             assert_eq!(admission_decision(&facts(class, None, false)), Ok(()));
         }

@@ -68,8 +68,8 @@ claim      F-36      sym=src/por/verifier.rs::shard_delete_decision accept=trust
 claim      F-22      sym=src/network/wan_rendezvous.rs::register accept=trust_enforcement::f22_rendezvous_within_quota_stored reject=trust_enforcement::f22_rendezvous_over_quota_refused code=reject.rendezvous_quota bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::RegisterWanRendezvous
 open       F-22      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 claim      F-23      sym=src/network/wire_handler.rs::renew_decision accept=trust_enforcement::f23_capability_holder_renews reject=trust_enforcement::f23_stranger_renew_refused code=reject.renew_capability_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::RenewBlindedLease
-claim      F-33      sym=src/network/wire_handler.rs::handle_mesh_wire_request accept=trust_enforcement::f33_admitted_originator_relayed reject=trust_enforcement::f33_relay_budget_exceeded_refused code=reject.onion_relay_budget bin=parvault ref=docs/security/TRUST_FINDINGS.md
-open       F-33      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+claim      F-33      sym=src/network/wire_handler.rs::admission_decision accept=trust_enforcement::f33_admitted_originator_relayed reject=trust_enforcement::f33_unadmitted_originator_refused code=reject.peer_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::RelayPqOnionEnvelope
+claim      F-33-BUDGET sym=src/network/server_events.rs::relay_forward_decision accept=trust_enforcement::f33_relay_within_budget_forwarded reject=trust_enforcement::f33_relay_over_budget_refused code=reject.relay_budget bin=parvault ref=docs/security/TRUST_FINDINGS.md
 
 # --- F-37 (2b) and 2c findings declared before their tests (architect 2b sign-off) ---
 claim      F-37      sym=src/network/wot.rs::ring_handshake_decision accept=trust_enforcement::f37_ring_node_admits_real_chain reject=trust_enforcement::f37_ticket_only_node_refuses_zero_rooted_chain code=reject.handshake_no_ring bin=parvault ref=docs/security/TRUST_FINDINGS.md
@@ -88,4 +88,4 @@ open       F-34      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FIND
 claim      F-35      sym=src/storage/anonymity.rs::redeem_voucher accept=trust_enforcement::f35_fresh_voucher_redeemed reject=trust_enforcement::f35_expired_voucher_refused code=reject.voucher_expired bin=parvault ref=docs/security/TRUST_FINDINGS.md
 open       F-35      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 
-ratchet    R         open=17 waive=0
+ratchet    R         open=16 waive=0

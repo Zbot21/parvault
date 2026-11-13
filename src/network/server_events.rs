@@ -27,12 +27,12 @@ pub const MAX_INFLIGHT_RELAYS_PER_PEER: usize = 4;
 
 /// Admits one more deferred onion forward only under both in-flight caps. Removing the blocking
 /// forward removed the only back-pressure on relaying; these caps replace it (F-33).
-pub fn relay_budget_decision(
+pub fn relay_forward_decision(
     in_flight_total: usize,
     in_flight_peer: usize,
 ) -> Result<(), &'static str> {
     if in_flight_total >= MAX_INFLIGHT_RELAYS || in_flight_peer >= MAX_INFLIGHT_RELAYS_PER_PEER {
-        Err("reject.onion_relay_budget")
+        Err("reject.relay_budget")
     } else {
         Ok(())
     }
@@ -279,7 +279,7 @@ impl ServerSwarmEvents {
                     WireReply::Deferred(job) => {
                         let in_flight_peer =
                             self.relays_per_peer.get(&peer_str).copied().unwrap_or(0);
-                        match relay_budget_decision(self.deferred.len(), in_flight_peer) {
+                        match relay_forward_decision(self.deferred.len(), in_flight_peer) {
                             Ok(()) => {
                                 *self.relays_per_peer.entry(peer_str.clone()).or_insert(0) += 1;
                                 self.deferred.push(Box::pin(async move {
@@ -320,18 +320,18 @@ mod tests {
 
     #[test]
     fn relay_budget_caps_total_and_per_peer() {
-        assert_eq!(relay_budget_decision(0, 0), Ok(()));
+        assert_eq!(relay_forward_decision(0, 0), Ok(()));
         assert_eq!(
-            relay_budget_decision(MAX_INFLIGHT_RELAYS - 1, MAX_INFLIGHT_RELAYS_PER_PEER - 1),
+            relay_forward_decision(MAX_INFLIGHT_RELAYS - 1, MAX_INFLIGHT_RELAYS_PER_PEER - 1),
             Ok(())
         );
         assert_eq!(
-            relay_budget_decision(MAX_INFLIGHT_RELAYS, 0),
-            Err("reject.onion_relay_budget")
+            relay_forward_decision(MAX_INFLIGHT_RELAYS, 0),
+            Err("reject.relay_budget")
         );
         assert_eq!(
-            relay_budget_decision(0, MAX_INFLIGHT_RELAYS_PER_PEER),
-            Err("reject.onion_relay_budget")
+            relay_forward_decision(0, MAX_INFLIGHT_RELAYS_PER_PEER),
+            Err("reject.relay_budget")
         );
     }
 

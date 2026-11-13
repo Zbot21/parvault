@@ -963,9 +963,8 @@ struct OnionSend {
     lease: crate::storage::BlindedLeaseSpec,
 }
 
-/// Originates onion uploads (ADR-11). It wraps a private client that never presents an
-/// admission credential, but it dials with the node's ring transport key, so the entry relay
-/// learns the originator's IP and ring identity. Onion routing hides the originator only from
+/// Originates onion uploads (ADR-11). It presents its ring credential at the entry relay,
+/// which admits it (F-33, L-38) and so learns the originator's IP and ring identity. Onion routing hides the originator only from
 /// the final target and the storage host. The relay's forward to the final target presents the
 /// relay's own chain. Unlinkable entry (an ephemeral key) is planned for v0.6.0.
 pub struct OnionOriginator {
@@ -998,7 +997,7 @@ impl OnionOriginator {
                 voucher,
                 lease,
             },
-            false,
+            true,
         )
     }
 
@@ -1009,7 +1008,7 @@ impl OnionOriginator {
         outer_envelope: PqRelayedShardEnvelope,
     ) -> anyhow::Result<()> {
         self.client
-            .send_layered_onion(entry_relay, outer_envelope, false)
+            .send_layered_onion(entry_relay, outer_envelope, true)
     }
 }
 

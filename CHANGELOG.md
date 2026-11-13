@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Security
+- **Onion relays need admission (F-33, L-38).** `RelayPqOnionEnvelope` is admitted like other storage requests: the originator presents its ring credential at the entry relay, and each relay at the next hop. A relay keeps at most 4 forwards in flight per sender and 64 in total, and refuses more (`relay busy; retry later`). Forwards no longer block the swarm task (F-18).
 - **F-37 (critical, pre-release):** a public-commons node outside any ring used the all-zero key as a placeholder genesis, and signatures were checked non-strictly, so a stranger could forge a one-hop chain and be admitted as a ring member. A node with no ring now has no genesis and refuses every `HandshakeWoT`; all Ed25519 checks use strict verification.
 - **Ring admission is enforced (item 2b, `docs/security/TRUST_FINDINGS.md`).** Storage requests (`PutShard`, `SyndicateLiteStripe`, `PutDhtEnvelope`, `PutBlindedShard`, onion final delivery) need an admitted sender; others get `peer not admitted; v0.5.0 requires ring admission`. Start a ring with `parvault wot init` and add devices with `parvault wot invite` / `parvault wot install-chain`. No node creates a genesis on its own any more: a private-mode daemon outside any ring, or with conflicting genesis sources, refuses to start. `v0.4.0` peers are refused.
 - Onion originators (`OnionOriginator`) never present a ring credential to the entry relay; only the relay's forward to the final target is admitted.

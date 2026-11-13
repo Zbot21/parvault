@@ -1364,45 +1364,77 @@ fn provision_process_genesis() {
     ONCE.call_once(|| std::env::set_var("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED)));
 }
 
-/// F-27 (ADR-11): a ring member that originates a layered onion through a relay is neither
-/// admitted at nor identified to the relay (the originator path cannot present a credential,
-/// although one is reachable in this process); the relay's last hop to the target is admitted.
-#[test]
-fn ring_member_originator_stays_anonymous_at_the_relay() {
-    provision_process_genesis();
-    let relay = spawn_daemon("b1-relay");
-    let target = spawn_daemon("b1-target");
-    let originator = key(0xF7);
-    let originator_id = node_identity_libp2p_peer_id(&originator).unwrap();
-    let b = blinded(0x57, 512);
+/// A 2-layer onion through `relay_kem` to a target, with `relay_jitter_ms` at the relay.
+fn f33_layered(
+    relay: &Node,
+    target_kem: &parvault::crypto::HybridKemPublicKey,
+    target_addr: String,
+    originator: &NodeIdentity,
+    seed: u8,
+    relay_jitter_ms: u64,
+) -> PqRelayedShardEnvelope {
+    let b = blinded(seed, 512);
     let bundle = parvault::crypto::pqc::PqOnionFinalBundle {
         blinded_id: b.id,
         shard_bytes: b.bytes.clone(),
         capability: b.cap,
-        voucher: AnonymousQuotaVoucher::mint(&originator, 8192),
+        voucher: AnonymousQuotaVoucher::mint(originator, 8192),
         current_epoch: 1,
         lease_duration_epochs: 30,
         delete_verifier: b.delete_verifier,
     };
-    let layered = PqRelayedShardEnvelope::seal_layered_pq(
+    PqRelayedShardEnvelope::seal_layered_pq(
         &relay.kem_public(),
         "relay",
-        &target.kem_public(),
-        target.addr.clone(),
+        target_kem,
+        target_addr,
         &bundle,
-        0,
+        relay_jitter_ms,
         0,
     )
-    .unwrap();
+    .unwrap()
+}
+
+fn f33_relay_request(
+    envelope: PqRelayedShardEnvelope,
+    originator: &NodeIdentity,
+) -> MeshWireRequest {
+    let b = blinded(0x58, 512);
+    MeshWireRequest::RelayPqOnionEnvelope {
+        target_peer_addr: None,
+        envelope,
+        capability: b.cap,
+        voucher: AnonymousQuotaVoucher::mint(originator, 8192),
+        current_epoch: 1,
+        lease_duration_epochs: 30,
+        delete_verifier: b.delete_verifier,
+    }
+}
+
+/// F-33 accept (L-38): a ring member originates a layered onion through `OnionOriginator`; it is
+/// admitted at the entry relay (so the relay knows its ring key, as ADR-11 now says), the relay
+/// forwards under its own identity, and the target delivers.
+#[test]
+fn f33_admitted_originator_relayed() {
+    provision_process_genesis();
+    let relay = spawn_daemon("f33-relay");
+    let target = spawn_daemon("f33-target");
+    let originator = key(0xF7);
+    let layered = f33_layered(
+        &relay,
+        &target.kem_public(),
+        target.addr.clone(),
+        &originator,
+        0x57,
+        0,
+    );
     parvault::network::OnionOriginator::new(originator.clone(), Vec::new())
         .send_layered_onion(&relay.addr, layered)
         .unwrap_or_else(|e| panic!("{e}\nrelay log:\n{}", relay.log_text()));
-    let relay_log = relay.log_text();
     assert!(
-        !relay_log
-            .lines()
-            .any(|l| l.contains("routing table updated") && l.contains(&originator_id.to_string())),
-        "{relay_log}"
+        !relay.log_text().contains("reject.peer_not_admitted"),
+        "{}",
+        relay.log_text()
     );
     // The last hop (relay -> target) is admitted: the target routes the relay.
     let relay_id = relay.peer_id().to_string();
@@ -1414,50 +1446,55 @@ fn ring_member_originator_stays_anonymous_at_the_relay() {
         "{}",
         target.log_text()
     );
-    gate_ran("trust_enforcement::ring_member_originator_stays_anonymous_at_the_relay");
+    gate_ran("trust_enforcement::f33_admitted_originator_relayed");
 }
 
-/// F-24 (relay): an originator without a chain sends a 2-layer onion through an admitted relay;
-/// the relay peels its layer and forwards under its own identity, and the target delivers. Only
-/// the last hop's sender is checked, so the originator is never asked to identify itself.
+/// F-33 reject (L-38): an originator without a chain is refused at the entry relay; nothing is
+/// forwarded (no open relay).
 #[test]
-fn f24_onion_relay_forwards_for_unadmitted_originator() {
-    let relay = spawn_daemon("f24-relay");
-    let target = spawn_daemon("f24-target");
+fn f33_unadmitted_originator_refused() {
+    let relay = spawn_daemon("f33-relay-r");
+    let target = spawn_daemon("f33-target-r");
     let originator = key(0xF3);
-    let b = blinded(0x54, 512);
-    let bundle = parvault::crypto::pqc::PqOnionFinalBundle {
-        blinded_id: b.id,
-        shard_bytes: b.bytes.clone(),
-        capability: b.cap,
-        voucher: AnonymousQuotaVoucher::mint(&originator, 8192),
-        current_epoch: 1,
-        lease_duration_epochs: 30,
-        delete_verifier: b.delete_verifier,
-    };
-    let layered = PqRelayedShardEnvelope::seal_layered_pq(
-        &relay.kem_public(),
-        "relay",
+    let layered = f33_layered(
+        &relay,
         &target.kem_public(),
         target.addr.clone(),
-        &bundle,
-        0,
-        0,
-    )
-    .unwrap();
-    let resp = send_as_stranger(
         &originator,
-        &relay,
-        MeshWireRequest::RelayPqOnionEnvelope {
-            target_peer_addr: None,
-            envelope: layered,
-            capability: b.cap,
-            voucher: AnonymousQuotaVoucher::mint(&originator, 8192),
-            current_epoch: 1,
-            lease_duration_epochs: 30,
-            delete_verifier: b.delete_verifier,
-        },
+        0x54,
+        0,
     );
+    let resp = send_as_stranger(&originator, &relay, f33_relay_request(layered, &originator));
+    assert_eq!(
+        refusal_text(&resp).as_deref(),
+        Some(NOT_ADMITTED),
+        "{resp:?}"
+    );
+    assert_logged(&relay, "reject.peer_not_admitted");
+    let relay_id = relay.peer_id().to_string();
+    assert!(
+        !target.log_text().contains(&relay_id),
+        "the relay forwarded:\n{}",
+        target.log_text()
+    );
+    gate_ran("trust_enforcement::f33_unadmitted_originator_refused");
+}
+
+/// F-33 budget accept: one forward from an admitted originator is within budget and delivered.
+#[test]
+fn f33_relay_within_budget_forwarded() {
+    let relay = spawn_daemon("f33-budget-a");
+    let target = spawn_daemon("f33-budget-target");
+    let originator = key(0xF8);
+    let layered = f33_layered(
+        &relay,
+        &target.kem_public(),
+        target.addr.clone(),
+        &originator,
+        0x59,
+        0,
+    );
+    let resp = send(&originator, &relay, f33_relay_request(layered, &originator));
     assert!(
         matches!(
             resp,
@@ -1466,12 +1503,69 @@ fn f24_onion_relay_forwards_for_unadmitted_originator() {
                 ..
             }
         ),
-        "{resp:?}\nrelay log:\n{}\ntarget log:\n{}",
-        relay.log_text(),
-        target.log_text()
+        "{resp:?}\nrelay log:\n{}",
+        relay.log_text()
     );
-    assert!(!target.log_text().contains("reject.peer_not_admitted"));
-    gate_ran("trust_enforcement::f24_onion_relay_forwards_for_unadmitted_originator");
+    assert!(!relay.log_text().contains("reject.relay_budget"));
+    gate_ran("trust_enforcement::f33_relay_within_budget_forwarded");
+}
+
+/// F-33 budget reject: an admitted originator with more forwards in flight than the per-sender
+/// budget is refused, not queued. The forwards wait on a 250 ms jitter and a next hop that never
+/// answers (a blackhole address), so they stay in flight while the extra requests arrive.
+#[test]
+fn f33_relay_over_budget_refused() {
+    let relay = spawn_daemon("f33-budget-r");
+    let originator = key(0xF9);
+    let blackhole_target = key(0xFA);
+    let target_kem = HybridKemKeypair::generate().unwrap().public_key();
+    let target_addr = format!(
+        "/ip4/10.255.255.1/tcp/9/p2p/{}",
+        node_identity_libp2p_peer_id(&blackhole_target).unwrap()
+    );
+    // Admit the originator first, so every concurrent request goes straight to the relay arm.
+    let warm = f33_layered(
+        &relay,
+        &target_kem,
+        target_addr.clone(),
+        &originator,
+        0x60,
+        0,
+    );
+    let _ = client(&originator).send_request(&relay.addr, f33_relay_request(warm, &originator));
+    let n = parvault::network::server_events::MAX_INFLIGHT_RELAYS_PER_PEER + 4;
+    let handles: Vec<_> = (0..n)
+        .map(|i| {
+            let req = f33_relay_request(
+                f33_layered(
+                    &relay,
+                    &target_kem,
+                    target_addr.clone(),
+                    &originator,
+                    0x61 + i as u8,
+                    250,
+                ),
+                &originator,
+            );
+            let c = client(&originator);
+            let addr = relay.addr.clone();
+            std::thread::spawn(move || c.send_request(&addr, req).ok())
+        })
+        .collect();
+    let busy = handles
+        .into_iter()
+        .filter_map(|h| h.join().unwrap())
+        .filter(|r| {
+            refusal_text(r).as_deref() == Some(parvault::network::server_events::RELAY_BUSY_TEXT)
+        })
+        .count();
+    assert!(
+        busy > 0,
+        "no forward was refused\nrelay log:\n{}",
+        relay.log_text()
+    );
+    assert_logged(&relay, "reject.relay_budget");
+    gate_ran("trust_enforcement::f33_relay_over_budget_refused");
 }
 
 // --- F-23: lease renewal needs the capability key -----------------------------------------------------
