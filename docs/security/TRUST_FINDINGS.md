@@ -118,6 +118,8 @@ Claim lines in `.enforcement.map` use the finding id, or the finding id with a s
 | F-43-PIN | Low | `parvault-fuse` cannot verify its own pinned `--macaroon` (no root key), so a wrong token surfaces only at the first uncached read; on a cache hit the WebDAV edge check is the only check. | post-v0.5.0 | Open (L-44) |
 | F-43-NOEXPIRY | Low | Expiry is not required: a non-expiring read-only token sent in clear stays valid until the root key rotates. | post-v0.5.0 | Open (L-44) |
 | G-MAC | Info | D-ADR claim for ADR-28: a gateway read frame whose attenuated macaroon is outside its caveat is refused, per frame (`gateway_macaroon_decision`). | 2c | Enforced (QA pending) |
+| G-SEAL | Info | D-ADR claim for ADR-32: under `--require-sealed-memfd` an unsealed ingest memfd is refused (`gateway_memfd_seal_decision`). | 2c | Enforced (QA pending) |
+| G-UID | Info | D-ADR claim for ADR-32: under `--allow-peer-uid` a client whose `SO_PEERCRED` UID is not listed is refused (`gateway_peer_uid_decision`). | 2c | Enforced (QA pending) |
 | F-33-BUDGET | Per-sender and total in-flight forward budget at a relay. |
 | F-24-LAYERED | F-24 admission at onion final delivery, layered branch (`open_final_target_pq`). |
 | F-25-DHT | F-25 admission for `PutDhtEnvelope`. |

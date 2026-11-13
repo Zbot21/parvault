@@ -5044,3 +5044,47 @@ fn gmac_frame_outside_caveat_refused() {
     assert_logged(&node, "reject.gateway_macaroon_caveat");
     gate_ran("trust_enforcement::gmac_frame_outside_caveat_refused");
 }
+
+/// ADR-32 accept: under --require-sealed-memfd a sealed memfd is stored.
+#[test]
+fn gseal_sealed_memfd_stored() {
+    let (_node, sock) = gw_up("gseal-ok", &["--require-sealed-memfd"], None);
+    gw_store(&sock, &[0x32; 8192], true).unwrap();
+    gate_ran("trust_enforcement::gseal_sealed_memfd_stored");
+}
+
+/// ADR-32 reject: under --require-sealed-memfd an unsealed memfd is refused with its own code.
+#[test]
+fn gseal_unsealed_memfd_refused() {
+    let (node, sock) = gw_up("gseal-bad", &["--require-sealed-memfd"], None);
+    assert!(gw_store(&sock, &[0x33; 8192], false).is_err());
+    assert_logged(&node, "reject.gateway_memfd_unsealed");
+    gate_ran("trust_enforcement::gseal_unsealed_memfd_refused");
+}
+
+/// ADR-32 accept: a client whose UID is on --allow-peer-uid is served.
+#[test]
+fn guid_allowed_peer_uid_served() {
+    let uid = parvault::os_sys::geteuid().to_string();
+    let (_node, sock) = gw_up(
+        "guid-ok",
+        &["--strict-plugins", "--allow-peer-uid", &uid],
+        None,
+    );
+    gw_store(&sock, &[0x34; 8192], false).unwrap();
+    gate_ran("trust_enforcement::guid_allowed_peer_uid_served");
+}
+
+/// ADR-32 reject: a client whose UID is not on --allow-peer-uid is refused with its own code.
+#[test]
+fn guid_peer_uid_not_allowed_refused() {
+    let other = (parvault::os_sys::geteuid() + 1).to_string();
+    let (node, sock) = gw_up(
+        "guid-bad",
+        &["--strict-plugins", "--allow-peer-uid", &other],
+        None,
+    );
+    assert!(gw_store(&sock, &[0x35; 8192], false).is_err());
+    assert_logged(&node, "reject.gateway_peer_uid_not_allowed");
+    gate_ran("trust_enforcement::guid_peer_uid_not_allowed_refused");
+}
