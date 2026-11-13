@@ -728,6 +728,23 @@ impl LocalKeystoreSealer for LocalFileKeystore {
 mod tests {
     use super::*;
 
+    /// F-37: with the all-zero (small-order) key, `R` = identity and `s` = 0, a non-strict
+    /// verifier accepts about one message in four. Find such a message, then check that
+    /// `verify_with_pubkey` (strict) refuses it; reverting to non-strict `verify` fails here.
+    #[test]
+    fn verify_with_pubkey_rejects_small_order_key_forgery() {
+        use ed25519_dalek::Verifier;
+        let zero = [0u8; 32];
+        let mut sig = [0u8; 64];
+        sig[0] = 1; // R = identity point encoding; s = 0
+        let weak = VerifyingKey::from_bytes(&zero).expect("all-zero decodes to a point");
+        let forged_msg = (0u32..256)
+            .map(|i| format!("forged hop {i}").into_bytes())
+            .find(|m| weak.verify(m, &Signature::from_bytes(&sig)).is_ok())
+            .expect("non-strict verify accepts some forged message");
+        assert!(!NodeIdentity::verify_with_pubkey(&zero, &forged_msg, &sig));
+    }
+
     #[test]
     fn test_subkey_domain_separation_and_node_identity_key_separation() {
         let mk = MasterKey::generate();
