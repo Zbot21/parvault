@@ -1,6 +1,7 @@
 # ADR-01: Fixed-Size Streaming Stripes & Encrypt-Before-Shard Pipeline
 
 - **Status:** Accepted — Extended by [ADR-13](ADR-13-symmetric-pq-grover-baseline-and-cascaded-aead.md) and [ADR-21](ADR-21-router-soc-1mib-streaming-profile.md)
+- **Formal model:** `specs/ParVaultConfidentialityAndTrust.tla`
 - **Subsystem:** `crypto::aes` / `sharding::reed_solomon` / `sharding::merkle`
 - **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
 

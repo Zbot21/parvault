@@ -1,4 +1,13 @@
 --------------------------- MODULE ParVaultProtocol ---------------------------
+\* @traceability
+\*   adr      ADR-04 ADR-05 ADR-09
+\*   const    K                 -> model-only: erasure tier tuple (ErasureTier::erasure_params), not a Rust const
+\*   const    N                 -> model-only: erasure tier tuple (ErasureTier::erasure_params), not a Rust const
+\*   const    RepairWatermark   -> model-only: model repair threshold
+\*   const    MaxEpochChurn     -> model-only: @assume bounded-epoch-churn (threat model)
+\*   const    MaxLeafFailures   -> src/network/wot.rs::MAX_LEAF_FAILURES
+\*   const    MaxSubtreeSlashes -> src/network/wot.rs::DEFAULT_SUBTREE_SLASH_LIMIT
+\* @end
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS

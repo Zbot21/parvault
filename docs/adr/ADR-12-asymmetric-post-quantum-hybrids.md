@@ -1,6 +1,7 @@
 # ADR-12: Asymmetric Post-Quantum Hybrid KEM & Signatures (`X25519 + ML-KEM-768` & `Ed25519 + ML-DSA-65`)
 
 - **Status:** Accepted
+- **Formal model:** `specs/ParVaultPostQuantum.tla`
 - **Subsystem:** `crypto::pqc`
 - **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
 

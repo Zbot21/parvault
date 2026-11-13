@@ -44,6 +44,19 @@ xref       X-ADR-CONTRIB path=CONTRIBUTING.md pattern=ADR-(\d+) target=docs/adr/
 
 # --- Formal proofs (P-01 to P-05; mutants are authored by QA) --------------------------------------
 tla-spec   T-SPECS   path=specs/*.tla
+# M5a: spec <-> ADR <-> Rust traceability; each @guard sym is reached from a production entry.
+tla-trace  T-TRACE   path=specs/*.tla
+reach      TR-NULLIFIER-FRESH sym=src/storage/anonymity.rs::redeem_voucher from=src/network/wire_handler.rs::handle_mesh_wire_request
+reach      TR-TIER-RESPECTS-SLASH sym=src/bootstrap.rs::evaluate from=src/cli/daemon.rs::run_daemon
+reach      TR-SLASHED-STICKY sym=src/storage/quota.rs::trust_level from=src/cli/daemon.rs::run_daemon
+reach      TR-HYBRID-SIG-BOTH sym=src/crypto/pqc.rs::hybrid_signature_decision from=src/network/wire_handler.rs::handle_mesh_wire_request
+reach      TR-READ-AUTH-OWNER sym=src/por/verifier.rs::grant_owner_decision from=src/network/wire_handler.rs::handle_mesh_wire_request
+reach      TR-READ-AUTH-REPAIR sym=src/por/verifier.rs::repair_read_decision from=src/network/wire_handler.rs::handle_mesh_wire_request
+reach      TR-WOT-ADMISSION sym=src/network/wot.rs::chain_admission_decision from=src/network/wire_handler.rs::handle_mesh_wire_request
+reach      TR-QUORUM-COUNT sym=src/storage/eviction.rs::tally_and_verify_quorum_raw from=src/network/wire_handler.rs::handle_mesh_wire_request
+reach      TR-NONCE-FRESH sym=src/admin_rpc.rs::validate_admin_rpc_slice_replay_and_auth_meta from=src/bin/parvault-seed.rs::main
+reach      TR-ORDER-ID-FRESH sym=src/storage/eviction.rs::replay_slot_check from=src/network/wire_handler.rs::handle_mesh_wire_request
+reach      TR-RING-SCOPE sym=src/storage/council.rs::council_from_manifest from=src/network/wire_handler.rs::handle_mesh_wire_request
 # L-47 guard-removal mutants (QA, independent); each @guard line names its Rust decision via sym=.
 tla-mutant TM-READ-OWNER    spec=specs/ParVaultProtocol.tla inv=DataSecrecyInvariant patch=specs/mutants/ParVaultProtocol-read-auth-owner.patch
 tla-mutant TM-READ-REPAIR   spec=specs/ParVaultProtocol.tla inv=DataSecrecyInvariant patch=specs/mutants/ParVaultProtocol-read-auth-repair.patch

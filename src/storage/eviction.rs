@@ -1,3 +1,4 @@
+//! Formal model: `specs/ParVaultZeroKeyAdminAndQuorum.tla` (guards `quorum-count`, `order-id-fresh`).
 use crate::crypto::aes::{
     compute_sha256, decrypt_manifest, decrypt_stripe, encrypt_manifest, CryptoError,
 };

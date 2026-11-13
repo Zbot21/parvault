@@ -1,4 +1,11 @@
 ------------------- MODULE ParVaultBootstrapAndEarnedTier -------------------
+\* @traceability
+\*   adr      ADR-15
+\*   const    MaxOrganicPeers       -> model-only: model bound
+\*   const    SeedAnchorPoolSize    -> model-only: model bound
+\*   const    MaxPorStreak          -> model-only: abstracts the 50 / 200 PoR-pass thresholds of PeerCreditAccount::trust_level
+\*   const    MaxSybilNodesOnSubnet -> model-only: unused since b7e72ce removed the per-subnet Sybil credit
+\* @end
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 CONSTANTS

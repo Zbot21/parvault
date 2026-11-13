@@ -1,8 +1,8 @@
 diff --git a/specs/ParVaultZeroKeyAdminAndQuorum.tla b/specs/ParVaultZeroKeyAdminAndQuorum.tla
-index bdfa095..7dc5883 100644
+index b423315..0407955 100644
 --- a/specs/ParVaultZeroKeyAdminAndQuorum.tla
 +++ b/specs/ParVaultZeroKeyAdminAndQuorum.tla
-@@ -120,7 +120,7 @@ OrderIdFresh(id) == id \notin seenOrderIds   \* @guard order-id-fresh sym=src/st
+@@ -128,7 +128,7 @@ OrderIdFresh(id) == id \notin seenOrderIds   \* @guard order-id-fresh sym=src/st
  \* A PrivateRing node resolves its order authority from the manifest whose scope root is its
  \* genesis (owner) key (council_scope_root / council_from_manifest), never the public council.
  OrderMeetsPrivateRingAuth(ord) ==

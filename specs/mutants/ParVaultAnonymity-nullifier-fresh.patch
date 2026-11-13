@@ -1,8 +1,8 @@
 diff --git a/specs/ParVaultAnonymity.tla b/specs/ParVaultAnonymity.tla
-index 7400f7a..5e42bf4 100644
+index e50acf7..3e8e9f7 100644
 --- a/specs/ParVaultAnonymity.tla
 +++ b/specs/ParVaultAnonymity.tla
-@@ -35,7 +35,7 @@ ASSUME
+@@ -41,7 +41,7 @@ ASSUME
  Senders == {"None", "OwnerNode", "RelayNode"}
  
  \* The guard: a voucher nullifier is accepted only once (`VoucherNullifierLedger`).

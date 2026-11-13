@@ -1,3 +1,4 @@
+//! Formal model: `specs/ParVaultConfidentialityAndTrust.tla` (guard `slashed-sticky`).
 use crate::config::ErasureTier;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};

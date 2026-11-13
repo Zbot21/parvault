@@ -1,6 +1,7 @@
 # ADR-11: 4-Layer Cryptographic Shard Anonymization & 2-Layer Onion Relaying
 
 - **Status:** Accepted
+- **Formal model:** `specs/ParVaultAnonymity.tla`
 - **Subsystem:** `storage::anonymity` / `crypto::pqc` / `network::client`
 - **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
 

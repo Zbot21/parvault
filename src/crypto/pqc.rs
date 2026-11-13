@@ -1,3 +1,4 @@
+//! Formal model: `specs/ParVaultPostQuantum.tla` (guard `hybrid-sig-both`).
 use crate::crypto::aes::deserialize_bounded;
 use crate::crypto::bip39::{normalize_seed_phrase_nfkd, validate_bip39_mnemonic};
 use crate::crypto::keys::{

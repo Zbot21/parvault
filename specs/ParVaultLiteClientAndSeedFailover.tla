@@ -1,4 +1,11 @@
 ------------------- MODULE ParVaultLiteClientAndSeedFailover -------------------
+\* @traceability
+\*   adr      ADR-20
+\*   const    K                    -> model-only: erasure tier tuple (ErasureTier::erasure_params), not a Rust const
+\*   const    N                    -> model-only: erasure tier tuple (ErasureTier::erasure_params), not a Rust const
+\*   const    TotalVaultFiles      -> model-only: model bound
+\*   const    SelectiveTargetCount -> model-only: model bound
+\* @end
 EXTENDS Naturals
 
 CONSTANTS

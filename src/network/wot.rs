@@ -1,3 +1,4 @@
+//! Formal model: `specs/ParVaultProtocol.tla` (guard `wot-admission`).
 use crate::crypto::keys::NodeIdentity;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

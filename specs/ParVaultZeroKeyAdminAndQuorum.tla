@@ -1,8 +1,16 @@
 ------------------- MODULE ParVaultZeroKeyAdminAndQuorum -------------------
+\* @traceability
+\*   adr      ADR-16 ADR-25 ADR-26
+\*   const    HonestCouncil    -> model-only: model identities
+\*   const    ByzantineCouncil -> model-only: model identities (@assume byzantine-below-quorum)
+\*   const    StrangerSigners  -> model-only: model identities
+\*   const    QuorumM          -> model-only: the quorum comes from the installed council manifest
+\*   const    MaxNonces        -> model-only: model bound
+\* @end
 EXTENDS Naturals, FiniteSets, Sequences
 
 \* Formal TLA+ Specification of ParVault's Zero-Private-Key-On-VPS `admin_rpc`
-\* Architecture and Federated `M-of-N` Council Eviction Governance (`ADR-19`).
+\* Architecture and Federated `M-of-N` Council Eviction Governance (`ADR-26`).
 \*
 \* Models:
 \*  1. A front-line `parvault-seed` VPS provisioned with `--admin-rpc-pubkey`
@@ -297,7 +305,7 @@ AdversaryAttemptReplay ==
                    confirmedAbuseTargets, honestOrderSigs, forgedOrderBuilt,
                    tamperedOrderBuilt, privateRingEvicted, ownerOrderSigned>>
 
-\* 10. Cross-mode broadcast check (`ADR-19` Strict Mode Isolation):
+\* 10. Cross-mode broadcast check (`ADR-26` Strict Mode Isolation):
 \*     A quorum-signed Public Tracker Council order and the owner's own order both reach a
 \*     `HomelabRedundancyVault` (`PrivateRing`) node, which evaluates each ONLY against
 \*     `{HomelabOwner}`. A rejected order changes nothing (no counter is bumped).

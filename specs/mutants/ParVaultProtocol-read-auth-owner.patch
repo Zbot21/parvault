@@ -1,8 +1,8 @@
 diff --git a/specs/ParVaultProtocol.tla b/specs/ParVaultProtocol.tla
-index 1e9a0c0..0584986 100644
+index 1da71a4..62c4589 100644
 --- a/specs/ParVaultProtocol.tla
 +++ b/specs/ParVaultProtocol.tla
-@@ -32,7 +32,7 @@ ASSUME AdvKeys \cap ({Owner, Genesis, Self} \cup Witnesses) = {}   \* @assume ad
+@@ -41,7 +41,7 @@ ASSUME AdvKeys \cap ({Owner, Genesis, Self} \cup Witnesses) = {}   \* @assume ad
  
  \* The guards: each compares a presented credential with honest state, and is used by both the
  \* adversary's attempts (it fails) and the honest access (it passes).

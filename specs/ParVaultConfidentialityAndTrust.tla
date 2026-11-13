@@ -1,4 +1,10 @@
 --------------------- MODULE ParVaultConfidentialityAndTrust ---------------------
+\* @traceability
+\*   adr      ADR-01 ADR-10
+\*   const    K         -> model-only: erasure tier tuple (ErasureTier::erasure_params), not a Rust const
+\*   const    N         -> model-only: erasure tier tuple (ErasureTier::erasure_params), not a Rust const
+\*   const    MaxPasses -> model-only: model bound on uptime passes
+\* @end
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 CONSTANTS

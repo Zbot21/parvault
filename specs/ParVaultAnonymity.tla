@@ -1,4 +1,10 @@
 --------------------------- MODULE ParVaultAnonymity ---------------------------
+\* @traceability
+\*   adr      ADR-11
+\*   const    K           -> model-only: erasure tier tuple (ErasureTier::erasure_params), not a Rust const
+\*   const    N           -> model-only: erasure tier tuple (ErasureTier::erasure_params), not a Rust const
+\*   const    MaxVouchers -> model-only: model bound on minted vouchers
+\* @end
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 \* ============================================================================

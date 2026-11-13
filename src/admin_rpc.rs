@@ -5,6 +5,8 @@
 //! `SignedBadActorEvictionOrder` batches, and update anti-Sybil Hashcash PoW thresholds across a
 //! fleet of `parvault-seed` nodes — while keeping **zero admin private keys** on front-line VPS
 //! seed servers and **zero plaintext warrant IPs** on the wire or on disk (`ADR-26`).
+//!
+//! Formal model: `specs/ParVaultZeroKeyAdminAndQuorum.tla` (guard `nonce-fresh`).
 
 use crate::crypto::NodeIdentity;
 use crate::storage::{

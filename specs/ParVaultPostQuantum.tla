@@ -1,4 +1,10 @@
 ------------------------- MODULE ParVaultPostQuantum -------------------------
+\* @traceability
+\*   adr      ADR-12 ADR-13
+\*   const    ClassicalMasterKeyBits -> model-only: key size (512-bit PqVaultMasterKey), not a Rust const
+\*   const    ClassicalAesBits       -> model-only: cipher parameter (AES-256)
+\*   const    MinPostQuantumBitFloor -> model-only: Grover floor (@assume grover-quadratic-only)
+\* @end
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 \* ============================================================================

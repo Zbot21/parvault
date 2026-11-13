@@ -1,3 +1,4 @@
+//! Formal model: `specs/ParVaultAnonymity.tla` (guard `nullifier-fresh`).
 use crate::crypto::aes::deserialize_bounded;
 use crate::crypto::{
     compute_sha256, decrypt_manifest, encrypt_manifest, pad_plaintext_iso_bucket,

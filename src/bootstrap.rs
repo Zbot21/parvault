@@ -20,6 +20,8 @@
 //!    Rewards early adopters for committed standby capacity during bootstrap epochs while applying
 //!    $1 / \sqrt{M_{\text{subnet}}}$ inverse-square-root Sybil quota damping per `/24` subnet and
 //!    strictly bounding per-stripe fault domains to $\le N - K$ shards per `/24`.
+//!
+//! Formal model: `specs/ParVaultBootstrapAndEarnedTier.tla` (guard `tier-respects-slash`).
 
 use crate::crypto::pqc::{HybridPqPublicKey, HybridPqSignature, HybridPqSigningKeypair};
 use crate::crypto::CryptoError;

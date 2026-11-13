@@ -1,3 +1,4 @@
+//! Formal model: `specs/ParVaultProtocol.tla` (guards `read-auth-owner`, `read-auth-repair`).
 use crate::config::ErasureTier;
 use crate::crypto::keys::NodeIdentity;
 use crate::por::challenger::{

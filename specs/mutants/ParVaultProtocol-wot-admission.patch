@@ -1,8 +1,8 @@
 diff --git a/specs/ParVaultProtocol.tla b/specs/ParVaultProtocol.tla
-index 1e9a0c0..52f379a 100644
+index 1da71a4..90cb8b5 100644
 --- a/specs/ParVaultProtocol.tla
 +++ b/specs/ParVaultProtocol.tla
-@@ -34,7 +34,7 @@ ASSUME AdvKeys \cap ({Owner, Genesis, Self} \cup Witnesses) = {}   \* @assume ad
+@@ -43,7 +43,7 @@ ASSUME AdvKeys \cap ({Owner, Genesis, Self} \cup Witnesses) = {}   \* @assume ad
  \* adversary's attempts (it fails) and the honest access (it passes).
  OwnerReadOk(signer) == signer = Owner   \* @guard read-auth-owner sym=src/por/verifier.rs::grant_owner_decision
  RepairReadOk(receipts) == Cardinality(receipts \cap Witnesses) >= MinWitnessSignatures   \* @guard read-auth-repair sym=src/por/verifier.rs::repair_read_decision
