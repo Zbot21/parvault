@@ -84,6 +84,7 @@ Status values:
 | ID | Line | Status |
 | :--- | :--- | :--- |
 | E-WIRE | Every `MeshWireRequest` variant is covered by a claim. | Passes (2c): all 23 variants are covered, except `QueryNodeStatus` (public by design, bucketed values, F-44) and `LookupWanRendezvous` (the slot code authorises; registration capped; public-slot enumeration under F-22), excluded by architect ruling. |
+| ADR-07 | A peer's shards are accepted only within its quota (bootstrap grace plus earned allowance) and a per-epoch write ceiling of 4x that quota (`quota_decision`; `reject.peer_quota_exceeded`, `reject.peer_write_amplification`). | Claim (2c D-ADR). SLA multipliers (item 2) are not implemented: credit is never earned in v0.5.0. |
 | ADR-08 | A wire frame longer than `MAX_WIRE_FRAME_BYTES` (32 MiB) is refused from its length prefix, before allocation (`wire_frame_decision`, `reject.wire_frame_oversized`; log code only, the codec answers nothing). | Claim (2c D-ADR): pair over a real libp2p connection. |
 | ADR-22 | A LAN beacon is recorded only if well formed, bound to its own key (no spoofed peer id), fresh within 15 s, and signed by that key (`beacon_decision`; `reject.beacon_*`). | Claim (2c D-ADR): pair through `parvault discover` on a registry dir. |
 | E-POR | `PorAudit` and `MultiSegmentPorAudit` read disk only for the session-key holder's fresh, unseen, HMAC-valid challenge (`por_prescreen_decision`). | Claim (2c item 5). |

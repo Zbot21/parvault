@@ -4763,3 +4763,48 @@ fn adr22_forged_beacon_ignored() {
     assert!(text.contains("reject.beacon_sig_invalid"), "{text}");
     gate_ran("trust_enforcement::adr22_forged_beacon_ignored");
 }
+
+// --- ADR-07: per-peer quota (bootstrap grace) on PutShard ------------------------------------------
+
+/// A daemon whose per-peer bootstrap grace is 4 KiB (`config.toml`).
+fn spawn_daemon_with_grace(label: &str) -> Node {
+    let (root, dir, reg, log) = prepare(label);
+    let cfg = parvault::config::NodeConfig {
+        data_dir: dir.clone(),
+        bootstrap_grace_bytes: 4096,
+        ..parvault::config::NodeConfig::default()
+    };
+    let cfg_path = root.path().join("config.toml");
+    std::fs::write(&cfg_path, toml::to_string_pretty(&cfg).unwrap()).unwrap();
+    let mut cmd = daemon_command(&dir, &reg);
+    cmd.arg("--config").arg(&cfg_path);
+    spawn(cmd, root, dir, log)
+}
+
+/// ADR-07 accept: a peer's shard within its 4 KiB grace is stored.
+#[test]
+fn adr07_shard_within_peer_quota_stored() {
+    let node = spawn_daemon_with_grace("adr07-a");
+    let member = key(0xD3);
+    let (sid, bytes) = shard(0x41, 3000);
+    assert!(stored(&send(
+        &member,
+        &node,
+        put_shard("", sid, bytes, None)
+    )));
+    gate_ran("trust_enforcement::adr07_shard_within_peer_quota_stored");
+}
+
+/// ADR-07 reject: the same peer's second 3000-byte shard exceeds its grace and is refused.
+#[test]
+fn adr07_shard_over_peer_quota_refused() {
+    let node = spawn_daemon_with_grace("adr07-r");
+    let member = key(0xD3);
+    let (a, ab) = shard(0x41, 3000);
+    let (b, bb) = shard(0x42, 3000);
+    assert!(stored(&send(&member, &node, put_shard("", a, ab, None))));
+    let resp = send(&member, &node, put_shard("", b, bb, None));
+    assert!(!stored(&resp), "{resp:?}");
+    assert_logged(&node, "reject.peer_quota_exceeded");
+    gate_ran("trust_enforcement::adr07_shard_over_peer_quota_refused");
+}

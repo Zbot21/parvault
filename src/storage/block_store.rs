@@ -866,7 +866,8 @@ impl BlockStore {
                             }
                         }
                     }
-                    if !q.can_accept_shard(owner_peer_id, shard_size) {
+                    if let Err(code) = q.quota_decision(owner_peer_id, shard_size) {
+                        tracing::warn!(code, owner = owner_peer_id, "refused a shard over quota");
                         return Err(StorageError::QuotaExceeded(owner_peer_id.to_string()));
                     }
                 }
@@ -918,7 +919,8 @@ impl BlockStore {
                     let p = self.shards_dir.join(format!("{evicted_key}.shard"));
                     let _ = fs::remove_file(p);
                 }
-                if !q.can_accept_shard(owner_peer_id, shard_size) {
+                if let Err(code) = q.quota_decision(owner_peer_id, shard_size) {
+                    tracing::warn!(code, owner = owner_peer_id, "refused a shard over quota");
                     return Err(StorageError::QuotaExceeded(owner_peer_id.to_string()));
                 }
             }
