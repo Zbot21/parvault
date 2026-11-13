@@ -206,7 +206,7 @@ parvault-fuse --socket "$SOCK" --macaroon-file ./plugin.token \
 ```
 <!-- doc-cmd: node plugins -->
 ```bash
-curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
+curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
 ```
 With no ring peer to take the data, `push` keeps it on this machine and exits with code 3 ("N stripe(s) kept only on this machine: NOT backed up"):
 <!-- doc-cmd: node plugins -->
@@ -227,7 +227,7 @@ parvault init && parvault wot init
 mkdir -p /mnt/usb-nas/shared
 ```
 <!-- doc-cmd: node vfs -->
-<!-- doc-cmd: background ready="WebDAV" -->
+<!-- doc-cmd: background ready="Built-in VFS WebDAV listening on http://127.0.0.1:8088" -->
 ```bash
 parvault up --no-socket --vfs-seed-dir /mnt/usb-nas/shared --vfs-webdav-listen 127.0.0.1:8088
 ```
@@ -235,7 +235,7 @@ parvault up --no-socket --vfs-seed-dir /mnt/usb-nas/shared --vfs-webdav-listen 1
 ```bash
 # Every WebDAV request needs a read-only token from this node's data dir (F-43):
 TOKEN="$(parvault token mint --read-only --ttl-secs 86400)"
-curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
+curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
 # Finder, davfs2: any user name, the token as the password. rclone: --webdav-bearer-token "$TOKEN".
 ```
 

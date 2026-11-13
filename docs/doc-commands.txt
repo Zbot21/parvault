@@ -40,7 +40,7 @@ TOKEN=$(parvault token mint --read-only --ttl-secs 3600)
 parvault-fuse --socket "$SOCK" --macaroon-file ./plugin.token --cache-dir /tmp/pv-cache --cache-mib 512 webdav --listen 127.0.0.1:8088
 
 ## README.md:208 node=plugins
-curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
+curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
 
 ## README.md:214 node=plugins expect-exit=3
 mkdir -p ~/Documents && echo "hello" > ~/Documents/hello.txt   # something to push
@@ -53,12 +53,12 @@ parvault-sync --socket "$SOCK" --catalog ./gw-catalog.bin --macaroon-file ./plug
 parvault init && parvault wot init
 mkdir -p /mnt/usb-nas/shared
 
-## README.md:231 node=vfs background ready="WebDAV"
+## README.md:231 node=vfs background ready="Built-in VFS WebDAV listening on http://127.0.0.1:8088"
 parvault up --no-socket --vfs-seed-dir /mnt/usb-nas/shared --vfs-webdav-listen 127.0.0.1:8088
 
 ## README.md:235 node=vfs
 TOKEN="$(parvault token mint --read-only --ttl-secs 86400)"
-curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
+curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
 
 ## README.md:243 node=main skip="needs the Rust toolchain, Docker, or cross linkers and this repository; CI's rust-tests and release jobs run these"
 cargo run --release --bin parvault-bench -- run --payload-mib 64
@@ -123,9 +123,9 @@ parvault-seed admin list-takedowns --data-dir /mnt/nas/parvault-seed
 parvault-seed admin approve-takedown --data-dir /mnt/nas/parvault-seed --report-id <REPORT_ID> --note "Confirmed violation" --propagate
 parvault-seed admin emergency-evict --data-dir /mnt/nas/parvault-seed --ip 203.0.113.66 --warrant-ref "WARRANT-1234" --propagate
 
-## QUICKSTART.md:317 node=laptop background ready="WebDAV"
+## QUICKSTART.md:317 node=laptop background ready="Built-in VFS WebDAV listening on http://127.0.0.1:8088"
 parvault up --no-socket --vfs-seed-dir ~/Documents --vfs-webdav-listen 127.0.0.1:8088
 
 ## QUICKSTART.md:322 node=laptop
 TOKEN="$(parvault token mint --read-only --ttl-secs 86400)"
-curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
+curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/

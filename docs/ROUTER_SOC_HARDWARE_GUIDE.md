@@ -446,7 +446,7 @@ Every request must present a read-only token (`parvault token mint --read-only`)
 - **`GET /api/v1/health`:** Returns health, RAM telemetry, storage quotas and uptime in JSON:
   ```bash
   ( umask 077; printf 'Authorization: Bearer %s\n' "$(parvault token mint --read-only)" > /etc/parvault/status.header )
-  curl -s -H @/etc/parvault/status.header http://127.0.0.1:4080/api/v1/health
+  curl -fsS -H @/etc/parvault/status.header http://127.0.0.1:4080/api/v1/health
   ```
   ```json
   {
@@ -488,7 +488,7 @@ case "$1" in
   list) echo '{ "status": {} }' ;;
   call)
     [ "$2" = status ] || exit 1
-    curl -s -m 5 -H @/etc/parvault/status.header http://127.0.0.1:4080/api/v1/health ;;
+    curl -fsS -m 5 -H @/etc/parvault/status.header http://127.0.0.1:4080/api/v1/health ;;
 esac
 ```
 

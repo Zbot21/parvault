@@ -313,7 +313,7 @@ parvault-seed admin emergency-evict --data-dir /mnt/nas/parvault-seed --ip 203.0
 `parvault up --no-socket --vfs-seed-dir <DIR> --vfs-webdav-listen 127.0.0.1:8088` serves your vault as a WebDAV drive. Every request needs a read-only token from the same data directory:
 
 <!-- doc-cmd: node laptop -->
-<!-- doc-cmd: background ready="WebDAV" -->
+<!-- doc-cmd: background ready="Built-in VFS WebDAV listening on http://127.0.0.1:8088" -->
 ```bash
 parvault up --no-socket --vfs-seed-dir ~/Documents --vfs-webdav-listen 127.0.0.1:8088
 ```
@@ -321,7 +321,7 @@ parvault up --no-socket --vfs-seed-dir ~/Documents --vfs-webdav-listen 127.0.0.1
 <!-- doc-cmd: node laptop -->
 ```bash
 TOKEN="$(parvault token mint --read-only --ttl-secs 86400)"
-curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
+curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
 ```
 
 Clients that cannot send a Bearer token (Finder, davfs2, Windows) use any user name and the token as the password.
