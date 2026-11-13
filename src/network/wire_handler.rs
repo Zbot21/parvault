@@ -1960,7 +1960,7 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
             if !may_fetch && order.council_epoch > 0 {
                 info!(
                     code = "reject.council_first_epoch_needs_install",
-                    "no council installed; public-mode councils are installed by the operator"
+                    "no council installed and none fetched automatically (its scope root is not this node's ring genesis); install one with `parvault council install`"
                 );
             }
             if let (Some(root), Some(mc), true) =
