@@ -6,6 +6,7 @@
 skips      K-1       path=tests/*.rs
 suite      S-DOCKER  test=docker_acceptance_gate::docker_acceptance_gate needs=docker
 suite      S-NOFS    test=gateway_ipc_benchmark::test_parvault_seed_no_fs_zero_disk_and_ram_cap_enforcement needs=cmd:sh
+suite      S-FUSE-PROTO test=vfs_fuse_protocol::no_reply_opcodes_get_no_reply_and_the_loop_keeps_serving needs=cmd:sh   # plan-5 D-1: FORGET/BATCH_FORGET/INTERRUPT take no reply
 
 # --- Artifact provenance (A-DOCKER: the gate copies from the build directory; convert before item 7)
 artifact   A-DOCKER  script=scripts/docker_acceptance_gate.sh bin=parvault suite=docker_acceptance_gate::docker_acceptance_gate
@@ -21,6 +22,8 @@ adr        D-ADR     path=docs/adr/*.md
 reach      F-03      sym=src/network/wire_handler.rs::admission_decision from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
 reach      F-05      sym=src/network/wot.rs::verify_and_admit_public_ticket from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
 reach      F-06      sym=src/por/verifier.rs::verify_audit_response from=src/cli/daemon.rs::run_daemon ref=docs/security/TRUST_FINDINGS.md
+reach      VFS-FUSE-1 sym=src/vfs.rs::serve_fuse_fd_blocking from=src/bin/parvault-fuse.rs::main   # plan-5: the FUSE loop is reached from the plugin and the daemon
+reach      VFS-FUSE-2 sym=src/vfs.rs::serve_fuse_fd_blocking from=src/cli/daemon.rs::run_daemon   # plan-5: the FUSE loop is reached from the plugin and the daemon
 open       F-06      expect=reach by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 
 # --- Blocking calls on handler paths --------------------------------------------------------------

@@ -1213,6 +1213,10 @@ mod unix_vfs {
     const FUSE_RELEASEDIR: u32 = 29;
     const FUSE_INIT: u32 = 26;
     const FUSE_DESTROY: u32 = 38;
+    /// Requests the kernel expects no reply to; replying fails with `ENOENT` (plan-5 D-1).
+    const FUSE_FORGET: u32 = 2;
+    const FUSE_INTERRUPT: u32 = 36;
+    const FUSE_BATCH_FORGET: u32 = 42;
     const FUSE_OUT_HEADER_BYTES: usize = 16;
 
     #[derive(Clone, Copy)]
@@ -1403,7 +1407,11 @@ mod unix_vfs {
         let mut pkt = Vec::with_capacity(hdr.len as usize);
         pkt.extend_from_slice(&hdr.to_ne_bytes());
         pkt.extend_from_slice(body);
-        dev.write_all(&pkt)
+        match dev.write_all(&pkt) {
+            // The kernel already dropped this request (interrupted or aborted): not fatal.
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+            other => other,
+        }
     }
 
     fn serve_pure_rust_fuse_loop(mut dev: std::fs::File, vfs: &VirtualVaultFs) -> io::Result<()> {
@@ -1423,6 +1431,8 @@ mod unix_vfs {
             let payload = &buf[FUSE_IN_HEADER_BYTES..frame_end];
 
             match in_hdr.opcode {
+                // No reply: the kernel only informs us (inode dropped, request interrupted).
+                FUSE_FORGET | FUSE_BATCH_FORGET | FUSE_INTERRUPT => {}
                 FUSE_INIT => {
                     let out = FuseInitOut {
                         major: FUSE_KERNEL_VERSION,
