@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+- **The FUSE mount no longer dies on the kernel's first FORGET.** The `/dev/fuse` loop replied ENOSYS to FORGET, BATCH_FORGET and INTERRUPT, which take no reply; the kernel refused the reply with ENOENT and the loop exited, leaving the mount `ENOTCONN`. Those three now get no reply, and an ENOENT on a reply is not fatal (plan-5 D-1).
+
+### Added
+- **Mounted-filesystem MP4 gate (design ledger §7.2).** `tests/vfs_mp4_seek_gate.rs` mounts the vault through the real kernel (`fusermount3`, no root) and over WebDAV `HTTP 206` with a ReadOnly bearer token. Real `ffprobe` must probe a 12 MiB H.264 file with at most 2 cache misses and no middle stripe fetched. `ffmpeg -ss` must decode the same frames as the local file within a 3 MiB cache. The cold mid-file read must take < 50 ms, and the `parvault-fuse` plugin's peak RSS must stay < 16 MiB. The time and RSS budgets are asserted in release builds; under `GATES_REQUIRE_REAL=1` a missing tool or a debug run fails.
+- **Docker gate stage 12c.** It runs the gate's release test binary in a container with `/dev/fuse` (FUSE and plugin legs) and in an unprivileged container (WebDAV leg). It then runs the WebDAV leg again under `tc netem delay 15ms loss 2%` with a 100 ms cold-read budget. A container without `/dev/fuse` is `SKIPPED`, which fails under `GATES_REQUIRE_REAL=1`. netem delays the HTTP hop; stripes fetched from mesh peers under netem are not covered yet. Under netem the leg logs the per-block miss set without asserting it: an abandoned `Range: bytes=N-` can hydrate up to about one TCP window of extra blocks (B-23).
+
 ### Security
 - **Plugin tokens off the command line (F-52).** `parvault-fuse`, `parvault-sync` and `parvault-status` take `--macaroon-file <path>`, refused if group or others can read it. `--macaroon <token>` still works but is visible to every local user in `/proc/<pid>/cmdline`; `--help` and the docs say so, and the examples use the file.
 - **`parvault token inspect` redacts the tag.** The HMAC tag is the bearer secret, so it now prints as `<redacted>` (text and JSON) unless `--show-tag` is given, as with the macaroon `Debug` output (F-43, L-44 item 8).

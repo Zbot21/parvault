@@ -171,6 +171,11 @@ fn test_vfs_lazy_fetch_latency() {
     // Reed-Solomon decode and AES on the first 1 MiB block, so there it is only printed.
     println!("VFS lazy fetch TTFB {ttfb:?}");
     if cfg!(debug_assertions) {
+        // Under GATES_REQUIRE_REAL=1 an unasserted budget is a failure: run with --release.
+        assert!(
+            std::env::var("GATES_REQUIRE_REAL").as_deref() != Ok("1"),
+            "TTFB {ttfb:?}: the 50 ms budget is not asserted in a debug build; run with --release (GATES_REQUIRE_REAL=1)"
+        );
         println!("(debug build: the 50 ms budget is asserted in release builds only)");
     } else {
         assert!(
