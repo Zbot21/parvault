@@ -942,10 +942,8 @@ fn test_4_embedded_router_nas_status_server_http_and_html_dashboard() {
     assert_eq!(snap.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(snap.hardware_profile, "router-soc");
     assert_eq!(snap.stripe_size_bytes, 1_048_576);
-    assert_eq!(
-        snap.pairing_sas_code.as_deref(),
-        Some(expected_sas.as_str())
-    );
+    // Item 3 (plan-3 ruling change 3): the pairing SAS code left the status snapshot.
+    assert!(!body_health.contains(expected_sas.as_str()));
     #[cfg(target_os = "linux")]
     {
         assert!(snap.rss_kib > 0, "Linux VmRSS must be > 0 KiB");
@@ -979,7 +977,7 @@ fn test_4_embedded_router_nas_status_server_http_and_html_dashboard() {
     );
     assert!(peers[0].multiaddr.contains("/p2p/"));
 
-    // 3. Verify `GET /` HTML dashboard (`< 6 KiB` target, contains VmRSS/VmHWM & 4-word SAS code)
+    // 3. Verify `GET /` HTML dashboard (`< 6 KiB` target, VmRSS/VmHWM; item 3: no SAS code)
     let (status_html, headers_html, body_html) = http_get_raw(status_http_port, "/");
     assert_eq!(status_html, 200);
     assert!(headers_html.to_ascii_lowercase().contains("text/html"));
@@ -989,8 +987,8 @@ fn test_4_embedded_router_nas_status_server_http_and_html_dashboard() {
         body_html.len()
     );
     assert!(
-        body_html.contains(&expected_sas),
-        "HTML dashboard must display the 4-word pairing SAS code '{expected_sas}'"
+        !body_html.contains(&expected_sas),
+        "item 3: the HTML dashboard must not show the pairing SAS code"
     );
     assert!(
         body_html.contains("VmRSS") || body_html.contains("VmHWM") || body_html.contains("MiB"),

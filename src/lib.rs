@@ -11,6 +11,7 @@ pub mod capabilities;
 pub mod config;
 pub mod crypto;
 pub mod gateway;
+pub mod http_edge;
 #[cfg(feature = "daemon-runtime")]
 pub mod network;
 #[cfg(unix)]

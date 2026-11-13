@@ -71,6 +71,7 @@ Every request (`IpcCommand`) and response (`IpcResponse`) over `/var/run/parvaul
 | `IpcCommand::FetchRange { manifest: EphemeralShardManifest, offset: u64, len: u64, output_fd: i32, macaroon: Option<CapabilityMacaroon> }` | `2` | **Required** (writable `memfd` / file) | Verifies `macaroon` in `< 1 ms` RAM (including `SO_PEERCRED` UID) and streams `[offset .. offset + len]` into `output_fd`. |
 | `IpcCommand::RegisterManifest { file_manifest: FileManifest }` | `3` | None | Indexes an existing or virtual `FileManifest` in gateway RAM and returns its `EphemeralShardManifest`. |
 | `IpcCommand::QueryHealthStatus` | `4` | None | Returns live `(iops, peer_count, por_sla_score)` telemetry. |
+| `IpcCommand::QueryStatus { macaroon: Option<CapabilityMacaroon> }` (appended in v0.5.0) | `5` | None | Returns `IpcResponse::StatusSnapshot`. `status_auth_decision` (`src/http_edge.rs`) checks the token first: a gateway root key and a published snapshot must exist (`reject.status_unavailable`); the token must be present, verify, be unexpired, carry `ReadOnly`, and carry no `AllowedManifest` or `ByteRange`; any `AllowedPeerUid` must match the socket peer's `SO_PEERCRED` UID. A daemon older than v0.5.0 cannot decode it; the client reports that. |
 
 `RetentionPolicy` discriminants (`u32` LE): `0 = Ephemeral`, `1 = Persistent`, `2 = PinnedRing`.
 
@@ -80,6 +81,7 @@ Every request (`IpcCommand`) and response (`IpcResponse`) over `/var/run/parvaul
 - `2 = HealthStatus { iops: u64, peer_count: u64, por_sla_score: f32 }`
 - `3 = Error { message: String }`
 - `4 = StoreSuccessLocalOnly { manifest: EphemeralShardManifest, local_only_stripes: u64 }` (appended): stored, but that many stripes stayed only on the daemon's machine because no ring peer accepted them, so they are **not backed up**. A client that does not know this variant fails to decode it rather than reporting success.
+- `5 = StatusSnapshot(StatusSnapshot)` (appended in v0.5.0): the node status (version, label, profile, peer IDs, owner PQ fingerprint, stripe size, SLA tier, storage, RSS, uptime, up to `MAX_STATUS_PEERS` = 128 LAN peers). Every string is at most `MAX_STATUS_STRING_BYTES` = 256 bytes; clients reject a snapshot over the caps. It carries no pairing SAS code and no watched-folder path.
 
 > [!NOTE]
 > The `payload_fd: i32` and `output_fd: i32` integers inside `IpcCommand` carry the sender's local descriptor number for diagnostic logging only. The gateway server **never** trusts that integer; it consumes exclusively the kernel-remapped `OwnedFd` delivered via `SCM_RIGHTS` (`MSG_CMSG_CLOEXEC`). Any surplus descriptors attached to a single `cmsg` are wrapped in `OwnedFd` and closed immediately on `recvmsg(2)` return so descriptors can never leak.

@@ -6260,3 +6260,57 @@ fn gpay_missing_token_refused() {
         .is_err());
     assert_logged(&node, "reject.gateway_macaroon_missing");
 }
+
+// --- Item 3: QueryStatus over the gateway socket (status_auth_decision) --------------------------
+
+fn status_client(sock: &Path) -> parvault::gateway::ipc::GatewayIpcClient {
+    parvault::gateway::ipc::GatewayIpcClient::new(sock)
+}
+
+/// STATUS-IPC accept: a ReadOnly, unscoped token gets the node's snapshot over the socket.
+#[test]
+fn status_ipc_readonly_token_served() {
+    let (_node, sock) = gw_up("st-ok", &[], Some(GW_KEY));
+    let snap = status_client(&sock)
+        .query_status(Some(gw_token(vec![
+            parvault::capabilities::Caveat::ReadOnly,
+        ])))
+        .unwrap();
+    assert_eq!(snap.version, env!("CARGO_PKG_VERSION"));
+    assert!(snap.within_caps());
+    gate_ran("trust_enforcement::status_ipc_readonly_token_served");
+}
+
+/// STATUS-IPC reject: no token, no status.
+#[test]
+fn status_ipc_missing_token_refused() {
+    let (node, sock) = gw_up("st-none", &[], Some(GW_KEY));
+    let err = status_client(&sock).query_status(None).unwrap_err();
+    assert!(
+        err.to_string().contains("reject.status_token_missing"),
+        "{err}"
+    );
+    assert_logged(&node, "reject.status_token_missing");
+    gate_ran("trust_enforcement::status_ipc_missing_token_refused");
+}
+
+/// A token scoped to one file is not a status token.
+#[test]
+fn status_ipc_manifest_scoped_token_refused() {
+    let (node, sock) = gw_up("st-scoped", &[], Some(GW_KEY));
+    let tok = gw_token(vec![
+        parvault::capabilities::Caveat::ReadOnly,
+        parvault::capabilities::Caveat::AllowedManifest([7; 32]),
+    ]);
+    assert!(status_client(&sock).query_status(Some(tok)).is_err());
+    assert_logged(&node, "reject.status_token_scoped");
+}
+
+/// With no gateway root key there is no verifier, so QueryStatus is refused even with a token.
+#[test]
+fn status_ipc_without_root_key_refused() {
+    let (node, sock) = gw_up("st-nokey", &[], None);
+    let tok = gw_token(vec![parvault::capabilities::Caveat::ReadOnly]);
+    assert!(status_client(&sock).query_status(Some(tok)).is_err());
+    assert_logged(&node, "reject.status_unavailable");
+}

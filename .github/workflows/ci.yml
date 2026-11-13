@@ -183,6 +183,8 @@ jobs:
         run: bash scripts/check_claim_cfg.sh .
       - name: Plugin feature sets link no tokio, libp2p, mio or quinn (L-48)
         run: bash scripts/check_no_runtime_deps.sh .
+      - name: Client-side unit tests and golden IPC wire bytes under ipc-client alone
+        run: cargo test --release --lib --no-default-features --features ipc-client
       - name: Check minimal headless build (--no-default-features, VFS excluded)
         run: cargo check --no-default-features --features daemon-runtime --bin parvault --bin parvault-seed --bin parvault-sync
       - name: Build binaries (parvault, parvault-seed, parvault-fuse, parvault-sync)

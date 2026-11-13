@@ -325,6 +325,8 @@ mod unix_engine {
         ops_counter: AtomicU64,
         bytes_ingested: AtomicU64,
         bytes_served_lan: AtomicU64,
+        /// Last snapshot the daemon published for `QueryStatus` (item 3); `None` refuses it.
+        status_snapshot: RwLock<Option<crate::gateway::ipc::StatusSnapshot>>,
     }
 
     impl GatewayEngine {
@@ -365,6 +367,7 @@ mod unix_engine {
                 strict_allowed_peer_uids: RwLock::new(None),
                 require_sealed_ingest_memfd: AtomicBool::new(false),
                 by_merkle_root: RwLock::new(HashMap::new()),
+                status_snapshot: RwLock::new(None),
                 by_shard_vec_hash: RwLock::new(HashMap::new()),
                 pinned_ring: RwLock::new(PinnedRingBudget::new(DEFAULT_PINNED_RING_MAX_BYTES)),
                 ops_counter: AtomicU64::new(0),
@@ -423,6 +426,7 @@ mod unix_engine {
                 strict_allowed_peer_uids: RwLock::new(cfg.strict_allowed_peer_uids),
                 require_sealed_ingest_memfd: AtomicBool::new(cfg.require_sealed_ingest_memfd),
                 by_merkle_root: RwLock::new(HashMap::new()),
+                status_snapshot: RwLock::new(None),
                 by_shard_vec_hash: RwLock::new(HashMap::new()),
                 pinned_ring: RwLock::new(PinnedRingBudget::new(DEFAULT_PINNED_RING_MAX_BYTES)),
                 ops_counter: AtomicU64::new(0),
@@ -525,6 +529,45 @@ mod unix_engine {
         pub fn set_require_sealed_ingest_memfd(&self, required: bool) {
             self.require_sealed_ingest_memfd
                 .store(required, Ordering::Release);
+        }
+
+        /// Publishes the snapshot `QueryStatus` serves (capped first). The daemon calls this at
+        /// start and on each refresh.
+        pub fn publish_status_snapshot(&self, snap: crate::gateway::ipc::StatusSnapshot) {
+            if let Ok(mut g) = self.status_snapshot.write() {
+                *g = Some(snap.capped());
+            }
+        }
+
+        /// `QueryStatus` (item 3): [`crate::http_edge::status_auth_decision`] under the gateway
+        /// root key, with the socket peer's UID, before the snapshot is read.
+        pub fn query_status(
+            &self,
+            macaroon: Option<&CapabilityMacaroon>,
+            peer_uid: Option<u32>,
+        ) -> anyhow::Result<crate::gateway::ipc::StatusSnapshot> {
+            let snap = self.status_snapshot.read().ok().and_then(|g| g.clone());
+            let root_key = self.macaroon_root_key.read().ok().and_then(|g| *g);
+            let verify = root_key.map(|k| move |t: &CapabilityMacaroon| t.tag_valid(&k));
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let facts = crate::http_edge::status_auth_facts(
+                macaroon,
+                verify
+                    .as_ref()
+                    .map(|v| v as &dyn Fn(&CapabilityMacaroon) -> bool),
+                now_ms,
+                crate::http_edge::StatusTransport::Socket { peer_uid },
+                true,
+                snap.is_some(),
+            );
+            if let Err(code) = crate::http_edge::status_auth_decision(&facts) {
+                tracing::warn!(code, ?peer_uid, "refused a QueryStatus");
+                anyhow::bail!("QueryStatus refused: {code}");
+            }
+            snap.ok_or_else(|| anyhow::anyhow!("QueryStatus refused: reject.status_unavailable"))
         }
 
         /// Returns `true` iff `StorePayload` requires `F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW` seals.

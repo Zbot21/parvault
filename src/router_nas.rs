@@ -6,66 +6,17 @@
 //! Built strictly with `tokio::net::TcpListener`, `tokio::io`, and `serde_json` to eliminate
 //! heavy web framework dependencies (axum/hyper/actix) and maintain a tiny binary footprint (< 32 MiB RAM).
 
-use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
-/// Peer entry discovered or registered on the local network.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RouterNasPeerEntry {
-    pub peer_id: String,
-    pub label: String,
-    pub role: String,
-    pub multiaddr: String,
-    pub available_bytes: u64,
-}
-
-/// Live snapshot of the ParVault Router Cloud-NAS appliance state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RouterNasLiveSnapshot {
-    pub version: String,
-    pub node_label: String,
-    pub hardware_profile: String,
-    pub device_peer_id: String,
-    pub libp2p_peer_id: String,
-    pub owner_pq_fingerprint: String,
-    pub stripe_size_bytes: usize,
-    pub watched_folder: Option<String>,
-    pub pairing_sas_code: Option<String>,
-    pub sla_tier: String,
-    pub used_storage_bytes: u64,
-    pub max_storage_bytes: u64,
-    pub rss_kib: u64,
-    pub hwm_kib: u64,
-    pub uptime_secs: u64,
-    pub lan_peers: Vec<RouterNasPeerEntry>,
-}
-
-impl Default for RouterNasLiveSnapshot {
-    fn default() -> Self {
-        Self {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            node_label: "parvault-router-nas".to_string(),
-            hardware_profile: "router-soc".to_string(),
-            device_peer_id: String::new(),
-            libp2p_peer_id: String::new(),
-            owner_pq_fingerprint: String::new(),
-            stripe_size_bytes: 1024 * 1024,
-            watched_folder: None,
-            pairing_sas_code: None,
-            sla_tier: "Community".to_string(),
-            used_storage_bytes: 0,
-            max_storage_bytes: 0,
-            rss_kib: 0,
-            hwm_kib: 0,
-            uptime_secs: 0,
-            lan_peers: Vec::new(),
-        }
-    }
-}
+/// Moved to `gateway::ipc` (item 3) so the sidecar and `QueryStatus` share it; the old names
+/// stay as aliases. `pairing_sas_code` and `watched_folder` are gone (plan-3 ruling change 3).
+pub use crate::gateway::ipc::{
+    StatusPeerEntry as RouterNasPeerEntry, StatusSnapshot as RouterNasLiveSnapshot,
+};
 
 impl RouterNasLiveSnapshot {
     /// Refreshes process memory telemetry and uptime.
@@ -401,17 +352,6 @@ pub fn render_dashboard_html(snap: &RouterNasLiveSnapshot) -> String {
     let label = html_escape(&snap.node_label);
     let version = html_escape(&snap.version);
     let profile = html_escape(&snap.hardware_profile);
-    let watched_folder = snap
-        .watched_folder
-        .as_ref()
-        .map(|s| html_escape(s))
-        .unwrap_or_else(|| "<em>None</em>".to_string());
-
-    let pairing_badge = match &snap.pairing_sas_code {
-        Some(code) => format!("<span class=\"sas-code\">{}</span>", html_escape(code)),
-        None => "<span class=\"badge-muted\">Standby (Run <code>parvault pair</code>)</span>"
-            .to_string(),
-    };
 
     let rss_mib = snap.rss_kib as f64 / 1024.0;
     let hwm_mib = snap.hwm_kib as f64 / 1024.0;
@@ -490,7 +430,6 @@ h1{{font-size:1.35rem;font-weight:700;display:flex;align-items:center;gap:0.5rem
 .val{{font-size:1.4rem;font-weight:700;color:var(--cyan)}}
 .bar-box{{background:#0f172a;border-radius:4px;height:10px;overflow:hidden;margin:0.5rem 0}}
 .bar{{background:linear-gradient(90deg,var(--cyan),var(--green));height:100%}}
-.sas-code{{font-family:monospace;font-size:1.05rem;font-weight:700;color:#fde047;background:#422006;padding:0.25rem 0.6rem;border-radius:6px;border:1px solid var(--amber);letter-spacing:0.05em}}
 table{{width:100%;border-collapse:collapse;font-size:0.85rem}}
 th,td{{text-align:left;padding:0.6rem;border-bottom:1px solid var(--border)}}
 th{{color:var(--muted);font-weight:600}}
@@ -507,7 +446,6 @@ footer{{margin-top:1.25rem;font-size:0.75rem;color:var(--muted);display:flex;jus
 <h1>ParVault Cloud NAS <span class="badge badge-profile">{profile}</span></h1>
 <div class="sub">Node: <strong>{label}</strong> &bull; v{version} &bull; Uptime: {uptime} &bull; SLA: {sla}</div>
 </div>
-<div>{pairing}</div>
 </header>
 <div class="grid">
 <div class="card">
@@ -522,8 +460,7 @@ footer{{margin-top:1.25rem;font-size:0.75rem;color:var(--muted);display:flex;jus
 </div>
 <div class="card">
 <h2>NAS Sync &amp; Network</h2>
-<div style="font-size:0.85rem">Watched Folder: <strong>{watched}</strong></div>
-<div style="font-size:0.85rem;margin-top:0.3rem">Stripe Size: <strong>{stripe}</strong> &bull; Quota Limit: <strong>{max_fmt}</strong></div>
+<div style="font-size:0.85rem">Stripe Size: <strong>{stripe}</strong> &bull; Quota Limit: <strong>{max_fmt}</strong></div>
 <div style="font-size:0.75rem;margin-top:0.4rem;color:var(--muted);word-break:break-all">Libp2p: <code>{libp2p}</code></div>
 </div>
 </div>
@@ -549,7 +486,6 @@ footer{{margin-top:1.25rem;font-size:0.75rem;color:var(--muted);display:flex;jus
         version = version,
         uptime = uptime,
         sla = html_escape(&snap.sla_tier),
-        pairing = pairing_badge,
         rss_mib = rss_mib,
         hwm_mib = hwm_mib,
         mem_cls = mem_status_cls,
@@ -557,7 +493,6 @@ footer{{margin-top:1.25rem;font-size:0.75rem;color:var(--muted);display:flex;jus
         storage_pct = storage_pct,
         used_fmt = used_fmt,
         max_fmt = max_fmt,
-        watched = watched_folder,
         stripe = stripe_str,
         libp2p = libp2p_id,
         peer_count = snap.lan_peers.len(),
@@ -590,8 +525,6 @@ mod tests {
     fn test_dashboard_html_rendering_size() {
         let snap = RouterNasLiveSnapshot {
             node_label: "openwrt-gateway".to_string(),
-            pairing_sas_code: Some("apple-banana-cherry-date".to_string()),
-            watched_folder: Some("/mnt/usb-nas/shared".to_string()),
             rss_kib: 14 * 1024,
             hwm_kib: 18 * 1024,
             used_storage_bytes: 5 * 1024 * 1024 * 1024,
@@ -608,7 +541,6 @@ mod tests {
 
         let html = render_dashboard_html(&snap);
         assert!(html.contains("ParVault Cloud NAS"));
-        assert!(html.contains("apple-banana-cherry-date"));
         assert!(html.contains("openwrt-gateway"));
         assert!(html.contains("12D3KooWTestPeer1"));
         assert!(
@@ -622,7 +554,6 @@ mod tests {
     async fn test_router_nas_http_server_endpoints() -> anyhow::Result<()> {
         let initial_snap = RouterNasLiveSnapshot {
             node_label: "test-router-node".to_string(),
-            pairing_sas_code: Some("test-pair-word-code".to_string()),
             lan_peers: vec![RouterNasPeerEntry {
                 peer_id: "12D3KooWPeer1".to_string(),
                 label: "laptop".to_string(),
@@ -655,10 +586,8 @@ mod tests {
             let body = resp_str.split("\r\n\r\n").nth(1).unwrap();
             let parsed: RouterNasLiveSnapshot = serde_json::from_str(body)?;
             assert_eq!(parsed.node_label, "test-router-node");
-            assert_eq!(
-                parsed.pairing_sas_code.as_deref(),
-                Some("test-pair-word-code")
-            );
+            // Item 3: the pairing SAS code is no longer in the status snapshot.
+            assert!(!body.contains("sas"));
         }
 
         // 2. Test GET /api/v1/peers
@@ -690,7 +619,8 @@ mod tests {
             assert!(resp_str.starts_with("HTTP/1.1 200 OK"));
             assert!(resp_str.contains("Content-Type: text/html; charset=utf-8"));
             assert!(resp_str.contains("ParVault Cloud NAS"));
-            assert!(resp_str.contains("test-pair-word-code"));
+            // Item 3: the dashboard no longer shows the pairing SAS code.
+            assert!(!resp_str.contains("sas-code"));
         }
 
         // 4. Test 404 for unknown route

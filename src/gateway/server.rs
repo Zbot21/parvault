@@ -320,6 +320,14 @@ fn execute_engine_command(
                 por_sla_score,
             }
         }
+        IpcCommand::QueryStatus { macaroon } => {
+            match engine.query_status(macaroon.as_ref(), peer_uid) {
+                Ok(snap) => IpcResponse::StatusSnapshot(snap),
+                Err(e) => IpcResponse::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
     }
 }
 

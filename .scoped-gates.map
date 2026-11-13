@@ -303,6 +303,9 @@ src/admin_rpc.rs                kani    proof_admin_rpc_replay_window_challenge_
 src/admin_rpc.rs                tla     specs/ParVaultZeroKeyAdminAndQuorum.tla
 src/telemetry.rs                test    anonymous_telemetry_tests
 src/telemetry.rs                test    red_team_hardening_tests
+src/http_edge.rs                lib     http_edge::
+src/http_edge.rs                lib     gateway::ipc::
+src/http_edge.rs                test    trust_enforcement                               # STATUS-IPC socket pair
 src/router_nas.rs               lib     router_nas::
 src/router_nas.rs               test    gateway_bus_and_plugin_security                 # spawns main
 src/router_nas.rs               test    gateway_ipc_benchmark                           # spawns parvault-seed

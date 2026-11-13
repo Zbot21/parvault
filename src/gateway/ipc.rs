@@ -138,6 +138,12 @@ pub enum IpcCommand {
         file_manifest: FileManifest,
     },
     QueryHealthStatus,
+    /// Appended (item 3): the node's [`StatusSnapshot`]. Always carries a token, checked by
+    /// [`crate::http_edge::status_auth_decision`]; refused without a root key or a published
+    /// snapshot.
+    QueryStatus {
+        macaroon: Option<CapabilityMacaroon>,
+    },
 }
 
 /// Control responses returned by [`GatewayIpcServer`] over `/var/run/parvault.sock`.
@@ -164,6 +170,128 @@ pub enum IpcResponse {
         manifest: EphemeralShardManifest,
         local_only_stripes: u64,
     },
+    /// Appended (item 3): the answer to `QueryStatus`.
+    StatusSnapshot(StatusSnapshot),
+}
+
+/// Most LAN peers a [`StatusSnapshot`] carries (item 3, ruling change 3).
+pub const MAX_STATUS_PEERS: usize = 128;
+/// Longest string field, in bytes, a [`StatusSnapshot`] carries.
+pub const MAX_STATUS_STRING_BYTES: usize = 256;
+// 10 top-level strings and 4 per peer, each with an 8-byte length prefix, plus 6 + 1 u64s per
+// snapshot and peer: far below one IPC frame.
+const _: () = assert!(
+    (10 + 4 * MAX_STATUS_PEERS) * (MAX_STATUS_STRING_BYTES + 8) + (7 + MAX_STATUS_PEERS) * 8 + 64
+        < MAX_IPC_FRAME_BYTES
+);
+
+/// One LAN peer in a [`StatusSnapshot`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusPeerEntry {
+    pub peer_id: String,
+    pub label: String,
+    pub role: String,
+    pub multiaddr: String,
+    pub available_bytes: u64,
+}
+
+/// The node status served to the status page and over `QueryStatus` (was
+/// `router_nas::RouterNasLiveSnapshot`, which is now an alias). Item 3 dropped
+/// `pairing_sas_code` and `watched_folder`; strings and the peer list are capped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusSnapshot {
+    pub version: String,
+    pub node_label: String,
+    pub hardware_profile: String,
+    pub device_peer_id: String,
+    pub libp2p_peer_id: String,
+    pub owner_pq_fingerprint: String,
+    pub stripe_size_bytes: u64,
+    pub sla_tier: String,
+    pub used_storage_bytes: u64,
+    pub max_storage_bytes: u64,
+    pub rss_kib: u64,
+    pub hwm_kib: u64,
+    pub uptime_secs: u64,
+    pub lan_peers: Vec<StatusPeerEntry>,
+}
+
+impl Default for StatusSnapshot {
+    fn default() -> Self {
+        Self {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            node_label: "parvault-router-nas".to_string(),
+            hardware_profile: "router-soc".to_string(),
+            device_peer_id: String::new(),
+            libp2p_peer_id: String::new(),
+            owner_pq_fingerprint: String::new(),
+            stripe_size_bytes: 1024 * 1024,
+            sla_tier: "Community".to_string(),
+            used_storage_bytes: 0,
+            max_storage_bytes: 0,
+            rss_kib: 0,
+            hwm_kib: 0,
+            uptime_secs: 0,
+            lan_peers: Vec::new(),
+        }
+    }
+}
+
+fn cap_string(s: &mut String) {
+    if s.len() > MAX_STATUS_STRING_BYTES {
+        let mut end = MAX_STATUS_STRING_BYTES;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+}
+
+impl StatusSnapshot {
+    /// Truncates strings and the peer list to the caps (the daemon publishes only capped
+    /// snapshots).
+    pub fn capped(mut self) -> Self {
+        for s in [
+            &mut self.version,
+            &mut self.node_label,
+            &mut self.hardware_profile,
+            &mut self.device_peer_id,
+            &mut self.libp2p_peer_id,
+            &mut self.owner_pq_fingerprint,
+            &mut self.sla_tier,
+        ] {
+            cap_string(s);
+        }
+        self.lan_peers.truncate(MAX_STATUS_PEERS);
+        for p in &mut self.lan_peers {
+            for s in [&mut p.peer_id, &mut p.label, &mut p.role, &mut p.multiaddr] {
+                cap_string(s);
+            }
+        }
+        self
+    }
+
+    /// True when every string and the peer list are within the caps (clients check a decoded
+    /// snapshot with this).
+    pub fn within_caps(&self) -> bool {
+        let ok = |s: &String| s.len() <= MAX_STATUS_STRING_BYTES;
+        [
+            &self.version,
+            &self.node_label,
+            &self.hardware_profile,
+            &self.device_peer_id,
+            &self.libp2p_peer_id,
+            &self.owner_pq_fingerprint,
+            &self.sla_tier,
+        ]
+        .into_iter()
+        .all(ok)
+            && self.lan_peers.len() <= MAX_STATUS_PEERS
+            && self
+                .lan_peers
+                .iter()
+                .all(|p| ok(&p.peer_id) && ok(&p.label) && ok(&p.role) && ok(&p.multiaddr))
+    }
 }
 
 /// Domain-separated SHA-256 digest of a vector of 32-byte shard/stripe identifiers used to index
@@ -660,6 +788,35 @@ mod unix_impl {
             }
         }
 
+        /// `QueryStatus` (item 3): the node's [`StatusSnapshot`], presenting `macaroon`. A daemon
+        /// older than v0.5.0 does not know the command; that is reported as such.
+        pub fn query_status(
+            &self,
+            macaroon: Option<CapabilityMacaroon>,
+        ) -> io::Result<StatusSnapshot> {
+            let resp = self
+                .send_request_sync(&IpcCommand::QueryStatus { macaroon }, None)
+                .map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!(
+                            "QueryStatus failed ({e}); the daemon on {} may predate v0.5.0, which added it",
+                            self.socket_path.display()
+                        ),
+                    )
+                })?;
+            match resp {
+                IpcResponse::StatusSnapshot(snap) if snap.within_caps() => Ok(snap),
+                IpcResponse::StatusSnapshot(_) => {
+                    Err(io::Error::other("QueryStatus: snapshot over its size caps"))
+                }
+                IpcResponse::Error { message } => Err(io::Error::other(message)),
+                other => Err(io::Error::other(format!(
+                    "unexpected QueryStatus response: {other:?}"
+                ))),
+            }
+        }
+
         /// Queries live gateway IOPS, peer count, and PoR SLA compliance score synchronously.
         pub fn query_health_sync(&self) -> io::Result<(u64, usize, f32)> {
             match self.send_request_sync(&IpcCommand::QueryHealthStatus, None)? {
@@ -1115,3 +1272,162 @@ pub use unix_impl::{
     create_memfd, create_memfd_sized, read_self_anon_rss_bytes, read_self_rss_bytes,
     recv_frame_with_optional_fd, send_frame_with_optional_fd, GatewayBus, GatewayIpcClient,
 };
+
+/// Golden wire bytes (item 3, plan-3 ruling): one fixed value per `IpcCommand` / `IpcResponse`
+/// variant, encoded with the frame codec. Each row pins the variant index and the SHA-256 of
+/// the bytes, so a renumbered, reordered or re-typed variant or field fails here. Run under the
+/// default features and under `--no-default-features --features ipc-client` (CI does both):
+/// the layout is the same in every feature set.
+#[cfg(test)]
+mod golden_wire {
+    use super::*;
+    use crate::capabilities::Caveat;
+    use crate::profile::ErasureTier;
+
+    fn tok() -> CapabilityMacaroon {
+        CapabilityMacaroon {
+            nonce_id: [0x11; 32],
+            issuer_fingerprint: [0x22; 32],
+            caveats: vec![Caveat::ReadOnly, Caveat::ExpiresAtUnixMs(7)],
+            tag: [0x33; 32],
+        }
+    }
+
+    fn eph() -> EphemeralShardManifest {
+        EphemeralShardManifest {
+            file_merkle_root: [0x44; 32],
+            shard_hashes: vec![[0x55; 32], [0x66; 32]],
+            total_size: 4096,
+            stripe_size_bytes: 1 << 20,
+        }
+    }
+
+    fn commands() -> Vec<IpcCommand> {
+        vec![
+            IpcCommand::StorePayload {
+                payload_fd: 3,
+                bytes_len: 4096,
+                retention_policy: RetentionPolicy::Persistent,
+            },
+            IpcCommand::FetchPayload {
+                ephemeral_shard_ids: vec![[0x77; 32]],
+                output_fd: 4,
+                macaroon: Some(tok()),
+            },
+            IpcCommand::FetchRange {
+                manifest: eph(),
+                offset: 1,
+                len: 2,
+                output_fd: 5,
+                macaroon: None,
+            },
+            IpcCommand::RegisterManifest {
+                file_manifest: FileManifest {
+                    version: 2,
+                    file_merkle_root: [0x88; 32],
+                    file_salt: [0x99; 32],
+                    original_file_size: 9,
+                    stripe_size_bytes: 1 << 20,
+                    tier: ErasureTier::Mixed,
+                    stripes: Vec::new(),
+                    witness_peers: vec!["w".into()],
+                },
+            },
+            IpcCommand::QueryHealthStatus,
+            IpcCommand::QueryStatus {
+                macaroon: Some(tok()),
+            },
+        ]
+    }
+
+    fn responses() -> Vec<IpcResponse> {
+        vec![
+            IpcResponse::StoreSuccess { manifest: eph() },
+            IpcResponse::FetchSuccess { bytes_streamed: 8 },
+            IpcResponse::HealthStatus {
+                iops: 1,
+                peer_count: 2,
+                por_sla_score: 0.5,
+            },
+            IpcResponse::Error {
+                message: "e".into(),
+            },
+            IpcResponse::StoreSuccessLocalOnly {
+                manifest: eph(),
+                local_only_stripes: 3,
+            },
+            IpcResponse::StatusSnapshot(StatusSnapshot {
+                version: "0.5.0".into(),
+                lan_peers: vec![StatusPeerEntry {
+                    peer_id: "p".into(),
+                    label: "l".into(),
+                    role: "r".into(),
+                    multiaddr: "/ip4/127.0.0.1/tcp/1".into(),
+                    available_bytes: 5,
+                }],
+                ..StatusSnapshot::default()
+            }),
+        ]
+    }
+
+    // Exhaustive (no wildcard): a new variant does not compile until it has a golden row.
+    fn cmd_name(c: &IpcCommand) -> &'static str {
+        match c {
+            IpcCommand::StorePayload { .. } => "StorePayload",
+            IpcCommand::FetchPayload { .. } => "FetchPayload",
+            IpcCommand::FetchRange { .. } => "FetchRange",
+            IpcCommand::RegisterManifest { .. } => "RegisterManifest",
+            IpcCommand::QueryHealthStatus => "QueryHealthStatus",
+            IpcCommand::QueryStatus { .. } => "QueryStatus",
+        }
+    }
+
+    fn resp_name(r: &IpcResponse) -> &'static str {
+        match r {
+            IpcResponse::StoreSuccess { .. } => "StoreSuccess",
+            IpcResponse::FetchSuccess { .. } => "FetchSuccess",
+            IpcResponse::HealthStatus { .. } => "HealthStatus",
+            IpcResponse::Error { .. } => "Error",
+            IpcResponse::StoreSuccessLocalOnly { .. } => "StoreSuccessLocalOnly",
+            IpcResponse::StatusSnapshot(_) => "StatusSnapshot",
+        }
+    }
+
+    fn row(name: &str, bytes: &[u8]) -> String {
+        let idx = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        format!("{name} {idx} {}", hex::encode(Sha256::digest(bytes)))
+    }
+
+    const GOLDEN: &[&str] = &[
+        "cmd StorePayload 0 7b0dbf38038f7d8066e4ba2c6b92391311224d8fdd74b9ca8e177582d1655144",
+        "cmd FetchPayload 1 cb9ee27d569a133d75be31d0bfd6262c40ce321ab590c9acf14d8652517a9a66",
+        "cmd FetchRange 2 0f48d64bf090dec6706c52c923f99c9ebb550605bad2a329329909fcfa23d61b",
+        "cmd RegisterManifest 3 bb9d2f5b2ef768d98e3f4b80ba0c63e4a4e74b14f71ac816610103854faad27e",
+        "cmd QueryHealthStatus 4 fb5e512425fc9449316ec95969ebe71e2d576dbab833d61e2a5b9330fd70ee02",
+        "cmd QueryStatus 5 90690e4aee4f4c975bb59f0b9edcc0b1603f1e3e871933889e314a4e5d768f64",
+        "resp StoreSuccess 0 d0cbeed4caa773256e6190330f1d22bc4a0bb707981381ea504318bb9dd22d28",
+        "resp FetchSuccess 1 3cf4c6d7d35690bf9cefc706492dccabc67d6e25ff145e0a681864bc0e3db0da",
+        "resp HealthStatus 2 42c3ccd517cfe720bf02dd2c56c9f606cc40fbd10ff238e4d9ef3215faeda5a1",
+        "resp Error 3 b7c04c4052c347008dfd50308f5eec48d49ea14b6799fbaf6766fd909f843bab",
+        "resp StoreSuccessLocalOnly 4 89d1aa480b45d25c240e8e575927ccf33ddb8bdef94edaa84e56a433b1e369ad",
+        "resp StatusSnapshot 5 91e96c3e3aa3aef402af076f2034354a657615f15706c1db41bc9c923896c556",
+    ];
+
+    #[test]
+    fn ipc_wire_layout_matches_golden() {
+        let mut got = Vec::new();
+        for c in commands() {
+            let b = ipc_bincode().serialize(&c).unwrap();
+            let back: IpcCommand = ipc_bincode().deserialize(&b).unwrap();
+            assert_eq!(ipc_bincode().serialize(&back).unwrap(), b);
+            got.push(format!("cmd {}", row(cmd_name(&c), &b)));
+        }
+        for r in responses() {
+            let b = ipc_bincode().serialize(&r).unwrap();
+            let back: IpcResponse = ipc_bincode().deserialize(&b).unwrap();
+            assert_eq!(back, r);
+            got.push(format!("resp {}", row(resp_name(&r), &b)));
+        }
+        assert_eq!(got, GOLDEN, "IPC wire layout changed:\n{}", got.join("\n"));
+    }
+}
