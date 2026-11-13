@@ -211,7 +211,14 @@ fn test_seed_server_public_bootstrapper_mode_blinded_storage_and_auto_drain() {
         let read_sig =
             BlindedShardCapability::sign_read_token(&cap_identity, &blinded_id.locator, 1_000);
         let commitment = server
-            .answer_blinded_por_challenge(&blinded_id, &capability, 1_000, &read_sig, &chal_nonce)
+            .answer_blinded_por_challenge(
+                &blinded_id,
+                &capability,
+                1_000,
+                &read_sig,
+                &chal_nonce,
+                1_000,
+            )
             .expect("answer blinded PoR challenge");
         assert_eq!(
             commitment,

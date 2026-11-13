@@ -331,13 +331,11 @@ pub fn decode_chain(bytes: &[u8]) -> anyhow::Result<DelegationChain> {
 /// Requests whose sender must be admitted (v0.5.0). Mirrors the server's admission classes;
 /// an onion relay request may be a final delivery, which the receiver checks.
 pub const fn requires_admitted_sender(request: &MeshWireRequest) -> bool {
+    // Derived from the server's classification so the two never drift (a request the server
+    // admits only from admitted peers must make the client handshake first).
     matches!(
-        request,
-        MeshWireRequest::PutShard { .. }
-            | MeshWireRequest::SyndicateLiteStripe { .. }
-            | MeshWireRequest::PutDhtEnvelope(_)
-            | MeshWireRequest::PutBlindedShard { .. }
-            | MeshWireRequest::RelayPqOnionEnvelope { .. }
+        crate::network::wire_handler::admission_class(request),
+        crate::network::wire_handler::AdmissionClass::AdmittedPeer
     )
 }
 
