@@ -40,7 +40,7 @@ $$
 ## Consequences & Verification
 
 - **Consequences:** Eliminates static disk grouping, PoR key correlation, quota ledger linkage, and single-hop IP exposure; paired with hedged parallel $N$-shard reads across degraded WANs.
-- **Verification:** `specs/ParVaultAnonymity.tla` (<!-- metric:tlc.distinct.ParVaultAnonymity -->`861`<!-- /metric --> distinct states, `0` errors) and `tests/anonymity_and_degraded_net_tests.rs` (`8/8` degraded network profiles).
+- **Verification:** `specs/ParVaultAnonymity.tla` (<!-- metric:tlc.distinct.ParVaultAnonymity -->`441`<!-- /metric --> distinct states, `0` errors) and `tests/anonymity_and_degraded_net_tests.rs` (`8/8` degraded network profiles).
 
 ## v0.5.0: deletes (F-41)
 

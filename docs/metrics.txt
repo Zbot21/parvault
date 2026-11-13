@@ -116,14 +116,14 @@ docker.live_rss = 8.63 MiB
 # the 21eee6a record. tlc.generated and tlc.distinct (sums) are generated.
 tlc.generated.ParVaultProtocol = 61,009
 tlc.generated.ParVaultConfidentialityAndTrust = 2,318
-tlc.generated.ParVaultAnonymity = 5,062
+tlc.generated.ParVaultAnonymity = 2,742
 tlc.generated.ParVaultPostQuantum = 3,514
 tlc.generated.ParVaultBootstrapAndEarnedTier = 1,091
 tlc.generated.ParVaultLiteClientAndSeedFailover = 212
 tlc.generated.ParVaultZeroKeyAdminAndQuorum = 2,325
 tlc.distinct.ParVaultProtocol = 3,040
 tlc.distinct.ParVaultConfidentialityAndTrust = 944
-tlc.distinct.ParVaultAnonymity = 861
+tlc.distinct.ParVaultAnonymity = 441
 tlc.distinct.ParVaultPostQuantum = 927
 tlc.distinct.ParVaultBootstrapAndEarnedTier = 360
 tlc.distinct.ParVaultLiteClientAndSeedFailover = 95
@@ -173,6 +173,6 @@ bench.soc.headroom_32m = 22.26 MiB
 bench.soc.headroom_48m = 38.26 MiB
 bench.soc.vmhwm_reduction = 5.9x
 aes.enc.span = 496.5–589.2 MiB/s
-tlc.generated = 75,531
-tlc.distinct = 6,707
+tlc.generated = 73,211
+tlc.distinct = 6,287
 # <<< end generated
