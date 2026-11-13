@@ -50,14 +50,15 @@ VARIABLES
     quantumForgeryAccepted,     \* TRUE if verifier accepts an adversary-forged envelope
     pqBackupSealed,             \* TRUE once 2-layer PQ onion + cascaded AEAD stripe is sealed
     hndlAttackAttempted,        \* TRUE once adversary executes HNDL attack on captured transcripts
-    hndlPlaintextExposed        \* TRUE if HNDL adversary recovers vault plaintext
+    hndlPlaintextExposed,       \* TRUE if HNDL adversary recovers vault plaintext
+    honestVerify                \* "pending", then the StoragePeer verifier's verdict on the honest envelope
 
 vars == <<x25519Keys, mlKemKeys, ed25519Keys, mlDsaKeys, adversaryBroken,
           groverApplied, effectiveSymmetricBits, hkdfSha512BoundPk,
           kemTranscripts, signedEnvelopes, onionLayers,
           kemAttackAttempted, hybridKemCompromised, unboundKemWouldCompromise,
           sigAttackAttempted, quantumForgeryAccepted, pqBackupSealed,
-          hndlAttackAttempted, hndlPlaintextExposed>>
+          hndlAttackAttempted, hndlPlaintextExposed, honestVerify>>
 
 Init ==
     /\ x25519Keys                = [a \in Actors |-> a \o "_X25519_PK"]
@@ -70,6 +71,7 @@ Init ==
     /\ hkdfSha512BoundPk         = TRUE
     /\ kemTranscripts            = {}
     /\ signedEnvelopes           = {}
+    /\ honestVerify              = "pending"
     /\ onionLayers               = {}
     /\ kemAttackAttempted        = FALSE
     /\ hybridKemCompromised      = FALSE
@@ -101,7 +103,7 @@ AdversaryChooseCapability(prim) ==
                    kemTranscripts, signedEnvelopes, onionLayers,
                    kemAttackAttempted, hybridKemCompromised, unboundKemWouldCompromise,
                    sigAttackAttempted, quantumForgeryAccepted, pqBackupSealed,
-                   hndlAttackAttempted, hndlPlaintextExposed>>
+                   hndlAttackAttempted, hndlPlaintextExposed, honestVerify>>
 
 ActivateGroverSearch ==
     /\ ~groverApplied
@@ -112,7 +114,7 @@ ActivateGroverSearch ==
                    signedEnvelopes, onionLayers, kemAttackAttempted,
                    hybridKemCompromised, unboundKemWouldCompromise,
                    sigAttackAttempted, quantumForgeryAccepted, pqBackupSealed,
-                   hndlAttackAttempted, hndlPlaintextExposed>>
+                   hndlAttackAttempted, hndlPlaintextExposed, honestVerify>>
 
 \* ----------------------------------------------------------------------------
 \* Action 2: ClientEncapsulateXWingHybridKem
@@ -147,7 +149,7 @@ ClientEncapsulateXWingHybridKem ==
                    hkdfSha512BoundPk, signedEnvelopes, onionLayers,
                    kemAttackAttempted, hybridKemCompromised, unboundKemWouldCompromise,
                    sigAttackAttempted, quantumForgeryAccepted, pqBackupSealed,
-                   hndlAttackAttempted, hndlPlaintextExposed>>
+                   hndlAttackAttempted, hndlPlaintextExposed, honestVerify>>
 
 \* ----------------------------------------------------------------------------
 \* Action 3: AdversaryAttemptKemKeySubstitutionOrDecaps
@@ -174,13 +176,16 @@ AdversaryAttemptKemKeySubstitutionOrDecaps ==
                    adversaryBroken, groverApplied, effectiveSymmetricBits,
                    hkdfSha512BoundPk, kemTranscripts, signedEnvelopes,
                    onionLayers, sigAttackAttempted, quantumForgeryAccepted,
-                   pqBackupSealed, hndlAttackAttempted, hndlPlaintextExposed>>
+                   pqBackupSealed, hndlAttackAttempted, hndlPlaintextExposed, honestVerify>>
 
 \* ----------------------------------------------------------------------------
 \* Action 4: ClientSignCompositeEnvelope
 \* Client signs a manifest / PersonalDeviceCert envelope with both Ed25519 and
 \* NIST FIPS 204 ML-DSA-65 (bound to ML_DSA_65_CONTEXT).
 \* ----------------------------------------------------------------------------
+\* ADR-12 verifier: a hybrid signature holds only if BOTH halves verify.
+HybridVerifies(edValid, mlValid) == edValid /\ mlValid   \* @guard hybrid-sig-both sym=src/crypto/pqc.rs::hybrid_signature_decision
+
 ClientSignCompositeEnvelope ==
     /\ signedEnvelopes = {}
     /\ LET env == [
@@ -197,7 +202,7 @@ ClientSignCompositeEnvelope ==
                    hkdfSha512BoundPk, kemTranscripts, onionLayers,
                    kemAttackAttempted, hybridKemCompromised, unboundKemWouldCompromise,
                    sigAttackAttempted, quantumForgeryAccepted, pqBackupSealed,
-                   hndlAttackAttempted, hndlPlaintextExposed>>
+                   hndlAttackAttempted, hndlPlaintextExposed, honestVerify>>
 
 \* ----------------------------------------------------------------------------
 \* Action 5: AdversaryAttemptSignatureForgery
@@ -211,7 +216,7 @@ AdversaryAttemptSignatureForgery ==
     /\ ~sigAttackAttempted
     /\ LET forgedEd25519Valid == ("Ed25519" \in adversaryBroken)
            forgedMlDsa65Valid == ("ML_DSA_65" \in adversaryBroken)
-           verifierAccepts    == (forgedEd25519Valid /\ forgedMlDsa65Valid)
+           verifierAccepts    == HybridVerifies(forgedEd25519Valid, forgedMlDsa65Valid)
        IN /\ sigAttackAttempted'     = TRUE
           /\ quantumForgeryAccepted' = verifierAccepts
     /\ UNCHANGED <<x25519Keys, mlKemKeys, ed25519Keys, mlDsaKeys,
@@ -219,7 +224,23 @@ AdversaryAttemptSignatureForgery ==
                    hkdfSha512BoundPk, kemTranscripts, signedEnvelopes,
                    onionLayers, kemAttackAttempted, hybridKemCompromised,
                    unboundKemWouldCompromise, pqBackupSealed,
-                   hndlAttackAttempted, hndlPlaintextExposed>>
+                   hndlAttackAttempted, hndlPlaintextExposed, honestVerify>>
+
+\* Action 5b: StoragePeerVerifyHonestEnvelope
+\* The receiving peer runs the same hybrid verifier on the Client's envelope
+\* (both halves produced with the Client's own keys), so the accept branch of
+\* HybridVerifies is exercised, not only its reject branch.
+StoragePeerVerifyHonestEnvelope ==
+    /\ honestVerify = "pending"
+    /\ \E env \in signedEnvelopes :
+        honestVerify' = IF HybridVerifies(env.ed25519_valid, env.ml_dsa_65_valid)
+                        THEN "accepted" ELSE "rejected"
+    /\ UNCHANGED <<x25519Keys, mlKemKeys, ed25519Keys, mlDsaKeys, adversaryBroken,
+                   groverApplied, effectiveSymmetricBits, hkdfSha512BoundPk,
+                   kemTranscripts, signedEnvelopes, onionLayers, kemAttackAttempted,
+                   hybridKemCompromised, unboundKemWouldCompromise, sigAttackAttempted,
+                   quantumForgeryAccepted, pqBackupSealed, hndlAttackAttempted,
+                   hndlPlaintextExposed>>
 
 \* ----------------------------------------------------------------------------
 \* Action 6: ClientSealTwoLayerPqOnion
@@ -253,7 +274,7 @@ ClientSealTwoLayerPqOnion ==
                    hkdfSha512BoundPk, kemTranscripts, signedEnvelopes,
                    kemAttackAttempted, hybridKemCompromised, unboundKemWouldCompromise,
                    sigAttackAttempted, quantumForgeryAccepted,
-                   hndlAttackAttempted, hndlPlaintextExposed>>
+                   hndlAttackAttempted, hndlPlaintextExposed, honestVerify>>
 
 \* ----------------------------------------------------------------------------
 \* Action 7: AttemptHarvestNowDecryptLater
@@ -278,7 +299,7 @@ AttemptHarvestNowDecryptLater ==
                    hkdfSha512BoundPk, kemTranscripts, signedEnvelopes,
                    onionLayers, kemAttackAttempted, hybridKemCompromised,
                    unboundKemWouldCompromise, sigAttackAttempted,
-                   quantumForgeryAccepted, pqBackupSealed>>
+                   quantumForgeryAccepted, pqBackupSealed, honestVerify>>
 
 Idle ==
     /\ pqBackupSealed
@@ -295,6 +316,7 @@ Next ==
     \/ AdversaryAttemptKemKeySubstitutionOrDecaps
     \/ ClientSignCompositeEnvelope
     \/ AdversaryAttemptSignatureForgery
+    \/ StoragePeerVerifyHonestEnvelope
     \/ ClientSealTwoLayerPqOnion
     \/ AttemptHarvestNowDecryptLater
     \/ Idle
