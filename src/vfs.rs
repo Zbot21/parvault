@@ -798,16 +798,6 @@ mod unix_vfs {
             offset: u64,
             length: u64,
         ) -> io::Result<(Vec<u8>, Duration)> {
-            self.read_range_with_ttfb_as(ino, offset, length, None)
-        }
-
-        fn read_range_with_ttfb_as(
-            &self,
-            ino: u64,
-            offset: u64,
-            length: u64,
-            explicit_macaroon: Option<CapabilityMacaroon>,
-        ) -> io::Result<(Vec<u8>, Duration)> {
             let t0 = Instant::now();
             let stub = self.getattr(ino).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("inode {ino} not found"))
@@ -840,9 +830,9 @@ mod unix_vfs {
                 let blk_bytes = match cached {
                     Some(hit_bytes) => hit_bytes,
                     None => {
-                        let effective_mac = explicit_macaroon
+                        let effective_mac = stub
+                            .macaroon
                             .clone()
-                            .or_else(|| stub.macaroon.clone())
                             .or_else(|| self.default_macaroon.clone());
                         let fetched = self.bus.fetch_range_bytes_sync(
                             &manifest,
@@ -872,20 +862,6 @@ mod unix_vfs {
         /// Convenience POSIX `pread`-equivalent returning the requested byte range.
         pub fn read_at(&self, ino: u64, offset: u64, length: u64) -> io::Result<Vec<u8>> {
             let (bytes, _ttfb) = self.read_range_with_ttfb(ino, offset, length)?;
-            Ok(bytes)
-        }
-
-        /// Like `read_at`, presenting `macaroon` on every gateway `FetchRange` (F-43: the WebDAV
-        /// request's own verified token, so the gateway checks it again per frame).
-        pub fn read_at_with_macaroon(
-            &self,
-            ino: u64,
-            offset: u64,
-            length: u64,
-            macaroon: CapabilityMacaroon,
-        ) -> io::Result<Vec<u8>> {
-            let (bytes, _ttfb) =
-                self.read_range_with_ttfb_as(ino, offset, length, Some(macaroon))?;
             Ok(bytes)
         }
 
@@ -1261,78 +1237,59 @@ mod unix_vfs {
                     stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")?;
                     return Ok(());
                 }
-                if let Some((start, end_opt)) = range_header {
-                    if start >= node.size_bytes {
-                        stream.write_all(
-                            b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\n\r\n",
-                        )?;
-                        return Ok(());
-                    }
-                    let end_incl = end_opt
-                        .unwrap_or_else(|| node.size_bytes.saturating_sub(1))
-                        .min(node.size_bytes.saturating_sub(1));
-                    let len = end_incl.saturating_sub(start) + 1;
-                    let body = if method == "GET" {
-                        match vfs.read_at_with_macaroon(node.ino, start, len, token.clone()) {
-                            Ok(b) => b,
-                            Err(_) => {
-                                stream.write_all(WEBDAV_502)?;
-                                return stream.flush();
-                            }
+                // `(start, len, Some(end_incl))` for a 206, `(0, size, None)` for a 200.
+                let (start, len, partial) = match range_header {
+                    Some((start, end_opt)) => {
+                        if start >= node.size_bytes {
+                            stream.write_all(
+                                b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\n\r\n",
+                            )?;
+                            return Ok(());
                         }
-                    } else {
-                        Vec::new()
-                    };
-                    let hdr = format!(
-                        "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end_incl}/{}\r\nContent-Length: {}\r\n\r\n",
-                        node.size_bytes,
-                        if method == "GET" { body.len() as u64 } else { len }
-                    );
-                    stream.write_all(hdr.as_bytes())?;
-                    if method == "GET" {
-                        stream.write_all(&body)?;
+                        let end_incl = end_opt
+                            .unwrap_or_else(|| node.size_bytes.saturating_sub(1))
+                            .min(node.size_bytes.saturating_sub(1));
+                        (start, end_incl.saturating_sub(start) + 1, Some(end_incl))
+                    }
+                    None => (0, node.size_bytes, None),
+                };
+                let block = DEFAULT_VFS_BLOCK_BYTES as u64;
+                // Read the first block before promising a status and a length: a failed read
+                // answers 502, never a silently truncated body.
+                let first = if method == "GET" && len > 0 {
+                    match vfs.read_at(node.ino, start, len.min(block)) {
+                        Ok(b) => b,
+                        Err(_) => {
+                            stream.write_all(WEBDAV_502)?;
+                            return stream.flush();
+                        }
                     }
                 } else {
-                    // Read the first block before promising a 200 and a length, so a failed
-                    // read answers 502 instead of a silently truncated body.
-                    let first = if method == "GET" && node.size_bytes > 0 {
-                        match vfs.read_at_with_macaroon(
-                            node.ino,
-                            0,
-                            DEFAULT_VFS_BLOCK_BYTES as u64,
-                            token.clone(),
-                        ) {
-                            Ok(b) => b,
-                            Err(_) => {
-                                stream.write_all(WEBDAV_502)?;
-                                return stream.flush();
-                            }
-                        }
-                    } else {
-                        Vec::new()
-                    };
-                    let hdr = format!(
-                        "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\n\r\n",
+                    Vec::new()
+                };
+                let hdr = match partial {
+                    Some(end_incl) => format!(
+                        "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end_incl}/{}\r\nContent-Length: {len}\r\n\r\n",
                         node.size_bytes
-                    );
-                    stream.write_all(hdr.as_bytes())?;
-                    if method == "GET" {
-                        stream.write_all(&first)?;
-                        let mut off = first.len() as u64;
-                        while off < node.size_bytes && !first.is_empty() {
-                            // A mid-body failure closes the connection short of Content-Length.
-                            let chunk = vfs.read_at_with_macaroon(
-                                node.ino,
-                                off,
-                                DEFAULT_VFS_BLOCK_BYTES as u64,
-                                token.clone(),
-                            )?;
-                            if chunk.is_empty() {
-                                break;
-                            }
-                            stream.write_all(&chunk)?;
-                            off += chunk.len() as u64;
+                    ),
+                    None => format!(
+                        "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Length: {len}\r\n\r\n"
+                    ),
+                };
+                stream.write_all(hdr.as_bytes())?;
+                if method == "GET" {
+                    // Stream block by block (a `Range: bytes=0-` never buffers the whole file);
+                    // a mid-body failure closes the connection short of Content-Length.
+                    stream.write_all(&first)?;
+                    let end = start + len;
+                    let mut off = start + first.len() as u64;
+                    while off < end && !first.is_empty() {
+                        let chunk = vfs.read_at(node.ino, off, (end - off).min(block))?;
+                        if chunk.is_empty() {
+                            break;
                         }
+                        stream.write_all(&chunk)?;
+                        off += chunk.len() as u64;
                     }
                 }
             }

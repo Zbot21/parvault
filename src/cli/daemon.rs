@@ -207,6 +207,14 @@ pub(crate) async fn run_daemon(
                 }
             }
         }
+        // F-43 (L-44, Addendum A ruling): with a root key, every in-process FetchRange needs a
+        // macaroon. The built-in VFS (WebDAV and FUSE) reads with a ReadOnly token minted here, in
+        // memory only: never written, logged or returned. Clients are gated at the WebDAV edge
+        // (`webdav_auth_decision`); their tokens never reach the gateway.
+        let vfs = match opts.macaroon_root_key {
+            Some(ref key) => vfs.with_default_macaroon(Some(builtin_vfs_read_token(key)?)),
+            None => vfs,
+        };
         if let Some(fuse_fd) = opts.vfs_fuse_fd {
             let fuse_dev = parvault::os_sys::adopt_fuse_dev_fd(fuse_fd)?;
             let vfs_fuse = vfs.clone();
@@ -719,4 +727,21 @@ pub(crate) fn spawn_wan_and_tracker_announce(task_cfg: WanAnnounceTaskConfig) {
             }
         }
     });
+}
+
+/// F-43: the in-memory ReadOnly macaroon the built-in VFS reads with (fresh random nonce).
+#[cfg(all(unix, feature = "vfs"))]
+fn builtin_vfs_read_token(
+    root_key: &[u8; 32],
+) -> anyhow::Result<parvault::capabilities::CapabilityMacaroon> {
+    use rand::RngCore;
+    let mut nonce = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    parvault::capabilities::CapabilityMacaroon::mint(
+        root_key,
+        nonce,
+        [0u8; 32],
+        vec![parvault::capabilities::Caveat::ReadOnly],
+    )
+    .map_err(|e| anyhow::anyhow!("built-in VFS read token: {e:?}"))
 }

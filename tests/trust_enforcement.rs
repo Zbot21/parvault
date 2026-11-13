@@ -4665,6 +4665,20 @@ fn f43_byte_range_caveat_applies_to_get_only() {
     );
     let head = f43_http(&addr, "HEAD", "/a.txt", &[f43_bearer(&token)]);
     assert_eq!(head.0, 200, "{}", f43_status(&head));
+    // Inside the window: 206 with those bytes. The edge is the only client gate; the built-in
+    // VFS reads whole blocks with its own in-memory token (Addendum A ruling).
+    let inside = f43_http(
+        &addr,
+        "GET",
+        "/a.txt",
+        &[f43_bearer(&token), "Range: bytes=0-3".into()],
+    );
+    assert_eq!(inside.0, 206, "{}", f43_status(&inside));
+    assert!(
+        inside.1.ends_with(&F43_BODY[..4]),
+        "{}",
+        f43_status(&inside)
+    );
 }
 
 /// F-43 accept: a full-vault read-only token lists the root collection (207).
