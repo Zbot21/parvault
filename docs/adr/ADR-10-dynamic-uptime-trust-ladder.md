@@ -24,4 +24,4 @@ Static per-subnet shard limits create an unappealing dilemma: capping every subn
 ## Consequences & Verification
 
 - **Consequences:** Rewards proven 24/7 homelab anchors with higher utilization while keeping unproven subnets strictly contained at 1 shard.
-- **Verification:** `specs/ParVaultConfidentialityAndTrust.tla` (`Safety_ZeroKnowledgeConfidentiality`, `Safety_SubnetTrustCapsEnforced`, `Safety_SlashedNeverTrusted`) and `tests/confidentiality_and_trust_proofs.rs`.
+- **Verification:** `specs/ParVaultConfidentialityAndTrust.tla` model-checks `Safety_SlashedNeverTrusted` (mutant-covered). `Safety_SubnetTrustCapsEnforced` is waived (`@assume placement-trust-cap`: production placement does not apply the cap, F-48), and zero-knowledge confidentiality is `@structural ciphertext-only-egress`, not model-checked. Unit checks: `tests/confidentiality_and_trust_proofs.rs`.
