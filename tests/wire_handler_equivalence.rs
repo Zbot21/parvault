@@ -1840,7 +1840,8 @@ fn register_wan_rendezvous() {
         )
     );
     assert_eq!(o[2].changed, o[0].changed);
-    // Absolute: the entry is retrievable and the signer is admitted at the sender's IP.
+    // Absolute: the entry is retrievable, but an unadmitted signer is not written to the
+    // admission-IP map (F-22).
     let pk_priv = peer.ident.public_key_bytes();
     for fx in &mut t.fx {
         assert_eq!(
@@ -1850,8 +1851,34 @@ fn register_wan_rendezvous() {
             fx.role
         );
         assert!(
-            fx.admitted_at(peer.ip).contains(&pk_priv),
-            "{:?}: signer admitted",
+            !fx.admitted_at(peer.ip).contains(&pk_priv),
+            "{:?}: unadmitted signer not recorded",
+            fx.role
+        );
+    }
+    // F-22: an admitted signer's registration is recorded at the sender's IP.
+    let member = Peer::new(0x72, "198.51.100.16");
+    t.admit(&member);
+    let member_code = "elm-fig-grape-hazel";
+    let member_entry = seal_wan_peer_card(
+        member_code,
+        &wan_card(&member.ident, &["/ip4/203.0.113.6/tcp/4001"]),
+        &member.ident,
+    )
+    .unwrap();
+    let o = t.run(
+        &member,
+        &MeshWireRequest::RegisterWanRendezvous {
+            slot_key: derive_slot_key_from_code(member_code),
+            entry: member_entry,
+        },
+    );
+    assert!(o[0].resp.contains("stored: true"), "{}", o[0].resp);
+    for fx in &mut t.fx {
+        assert!(
+            fx.admitted_at(member.ip)
+                .contains(&member.ident.public_key_bytes()),
+            "{:?}: admitted signer recorded",
             fx.role
         );
     }

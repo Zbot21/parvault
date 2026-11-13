@@ -1656,9 +1656,13 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                 } else {
                     Vec::new()
                 };
-            match wan_registry.register(slot_key, entry, now_unix_ms()) {
+            let source_subnet =
+                remote_ip.map(|ip| crate::bootstrap::canonical_sybil_subnet_key(ip, None));
+            // F-22: the admission-IP map is written only for admitted signers.
+            let signer_admitted = wot.is_peer_trusted(&signer_pk);
+            match wan_registry.register_from(slot_key, entry, now_unix_ms(), source_subnet) {
                 Ok(stored) => {
-                    if stored {
+                    if stored && signer_admitted {
                         if let Some(ip) = remote_ip {
                             let _ = eviction.record_peer_admission_ip(ip, signer_pk);
                         }

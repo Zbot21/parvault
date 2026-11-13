@@ -1631,13 +1631,10 @@ fn f23_stranger_renew_refused() {
 
 // --- F-22: rendezvous registration before admission -------------------------------------------------------
 
-#[test]
-fn repro_f22_unadmitted_rendezvous_register_stored() {
-    let node = spawn_daemon("f22");
-    let stranger = key(0xF5);
-    let code = "quiet-river-stone-lamp";
+/// A signed rendezvous registration for `signer` under `code`.
+fn f22_register(signer: &NodeIdentity, code: &str) -> MeshWireRequest {
     let card = WanPeerCard::new(
-        &stranger,
+        signer,
         "probe",
         "daemon",
         vec!["/ip4/203.0.113.9/tcp/4001".into()],
@@ -1647,23 +1644,66 @@ fn repro_f22_unadmitted_rendezvous_register_stored() {
         now_ms(),
     )
     .unwrap();
-    let entry = seal_wan_peer_card(code, &card, &stranger).unwrap();
+    MeshWireRequest::RegisterWanRendezvous {
+        slot_key: derive_slot_key_from_code(code),
+        entry: seal_wan_peer_card(code, &card, signer).unwrap(),
+    }
+}
+
+/// F-22 accept: registration stays pre-admission (pairing needs it), so a stranger's entry
+/// within quota is stored.
+#[test]
+fn f22_rendezvous_within_quota_stored() {
+    let node = spawn_daemon("f22-a");
+    let stranger = key(0xF5);
     let resp = send(
         &stranger,
         &node,
-        MeshWireRequest::RegisterWanRendezvous {
-            slot_key: derive_slot_key_from_code(code),
-            entry,
-        },
+        f22_register(&stranger, "quiet-river-stone-lamp"),
     );
     assert!(
         matches!(
             resp,
             MeshWireResponse::RegisterWanRendezvousAck { stored: true, .. }
         ),
-        "gap: unadmitted rendezvous registration stored: {resp:?}"
+        "{resp:?}"
     );
-    gate_ran("trust_enforcement::repro_f22_unadmitted_rendezvous_register_stored");
+    gate_ran("trust_enforcement::f22_rendezvous_within_quota_stored");
+}
+
+/// F-22 reject: a signer holding 8 slots cannot register a 9th.
+#[test]
+fn f22_rendezvous_over_quota_refused() {
+    let node = spawn_daemon("f22-r");
+    let stranger = key(0xF5);
+    for i in 0..parvault::network::wan_rendezvous::MAX_RENDEZVOUS_SLOTS_PER_SIGNER {
+        let resp = send(
+            &stranger,
+            &node,
+            f22_register(&stranger, &format!("slot-{i}-code")),
+        );
+        assert!(
+            matches!(
+                resp,
+                MeshWireResponse::RegisterWanRendezvousAck { stored: true, .. }
+            ),
+            "slot {i}: {resp:?}"
+        );
+    }
+    let resp = send(
+        &stranger,
+        &node,
+        f22_register(&stranger, "one-slot-too-many"),
+    );
+    assert!(
+        matches!(
+            resp,
+            MeshWireResponse::RegisterWanRendezvousAck { stored: false, .. }
+        ),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.rendezvous_quota");
+    gate_ran("trust_enforcement::f22_rendezvous_over_quota_refused");
 }
 
 // --- F-25: syndication cert not bound to the sender; self-signed DHT records from strangers -------------
