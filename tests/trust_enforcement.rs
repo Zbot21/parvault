@@ -3167,19 +3167,34 @@ fn f38_no_grant_still_accepted() {
     assert!(synd_stored(&send(&device, &node, req)));
 }
 
-/// F-38: an invited, non-genesis lite client syndicates as its vault key. The client's admission
-/// source extends its member chain one hop for the vault key (genesis -> member -> vault); the
-/// seed admits that chain and accepts the vault-owned grant.
+/// F-38: an invited, non-genesis lite client syndicates as its vault key. The client's real
+/// admission source (`AdmissionSource::credential_for`, no genesis held) extends its installed
+/// member chain one hop for the vault key (genesis -> member -> vault); the seed admits that
+/// chain and accepts the vault-owned grant.
 #[test]
 fn f38_invited_client_syndicates_as_vault_key() {
     let node = spawn_seed("f38-invited");
-    let member = key(0xCD);
+    let client_root = temp_root("f38-invited-client");
+    let client_dir = client_root.path().join("data");
+    std::fs::create_dir_all(&client_dir).unwrap();
+    let member = NodeIdentity::load_or_generate_in_dir(&client_dir).unwrap();
     let vault = key(0xCE);
+    let source = AdmissionSource::from_data_dir(&client_dir);
+    assert!(
+        !source.holds_genesis(),
+        "the client must not hold the genesis"
+    );
     let to_member = InvitationHop::issue(&genesis(), member.public_key_bytes(), 1, 100);
-    let to_vault = InvitationHop::issue(&member, vault.public_key_bytes(), 2, 100);
-    let chain = DelegationChain {
-        hops: vec![to_member, to_vault],
-    };
+    source
+        .store_chain(&DelegationChain {
+            hops: vec![to_member],
+        })
+        .unwrap();
+    let chain = source
+        .credential_for(&vault)
+        .expect("member extends its chain for the vault key");
+    assert_eq!(chain.hops.len(), 2, "genesis -> member -> vault");
+    assert_eq!(chain.leaf_pubkey(), Some(vault.public_key_bytes()));
     assert!(accepted(&handshake(&vault, &node, chain)));
     let (req, sid) = f38_syndicate(&node, &vault, Some(&vault));
     let resp = send_as_stranger(&vault, &node, req);
