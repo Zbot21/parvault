@@ -8,6 +8,8 @@
 //!
 //! Known limit: a quorum of epoch `n` that signs two different epoch `n + 1` manifests forks the
 //! council; nodes keep whichever successor they install first (no equivocation proof exists).
+//!
+//! Formal model: `specs/ParVaultZeroKeyAdminAndQuorum.tla` (guard `ring-scope`).
 
 use crate::crypto::NodeIdentity;
 use crate::storage::block_store::{BlockStore, StorageError};

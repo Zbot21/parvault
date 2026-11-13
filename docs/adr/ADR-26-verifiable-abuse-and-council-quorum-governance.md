@@ -1,6 +1,7 @@
 # ADR-26: Cryptographic Reporter Burden-of-Proof (`VerifiableAbuseReport`), Zero-Private-Key `admin_rpc` & `M-of-N` Council Quorum
 
 - **Status:** Accepted
+- **Formal model:** `specs/ParVaultZeroKeyAdminAndQuorum.tla`
 - **Subsystem:** `storage::eviction` / `admin_rpc`
 - **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
 

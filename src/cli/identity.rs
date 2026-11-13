@@ -33,7 +33,7 @@ pub(crate) async fn status(env: CliEnv, command: Commands) -> anyhow::Result<()>
         if cfg.enable_quic {
             "Enabled"
         } else {
-            "Disabled (ADR-08)"
+            "Disabled (QUIC is opt-in, ADR-08)"
         }
     );
     println!(

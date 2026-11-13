@@ -419,27 +419,9 @@ pub use crate::http_edge::{
     MAX_TOKEN_CHARS as WEBDAV_MAX_TOKEN_CHARS,
 };
 
-/// How a WebDAV server checks a token's chain. Required by both constructors (no
-/// unauthenticated server). Deliberately not `Debug`: it holds the root key or a pinned token.
-#[derive(Clone)]
-pub enum WebdavVerifier {
-    /// The daemon's macaroon root key (built-in host).
-    RootKey([u8; 32]),
-    /// The plugin's pinned `--macaroon`: a request token must be it or an offline attenuation of
-    /// it (`capabilities::is_attenuation_of`).
-    PinnedParent(CapabilityMacaroon),
-}
-
-impl WebdavVerifier {
-    fn chain_ok(&self, token: &CapabilityMacaroon) -> bool {
-        match self {
-            Self::RootKey(key) => token.tag_valid(key),
-            // L-44 item 4: on a plugin block-cache hit the read never reaches the gateway, so this
-            // check (plus the caveat evaluation in `webdav_auth_decision`) is the only check.
-            Self::PinnedParent(parent) => crate::capabilities::is_attenuation_of(parent, token),
-        }
-    }
-}
+/// How a WebDAV server checks a token's chain (moved to `http_edge`, shared with the status
+/// page; item 3).
+pub use crate::http_edge::EdgeVerifier as WebdavVerifier;
 
 #[cfg(unix)]
 mod unix_vfs {

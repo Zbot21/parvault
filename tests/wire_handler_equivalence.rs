@@ -806,33 +806,21 @@ fn handshake_wot() {
         o[0].resp
     );
     assert_identical(&o);
-    // F-30: the handshake is not a quarantine oracle. A forged hop (rogue inviter) for a
-    // quarantined key and for an ordinary key gets the same response on every role.
-    let quarantined = Peer::new(0x54, "198.51.100.32");
+    // F-30 (handshake is not a quarantine oracle) is checked at the registry in
+    // `network::wot::tests::f30_forged_hop_is_not_a_quarantine_oracle` (P-01: quarantining a key
+    // is test-only in v0.5.0). Here: a forged hop is refused identically on every role.
     let ordinary = Peer::new(0x55, "198.51.100.33");
-    let qk = quarantined.ident.public_key_bytes();
-    t.each(|fx, _| {
-        fx.wot.slash_immediately(qk);
-    });
-    // The probe names the genesis as inviter but carries a rogue signature.
     let genesis_pk = t.keys.genesis.public_key_bytes();
-    let forged = |p: &Peer| {
-        let mut hop = InvitationHop::issue(&rogue, p.ident.public_key_bytes(), 1, 100);
-        hop.inviter_pubkey = genesis_pk;
-        MeshWireRequest::HandshakeWoT {
-            chain: DelegationChain { hops: vec![hop] },
-            asn: None,
-            region: None,
-        }
+    let mut hop = InvitationHop::issue(&rogue, ordinary.ident.public_key_bytes(), 1, 100);
+    hop.inviter_pubkey = genesis_pk;
+    let forged = MeshWireRequest::HandshakeWoT {
+        chain: DelegationChain { hops: vec![hop] },
+        asn: None,
+        region: None,
     };
-    let oq = t.run(&quarantined, &forged(&quarantined));
-    let oo = t.run(&ordinary, &forged(&ordinary));
-    assert_eq!(
-        oq[0].resp, oo[0].resp,
-        "quarantine state must not show on the wire"
-    );
-    assert!(oq[0].resp.contains("handshake refused"), "{}", oq[0].resp);
-    assert_identical(&oq);
+    let oo = t.run(&ordinary, &forged);
+    assert!(oo[0].resp.contains("handshake refused"), "{}", oo[0].resp);
+    assert_identical(&oo);
 }
 
 // --- 2. PutShard (seed also records the admission IP) -------------------------------------------

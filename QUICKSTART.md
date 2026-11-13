@@ -94,6 +94,8 @@ This automatically starts:
 3. The **Embedded Status Dashboard** on `http://localhost:4080`,
 4. An active **4-word pairing code** (e.g. `shield-copper-alpine-matrix`).
 
+The status page needs a read-only token on every request (v0.5.0): run `parvault token mint --read-only` on the node, open `http://<node-ip>:4080`, and enter the token as the password (any user name), or send `Authorization: Bearer <token>` to `/api/v1/health`. The token goes only in that header, never in the URL: `?token=` is ignored and refused. Use an IP address or `localhost`, not a host name: DNS names are refused (DNS rebinding). Without `--status-http` there is no status listener.
+
 ---
 
 ### Step 3: Auto-Discover & Pair with 4 Words (`parvault discover` & `join`)
@@ -238,7 +240,7 @@ parvault scrub
 
 ---
 
-### Recipe D: Evict a Bad Actor or Content Takedown (`parvault evict`, `ADR-19`)
+### Recipe D: Evict a Bad Actor or Content Takedown (`parvault evict`, `ADR-25`, `ADR-26`)
 If a spammer or illegal content is detected, administrators can purge matching shards with zero-wipe `0x00` disk shredding and block future ingress without storing any plaintext IPs on disk:
 
 ```bash
@@ -254,7 +256,7 @@ parvault evict --merkle-root <STRIPE_MERKLE_ROOT_HEX> --propagate
 
 ---
 
-### Recipe E: Report Abusive Content & Public Tracker Administration (`ADR-19`)
+### Recipe E: Report Abusive Content & Public Tracker Administration (`ADR-26`)
 This needs a public tracker you run yourself (none is hosted today). On Public Commons swarms (`--public`), random users cannot grief or evict honest users. To report illegal content, submit a cryptographic burden-of-proof report (`parvault report-abuse`). The Public Tracker Operator reviews cryptographic proofs and issues official eviction orders:
 
 ```bash

@@ -305,7 +305,10 @@ src/telemetry.rs                test    anonymous_telemetry_tests
 src/telemetry.rs                test    red_team_hardening_tests
 src/http_edge.rs                lib     http_edge::
 src/http_edge.rs                lib     gateway::ipc::
-src/http_edge.rs                test    trust_enforcement                               # STATUS-IPC socket pair
+src/http_edge.rs                test    trust_enforcement                               # STATUS-IPC/AUTH/HOST pairs
+src/http_edge.rs                test    vfs_lazy_stream                                 # WebDAV on the shared edge
+src/http_edge.rs                kani    proof_status_auth_requires_readonly_unscoped_token_and_host
+src/router_nas.rs               test    trust_enforcement                               # status_http_*
 src/router_nas.rs               lib     router_nas::
 src/router_nas.rs               test    gateway_bus_and_plugin_security                 # spawns main
 src/router_nas.rs               test    gateway_ipc_benchmark                           # spawns parvault-seed
@@ -324,6 +327,8 @@ src/bin/parvault-sync.rs        test    plugin_self_test                        
 src/bin/parvault-fuse.rs        test    m3_dual_mode_vfs_and_gateway_sync
 src/bin/parvault-fuse.rs        test    vfs_lazy_stream                                 # VirtualVaultFs
 src/bin/parvault-fuse.rs        test    plugin_self_test                                # client-only self-test vs hosted gateway
+src/bin/parvault-status.rs      test    trust_enforcement                               # status_sidecar_* (STATUS-*-SIDECAR)
+src/bin/parvault-status.rs      doc     docs/USER_AND_CLI_GUIDE.md
 scripts/plugin_self_test.sh     test    plugin_self_test
 src/bin/parvault-bench.rs       test    gateway_ipc_benchmark                           # compile + RSS readers
 

@@ -1,7 +1,7 @@
 # ParVault (`parvault`) — Master Architectural Decision Record (ADR) Index & Active Cryptographic Suite Guide (<!-- metric:crate_version_tag -->`v0.5.0`<!-- /metric -->)
 
 - **Architecture Policy:** **Strictly Single-Concern ADRs** (`docs/adr/ADR-01-*.md` through `docs/adr/ADR-33-*.md`) — one architectural decision per file in canonical Michael Nygard format (**Status**, **Subsystem**, **Context**, **Decision**, **Consequences & Verification**).
-- **Target Build & Verification Posture:** `#![deny(unsafe_code)]` library + `#![forbid(unsafe_code)]` binaries (`x86_64-unknown-linux-musl` & `aarch64-unknown-linux-musl`), **<!-- metric:kani_harnesses -->`25`<!-- /metric --> Kani Rust Bounded Model Checking symbolic harnesses**, **<!-- metric:tla_specs -->`7`<!-- /metric --> TLA+ TLC formal specifications**, and full release/plugin security suites (see [`docs/SAFETY_AND_LINT_AUDIT.md`](SAFETY_AND_LINT_AUDIT.md), [`docs/GATEWAY_SOCKET_PROTOCOL.md`](GATEWAY_SOCKET_PROTOCOL.md), and [`docs/SECURITY_AND_CRYPTOGRAPHY.md`](SECURITY_AND_CRYPTOGRAPHY.md)).
+- **Target Build & Verification Posture:** `#![deny(unsafe_code)]` library + `#![forbid(unsafe_code)]` binaries (`x86_64-unknown-linux-musl` & `aarch64-unknown-linux-musl`), **<!-- metric:kani_harnesses -->`29`<!-- /metric --> Kani Rust Bounded Model Checking symbolic harnesses**, **<!-- metric:tla_specs -->`7`<!-- /metric --> TLA+ TLC formal specifications**, and full release/plugin security suites (see [`docs/SAFETY_AND_LINT_AUDIT.md`](SAFETY_AND_LINT_AUDIT.md), [`docs/GATEWAY_SOCKET_PROTOCOL.md`](GATEWAY_SOCKET_PROTOCOL.md), and [`docs/SECURITY_AND_CRYPTOGRAPHY.md`](SECURITY_AND_CRYPTOGRAPHY.md)).
 
 ---
 
@@ -73,21 +73,23 @@ A recurring question when reading historical `v0.1` ADRs ([`ADR-01`](adr/ADR-01-
 
 ---
 
-## 2. Legacy `v0.1` – `v0.3` Monolithic ADR Crosswalk (Source Doc-Comment Mapping)
+## 2. Renumbering History (Legacy `v0.1` – `v0.3` Monolithic ADR Numbers)
 
-Prior to `v0.4.0`, several historical ADR numbers (`ADR-10` through `ADR-19`) grouped multiple subsystems into release-milestone sections. In `v0.4.0`, every multi-concern milestone was split into **strictly single-concern ADR files** under [`docs/adr/`](adr/). Inline Rust `///` doc comments in `src/` referencing legacy `ADR-01`–`ADR-19` identifiers map deterministically via this crosswalk:
+Prior to `v0.4.0`, several historical ADR numbers (old `10` through old `19`) grouped multiple subsystems into release-milestone sections. In `v0.4.0`, every multi-concern milestone was split into **strictly single-concern ADR files** under [`docs/adr/`](adr/). Inline Rust `///` doc comments in `src/` referencing legacy (old `01`–`19`) identifiers map deterministically via this crosswalk:
 
-| Legacy `src/` Reference | Single-Concern `v0.4.0` ADR File(s) in `docs/adr/` |
+> **F-16 (2d-β):** source comments, CLI output and docs now cite only the current numbers in [`docs/adr/`](adr/); this table is history. The enforcement gate checks every `ADR-NN` citation against `docs/adr/xref-keywords.txt` (`xref ... expect=`).
+
+| Legacy number | Single-Concern `v0.4.0` ADR File(s) in `docs/adr/` |
 | :--- | :--- |
-| `ADR-01` .. `ADR-09` | [`ADR-01`](adr/ADR-01-streaming-stripes-and-encrypt-before-shard.md) through [`ADR-09`](adr/ADR-09-byzantine-merkle-quarantine-and-egress-slashing.md) (`1:1` exact match; `ADR-03` PoR and `ADR-04` `RepairGrant` now live in separate files) |
-| `ADR-10` | [`ADR-10`](adr/ADR-10-dynamic-uptime-trust-ladder.md) (Dynamic Uptime Trust Ladder) + [`ADR-14`](adr/ADR-14-incremental-folder-sync-engine.md) (`FolderSyncEngine`) |
-| `ADR-11` | [`ADR-11`](adr/ADR-11-four-layer-shard-anonymization.md) (4-Layer Cryptographic Shard Anonymization & 2-Layer Onion Relaying) |
-| `ADR-12` | [`ADR-12`](adr/ADR-12-asymmetric-post-quantum-hybrids.md) (Asymmetric `X25519 + ML-KEM-768` & `Ed25519 + ML-DSA-65`) + [`ADR-13`](adr/ADR-13-symmetric-pq-grover-baseline-and-cascaded-aead.md) (Symmetric `AES-256-GCM` PQ Grover Baseline & `PqVaultMasterKey` Dual-Cipher Cascade) |
-| `ADR-13` | [`ADR-15`](adr/ADR-15-elastic-bootstrap-and-earned-tiers.md) (Elastic Bootstrap, Auto-Draining Seed Anchors & Earned Tier Progression) |
-| `ADR-14` | [`ADR-16`](adr/ADR-16-zero-trust-seed-server.md) (`parvault-seed` Server) + [`ADR-17`](adr/ADR-17-anonymous-census-telemetry.md) (Anonymous Network Census Telemetry) |
-| `ADR-15` | [`ADR-18`](adr/ADR-18-seed-phrase-house-fire-disaster-recovery.md) (BIP-39 / `Argon2id` Disaster Recovery) + [`ADR-19`](adr/ADR-19-crash-safe-atomic-storage-and-lease-pinning.md) (Atomic `fsync`+`rename`, Path-Traversal Defense & Lease Pinning) + [`ADR-08`](adr/ADR-08-noise-xx-transport-and-bounded-wire-framing.md) (`with_limit` Wire Framing) |
-| `ADR-16` | [`ADR-14`](adr/ADR-14-incremental-folder-sync-engine.md) (`.parvaultignore` & `64 KiB` Streaming SHA-256) + [`ADR-19`](adr/ADR-19-crash-safe-atomic-storage-and-lease-pinning.md) (`65,536`-Entry Bounded FIFO Caches & Token-Bucket Rate Limits) |
-| `ADR-17` | [`ADR-20`](adr/ADR-20-lite-client-seed-syndication-and-failover.md) (Lite-Client `1.0×` Seed Syndication, NAS-Death Failover & Selective Byte-Range Restore) |
-| `ADR-18` | [`ADR-21`](adr/ADR-21-router-soc-1mib-streaming-profile.md) (`1 MiB` Router-SoC Profile) + [`ADR-22`](adr/ADR-22-zero-ip-lan-discovery-and-sas-pairing.md) (Zero-IP LAN Discovery & 4-Word SAS Pairing) + [`ADR-23`](adr/ADR-23-online-wan-rendezvous-and-stun-over-noise.md) (Online WAN Rendezvous & STUN-over-Noise) + [`ADR-24`](adr/ADR-24-public-commons-pow-swarm-mode.md) (Public Commons PoW Mode) |
-| `ADR-19` | [`ADR-25`](adr/ADR-25-hmac-blinded-shard-eviction-and-shredding.md) (4-Vector HMAC-Blinded Shard Eviction & `0x00` Shredding) + [`ADR-26`](adr/ADR-26-verifiable-abuse-and-council-quorum-governance.md) (`VerifiableAbuseReport`, Zero-Private-Key `admin_rpc` & `M-of-N` Council Quorum) |
+| old `01` .. old `09` | [`ADR-01`](adr/ADR-01-streaming-stripes-and-encrypt-before-shard.md) through [`ADR-09`](adr/ADR-09-byzantine-merkle-quarantine-and-egress-slashing.md) (`1:1` exact match; `ADR-03` PoR and `ADR-04` `RepairGrant` now live in separate files) |
+| old `10` | [`ADR-10`](adr/ADR-10-dynamic-uptime-trust-ladder.md) (Dynamic Uptime Trust Ladder) + [`ADR-14`](adr/ADR-14-incremental-folder-sync-engine.md) (`FolderSyncEngine`) |
+| old `11` | [`ADR-11`](adr/ADR-11-four-layer-shard-anonymization.md) (4-Layer Cryptographic Shard Anonymization & 2-Layer Onion Relaying) |
+| old `12` | [`ADR-12`](adr/ADR-12-asymmetric-post-quantum-hybrids.md) (Asymmetric `X25519 + ML-KEM-768` & `Ed25519 + ML-DSA-65`) + [`ADR-13`](adr/ADR-13-symmetric-pq-grover-baseline-and-cascaded-aead.md) (Symmetric `AES-256-GCM` PQ Grover Baseline & `PqVaultMasterKey` Dual-Cipher Cascade) |
+| old `13` | [`ADR-15`](adr/ADR-15-elastic-bootstrap-and-earned-tiers.md) (Elastic Bootstrap, Auto-Draining Seed Anchors & Earned Tier Progression) |
+| old `14` | [`ADR-16`](adr/ADR-16-zero-trust-seed-server.md) (`parvault-seed` Server) + [`ADR-17`](adr/ADR-17-anonymous-census-telemetry.md) (Anonymous Network Census Telemetry) |
+| old `15` | [`ADR-18`](adr/ADR-18-seed-phrase-house-fire-disaster-recovery.md) (BIP-39 / `Argon2id` Disaster Recovery) + [`ADR-19`](adr/ADR-19-crash-safe-atomic-storage-and-lease-pinning.md) (Atomic `fsync`+`rename`, Path-Traversal Defense & Lease Pinning) + [`ADR-08`](adr/ADR-08-noise-xx-transport-and-bounded-wire-framing.md) (`with_limit` Wire Framing) |
+| old `16` | [`ADR-14`](adr/ADR-14-incremental-folder-sync-engine.md) (`.parvaultignore` & `64 KiB` Streaming SHA-256) + [`ADR-19`](adr/ADR-19-crash-safe-atomic-storage-and-lease-pinning.md) (`65,536`-Entry Bounded FIFO Caches & Token-Bucket Rate Limits) |
+| old `17` | [`ADR-20`](adr/ADR-20-lite-client-seed-syndication-and-failover.md) (Lite-Client `1.0×` Seed Syndication, NAS-Death Failover & Selective Byte-Range Restore) |
+| old `18` | [`ADR-21`](adr/ADR-21-router-soc-1mib-streaming-profile.md) (`1 MiB` Router-SoC Profile) + [`ADR-22`](adr/ADR-22-zero-ip-lan-discovery-and-sas-pairing.md) (Zero-IP LAN Discovery & 4-Word SAS Pairing) + [`ADR-23`](adr/ADR-23-online-wan-rendezvous-and-stun-over-noise.md) (Online WAN Rendezvous & STUN-over-Noise) + [`ADR-24`](adr/ADR-24-public-commons-pow-swarm-mode.md) (Public Commons PoW Mode) |
+| old `19` | [`ADR-25`](adr/ADR-25-hmac-blinded-shard-eviction-and-shredding.md) (4-Vector HMAC-Blinded Shard Eviction & `0x00` Shredding) + [`ADR-26`](adr/ADR-26-verifiable-abuse-and-council-quorum-governance.md) (`VerifiableAbuseReport`, Zero-Private-Key `admin_rpc` & `M-of-N` Council Quorum) |
 | `v0.4.0` Pillars | [`ADR-27`](adr/ADR-27-zero-copy-uds-gateway-and-hedged-pool.md) (`parvault-gateway` `SCM_RIGHTS` & `40`-Lane Pool) + [`ADR-28`](adr/ADR-28-stateless-macaroon-capability-attenuation.md) (`CapabilityMacaroon`) + [`ADR-29`](adr/ADR-29-pure-rust-fuse-and-webdav-lazy-vfs.md) (`parvault-fuse` Lazy VFS) + [`ADR-30`](adr/ADR-30-filesystem-free-in-memory-seed-mode.md) (`parvault-seed --no-fs`) + [`ADR-31`](adr/ADR-31-unsafe-remediation-and-os-sys-ffi-boundary.md) (`#![deny/forbid(unsafe_code)]` & `src/os_sys.rs`) |

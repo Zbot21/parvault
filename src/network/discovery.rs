@@ -16,7 +16,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
-/// Default UDP port for Zero-IP Home Network Auto-Discovery (`ADR-18`).
+/// Default UDP port for Zero-IP Home Network Auto-Discovery (`ADR-22`).
 pub const DEFAULT_LAN_DISCOVERY_PORT: u16 = 4009;
 
 /// Administratively scoped IPv4 multicast group (`239.255.80.86`, ASCII `'P','V'`) for LAN discovery.
@@ -1050,7 +1050,7 @@ pub struct KnownPeerRecord {
 pub struct KnownPeersStore {
     #[serde(default)]
     pub peers: BTreeMap<String, KnownPeerRecord>,
-    /// TOFU-pinned Public Tracker Admin Ed25519 public keys keyed by tracker endpoint / PeerId (`ADR-19`).
+    /// TOFU-pinned Public Tracker Admin Ed25519 public keys keyed by tracker endpoint / PeerId (`ADR-26`).
     #[serde(default)]
     pub tracker_admin_pubkeys: BTreeMap<String, [u8; 32]>,
 }
@@ -1183,7 +1183,7 @@ impl KnownPeersStore {
 
     /// TOFU-pins the official `tracker_admin_pubkey` (`tracker_admin.seed`) advertised by a
     /// Public Tracker (`parvault-seed --mode public-bootstrap`) so `--public` nodes accept
-    /// admin-approved takedowns while rejecting forged/MITM swaps (`ADR-19`).
+    /// admin-approved takedowns while rejecting forged/MITM swaps (`ADR-26`).
     pub fn pin_tracker_admin_pubkey(&mut self, tracker_key: &str, admin_pubkey: [u8; 32]) {
         let key = tracker_key.trim();
         if key.is_empty() || admin_pubkey == [0u8; 32] {

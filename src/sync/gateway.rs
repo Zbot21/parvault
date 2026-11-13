@@ -103,7 +103,7 @@ impl GatewayFolderCatalog {
 /// Zero-key sibling incremental folder synchronizer communicating exclusively over [`GatewayBus`]
 /// (`GatewayBus::InProcess` or `GatewayBus::UnixSocket`).
 ///
-/// ### Architectural Invariant (`ADR-33`)
+/// ### Architectural Invariant (`ADR-33` zero-key sync)
 /// Holds **zero** `MasterKey` and **zero** `NodeIdentity` fields: encryption, Reed-Solomon
 /// erasure coding, and `CapabilityMacaroon` verification remain isolated inside `GatewayEngine`.
 pub struct GatewayFolderSync {

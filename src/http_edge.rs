@@ -19,6 +19,10 @@ pub const EDGE_MAX_HEAD_BYTES: usize = 8192;
 /// A client must finish its whole request head within this one deadline (dropped unanswered
 /// otherwise); each read's timeout shrinks to the time left, so a slow drip cannot hold a slot.
 pub const EDGE_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
+/// Each write to the client must make progress within this (QA item 3, plan-3 §2): a client
+/// that stops reading cannot hold a slot. Per write call, so long transfers to a reading client
+/// are not cut.
+pub const EDGE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The WebDAV 401: byte-identical for every reason; the reason code is only logged.
 pub const WEBDAV_401: &[u8] = b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"parvault-webdav\"\r\nWWW-Authenticate: Basic realm=\"parvault-webdav\", charset=\"UTF-8\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -30,6 +34,60 @@ pub const RESP_403: &[u8] =
 pub const RESP_431: &[u8] = b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 pub const RESP_502: &[u8] =
     b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+pub const RESP_503: &[u8] =
+    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+/// How an HTTP server checks a token's chain (WebDAV and status). Required by every server
+/// constructor (no unauthenticated server, L-44). Deliberately not `Debug`: it holds the root
+/// key or a pinned token.
+#[derive(Clone)]
+pub enum EdgeVerifier {
+    /// The daemon's macaroon root key (built-in host).
+    RootKey([u8; 32]),
+    /// The plugin's pinned `--macaroon`: a request token must be it or an offline attenuation of
+    /// it (`capabilities::is_attenuation_of`).
+    PinnedParent(CapabilityMacaroon),
+}
+
+impl EdgeVerifier {
+    pub fn chain_ok(&self, token: &CapabilityMacaroon) -> bool {
+        match self {
+            Self::RootKey(key) => token.tag_valid(key),
+            // L-44 item 4: on a plugin block-cache hit the read never reaches the gateway, so
+            // this check (plus the caveat evaluation in the decision) is the only check.
+            Self::PinnedParent(parent) => crate::capabilities::is_attenuation_of(parent, token),
+        }
+    }
+}
+
+/// Plan-3 ruling change 8 (DNS rebinding): the `Host` must be an IP literal or `localhost`,
+/// with an optional port. On a wildcard bind any IP literal passes; on a specific bind only that
+/// address, plus `localhost` when it is loopback. A missing `Host` or a DNS name is refused.
+pub fn status_host_allowed(host: Option<&str>, bound: std::net::SocketAddr) -> bool {
+    let Some(h) = host.map(str::trim).filter(|h| !h.is_empty()) else {
+        return false;
+    };
+    let name = if let Some(rest) = h.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((ip, tail)) if tail.is_empty() || tail.starts_with(':') => ip,
+            _ => return false,
+        }
+    } else {
+        match h.split_once(':') {
+            Some((n, port)) if !port.contains(':') => n,
+            Some(_) => return false,
+            None => h,
+        }
+    };
+    let ip = bound.ip();
+    if name.eq_ignore_ascii_case("localhost") {
+        return ip.is_unspecified() || ip.is_loopback();
+    }
+    match name.parse::<IpAddr>() {
+        Ok(literal) => ip.is_unspecified() || literal == ip,
+        Err(_) => false,
+    }
+}
 
 /// Connection slots of one server: a global count and a count per source IP.
 pub struct EdgeSlots {
@@ -88,6 +146,10 @@ where
 {
     let ip = stream.peer_addr().ok().map(|a| a.ip());
     if !slots.acquire(ip) {
+        return;
+    }
+    if stream.set_write_timeout(Some(EDGE_WRITE_TIMEOUT)).is_err() {
+        slots.release(ip);
         return;
     }
     let slots_cl = Arc::clone(slots);
@@ -300,6 +362,23 @@ mod tests {
         peer_uid: Some(1000),
     };
 
+    /// QA item 3, defect 3: every edge connection (WebDAV and status) gets a write deadline, so
+    /// a client that stops reading cannot hold a slot.
+    #[test]
+    fn edge_conn_has_write_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let slots = Arc::new(EdgeSlots::new(4));
+        spawn_edge_conn(server, &slots, "edge-test", move |s| {
+            let _ = tx.send(s.write_timeout().unwrap());
+        });
+        let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(got, Some(EDGE_WRITE_TIMEOUT));
+    }
+
     /// The 33rd connection to a 32-slot server is refused (spread over IPs so the per-IP cap
     /// does not hit first); the 9th from one IP is refused; releasing frees a slot.
     #[test]
@@ -318,6 +397,37 @@ mod tests {
         }
         assert!(!one.acquire(ip(1)));
         assert!(one.acquire(ip(2)));
+    }
+
+    #[test]
+    fn status_host_check() {
+        let any: std::net::SocketAddr = "0.0.0.0:4080".parse().unwrap();
+        let lo: std::net::SocketAddr = "127.0.0.1:4080".parse().unwrap();
+        let lan: std::net::SocketAddr = "192.168.1.5:4080".parse().unwrap();
+        for ok in [
+            "192.168.1.5:4080",
+            "10.0.0.1",
+            "[::1]:4080",
+            "localhost:4080",
+            "LOCALHOST",
+        ] {
+            assert!(status_host_allowed(Some(ok), any), "{ok}");
+        }
+        for bad in [
+            "rebind.example:4080",
+            "nas.local",
+            "",
+            "1.2.3.4:5:6",
+            "[::1",
+        ] {
+            assert!(!status_host_allowed(Some(bad), any), "{bad}");
+        }
+        assert!(!status_host_allowed(None, any));
+        assert!(status_host_allowed(Some("127.0.0.1:4080"), lo));
+        assert!(status_host_allowed(Some("localhost:4080"), lo));
+        assert!(!status_host_allowed(Some("10.0.0.1"), lo));
+        assert!(status_host_allowed(Some("192.168.1.5"), lan));
+        assert!(!status_host_allowed(Some("localhost"), lan));
     }
 
     #[test]

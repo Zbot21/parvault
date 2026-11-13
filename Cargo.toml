@@ -26,6 +26,11 @@ path = "src/bin/parvault-sync.rs"
 required-features = ["ipc-client"]
 
 [[bin]]
+name = "parvault-status"
+path = "src/bin/parvault-status.rs"
+required-features = ["status-ui"]
+
+[[bin]]
 name = "parvault-bench"
 path = "src/bin/parvault-bench.rs"
 required-features = ["daemon-runtime"]
@@ -35,12 +40,14 @@ name = "parvault"
 path = "src/lib.rs"
 
 [features]
-default = ["daemon-runtime", "vfs"]
+default = ["daemon-runtime", "vfs", "status-ui"]
 # The full daemon: tokio, libp2p and everything that drives the ring (item 3, L-48).
-daemon-runtime = ["ipc-client", "dep:tokio", "dep:libp2p", "dep:async-trait"]
+daemon-runtime = ["ipc-client", "status-ui", "dep:tokio", "dep:libp2p", "dep:async-trait"]
 # The gateway socket client, wire types and client-side crypto: what a plugin links. No tokio or libp2p.
 ipc-client = []
 vfs = ["ipc-client"]
+# The status page (router_nas) on the shared HTTP edge; the daemon and parvault-status link it.
+status-ui = ["ipc-client"]
 simd-accel = ["reed-solomon-erasure/simd-accel"]
 
 [package.metadata.kani]
