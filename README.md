@@ -79,7 +79,7 @@ parvault watch-folder --folder ~/Documents --public --tracker /ip4/<YOUR_SEED_IP
 
 Discovery and pairing find and pin peers; storing data needs ring membership. A node outside the ring is refused with `peer not admitted; v0.5.0 requires ring admission`, and a node with no ring prints how to start or join one (`parvault wot init` or `parvault wot install-chain`).
 
-With one paired router, all 20 shards of every stripe sit on that one machine: erasure coding protects against bit rot there, not against losing the router. Add more ring members to spread shards. Recovery after losing the laptop works only for folders backed up with a phrase (step 6): `PARVAULT_SEED_PHRASE="<phrase>" parvault recover-from-seed --vault-namespace laptop --out-dir ~/Recovered` on any machine that can reach the ring's nodes (ring membership is not needed: ring members serve the encrypted catalog and shards to any node, and only the phrase decrypts them). Folders served by `parvault up --folder` have no phrase recovery.
+With one paired router, all 20 shards of every stripe sit on that one machine: erasure coding protects against bit rot there, not against losing the router. Add more ring members to spread shards. Recovery after losing the laptop works only for folders backed up with a phrase (step 6): `PARVAULT_SEED_PHRASE="<phrase>" parvault recover-from-seed --vault-namespace laptop --out-dir ~/Recovered` on any machine that can reach the ring's nodes. Ring membership gates storing and publishing, not reading. Anyone holding the owner's recovery key can restore from any reachable member without an invitation; it cannot store until invited. Members serve only ciphertext. Folders served by `parvault up --folder` have no phrase recovery.
 
 ---
 

@@ -195,7 +195,7 @@ What if your laptop is lost or destroyed? A folder can be recovered on a new mac
 export PARVAULT_SEED_PHRASE="$(parvault new-seed-phrase)"; echo "$PARVAULT_SEED_PHRASE"
 parvault watch-folder --folder ~/Documents --vault-namespace documents --once
 ```
-2. On the new machine (it needs to reach the ring's nodes, not to be a ring member: ring members serve the encrypted catalog and pieces to any node, and only your phrase decrypts them), recover with the same phrase and namespace:
+2. On the new machine (it needs to reach the ring's nodes; ring membership gates storing and publishing, not reading. Anyone holding the owner's recovery key can restore from any reachable member without an invitation; it cannot store until invited. Members serve only ciphertext.), recover with the same phrase and namespace:
 ```bash
 export PARVAULT_SEED_PHRASE="<your 24 words>"
 parvault recover-from-seed --vault-namespace documents --out-dir ./recovered-after-fire
