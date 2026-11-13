@@ -5,9 +5,7 @@ use parvault::bootstrap::{
 use parvault::config::ErasureTier;
 use parvault::crypto::{MasterKey, NodeIdentity, PqVaultMasterKey};
 use parvault::network::behaviour::{is_routable_public_ip, BincodeWireCodec};
-use parvault::network::wot::{
-    DelegationChain, InvitationHop, SlashingEvidence, SlashingReason, WebOfTrustRegistry,
-};
+use parvault::network::wot::{DelegationChain, InvitationHop, WebOfTrustRegistry};
 use parvault::por::{PorError, PorVerifierEngine, RepairGrant};
 use parvault::sharding::encode_ciphertext_stripe;
 use parvault::storage::{
@@ -412,20 +410,10 @@ fn test_rt4_wire_codec_oom_bomb_defense_por_cross_protocol_replay_and_telemetry_
     })
     .unwrap();
 
-    // A single PorAuditTimeoutOrTamper evidence (nonce = 777) replayed 5 times must only count ONCE
-    let ev = SlashingEvidence::issue(
-        &reporter,
-        offender.public_key_bytes(),
-        SlashingReason::PorAuditTimeoutOrTamper,
-        777,
-    );
-    for _ in 0..5 {
-        wot.apply_slashing_evidence(&ev);
-    }
-    assert!(
-        wot.is_peer_trusted(&offender.public_key_bytes()),
-        "Replaying the same SlashingEvidence nonce must not quarantine an honest node"
-    );
+    // Peer slashing evidence is not applied in v0.5.0 (apply_slashing_evidence is test-only);
+    // its replay dedupe is covered by the network::wot unit tests.
+    assert!(wot.is_peer_trusted(&offender.public_key_bytes()));
+    assert!(wot.is_peer_trusted(&reporter.public_key_bytes()));
 
     // 5. [RT3-01] AnonymousTelemetryBeacon Hashcash PoW, Bucket Bounds & IQR Outlier Trimming:
     let mut agg = NetworkCensusAggregator::with_min_pow_bits(500, 8);

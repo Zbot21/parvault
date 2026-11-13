@@ -1145,7 +1145,9 @@ impl WebOfTrustRegistry {
 
     /// Processes a signed `SlashingEvidence` message received via Gossipsub.
     /// Deduplicates `(reporter_pubkey, offender_pubkey, nonce)` so replayed evidence cannot
-    /// repeatedly increment `record_failure` (`ADR-15`).
+    /// repeatedly increment `record_failure` (`ADR-15`). Test-only: nothing applies peer evidence
+    /// in `v0.5.0` (slashing is local; architect 2b sign-off).
+    #[cfg(test)]
     pub fn apply_slashing_evidence(&mut self, evidence: &SlashingEvidence) -> bool {
         if !evidence.verify() {
             return false;

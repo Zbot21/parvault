@@ -1787,6 +1787,11 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
         wot.set_trust_pool_mode(TrustPoolMode::Hybrid, DEFAULT_PUBLIC_WOT_POW_BITS);
     }
     wot.protect_key(node_identity.public_key_bytes());
+    // The owner's key is never slashed either, so a future audit loop's record_failure cannot
+    // quarantine the owner (architect 2b sign-off, notes for 2c).
+    if let Some(owner) = server.owner_root_pubkey() {
+        wot.protect_key(owner.ed25519_pub);
+    }
     let por_verifier = if in_memory_mode {
         PorVerifierEngine::new(300)
     } else {

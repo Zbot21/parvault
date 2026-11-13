@@ -19,8 +19,8 @@ use parvault::{
         MasterKey, NodeIdentity,
     },
     network::{
-        DelegationChain, InvitationHop, PeerTopologyMetrics, PlacementEngine, SlashingEvidence,
-        SlashingReason, TokenBucketRateLimiter, WebOfTrustRegistry,
+        DelegationChain, InvitationHop, PeerTopologyMetrics, PlacementEngine,
+        TokenBucketRateLimiter, WebOfTrustRegistry,
     },
     por::{
         compute_salted_commitment, generate_por_challenge, PorError, PorResponse,
@@ -362,26 +362,10 @@ fn test_bounded_por_and_slashing_replay_caches_and_range_cap() {
     })
     .unwrap();
 
-    let ev = SlashingEvidence::issue(
-        &reporter,
-        offender.public_key_bytes(),
-        SlashingReason::PorAuditTimeoutOrTamper,
-        42,
-    );
-    assert!(
-        !wot.apply_slashing_evidence(&ev),
-        "1st PoR timeout increments failure count to 1/3 (not yet quarantined)"
-    );
-    assert_eq!(wot.seen_slashing_nonces_count(), 1);
-    // Replaying the exact same SlashingEvidence (nonce=42) 5 times must be ignored and never quarantine offender
-    for _ in 0..5 {
-        assert!(!wot.apply_slashing_evidence(&ev));
-    }
-    assert!(
-        wot.is_peer_trusted(&offender.public_key_bytes()),
-        "Replayed SlashingEvidence with duplicate nonce must not quarantine honest/single-fault peer"
-    );
-    assert_eq!(wot.seen_slashing_nonces_count(), 1);
+    // Slashing evidence from peers is not applied in v0.5.0 (apply_slashing_evidence is
+    // test-only); its replay dedupe is covered by the network::wot unit tests.
+    assert!(wot.is_peer_trusted(&offender.public_key_bytes()));
+    assert!(wot.is_peer_trusted(&reporter.public_key_bytes()));
 
     let _ = fs::remove_dir_all(&base);
 }

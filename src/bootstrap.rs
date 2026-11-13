@@ -1171,6 +1171,11 @@ impl ZeroTrustSeedServer {
         self.mode
     }
 
+    /// The homelab owner's root public key, if this seed has one.
+    pub fn owner_root_pubkey(&self) -> Option<&HybridPqPublicKey> {
+        self.owner_root_pubkey.as_ref()
+    }
+
     pub fn block_store(&self) -> &BlockStore {
         &self.block_store
     }

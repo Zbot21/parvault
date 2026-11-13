@@ -50,6 +50,17 @@ pub(crate) async fn run_daemon(
     );
     wot.set_trust_pool_mode(opts.trust_mode, DEFAULT_PUBLIC_WOT_POW_BITS);
     wot.protect_key(node_identity.public_key_bytes());
+    // The owner key (derived from the master key) is never slashed either, so a future audit
+    // loop's record_failure cannot quarantine the owner. Only an existing key is read here.
+    if cfg.data_dir.join("master_key.sealed").exists() {
+        if let Ok(mk) = resolve_master_key(
+            &cfg.data_dir,
+            None,
+            cfg.device_sealing_passphrase.as_deref(),
+        ) {
+            wot.protect_key(NodeIdentity::from_master_key(&mk).public_key_bytes());
+        }
+    }
 
     let mut por_verifier =
         PorVerifierEngine::with_persistence_dir(cfg.por_timeout_ms, &cfg.data_dir);
