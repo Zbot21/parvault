@@ -3885,3 +3885,123 @@ fn ewire_blinded_read_by_other_key_refused() {
     assert_logged(&node, "reject.blinded_read_sig_invalid");
     gate_ran("trust_enforcement::ewire_blinded_read_by_other_key_refused");
 }
+
+/// A signed abuse report with a working burden of proof (a file stored with a key the reporter
+/// discloses, and its first stripe's data shards).
+fn abuse_report(reporter: &NodeIdentity) -> parvault::storage::VerifiableAbuseReport {
+    let dir = tempfile::tempdir().unwrap();
+    let store = parvault::storage::BlockStore::new(
+        dir.path(),
+        parvault::storage::QuotaManager::new(64 * 1024 * 1024, 32 * 1024 * 1024),
+    )
+    .unwrap();
+    let key = MasterKey::generate();
+    let input = dir.path().join("leaked.bin");
+    std::fs::write(
+        &input,
+        b"publicly shared payload with a leaked key".repeat(256),
+    )
+    .unwrap();
+    let manifest = store
+        .store_file_streaming("uploader", &input, &key, ErasureTier::Consumer, 65_536)
+        .unwrap();
+    let stripe = &manifest.stripes[0];
+    let samples = (0..stripe.k_data)
+        .map(|i| {
+            let sid = ShardId {
+                stripe_merkle_root: stripe.stripe_merkle_root,
+                shard_index: i as u32,
+                shard_hash: stripe.shard_hashes[i],
+            };
+            (i as u32, store.get_shard(&sid).unwrap())
+        })
+        .collect();
+    parvault::storage::VerifiableAbuseReport::submit_signed(
+        reporter,
+        "abuse@example.org",
+        "publicly shared illegal content",
+        None,
+        manifest.clone(),
+        key.to_hex(),
+        0,
+        samples,
+        now_ms(),
+    )
+}
+
+/// E-WIRE SubmitAbuseTakedownReport accept: a signed report with a working proof is queued.
+#[test]
+fn ewire_signed_abuse_report_queued() {
+    let node = spawn_daemon("ew-abuse-a");
+    let reporter = key(0xB5);
+    let resp = send(
+        &reporter,
+        &node,
+        MeshWireRequest::SubmitAbuseTakedownReport(abuse_report(&reporter)),
+    );
+    assert!(
+        format!("{resp:?}").contains("queued_for_admin_review: true"),
+        "{resp:?}"
+    );
+    gate_ran("trust_enforcement::ewire_signed_abuse_report_queued");
+}
+
+/// E-WIRE SubmitAbuseTakedownReport reject: the same report with a forged signature is refused.
+#[test]
+fn ewire_forged_abuse_report_refused() {
+    let node = spawn_daemon("ew-abuse-r");
+    let reporter = key(0xB5);
+    let mut report = abuse_report(&reporter);
+    report.sig_r[0] ^= 0xFF;
+    let resp = send(
+        &reporter,
+        &node,
+        MeshWireRequest::SubmitAbuseTakedownReport(report),
+    );
+    assert!(
+        format!("{resp:?}").contains("queued_for_admin_review: false"),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.abuse_report_sig_invalid");
+    gate_ran("trust_enforcement::ewire_forged_abuse_report_refused");
+}
+
+/// A node holding a genesis-signed 1-of-1 council (epoch 1).
+fn node_with_council(label: &str) -> Node {
+    let node = spawn_daemon(label);
+    let out = council_cli(&node, &council_init_args(&[genesis()], 1));
+    assert!(out.status.success(), "{}", combined(&out));
+    node
+}
+
+fn council_ask() -> MeshWireRequest {
+    MeshWireRequest::GetCouncilManifest {
+        scope_root: genesis().public_key_bytes(),
+        from_epoch: 0,
+    }
+}
+
+/// E-WIRE GetCouncilManifest accept: an admitted peer gets the council chain.
+#[test]
+fn ewire_admitted_peer_gets_council_manifest() {
+    let node = node_with_council("ew-council-a");
+    let resp = send(&key(0xB6), &node, council_ask());
+    assert!(
+        matches!(&resp, MeshWireResponse::CouncilManifestResult { manifests } if manifests.len() == 1),
+        "{resp:?}"
+    );
+    gate_ran("trust_enforcement::ewire_admitted_peer_gets_council_manifest");
+}
+
+/// E-WIRE GetCouncilManifest reject: a peer that is not admitted gets nothing.
+#[test]
+fn ewire_unadmitted_peer_council_manifest_refused() {
+    let node = node_with_council("ew-council-r");
+    let resp = send_as_stranger(&key(0xB6), &node, council_ask());
+    assert!(
+        matches!(&resp, MeshWireResponse::CouncilManifestResult { manifests } if manifests.is_empty()),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.peer_not_admitted");
+    gate_ran("trust_enforcement::ewire_unadmitted_peer_council_manifest_refused");
+}

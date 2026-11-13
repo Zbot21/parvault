@@ -779,6 +779,27 @@ pub struct VerifiedAbuseProofOutcome {
     pub verified_plaintext_len: usize,
 }
 
+/// What the takedown queue knows about a submitted report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AbuseReportFacts {
+    /// The reporter's Ed25519 accountability signature verifies (and an allegation is present).
+    pub sig_valid: bool,
+    /// The disclosed key decrypts the sampled stripe to the manifest's roots (burden of proof).
+    pub proof_valid: bool,
+}
+
+/// ADR-26 / E-WIRE SubmitAbuseTakedownReport: a report is queued for admin review only if its
+/// reporter signed it and it carries a working burden of proof.
+pub fn abuse_report_decision(f: &AbuseReportFacts) -> Result<(), &'static str> {
+    if !f.sig_valid {
+        return Err("reject.abuse_report_sig_invalid");
+    }
+    if !f.proof_valid {
+        return Err("reject.abuse_report_proof_invalid");
+    }
+    Ok(())
+}
+
 /// Signed abuse / illegal-content report carrying cryptographic burden-of-proof (`ADR-19`).
 /// Because `ParVault` storage nodes and public trackers are zero-knowledge, the reporter bears
 /// the mathematical burden of proving what the encrypted network shards contain (via `AES-256-GCM`
@@ -1151,7 +1172,19 @@ impl PublicTrackerTakedownQueue {
         {
             return Err("duplicate report_id already queued".to_string());
         }
-        let proof_outcome = report.verify_cryptographic_burden_of_proof()?;
+        let sig_valid = report.verify_reporter_signature();
+        let proof = if sig_valid {
+            report.verify_cryptographic_burden_of_proof()
+        } else {
+            Err("invalid reporter Ed25519 signature or missing legal allegation".to_string())
+        };
+        if let Err(code) = abuse_report_decision(&AbuseReportFacts {
+            sig_valid,
+            proof_valid: proof.is_ok(),
+        }) {
+            tracing::warn!(code, report = %hex::encode(report.report_id), "refused an abuse report");
+        }
+        let proof_outcome = proof?;
 
         while self.entries.len() >= MAX_TAKEDOWN_QUEUE_ENTRIES {
             // Evict oldest already-reviewed entry first; if all are pending, reject overflow.
@@ -2965,6 +2998,21 @@ mod tests {
 
     fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// E-WIRE SubmitAbuseTakedownReport: the reporter's signature, then the burden of proof.
+    #[test]
+    fn abuse_report_decision_rules() {
+        let f = |sig_valid, proof_valid| {
+            abuse_report_decision(&AbuseReportFacts {
+                sig_valid,
+                proof_valid,
+            })
+        };
+        assert_eq!(f(true, true), Ok(()));
+        assert_eq!(f(false, true), Err("reject.abuse_report_sig_invalid"));
+        assert_eq!(f(false, false), Err("reject.abuse_report_sig_invalid"));
+        assert_eq!(f(true, false), Err("reject.abuse_report_proof_invalid"));
     }
 
     /// F-09: epoch, freshness and expiry, in that order; local-owner orders need no council.
