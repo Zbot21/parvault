@@ -56,7 +56,7 @@ Status values:
 | F-38-SHARED | Low | A phrase-derived vault identity is shared by every device holding the phrase: one cert covers them all, so per-device revocation is lost for lite syndication. | 2e | Registered (L-40) |
 | F-38-PREFIX | Low | The cert names a device id, the first 16 hex characters of the key (`keys.rs` `device_peer_id_for_pubkey`), so it binds only a 64-bit prefix (predates F-38). | after v0.5.0 | Registered (L-40): name the full key in the cert after v0.5.0 |
 | F-38-NET | Low | The lite path's client is built with all mesh endpoints: it sends `SyndicateLiteStripe` only to the seed, but publishes the snapshot's DHT envelope to every mesh endpoint as the vault identity. | 2e | Registered (L-40 asked to confirm it talks only to the seed: it does not, for the DHT put) |
-| F-38-GRANT | Unverified | `register_grant` may overwrite an existing shard's grant owner unconditionally (`por/verifier.rs` `register_grant`); a second certified sender could take over a shard's owner. | 2e | For QA to check (L-40) |
+| F-38-GRANT | Confirmed | PutShard (`network/wire_handler.rs:~899`) binds `owner_peer_id` to the sender but never checks the repair grant's owner against the sender. A re-put of an existing shard also overwrites its owner: `put_shard` (`storage/block_store.rs:~755`, `~785`) calls `record_shard_stored`, which moves the quota owner, and `register_grant` (`por/verifier.rs:~451`) replaces `shard_grant_owners` unconditionally. So an admitted peer that holds a shard's bytes can take over its ownership, then read or delete it. | 2e | Open: awaiting an architect ruling (L-40) |
 | F-38-TLA | Info | `ParVaultLiteClientAndSeedFailover.tla` models no grant or cert binding. | after v0.5.0 | Registered, not blocking (L-40) |
 
 ## Proof gaps
