@@ -1091,6 +1091,15 @@ fn proof_sanitize_sync_relative_path_no_traversal() {
     let mut out_buf = [0u8; 10];
     let result =
         sanitize_sync_relative_path_into(&raw_bytes[..slice_len], &mut out_buf[..slice_len]);
+    // Non-vacuity (ADR-33): a `..` traversal segment is rejected, and a nested path is accepted.
+    kani::cover!(
+        result.is_none() && slice_len == 2 && raw_bytes[0] == b'.' && raw_bytes[1] == b'.',
+        "traversal segment rejected"
+    );
+    kani::cover!(
+        result.is_some_and(|n| out_buf[..n].contains(&b'/')),
+        "nested relative path accepted"
+    );
 
     if slice_len == 0 || raw_bytes[0] == b'/' || raw_bytes[0] == b'\\' {
         assert!(result.is_none());

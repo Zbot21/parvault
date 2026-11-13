@@ -120,6 +120,7 @@ Claim lines in `.enforcement.map` use the finding id, or the finding id with a s
 | G-MAC | Info | D-ADR claim for ADR-28: a gateway read frame whose attenuated macaroon is outside its caveat is refused, per frame (`gateway_macaroon_decision`). | 2c | Enforced (QA pending) |
 | G-SEAL | Info | D-ADR claim for ADR-32: under `--require-sealed-memfd` an unsealed ingest memfd is refused (`gateway_memfd_seal_decision`). | 2c | Enforced (QA pending) |
 | G-UID | Info | D-ADR claim for ADR-32: under `--allow-peer-uid` a client whose `SO_PEERCRED` UID is not listed is refused (`gateway_peer_uid_decision`). | 2c | Enforced (QA pending) |
+| S-SANITIZE | Info | D-ADR `kani` line for ADR-33: `proof_sanitize_sync_relative_path_no_traversal` now covers a rejected `..` segment and an accepted nested path (ADR-33 itself is linked by claim F-43-ADR33). | 2c | Enforced (QA pending; Kani not yet run) |
 | F-33-BUDGET | Per-sender and total in-flight forward budget at a relay. |
 | F-24-LAYERED | F-24 admission at onion final delivery, layered branch (`open_final_target_pq`). |
 | F-25-DHT | F-25 admission for `PutDhtEnvelope`. |
