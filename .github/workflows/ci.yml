@@ -179,6 +179,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run Clippy lints
         run: cargo clippy --all-targets -- -D warnings
+      - name: No feature cfg inside claimed or Kani functions (plan-3 ruling change 5)
+        run: bash scripts/check_claim_cfg.sh .
       - name: Check minimal headless build (--no-default-features, VFS excluded)
         run: cargo check --no-default-features --features daemon-runtime --bin parvault --bin parvault-seed --bin parvault-sync
       - name: Build binaries (parvault, parvault-seed, parvault-fuse, parvault-sync)

@@ -5,6 +5,8 @@ pub mod cli_runner;
 #[cfg(feature = "daemon-runtime")]
 pub mod engine;
 pub mod ipc;
+#[cfg(all(unix, feature = "daemon-runtime"))]
+pub mod server;
 #[cfg(unix)]
 pub mod shm;
 
@@ -27,7 +29,11 @@ pub use engine::GatewayEngine;
 #[cfg(unix)]
 pub use ipc::{
     create_memfd, create_memfd_sized, read_self_anon_rss_bytes, read_self_rss_bytes, GatewayBus,
-    GatewayIpcClient, GatewayIpcServer, GatewayIpcServerHandle,
+    GatewayIpcClient,
 };
+#[cfg(all(unix, feature = "daemon-runtime"))]
+pub use ipc::{GatewayIpcServer, GatewayIpcServerHandle};
 #[cfg(unix)]
-pub use shm::{pread_full_or_eof, pwrite_all, recv_frame_with_fd, send_frame_with_fd};
+pub use shm::{pread_full_or_eof, pwrite_all};
+#[cfg(all(unix, feature = "daemon-runtime"))]
+pub use shm::{recv_frame_with_fd, send_frame_with_fd};
