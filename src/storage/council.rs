@@ -333,36 +333,52 @@ pub fn council_members_and_quorum(
     }
 }
 
-/// The key that signs a scope's epoch 1, by mode (as the pre-manifest resolvers split it):
+/// The scope root of this node's council, by mode (as the pre-manifest resolvers split it):
 /// private mode trusts the ring genesis only, so no public tracker authority affects a private
-/// ring; public mode trusts the first pinned tracker admin key (`known_peers.json`, the legacy
-/// `pinned_tracker_admins.json` read once as the root, or `extra_pinned`).
+/// ring. Public mode trusts a pinned tracker admin key: once a manifest is installed, the key
+/// that rooted it (while it is still pinned), so a change in pin order cannot strip the
+/// council (QA 2c R1); before that, the first key in `known_peers.json`'s order (sorted by
+/// tracker address), else the legacy `pinned_tracker_admins.json`, else `extra_pinned`.
 pub fn council_scope_root(
     data_dir: &Path,
     genesis_pubkey: Option<[u8; 32]>,
     public_mode: bool,
     extra_pinned: &[[u8; 32]],
 ) -> Option<[u8; 32]> {
-    if public_mode {
-        pinned_admin_root(data_dir).or_else(|| extra_pinned.first().copied())
-    } else {
-        genesis_pubkey
+    if !public_mode {
+        return genesis_pubkey;
     }
+    if let Some(m) = load_council_manifest(data_dir) {
+        let pinned = crate::network::KnownPeersStore::load(data_dir).pinned_tracker_admin_pubkeys();
+        if pinned.contains(&m.scope_root)
+            || extra_pinned.contains(&m.scope_root)
+            || legacy_pinned_admins(data_dir).contains(&m.scope_root)
+        {
+            return Some(m.scope_root);
+        }
+    }
+    pinned_admin_root(data_dir).or_else(|| extra_pinned.first().copied())
+}
+
+fn legacy_pinned_admins(data_dir: &Path) -> Vec<[u8; 32]> {
+    std::fs::read_to_string(data_dir.join("pinned_tracker_admins.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|h| {
+            let b = hex::decode(h.trim()).ok()?;
+            <[u8; 32]>::try_from(b.as_slice()).ok()
+        })
+        .collect()
 }
 
 pub fn pinned_admin_root(data_dir: &Path) -> Option<[u8; 32]> {
-    if let Some(pk) = crate::network::KnownPeersStore::load(data_dir)
+    crate::network::KnownPeersStore::load(data_dir)
         .pinned_tracker_admin_pubkeys()
         .first()
-    {
-        return Some(*pk);
-    }
-    let raw = std::fs::read_to_string(data_dir.join("pinned_tracker_admins.json")).ok()?;
-    let list: Vec<String> = serde_json::from_str(&raw).ok()?;
-    list.iter().find_map(|h| {
-        let b = hex::decode(h.trim()).ok()?;
-        <[u8; 32]>::try_from(b.as_slice()).ok()
-    })
+        .copied()
+        .or_else(|| legacy_pinned_admins(data_dir).first().copied())
 }
 
 #[cfg(test)]
@@ -489,6 +505,45 @@ mod tests {
             Some([3; 32])
         );
         assert_eq!(council_scope_root(dir.path(), None, false, &[]), None);
+    }
+
+    /// QA 2c R1(b): once installed, a public node's council keeps the root that signed it while
+    /// that key is still pinned, even if another pinned key now sorts first.
+    #[test]
+    fn public_scope_root_follows_the_installed_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (id(0x10), id(0x20));
+        let (first, second) = if a.public_key_bytes() < b.public_key_bytes() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        std::fs::write(
+            dir.path().join("pinned_tracker_admins.json"),
+            format!(
+                "[\"{}\", \"{}\"]",
+                hex::encode(first.public_key_bytes()),
+                hex::encode(second.public_key_bytes())
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            council_scope_root(dir.path(), None, true, &[]),
+            Some(first.public_key_bytes())
+        );
+        let mut m = CouncilManifest::new(
+            second.public_key_bytes(),
+            1,
+            vec![id(3).public_key_bytes()],
+            1,
+            1,
+        );
+        m.sign(&second);
+        install_council_manifest(dir.path(), &m, second.public_key_bytes()).unwrap();
+        assert_eq!(
+            council_scope_root(dir.path(), None, true, &[]),
+            Some(second.public_key_bytes())
+        );
     }
 
     #[test]

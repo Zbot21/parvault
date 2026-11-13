@@ -6120,3 +6120,72 @@ fn bseed_silent_peer_gets_one_put_per_job() {
         "the silent peer received more than one put in one job"
     );
 }
+
+/// QA 2c R1: a public-mode node with no council manifest never auto-installs epoch 1 (its root
+/// is a TOFU-pinned tracker key, not the ring genesis). A peer serving a manifest signed by that
+/// root is ignored; the order is refused and nothing is installed.
+#[test]
+fn council_public_first_epoch_not_auto_installed() {
+    use parvault::storage::council::{install_council_manifest, CouncilManifest};
+    let tracker = key(0x7A);
+    let members = [key(0x81)];
+    let mut m = CouncilManifest::new(
+        tracker.public_key_bytes(),
+        1,
+        members.iter().map(|k| k.public_key_bytes()).collect(),
+        1,
+        now_ms(),
+    );
+    m.sign(&tracker);
+    // The serving peer holds the manifest (it reads it per request).
+    let ahead = spawn_daemon("cpub-ahead");
+    install_council_manifest(&ahead.dir, &m, tracker.public_key_bytes()).unwrap();
+    // The public node pins the tracker key and has `ahead` as its peer.
+    let (root_dir, dir, reg, log) = prepare("cpub-behind");
+    std::fs::write(
+        dir.join("pinned_tracker_admins.json"),
+        format!("[\"{}\"]", hex::encode(tracker.public_key_bytes())),
+    )
+    .unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .arg("--data-dir")
+        .arg(&dir)
+        .args([
+            "--no-lan-discovery",
+            "--public",
+            "--peers",
+            &format!("{}/p2p/{}", ahead.addr, ahead.peer_id()),
+            "daemon",
+            "start",
+            "--listen",
+            common::LOOPBACK_EPHEMERAL,
+        ]);
+    let behind = spawn(cmd, root_dir, dir, log);
+    // `behind` admits `ahead` (public-commons ticket).
+    let c = MeshClient::new(ahead.identity(), Vec::new(), None).with_admission(
+        AdmissionSource::default().with_public_tickets(DEFAULT_PUBLIC_WOT_POW_BITS),
+    );
+    let _ = c.send_request(
+        &behind.addr,
+        MeshWireRequest::GetCouncilManifest {
+            scope_root: tracker.public_key_bytes(),
+            from_epoch: 0,
+        },
+    );
+    let order = council_order(&[&members[0]], ban_ip(89), 1);
+    let r = send(
+        &key(0x89),
+        &behind,
+        MeshWireRequest::BroadcastEvictionOrder(order.clone()),
+    );
+    assert!(!order_accepted(&r), "{r:?}");
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(council_epoch_of(&behind), 0, "{}", behind.log_text());
+    let r = send(
+        &key(0x89),
+        &behind,
+        MeshWireRequest::BroadcastEvictionOrder(order),
+    );
+    assert!(!order_accepted(&r), "{r:?}");
+}

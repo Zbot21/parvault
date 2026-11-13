@@ -903,7 +903,7 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
         data_dir,
         council_root,
         node_identity,
-        genesis_pubkey: _,
+        genesis_pubkey,
         block_store,
         server,
         wot,
@@ -1952,9 +1952,20 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
             let council = crate::storage::council::council_from_manifest(data_dir, council_root);
             // An order from a newer council epoch: refused below, and the newer manifest is
             // fetched in the background from peers this node admitted (bounded).
-            // With no manifest yet (epoch 0) the fetch asks for the chain from epoch 1, which
-            // must verify against this node's own scope root (QA 2c D6).
-            if let (Some(root), Some(mc)) = (council_root, block_store.mesh_client()) {
+            // With no manifest yet, epoch 1 is fetched only when the scope root is the ring
+            // genesis (private mode, QA 2c D6). A public node's root is a TOFU-pinned tracker
+            // key, so its epoch 1 is an operator `council install`, never automatic (R1).
+            let may_fetch =
+                council.is_some() || (council_root.is_some() && council_root == genesis_pubkey);
+            if !may_fetch && order.council_epoch > 0 {
+                info!(
+                    code = "reject.council_first_epoch_needs_install",
+                    "no council installed; public-mode councils are installed by the operator"
+                );
+            }
+            if let (Some(root), Some(mc), true) =
+                (council_root, block_store.mesh_client(), may_fetch)
+            {
                 if order.council_epoch > council.as_ref().map_or(0, |c| c.epoch) {
                     let admitted: Vec<String> = mc
                         .all_network_endpoints()
