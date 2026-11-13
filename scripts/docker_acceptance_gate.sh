@@ -301,8 +301,14 @@ docker exec parvault-client sh -cex '
     sha256sum /workspace/lite_source/laptop_note.txt > /tmp/expected_lite.sha256
 '
 SEED_PUBKEY_HEX="$(docker exec parvault-seed-0 /usr/local/bin/parvault-seed identity --data-dir /var/lib/parvault-seed | awk '/Owner PQ Public Key Hex/ {print $7}')"
-# The cert must name the client's own Device Peer ID (F-25): read it from `parvault identity`.
-LITE_DEVICE_ID="$(docker exec -w /tmp/lite-client-state parvault-client /usr/local/bin/parvault identity 2>/dev/null | awk '/Device Peer ID/ {print $5}')"
+# The lite client syndicates as its vault identity, which also signs the repair grant (F-25,
+# F-38): the cert names the Vault Device Peer ID that `parvault identity --seed-phrase` prints.
+LITE_DEVICE_ID="$(docker exec -w /tmp/lite-client-state parvault-client /usr/local/bin/parvault identity \
+    --seed-phrase "$SEED_PHRASE" --vault-namespace "lite-failover-ns" 2>/dev/null | awk '/Vault Device Peer ID/ {print $6}')"
+if [ -z "$LITE_DEVICE_ID" ]; then
+    echo "ERROR: could not read the Vault Device Peer ID"
+    exit 1
+fi
 DEVICE_CERT_TOKEN="$(docker exec parvault-seed-0 /usr/local/bin/parvault-seed issue-device-cert --data-dir /var/lib/parvault-seed --device-peer-id "$LITE_DEVICE_ID" --device-label laptop | awk '/Shareable Token/ {print $4}')"
 
 docker exec -w /tmp/lite-client-state parvault-client /usr/local/bin/parvault \
@@ -317,6 +323,8 @@ docker exec -w /tmp/lite-client-state parvault-client /usr/local/bin/parvault \
     --once
 
 # Simulate NAS / Seed Server death by stopping parvault-seed-0, then recover Lite-Client vault directly from mesh peers!
+# Wipe the client's local shards first, so the restore cannot read them (F-38 ruling).
+docker exec parvault-client sh -c 'rm -rf /tmp/lite-client-state/.parvault-data/shards /tmp/lite-client-state/.parvault-data/shard_index.bin'
 docker stop parvault-seed-0
 docker exec -w /tmp/lite-client-state parvault-client /usr/local/bin/parvault \
     --peers "$PEERS_CSV" \

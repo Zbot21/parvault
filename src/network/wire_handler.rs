@@ -595,6 +595,21 @@ pub fn renew_decision(facts: &RenewFacts) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// A syndicated stripe's repair grant must be owned by the authenticated sender, compared on
+/// the full 32-byte key (never the 64-bit device id). With F-25 (the cert names the sender) this
+/// chains the grant owner to the owner root, so a certified device cannot attach a grant
+/// self-signed by another key (F-38, L-40). No grant is allowed.
+pub fn syndication_grant_decision(
+    grant_owner: Option<[u8; 32]>,
+    sender_pubkey: Option<[u8; 32]>,
+) -> Result<(), &'static str> {
+    match grant_owner {
+        None => Ok(()),
+        Some(owner) if sender_pubkey == Some(owner) => Ok(()),
+        Some(_) => Err("reject.syndication_grant_not_sender"),
+    }
+}
+
 /// The one refusal text for every failed handshake (F-30): the reason stays in the local log.
 pub const HANDSHAKE_REFUSED_TEXT: &str = "handshake refused";
 
@@ -1612,6 +1627,18 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                     receipt: None,
                     syndicated_peers: Vec::new(),
                     error: Some("device cert does not name the sender".to_string()),
+                };
+            }
+            // F-38: refuse the whole request (never store while dropping the grant).
+            if let Err(code) = syndication_grant_decision(
+                repair_grant.as_ref().map(|g| g.owner_pubkey),
+                remote_pubkey,
+            ) {
+                warn!(code, peer = %remote_peer_id, "refused a repair grant not owned by the sender");
+                return MeshWireResponse::SyndicateLiteStripeAck {
+                    receipt: None,
+                    syndicated_peers: Vec::new(),
+                    error: Some("repair grant must be owned by the sender".to_string()),
                 };
             }
             let grant_to_register = repair_grant.clone();

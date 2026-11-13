@@ -3338,50 +3338,112 @@ fn r3_partial_placement_keeps_remote_shards() {
     assert_eq!(listed.lines().count(), 1, "no new entry: {listed:?}");
 }
 
-/// Grant/cert owner binding (QA on 5f330a1), reproduction: an owner-certified device attaches a
-/// repair grant self-signed by an unrelated key X; checks whether X can then read a shard the
-/// seed stored. Today it can (open: the fix needs an architect ruling on which key a lite
-/// syndication grant must be bound to).
-#[test]
-fn repro_syndication_grant_from_foreign_owner() {
-    let node = spawn_seed("synd-grant-x");
-    let device = key(0xC7);
-    let stranger = key(0xC8);
-    let mut req = syndicate(&node, &device);
-    let (root, hashes) = match &req {
-        MeshWireRequest::SyndicateLiteStripe { bundle, .. } => (
-            bundle.expected_stripe_merkle_root,
-            bundle.expected_shard_hashes.clone(),
-        ),
-        _ => unreachable!(),
+/// A syndication of one stripe whose cert names `cert_device` and whose repair grant, if any, is
+/// self-signed by `grant_owner`. Returns the request and the stripe's shard 0.
+fn f38_syndicate(
+    seed: &Node,
+    cert_device: &NodeIdentity,
+    grant_owner: Option<&NodeIdentity>,
+) -> (MeshWireRequest, ShardId) {
+    let mut req = syndicate(seed, cert_device);
+    let MeshWireRequest::SyndicateLiteStripe {
+        bundle,
+        repair_grant,
+        ..
+    } = &mut req
+    else {
+        unreachable!()
     };
-    if let MeshWireRequest::SyndicateLiteStripe { repair_grant, .. } = &mut req {
-        *repair_grant = Some(parvault::por::RepairGrant::issue(
-            &stranger,
-            root,
-            Vec::new(),
-            ErasureTier::Homelab,
-        ));
-    }
-    let resp = send(&device, &node, req);
-    let stored = matches!(
+    let root = bundle.expected_stripe_merkle_root;
+    let sid = ShardId {
+        stripe_merkle_root: root,
+        shard_index: 0,
+        shard_hash: bundle.expected_shard_hashes[0],
+    };
+    *repair_grant = grant_owner
+        .map(|o| parvault::por::RepairGrant::issue(o, root, Vec::new(), ErasureTier::Homelab));
+    (req, sid)
+}
+
+fn synd_stored(resp: &MeshWireResponse) -> bool {
+    matches!(
         resp,
         MeshWireResponse::SyndicateLiteStripeAck {
             receipt: Some(_),
             ..
         }
-    );
-    let sid = ShardId {
-        stripe_merkle_root: root,
-        shard_index: 0,
-        shard_hash: hashes[0],
+    )
+}
+
+/// F-38 accept (L-40): the vault identity sends, the cert names it and it signs the grant; it
+/// then reads the shard as its owner.
+#[test]
+fn f38_sender_owned_grant_accepted() {
+    let node = spawn_seed("f38-a");
+    let vault = key(0xC9);
+    let (req, sid) = f38_syndicate(&node, &vault, Some(&vault));
+    let resp = send(&vault, &node, req);
+    assert!(synd_stored(&resp), "{resp:?}");
+    assert!(read_bytes(&send(&vault, &node, owner_read(&vault, sid))).is_some());
+    gate_ran("trust_enforcement::f38_sender_owned_grant_accepted");
+}
+
+/// F-38 reject (reproduced before the fix: the foreign key was registered and read the shard):
+/// a certified device attaching a grant self-signed by another key is refused outright; nothing
+/// is stored and the foreign key reads nothing.
+#[test]
+fn f38_foreign_owner_grant_refused() {
+    let node = spawn_seed("f38-r");
+    let device = key(0xC7);
+    let stranger = key(0xC8);
+    let (req, sid) = f38_syndicate(&node, &device, Some(&stranger));
+    let resp = send(&device, &node, req);
+    assert!(!synd_stored(&resp), "{resp:?}");
+    assert_logged(&node, "reject.syndication_grant_not_sender");
+    assert!(read_bytes(&send(&stranger, &node, owner_read(&stranger, sid))).is_none());
+    gate_ran("trust_enforcement::f38_foreign_owner_grant_refused");
+}
+
+/// F-38: the node identity sending a vault-signed grant (the 5f330a1 shape) is refused with the
+/// new code, even though its cert names it.
+#[test]
+fn f38_node_sending_vault_grant_refused() {
+    let node = spawn_seed("f38-n");
+    let device = key(0xCA);
+    let vault = key(0xCB);
+    let (req, _) = f38_syndicate(&node, &device, Some(&vault));
+    let resp = send(&device, &node, req);
+    assert!(!synd_stored(&resp), "{resp:?}");
+    assert_logged(&node, "reject.syndication_grant_not_sender");
+}
+
+/// F-38: a syndication without a repair grant is still accepted.
+#[test]
+fn f38_no_grant_still_accepted() {
+    let node = spawn_seed("f38-none");
+    let device = key(0xCC);
+    let (req, _) = f38_syndicate(&node, &device, None);
+    assert!(synd_stored(&send(&device, &node, req)));
+}
+
+/// F-38: an invited, non-genesis lite client syndicates as its vault key. The client's admission
+/// source extends its member chain one hop for the vault key (genesis -> member -> vault); the
+/// seed admits that chain and accepts the vault-owned grant.
+#[test]
+fn f38_invited_client_syndicates_as_vault_key() {
+    let node = spawn_seed("f38-invited");
+    let member = key(0xCD);
+    let vault = key(0xCE);
+    let to_member = InvitationHop::issue(&genesis(), member.public_key_bytes(), 1, 100);
+    let to_vault = InvitationHop::issue(&member, vault.public_key_bytes(), 2, 100);
+    let chain = DelegationChain {
+        hops: vec![to_member, to_vault],
     };
-    let read = read_bytes(&send(&stranger, &node, owner_read(&stranger, sid)));
-    assert!(
-        stored && read.is_some(),
-        "gap: a foreign-owner grant is registered and its key reads the shard (stored={stored})"
-    );
-    gate_ran("trust_enforcement::repro_syndication_grant_from_foreign_owner");
+    assert!(accepted(&handshake(&vault, &node, chain)));
+    let (req, sid) = f38_syndicate(&node, &vault, Some(&vault));
+    let resp = send_as_stranger(&vault, &node, req);
+    assert!(synd_stored(&resp), "{resp:?}");
+    assert!(read_bytes(&send_as_stranger(&vault, &node, owner_read(&vault, sid))).is_some());
 }
 
 /// F-35 accept: a fresh voucher from a trusted issuer is redeemed.
