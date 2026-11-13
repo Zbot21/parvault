@@ -699,6 +699,22 @@ mod unix_impl {
             bytes_len: u64,
             retention_policy: RetentionPolicy,
         ) -> anyhow::Result<EphemeralShardManifest> {
+            let (manifest, local_only_stripes) = self
+                .store_payload_fd_counted(payload_fd, bytes_len, retention_policy)
+                .await?;
+            crate::storage::local_only::note(local_only_stripes);
+            Ok(manifest)
+        }
+
+        /// Like [`Self::store_payload_fd`], returning how many stripes stayed only on the
+        /// daemon's machine (not backed up, R3-1). Async callers that need the count use this:
+        /// the thread-local count does not follow a task across `.await`.
+        pub async fn store_payload_fd_counted(
+            &self,
+            payload_fd: RawFd,
+            bytes_len: u64,
+            retention_policy: RetentionPolicy,
+        ) -> anyhow::Result<(EphemeralShardManifest, u64)> {
             let cmd = IpcCommand::StorePayload {
                 payload_fd,
                 bytes_len,
@@ -708,11 +724,8 @@ mod unix_impl {
                 IpcResponse::StoreSuccessLocalOnly {
                     manifest,
                     local_only_stripes,
-                } => {
-                    crate::storage::local_only::note(local_only_stripes);
-                    Ok(manifest)
-                }
-                IpcResponse::StoreSuccess { manifest } => Ok(manifest),
+                } => Ok((manifest, local_only_stripes)),
+                IpcResponse::StoreSuccess { manifest } => Ok((manifest, 0)),
                 IpcResponse::Error { message } => {
                     anyhow::bail!("gateway StorePayload error: {message}")
                 }
@@ -1021,20 +1034,39 @@ mod unix_impl {
             bytes_len: u64,
             retention: RetentionPolicy,
         ) -> anyhow::Result<EphemeralShardManifest> {
+            let (manifest, local_only_stripes) = self
+                .store_payload_fd_counted(payload_fd, bytes_len, retention)
+                .await?;
+            crate::storage::local_only::note(local_only_stripes);
+            Ok(manifest)
+        }
+
+        /// Like [`Self::store_payload_fd`], returning how many stripes stayed only on this
+        /// machine (not backed up, R3-1). The in-process store runs on the blocking pool, so the
+        /// count is taken there and returned rather than left in a thread-local.
+        pub async fn store_payload_fd_counted(
+            &self,
+            payload_fd: RawFd,
+            bytes_len: u64,
+            retention: RetentionPolicy,
+        ) -> anyhow::Result<(EphemeralShardManifest, u64)> {
             match self {
                 Self::InProcess(engine) => {
                     Self::ensure_in_process_peer_uid(engine)?;
                     let dup = crate::os_sys::dup_fd_cloexec(payload_fd)?;
                     let eng = Arc::clone(engine);
-                    tokio::task::spawn_blocking(move || {
-                        eng.store_from_owned_fd(dup, bytes_len, retention)
+                    let (stored, local_only_stripes) = tokio::task::spawn_blocking(move || {
+                        crate::storage::local_only::track(|| {
+                            eng.store_from_owned_fd(dup, bytes_len, retention)
+                        })
                     })
                     .await
-                    .map_err(|e| anyhow::anyhow!("in-process StorePayload join error: {e}"))?
+                    .map_err(|e| anyhow::anyhow!("in-process StorePayload join error: {e}"))?;
+                    Ok((stored?, local_only_stripes))
                 }
                 Self::UnixSocket(client) => {
                     client
-                        .store_payload_fd(payload_fd, bytes_len, retention)
+                        .store_payload_fd_counted(payload_fd, bytes_len, retention)
                         .await
                 }
             }
@@ -1055,12 +1087,9 @@ mod unix_impl {
                     if !crate::os_sys::has_immutable_memfd_seals(dup.as_fd())? {
                         crate::os_sys::seal_memfd_immutable(dup.as_fd())?;
                     }
-                    let eng = Arc::clone(engine);
-                    tokio::task::spawn_blocking(move || {
-                        eng.store_from_owned_fd(dup, bytes_len, retention)
-                    })
-                    .await
-                    .map_err(|e| anyhow::anyhow!("in-process StorePayload join error: {e}"))?
+                    drop(dup);
+                    // One store path, so the local-only count is carried the same way (R3-1).
+                    self.store_payload_fd(fd, bytes_len, retention).await
                 }
                 Self::UnixSocket(client) => {
                     client

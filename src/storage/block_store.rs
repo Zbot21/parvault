@@ -1950,27 +1950,48 @@ impl BlockStore {
         use_network: bool,
         deferred_flush: bool,
     ) -> Result<(Vec<String>, bool), StorageError> {
+        let n_shards = shard_set.shards.len();
+        let mut placed: Vec<Option<String>> = vec![None; n_shards];
         if use_network {
             let client = self.mesh_client.as_ref().expect("checked use_network");
             let session_key = client
                 .identity()
                 .derive_stripe_por_session_key(&shard_set.stripe_merkle_root);
-            match client.distribute_stripe_shards(
+            match client.distribute_stripe_shards_partial(
                 client.identity(),
                 owner_peer_id,
                 shard_set,
                 tier,
                 session_key,
             ) {
-                Ok(assigned) => return Ok((assigned, false)),
-                // R3-1: this stripe is not backed up; the store path reports it.
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    "no ring peer accepted the stripe; storing it locally"
-                ),
+                Ok(p) => placed = p,
+                Err(e) => tracing::warn!(error = %e, "stripe distribution failed"),
             }
         }
+        let remote = placed.iter().filter(|p| p.is_some()).count();
+        if remote == n_shards {
+            self.forget_local_only_stripe(&shard_set.stripe_merkle_root);
+            return Ok((placed.into_iter().flatten().collect(), false));
+        }
+        if use_network {
+            if remote == 0 {
+                tracing::warn!("no ring peer accepted the stripe; storing it locally");
+            } else {
+                tracing::warn!(
+                    remote,
+                    n_shards,
+                    "some shards reached no ring peer; storing those locally"
+                );
+            }
+        }
+        // QA 2e M2: shards already on peers stay there and in the manifest; only the missing
+        // ones are written locally.
+        let mut assigned = Vec::with_capacity(n_shards);
         for (idx, shard_bytes) in shard_set.shards.iter().enumerate() {
+            if let Some(peer) = placed[idx].take() {
+                assigned.push(peer);
+                continue;
+            }
             let shard_id = ShardId {
                 stripe_merkle_root: shard_set.stripe_merkle_root,
                 shard_index: idx as u32,
@@ -1981,10 +2002,13 @@ impl BlockStore {
             } else {
                 self.put_shard(owner_peer_id, &shard_id, shard_bytes)?;
             }
+            assigned.push(owner_peer_id.to_string());
         }
-        self.record_local_only_stripe(&shard_set.stripe_merkle_root);
-        let (_, _, n_total) = tier.params();
-        Ok((vec![owner_peer_id.to_string(); n_total], true))
+        // R3-1: without k shards on peers the stripe cannot be rebuilt without this machine.
+        if remote < shard_set.k_data {
+            self.record_local_only_stripe(&shard_set.stripe_merkle_root);
+        }
+        Ok((assigned, true))
     }
 
     /// Records a stripe whose shards are all on this machine (not backed up, R3-1): counted on
@@ -2010,14 +2034,52 @@ impl BlockStore {
         }
     }
 
-    /// Number of stripes stored on this node that never reached a ring peer (R3-1).
+    /// Drops `stripe_root` from the local-only list once it is fully placed on peers.
+    pub fn forget_local_only_stripe(&self, stripe_root: &Hash32) {
+        if self.is_in_memory() {
+            return;
+        }
+        let path = self
+            .root_dir
+            .join(crate::storage::local_only::LOCAL_ONLY_STRIPES_FILE);
+        let Ok(text) = fs::read_to_string(&path) else {
+            return;
+        };
+        let line = hex::encode(stripe_root);
+        if !text.lines().any(|l| l == line) {
+            return;
+        }
+        let kept: String = text
+            .lines()
+            .filter(|l| !l.is_empty() && *l != line)
+            .map(|l| format!("{l}\n"))
+            .collect();
+        if let Err(e) = Self::atomic_write_file(&path, kept.as_bytes()) {
+            tracing::error!(error = %e, "could not update the local-only stripe list");
+        }
+    }
+
+    /// Number of listed local-only stripes (R3-1) that still have a shard on this node, so
+    /// stripes since evicted, pruned or deleted are not counted.
     pub fn local_only_stripe_count(&self) -> usize {
-        fs::read_to_string(
+        let Ok(text) = fs::read_to_string(
             self.root_dir
                 .join(crate::storage::local_only::LOCAL_ONLY_STRIPES_FILE),
-        )
-        .map(|t| t.lines().filter(|l| !l.is_empty()).count())
-        .unwrap_or(0)
+        ) else {
+            return 0;
+        };
+        let held: std::collections::HashSet<String> = self
+            .shard_id_by_file_key
+            .lock()
+            .map(|m| {
+                m.values()
+                    .map(|id| hex::encode(id.stripe_merkle_root))
+                    .collect()
+            })
+            .unwrap_or_default();
+        text.lines()
+            .filter(|l| !l.is_empty() && held.contains(*l))
+            .count()
     }
 
     fn put_shard_deferred_flush(
