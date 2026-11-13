@@ -659,7 +659,8 @@ fn test_cli_end_to_end_parvault_and_parvault_seed_subcommands() {
             "--catalog-out",
         ])
         .arg(&catalog_path)
-        .arg("--once")
+        // No peers: the stripes stay on this machine (R3-1); this test checks the catalog path.
+        .args(["--once", "--allow-local-only"])
         .output()
         .expect("run parvault watch-folder");
     assert!(
