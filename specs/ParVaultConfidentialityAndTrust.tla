@@ -61,7 +61,7 @@ RecordUptimePass ==
            nextTier == IF nextPass = 1 THEN "Verified" ELSE "Anchor"
        IN /\ consecutivePasses' = nextPass
           /\ subnetTrust' = [s \in Subnets |->
-                IF subnetTrust[s] = "Slashed"
+                IF subnetTrust[s] = "Slashed"   \* @guard slashed-sticky sym=src/storage/quota.rs::trust_level (N-09: nothing sets is_slashed in production v0.5.0)
                 THEN "Slashed"
                 ELSE nextTier]
     /\ UNCHANGED <<subnetShards, totalPlacedShards, adversaryShards,
@@ -73,7 +73,9 @@ RecordUptimePass ==
 AllocateShardToSubnet(s) ==
     /\ s \in HonestSubnets
     /\ totalPlacedShards < N
-    /\ subnetTrust[s] /= "Slashed"
+    \* @assume placement-trust-cap: TrustLevel::max_shards_per_subnet caps placement only in
+    \* PlacementEngine::select_trust_weighted_peers, which has no production caller in v0.5.0.
+    \* (TrustCap("Slashed") = 0 also excludes slashed subnets; the separate check was dead, QA Q6.)
     /\ subnetShards[s] < TrustCap(subnetTrust[s])
     /\ (subnetShards[s] + 1) < K
     /\ \A prev \in HonestSubnets :
