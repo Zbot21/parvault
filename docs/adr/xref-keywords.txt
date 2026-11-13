@@ -3,25 +3,25 @@
 # (case-insensitive substring), so a citation of the wrong (but existing) ADR is caught.
 # Format: <NN> <keyword>[,<keyword>...]. Keywords are slug words plus common synonyms.
 01 stream,stripe,encrypt-before-shard,encrypt,shard,aes,adr-33,adr-09
-02 dht,manifest,kademlia,catalog,routing table
+02 dht,manifest,kademlia,routing table
 03 witness,por,audit,retrievab,challenge,merkle,session,chunk
-04 repair,grant,reconstruct,ciphertext,witness,owner shard
+04 repair,grant,reconstruct,ciphertext,witness,read token
 05 wot,web-of-trust,web of trust,slash,invit,admission,ring,genesis,subtree,penaliz,failure
 06 locality,placement,70/30,70-30,hybrid,asn,region,subnet,simulation,topology,affinity,intra
 07 reciprocity,ledger,tier-weighted,quota,credit,capacity,reserve
 08 noise,transport,framing,frame,yamux,wire,swarm,libp2p,quic
 09 quarantine,egress,byzantine,merkle,slash
 10 uptime,trust ladder,trust-ladder,ladder,standing
-11 anonym,blinded,onion,relay,voucher,origin,issuer,lease,delete_verifier,linking
+11 anonym,blinded,onion,relay,voucher,origin,issuer,delete_verifier,linking
 12 post-quantum,post quantum,pq,ml-kem,ml-dsa,hybrid,kem,signature,composite,confidential,harvest
 13 grover,symmetric,aead,cascade,chacha,aes,harvest
 14 folder,sync,incremental,snapshot,watch,streaming
 15 bootstrap,earned,elastic,tier,seed anchor,standby,cgnat,sybil,lir,outage,repair-storm
 16 seed server,seed-server,zero-trust,seed,device cert
 17 census,telemetry,outlier,bucket
-18 seed phrase,seed-phrase,recovery,disaster,house-fire,house fire,phrase,bip39,mnemonic,red-team,recover,catalog,argon2,namespace,hkdf
-19 crash,atomic,lease,pinning,fsync,storage,durab,eviction,scrub,bit-rot,clock-skew,capability key,wear,traversal,fifo,red-team,blindedshardcapability
-20 lite,syndicat,failover,selective,partial,catalog,byte-range,operating mode,unreachable,browse,list-snapshot
+18 seed phrase,seed-phrase,recovery,disaster,house-fire,house fire,bip39,mnemonic,argon2,namespace,hkdf,recover-from-seed,vaultcatalog,superblock
+19 crash,atomic,pinning,fsync,durab,eviction,scrub,bit-rot,clock-skew,capability key,wear,traversal,fifo,blindedshardcapability,signed delete,lease pinning
+20 lite,syndicat,failover,selective,partial,byte-range,operating mode,unreachable,browse,list-snapshot,list_snapshot
 21 router,soc,1 mib,1mib,streaming,profile
 22 lan,discovery,sas,pairing,zero-ip,beacon
 23 wan,rendezvous,stun,ddns

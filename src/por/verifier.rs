@@ -587,7 +587,8 @@ impl PorVerifierEngine {
         )
     }
 
-    /// Constructs and signs a domain-separated owner shard-delete token (`ADR-04`).
+    /// Constructs and signs a domain-separated owner shard-delete token.
+    /// A signed delete as in `ADR-19` (no ADR covers owner deletes of unblinded shards).
     pub fn sign_owner_shard_delete_token(
         owner: &NodeIdentity,
         shard_id: &ShardId,

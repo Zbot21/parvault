@@ -1083,7 +1083,7 @@ impl BlockStore {
     }
 
     /// Persists an anonymized `BlindedShardId` to `{locator}.bshard` on disk with an explicit
-    /// Byte-Epoch lease (`lease.current_epoch + lease.lease_duration_epochs`) and `delete_verifier` (`ADR-11` + `ADR-19`).
+    /// Byte-Epoch lease (`lease.current_epoch + lease.lease_duration_epochs`) and `delete_verifier` (`ADR-11` + `ADR-19` signed delete).
     /// If disk capacity is reached, automatically evicts and physically unlinks expired `.bshard` files on disk.
     pub fn put_blinded_shard_with_lease(
         &self,

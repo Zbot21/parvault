@@ -699,7 +699,7 @@ pub(crate) async fn recover_from_seed(env: CliEnv, command: Commands) -> anyhow:
         let engine =
             FolderSyncEngine::new(recovery_store, master_key, owner_identity, snapshot.tier);
         let report = engine.restore_selective_subset(&snapshot, &filters, &out_dir)?;
-        println!("=== ParVault Selective Disaster Recovery From Seed Phrase Complete (ADR-20) ===");
+        println!("=== ParVault Selective Disaster Recovery From Seed Phrase Complete (ADR-18) ===");
         println!("Vault Namespace    : {}", vault_namespace);
         println!("Files Restored     : {:?}", report.files_restored);
         println!("Files Skipped      : {}", report.files_skipped);

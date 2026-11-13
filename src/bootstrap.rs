@@ -680,7 +680,7 @@ impl BlindedShardTombstone {
         Self::create_for_generation(delete_verifier, blinded_shard_id, nonce, 0)
     }
 
-    /// Creates a generation-scoped `BlindedShardTombstone` (`ADR-19`) bound to `lease_generation`
+    /// Creates a generation-scoped `BlindedShardTombstone` (`ADR-19` signed delete) bound to `lease_generation`
     /// so old tombstones cannot be replayed after a shard is legitimately re-uploaded.
     pub fn create_for_generation(
         delete_verifier: &[u8; 32],
@@ -816,7 +816,7 @@ impl BlindedShardLeaseManager {
     }
 
     /// Stores a blinded shard while binding its `BlindedShardCapability` public key (`capability_pubkey`)
-    /// and incrementing its monotonic `lease_generation` (`ADR-19`).
+    /// and incrementing its monotonic `lease_generation` (`ADR-19` lease pinning).
     pub fn store_with_capability_and_lease(
         &mut self,
         blinded_shard_id: [u8; 32],

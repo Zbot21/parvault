@@ -261,7 +261,7 @@ pub struct BlindedReadFacts {
     pub sig_valid: bool,
 }
 
-/// ADR-11 / ADR-19 / E-WIRE GetBlindedShard: bytes are served only to the holder of the lease's
+/// ADR-11 / ADR-19 capability key / E-WIRE GetBlindedShard: bytes are served only to the holder of the lease's
 /// capability key, for this locator, with a fresh signature (a captured token expires in 30 s).
 pub fn blinded_read_decision(f: &BlindedReadFacts) -> Result<(), &'static str> {
     if !f.capability_known {

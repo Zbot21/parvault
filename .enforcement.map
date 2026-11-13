@@ -38,6 +38,8 @@ no-blocking B-SEED-SYND path=src/bin/parvault-seed.rs
 # same line (docs/adr/xref-keywords.txt) ------------------------------------------------------------
 xref       X-ADR     path=src/**.rs pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md expect=docs/adr/xref-keywords.txt
 xref       X-ADR-DOC path=docs/**.md pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md expect=docs/adr/xref-keywords.txt
+xref       X-ADR-ROOT path=*.md pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md expect=docs/adr/xref-keywords.txt
+open       X-ADR-ROOT expect=xref by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md   # root docs still cite pre-renumbering ADR numbers (F-16 batch 3)
 
 # --- Formal proofs (P-01 to P-05; mutants are authored by QA) --------------------------------------
 tla-spec   T-SPECS   path=specs/*.tla
@@ -192,4 +194,4 @@ kani       S-SANITIZE sym=src/sync.rs::sanitize_sync_relative_path_into harness=
 claim      B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision accept=trust_enforcement::bseed_second_sender_accepted_while_one_job_runs reject=trust_enforcement::bseed_third_job_refused_busy code=reject.syndication_busy bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe
 kani       B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision harness=proof_syndication_fanout_budget cover=syndication over budget
 
-ratchet    R         open=4 waive=30
+ratchet    R         open=5 waive=30
