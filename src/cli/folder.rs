@@ -181,10 +181,8 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
 
             let seed_str = seed_dir.to_string_lossy().to_string();
             if is_network_peer_addr(&seed_str) {
-                let (snap, n) =
-                    parvault::storage::local_only::track(|| engine.sync_folder_once(&folder));
-                pass_local_only += n;
-                let mut snap = snap?;
+                // Stored locally first; counted after syndication below.
+                let mut snap = engine.sync_folder_once(&folder)?;
                 let net_client = MeshClient::new(
                     owner_identity.clone(),
                     mesh_client.all_network_endpoints(),
@@ -277,6 +275,20 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                         let _ = store_with_net.save_manifest(&master_key, &entry.manifest);
                     }
                 }
+                // The first local pass counted every new stripe as local-only; after
+                // syndication, report only the stripes still below k shards on peers (R3-1).
+                pass_local_only = snap
+                    .files
+                    .values()
+                    .flat_map(|f| f.manifest.stripes.iter())
+                    .filter(|s| {
+                        s.assigned_peers
+                            .iter()
+                            .filter(|p| is_network_peer_addr(p))
+                            .count()
+                            < s.k_data
+                    })
+                    .count() as u64;
                 if let Some(ref env) = snap.signed_dht_envelope {
                     let _ = net_client
                         .put_dht_envelope(DhtWireEnvelope::ClassicalManifest(env.clone()));
