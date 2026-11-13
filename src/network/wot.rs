@@ -1239,6 +1239,27 @@ impl WebOfTrustRegistry {
 
 #[cfg(test)]
 mod tests {
+    /// QA 2c D1: a peer's PoW demand is capped, and mint never searches past the ceiling.
+    #[test]
+    fn ticket_pow_demand_is_bounded() {
+        use super::*;
+        assert_eq!(ticket_pow_demand_decision(12, 12), Ok(()));
+        assert_eq!(ticket_pow_demand_decision(16, 12), Ok(()));
+        assert_eq!(
+            ticket_pow_demand_decision(17, 12),
+            Err("reject.ticket_pow_demand_excessive")
+        );
+        assert_eq!(
+            ticket_pow_demand_decision(255, 30),
+            Err("reject.ticket_pow_demand_excessive")
+        );
+        assert_eq!(ticket_pow_demand_decision(20, 18), Ok(()));
+        let started = std::time::Instant::now();
+        let t = PublicCommonsTicket::mint(&NodeIdentity::from_seed([3; 32]), [4; 32], 1, 255);
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        assert!(!t.verify(255), "a ticket declaring 255 bits never verifies");
+    }
+
     #[test]
     fn f32_subinvites_and_chain_store_are_bounded() {
         let genesis = NodeIdentity::from_seed([0x47; 32]);
