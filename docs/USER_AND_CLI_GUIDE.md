@@ -62,6 +62,9 @@ Global options (available on all subcommands):
 | `parvault identity` | *(none)* | Initializes (if absent) and displays your persistent `Device Peer ID`, `Ed25519 Public Key`, `Owner PQ Public Key Hex` (`Ed25519 + ML-DSA-65`), and `Master Key Fingerprint`. |
 | `parvault issue-device-cert` | `--device-peer-id <ID>` *(required)*<br>`--device-label <LABEL>` *(default: `"personal-device"`)*<br>`--cert-out <PATH>` *(optional)* | Signs a post-quantum composite `PersonalDeviceCert` (`Ed25519 + NIST FIPS 204 ML-DSA-65`) authorizing `<device-peer-id>` to store shards on your Personal Device Ring at `0.0x` quota cost. Outputs both JSON and a compact `PARVAULT-CERT-V1:<hex>` token. |
 | `parvault verify-device-cert` | `--cert <PATH_OR_JSON_OR_TOKEN>` *(required)*<br>`--owner-pq-pubkey-hex <HEX>` *(optional)* | Cryptographically verifies a `PersonalDeviceCert` from a `.json` file, raw JSON string, or `PARVAULT-CERT-V1:<hex>` token against the expected Owner PQ Public Key. |
+| `parvault council init` | `--member <PUBKEY_HEX>` *(repeat)*, `--quorum <N>` *(required)* | Signs and installs epoch 1 of this ring's eviction council with the ring genesis held here. The quorum must be a strict majority. Prints the manifest hex for `council install` on other nodes. |
+| `parvault council install` | `--manifest <HEX>` *(required)* | Installs a council manifest: epoch 1 signed by the scope root (ring genesis; in `--public` mode the pinned tracker admin key), or the next epoch signed by a quorum of the installed one. |
+| `parvault council show` | *(none)* | Prints the installed council (scope root, epoch, quorum, members) and its hex manifest. A node with none accepts no council eviction orders. |
 | `parvault wot init` | *(none)* | Starts a new ring on this node: creates the ring genesis secret (`<data_dir>/ring_genesis.seed`, `0600`). The only way a genesis is created; refused if the node is already in a ring. |
 | `parvault wot invite` | `--peer <PUBKEY_HEX>` *(required)* | Prints a ring invitation token (the chain and the ring's genesis key) admitting that key. Needs the ring secret from `parvault wot init` (or `PARVAULT_GENESIS_SEED_HEX`). |
 | `parvault wot install-chain` | `--token <HEX>` *(required)* | Verifies the invitation against its ring key, pins that key (`ring_genesis.pub`) and installs the chain; the node then serves the ring and presents the chain before storing on ring peers. |
@@ -413,8 +416,8 @@ parvault-seed admin cosign-eviction \
 > [!IMPORTANT]
 > **Strict Mode Isolation & M-of-N Quorum Invariants:**
 > - In `TrustPoolMode::PrivateRing` (family or homelab rings), nodes **unconditionally ignore and reject** external `tracker_admin_pubkey` eviction orders. Unilateral tracker admin actions can never affect private rings.
-> - In `TrustPoolMode::PublicCommons` / `Hybrid` (`--public`), nodes trust their pinned `tracker_admin_pubkey` council for swarm-wide protection while rejecting arbitrary non-admin public peers.
-> - If multiple tracker council operators exist ($N \ge 2$), a single rogue tracker operator cannot unilaterally wipe shards without reaching $M$-of-$N$ threshold co-signatures (`default_tracker_quorum_threshold(N) = \lfloor N/2 \rfloor + 1`).
+> - In `TrustPoolMode::PublicCommons` / `Hybrid` (`--public`), the council is the manifest signed by the pinned `tracker_admin_pubkey` (`parvault council install`); arbitrary public peers are rejected.
+> - The council manifest's quorum must be a strict majority (`2·quorum > members`), so a single rogue council member cannot evict alone; orders carry the council epoch, expire within 365 days and are refused when stale (F-08, F-09).
 
 ---
 

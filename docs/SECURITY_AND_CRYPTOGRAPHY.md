@@ -1,6 +1,6 @@
 # Security Architecture, Cryptographic Proofs & Formal Verification (`SECURITY_AND_CRYPTOGRAPHY.md`)
 
-This document details the mathematical, cryptographic, game-theoretic, and formal-verification foundations of **`parvault`** (`parvault`, `parvault-seed`, `parvault-fuse`, and `parvault-sync`), covering the single-concern Architectural Decision Records [`ADR-01` through `ADR-33`](ADR.md) in [`docs/adr/`](adr/) and <!-- metric:crate_version_tag -->`v0.5.0`<!-- /metric --> formal verification (<!-- metric:kani_harnesses -->`23`<!-- /metric --> Kani Rust Bounded Model Checking symbolic harnesses + <!-- metric:tla_specs -->`7`<!-- /metric --> TLA+ TLC specifications).
+This document details the mathematical, cryptographic, game-theoretic, and formal-verification foundations of **`parvault`** (`parvault`, `parvault-seed`, `parvault-fuse`, and `parvault-sync`), covering the single-concern Architectural Decision Records [`ADR-01` through `ADR-33`](ADR.md) in [`docs/adr/`](adr/) and <!-- metric:crate_version_tag -->`v0.5.0`<!-- /metric --> formal verification (<!-- metric:kani_harnesses -->`24`<!-- /metric --> Kani Rust Bounded Model Checking symbolic harnesses + <!-- metric:tla_specs -->`7`<!-- /metric --> TLA+ TLC specifications).
 
 ---
 
@@ -132,8 +132,8 @@ To protect long-lived backup shards and P2P envelopes against **Harvest-Now, Dec
 
 1. **Zero-Local-State "House Fire" Recovery (`MasterKey::from_recovery_seed_phrase` & `EncryptedVaultCatalogEnvelope`):**
    Memory-hard **Argon2id** (`m=64 MiB, t=3 iterations, p=4 lanes`) + domain-separated `HKDF-SHA256` / `HKDF-SHA512` deterministically reconstruct the 256-bit `MasterKey`, full 512-bit `PqVaultMasterKey`, `NodeIdentity`, and `derive_vault_root_dht_key(vault_namespace)`, publishing and querying `SignedDhtManifestEnvelope` catalog records across all reachable `libp2p` peers and selecting the strictly highest `monotonic_version`.
-2. **Capability Key Pinning, $\pm 30\text{ s}$ NTP Skew, Generation-Scoped Tombstones & Remote `DeleteShard` Auth:**
-   `BlockStore` pins `capability_pubkey` at upload time, enforces `MAX_CAPABILITY_CLOCK_SKEW_MS = 30_000`, scopes `BlindedShardTombstone`s to monotonic lease generations so old tombstones cannot delete re-uploaded files, and authenticates remote unblinded shard deletions (`MeshWireRequest::DeleteShard`) via domain-separated Ed25519 owner signatures (`"parvault-owner-shard-delete-v1:"`) against persisted `RepairGrant` records (`por_verifier_state.bin`).
+2. **Capability Key Pinning, $\pm 30\text{ s}$ NTP Skew, Signed Blinded Deletes & Remote `DeleteShard` Auth:**
+   `BlockStore` pins `capability_pubkey` at upload time and a re-put cannot replace it while the lease exists (`blinded_rebind_decision`, F-41); read tokens and deletes must be signed within `MAX_CAPABILITY_CLOCK_SKEW_MS = 30_000` (F-40); a blinded shard is deleted only by `DeleteBlindedShardSigned`, an Ed25519 signature by its capability key bound to the host, the locator and the content hash (`blinded_delete_decision`; MAC tombstones are refused, F-41); a lease without a registered capability is neither readable nor deletable (F-42); and authenticates remote unblinded shard deletions (`MeshWireRequest::DeleteShard`) via domain-separated Ed25519 owner signatures (`"parvault-owner-shard-delete-v1:"`) against persisted `RepairGrant` records (`por_verifier_state.bin`).
 3. **Ephemeral Sybil Drain Gate & `/32` IPv6 + RFC 6598 CGNAT Normalization:**
    `plan_seed_anchor_drain` only migrates seed shards to `VerifiedNeighbor` ($\ge 50$ PoR passes) organic nodes; `canonical_sybil_subnet_key` buckets IPv6 by `/32` LIR prefix and grants Starlink/5G CGNAT (`100.64.0.0/10`) up to 4 attested household sub-slots per `/24`.
 4. **Wire-Protocol Pre-Auth OOM Bomb Defense, Bounded Replay Caches & Crash-Persisted Security Ledgers:**
@@ -164,9 +164,9 @@ To protect long-lived backup shards and P2P envelopes against **Harvest-Now, Dec
 bash scripts/verify_formal_proofs.sh
 ```
 
-### 7.2 Kani Rust Bounded Model Checking Matrix (<!-- metric:kani_harnesses -->`23`<!-- /metric --> Symbolic Harnesses)
+### 7.2 Kani Rust Bounded Model Checking Matrix (<!-- metric:kani_harnesses -->`24`<!-- /metric --> Symbolic Harnesses)
 
-All <!-- metric:kani_harnesses -->23<!-- /metric --> harnesses exercise real production code with symbolic `kani::any()` inputs (`cargo kani` $\to$ `VERIFICATION:- SUCCESSFUL`). Non-vacuity is independently verified by mutating the quorum assertion (`tally < min_quorum` $\to$ `tally + 1 < min_quorum`) in `proof_eviction_quorum_sub_threshold_and_duplicate_signer_rejected` and confirming CBMC emits a concrete counterexample (`VERIFICATION:- FAILED`) before restoring the invariant.
+All <!-- metric:kani_harnesses -->24<!-- /metric --> harnesses exercise real production code with symbolic `kani::any()` inputs (`cargo kani` $\to$ `VERIFICATION:- SUCCESSFUL`). Non-vacuity is independently verified by mutating the quorum assertion (`tally < min_quorum` $\to$ `tally + 1 < min_quorum`) in `proof_eviction_quorum_sub_threshold_and_duplicate_signer_rejected` and confirming CBMC emits a concrete counterexample (`VERIFICATION:- FAILED`) before restoring the invariant.
 
 | Kani Proof Harness | Target Production Module / Function | Symbolic Property Verified (`kani::any()`) | CBMC Result |
 | :--- | :--- | :--- | :---: |
