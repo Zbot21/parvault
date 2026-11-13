@@ -6548,5 +6548,8 @@ fn status_http_query_string_token_refused() {
         assert_eq!(raw, parvault::http_edge::STATUS_401);
     }
     assert_logged(&node, "reject.status_token_missing");
-    assert!(!node.log_text().contains(tok.as_str()), "URL token in the node log");
+    assert!(
+        !node.log_text().contains(tok.as_str()),
+        "URL token in the node log"
+    );
 }
