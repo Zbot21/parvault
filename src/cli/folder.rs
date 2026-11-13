@@ -35,6 +35,19 @@ pub(crate) async fn diff_folder(env: CliEnv, command: Commands) -> anyhow::Resul
     Ok(())
 }
 
+/// How long a lite client waits for a seed to ack one `SyndicateLiteStripe`. The seed
+/// erasure-encodes, checks (F-38-GRANT, every shard) and stores the whole stripe before it acks,
+/// so the client default (1.2 s) times out on a slow or loaded seed and the stripe is then
+/// reported NOT backed up.
+pub(crate) const LITE_SYNDICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The client for `SyndicateLiteStripe` to the seed only: `base` with
+/// `LITE_SYNDICATION_TIMEOUT`. The timeout is per request, so `base` (used for the manifest and
+/// snapshot DHT puts to every mesh endpoint) keeps the default.
+pub(crate) fn lite_syndication_client(base: &MeshClient) -> MeshClient {
+    base.clone().with_timeout(LITE_SYNDICATION_TIMEOUT)
+}
+
 /// The recovery phrase from `--seed-phrase` or `PARVAULT_SEED_PHRASE`, if any.
 pub(crate) fn effective_seed_phrase(arg: Option<String>) -> Option<String> {
     arg.or_else(|| std::env::var("PARVAULT_SEED_PHRASE").ok())
@@ -166,14 +179,14 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                 PersonalDeviceCert::from_shareable_token(&raw_cert)
                     .or_else(|_| PersonalDeviceCert::from_json_str(&raw_cert))?
             } else {
-                let node_id = NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?;
+                // F-38: the cert must name the identity this client sends as (the vault owner).
                 let issued_at = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
                 PersonalDeviceCert::issue(
                     &pq_kp,
-                    &node_id.device_peer_id(),
+                    &owner_identity.device_peer_id(),
                     "lite-client",
                     issued_at,
                 )?
@@ -186,13 +199,16 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                 // F-38 (L-40): the seed requires the repair grant's owner to be the sender and the
                 // device cert to name the sender, so send as the vault owner identity that signs
                 // the grant. Its id is the Vault Device Peer ID `parvault identity --seed-phrase`
-                // prints. Only the seed is contacted for syndication.
+                // prints. Only the seed is contacted for syndication. `net_client` (default
+                // timeout) also carries the manifest and snapshot DHT puts to every mesh endpoint;
+                // only `syndication_client` waits LITE_SYNDICATION_TIMEOUT.
                 let net_client = MeshClient::new(
                     owner_identity.clone(),
                     mesh_client.all_network_endpoints(),
                     Some(seed_str.clone()),
                 )
                 .with_data_dir_discovery(cfg.data_dir.clone(), lan_port);
+                let syndication_client = lite_syndication_client(&net_client);
                 let store_with_net = block_store.clone().with_mesh_client(net_client.clone());
                 let mut receipt_count = 0usize;
                 for entry in snap.files.values_mut() {
@@ -242,7 +258,7 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                                     Vec::new(),
                                     snap.tier,
                                 );
-                                match net_client.syndicate_lite_stripe_with_grant(
+                                match syndication_client.syndicate_lite_stripe_with_grant(
                                     &seed_str,
                                     cert.clone(),
                                     bundle,
@@ -668,4 +684,26 @@ pub(crate) async fn recover_from_seed(env: CliEnv, command: Commands) -> anyhow:
         println!("Files Restored     : {}", recovered_count);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only the seed-syndication client waits `LITE_SYNDICATION_TIMEOUT`; the base client that
+    /// carries the DHT puts keeps the default (QA 2e r3).
+    #[test]
+    fn lite_syndication_client_uses_the_long_timeout() {
+        let default = MeshClient::new(NodeIdentity::from_seed([0x32; 32]), Vec::new(), None)
+            .request_timeout();
+        let dht_client = MeshClient::new(
+            NodeIdentity::from_seed([0x31; 32]),
+            vec!["/ip4/127.0.0.1/tcp/2".to_string()],
+            Some("/ip4/127.0.0.1/tcp/1".to_string()),
+        );
+        let syndication = lite_syndication_client(&dht_client);
+        assert_eq!(syndication.request_timeout(), LITE_SYNDICATION_TIMEOUT);
+        assert_eq!(dht_client.request_timeout(), default);
+        assert!(LITE_SYNDICATION_TIMEOUT > default);
+    }
 }

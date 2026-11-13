@@ -5,6 +5,8 @@
 //! bounded FIFO nonce caches, PoR range limits, token-bucket bandwidth rate limiting,
 //! minimum free disk space guards, and PQ/Catalog `ZeroTrustDhtStore` enforcement.
 
+mod common;
+
 use parvault::{
     bootstrap::{
         normalize_subnet_prefix_key, ElasticBootstrapEngine, ElasticPeerCandidate,
@@ -850,91 +852,58 @@ fn test_live_libp2p_tcp_multi_daemon_network_backup_prune_and_seed_recovery() {
         }
     }
 
-    fn reserve_free_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        listener.local_addr().unwrap().port()
-    }
-
     let base = unique_temp_dir("live-libp2p-multi-daemon");
     let parvault_bin = env!("CARGO_BIN_EXE_parvault");
     let seed_bin = env!("CARGO_BIN_EXE_parvault-seed");
 
-    let seed_port = reserve_free_port();
-    let node_ports = [
-        reserve_free_port(),
-        reserve_free_port(),
-        reserve_free_port(),
-        reserve_free_port(),
-    ];
-    let peers_csv = node_ports
-        .iter()
-        .map(|p| format!("/ip4/127.0.0.1/tcp/{p}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let seed_multiaddr = format!("/ip4/127.0.0.1/tcp/{seed_port}");
-
     let mut guards = ChildGuard(Vec::new());
 
-    // 1. Spawn parvault-seed + 4 parvault daemon processes on isolated data directories
-    let seed_dir = base.join("seed_node");
-    fs::create_dir_all(&seed_dir).unwrap();
-    let seed_child = std::process::Command::new(seed_bin)
-        .args([
-            "--peers",
-            &peers_csv,
-            "start",
-            "--mode",
-            "homelab-vault",
-            "--no-lan-discovery",
-            "--listen",
-            &seed_multiaddr,
-            "--data-dir",
-        ])
-        .arg(&seed_dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn parvault-seed");
-    guards.0.push(seed_child);
-
+    // 1. Spawn 4 parvault daemons, then parvault-seed (it syndicates to their addresses), each
+    // on an ephemeral port read back from its log (common::LOOPBACK_EPHEMERAL). `daemon start`
+    // does not use --peers or --seed-addr, so the daemons need no addresses up front.
     let mut node_dirs = Vec::new();
-    for (idx, port) in node_ports.iter().enumerate() {
+    let mut node_addrs = Vec::new();
+    for idx in 0..4 {
         let ndir = base.join(format!("daemon_{idx}"));
         fs::create_dir_all(&ndir).unwrap();
         node_dirs.push(ndir.clone());
-        let child = std::process::Command::new(parvault_bin)
-            .arg("--data-dir")
-            .arg(&ndir)
+        let (child, addr) = common::spawn_on_ephemeral_port(
+            std::process::Command::new(parvault_bin)
+                .arg("--data-dir")
+                .arg(&ndir)
+                .args([
+                    "--no-lan-discovery",
+                    "daemon",
+                    "start",
+                    "--listen",
+                    common::LOOPBACK_EPHEMERAL,
+                ]),
+            &base.join(format!("daemon_{idx}.log")),
+        );
+        guards.0.push(child);
+        node_addrs.push(addr);
+    }
+    let peers_csv = node_addrs.join(",");
+
+    let seed_dir = base.join("seed_node");
+    fs::create_dir_all(&seed_dir).unwrap();
+    let (seed_child, seed_multiaddr) = common::spawn_on_ephemeral_port(
+        std::process::Command::new(seed_bin)
             .args([
-                "--no-lan-discovery",
                 "--peers",
                 &peers_csv,
-                "--seed-addr",
-                &seed_multiaddr,
-                "daemon",
                 "start",
+                "--mode",
+                "homelab-vault",
+                "--no-lan-discovery",
                 "--listen",
-                &format!("/ip4/127.0.0.1/tcp/{port}"),
+                common::LOOPBACK_EPHEMERAL,
+                "--data-dir",
             ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn parvault daemon");
-        guards.0.push(child);
-    }
-
-    // Wait until all TCP listeners accept connections
-    for port in std::iter::once(seed_port).chain(node_ports.iter().copied()) {
-        let mut connected = false;
-        for _ in 0..50 {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                connected = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        assert!(connected, "Daemon on port {port} did not start listening");
-    }
+            .arg(&seed_dir),
+        &base.join("seed.log"),
+    );
+    guards.0.push(seed_child);
 
     // 2. From an isolated client directory, run watch-folder --once over libp2p
     let client_dir = base.join("client_data");

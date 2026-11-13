@@ -1344,6 +1344,11 @@ impl MeshClient {
         self
     }
 
+    /// The timeout this client applies to each request.
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
     pub fn with_identity(&self, identity: NodeIdentity) -> Self {
         let same_key = self.identity.public_key_bytes() == identity.public_key_bytes();
         let mut cloned = self.clone();

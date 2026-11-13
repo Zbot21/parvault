@@ -905,6 +905,27 @@ fn put_shard() {
         assert!(!fx.store.has_shard(&sid));
         assert_eq!(fx.hosted("alice-owner"), 0);
     }
+    // F-38-GRANT (L-41): first writer wins. Another admitted sender re-putting a stored shard
+    // (no grant on either side) is refused identically, and nothing changes: the shard stays
+    // charged to its first writer.
+    let (sid, bytes) = shard(29, 1024);
+    let o = t.run(&peer, &put_shard_req("", sid, bytes.clone(), [29; 32]));
+    assert!(o[0].resp.contains("stored: true"), "{}", o[0].resp);
+    let squatter = Peer::new(0x62, "198.51.100.3");
+    t.admit(&squatter);
+    let squatter_device = squatter.ident.device_peer_id();
+    let o = t.run(&squatter, &put_shard_req("", sid, bytes, [0x66; 32]));
+    assert!(
+        o[0].resp.contains("shard is bound to another owner"),
+        "{}",
+        o[0].resp
+    );
+    assert_identical(&o);
+    assert!(o[0].changed.is_empty() && o[0].quota_delta == 0);
+    for fx in &t.fx {
+        assert!(fx.store.has_shard(&sid));
+        assert_eq!(fx.hosted(&squatter_device), 0, "{:?}", fx.role);
+    }
     // Error path: shard hash mismatch.
     let (mut sid, bytes) = shard(3, 1024);
     sid.shard_hash = [0xEE; 32];
