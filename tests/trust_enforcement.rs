@@ -6899,3 +6899,25 @@ fn plugin_macaroon_file_group_readable_refused() {
         assert!(err.contains("readable by group or others"), "{name}: {err}");
     }
 }
+
+/// QA item 3, defect 2: status responses carry a restrictive CSP (no scripts, no framing) and
+/// nosniff.
+#[test]
+fn status_http_security_headers() {
+    let (_node, addr) = status_up("sh-csp", Some(GW_KEY));
+    for path in ["/", "/api/v1/health"] {
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\n\r\n",
+            host_of(addr),
+            ro_token()
+        );
+        let raw = String::from_utf8_lossy(&http_raw(addr, &[req.as_bytes()])).to_string();
+        let head = raw.split("\r\n\r\n").next().unwrap().to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 200"), "{head}");
+        assert!(
+            head.contains("content-security-policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"),
+            "{path}: {head}"
+        );
+        assert!(head.contains("x-content-type-options: nosniff"));
+    }
+}
