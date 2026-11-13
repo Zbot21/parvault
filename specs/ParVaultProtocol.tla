@@ -115,7 +115,7 @@ RecordDishonestFailure ==
     /\ ~offenderQuarantined
     /\ offenderFailures < MaxLeafFailures
     /\ LET nextLeafFails     == offenderFailures + 1
-           leafSlashed       == (nextLeafFails >= MaxLeafFailures)
+           leafSlashed       == (nextLeafFails >= MaxLeafFailures)   \* @assume leaf-quarantine-not-run: WebOfTrust::record_failure is #[cfg(test)] and nothing slashes in production v0.5.0 (ADR-09, N-09); SlashingBoundInvariant is waived, not mutant-covered
            nextParentSlashes == IF leafSlashed THEN parentBranchSlashes + 1 ELSE parentBranchSlashes
            branchPruned      == (nextParentSlashes >= MaxSubtreeSlashes)
        IN /\ offenderFailures' = IF leafSlashed /\ ~branchPruned THEN 0 ELSE nextLeafFails
