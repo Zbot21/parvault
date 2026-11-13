@@ -1320,7 +1320,7 @@ impl NodeConfig {
     ///   unless overridden via `tracker_eviction_quorum` or `PARVAULT_TRACKER_EVICTION_QUORUM`.
     pub fn resolve_eviction_council_and_quorum(
         &self,
-        genesis_pubkey: [u8; 32],
+        genesis_pubkey: Option<[u8; 32]>,
         extra_pinned_admin_pubkeys: &[[u8; 32]],
         public_commons_active: bool,
     ) -> (Vec<[u8; 32]>, usize) {
@@ -1385,7 +1385,9 @@ impl NodeConfig {
                 .max(1);
             (council, min_quorum)
         } else {
-            push_pk(genesis_pubkey);
+            if let Some(pk) = genesis_pubkey {
+                push_pk(pk);
+            }
             let min_quorum = self
                 .tracker_eviction_quorum
                 .or(env_quorum)

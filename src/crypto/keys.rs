@@ -1,6 +1,6 @@
 use crate::crypto::aes::CryptoError;
 use crate::crypto::bip39::{normalize_seed_phrase_nfkd, validate_bip39_mnemonic};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -583,7 +583,9 @@ impl NodeIdentity {
             return false;
         };
         let sig = Signature::from_bytes(sig_bytes);
-        vk.verify(msg, &sig).is_ok()
+        // Strict: rejects small-order keys and non-canonical `R`, so no signature verifies
+        // under a weak key such as all-zero (F-37).
+        vk.verify_strict(msg, &sig).is_ok()
     }
 
     /// Derives a shared 32-byte stateless Proof-of-Retrievability session key (`K_session`)

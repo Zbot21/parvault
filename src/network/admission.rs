@@ -106,26 +106,28 @@ fn existing_node_identity(data_dir: &Path) -> Option<NodeIdentity> {
         .flatten()
 }
 
-/// The genesis of a node outside any private ring in public-commons mode: no key signs for it, so
-/// no chain can verify and peers are admitted by public-commons ticket only.
-pub const TICKET_ONLY_GENESIS: [u8; 32] = [0u8; 32];
+/// Trusted voucher issuer of a node outside any ring. The all-zero key is a small-order point;
+/// strict verification accepts no signature under it, so no voucher verifies (F-37). It is never
+/// used as a genesis.
+pub const NO_RING_ISSUER: [u8; 32] = [0u8; 32];
 
-/// The ring genesis a server runs with. Conflicting sources are always an error; a node with no
-/// source runs ticket-only in public-commons mode and otherwise refuses to start.
+/// The ring genesis a server runs with, or `None` for a node outside any ring (F-37: there is
+/// no placeholder genesis). Conflicting sources are always an error; a node with no source runs
+/// ticket-only in public-commons mode (it admits no chain) and otherwise refuses to start.
 pub fn server_ring_genesis(
     data_dir: &Path,
     configured_pubkey_hex: Option<&str>,
     public_commons: bool,
-) -> anyhow::Result<[u8; 32]> {
+) -> anyhow::Result<Option<[u8; 32]>> {
     match NodeIdentity::resolve_genesis_root_pubkey_in_dir(data_dir, configured_pubkey_hex) {
-        Ok(pk) => Ok(pk),
+        Ok(pk) => Ok(Some(pk)),
         Err(e) => {
             let msg = e.to_string();
             if public_commons && msg.contains(crate::crypto::keys::NOT_IN_RING_MESSAGE) {
                 tracing::info!(
                     "not in a private ring: admitting peers by public-commons ticket only"
                 );
-                Ok(TICKET_ONLY_GENESIS)
+                Ok(None)
             } else {
                 anyhow::bail!("{msg}")
             }
