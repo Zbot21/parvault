@@ -597,8 +597,9 @@ fn f05_public_ticket_one_bit_short_refused() {
 
 /// Ticket bits: a client whose default ticket is below the node's bits learns
 /// `required_pow_bits` from the refusal, re-mints once, and is admitted (its shard is stored).
-/// The default is 0 bits: a hashcash mint overshoots its target, so a mint at 11 bits meets 12
-/// half the time; at 0 bits the chance of skipping the refusal is 2^-12.
+/// The refusal is deterministic: the node compares the ticket's declared `pow_bits` with its own
+/// before it checks the hash (`PublicCommonsTicket::verify`), so a ticket declaring one bit less
+/// is always refused, however many leading zeros its digest happens to have.
 #[test]
 fn ticket_client_remints_at_required_bits() {
     let node = spawn_public_daemon("tbits-a");
