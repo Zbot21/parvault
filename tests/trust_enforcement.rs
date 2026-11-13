@@ -5841,3 +5841,29 @@ fn council_first_epoch_fetched_when_none_installed() {
     );
     assert!(order_accepted(&r), "{r:?}\n{}", behind.log_text());
 }
+
+/// F-41 (QA 2c part B item 4): a delete validly signed by the capability key for the stored
+/// locator but naming a different content hash does not match the stored id and is refused.
+#[test]
+fn f41_delete_with_other_content_hash_refused() {
+    let node = spawn_daemon("f41-idmm");
+    let sender = key(0xC1);
+    let b = blinded(0x61, 512);
+    let cap = blinded_cap_identity(0x61, &b);
+    put_blinded_ok(&node, &sender, &b);
+    let other = BlindedShardId {
+        locator: b.id.locator,
+        content_sha256: [0xEE; 32],
+    };
+    let host = node.identity().public_key_bytes();
+    let ts = now_ms();
+    let req = MeshWireRequest::DeleteBlindedShardSigned {
+        blinded_id: other,
+        timestamp_ms: ts,
+        sig: BlindedShardCapability::sign_delete(&cap, &host, &other, ts).to_vec(),
+    };
+    let resp = send(&sender, &node, req);
+    assert!(!blinded_deleted(&resp), "{resp:?}");
+    assert_logged(&node, "reject.blinded_delete_id_mismatch");
+    assert!(still_served(&node, &sender, &b, &cap));
+}
