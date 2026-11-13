@@ -131,3 +131,21 @@ pub fn tcp_port_of(addr: &str) -> u16 {
         .and_then(|p| p.parse().ok())
         .expect("tcp port in address")
 }
+
+/// A plugin binary: `$PARVAULT_PLUGIN_BIN_DIR/<name>` when that is set (the no-default artifacts
+/// from `scripts/build_bins.sh`, item 3), else cargo's default-feature build `cargo_default`.
+/// CI runs the plugin claims both ways.
+pub fn plugin_bin(name: &str, cargo_default: &str) -> std::path::PathBuf {
+    match std::env::var_os("PARVAULT_PLUGIN_BIN_DIR") {
+        Some(dir) => {
+            let p = std::path::Path::new(&dir).join(name);
+            assert!(
+                p.is_file(),
+                "PARVAULT_PLUGIN_BIN_DIR has no {name}: {}",
+                p.display()
+            );
+            p
+        }
+        None => std::path::PathBuf::from(cargo_default),
+    }
+}

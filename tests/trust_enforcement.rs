@@ -3397,16 +3397,19 @@ fn r3_sync_push_local_only_exits_with_code() {
         std::thread::sleep(Duration::from_millis(100));
     }
     let push = |extra: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_parvault-sync"))
-            .arg("--socket")
-            .arg(&sock)
-            .arg("--catalog")
-            .arg(sock.with_file_name(format!("catalog{}.bin", extra.len())))
-            .args(["push", "--folder"])
-            .arg(&folder)
-            .args(extra)
-            .output()
-            .expect("run parvault-sync push")
+        Command::new(common::plugin_bin(
+            "parvault-sync",
+            env!("CARGO_BIN_EXE_parvault-sync"),
+        ))
+        .arg("--socket")
+        .arg(&sock)
+        .arg("--catalog")
+        .arg(sock.with_file_name(format!("catalog{}.bin", extra.len())))
+        .args(["push", "--folder"])
+        .arg(&folder)
+        .args(extra)
+        .output()
+        .expect("run parvault-sync push")
     };
     let out = push(&[]);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -5335,21 +5338,24 @@ fn f43_plugin_up(label: &str) -> F43Plugin {
         std::thread::sleep(Duration::from_millis(50));
     }
     let file = std::fs::File::create(&fuse_log).unwrap();
-    let mut fuse = Command::new(env!("CARGO_BIN_EXE_parvault-fuse"))
-        .arg("--socket")
-        .arg(&sock)
-        .arg("--cache-dir")
-        .arg(&cache)
-        .arg("--macaroon")
-        .arg(f43_plugin_parent().to_compact_token())
-        .args(["webdav", "--listen", "127.0.0.1:0", "--seed-dir"])
-        .arg(&seed)
-        .env("RUST_LOG", "info")
-        .env("NO_COLOR", "1")
-        .stdout(Stdio::from(file.try_clone().unwrap()))
-        .stderr(Stdio::from(file))
-        .spawn()
-        .unwrap();
+    let mut fuse = Command::new(common::plugin_bin(
+        "parvault-fuse",
+        env!("CARGO_BIN_EXE_parvault-fuse"),
+    ))
+    .arg("--socket")
+    .arg(&sock)
+    .arg("--cache-dir")
+    .arg(&cache)
+    .arg("--macaroon")
+    .arg(f43_plugin_parent().to_compact_token())
+    .args(["webdav", "--listen", "127.0.0.1:0", "--seed-dir"])
+    .arg(&seed)
+    .env("RUST_LOG", "info")
+    .env("NO_COLOR", "1")
+    .stdout(Stdio::from(file.try_clone().unwrap()))
+    .stderr(Stdio::from(file))
+    .spawn()
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let text = std::fs::read_to_string(&fuse_log).unwrap_or_default();
@@ -5438,12 +5444,15 @@ fn f43_plugin_child_missing_parent_caveat_unauthorized() {
 fn f43_plugin_requires_macaroon() {
     let root = temp_root("f43-plugin-nomac");
     let out = common::output_within_deadline(
-        Command::new(env!("CARGO_BIN_EXE_parvault-fuse"))
-            .arg("--socket")
-            .arg(root.path().join("none.sock"))
-            .arg("--cache-dir")
-            .arg(root.path().join("c"))
-            .args(["webdav", "--listen", "127.0.0.1:0"]),
+        Command::new(common::plugin_bin(
+            "parvault-fuse",
+            env!("CARGO_BIN_EXE_parvault-fuse"),
+        ))
+        .arg("--socket")
+        .arg(root.path().join("none.sock"))
+        .arg("--cache-dir")
+        .arg(root.path().join("c"))
+        .args(["webdav", "--listen", "127.0.0.1:0"]),
     );
     assert!(!out.status.success());
     assert!(
