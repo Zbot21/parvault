@@ -797,7 +797,8 @@ fn test_mechanism6_blockstore_physical_file_deletion_over_time_on_lease_expiry_a
         "Departed Node X's .bshard file MUST be physically deleted from disk at epoch 8"
     );
     assert!(!store.has_blinded_shard_on_disk(&bid_x));
-    let read_deleted_x = store.get_blinded_shard_authorized(&bid_x, &cap_x, 1_000, &read_sig_x);
+    let read_deleted_x =
+        store.get_blinded_shard_authorized(&bid_x, &cap_x, 1_000, &read_sig_x, 1_000);
     assert!(
         matches!(read_deleted_x, Err(StorageError::ShardNotFound(_))),
         "Reading departed Node X's evicted shard must return Err(StorageError::ShardNotFound)"
@@ -806,7 +807,7 @@ fn test_mechanism6_blockstore_physical_file_deletion_over_time_on_lease_expiry_a
     // Meanwhile, Active Node Y's renewed shard_y is still intact on disk and readable!
     assert!(path_y.exists());
     let read_y = store
-        .get_blinded_shard_authorized(&bid_y, &cap_y, 1_000, &read_sig_y)
+        .get_blinded_shard_authorized(&bid_y, &cap_y, 1_000, &read_sig_y, 1_000)
         .expect("Active Node Y shard remains readable");
     assert_eq!(read_y, bytes_y);
 
@@ -821,7 +822,7 @@ fn test_mechanism6_blockstore_physical_file_deletion_over_time_on_lease_expiry_a
         "Tombstoned .bshard file must be physically unlinked from the filesystem immediately"
     );
     assert!(matches!(
-        store.get_blinded_shard_authorized(&bid_y, &cap_y, 1_000, &read_sig_y),
+        store.get_blinded_shard_authorized(&bid_y, &cap_y, 1_000, &read_sig_y, 1_000),
         Err(StorageError::ShardNotFound(_))
     ));
 }

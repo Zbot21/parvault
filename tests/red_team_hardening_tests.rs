@@ -168,7 +168,8 @@ fn test_rt2_blinded_capability_pinning_clock_skew_and_tombstone_generation_repla
             &blinded_id,
             &attacker_forged_cap,
             1_000_000,
-            &attacker_sig
+            &attacker_sig,
+            1_000_000
         ),
         Err(StorageError::QuotaExceeded(_))
     ));
@@ -177,7 +178,7 @@ fn test_rt2_blinded_capability_pinning_clock_skew_and_tombstone_generation_repla
     let owner_sig =
         BlindedShardCapability::sign_read_token(&owner_cap_id, &blinded_id.locator, 1_000_000);
     let read_back = store
-        .get_blinded_shard_authorized(&blinded_id, &owner_cap, 1_000_000, &owner_sig)
+        .get_blinded_shard_authorized(&blinded_id, &owner_cap, 1_000_000, &owner_sig, 1_000_000)
         .expect("genuine owner read");
     assert_eq!(read_back, shard_bytes);
 

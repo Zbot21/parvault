@@ -37,6 +37,35 @@ pub fn grant_registration_decision(facts: &GrantRegFacts) -> Result<(), &'static
     Ok(())
 }
 
+/// What the PoR pre-screen knows about a challenge, all from RAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PorPrescreenFacts {
+    pub range_ok: bool,
+    pub session_known: bool,
+    pub fresh: bool,
+    pub nonce_unseen: bool,
+    pub hmac_valid: bool,
+}
+
+/// ADR-03 / E-WIRE: a host answers a PoR challenge (and reads disk) only if the challenge names a
+/// bounded range of a shard it holds a session key for, is fresh and unseen, and carries that
+/// key's HMAC. Only the key holder can make the host read disk.
+pub fn por_prescreen_decision(f: &PorPrescreenFacts) -> Result<(), &'static str> {
+    if !f.range_ok {
+        return Err("reject.por_range_invalid");
+    }
+    if !f.session_known {
+        return Err("reject.por_session_unknown");
+    }
+    if !f.fresh || !f.nonce_unseen {
+        return Err("reject.por_stale_or_replayed");
+    }
+    if !f.hmac_valid {
+        return Err("reject.por_hmac_invalid");
+    }
+    Ok(())
+}
+
 /// A read or delete authorised by a grant owner applies only to shards that were stored with
 /// that owner's grant (F-26): an owner who registered a grant for the same stripe root first
 /// gains nothing over another owner's shards.
@@ -537,6 +566,39 @@ impl PorVerifierEngine {
         authorized
     }
 
+    /// Runs [`por_prescreen_decision`] for one challenge; a refusal is logged with its code,
+    /// counted, and mapped to the existing `PorError`.
+    #[allow(clippy::too_many_arguments)]
+    fn prescreen(
+        &mut self,
+        range_ok: bool,
+        session_known: bool,
+        issued_at_unix_ms: u64,
+        nonce: &[u8; 32],
+        hmac_valid: bool,
+        now_unix_ms: u64,
+        shard_id: &ShardId,
+    ) -> Result<(), PorError> {
+        let facts = PorPrescreenFacts {
+            range_ok,
+            session_known,
+            fresh: now_unix_ms.abs_diff(issued_at_unix_ms) <= CHALLENGE_FRESHNESS_WINDOW_MS,
+            nonce_unseen: !self.seen_nonces_ram.contains(nonce),
+            hmac_valid,
+        };
+        por_prescreen_decision(&facts).map_err(|code| {
+            self.blocked_ddos_challenges += 1;
+            tracing::warn!(code, "refused a PoR challenge before any disk read");
+            if facts.range_ok && !facts.session_known {
+                PorError::UnknownSessionKey(shard_id.file_key())
+            } else if facts.range_ok && (!facts.fresh || !facts.nonce_unseen) {
+                PorError::StaleOrReplayedNonce
+            } else {
+                PorError::InvalidHmacToken
+            }
+        })
+    }
+
     /// Handles an incoming `PorChallenge` on the storage host node (`P_x`):
     /// 1. Validates `H_chal` and nonce freshness **strictly in RAM** before any disk access.
     /// 2. If valid, reads the requested byte range from `BlockStore` and returns `SHA-256(Nonce || Data)`.
@@ -546,37 +608,31 @@ impl PorVerifierEngine {
         now_unix_ms: u64,
         block_store: &BlockStore,
     ) -> Result<PorResponse, PorError> {
-        if challenge.length == 0 || challenge.length > MAX_POR_RANGE_BYTES {
-            self.blocked_ddos_challenges += 1;
-            return Err(PorError::InvalidHmacToken);
-        }
-        let key_id = challenge.shard_id.file_key();
-        let Some(&session_key) = self.session_keys_ram.get(&key_id) else {
-            self.blocked_ddos_challenges += 1;
-            return Err(PorError::UnknownSessionKey(key_id));
-        };
-
-        // 1a. Verify timestamp freshness & nonce uniqueness in RAM (0 disk I/O).
-        if now_unix_ms.abs_diff(challenge.issued_at_unix_ms) > CHALLENGE_FRESHNESS_WINDOW_MS
-            || self.seen_nonces_ram.contains(&challenge.nonce)
-        {
-            self.blocked_ddos_challenges += 1;
-            return Err(PorError::StaleOrReplayedNonce);
-        }
-
-        // 1b. Constant-time HMAC verification in RAM (0 disk I/O).
-        let expected_hmac = compute_challenge_hmac(
-            &session_key,
-            &challenge.shard_id,
-            &challenge.nonce,
-            challenge.offset,
-            challenge.length,
+        let range_ok = challenge.length != 0 && challenge.length <= MAX_POR_RANGE_BYTES;
+        let session_key = self
+            .session_keys_ram
+            .get(&challenge.shard_id.file_key())
+            .copied();
+        // 1. Range, session key, freshness, nonce and HMAC, all in RAM (0 disk I/O).
+        let hmac_valid = session_key.is_some_and(|k| {
+            compute_challenge_hmac(
+                &k,
+                &challenge.shard_id,
+                &challenge.nonce,
+                challenge.offset,
+                challenge.length,
+                challenge.issued_at_unix_ms,
+            ) == challenge.hmac_token
+        });
+        self.prescreen(
+            range_ok,
+            session_key.is_some(),
             challenge.issued_at_unix_ms,
-        );
-        if expected_hmac != challenge.hmac_token {
-            self.blocked_ddos_challenges += 1;
-            return Err(PorError::InvalidHmacToken);
-        }
+            &challenge.nonce,
+            hmac_valid,
+            now_unix_ms,
+            &challenge.shard_id,
+        )?;
 
         // Record nonce in bounded RAM replay filter.
         self.record_seen_nonce(challenge.nonce);
@@ -766,41 +822,35 @@ impl PorVerifierEngine {
         now_unix_ms: u64,
         block_store: &BlockStore,
     ) -> Result<PorResponse, PorError> {
-        if challenge.segments.is_empty()
-            || challenge.segments.len() > 64
-            || challenge
+        let range_ok = !challenge.segments.is_empty()
+            && challenge.segments.len() <= 64
+            && challenge
                 .segments
                 .iter()
-                .any(|seg| seg.length == 0 || seg.length > MAX_POR_RANGE_BYTES)
-        {
-            self.blocked_ddos_challenges += 1;
-            return Err(PorError::InvalidHmacToken);
-        }
-        let key_id = challenge.shard_id.file_key();
-        let Some(&session_key) = self.session_keys_ram.get(&key_id) else {
-            self.blocked_ddos_challenges += 1;
-            return Err(PorError::UnknownSessionKey(key_id));
-        };
-
-        if now_unix_ms.abs_diff(challenge.issued_at_unix_ms) > CHALLENGE_FRESHNESS_WINDOW_MS
-            || self.seen_nonces_ram.contains(&challenge.nonce)
-        {
-            self.blocked_ddos_challenges += 1;
-            return Err(PorError::StaleOrReplayedNonce);
-        }
-
-        let expected_hmac = compute_multi_challenge_hmac(
-            &session_key,
-            &challenge.shard_id,
-            &challenge.nonce,
-            &challenge.segments,
-            challenge.max_rtt_ms,
+                .all(|seg| seg.length != 0 && seg.length <= MAX_POR_RANGE_BYTES);
+        let session_key = self
+            .session_keys_ram
+            .get(&challenge.shard_id.file_key())
+            .copied();
+        let hmac_valid = session_key.is_some_and(|k| {
+            compute_multi_challenge_hmac(
+                &k,
+                &challenge.shard_id,
+                &challenge.nonce,
+                &challenge.segments,
+                challenge.max_rtt_ms,
+                challenge.issued_at_unix_ms,
+            ) == challenge.hmac_token
+        });
+        self.prescreen(
+            range_ok,
+            session_key.is_some(),
             challenge.issued_at_unix_ms,
-        );
-        if expected_hmac != challenge.hmac_token {
-            self.blocked_ddos_challenges += 1;
-            return Err(PorError::InvalidHmacToken);
-        }
+            &challenge.nonce,
+            hmac_valid,
+            now_unix_ms,
+            &challenge.shard_id,
+        )?;
 
         self.record_seen_nonce(challenge.nonce);
 
@@ -988,6 +1038,44 @@ impl EgressWithholdingEvidence {
 #[cfg(test)]
 mod decision_tests {
     use super::*;
+
+    /// E-WIRE PorAudit / MultiSegmentPorAudit: range, session, freshness, then the HMAC.
+    #[test]
+    fn por_prescreen_decision_rules() {
+        let ok = PorPrescreenFacts {
+            range_ok: true,
+            session_known: true,
+            fresh: true,
+            nonce_unseen: true,
+            hmac_valid: true,
+        };
+        assert_eq!(por_prescreen_decision(&ok), Ok(()));
+        let with = |f: &dyn Fn(&mut PorPrescreenFacts)| {
+            let mut x = ok;
+            f(&mut x);
+            por_prescreen_decision(&x)
+        };
+        assert_eq!(
+            with(&|f| f.range_ok = false),
+            Err("reject.por_range_invalid")
+        );
+        assert_eq!(
+            with(&|f| f.session_known = false),
+            Err("reject.por_session_unknown")
+        );
+        assert_eq!(
+            with(&|f| f.fresh = false),
+            Err("reject.por_stale_or_replayed")
+        );
+        assert_eq!(
+            with(&|f| f.nonce_unseen = false),
+            Err("reject.por_stale_or_replayed")
+        );
+        assert_eq!(
+            with(&|f| f.hmac_valid = false),
+            Err("reject.por_hmac_invalid")
+        );
+    }
 
     #[test]
     fn grant_and_repair_read_decisions() {

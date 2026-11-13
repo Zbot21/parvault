@@ -3514,7 +3514,7 @@ mod tests {
             BlindedShardCapability::sign_read_token(&honest_cap_id, &honest_bid.locator, 1000);
         assert_eq!(
             store
-                .get_blinded_shard_authorized(&honest_bid, &honest_cap, 1000, &read_sig)
+                .get_blinded_shard_authorized(&honest_bid, &honest_cap, 1000, &read_sig, 1000)
                 .unwrap(),
             honest_payload
         );

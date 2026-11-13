@@ -91,4 +91,8 @@ claim      F-35      sym=src/storage/anonymity.rs::voucher_freshness_decision ac
 claim      F-38      sym=src/network/wire_handler.rs::syndication_grant_decision accept=trust_enforcement::f38_sender_owned_grant_accepted reject=trust_enforcement::f38_foreign_owner_grant_refused code=reject.syndication_grant_not_sender bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md
 kani       F-38      sym=src/network/wire_handler.rs::syndication_grant_decision harness=proof_syndication_grant_owned_by_sender cover=grant not owned by sender
 
+# --- E-WIRE (2c item 5): claims for the remaining wire variants ---
+claim      E-POR     sym=src/por/verifier.rs::por_prescreen_decision accept=trust_enforcement::ewire_por_audit_with_session_key_answered reject=trust_enforcement::ewire_por_audit_wrong_key_refused code=reject.por_hmac_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::PorAudit,MeshWireRequest::MultiSegmentPorAudit
+claim      E-BREAD   sym=src/storage/anonymity.rs::blinded_read_decision accept=trust_enforcement::ewire_blinded_read_by_capability_holder_served reject=trust_enforcement::ewire_blinded_read_by_other_key_refused code=reject.blinded_read_sig_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::GetBlindedShard
+
 ratchet    R         open=9 waive=0

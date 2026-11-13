@@ -1439,11 +1439,16 @@ impl ZeroTrustSeedServer {
         read_sig: &[u8; 64],
         challenge_nonce: &[u8; 32],
     ) -> Result<[u8; 32], BootstrapError> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         let bytes = self.block_store.get_blinded_shard_authorized(
             blinded_id,
             capability,
             timestamp_ms,
             read_sig,
+            now_ms,
         )?;
         // No self-credit for answering (F-07).
         Ok(compute_salted_commitment(challenge_nonce, &bytes))

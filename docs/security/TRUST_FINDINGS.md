@@ -94,6 +94,7 @@ Claim lines in `.enforcement.map` use the finding id, or the finding id with a s
 | F-24-ONION | F-24 admission at onion final delivery, single-layer branch (forwarding is admitted too since F-33). |
 | F-33 | Onion relay entry needs an admitted sender (L-38). |
 | F-39 | Low | A quorum of council epoch n can sign two different epoch n+1 manifests; nodes keep the successor they install first, and no node can prove the fork to another. | 2c | Accepted for v0.5.0 (documented in ADR-26); equivocation evidence is v0.6.0 |
+| F-40 | Medium | A blinded-shard read token (`GetBlindedShard`) was checked without its ±30 s clock-skew window, so a captured token stayed valid forever. | 2c | Fixed (QA pending): `blinded_read_decision` requires the registered capability key, this locator, a fresh token (`reject.blinded_read_stale`) and a valid signature (`reject.blinded_read_sig_invalid`; claim E-BREAD) |
 | F-33-BUDGET | Per-sender and total in-flight forward budget at a relay. |
 | F-24-LAYERED | F-24 admission at onion final delivery, layered branch (`open_final_target_pq`). |
 | F-25-DHT | F-25 admission for `PutDhtEnvelope`. |

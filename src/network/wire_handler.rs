@@ -1193,6 +1193,7 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                 &capability,
                 timestamp_ms,
                 &sig64,
+                now_unix_ms(),
             ) {
                 Ok(bytes) => MeshWireResponse::BlindedShardResult {
                     shard_bytes: Some(bytes),

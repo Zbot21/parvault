@@ -1398,23 +1398,22 @@ impl BlockStore {
         capability: &BlindedShardCapability,
         timestamp_ms: u64,
         read_sig: &[u8; 64],
+        now_ms: u64,
     ) -> Result<Vec<u8>, StorageError> {
-        // ADR-15 Red-Team Fix: Verify `capability.capability_pubkey` matches the capability key
-        // registered when the shard lease was created (preventing caller-supplied key substitution).
-        if let Ok(mgr) = self.blinded_leases.lock() {
-            if let Some(entry) = mgr.lease_entry(&blinded_id.locator) {
-                if let Some(registered_pubkey) = entry.capability_pubkey {
-                    if capability.capability_pubkey != registered_pubkey {
-                        return Err(StorageError::QuotaExceeded(
-                            "unauthorized_blinded_shard_capability".into(),
-                        ));
-                    }
-                }
-            }
-        }
-        if capability.locator != blinded_id.locator
-            || !capability.verify_read_token(timestamp_ms, read_sig)
-        {
+        // ADR-15: the capability key must be the one registered with the lease (no caller-supplied
+        // key substitution), name this locator, be signed within +/-30 s, and verify.
+        let registered = self.blinded_leases.lock().ok().and_then(|mgr| {
+            mgr.lease_entry(&blinded_id.locator)
+                .and_then(|e| e.capability_pubkey)
+        });
+        let facts = crate::storage::anonymity::BlindedReadFacts {
+            capability_registered: registered.is_none_or(|pk| pk == capability.capability_pubkey),
+            locator_matches: capability.locator == blinded_id.locator,
+            fresh: timestamp_ms.abs_diff(now_ms) <= crate::storage::MAX_CAPABILITY_CLOCK_SKEW_MS,
+            sig_valid: capability.verify_read_token(timestamp_ms, read_sig),
+        };
+        if let Err(code) = crate::storage::anonymity::blinded_read_decision(&facts) {
+            tracing::warn!(code, "refused a blinded shard read");
             return Err(StorageError::QuotaExceeded(
                 "unauthorized_blinded_shard_capability".into(),
             ));

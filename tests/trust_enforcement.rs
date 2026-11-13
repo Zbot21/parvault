@@ -3788,3 +3788,100 @@ fn evict_propagate_needs_council_membership() {
     assert!(!out.status.success(), "{text}");
     assert!(text.contains("member of the installed council"), "{text}");
 }
+
+// --- E-WIRE (2c item 5): claims for the remaining wire variants ---------------------------------
+
+/// E-WIRE PorAudit accept: the session key holder's audit is answered from disk.
+#[test]
+fn ewire_por_audit_with_session_key_answered() {
+    let node = spawn_daemon("ew-por-a");
+    let owner = key(0xB1);
+    let (sid, bytes) = shard(0x31, 2048);
+    assert!(stored(&send(
+        &owner,
+        &node,
+        put_shard("", sid, bytes.clone(), None)
+    )));
+    let chal =
+        parvault::por::generate_por_challenge(&[0x5E; 32], sid, bytes.len() as u64, now_ms());
+    let resp = send(&owner, &node, MeshWireRequest::PorAudit(chal));
+    assert!(
+        matches!(resp, MeshWireResponse::PorAuditResult(Some(_))),
+        "{resp:?}"
+    );
+    gate_ran("trust_enforcement::ewire_por_audit_with_session_key_answered");
+}
+
+/// E-WIRE PorAudit reject: an audit keyed with another key is refused before any disk read.
+#[test]
+fn ewire_por_audit_wrong_key_refused() {
+    let node = spawn_daemon("ew-por-r");
+    let owner = key(0xB1);
+    let (sid, bytes) = shard(0x31, 2048);
+    assert!(stored(&send(
+        &owner,
+        &node,
+        put_shard("", sid, bytes.clone(), None)
+    )));
+    let chal =
+        parvault::por::generate_por_challenge(&[0x11; 32], sid, bytes.len() as u64, now_ms());
+    let resp = send(&key(0xB2), &node, MeshWireRequest::PorAudit(chal));
+    assert!(
+        matches!(resp, MeshWireResponse::PorAuditResult(None)),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.por_hmac_invalid");
+    gate_ran("trust_enforcement::ewire_por_audit_wrong_key_refused");
+}
+
+/// A fresh read of blinded shard `b` signed by `signer` (the capability key, or another).
+fn blinded_read(b: &Blinded, signer: &NodeIdentity) -> MeshWireRequest {
+    let ts = now_ms();
+    MeshWireRequest::GetBlindedShard {
+        blinded_id: b.id,
+        capability: b.cap,
+        timestamp_ms: ts,
+        read_sig: BlindedShardCapability::sign_read_token(signer, &b.id.locator, ts).to_vec(),
+    }
+}
+
+fn blinded_cap_identity(seed: u8, b: &Blinded) -> NodeIdentity {
+    BlindedShardCapability::derive_keypair(&MasterKey::from_bytes([seed; 32]), &b.id.locator).0
+}
+
+/// E-WIRE GetBlindedShard accept: the capability key holder reads its shard.
+#[test]
+fn ewire_blinded_read_by_capability_holder_served() {
+    let node = spawn_daemon("ew-bread-a");
+    let sender = key(0xB3);
+    let b = blinded(0x5B, 512);
+    let put = send(&sender, &node, blinded_put(&b, &sender));
+    assert!(format!("{put:?}").contains("stored: true"), "{put:?}");
+    let resp = send(
+        &sender,
+        &node,
+        blinded_read(&b, &blinded_cap_identity(0x5B, &b)),
+    );
+    assert!(
+        format!("{resp:?}").contains("shard_bytes: Some"),
+        "{resp:?}"
+    );
+    gate_ran("trust_enforcement::ewire_blinded_read_by_capability_holder_served");
+}
+
+/// E-WIRE GetBlindedShard reject: a read signed by another key is refused.
+#[test]
+fn ewire_blinded_read_by_other_key_refused() {
+    let node = spawn_daemon("ew-bread-r");
+    let sender = key(0xB3);
+    let b = blinded(0x5B, 512);
+    let put = send(&sender, &node, blinded_put(&b, &sender));
+    assert!(format!("{put:?}").contains("stored: true"), "{put:?}");
+    let resp = send(&sender, &node, blinded_read(&b, &key(0xB4)));
+    assert!(
+        format!("{resp:?}").contains("shard_bytes: None"),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.blinded_read_sig_invalid");
+    gate_ran("trust_enforcement::ewire_blinded_read_by_other_key_refused");
+}

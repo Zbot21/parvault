@@ -210,6 +210,32 @@ impl BlindedShardCapability {
     }
 }
 
+/// What a blinded-shard read knows about its capability and token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlindedReadFacts {
+    /// The capability key is the one registered with the lease (or none was registered).
+    pub capability_registered: bool,
+    pub locator_matches: bool,
+    /// The read token was signed within `MAX_CAPABILITY_CLOCK_SKEW_MS` of now.
+    pub fresh: bool,
+    pub sig_valid: bool,
+}
+
+/// ADR-11 / ADR-15 / E-WIRE GetBlindedShard: bytes are served only to the holder of the lease's
+/// capability key, for this locator, with a fresh signature (a captured token expires in 30 s).
+pub fn blinded_read_decision(f: &BlindedReadFacts) -> Result<(), &'static str> {
+    if !f.capability_registered || !f.locator_matches {
+        return Err("reject.blinded_read_capability_mismatch");
+    }
+    if !f.fresh {
+        return Err("reject.blinded_read_stale");
+    }
+    if !f.sig_valid {
+        return Err("reject.blinded_read_sig_invalid");
+    }
+    Ok(())
+}
+
 /// Layer 3 (ADR-11): Unlinkable Bearer Storage Quota Voucher.
 /// Decouples storage reciprocity accounting from static `peer_id` identities so storage nodes
 /// cannot link multiple shards to the same user account.
@@ -645,5 +671,40 @@ mod tests {
         assert_eq!(padded.len(), 4096);
         let unpadded = unpad_shard_uniform_bucket(&padded).expect("unpad");
         assert_eq!(unpadded, raw_shard);
+    }
+}
+
+#[cfg(test)]
+mod blinded_read_decision_tests {
+    use super::*;
+
+    /// E-WIRE GetBlindedShard: registered capability for this locator, fresh, then the signature.
+    #[test]
+    fn blinded_read_decision_rules() {
+        let ok = BlindedReadFacts {
+            capability_registered: true,
+            locator_matches: true,
+            fresh: true,
+            sig_valid: true,
+        };
+        assert_eq!(blinded_read_decision(&ok), Ok(()));
+        let with = |f: &dyn Fn(&mut BlindedReadFacts)| {
+            let mut x = ok;
+            f(&mut x);
+            blinded_read_decision(&x)
+        };
+        assert_eq!(
+            with(&|f| f.capability_registered = false),
+            Err("reject.blinded_read_capability_mismatch")
+        );
+        assert_eq!(
+            with(&|f| f.locator_matches = false),
+            Err("reject.blinded_read_capability_mismatch")
+        );
+        assert_eq!(with(&|f| f.fresh = false), Err("reject.blinded_read_stale"));
+        assert_eq!(
+            with(&|f| f.sig_valid = false),
+            Err("reject.blinded_read_sig_invalid")
+        );
     }
 }
