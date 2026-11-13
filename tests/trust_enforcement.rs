@@ -5666,3 +5666,90 @@ fn f43_per_ip_connection_cap() {
     let fresh = f43_http(&addr, "GET", "/a.txt", &[]);
     assert_eq!(fresh.0, 401, "{}", f43_status(&fresh));
 }
+
+// --- QA 2c D1: a peer demanding excessive ticket PoW cannot hang a public client --------------------
+
+/// A fake public peer: answers every request with a refused `AdmitPublicTicketAck` demanding
+/// `bits` of PoW. Returns its `/p2p/` address; the swarm runs on its own thread.
+fn spawn_pow_demanding_peer(bits: u8) -> String {
+    use libp2p::request_response::{self, ProtocolSupport};
+    use parvault::network::behaviour::BincodeWireCodec;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let ident = key(0xD9);
+            let verifier = ident.public_key_bytes();
+            let mut swarm =
+                libp2p::SwarmBuilder::with_existing_identity(ident.to_libp2p_keypair().unwrap())
+                    .with_tokio()
+                    .with_tcp(
+                        libp2p::tcp::Config::default(),
+                        libp2p::noise::Config::new,
+                        libp2p::yamux::Config::default,
+                    )
+                    .unwrap()
+                    .with_behaviour(|_| {
+                        request_response::Behaviour::with_codec(
+                            BincodeWireCodec::default(),
+                            [(
+                                libp2p::StreamProtocol::new("/parvault/wire/1.0.0"),
+                                ProtocolSupport::Full,
+                            )],
+                            request_response::Config::default(),
+                        )
+                    })
+                    .unwrap()
+                    .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
+                    .build();
+            swarm
+                .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+                .unwrap();
+            let pid = *swarm.local_peer_id();
+            loop {
+                match swarm.select_next_some().await {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        let _ = tx.send(format!("{address}/p2p/{pid}"));
+                    }
+                    SwarmEvent::Behaviour(request_response::Event::Message {
+                        message: request_response::Message::Request { channel, .. },
+                        ..
+                    }) => {
+                        let _ = swarm.behaviour_mut().send_response(
+                            channel,
+                            MeshWireResponse::AdmitPublicTicketAck {
+                                admitted: false,
+                                reason: Some("more work".into()),
+                                verifier_pubkey: verifier,
+                                required_pow_bits: bits,
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        });
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("fake peer listening")
+}
+
+/// D1: a public-commons client facing a peer that demands 255 bits of PoW refuses the demand
+/// and returns quickly instead of minting forever.
+#[test]
+fn ticket_excessive_pow_demand_refused_fast() {
+    let addr = spawn_pow_demanding_peer(255);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let c = MeshClient::new(key(0xDA), Vec::new(), None).with_admission(
+            AdmissionSource::default().with_public_tickets(DEFAULT_PUBLIC_WOT_POW_BITS),
+        );
+        let (sid, bytes) = shard(0x51, 64);
+        let r = c.send_request(&addr, put_shard("", sid, bytes, None));
+        let _ = done_tx.send(format!("{r:?}"));
+    });
+    let out = done_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the client must not hang minting a 255-bit ticket");
+    assert!(!out.contains("stored: true"), "{out}");
+}

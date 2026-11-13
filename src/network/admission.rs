@@ -190,6 +190,11 @@ impl AdmissionSource {
         }
     }
 
+    /// The PoW bits of tickets this source mints by default, if it mints tickets.
+    pub fn public_ticket_bits(&self) -> Option<u8> {
+        self.public_ticket_bits
+    }
+
     /// Falls back to a public-commons ticket of `pow_bits` when no chain is available.
     pub fn with_public_tickets(mut self, pow_bits: u8) -> Self {
         self.public_ticket_bits = Some(pow_bits);

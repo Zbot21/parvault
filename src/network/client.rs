@@ -1162,6 +1162,22 @@ impl MeshClient {
                     && (verifier_pubkey != verifier
                         || required_bits != Some(required_pow_bits)) =>
                 {
+                    let own = self
+                        .admission
+                        .as_deref()
+                        .and_then(|s| s.public_ticket_bits())
+                        .unwrap_or(crate::network::wot::DEFAULT_PUBLIC_WOT_POW_BITS);
+                    if let Err(code) =
+                        crate::network::wot::ticket_pow_demand_decision(required_pow_bits, own)
+                    {
+                        warn!(
+                            code,
+                            peer = peer_addr,
+                            demanded = required_pow_bits,
+                            "refused a peer's ticket PoW demand"
+                        );
+                        break;
+                    }
                     verifier = verifier_pubkey;
                     required_bits = Some(required_pow_bits);
                 }

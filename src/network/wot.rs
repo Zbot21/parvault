@@ -50,6 +50,24 @@ fn now_unix_ms() -> u64 {
 /// zero-pairing admission (~0.5–2 ms on tiny router SoCs).
 pub const DEFAULT_PUBLIC_WOT_POW_BITS: u8 = 12;
 
+/// Hard ceiling on ticket PoW a client will mint (QA 2c D1): about a million hashes.
+pub const MAX_TICKET_POW_BITS: u8 = 20;
+
+/// QA 2c D1: a client re-mints at a peer's stated `required_pow_bits` only if the demand is at
+/// most 4 bits above its own (or the default) level and never above `MAX_TICKET_POW_BITS`; a
+/// larger demand would hang the client minting.
+pub fn ticket_pow_demand_decision(demanded: u8, own_bits: u8) -> Result<(), &'static str> {
+    let limit = own_bits
+        .max(DEFAULT_PUBLIC_WOT_POW_BITS)
+        .saturating_add(4)
+        .min(MAX_TICKET_POW_BITS);
+    if demanded > limit {
+        Err("reject.ticket_pow_demand_excessive")
+    } else {
+        Ok(())
+    }
+}
+
 /// Domain separator for `PublicCommonsTicket` Hashcash PoW and Ed25519 self-attestation.
 pub const PUBLIC_COMMONS_POW_DOMAIN: &[u8] = b"parvault-public-wot-pow-v1:";
 
@@ -227,7 +245,9 @@ impl PublicCommonsTicket {
         min_pow_bits: u8,
     ) -> Self {
         let peer_pubkey = identity.public_key_bytes();
-        let target_bits = u32::from(min_pow_bits);
+        // Defence in depth (QA 2c D1): the search never runs past MAX_TICKET_POW_BITS; a ticket
+        // declaring more is then simply invalid, never an endless loop.
+        let target_bits = u32::from(min_pow_bits.min(MAX_TICKET_POW_BITS));
 
         let mut prefix_hasher = Sha256::new();
         prefix_hasher.update(PUBLIC_COMMONS_POW_DOMAIN);
