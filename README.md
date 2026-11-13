@@ -137,6 +137,7 @@ flowchart LR
 - **Re-syndicating a partly placed stripe:** `watch-folder` with a lite seed re-sends the whole stripe, so shards that an earlier pass already placed on peers stay there unreferenced (they use those peers' quota until evicted).
 - **Built-in VFS seed folder (W-04):** if the seed folder cannot be stored at all, the daemon prints a warning and keeps serving without it.
 - **Personal device rings:** the "zero storage quota tax" for linked devices is planned; nothing charges or waives quota by device certificate yet.
+- **Lost quota state:** if a node's `quota_state.bin` is deleted or unreadable, it starts with empty accounting, so a shard stored without a repair grant can no longer be re-put or deleted by its owner there (shards stored with a grant are unaffected; F-38-GRANT-QUOTA).
 - **Public tracker:** none is hosted; `--public` needs your own `parvault-seed`.
 - **RAM:** `< 32 MiB` is a design target; the evidence is a 48 MiB cgroup Docker stage and `parvault-bench`.
 
