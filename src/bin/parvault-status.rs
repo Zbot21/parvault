@@ -1,6 +1,6 @@
 //! `parvault-status`: the status page as a separate process (item 3, plan-3 option A).
 //!
-//! It holds no key. It pins one read-only token (`--macaroon`): a browser or script must present
+//! It holds no key. It pins one read-only token (`--macaroon-file`, or `--macaroon`): a browser or script must present
 //! that token or an offline attenuation of it, only in the `Authorization` header (L-52), and
 //! the page checks it with `http_edge::status_auth_decision` (Host check included) before
 //! asking the daemon for the snapshot over the gateway socket with the same token. Built with
@@ -28,8 +28,17 @@ struct StatusCli {
 
     /// The pinned read-only `PARVAULT-MAC-V1:` token (`parvault token mint --read-only`).
     /// Requests must present it or an offline attenuation of it.
-    #[arg(long, value_name = "PARVAULT-MAC-V1:...")]
-    macaroon: String,
+    /// Visible to every local user in the process list (`/proc/<pid>/cmdline`); prefer `--macaroon-file`.
+    #[arg(
+        long,
+        value_name = "PARVAULT-MAC-V1:...",
+        required_unless_present = "macaroon_file"
+    )]
+    macaroon: Option<String>,
+
+    /// File holding the pinned token (mode 600; refused if group or others can read it).
+    #[arg(long, value_name = "PATH")]
+    macaroon_file: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -40,9 +49,12 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     let cli = StatusCli::parse();
-    let pinned =
-        parvault::capabilities::CapabilityMacaroon::from_compact_token(cli.macaroon.trim())
-            .map_err(|e| anyhow::anyhow!("invalid --macaroon token: {e}"))?;
+    let pinned = parvault::capabilities::token_from_args(
+        cli.macaroon.as_deref(),
+        cli.macaroon_file.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?
+    .ok_or_else(|| anyhow::anyhow!("--macaroon or --macaroon-file is required"))?;
 
     // Fail at start, not on the first request: the daemon must know QueryStatus and accept
     // the pinned token.

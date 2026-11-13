@@ -6633,6 +6633,19 @@ fn status_sidecar_log(s: &StatusSidecar) -> String {
 /// A daemon with a gateway socket under GW_KEY, and `parvault-status` pinned to a ReadOnly root
 /// token, serving on an ephemeral loopback port.
 fn status_sidecar_up(label: &str) -> StatusSidecar {
+    status_sidecar_up_with(label, false)
+}
+
+/// Writes `token` to `dir/name` with `mode` (QA item 3, defect 1: tokens off argv).
+fn write_token_file(dir: &Path, name: &str, token: &str, mode: u32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join(name);
+    std::fs::write(&p, format!("{token}\n")).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+    p
+}
+
+fn status_sidecar_up_with(label: &str, token_file: bool) -> StatusSidecar {
     let (gateway, sock) = gw_up(label, &[], Some(GW_KEY));
     let log = gateway.dir.join("parvault-status.log");
     let f = std::fs::File::create(&log).unwrap();
@@ -6644,7 +6657,17 @@ fn status_sidecar_up(label: &str) -> StatusSidecar {
         env!("CARGO_BIN_EXE_parvault-status"),
     ))
     .current_dir(&cwd)
-    .args(["--listen", "127.0.0.1:0", "--macaroon", &ro_token()])
+    .args(["--listen", "127.0.0.1:0"])
+    .args(if token_file {
+        vec![
+            "--macaroon-file".to_string(),
+            write_token_file(&gateway.dir, "status.token", &ro_token(), 0o600)
+                .display()
+                .to_string(),
+        ]
+    } else {
+        vec!["--macaroon".to_string(), ro_token()]
+    })
     .arg("--socket")
     .arg(&sock)
     .stdout(Stdio::from(f.try_clone().unwrap()))
@@ -6824,4 +6847,55 @@ fn status_sidecar_old_daemon_clear_message() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("predates v0.5.0"), "{err}");
+}
+
+/// QA item 3, defect 1: the sidecar reads its pinned token from a 0600 file, so it is not in
+/// /proc/<pid>/cmdline.
+#[test]
+fn status_sidecar_macaroon_file_served() {
+    let s = status_sidecar_up_with("ss-file", true);
+    let (code, _) = status_get(
+        s.addr,
+        &host_of(s.addr),
+        Some(format!("Bearer {}", ro_token())),
+    );
+    assert_eq!(code, 200);
+    let cmdline = std::fs::read(format!("/proc/{}/cmdline", s.child.id())).unwrap();
+    assert!(!String::from_utf8_lossy(&cmdline).contains(&ro_token()));
+}
+
+/// QA item 3, defect 1: every plugin refuses a token file that group or others can read,
+/// before it does anything else.
+#[test]
+fn plugin_macaroon_file_group_readable_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = write_token_file(dir.path(), "open.token", &ro_token(), 0o644);
+    let f = f.to_str().unwrap();
+    let runs: [(&str, std::path::PathBuf, Vec<&str>); 3] = [
+        (
+            "parvault-status",
+            common::plugin_bin("parvault-status", env!("CARGO_BIN_EXE_parvault-status")),
+            vec!["--listen", "127.0.0.1:0", "--macaroon-file", f],
+        ),
+        (
+            "parvault-fuse",
+            common::plugin_bin("parvault-fuse", env!("CARGO_BIN_EXE_parvault-fuse")),
+            vec!["--macaroon-file", f, "self-test"],
+        ),
+        (
+            "parvault-sync",
+            common::plugin_bin("parvault-sync", env!("CARGO_BIN_EXE_parvault-sync")),
+            vec!["--macaroon-file", f, "list"],
+        ),
+    ];
+    for (name, bin, args) in runs {
+        let out = Command::new(bin)
+            .current_dir(dir.path())
+            .args(&args)
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{name} accepted a 0644 token file");
+        assert!(err.contains("readable by group or others"), "{name}: {err}");
+    }
 }

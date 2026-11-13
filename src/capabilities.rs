@@ -891,6 +891,45 @@ impl GatewayIdentityStatement {
     }
 }
 
+/// The token a plugin presents, from `--macaroon` (inline; visible to every local user in
+/// `/proc/<pid>/cmdline`) or `--macaroon-file` (QA item 3: a file only its owner can read).
+/// Both at once is refused; neither is `Ok(None)`.
+pub fn token_from_args(
+    inline: Option<&str>,
+    file: Option<&std::path::Path>,
+) -> Result<Option<CapabilityMacaroon>, String> {
+    let text = match (inline.map(str::trim).filter(|s| !s.is_empty()), file) {
+        (Some(_), Some(_)) => return Err("give --macaroon or --macaroon-file, not both".into()),
+        (Some(t), None) => t.to_string(),
+        (None, Some(path)) => read_owner_only_token_file(path)?,
+        (None, None) => return Ok(None),
+    };
+    CapabilityMacaroon::from_compact_token(&text)
+        .map(Some)
+        .map_err(|e| format!("invalid token: {e}"))
+}
+
+/// Reads a token file, refusing one that group or others can read (mode `& 0o077 != 0`).
+fn read_owner_only_token_file(path: &std::path::Path) -> Result<String, String> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("cannot read --macaroon-file {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.mode() & 0o077 != 0 {
+            return Err(format!(
+                "--macaroon-file {} is readable by group or others (mode {:o}); chmod 600 it",
+                path.display(),
+                meta.mode() & 0o777
+            ));
+        }
+    }
+    let _ = &meta;
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read --macaroon-file {}: {e}", path.display()))?;
+    Ok(text.trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

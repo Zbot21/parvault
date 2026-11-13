@@ -143,10 +143,11 @@ The status page needs a read-only token on every request (v0.5.0): run `parvault
 #### Status page as a separate process (`parvault-status`)
 `parvault-status` serves the same status page from outside the daemon. It holds no key and links no tokio or libp2p. It pins one read-only token, and asks the daemon for the snapshot over the gateway socket:
 ```bash
-TOKEN="$(parvault token mint --read-only)"
-parvault-status --socket /var/run/parvault.sock --listen 127.0.0.1:4080 --macaroon "$TOKEN"
+( umask 077; parvault token mint --read-only > ~/.parvault-status.token )
+parvault-status --socket /var/run/parvault.sock --listen 127.0.0.1:4080 \
+  --macaroon-file ~/.parvault-status.token
 ```
-Requests must present that token, or an offline attenuation of it, in the `Authorization` header (Bearer, or as the Basic password), never in the URL. `--listen` has no default. The socket is mode `0600`, so run it as the daemon's user or set up the socket for its user. Against a daemon older than v0.5.0 it exits with "predates v0.5.0".
+Requests must present that token, or an offline attenuation of it, in the `Authorization` header (Bearer, or as the Basic password), never in the URL. `--macaroon <token>` still works, but any local user can read it in the process list (`/proc/<pid>/cmdline`); use `--macaroon-file`, which is refused if group or others can read it. `--listen` has no default. The socket is mode `0600`, so run it as the daemon's user or set up the socket for its user. Against a daemon older than v0.5.0 it exits with "predates v0.5.0".
 
 #### 3. Zero-IP Auto-Discovery & Pairing on Laptops (`parvault discover` & `join`)
 On any other computer on your Wi-Fi/LAN:
