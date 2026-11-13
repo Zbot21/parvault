@@ -84,6 +84,10 @@ Status values:
 | ID | Line | Status |
 | :--- | :--- | :--- |
 | E-WIRE | Every `MeshWireRequest` variant is covered by a claim. | Open until every variant has a claim (2b covers the admitted classes; the rest follow in 2c). |
+| E-POR | `PorAudit` and `MultiSegmentPorAudit` read disk only for the session-key holder's fresh, unseen, HMAC-valid challenge (`por_prescreen_decision`). | Claim (2c item 5). |
+| E-BREAD | `GetBlindedShard` serves bytes only for the lease's capability key, this locator, a fresh token and a valid signature (`blinded_read_decision`, F-40). | Claim (2c item 5). |
+| E-ABUSE | `SubmitAbuseTakedownReport` queues only a reporter-signed report with a working burden of proof (`abuse_report_decision`). | Claim (2c item 5). |
+| E-COUNCIL | `GetCouncilManifest` answers only admitted peers (`admission_decision`). | Claim (2c item 5). |
 | D-ADR | Every accepted ADR is a claim's `adr=` or has a `noenforce` line. | Open (2c). |
 | A-DOCKER | `scripts/docker_acceptance_gate.sh` stages binaries through `stage_artifact.sh`. | Open; converted before item 7. |
 | B-DISC | `src/network/discovery.rs` has three `std::thread::sleep` calls (LAN beacon and probe loops); review whether any runs on the async runtime. | Closed (2c, QA pending): two run on the beacon responder's dedicated thread; the third is reached from the swarm only through the onion forward, which runs on the blocking pool since F-18. `discovery.rs` is exempt; the `no-blocking` check now covers the handler modules (`wire_handler.rs`, `server_events.rs`, `cli/daemon.rs`). |
