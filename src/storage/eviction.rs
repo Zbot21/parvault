@@ -2579,6 +2579,10 @@ impl PrivacyPreservingEvictionEngine {
         now_ms: u64,
     ) -> Result<(), StorageError> {
         if self.seen_order_ids_set.contains(&order.order_id) {
+            tracing::warn!(
+                code = "reject.order_replayed",
+                "refused a replayed eviction order"
+            );
             return Err(StorageError::QuotaExceeded(
                 "duplicate_replayed_eviction_order".into(),
             ));
@@ -4093,7 +4097,9 @@ mod tests {
                 20_001,
                 &store,
             )
-            .is_err());
+            .unwrap_err()
+            .to_string()
+            .contains("reject.order_quorum"));
         assert!(store.has_shard(&honest_sid));
 
         // (b) Single compromised/rogue council member (`1-of-3`) tries to wipe honest shards to hog space -> rejected!
@@ -4115,7 +4121,9 @@ mod tests {
                 20_006,
                 &store,
             )
-            .is_err());
+            .unwrap_err()
+            .to_string()
+            .contains("reject.order_quorum"));
         assert!(store.has_shard(&honest_sid));
 
         // (c) Legitimate takedown order starts at 1-of-3 (rejected if broadcast early), then 2nd independent
@@ -4136,7 +4144,9 @@ mod tests {
                 20_011,
                 &store,
             )
-            .is_err());
+            .unwrap_err()
+            .to_string()
+            .contains("reject.order_quorum"));
         assert!(store.has_shard(&bad_sid));
 
         assert!(council_order.add_cosignature(&tracker_2_honest));

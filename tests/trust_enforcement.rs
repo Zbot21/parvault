@@ -2826,6 +2826,7 @@ fn f09_stale_or_replayed_order_refused() {
         MeshWireRequest::BroadcastEvictionOrder(fresh),
     );
     assert!(!order_accepted(&replay), "{replay:?}");
+    assert_logged(&node, "reject.order_replayed");
     gate_ran("trust_enforcement::f09_stale_or_replayed_order_refused");
 }
 
@@ -2937,6 +2938,7 @@ fn council_peer_refuses_another_nodes_local_owner_order() {
         MeshWireRequest::BroadcastEvictionOrder(order),
     );
     assert!(!order_accepted(&resp), "{resp:?}");
+    assert_logged(&node, "reject.order_quorum");
 }
 
 /// Two daemons of one ring, both at council epoch 1; `ahead` also holds epoch 2 (or, if
