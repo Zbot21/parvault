@@ -1897,13 +1897,20 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                 now_unix_ms(),
                 block_store,
             ) {
-                Ok(rep) => MeshWireResponse::EvictionOrderAck {
-                    accepted: true,
-                    purged_regular_shards: rep.purged_regular_shards,
-                    purged_blinded_shards: rep.purged_blinded_shards,
-                    zero_wiped_bytes: rep.zero_wiped_bytes,
-                    error: None,
-                },
+                Ok(rep) => {
+                    info!(
+                        order = %hex::encode(order.order_id),
+                        epoch = order.council_epoch,
+                        "applied an eviction order"
+                    );
+                    MeshWireResponse::EvictionOrderAck {
+                        accepted: true,
+                        purged_regular_shards: rep.purged_regular_shards,
+                        purged_blinded_shards: rep.purged_blinded_shards,
+                        zero_wiped_bytes: rep.zero_wiped_bytes,
+                        error: None,
+                    }
+                }
                 Err(err) => MeshWireResponse::EvictionOrderAck {
                     accepted: false,
                     purged_regular_shards: 0,
