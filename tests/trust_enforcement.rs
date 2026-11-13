@@ -3458,3 +3458,39 @@ fn f38g_seed_second_key_same_bundle_refused() {
     assert!(read_bytes(&send(&vault, &node, owner_read(&vault, sid))).is_some());
     gate_ran("trust_enforcement::f38g_seed_second_key_same_bundle_refused");
 }
+
+/// F-38-GRANT accept: after a shard is LRU-evicted (its file removed, as `put_shard`'s eviction
+/// does, with no verifier cleanup), a new owner may store it; the old owner's stale grant
+/// binding is dropped on that fresh bind, so the old owner can neither read nor delete it.
+#[test]
+fn f38g_evicted_then_new_owner_rebinds() {
+    let node = spawn_daemon("f38g-evict");
+    let old = key(0xDD);
+    let new = key(0xDE);
+    let (sid, bytes) = shard(0x66, 1024);
+    let r = send(
+        &old,
+        &node,
+        put_shard("", sid, bytes.clone(), Some(self_grant(&old, &sid))),
+    );
+    assert!(stored(&r), "{r:?}");
+    let file = node
+        .dir
+        .join("shards")
+        .join(format!("{}.shard", sid.file_key()));
+    assert!(file.exists(), "{}", file.display());
+    std::fs::remove_file(&file).unwrap();
+    let r = send(
+        &new,
+        &node,
+        put_shard("", sid, bytes.clone(), Some(self_grant(&new, &sid))),
+    );
+    assert!(stored(&r), "{r:?}");
+    assert_eq!(
+        read_bytes(&send(&new, &node, owner_read(&new, sid))),
+        Some(bytes)
+    );
+    assert!(read_bytes(&send(&old, &node, owner_read(&old, sid))).is_none());
+    assert!(!deleted(&send(&old, &node, delete_req(&old, sid))));
+    assert!(deleted(&send(&new, &node, delete_req(&new, sid))));
+}
