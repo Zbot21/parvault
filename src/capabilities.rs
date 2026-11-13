@@ -38,6 +38,9 @@ pub const GATEWAY_STATEMENT_DOMAIN: &[u8] = b"parvault-gateway-identity-statemen
 /// Longest lifetime of a [`GatewayIdentityStatement`] (`expires - issued`): 30 days (F-17).
 pub const MAX_GATEWAY_STATEMENT_LIFETIME_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
+/// Largest clock skew allowed for a statement's issue time (5 minutes, as eviction orders).
+pub const GATEWAY_STATEMENT_FUTURE_SKEW_MS: u64 = 5 * 60 * 1000;
+
 /// F-17: a gateway statement counts only if its authority is the one the verifier pinned and its
 /// expiry is bounded (`issued < expires <= issued + 30 days`) and not yet passed.
 pub fn gateway_statement_decision(
@@ -53,6 +56,10 @@ pub fn gateway_statement_decision(
         || expires_at_unix_ms - issued_at_unix_ms > MAX_GATEWAY_STATEMENT_LIFETIME_MS
     {
         return Err("reject.gateway_statement_unbounded");
+    }
+    // QA 2c D4: issued at most 5 minutes in the future (the eviction-order clock skew).
+    if issued_at_unix_ms > now_unix_ms.saturating_add(GATEWAY_STATEMENT_FUTURE_SKEW_MS) {
+        return Err("reject.gateway_statement_future");
     }
     if now_unix_ms > expires_at_unix_ms {
         return Err("reject.gateway_statement_expired");
@@ -911,6 +918,17 @@ mod tests {
         assert_eq!(
             stmt.verify_pinned(&pinned.public_key(), 30_000),
             Err("reject.gateway_authority_unpinned")
+        );
+        let future = GatewayIdentityStatement::issue(
+            &pinned, "gw-1", [0x11; 32], [0x22; 32], 10_000_000, 10_060_000,
+        )
+        .unwrap();
+        assert_eq!(
+            future.verify_pinned(
+                &pinned.public_key(),
+                10_000_000 - GATEWAY_STATEMENT_FUTURE_SKEW_MS - 1
+            ),
+            Err("reject.gateway_statement_future")
         );
         for expires in [0, 1 + MAX_GATEWAY_STATEMENT_LIFETIME_MS + 1] {
             let stmt = GatewayIdentityStatement::issue(

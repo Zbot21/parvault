@@ -1171,8 +1171,9 @@ fn proof_syndication_grant_owned_by_sender() {
     assert_eq!(decision.is_ok(), expected_ok);
 }
 
-/// F-17: a gateway statement is accepted only from the pinned authority with a lifetime in
-/// `(0, 30 days]` that has not passed.
+/// F-17: a gateway statement is accepted only from the pinned authority, with a lifetime in
+/// `(0, 30 days]`, issued at most 5 minutes ahead, and not expired. Each condition is checked
+/// on its own as an implication, plus the all-good case (QA 2c D4: not a restatement).
 #[kani::proof]
 fn proof_gateway_statement_pinned_and_bounded() {
     let pinned: bool = kani::any();
@@ -1181,11 +1182,26 @@ fn proof_gateway_statement_pinned_and_bounded() {
     let now: u64 = kani::any();
     let decision = crate::capabilities::gateway_statement_decision(pinned, issued, expires, now);
     kani::cover!(decision.is_err(), "statement unpinned or unbounded");
-    let expected_ok = pinned
-        && expires > issued
-        && expires - issued <= crate::capabilities::MAX_GATEWAY_STATEMENT_LIFETIME_MS
-        && now <= expires;
-    assert_eq!(decision.is_ok(), expected_ok);
+    if !pinned {
+        assert!(decision.is_err());
+    }
+    if expires <= issued {
+        assert!(decision.is_err());
+    }
+    if expires > issued && expires - issued > crate::capabilities::MAX_GATEWAY_STATEMENT_LIFETIME_MS
+    {
+        assert!(decision.is_err());
+    }
+    if now < issued && issued - now > crate::capabilities::GATEWAY_STATEMENT_FUTURE_SKEW_MS {
+        assert!(decision.is_err());
+    }
+    if now > expires {
+        assert!(decision.is_err());
+    }
+    // A concrete good statement: pinned, one-day lifetime, issued now.
+    if pinned && issued == now && expires == now.wrapping_add(86_400_000) && now < u64::MAX / 2 {
+        assert!(decision.is_ok());
+    }
 }
 
 /// F-38-GRANT (L-41): while a shard is stored, a permitted put never changes its grant owner
