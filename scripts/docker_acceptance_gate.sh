@@ -168,8 +168,16 @@ if [ "$OUTSIDER_RC" -ne 3 ] || ! grep -q "NOT backed up" <<<"$OUTSIDER_OUT"; the
     exit 1
 fi
 OUTSIDER_ROOT="$(awk '/File Merkle Root/ {print $5}' <<<"$OUTSIDER_OUT")"
-NODE1_SHARDS="$(docker exec parvault-node-1 sh -c 'ls /var/lib/parvault/.parvault-data/shards 2>/dev/null' || true)"
-if [ -n "$OUTSIDER_ROOT" ] && grep -q "^${OUTSIDER_ROOT:0:16}" <<<"$NODE1_SHARDS"; then
+if [ "${#OUTSIDER_ROOT}" -ne 64 ]; then
+    echo "ERROR: could not read the outsider's stripe root from its store output"
+    exit 1
+fi
+# The daemon creates its shards directory at start, so it must exist.
+if ! NODE1_SHARDS="$(docker exec parvault-node-1 ls /var/lib/parvault/.parvault-data/shards)"; then
+    echo "ERROR: node-1 has no shards directory to check"
+    exit 1
+fi
+if grep -q "^${OUTSIDER_ROOT:0:16}" <<<"$NODE1_SHARDS"; then
     echo "ERROR: a non-member stored data on a ring node"
     exit 1
 fi

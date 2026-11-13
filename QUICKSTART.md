@@ -157,6 +157,8 @@ parvault watch-folder \
   --once
 # If no ring peer takes the data, this prints "N stripe(s) kept only on this machine: NOT backed up"
 # and exits with code 3: nothing left this machine. Pass --allow-local-only to accept that.
+# "Backed up" means at least k shards are off this machine; with a lite seed they may all be on
+# the seed itself (one other machine).
 
 # Restore a single file or the whole directory tree (keep PARVAULT_SEED_PHRASE set and pass the
 # same namespace if you backed up with a phrase; without one, omit --vault-namespace)
