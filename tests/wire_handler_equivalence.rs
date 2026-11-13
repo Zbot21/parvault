@@ -290,6 +290,7 @@ impl Fx {
                 Some(&peer.addr),
                 req,
                 DaemonWireHandlerCtx {
+                    syndication_load: Default::default(),
                     cfg: &self.cfg,
                     node_identity: &self.node,
                     genesis_pubkey: Some(self.genesis),
@@ -314,6 +315,7 @@ impl Fx {
                     Some(&peer.addr),
                     req,
                     SeedWireHandlerCtx {
+                        syndication_load: Default::default(),
                         data_dir: &self.dir,
                         node_identity: &self.node,
                         advertised_admin_pk: advertised,

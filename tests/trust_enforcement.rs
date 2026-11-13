@@ -4835,3 +4835,256 @@ fn adr12_cert_with_bad_ml_dsa_half_refused() {
     assert_logged(&node, "reject.hybrid_sig_ml_dsa_invalid");
     gate_ran("trust_enforcement::adr12_cert_with_bad_ml_dsa_half_refused");
 }
+
+// --- B-SEED-SYND (L-46): the seed's syndication fan-out never blocks other requests ------------
+
+/// A TCP listener that accepts connections and never answers (a silent mesh peer). Returns its
+/// multiaddr and the number of connections it accepted.
+fn bseed_silent_peer() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = format!("/ip4/127.0.0.1/tcp/{}", l.local_addr().unwrap().port());
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = std::sync::Arc::clone(&count);
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for s in l.incoming().flatten() {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            held.push(s);
+        }
+    });
+    (addr, count)
+}
+
+/// `parvault-seed` (homelab vault) with `--peers` and an admin RPC for `admin`.
+fn bseed_seed(label: &str, peers: &[&str], admin: &NodeIdentity) -> (Node, String) {
+    let (root, dir, reg, log) = prepare(label);
+    let admin_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let admin_addr = format!("127.0.0.1:{admin_port}");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault-seed"));
+    cmd.arg("--peers").arg(peers.join(","));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .args([
+            "start",
+            "--mode",
+            "homelab-vault",
+            "--no-lan-discovery",
+            "--listen",
+            common::LOOPBACK_EPHEMERAL,
+            "--admin-rpc-listen",
+            &admin_addr,
+            "--admin-rpc-pubkey",
+            &hex::encode(admin.public_key_bytes()),
+            "--data-dir",
+        ])
+        .arg(&dir);
+    (spawn(cmd, root, dir, log), admin_addr)
+}
+
+/// A syndication of a distinct stripe (filled with `fill`) by `device`, certified by the seed.
+fn bseed_synd(seed: &Node, device: &NodeIdentity, fill: u8) -> (MeshWireRequest, [u8; 32]) {
+    let cert = PersonalDeviceCert::issue(
+        &seed.owner_pq(),
+        &device.device_peer_id(),
+        "laptop",
+        1_700_000_000,
+    )
+    .unwrap();
+    let ct = vec![fill; 32 * 1024];
+    let set = encode_ciphertext_stripe(0, &ct, ErasureTier::Homelab).unwrap();
+    let root = set.stripe_merkle_root;
+    let req = MeshWireRequest::SyndicateLiteStripe {
+        cert,
+        bundle: LiteStripeSyndicationBundle {
+            stripe_index: 0,
+            tier: ErasureTier::Homelab,
+            ciphertext_bytes: ct,
+            expected_stripe_merkle_root: root,
+            expected_shard_hashes: set.shard_hashes.clone(),
+        },
+        repair_grant: None,
+    };
+    (req, root)
+}
+
+/// Runs a syndication on a thread with a 40 s client timeout; returns (response, elapsed).
+fn bseed_spawn_synd(
+    seed: &Node,
+    device: NodeIdentity,
+    req: MeshWireRequest,
+) -> std::thread::JoinHandle<(Result<MeshWireResponse, String>, Duration)> {
+    let addr = seed.addr.clone();
+    std::thread::spawn(move || {
+        let t0 = Instant::now();
+        let r = client(&device)
+            .with_timeout(Duration::from_secs(40))
+            .send_request(&addr, req)
+            .map_err(|e| e.to_string());
+        (r, t0.elapsed())
+    })
+}
+
+fn bseed_shard_on_seed(seed: &Node, root: [u8; 32]) -> bool {
+    std::fs::read_dir(seed.dir.join("shards"))
+        .map(|rd| {
+            let prefix = hex::encode(&root[..8]);
+            rd.flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        })
+        .unwrap_or(false)
+}
+
+/// B-SEED-SYND (L-46): with every mesh peer silent, a syndication is in flight while another
+/// peer's request is answered within 1 s and an admin RPC returns; the syndication answers within
+/// its 20 s deadline with a receipt naming no mesh peer.
+#[test]
+fn bseed_silent_peers_do_not_block_other_requests() {
+    let silent: Vec<_> = (0..3).map(|_| bseed_silent_peer()).collect();
+    let addrs: Vec<&str> = silent.iter().map(|(a, _)| a.as_str()).collect();
+    let admin = key(0xB1);
+    let (seed, admin_addr) = bseed_seed("bseed-block", &addrs, &admin);
+    let device = key(0xB2);
+    let (req, _) = bseed_synd(&seed, &device, 0x41);
+    let job = bseed_spawn_synd(&seed, device, req);
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let t0 = Instant::now();
+    let status = send(&key(0xB3), &seed, MeshWireRequest::QueryNodeStatus);
+    assert!(
+        t0.elapsed() < Duration::from_secs(1),
+        "status took {:?}: {status:?}",
+        t0.elapsed()
+    );
+    let t1 = Instant::now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let admin_resp = rt.block_on(parvault::admin_rpc::send_admin_rpc_with_identity(
+        &admin_addr,
+        None,
+        &admin,
+        &parvault::admin_rpc::SeedAdminRequest::GetSeedTelemetry,
+    ));
+    assert!(admin_resp.is_ok(), "{:?}", admin_resp.err());
+    assert!(
+        t1.elapsed() < Duration::from_secs(2),
+        "admin RPC took {:?}",
+        t1.elapsed()
+    );
+
+    let (resp, elapsed) = job.join().unwrap();
+    assert!(
+        elapsed < Duration::from_secs(22),
+        "syndication took {elapsed:?}"
+    );
+    match resp.unwrap() {
+        MeshWireResponse::SyndicateLiteStripeAck {
+            receipt: Some(r),
+            syndicated_peers,
+            ..
+        } => {
+            assert_eq!(r.mesh_peers_populated, 0);
+            assert!(
+                syndicated_peers.iter().all(|p| !p.contains("/ip4/")),
+                "{syndicated_peers:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    gate_ran("trust_enforcement::bseed_silent_peers_do_not_block_other_requests");
+}
+
+/// B-SEED-SYND accept: while one sender's syndication runs, a second sender's is accepted.
+#[test]
+fn bseed_second_sender_accepted_while_one_job_runs() {
+    let (silent, _) = bseed_silent_peer();
+    let admin = key(0xB4);
+    let (seed, _) = bseed_seed("bseed-two", &[&silent], &admin);
+    let (a, b) = (key(0xB5), key(0xB6));
+    let (ra, _) = bseed_synd(&seed, &a, 0x42);
+    let ja = bseed_spawn_synd(&seed, a, ra);
+    std::thread::sleep(Duration::from_millis(800));
+    let (rb, root_b) = bseed_synd(&seed, &b, 0x43);
+    let jb = bseed_spawn_synd(&seed, b, rb);
+    let (resp_b, _) = jb.join().unwrap();
+    assert!(
+        matches!(
+            resp_b,
+            Ok(MeshWireResponse::SyndicateLiteStripeAck {
+                receipt: Some(_),
+                ..
+            })
+        ),
+        "{resp_b:?}"
+    );
+    assert!(bseed_shard_on_seed(&seed, root_b));
+    let _ = ja.join();
+    gate_ran("trust_enforcement::bseed_second_sender_accepted_while_one_job_runs");
+}
+
+/// B-SEED-SYND reject: with two jobs in flight (the seed's budget), a third sender is refused at
+/// once with `reject.syndication_busy`, and nothing of its stripe is written.
+#[test]
+fn bseed_third_job_refused_busy() {
+    let (silent, _) = bseed_silent_peer();
+    let admin = key(0xB7);
+    let (seed, _) = bseed_seed("bseed-busy", &[&silent], &admin);
+    let (a, b, c) = (key(0xB8), key(0xB9), key(0xBA));
+    let (ra, _) = bseed_synd(&seed, &a, 0x44);
+    let ja = bseed_spawn_synd(&seed, a, ra);
+    let (rb, _) = bseed_synd(&seed, &b, 0x45);
+    let jb = bseed_spawn_synd(&seed, b, rb);
+    std::thread::sleep(Duration::from_millis(1500));
+    let (rc, root_c) = bseed_synd(&seed, &c, 0x46);
+    let t0 = Instant::now();
+    let resp_c = send_with(client(&c).with_timeout(Duration::from_secs(40)), &seed, rc);
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "busy refusal took {:?}",
+        t0.elapsed()
+    );
+    assert!(
+        matches!(
+            resp_c,
+            MeshWireResponse::SyndicateLiteStripeAck { receipt: None, .. }
+        ),
+        "{resp_c:?}"
+    );
+    assert_logged(&seed, "reject.syndication_busy");
+    assert!(
+        !bseed_shard_on_seed(&seed, root_c),
+        "a refused stripe was written"
+    );
+    let _ = (ja.join(), jb.join());
+    gate_ran("trust_enforcement::bseed_third_job_refused_busy");
+}
+
+/// B-SEED-SYND: one silent peer among healthy ones receives exactly one put per job (the job's
+/// dead set), and the healthy peers get the shards.
+#[test]
+fn bseed_silent_peer_gets_one_put_per_job() {
+    let (silent, count) = bseed_silent_peer();
+    let d1 = spawn_daemon("bseed-h1");
+    let d2 = spawn_daemon("bseed-h2");
+    let admin = key(0xBB);
+    let (seed, _) = bseed_seed("bseed-dead", &[&d1.addr, &silent, &d2.addr], &admin);
+    let device = key(0xBC);
+    let (req, _) = bseed_synd(&seed, &device, 0x47);
+    let (resp, elapsed) = bseed_spawn_synd(&seed, device, req).join().unwrap();
+    match resp.unwrap() {
+        MeshWireResponse::SyndicateLiteStripeAck {
+            receipt: Some(r), ..
+        } => assert!(r.mesh_peers_populated > 0, "{r:?}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(elapsed < Duration::from_secs(22), "{elapsed:?}");
+    // One `put_shard` dials twice: the admission handshake (`ensure_admitted`) and the put.
+    // Without the per-job dead set the silent peer got about 20 puts (8 connections measured
+    // with 4 parallel workers racing it).
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the silent peer received more than one put in one job"
+    );
+}

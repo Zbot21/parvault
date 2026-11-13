@@ -302,12 +302,13 @@ pub(crate) async fn run_daemon(
                 server_events.send_deferred(&mut swarm, done);
             }
             event = swarm.select_next_some() => {
-                let unhandled = server_events.handle(&mut swarm, event, |peer_str, remote_addr, request| {
+                let unhandled = server_events.handle(&mut swarm, event, |peer_str, remote_addr, request, syndication_load| {
                     handle_daemon_wire_request(
                         peer_str,
                         remote_addr,
                         request,
                             DaemonWireHandlerCtx {
+                                    syndication_load,
                                 cfg: &cfg,
                                 node_identity: &node_identity,
                                 genesis_pubkey,
