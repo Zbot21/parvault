@@ -183,8 +183,11 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
             if is_network_peer_addr(&seed_str) {
                 // Stored locally first; counted after syndication below.
                 let mut snap = engine.sync_folder_once(&folder)?;
+                // The seed checks that the device cert names the sender (F-25), and the cert is
+                // issued for the Device Peer ID that `parvault identity` prints: send as this
+                // node. The repair grant below is still signed by the vault owner.
                 let net_client = MeshClient::new(
-                    owner_identity.clone(),
+                    NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?,
                     mesh_client.all_network_endpoints(),
                     Some(seed_str.clone()),
                 )

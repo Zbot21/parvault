@@ -293,7 +293,9 @@ docker exec parvault-client sh -cex '
     sha256sum /workspace/lite_source/laptop_note.txt > /tmp/expected_lite.sha256
 '
 SEED_PUBKEY_HEX="$(docker exec parvault-seed-0 /usr/local/bin/parvault-seed identity --data-dir /var/lib/parvault-seed | awk '/Owner PQ Public Key Hex/ {print $7}')"
-DEVICE_CERT_TOKEN="$(docker exec parvault-seed-0 /usr/local/bin/parvault-seed issue-device-cert --data-dir /var/lib/parvault-seed --device-peer-id parvault-peer-lite-laptop --device-label laptop | awk '/Shareable Token/ {print $4}')"
+# The cert must name the client's own Device Peer ID (F-25): read it from `parvault identity`.
+LITE_DEVICE_ID="$(docker exec -w /tmp/lite-client-state parvault-client /usr/local/bin/parvault identity 2>/dev/null | awk '/Device Peer ID/ {print $5}')"
+DEVICE_CERT_TOKEN="$(docker exec parvault-seed-0 /usr/local/bin/parvault-seed issue-device-cert --data-dir /var/lib/parvault-seed --device-peer-id "$LITE_DEVICE_ID" --device-label laptop | awk '/Shareable Token/ {print $4}')"
 
 docker exec -w /tmp/lite-client-state parvault-client /usr/local/bin/parvault \
     --peers "$PEERS_CSV" \
