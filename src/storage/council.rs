@@ -22,6 +22,10 @@ pub const MAX_COUNCIL_MEMBERS: usize = 64;
 pub const MAX_COUNCIL_MANIFEST_BYTES: usize = 64 * 1024;
 /// File holding the installed manifest.
 pub const COUNCIL_MANIFEST_FILE: &str = "council_manifest.bin";
+/// File holding every installed epoch of this scope, oldest first (served to peers behind).
+pub const COUNCIL_HISTORY_FILE: &str = "council_history.bin";
+/// Most epochs kept in the history (the oldest are dropped).
+pub const MAX_COUNCIL_HISTORY: usize = 256;
 
 /// One signature over [`CouncilManifest::canonical_sign_bytes`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,8 +229,84 @@ pub fn install_council_manifest(
         return Err(code.to_string());
     }
     std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
+    let mut history = load_council_history(data_dir);
+    if current.is_none() {
+        history.clear();
+    }
+    history.push(manifest.clone());
+    let excess = history.len().saturating_sub(MAX_COUNCIL_HISTORY);
+    history.drain(..excess);
+    let history_bytes = bincode::serialize(&history).map_err(|e| e.to_string())?;
+    BlockStore::atomic_write_file(&data_dir.join(COUNCIL_HISTORY_FILE), &history_bytes)
+        .map_err(|e: StorageError| e.to_string())?;
     BlockStore::atomic_write_file(&manifest_path(data_dir), &manifest.to_bytes())
         .map_err(|e: StorageError| e.to_string())
+}
+
+fn load_council_history(data_dir: &Path) -> Vec<CouncilManifest> {
+    use bincode::Options;
+    let limit = (MAX_COUNCIL_HISTORY * MAX_COUNCIL_MANIFEST_BYTES) as u64;
+    std::fs::read(data_dir.join(COUNCIL_HISTORY_FILE))
+        .ok()
+        .and_then(|b| {
+            bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .allow_trailing_bytes()
+                .with_limit(limit)
+                .deserialize::<Vec<CouncilManifest>>(&b)
+                .ok()
+        })
+        .unwrap_or_default()
+}
+
+/// The manifests of `scope_root` after `from_epoch`, oldest first, as served to a peer behind:
+/// the installed history plus the installed manifest, cut to the oldest that fit in
+/// [`MAX_COUNCIL_MANIFEST_BYTES`] (the peer installs them and asks again from its new epoch).
+pub fn council_chain_after(
+    data_dir: &Path,
+    scope_root: [u8; 32],
+    from_epoch: u64,
+) -> Vec<CouncilManifest> {
+    let Some(latest) = council_from_manifest(data_dir, Some(scope_root)) else {
+        return Vec::new();
+    };
+    let mut chain: Vec<CouncilManifest> = load_council_history(data_dir)
+        .into_iter()
+        .filter(|m| m.scope_root == scope_root && m.epoch > from_epoch && m.epoch < latest.epoch)
+        .collect();
+    if latest.epoch > from_epoch {
+        chain.push(latest);
+    }
+    chain.sort_by_key(|m| m.epoch);
+    chain.dedup_by_key(|m| m.epoch);
+    let mut used = 0usize;
+    let mut out = Vec::new();
+    for m in chain {
+        // Vec length prefix plus each manifest's encoding.
+        used += m.to_bytes().len();
+        if used + 8 > MAX_COUNCIL_MANIFEST_BYTES {
+            break;
+        }
+        out.push(m);
+    }
+    out
+}
+
+/// Installs `chain` (oldest first) one manifest at a time through
+/// [`council_manifest_decision`], stopping at the first one refused. Returns how many installed.
+pub fn install_council_chain(
+    data_dir: &Path,
+    chain: &[CouncilManifest],
+    expected_root: [u8; 32],
+) -> usize {
+    let mut installed = 0;
+    for m in chain {
+        if install_council_manifest(data_dir, m, expected_root).is_err() {
+            break;
+        }
+        installed += 1;
+    }
+    installed
 }
 
 /// The single council resolver: the installed manifest, if its scope root is `scope_root` (see
@@ -336,6 +416,79 @@ mod tests {
             council_manifest_decision(&m1.facts(id(9).public_key_bytes(), None)),
             Err("reject.council_epoch_chain")
         );
+    }
+
+    /// A node at epoch 1 fetches a 1 -> 2 -> 3 chain from a peer and ends at 3; a forged epoch 2
+    /// in the chain installs nothing.
+    #[test]
+    fn chain_fetch_steps_forward_and_stops_at_a_forgery() {
+        let (root, m1) = genesis_signed(&[2, 3, 4], 2);
+        let rk = root.public_key_bytes();
+        let next = |prev_epoch: u64, signers: &[u8]| {
+            let mut m = CouncilManifest::new(
+                rk,
+                prev_epoch + 1,
+                [2u8, 3, 4]
+                    .iter()
+                    .map(|b| id(*b).public_key_bytes())
+                    .collect(),
+                2,
+                prev_epoch * 1_000,
+            );
+            for b in signers {
+                m.sign(&id(*b));
+            }
+            m
+        };
+        let m2 = next(1, &[2, 3]);
+        let m3 = next(2, &[3, 4]);
+        let peer = tempfile::tempdir().unwrap();
+        for m in [&m1, &m2, &m3] {
+            install_council_manifest(peer.path(), m, rk).unwrap();
+        }
+        let behind = tempfile::tempdir().unwrap();
+        install_council_manifest(behind.path(), &m1, rk).unwrap();
+        let chain = council_chain_after(peer.path(), rk, 1);
+        assert_eq!(
+            chain.iter().map(|m| m.epoch).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(install_council_chain(behind.path(), &chain, rk), 2);
+        assert_eq!(load_council_manifest(behind.path()).unwrap().epoch, 3);
+        assert!(council_chain_after(peer.path(), rk, 3).is_empty());
+
+        let forged = next(1, &[8, 9]);
+        let behind = tempfile::tempdir().unwrap();
+        install_council_manifest(behind.path(), &m1, rk).unwrap();
+        assert_eq!(install_council_chain(behind.path(), &[forged, m3], rk), 0);
+        assert_eq!(load_council_manifest(behind.path()).unwrap().epoch, 1);
+    }
+
+    /// Scope root by mode (ADR-26 table): private = genesis even with pins; public = first pinned
+    /// tracker admin (disk pins, then the caller's pins), never the genesis (hybrid nodes).
+    #[test]
+    fn scope_root_follows_the_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let genesis = Some([1u8; 32]);
+        assert_eq!(
+            council_scope_root(dir.path(), genesis, false, &[[2; 32]]),
+            genesis
+        );
+        assert_eq!(
+            council_scope_root(dir.path(), genesis, true, &[[2; 32]]),
+            Some([2; 32])
+        );
+        assert_eq!(council_scope_root(dir.path(), genesis, true, &[]), None);
+        std::fs::write(
+            dir.path().join("pinned_tracker_admins.json"),
+            format!("[\"{}\"]", hex::encode([3u8; 32])),
+        )
+        .unwrap();
+        assert_eq!(
+            council_scope_root(dir.path(), genesis, true, &[[2; 32]]),
+            Some([3; 32])
+        );
+        assert_eq!(council_scope_root(dir.path(), None, false, &[]), None);
     }
 
     #[test]

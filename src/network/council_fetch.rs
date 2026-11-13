@@ -9,7 +9,9 @@
 //! [`council_manifest_decision`]: crate::storage::council::council_manifest_decision
 
 use crate::network::{MeshClient, MeshWireRequest, MeshWireResponse};
-use crate::storage::council::{install_council_manifest, MAX_COUNCIL_MANIFEST_BYTES};
+use crate::storage::council::{
+    install_council_chain, load_council_manifest, MAX_COUNCIL_MANIFEST_BYTES,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -19,6 +21,8 @@ use std::time::{Duration, Instant};
 pub const COUNCIL_FETCH_PEER_INTERVAL: Duration = Duration::from_secs(60);
 /// Timeout of one `GetCouncilManifest` request.
 pub const COUNCIL_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Most requests to one peer in one fetch (each returns up to 64 KiB of the chain).
+pub const COUNCIL_FETCH_MAX_ROUNDS: usize = 16;
 /// Most peers asked by one fetch.
 pub const COUNCIL_FETCH_MAX_PEERS: usize = 8;
 
@@ -76,17 +80,31 @@ pub fn spawn_council_fetch(
         .name("council-fetch".into())
         .spawn(move || {
             for peer in &peers {
-                let resp = client.send_request(peer, MeshWireRequest::GetCouncilManifest { scope_root });
-                let Ok(MeshWireResponse::CouncilManifestResult { manifest: Some(m) }) = resp else {
-                    continue;
-                };
-                if m.to_bytes().len() > MAX_COUNCIL_MANIFEST_BYTES {
-                    tracing::warn!(code = "reject.council_manifest_oversized", peer = %peer, "ignored a council manifest");
-                    continue;
-                }
-                if install_council_manifest(&data_dir, &m, scope_root).is_ok() {
-                    tracing::info!(epoch = m.epoch, peer = %peer, "installed a newer council manifest");
-                    break;
+                // Step forward: each answer is the oldest manifests that fit; ask again from the
+                // new epoch until the peer has nothing newer or a manifest is refused.
+                for _ in 0..COUNCIL_FETCH_MAX_ROUNDS {
+                    let from_epoch = load_council_manifest(&data_dir).map_or(0, |m| m.epoch);
+                    let resp = client.send_request(
+                        peer,
+                        MeshWireRequest::GetCouncilManifest {
+                            scope_root,
+                            from_epoch,
+                        },
+                    );
+                    let Ok(MeshWireResponse::CouncilManifestResult { manifests }) = resp else {
+                        break;
+                    };
+                    let size: usize = manifests.iter().map(|m| m.to_bytes().len()).sum();
+                    if manifests.is_empty() || size > MAX_COUNCIL_MANIFEST_BYTES {
+                        break;
+                    }
+                    let n = install_council_chain(&data_dir, &manifests, scope_root);
+                    if n > 0 {
+                        tracing::info!(installed = n, peer = %peer, "installed newer council manifests");
+                    }
+                    if n < manifests.len() {
+                        break;
+                    }
                 }
             }
             limiter()

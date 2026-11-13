@@ -3043,13 +3043,13 @@ fn council_pair(label: &str, forged: bool) -> (Node, Node, Vec<NodeIdentity>) {
     let r = send(
         &ahead.identity(),
         &behind,
-        MeshWireRequest::GetCouncilManifest { scope_root: root },
+        MeshWireRequest::GetCouncilManifest {
+            scope_root: root,
+            from_epoch: 0,
+        },
     );
     assert!(
-        matches!(
-            r,
-            MeshWireResponse::CouncilManifestResult { manifest: Some(_) }
-        ),
+        matches!(&r, MeshWireResponse::CouncilManifestResult { manifests } if !manifests.is_empty()),
         "{r:?}"
     );
     (behind, ahead, members)
@@ -3763,4 +3763,28 @@ fn f35_expired_voucher_refused() {
     assert!(format!("{resp:?}").contains("stored: false"), "{resp:?}");
     assert_logged(&node, "reject.voucher_expired");
     gate_ran("trust_enforcement::f35_expired_voucher_refused");
+}
+
+/// `evict --propagate` refuses when this node is not a member of its installed council (it has
+/// none here); the local eviction still applies.
+#[test]
+fn evict_propagate_needs_council_membership() {
+    let root = temp_root("evict-prop");
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+        .env("PARVAULT_LAN_REGISTRY_DIR", root.path().join("reg"))
+        .arg("--data-dir")
+        .arg(root.path().join("data"))
+        .args([
+            "--no-lan-discovery",
+            "evict",
+            "--ip",
+            "192.0.2.77",
+            "--propagate",
+        ])
+        .output()
+        .expect("run parvault evict");
+    let text = combined(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("member of the installed council"), "{text}");
 }

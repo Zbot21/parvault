@@ -615,9 +615,9 @@ pub fn reject_response(request: &MeshWireRequest, reason: String) -> MeshWireRes
             verifier_pubkey: [0u8; 32],
             required_pow_bits: 0,
         },
-        MeshWireRequest::GetCouncilManifest { .. } => {
-            MeshWireResponse::CouncilManifestResult { manifest: None }
-        }
+        MeshWireRequest::GetCouncilManifest { .. } => MeshWireResponse::CouncilManifestResult {
+            manifests: Vec::new(),
+        },
         MeshWireRequest::PutShard { .. } => MeshWireResponse::PutShardAck {
             stored: false,
             error: Some(reason),
@@ -1745,14 +1745,14 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                 },
             }
         }
-        MeshWireRequest::GetCouncilManifest { scope_root } => {
-            MeshWireResponse::CouncilManifestResult {
-                manifest: crate::storage::council::council_from_manifest(
-                    data_dir,
-                    Some(scope_root),
-                ),
-            }
-        }
+        MeshWireRequest::GetCouncilManifest {
+            scope_root,
+            from_epoch,
+        } => MeshWireResponse::CouncilManifestResult {
+            manifests: crate::storage::council::council_chain_after(
+                data_dir, scope_root, from_epoch,
+            ),
+        },
         MeshWireRequest::BroadcastEvictionOrder(order) => {
             // One resolver for both roles (F-08): the installed, signed council manifest.
             let council = crate::storage::council::council_from_manifest(data_dir, council_root);
@@ -2043,6 +2043,7 @@ mod tests {
             (
                 MeshWireRequest::GetCouncilManifest {
                     scope_root: [3; 32],
+                    from_epoch: 0,
                 },
                 "CouncilManifestResult",
                 false,

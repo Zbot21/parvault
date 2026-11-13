@@ -2220,9 +2220,10 @@ fn broadcast_eviction_order() {
     let genesis_root = t.keys.genesis.public_key_bytes();
     let ask = MeshWireRequest::GetCouncilManifest {
         scope_root: genesis_root,
+        from_epoch: 0,
     };
     let o = t.run(&peer, &ask);
-    assert!(o.iter().all(|x| !x.resp.contains("Some(")), "{o:?}");
+    assert!(o.iter().all(|x| x.resp.contains("manifests: []")), "{o:?}");
     t.admit(&peer);
     let o = t.run(&peer, &ask);
     assert!(o.iter().all(|x| x.resp.contains("epoch: 1")), "{o:?}");
