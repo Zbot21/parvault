@@ -1381,8 +1381,8 @@ fn f33_layered(
         shard_bytes: b.bytes.clone(),
         capability: b.cap,
         // F-24: the target honours only issuers it knows. It knows the relay (admitted at
-        // the last hop), not the originator, so the relay issues the voucher here; who issues
-        // onion vouchers in production is open (no shipped command originates onions).
+        // the last hop), not the originator, so the relay issues the voucher here. A voucher
+        // the originator issued would name it to the target (L-39; unlinkable vouchers: v0.6.0).
         voucher: AnonymousQuotaVoucher::mint(
             &NodeIdentity::load_or_generate_in_dir(&relay.dir).unwrap(),
             8192,
