@@ -4692,3 +4692,74 @@ fn adr08_oversized_frame_refused() {
     assert_logged(&node, "reject.wire_frame_oversized");
     gate_ran("trust_enforcement::adr08_oversized_frame_refused");
 }
+
+// --- ADR-22: signed LAN beacons --------------------------------------------------------------------
+
+/// Writes a beacon signed by `signer` into `reg` (`forge` flips a signature bit) and returns its
+/// peer id.
+fn plant_beacon(reg: &Path, signer: &NodeIdentity, forge: bool) -> String {
+    let mut pkt = parvault::network::LanBeaconPacket::sign_new(
+        signer,
+        "test-node",
+        "daemon",
+        4555,
+        1 << 30,
+        now_ms(),
+        parvault::network::discovery::LanBeaconOptions {
+            explicit_listen_ip: Some("127.0.0.1"),
+            owner_pq_fingerprint: None,
+            pairing_sas_commitment: None,
+        },
+    )
+    .unwrap();
+    if forge {
+        pkt.sig_r[0] ^= 1;
+    }
+    std::fs::create_dir_all(reg).unwrap();
+    let id = pkt.libp2p_peer_id.clone();
+    std::fs::write(
+        reg.join(format!("{id}.beacon")),
+        pkt.to_wire_bytes().unwrap(),
+    )
+    .unwrap();
+    id
+}
+
+/// Runs `parvault discover` reading `reg`; returns its combined output.
+fn discover_with_registry(reg: &Path, data: &Path) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env("PARVAULT_LAN_REGISTRY_DIR", reg)
+        .env("RUST_LOG", "info")
+        .env("NO_COLOR", "1")
+        .arg("--data-dir")
+        .arg(data)
+        .args(["discover", "--timeout-ms", "300", "--port", "0"])
+        .output()
+        .expect("run parvault discover");
+    combined(&out)
+}
+
+/// ADR-22 accept: a beacon signed by its own key is discovered.
+#[test]
+fn adr22_signed_beacon_discovered() {
+    let root = temp_root("adr22-a");
+    let reg = root.path().join("reg");
+    let id = plant_beacon(&reg, &key(0xD1), false);
+    let text = discover_with_registry(&reg, &root.path().join("data"));
+    let listed = text.split("DISCOVERED PARVAULT PEERS").nth(1).unwrap_or("");
+    assert!(listed.contains(&id), "{text}");
+    gate_ran("trust_enforcement::adr22_signed_beacon_discovered");
+}
+
+/// ADR-22 reject: a beacon with a forged signature is ignored with a reason code.
+#[test]
+fn adr22_forged_beacon_ignored() {
+    let root = temp_root("adr22-r");
+    let reg = root.path().join("reg");
+    let id = plant_beacon(&reg, &key(0xD2), true);
+    let text = discover_with_registry(&reg, &root.path().join("data"));
+    let listed = text.split("DISCOVERED PARVAULT PEERS").nth(1).unwrap_or("");
+    assert!(!listed.contains(&id), "{text}");
+    assert!(text.contains("reject.beacon_sig_invalid"), "{text}");
+    gate_ran("trust_enforcement::adr22_forged_beacon_ignored");
+}

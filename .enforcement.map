@@ -114,6 +114,8 @@ kani       F-41-REBIND sym=src/storage/anonymity.rs::blinded_rebind_decision har
 
 claim      ADR-08    sym=src/network/behaviour.rs::wire_frame_decision accept=trust_enforcement::adr08_frame_within_limit_answered reject=trust_enforcement::adr08_oversized_frame_refused code=reject.wire_frame_oversized bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-08-noise-xx-transport-and-bounded-wire-framing.md
 
+claim      ADR-22    sym=src/network/discovery.rs::beacon_decision accept=trust_enforcement::adr22_signed_beacon_discovered reject=trust_enforcement::adr22_forged_beacon_ignored code=reject.beacon_sig_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-22-zero-ip-lan-discovery-and-sas-pairing.md
+
 # --- D-ADR (architect ruling on 2c-dadr-classification.md): ADRs with no runtime claim ---
 noenforce  N-01      adr=docs/adr/ADR-01-streaming-stripes-and-encrypt-before-shard.md reason=client pipeline order; no peer can violate it; unit and Kani in sharding and crypto::aes
 noenforce  N-06      adr=docs/adr/ADR-06-hybrid-locality-and-70-30-placement.md reason=client-side placement policy (performance); no peer-facing promise
