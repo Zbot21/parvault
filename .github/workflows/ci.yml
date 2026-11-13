@@ -222,7 +222,10 @@ jobs:
         run: |
           base_branch="${GITHUB_BASE_REF:-main}"
           git fetch --no-tags origin "$base_branch"
-          base="$(git merge-base HEAD "origin/$base_branch")"
+          if ! base="$(git merge-base HEAD "origin/$base_branch")" || [ -z "$base" ]; then
+            echo "::error::no merge base between HEAD and origin/$base_branch (needs fetch-depth: 0); cannot check that skips never increase" >&2
+            exit 1
+          fi
           bash scripts/doc_commands.sh check --base "$base"
       - name: Runner positive controls (stdin closed, failures fail, dead daemons are not ready)
         run: bash scripts/doc_commands.sh selftest

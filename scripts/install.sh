@@ -26,17 +26,33 @@ case "$ARCH" in
 esac
 
 # HTTPS only. PARVAULT_BASE_URL (scripts/test_install.sh serves local assets) may use plain
-# http only to 127.0.0.1 or localhost.
+# http only to the exact hosts 127.0.0.1, localhost or [::1], with an optional numeric port and
+# no userinfo; the scheme is case-insensitive.
 PROTO="=https"
+refuse_base_url() {
+  echo "PARVAULT_BASE_URL '$PARVAULT_BASE_URL': plain http only to 127.0.0.1, localhost or [::1] (optional port, no user@); use https for anything else" >&2
+  exit 1
+}
 if [ -n "${PARVAULT_BASE_URL:-}" ]; then
   BASE_URL="$PARVAULT_BASE_URL"
-  case "$BASE_URL" in
+  url_lc=$(printf '%s' "$BASE_URL" | tr 'A-Z' 'a-z')
+  case "$url_lc" in
     https://*) ;;
-    http://127.0.0.1/*|http://127.0.0.1:*|http://localhost/*|http://localhost:*) PROTO="=http" ;;
-    *)
-      echo "PARVAULT_BASE_URL: plain http only to 127.0.0.1 or localhost; use https for anything else" >&2
-      exit 1
+    http://*)
+      rest=${url_lc#http://}
+      authority=${rest%%/*}
+      case "$authority" in *@*) refuse_base_url ;; esac
+      case "$authority" in
+        127.0.0.1|localhost|"[::1]") ;;
+        127.0.0.1:*|localhost:*|"[::1]":*)
+          port=${authority##*:}
+          case "$port" in ''|*[!0-9]*) refuse_base_url ;; esac
+          ;;
+        *) refuse_base_url ;;
+      esac
+      PROTO="=http"
       ;;
+    *) refuse_base_url ;;
   esac
 elif [ "$VERSION" = "latest" ]; then
   BASE_URL="https://github.com/${REPO}/releases/latest/download"

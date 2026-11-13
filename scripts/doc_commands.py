@@ -181,6 +181,9 @@ def check(root, bl, fence_problems, base=None):
     if skips != ratchet:
         problems.append(f"{skips} skipped block(s) but {RATCHET} says {ratchet}; update it in the same commit")
     if base:
+        if subprocess.run(["git", "-C", root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"],
+                          capture_output=True).returncode != 0:
+            problems.append(f"--base {base} is not a commit here (shallow clone? CI needs fetch-depth: 0)")
         before = base_ratchet(root, base)
         if before is not None and ratchet > before:
             problems.append(f"the skip ratchet grew from {before} (at {base}) to {ratchet}: skips may only decrease")
