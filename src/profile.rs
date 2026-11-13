@@ -120,7 +120,7 @@ impl HardwareProfile {
     /// Minimum free OS filesystem space reserved as a safety guard against disk exhaustion.
     pub const fn min_free_disk_bytes(self) -> u64 {
         match self {
-            Self::Desktop => crate::storage::quota::DEFAULT_MIN_FREE_DISK_BYTES,
+            Self::Desktop => DEFAULT_MIN_FREE_DISK_BYTES,
             Self::HomelabNas => 1024 * 1024 * 1024, // 1 GiB
             Self::RouterSoc => 64 * 1024 * 1024,    // 64 MiB for small USB/eMMC partitions
         }
@@ -222,3 +222,7 @@ impl ErasureTier {
 /// Gateway IPC stripe size: the 1 MiB router-SoC profile (moved from `gateway::engine`; the
 /// client side of `gateway::shm` needs it without the engine).
 pub const GATEWAY_STRIPE_BYTES: usize = ROUTER_SOC_STRIPE_SIZE_BYTES;
+
+/// Default minimum free OS filesystem space (5 GiB) reserved as a safety guard against disk
+/// exhaustion (moved from `storage::quota`, which re-exports it).
+pub const DEFAULT_MIN_FREE_DISK_BYTES: u64 = 5 * 1024 * 1024 * 1024;

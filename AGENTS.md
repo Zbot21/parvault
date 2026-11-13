@@ -20,7 +20,7 @@ This document is the authoritative architectural, security, and verification man
 4. **Canonical Lazy-Streaming VFS Reference Plugin (`parvault-fuse` — `src/bin/parvault-fuse.rs`, `#![forbid(unsafe_code)]`):**
    Standalone out-of-process reference plugin (`--features vfs`, zero C `libfuse3`, zero `unsafe`) speaking [`docs/GATEWAY_SOCKET_PROTOCOL.md`](docs/GATEWAY_SOCKET_PROTOCOL.md) over `/var/run/parvault.sock` (`mount-fd` Linux `/dev/fuse` `ABI 7.31`, unprivileged HTTP `206` / WebDAV `PROPFIND`, and sealed-`memfd` folder `sync` with `--macaroon <PARVAULT-MAC-V1:...>` and bounded `LruBlockCache` `< 50 ms` TTFB).
 5. **Zero-Key Incremental Folder Sync Sibling Plugin (`parvault-sync` — `src/bin/parvault-sync.rs`, `#![forbid(unsafe_code)]`):**
-   Standalone out-of-process folder synchronization plugin (`diff`, `push`, `watch`, `pull`, `list`, `self-test`; compiles even with `--no-default-features`) backed by `GatewayFolderSync` (`src/sync.rs`). Holds **zero** `MasterKey` and **zero** `NodeIdentity` secrets in process memory or `GatewayFolderCatalog` state, seals ingested `memfd`s (`F_ADD_SEALS`), enforces `sanitize_sync_relative_path` path-traversal rejection, and verifies streaming `SHA-256` digests on `1 MiB` chunked `--macaroon` restores (`ADR-33`).
+   Standalone out-of-process folder synchronization plugin (`diff`, `push`, `watch`, `pull`, `list`, `self-test`; builds with `--no-default-features --features ipc-client`, no tokio or libp2p, from item 3) backed by `GatewayFolderSync` (`src/sync/gateway.rs`). Holds **zero** `MasterKey` and **zero** `NodeIdentity` secrets in process memory or `GatewayFolderCatalog` state, seals ingested `memfd`s (`F_ADD_SEALS`), enforces `sanitize_sync_relative_path` path-traversal rejection, and verifies streaming `SHA-256` digests on `1 MiB` chunked `--macaroon` restores (`ADR-33`).
 6. **Empirical Benchmark & Memory Telemetry Runner (`parvault-bench` — `src/bin/parvault-bench.rs`, `#![forbid(unsafe_code)]`):**
    Executes real wall-clock benchmarks (`Argon2id`, `AES-256-GCM`, `PqVaultMasterKey`, `X25519 + ML-KEM-768`, `Ed25519 + ML-DSA-65`, Reed-Solomon $GF(2^8)$) and Linux `/proc/self/status` (`VmRSS`, `VmHWM`) + `CLOCK_PROCESS_CPUTIME_ID` (`parvault::os_sys::process_cpu_time_ns`) streaming memory measurements.
 
@@ -95,7 +95,7 @@ Every code change or PR **must** preserve these 7 invariants:
 # Check formatting, lints, and --no-default-features compilation
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo check --no-default-features --bin parvault --bin parvault-seed --bin parvault-sync
+cargo check --no-default-features --features daemon-runtime --bin parvault --bin parvault-seed --bin parvault-sync
 
 # Run all unit, integration, Stateright, TLA+ TLC, GatewayBus, VFS, GatewayFolderSync, and live localhost TCP P2P tests
 TLA2TOOLS_JAR=/root/tla2tools.jar cargo test --release

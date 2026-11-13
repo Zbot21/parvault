@@ -180,7 +180,7 @@ jobs:
       - name: Run Clippy lints
         run: cargo clippy --all-targets -- -D warnings
       - name: Check minimal headless build (--no-default-features, VFS excluded)
-        run: cargo check --no-default-features --bin parvault --bin parvault-seed --bin parvault-sync
+        run: cargo check --no-default-features --features daemon-runtime --bin parvault --bin parvault-seed --bin parvault-sync
       - name: Build binaries (parvault, parvault-seed, parvault-fuse, parvault-sync)
         run: cargo build --release --bins
       - name: Run all integration, formal (Stateright + TLA+ TLC), UDS zero-copy IPC & VFS test suites
