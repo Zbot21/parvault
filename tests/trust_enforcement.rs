@@ -6373,7 +6373,8 @@ fn status_ipc_without_root_key_refused() {
 
 // ---- Item 6 C1: InstallCouncilManifest over admin RPC (plan-6 ruling, L-53) -----------------
 
-/// A public-bootstrap seed whose first `--admin-rpc-pubkey` (its council scope root) is `admin`.
+/// A public-bootstrap seed given `--admin-rpc-pubkey admin` and no `tracker_admin.seed`, so its
+/// council scope root is `admin`.
 fn c1_public_seed(label: &str, admin: &NodeIdentity, extra: &[&str]) -> (Node, String) {
     let (root, dir, reg, log) = prepare(label);
     let admin_port = std::net::TcpListener::bind("127.0.0.1:0")
