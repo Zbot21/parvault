@@ -1,12 +1,13 @@
 --------------------------- MODULE ParVaultProtocol ---------------------------
 \* @traceability
 \*   adr      ADR-04 ADR-05 ADR-09
-\*   const    K                 -> model-only: erasure tier tuple (ErasureTier::erasure_params), not a Rust const
-\*   const    N                 -> model-only: erasure tier tuple (ErasureTier::erasure_params), not a Rust const
-\*   const    RepairWatermark   -> model-only: model repair threshold
-\*   const    MaxEpochChurn     -> model-only: @assume bounded-epoch-churn (threat model)
-\*   const    MaxLeafFailures   -> src/network/wot.rs::MAX_LEAF_FAILURES
-\*   const    MaxSubtreeSlashes -> src/network/wot.rs::DEFAULT_SUBTREE_SLASH_LIMIT
+\*   const    K                    -> model-only: erasure tier tuple (ErasureTier::erasure_params), not a Rust const
+\*   const    N                    -> model-only: erasure tier tuple (ErasureTier::erasure_params), not a Rust const
+\*   const    RepairWatermark      -> model-only: model repair threshold
+\*   const    MaxEpochChurn        -> model-only: @assume bounded-epoch-churn (threat model)
+\*   const    MaxLeafFailures      -> src/network/wot.rs::MAX_LEAF_FAILURES
+\*   const    MaxSubtreeSlashes    -> src/network/wot.rs::DEFAULT_SUBTREE_SLASH_LIMIT
+\*   const    MinWitnessSignatures -> src/por/verifier.rs::MIN_WITNESS_SIGNATURES_FOR_REPAIR
 \* @end
 EXTENDS Naturals, FiniteSets
 
@@ -16,6 +17,7 @@ CONSTANTS
     RepairWatermark,    \* Proactive repair trigger threshold (e.g., 18)
     MaxEpochChurn,      \* Maximum node failures within a single repair window (<= N - K)
     MaxLeafFailures,    \* Maximum invalid handshakes / failed PoR audits before leaf slashing (3)
+    MinWitnessSignatures, \* Witness receipts a repair read needs (`MIN_WITNESS_SIGNATURES_FOR_REPAIR` = 2)
     MaxSubtreeSlashes   \* Maximum slashed children before parent inviter branch is pruned (M = 5, `DEFAULT_SUBTREE_SLASH_LIMIT` in `src/network/wot.rs`)
 
 ASSUME
@@ -26,6 +28,7 @@ ASSUME
     /\ MaxEpochChurn <= (N - K)
     /\ MaxLeafFailures > 0
     /\ MaxSubtreeSlashes > 0
+    /\ MinWitnessSignatures > 0
 
 \* Keys (L-47): the adversary signs only with its own keys (`AdvKeys`); guards compare what it
 \* presents with honest state. That the adversary holds no honest key is an assumption.
@@ -36,7 +39,6 @@ Leaf == "leaf"
 Witnesses == {"w1", "w2"}
 AdvKeys == {"adv1", "adv2"}
 \* `MIN_WITNESS_SIGNATURES_FOR_REPAIR` in `src/por/verifier.rs`.
-MinWitnessSignatures == 2
 ASSUME AdvKeys \cap ({Owner, Genesis, Self} \cup Witnesses) = {}   \* @assume adversary-holds-no-honest-key
 
 \* The guards: each compares a presented credential with honest state, and is used by both the
