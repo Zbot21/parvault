@@ -1,0 +1,12 @@
+diff --git a/specs/ParVaultGatewayPluginBus.tla b/specs/ParVaultGatewayPluginBus.tla
+--- a/specs/ParVaultGatewayPluginBus.tla
++++ b/specs/ParVaultGatewayPluginBus.tla
+@@ -96,7 +96,7 @@
+     /\ t /= NoToken => UidCaveatOk(t, u)
+     \* The manifest and byte-range caveats (AllowedManifest, ByteRange arms of `allows`): a token
+     \* scoped to another file is not a capability for this one.
+-    /\ t /= NoToken => t.scope \in {"in", "any"}   \* @guard macaroon-scope sym=src/capabilities.rs::evaluate_caveats
++    /\ TRUE
+ IngestSealedOk(sealed) == ~requireSealed \/ sealed   \* @guard memfd-seal sym=src/gateway/engine.rs::gateway_memfd_seal_decision
+ \* status_auth_decision: a verifier (root key) and a snapshot, then a valid, ReadOnly,
+ \* unscoped token whose AllowedPeerUid (if any) is the caller's.

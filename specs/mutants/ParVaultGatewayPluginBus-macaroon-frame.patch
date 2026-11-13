@@ -1,0 +1,12 @@
+diff --git a/specs/ParVaultGatewayPluginBus.tla b/specs/ParVaultGatewayPluginBus.tla
+--- a/specs/ParVaultGatewayPluginBus.tla
++++ b/specs/ParVaultGatewayPluginBus.tla
+@@ -92,7 +92,7 @@
+ \* gateway_macaroon_decision: with a root key a frame needs a token with a valid tag; any
+ \* token it carries must allow this frame (scope and peer UID).
+ ReadAuthorized(t, u) ==
+-    /\ rootKeySet => (t /= NoToken /\ t.key = "root")   \* @guard macaroon-frame sym=src/gateway/engine.rs::gateway_macaroon_decision
++    /\ TRUE
+     /\ t /= NoToken => UidCaveatOk(t, u)
+     \* The manifest and byte-range caveats (AllowedManifest, ByteRange arms of `allows`): a token
+     \* scoped to another file is not a capability for this one.

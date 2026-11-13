@@ -1,6 +1,7 @@
 # ADR-27: Zero-Copy Unix Socket & `SCM_RIGHTS` `memfd` Data-Plane Gateway (`parvault-gateway`)
 
 - **Status:** Accepted (`v0.4.0`)
+- **Formal model:** `specs/ParVaultGatewayPluginBus.tla`
 - **Subsystem:** `gateway::engine` / `gateway::ipc` / `gateway::shm` / `bin/parvault-gateway`
 - **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
 

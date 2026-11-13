@@ -1,6 +1,7 @@
 # ADR-28: Stateless `HMAC-SHA256` `CapabilityMacaroon` Offline Caveat Attenuation
 
 - **Status:** Accepted (`v0.4.0`)
+- **Formal model:** `specs/ParVaultGatewayPluginBus.tla`
 - **Subsystem:** `capabilities` / `gateway`
 - **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
 
