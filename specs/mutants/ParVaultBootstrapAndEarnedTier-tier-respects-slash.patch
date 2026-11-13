@@ -1,8 +1,8 @@
 diff --git a/specs/ParVaultBootstrapAndEarnedTier.tla b/specs/ParVaultBootstrapAndEarnedTier.tla
-index aae29b0..f00970f 100644
+index 9d7c07e..a24b584 100644
 --- a/specs/ParVaultBootstrapAndEarnedTier.tla
 +++ b/specs/ParVaultBootstrapAndEarnedTier.tla
-@@ -49,7 +49,7 @@ vars == <<personalDevices, organicPeers, seedAnchors, porStreak, isSlashed,
+@@ -46,7 +46,7 @@ vars == <<personalDevices, organicPeers, seedAnchors, porStreak, isSlashed,
  
  \* Helper: maps (porStreak, isSlashed) to EarnedStanding tier once in the 20-peer mesh
  EarnedTierFromStreak(streak, slashed) ==

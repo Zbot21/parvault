@@ -1,24 +1,21 @@
 ------------------- MODULE ParVaultBootstrapAndEarnedTier -------------------
 \* @traceability
 \*   adr      ADR-15
-\*   const    MaxOrganicPeers       -> model-only: model bound
-\*   const    SeedAnchorPoolSize    -> model-only: model bound
-\*   const    MaxPorStreak          -> model-only: abstracts the 50 / 200 PoR-pass thresholds of PeerCreditAccount::trust_level
-\*   const    MaxSybilNodesOnSubnet -> model-only: unused since b7e72ce removed the per-subnet Sybil credit
+\*   const    MaxOrganicPeers    -> model-only: model bound
+\*   const    SeedAnchorPoolSize -> model-only: model bound
+\*   const    MaxPorStreak       -> model-only: abstracts the 50 / 200 PoR-pass thresholds of PeerCreditAccount::trust_level
 \* @end
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 CONSTANTS
     MaxOrganicPeers,        \* Full organic neighborhood cohort size (20)
     SeedAnchorPoolSize,     \* Foundation Seed Anchor fallback pool size (20)
-    MaxPorStreak,           \* PoR uptime streak ceiling modeled (3)
-    MaxSybilNodesOnSubnet   \* Max Sybil VMs spun up on a single /24 subnet (5)
+    MaxPorStreak            \* PoR uptime streak ceiling modeled (3)
 
 ASSUME
     /\ MaxOrganicPeers = 20
     /\ SeedAnchorPoolSize = 20
     /\ MaxPorStreak = 3
-    /\ MaxSybilNodesOnSubnet = 5
 
 TierNames == {
     "PersonalRing_2of3",
