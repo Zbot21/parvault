@@ -1,11 +1,10 @@
 diff --git a/specs/ParVaultGatewayPluginBus.tla b/specs/ParVaultGatewayPluginBus.tla
-index 902e877..a043442 100644
 --- a/specs/ParVaultGatewayPluginBus.tla
 +++ b/specs/ParVaultGatewayPluginBus.tla
-@@ -94,7 +94,7 @@ UidCaveatOk(t, u) == t.uid \in {"none", u}   \* @guard macaroon-uid-caveat sym=s
- ReadAuthorized(t, u) ==
-     /\ rootKeySet => (t /= NoToken /\ t.key = "root")   \* @guard macaroon-frame sym=src/gateway/engine.rs::gateway_macaroon_decision
-     /\ t /= NoToken => (UidCaveatOk(t, u) /\ t.scope \in {"in", "any"})
+@@ -97,7 +97,7 @@
+     \* The manifest and byte-range caveats (AllowedManifest, ByteRange arms of `allows`): a token
+     \* scoped to another file is not a capability for this one.
+     /\ t /= NoToken => t.scope \in {"in", "any"}   \* @guard macaroon-scope sym=src/capabilities.rs::evaluate_caveats
 -IngestSealedOk(sealed) == ~requireSealed \/ sealed   \* @guard memfd-seal sym=src/gateway/engine.rs::gateway_memfd_seal_decision
 +IngestSealedOk(sealed) == TRUE   \* @guard memfd-seal sym=src/gateway/engine.rs::gateway_memfd_seal_decision
  \* status_auth_decision: a verifier (root key) and a snapshot, then a valid, ReadOnly,

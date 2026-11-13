@@ -1,8 +1,7 @@
 diff --git a/specs/ParVaultGatewayPluginBus.tla b/specs/ParVaultGatewayPluginBus.tla
-index 902e877..7ad5976 100644
 --- a/specs/ParVaultGatewayPluginBus.tla
 +++ b/specs/ParVaultGatewayPluginBus.tla
-@@ -131,7 +131,7 @@ FetchRange(u, t) ==
+@@ -134,7 +134,7 @@
  \* Item 3 gives FetchPayload the same per-frame check (before it, FetchPayload had none).
  FetchPayload(u, t) ==
      /\ u \in conns

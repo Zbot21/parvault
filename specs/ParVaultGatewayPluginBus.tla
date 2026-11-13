@@ -87,18 +87,21 @@ vars == <<allowlistSet, rootKeySet, requireSealed, snapshotPublished, conns, las
 
 \* --- Guards (each mirrors one Rust decision) -------------------------------------------
 UidAdmitted(u) == ~allowlistSet \/ u \in Allowlist   \* @guard uid-allowlist sym=src/gateway/engine.rs::gateway_peer_uid_decision
-\* The sym is broader than this check: the UID comparison is the AllowedPeerUid arm of `allows` (capabilities.rs:284).
+\* The sym is broader than this check: the UID comparison is the AllowedPeerUid arm of `allows` in capabilities.rs.
 UidCaveatOk(t, u) == t.uid \in {"none", u}   \* @guard macaroon-uid-caveat sym=src/capabilities.rs::evaluate_caveats
 \* gateway_macaroon_decision: with a root key a frame needs a token with a valid tag; any
 \* token it carries must allow this frame (scope and peer UID).
 ReadAuthorized(t, u) ==
     /\ rootKeySet => (t /= NoToken /\ t.key = "root")   \* @guard macaroon-frame sym=src/gateway/engine.rs::gateway_macaroon_decision
-    /\ t /= NoToken => (UidCaveatOk(t, u) /\ t.scope \in {"in", "any"})
+    /\ t /= NoToken => UidCaveatOk(t, u)
+    \* The manifest and byte-range caveats (AllowedManifest, ByteRange arms of `allows`): a token
+    \* scoped to another file is not a capability for this one.
+    /\ t /= NoToken => t.scope \in {"in", "any"}   \* @guard macaroon-scope sym=src/capabilities.rs::evaluate_caveats
 IngestSealedOk(sealed) == ~requireSealed \/ sealed   \* @guard memfd-seal sym=src/gateway/engine.rs::gateway_memfd_seal_decision
 \* status_auth_decision: a verifier (root key) and a snapshot, then a valid, ReadOnly,
 \* unscoped token whose AllowedPeerUid (if any) is the caller's.
 StatusAuthorized(t, u) ==
-    /\ rootKeySet /\ snapshotPublished
+    /\ rootKeySet /\ snapshotPublished   \* @guard status-verifier sym=src/http_edge.rs::status_auth_decision
     /\ t /= NoToken /\ t.key = "root" /\ t.scope = "any" /\ UidCaveatOk(t, u)   \* @guard status-auth sym=src/http_edge.rs::status_auth_decision
 
 Init ==
@@ -199,11 +202,13 @@ OnlyAllowedUidsServed ==
 \* With a root key, a read is served only on a token its owner issued to that requester.
 \* Without one, tokenless reads are served (F-47): TLC reaches that state.
 NoReadWithoutCapability ==
-    (rootKeySet /\ lastRead /= <<>>) => lastRead[2] \in IssuedTo(lastRead[1])
+    /\ (rootKeySet /\ lastRead /= <<>>) => lastRead[2] \in IssuedTo(lastRead[1])
+    \* ... and never on a token scoped to another file, with or without a root key.
+    /\ (lastRead /= <<>> /\ lastRead[2] /= NoToken) => lastRead[2].scope \in {"in", "any"}
 
 \* QueryStatus is refused without a root key and needs an issued token (not scoped).
 StatusOnlyWithIssuedToken ==
-    lastStatus /= <<>> => (rootKeySet /\ lastStatus[2] \in IssuedTo(lastStatus[1]))
+    lastStatus /= <<>> => (rootKeySet /\ snapshotPublished /\ lastStatus[2] \in IssuedTo(lastStatus[1]))
 
 \* Under --require-sealed-memfd no stored payload changes after it was stored.
 StoredPayloadImmutable ==

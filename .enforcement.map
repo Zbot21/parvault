@@ -95,7 +95,9 @@ tla-mutant TM-GPB-UIDCAV   spec=specs/ParVaultGatewayPluginBus.tla inv=NoReadWit
 tla-mutant TM-GPB-SEAL     spec=specs/ParVaultGatewayPluginBus.tla inv=StoredPayloadImmutable patch=specs/mutants/ParVaultGatewayPluginBus-memfd-seal.patch
 tla-mutant TM-GPB-STATUS   spec=specs/ParVaultGatewayPluginBus.tla inv=StatusOnlyWithIssuedToken patch=specs/mutants/ParVaultGatewayPluginBus-status-auth.patch
 tla-mutant TM-GPB-FETCHPAY spec=specs/ParVaultGatewayPluginBus.tla inv=NoReadWithoutCapability patch=specs/mutants/ParVaultGatewayPluginBus-fetch-payload-macaroon.patch
-waive TM-GPB-W-TYPE inv=specs/ParVaultGatewayPluginBus.tla::TypeOK reason=structural: type invariant
+tla-mutant TM-GPB-SCOPE    spec=specs/ParVaultGatewayPluginBus.tla inv=NoReadWithoutCapability patch=specs/mutants/ParVaultGatewayPluginBus-macaroon-scope.patch
+tla-mutant TM-GPB-STATUSVER spec=specs/ParVaultGatewayPluginBus.tla inv=StatusOnlyWithIssuedToken patch=specs/mutants/ParVaultGatewayPluginBus-status-verifier.patch
+waive TM-GPB-W-TYPE inv=specs/ParVaultGatewayPluginBus.tla::TypeOK reason=type invariant, not a security property, with no guard to remove; it types conns, lastRead and lastStatus and omits lastUnauth and stored, whose shapes are fixed by the actions that write them
 reach      TR-UID-ALLOWLIST sym=src/gateway/engine.rs::gateway_peer_uid_decision from=src/gateway/server.rs::spawn
 reach      TR-MACAROON-FRAME sym=src/gateway/engine.rs::gateway_macaroon_decision from=src/gateway/server.rs::execute_engine_command
 reach      TR-MACAROON-UID-CAVEAT sym=src/capabilities.rs::evaluate_caveats from=src/gateway/server.rs::execute_engine_command
