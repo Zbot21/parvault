@@ -53,8 +53,10 @@ pub(crate) async fn run_daemon(
 
     let mut por_verifier =
         PorVerifierEngine::with_persistence_dir(cfg.por_timeout_ms, &cfg.data_dir);
-    let mut nullifier_ledger =
-        VoucherNullifierLedger::with_persistence_dir(genesis_pubkey, &cfg.data_dir);
+    let mut nullifier_ledger = VoucherNullifierLedger::with_persistence_dir(
+        genesis_pubkey.unwrap_or(parvault::network::admission::NO_RING_ISSUER),
+        &cfg.data_dir,
+    );
     let pq_kem = HybridKemKeypair::load_or_generate_in_dir(&cfg.data_dir)?;
     let pq_signer = HybridPqSigningKeypair::load_or_generate_in_dir(&cfg.data_dir)?;
     let pq_fp = pq_signer.public_key().fingerprint_hex();

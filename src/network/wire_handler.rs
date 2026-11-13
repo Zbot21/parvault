@@ -54,7 +54,7 @@ pub fn resolve_seed_council_and_quorum(
     local_tracker_admin_pubkey: Option<[u8; 32]>,
     extra_council_pubkeys: &[[u8; 32]],
     cli_quorum_override: Option<usize>,
-    genesis_pubkey: [u8; 32],
+    genesis_pubkey: Option<[u8; 32]>,
 ) -> (Vec<[u8; 32]>, usize) {
     let mut council = Vec::new();
     let mut push_pk = |pk: [u8; 32]| {
@@ -99,7 +99,9 @@ pub fn resolve_seed_council_and_quorum(
             (council, min_quorum)
         }
         SeedServerMode::HomelabRedundancyVault => {
-            push_pk(genesis_pubkey);
+            if let Some(pk) = genesis_pubkey {
+                push_pk(pk);
+            }
             let min_quorum = quorum_override.unwrap_or(1).max(1);
             (council, min_quorum)
         }
@@ -110,7 +112,7 @@ pub fn resolve_seed_council_and_quorum(
 pub struct DaemonWireHandlerCtx<'a> {
     pub cfg: &'a NodeConfig,
     pub node_identity: &'a NodeIdentity,
-    pub genesis_pubkey: [u8; 32],
+    pub genesis_pubkey: Option<[u8; 32]>,
     pub public_mode: bool,
     pub block_store: &'a BlockStore,
     pub wot: &'a mut WebOfTrustRegistry,
@@ -132,7 +134,7 @@ pub struct SeedWireHandlerCtx<'a> {
     pub extra_council_pks: &'a [[u8; 32]],
     pub council_quorum: Option<usize>,
     pub max_probationary_lease_bytes: u64,
-    pub genesis_pubkey: [u8; 32],
+    pub genesis_pubkey: Option<[u8; 32]>,
     pub block_store: &'a BlockStore,
     pub server: &'a mut ZeroTrustSeedServer,
     pub wot: &'a mut WebOfTrustRegistry,
@@ -243,7 +245,7 @@ impl<'a> WirePeer<'a> {
 /// Node state the handler reads and mutates for one request.
 pub struct WireState<'a> {
     pub node_identity: &'a NodeIdentity,
-    pub genesis_pubkey: [u8; 32],
+    pub genesis_pubkey: Option<[u8; 32]>,
     pub block_store: &'a BlockStore,
     /// The daemon's embedded lite seed server, or the seed binary's server.
     pub server: &'a mut ZeroTrustSeedServer,
@@ -292,7 +294,7 @@ pub trait WireRolePolicy {
         &self,
         block_store: &BlockStore,
         mode: SeedServerMode,
-        genesis_pubkey: [u8; 32],
+        genesis_pubkey: Option<[u8; 32]>,
     ) -> (Vec<[u8; 32]>, usize);
 }
 
@@ -339,7 +341,7 @@ impl WireRolePolicy for DaemonWirePolicy<'_> {
         &self,
         block_store: &BlockStore,
         _mode: SeedServerMode,
-        genesis_pubkey: [u8; 32],
+        genesis_pubkey: Option<[u8; 32]>,
     ) -> (Vec<[u8; 32]>, usize) {
         let mut pinned_admins =
             KnownPeersStore::load(&self.cfg.data_dir).pinned_tracker_admin_pubkeys();
@@ -390,7 +392,7 @@ impl WireRolePolicy for SeedWirePolicy<'_> {
         &self,
         _block_store: &BlockStore,
         mode: SeedServerMode,
-        genesis_pubkey: [u8; 32],
+        genesis_pubkey: Option<[u8; 32]>,
     ) -> (Vec<[u8; 32]>, usize) {
         resolve_seed_council_and_quorum(
             self.data_dir,
@@ -765,6 +767,10 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                 None,
             ) {
                 warn!(%reason, peer = %remote_peer_id, "refused a handshake from a blocked peer");
+                return handshake_refused();
+            }
+            if let Err(code) = WebOfTrustRegistry::ring_handshake_decision(wot.genesis_pubkey()) {
+                warn!(code, peer = %remote_peer_id, "refused a handshake: this node is in no ring");
                 return handshake_refused();
             }
             if let Err(code) = WebOfTrustRegistry::chain_leaf_decision(leaf_pk, remote_pubkey) {

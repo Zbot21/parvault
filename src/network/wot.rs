@@ -146,6 +146,9 @@ pub enum WebOfTrustError {
     PublicCommonsFull,
     #[error("Chain admission limit reached")]
     ChainAdmissionLimit,
+    /// Appended (F-37): this node is in no ring, so it admits no chain.
+    #[error("This node is not in a ring and admits no delegation chain")]
+    NoRing,
 }
 
 /// Alias for [`WebOfTrustError`] used by Public Commons WoT admission APIs.
@@ -550,7 +553,8 @@ impl SlashingEvidence {
 /// recursive parent branch pruning, and optional Public Commons PoW zero-pairing admission (`network::wot`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebOfTrustRegistry {
-    genesis_pubkey: [u8; 32],
+    /// The ring genesis; `None` on a node outside any ring, which admits no chain (F-37).
+    genesis_pubkey: Option<[u8; 32]>,
     max_subtree_slashes: u32,
     /// Verified chain per admitted PrivateRing peer public key.
     admitted_chains: HashMap<[u8; 32], DelegationChain>,
@@ -601,12 +605,23 @@ impl WebOfTrustRegistry {
     pub const PUBLIC_COMMONS_GENESIS_SEED_DOMAIN: &[u8] = PUBLIC_COMMONS_GENESIS_SEED_DOMAIN;
 
     /// Derives the deterministic Ed25519 Genesis public key shared across Public Commons trackers.
+    /// Its seed is public, so anyone can sign chains for it: test fixtures only (F-37).
+    #[cfg(test)]
     pub fn public_commons_genesis_pubkey() -> [u8; 32] {
         let seed: [u8; 32] = Sha256::digest(PUBLIC_COMMONS_GENESIS_SEED_DOMAIN).into();
         NodeIdentity::from_seed(seed).public_key_bytes()
     }
 
     pub fn new(genesis_pubkey: [u8; 32], max_subtree_slashes: u32) -> Self {
+        Self::with_genesis(Some(genesis_pubkey), max_subtree_slashes)
+    }
+
+    /// A registry for a node outside any ring: every chain is refused (F-37).
+    pub fn without_ring(max_subtree_slashes: u32) -> Self {
+        Self::with_genesis(None, max_subtree_slashes)
+    }
+
+    fn with_genesis(genesis_pubkey: Option<[u8; 32]>, max_subtree_slashes: u32) -> Self {
         Self {
             genesis_pubkey,
             max_subtree_slashes: max_subtree_slashes.max(1),
@@ -631,6 +646,7 @@ impl WebOfTrustRegistry {
 
     /// Initializes a `WebOfTrustRegistry` configured for open `PublicCommons` zero-pairing admission
     /// anchored at [`Self::public_commons_genesis_pubkey`].
+    #[cfg(test)]
     pub fn new_public_commons(min_pow_bits: u8) -> Self {
         let mut reg = Self::new(
             Self::public_commons_genesis_pubkey(),
@@ -643,7 +659,7 @@ impl WebOfTrustRegistry {
 
     /// Loads or initializes a persistent `WebOfTrustRegistry` at `data_dir/wot_state.bin`.
     pub fn with_persistence_dir(
-        genesis_pubkey: [u8; 32],
+        genesis_pubkey: Option<[u8; 32]>,
         max_subtree_slashes: u32,
         data_dir: &std::path::Path,
     ) -> Self {
@@ -658,18 +674,19 @@ impl WebOfTrustRegistry {
                 }
             }
         }
-        let mut reg = Self::new(genesis_pubkey, max_subtree_slashes);
+        let mut reg = Self::with_genesis(genesis_pubkey, max_subtree_slashes);
         reg.persistence_path = Some(path);
         reg
     }
 
     /// Loads or initializes a persistent `PublicCommons` `WebOfTrustRegistry` at `data_dir/wot_state.bin`.
+    #[cfg(test)]
     pub fn with_public_commons_persistence_dir(
         min_pow_bits: u8,
         data_dir: &std::path::Path,
     ) -> Self {
         let mut reg = Self::with_persistence_dir(
-            Self::public_commons_genesis_pubkey(),
+            Some(Self::public_commons_genesis_pubkey()),
             DEFAULT_SUBTREE_SLASH_LIMIT,
             data_dir,
         );
@@ -694,8 +711,8 @@ impl WebOfTrustRegistry {
         self.min_public_pow_bits
     }
 
-    /// Returns the Genesis Root Ed25519 public key configured for this registry.
-    pub fn genesis_pubkey(&self) -> [u8; 32] {
+    /// Returns the ring genesis public key, or `None` outside any ring.
+    pub fn genesis_pubkey(&self) -> Option<[u8; 32]> {
         self.genesis_pubkey
     }
 
@@ -837,7 +854,7 @@ impl WebOfTrustRegistry {
     /// Runs the slash guard for `target`; logs and returns `false` for a protected key.
     fn may_slash(&self, target: [u8; 32]) -> bool {
         let facts = SlashTargetFacts {
-            is_genesis: target == self.genesis_pubkey,
+            is_genesis: self.genesis_pubkey == Some(target),
             is_protected: self.protected_keys.contains(&target),
         };
         match Self::slash_target_decision(&facts) {
@@ -863,6 +880,13 @@ impl WebOfTrustRegistry {
 
     /// Validates and admits a peer's `DelegationChain` if anchored at `genesis_pubkey`
     /// and free of quarantined ancestors.
+    /// A node outside any ring (no genesis) admits no chain (F-37). Before this, ticket-only
+    /// nodes used the all-zero key as a placeholder genesis, a small-order point for which a
+    /// stranger could forge a hop.
+    pub fn ring_handshake_decision(genesis: Option<[u8; 32]>) -> Result<[u8; 32], &'static str> {
+        genesis.ok_or("reject.handshake_no_ring")
+    }
+
     pub fn verify_and_admit_chain(
         &mut self,
         chain: &DelegationChain,
@@ -873,7 +897,9 @@ impl WebOfTrustRegistry {
         if chain.hops.len() as u32 > MAX_DELEGATION_DEPTH {
             return Err(WebOfTrustError::MaxDepthExceeded(chain.hops.len() as u32));
         }
-        if chain.hops[0].inviter_pubkey != self.genesis_pubkey {
+        let genesis = Self::ring_handshake_decision(self.genesis_pubkey)
+            .map_err(|_| WebOfTrustError::NoRing)?;
+        if chain.hops[0].inviter_pubkey != genesis {
             return Err(WebOfTrustError::UntrustedGenesisRoot);
         }
 
@@ -901,7 +927,7 @@ impl WebOfTrustRegistry {
         }
         let inviter = chain.hops.last().expect("checked non-empty").inviter_pubkey;
         let facts = ChainAdmissionFacts {
-            inviter_is_genesis: inviter == self.genesis_pubkey,
+            inviter_is_genesis: inviter == genesis,
             inviter_subinvites: self
                 .admitted_chains
                 .values()
@@ -1033,7 +1059,7 @@ impl WebOfTrustRegistry {
     /// Checks whether a peer is currently admitted (via `genesis_pubkey`, unquarantined
     /// `PrivateRing` `DelegationChain`, or active `PublicCommonsTicket`) and not slashed.
     pub fn is_peer_trusted(&self, peer_pubkey: &[u8; 32]) -> bool {
-        if *peer_pubkey == self.genesis_pubkey {
+        if self.genesis_pubkey == Some(*peer_pubkey) {
             return !self.quarantined_keys.contains(peer_pubkey);
         }
         if self.quarantined_keys.contains(peer_pubkey) {
@@ -1066,7 +1092,7 @@ impl WebOfTrustRegistry {
             if let Some(chain) = self.admitted_chains.get(&offender_pubkey).cloned() {
                 for hop in &chain.hops {
                     let parent = hop.inviter_pubkey;
-                    if parent == self.genesis_pubkey {
+                    if self.genesis_pubkey == Some(parent) {
                         continue;
                     }
                     let branch_slashes = self.branch_slash_counts.entry(parent).or_insert(0);
@@ -1102,7 +1128,7 @@ impl WebOfTrustRegistry {
         if let Some(chain) = self.admitted_chains.get(&offender_pubkey).cloned() {
             for hop in &chain.hops {
                 let parent = hop.inviter_pubkey;
-                if parent == self.genesis_pubkey {
+                if self.genesis_pubkey == Some(parent) {
                     continue;
                 }
                 let branch_slashes = self.branch_slash_counts.entry(parent).or_insert(0);
@@ -1546,7 +1572,7 @@ mod tests {
         assert_eq!(public_wot.trust_pool_mode(), TrustPoolMode::PublicCommons);
         assert_eq!(
             public_wot.genesis_pubkey(),
-            WebOfTrustRegistry::public_commons_genesis_pubkey()
+            Some(WebOfTrustRegistry::public_commons_genesis_pubkey())
         );
 
         let weak_ticket = PublicCommonsTicket::mint(&stranger, [0u8; 32], now_ms, 4);
