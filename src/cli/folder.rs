@@ -36,7 +36,7 @@ pub(crate) async fn diff_folder(env: CliEnv, command: Commands) -> anyhow::Resul
 }
 
 /// The recovery phrase from `--seed-phrase` or `PARVAULT_SEED_PHRASE`, if any.
-fn effective_seed_phrase(arg: Option<String>) -> Option<String> {
+pub(crate) fn effective_seed_phrase(arg: Option<String>) -> Option<String> {
     arg.or_else(|| std::env::var("PARVAULT_SEED_PHRASE").ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -44,7 +44,7 @@ fn effective_seed_phrase(arg: Option<String>) -> Option<String> {
 
 /// The vault keys: derived from the recovery phrase and namespace when one is given (ADR-18),
 /// otherwise the node's sealed master key (or `--key-hex`).
-fn vault_keys(
+pub(crate) fn vault_keys(
     phrase: Option<&str>,
     vault_namespace: &str,
     cfg: &NodeConfig,
@@ -183,11 +183,12 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
             if is_network_peer_addr(&seed_str) {
                 // Stored locally first; counted after syndication below.
                 let mut snap = engine.sync_folder_once(&folder)?;
-                // The seed checks that the device cert names the sender (F-25), and the cert is
-                // issued for the Device Peer ID that `parvault identity` prints: send as this
-                // node. The repair grant below is still signed by the vault owner.
+                // F-38 (L-40): the seed requires the repair grant's owner to be the sender and the
+                // device cert to name the sender, so send as the vault owner identity that signs
+                // the grant. Its id is the Vault Device Peer ID `parvault identity --seed-phrase`
+                // prints. Only the seed is contacted for syndication.
                 let net_client = MeshClient::new(
-                    NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?,
+                    owner_identity.clone(),
                     mesh_client.all_network_endpoints(),
                     Some(seed_str.clone()),
                 )

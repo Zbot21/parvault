@@ -550,7 +550,16 @@ pub enum Commands {
     /// Inspect local daemon health, SLA cohort tier, WoT peers, and storage quota.
     Status,
     /// Display or initialize the persistent NodeIdentity, Post-Quantum Owner Key, and Master Key fingerprints.
-    Identity,
+    Identity {
+        /// Also print the Vault Device Peer ID of the vault this phrase and namespace derive
+        /// (the id a lite-seed device cert must name, F-38). Or set `PARVAULT_SEED_PHRASE`.
+        #[arg(long)]
+        seed_phrase: Option<String>,
+
+        /// Vault namespace used with `--seed-phrase`.
+        #[arg(long, default_value = "default")]
+        vault_namespace: String,
+    },
     /// Print a fresh 24-word BIP-39 recovery phrase and store nothing. Back up with
     /// `watch-folder --seed-phrase` to make a folder recoverable with `recover-from-seed` (ADR-18).
     NewSeedPhrase,

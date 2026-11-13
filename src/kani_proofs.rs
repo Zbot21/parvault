@@ -1129,3 +1129,22 @@ fn proof_sanitize_sync_relative_path_no_traversal() {
     assert!(sanitize_sync_relative_path("../escape").is_none());
     assert!(sanitize_sync_relative_path("C:\\win").is_none());
 }
+
+/// F-38 (L-40): a syndication repair grant is accepted only when absent or owned by exactly the
+/// authenticated sender's 32-byte key; any other owner, or an unknown sender, is refused.
+#[kani::proof]
+#[kani::unwind(34)]
+fn proof_syndication_grant_owned_by_sender() {
+    let owner: [u8; 32] = kani::any();
+    let sender: [u8; 32] = kani::any();
+    let has_grant: bool = kani::any();
+    let sender_known: bool = kani::any();
+    let grant = has_grant.then_some(owner);
+    let sender_opt = sender_known.then_some(sender);
+    let decision = crate::network::wire_handler::syndication_grant_decision(grant, sender_opt);
+    kani::cover!(decision.is_err(), "grant not owned by sender");
+    let expected_ok = !has_grant || (sender_known && owner == sender);
+    // Only the outcome is checked: comparing the &str reason code makes CBMC unwind memcmp
+    // without a bound; the code itself is checked by the claim's wire test.
+    assert_eq!(decision.is_ok(), expected_ok);
+}

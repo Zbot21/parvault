@@ -132,7 +132,7 @@ fn command_needs_network_discovery(cmd: &Commands) -> bool {
             | Commands::Discover { .. }
             | Commands::Pair { .. }
             | Commands::Join { .. }
-            | Commands::Identity
+            | Commands::Identity { .. }
             | Commands::IssueDeviceCert { .. }
             | Commands::VerifyDeviceCert { .. }
             | Commands::DiffFolder { .. }
@@ -378,7 +378,7 @@ async fn main() -> anyhow::Result<()> {
         command @ Commands::Daemon { .. } => cli::daemon_cmds::daemon(env, command).await?,
         command @ Commands::File { .. } => cli::file::file(env, command).await?,
         command @ Commands::Status => cli::identity::status(env, command).await?,
-        command @ Commands::Identity => cli::identity::identity(env, command).await?,
+        command @ Commands::Identity { .. } => cli::identity::identity(env, command).await?,
         command @ Commands::IssueDeviceCert { .. } => {
             cli::identity::issue_device_cert(env, command).await?
         }

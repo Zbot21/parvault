@@ -211,7 +211,9 @@ For example, the BIP-39 test vector `legal winner thank year wave sausage worth 
 ### Recipe B: Link Personal Devices with Zero Reciprocity Tax (`issue-device-cert`)
 To link machines into a private Day-1 Personal Ring (the planned zero storage quota tax for linked devices is not applied yet):
 ```bash
-# 1. On your laptop, issue a certificate for your desktop or NAS:
+# 1. On your laptop, issue a certificate for your desktop or NAS. For a lite seed
+#    (watch-folder --lite-seed-dir), certify the "Vault Device Peer ID" that
+#    `parvault identity --seed-phrase ... --vault-namespace ...` prints instead.
 parvault issue-device-cert \
   --device-peer-id "parvault-peer-8f3a9c12e4b07d11" \
   --device-label "Work-Laptop"

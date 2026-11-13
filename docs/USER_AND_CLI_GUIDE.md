@@ -176,6 +176,7 @@ Run `parvault identity` on your laptop:
 ```bash
 parvault identity
 ```
+For a lite seed (`watch-folder --lite-seed-dir`), the device cert must name the **Vault Device Peer ID** instead: syndication is sent and the repair grant signed by the vault identity derived from your recovery phrase and namespace (F-38). Print it with `parvault identity --seed-phrase "<phrase>" --vault-namespace <ns>` (or `PARVAULT_SEED_PHRASE`); without a phrase it is derived from the local master key. Every device holding the same phrase shares this id.
 Example output:
 ```text
 === ParVault Node & Post-Quantum Identity ===
