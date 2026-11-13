@@ -298,8 +298,10 @@ echo "=== [7/12] Lite-Client 1.0x Stripe Syndication via parvault-seed-0 & NAS-D
 docker exec parvault-client sh -cex '
     mkdir -p /tmp/lite-client-state /workspace/lite_source /workspace/lite_restored_after_nas_death
     echo "Lite-Client 1.0x stripe syndicated through parvault-seed-0 to 10 mesh peers" > /workspace/lite_source/laptop_note.txt
-    sha256sum /workspace/lite_source/laptop_note.txt > /tmp/expected_lite.sha256
+    sha256sum < /workspace/lite_source/laptop_note.txt | cut -d " " -f1 > /tmp/expected_lite.hash
 '
+# Every shard file in the client container before the lite run (other stages' vaults live here).
+LITE_SHARDS_BEFORE="$(docker exec parvault-client sh -c 'find / \( -path /proc -o -path /sys -o -path /dev \) -prune -o -name "*.shard" -type f -print 2>/dev/null | sort')"
 SEED_PUBKEY_HEX="$(docker exec parvault-seed-0 /usr/local/bin/parvault-seed identity --data-dir /var/lib/parvault-seed | awk '/Owner PQ Public Key Hex/ {print $7}')"
 # The lite client syndicates as its vault identity, which also signs the repair grant (F-25,
 # F-38): the cert names the Vault Device Peer ID that `parvault identity --seed-phrase` prints.
@@ -322,29 +324,41 @@ docker exec -w /tmp/lite-client-state parvault-client /usr/local/bin/parvault \
     --vault-namespace "lite-failover-ns" \
     --once
 
-# Simulate NAS / Seed Server death by stopping parvault-seed-0, then recover Lite-Client vault directly from mesh peers!
-# Wipe the client's local shards first, so the restore cannot read them (F-38 ruling).
-LITE_SHARD_DIR=/tmp/lite-client-state/.parvault-data/shards
-LITE_LOCAL_SHARDS="$(docker exec parvault-client sh -c "ls -1 $LITE_SHARD_DIR/*.shard 2>/dev/null | wc -l")"
-if [ "${LITE_LOCAL_SHARDS:-0}" -lt 1 ]; then
-    echo "ERROR: stage 7: $LITE_SHARD_DIR is missing or holds no shards; the wipe would be vacuous"
+# Simulate NAS / Seed Server death by stopping parvault-seed-0, then recover the Lite-Client vault
+# from mesh peers only. By design a successful lite syndication deletes the client's local shards
+# (src/cli/folder.rs, after syndication), so there is nothing to wipe: instead assert the lite run
+# left no shard file anywhere in the container, hide the source folder, and restore into a fresh
+# data dir and working dir, so the restore can read neither local shards nor the original file.
+LITE_SHARDS_AFTER="$(docker exec parvault-client sh -c 'find / \( -path /proc -o -path /sys -o -path /dev \) -prune -o -name "*.shard" -type f -print 2>/dev/null | sort')"
+LITE_NEW_SHARDS="$(comm -13 <(printf '%s\n' "$LITE_SHARDS_BEFORE") <(printf '%s\n' "$LITE_SHARDS_AFTER") | sed '/^$/d')"
+if [ -n "$LITE_NEW_SHARDS" ]; then
+    echo "ERROR: stage 7: the lite run kept local shards, so the restore could read them:"
+    echo "$LITE_NEW_SHARDS"
     exit 1
 fi
-docker exec parvault-client sh -c "rm -rf $LITE_SHARD_DIR /tmp/lite-client-state/.parvault-data/shard_index.bin"
-if docker exec parvault-client test -e "$LITE_SHARD_DIR"; then
-    echo "ERROR: stage 7: $LITE_SHARD_DIR survived the wipe"
+if ! docker exec parvault-client test -s /tmp/lite-client-state/lite.manifest.bin; then
+    echo "ERROR: stage 7: the lite run wrote no snapshot; nothing was synced"
     exit 1
 fi
+docker exec parvault-client sh -cex '
+    mv /workspace/lite_source /workspace/lite_source.hidden-for-restore
+    mkdir -p /tmp/lite-restore-fresh/data /tmp/lite-restore-fresh/cwd
+    test -z "$(ls -A /tmp/lite-restore-fresh/data)"
+'
 docker stop parvault-seed-0
-docker exec -w /tmp/lite-client-state parvault-client /usr/local/bin/parvault \
+docker exec -w /tmp/lite-restore-fresh/cwd parvault-client /usr/local/bin/parvault \
+    --data-dir /tmp/lite-restore-fresh/data \
     --peers "$PEERS_CSV" \
     recover-from-seed \
     --seed-phrase "$SEED_PHRASE" \
     --vault-namespace "lite-failover-ns" \
     --out-dir /workspace/lite_restored_after_nas_death
+# Compare the restored file's content (not a path: a path-based check would re-hash the source).
 docker exec parvault-client sh -cex '
-    cd /workspace/lite_restored_after_nas_death
-    sha256sum -c /tmp/expected_lite.sha256
+    test ! -e /workspace/lite_source
+    RESTORED="$(find /workspace/lite_restored_after_nas_death -type f -name laptop_note.txt)"
+    test "$(printf "%s\n" "$RESTORED" | sed "/^$/d" | wc -l)" -eq 1
+    test "$(sha256sum < "$RESTORED" | cut -d " " -f1)" = "$(cat /tmp/expected_lite.hash)"
 '
 docker start parvault-seed-0
 for attempt in $(seq 1 30); do
