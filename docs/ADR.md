@@ -1,7 +1,7 @@
 # ParVault (`parvault`) — Master Architectural Decision Record (ADR) Index & Active Cryptographic Suite Guide (<!-- metric:crate_version_tag -->`v0.5.0`<!-- /metric -->)
 
 - **Architecture Policy:** **Strictly Single-Concern ADRs** (`docs/adr/ADR-01-*.md` through `docs/adr/ADR-33-*.md`) — one architectural decision per file in canonical Michael Nygard format (**Status**, **Subsystem**, **Context**, **Decision**, **Consequences & Verification**).
-- **Target Build & Verification Posture:** `#![deny(unsafe_code)]` library + `#![forbid(unsafe_code)]` binaries (`x86_64-unknown-linux-musl` & `aarch64-unknown-linux-musl`), **<!-- metric:kani_harnesses -->`20`<!-- /metric --> Kani Rust Bounded Model Checking symbolic harnesses**, **<!-- metric:tla_specs -->`7`<!-- /metric --> TLA+ TLC formal specifications**, and full release/plugin security suites (see [`docs/SAFETY_AND_LINT_AUDIT.md`](SAFETY_AND_LINT_AUDIT.md), [`docs/GATEWAY_SOCKET_PROTOCOL.md`](GATEWAY_SOCKET_PROTOCOL.md), and [`docs/SECURITY_AND_CRYPTOGRAPHY.md`](SECURITY_AND_CRYPTOGRAPHY.md)).
+- **Target Build & Verification Posture:** `#![deny(unsafe_code)]` library + `#![forbid(unsafe_code)]` binaries (`x86_64-unknown-linux-musl` & `aarch64-unknown-linux-musl`), **<!-- metric:kani_harnesses -->`21`<!-- /metric --> Kani Rust Bounded Model Checking symbolic harnesses**, **<!-- metric:tla_specs -->`7`<!-- /metric --> TLA+ TLC formal specifications**, and full release/plugin security suites (see [`docs/SAFETY_AND_LINT_AUDIT.md`](SAFETY_AND_LINT_AUDIT.md), [`docs/GATEWAY_SOCKET_PROTOCOL.md`](GATEWAY_SOCKET_PROTOCOL.md), and [`docs/SECURITY_AND_CRYPTOGRAPHY.md`](SECURITY_AND_CRYPTOGRAPHY.md)).
 
 ---
 
