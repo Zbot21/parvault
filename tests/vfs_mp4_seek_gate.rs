@@ -88,6 +88,24 @@ fn assert_budget(what: &str, ok: bool, measured: String) {
     }
 }
 
+/// Cold time-to-first-byte budget; the Docker gate's netem stage sets 100 (§7.2).
+fn ttfb_budget() -> Duration {
+    Duration::from_millis(
+        std::env::var("PARVAULT_VFS_TTFB_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50),
+    )
+}
+
+/// The plugin binary: `PARVAULT_FUSE_BIN` (the Docker gate runs this test binary in a container),
+/// else the one cargo built.
+fn plugin_bin() -> PathBuf {
+    std::env::var_os("PARVAULT_FUSE_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_parvault-fuse")))
+}
+
 fn run(cmd: &mut Command) -> std::process::Output {
     let out = cmd.output().expect("spawn");
     assert!(
@@ -372,8 +390,8 @@ fn fuse_mount_mp4_probe_and_random_seek() {
     assert_eq!(buf, want, "bytes at the keyframe differ");
     eprintln!("A3 cold TTFB at offset {pos}: {ttfb:?}");
     assert_budget(
-        "cold TTFB < 50 ms",
-        ttfb < Duration::from_millis(50),
+        "cold FUSE TTFB within budget",
+        ttfb < ttfb_budget(),
         format!("{ttfb:?}"),
     );
 
@@ -437,6 +455,49 @@ fn webdav_206_mp4_probe_and_random_seek() {
         "probe hydrated a middle stripe: {fetched:?}"
     );
 
+    // B3: cold time-to-first-byte of a Range request at the mid keyframe (the HTTP hop is what
+    // the Docker gate's netem stage delays).
+    let pos = keyframe_offset(&clip);
+    let mut conn = std::net::TcpStream::connect(handle.local_addr()).unwrap();
+    let t0 = Instant::now();
+    std::io::Write::write_all(
+        &mut conn,
+        format!(
+            "GET /clip.mp4 HTTP/1.1\r\nHost: gate\r\nRange: bytes={pos}-{}\r\nAuthorization: Bearer {bearer}\r\nConnection: close\r\n\r\n",
+            pos + 4095
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let mut first = [0u8; 1];
+    std::io::Read::read_exact(&mut conn, &mut first).unwrap();
+    let ttfb = t0.elapsed();
+    let mut rest = Vec::new();
+    std::io::Read::read_to_end(&mut conn, &mut rest).unwrap();
+    let mut resp = first.to_vec();
+    resp.extend(rest);
+    let split = resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("HTTP head");
+    assert!(
+        resp.starts_with(b"HTTP/1.1 206"),
+        "{}",
+        String::from_utf8_lossy(&resp[..split])
+    );
+    let mut want = vec![0u8; 4096];
+    File::open(&clip)
+        .unwrap()
+        .read_exact_at(&mut want, pos)
+        .unwrap();
+    assert_eq!(&resp[split + 4..], &want[..], "Range body differs");
+    eprintln!("B3 cold WebDAV TTFB at offset {pos}: {ttfb:?}");
+    assert_budget(
+        "cold WebDAV TTFB within budget",
+        ttfb < ttfb_budget(),
+        format!("{ttfb:?}"),
+    );
+
     // B2: random seek over HTTP Range.
     assert_eq!(
         framemd5(&url, Some(&bearer)),
@@ -460,7 +521,7 @@ fn parvault_fuse_plugin_mount_rss_under_16_mib() {
     // The plugin refuses fds 0-2 as /dev/fuse, so a shell moves the fd from stdin to 3.
     let mut plugin = Command::new("sh")
         .args(["-c", "exec 3<&0 0</dev/null; exec \"$@\"", "sh"])
-        .arg(env!("CARGO_BIN_EXE_parvault-fuse"))
+        .arg(plugin_bin())
         .arg("--socket")
         .arg(&gw.sock)
         .arg("--cache-dir")

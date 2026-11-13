@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 - **Mounted-filesystem MP4 gate (design ledger §7.2).** `tests/vfs_mp4_seek_gate.rs` mounts the vault through the real kernel (`fusermount3`, no root) and over WebDAV `HTTP 206` with a ReadOnly bearer token. Real `ffprobe` must probe a 12 MiB H.264 file with at most 2 cache misses and no middle stripe fetched. `ffmpeg -ss` must decode the same frames as the local file within a 3 MiB cache. The cold mid-file read must take < 50 ms, and the `parvault-fuse` plugin's peak RSS must stay < 16 MiB. The time and RSS budgets are asserted in release builds; under `GATES_REQUIRE_REAL=1` a missing tool or a debug run fails.
+- **Docker gate stage 12c.** It runs the gate's release test binary in a container with `/dev/fuse` (FUSE and plugin legs) and in an unprivileged container (WebDAV leg). It then runs the WebDAV leg again under `tc netem delay 15ms loss 2%` with a 100 ms cold-read budget. A container without `/dev/fuse` is `SKIPPED`, which fails under `GATES_REQUIRE_REAL=1`. netem delays the HTTP hop; stripes fetched from mesh peers under netem are not covered yet.
 
 ### Security
 - **`parvault token inspect` redacts the tag.** The HMAC tag is the bearer secret, so it now prints as `<redacted>` (text and JSON) unless `--show-tag` is given, as with the macaroon `Debug` output (F-43, L-44 item 8).
