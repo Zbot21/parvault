@@ -2997,6 +2997,32 @@ fn r3_partial_placement_keeps_remote_shards() {
         .expect("root printed")
         .trim()
         .to_string();
+    // The manifest names the peer for each remote shard and this node for each local one.
+    let mk = MasterKey::from_hex(&key_hex).unwrap();
+    let file_root: [u8; 32] = hex::decode(&root_hex).unwrap().try_into().unwrap();
+    let manifest = parvault::storage::BlockStore::new(
+        &dir,
+        parvault::storage::QuotaManager::new(1 << 30, 1 << 30),
+    )
+    .unwrap()
+    .load_manifest(&mk, &file_root)
+    .unwrap();
+    assert_eq!(manifest.stripes.len(), 1);
+    let assigned = &manifest.stripes[0].assigned_peers;
+    let on_peer = assigned.iter().filter(|p| p.contains(&pid)).count();
+    assert_eq!(on_peer, remote, "{assigned:?}");
+    // Leave fewer than k local shards, so the restore must fetch the remote ones.
+    let mut local_files: Vec<_> = std::fs::read_dir(dir.join("shards"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "shard"))
+        .collect();
+    local_files.sort();
+    while local_files.len() >= TIER_K {
+        std::fs::remove_file(local_files.pop().unwrap()).unwrap();
+    }
+    assert!(shard_files(&dir) < TIER_K);
     let restored = root.path().join("restored.bin");
     let out = run(&[
         "file",
