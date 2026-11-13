@@ -5089,35 +5089,76 @@ fn guid_peer_uid_not_allowed_refused() {
     gate_ran("trust_enforcement::guid_peer_uid_not_allowed_refused");
 }
 
-/// F-43 (QA r1, slowloris): the request head has one absolute deadline, not a per-read timeout. A
-/// client dripping one byte a second is cut off within about the deadline (5 s), unanswered.
+/// Opens a WebDAV connection and starts its request head without finishing it.
+fn f43_partial_head(addr: &str) -> std::net::TcpStream {
+    use std::io::Write;
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+    s.write_all(b"GET /a.txt HTTP/1.1\r\n").unwrap();
+    s
+}
+
+/// Whether the server has closed `s` (EOF or a reset), without waiting.
+fn f43_closed(s: &mut std::net::TcpStream) -> bool {
+    use std::io::Read;
+    let mut buf = [0u8; 64];
+    match s.read(&mut buf) {
+        Ok(0) => true,
+        Ok(n) => panic!("answered: {}", String::from_utf8_lossy(&buf[..n])),
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+    }
+}
+
+/// F-43 (QA r1, slowloris): the request head has one absolute deadline, not a per-read timeout.
+/// A client trickling one byte every 2 s is cut off within about the deadline (5 s),
+/// unanswered, and a fresh client is then served (401 without a token).
 #[test]
 fn f43_slow_drip_headers_cut_off() {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let (_node, addr) = f43_up("f43-drip");
-    let mut s = std::net::TcpStream::connect(&addr).unwrap();
-    s.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+    let mut s = f43_partial_head(&addr);
     let t0 = Instant::now();
     let mut closed_after = None;
-    for b in b"GET /a.txt HTTP/1.1\r\nHost: x\r\nX-Slow: aaaaaaaaaaaa".iter() {
-        if s.write_all(&[*b]).is_err() {
+    for b in b"Host: x\r\nX-Slow: aaaaaaaaaaaa".iter() {
+        std::thread::sleep(Duration::from_millis(2000));
+        if f43_closed(&mut s) || s.write_all(&[*b]).is_err() {
             closed_after = Some(t0.elapsed());
             break;
         }
-        std::thread::sleep(Duration::from_millis(1000));
-        let mut buf = [0u8; 64];
-        match s.read(&mut buf) {
-            Ok(0) => {
-                closed_after = Some(t0.elapsed());
-                break;
-            }
-            Ok(n) => panic!("answered: {}", String::from_utf8_lossy(&buf[..n])),
-            Err(_) => {}
-        }
     }
-    let closed_after = closed_after.expect("a 1 byte/s drip was never cut off");
+    let closed_after = closed_after.expect("a 1 byte / 2 s trickle was never cut off");
     assert!(
         closed_after < Duration::from_secs(9),
         "cut off only after {closed_after:?}"
     );
+    let fresh = f43_http(&addr, "GET", "/a.txt", &[]);
+    assert_eq!(fresh.0, 401, "{}", f43_status(&fresh));
+}
+
+/// F-43 (QA r1, connection cap): one source IP holds at most 8 connections; a 9th is dropped
+/// unanswered at once, and the IP is served again once its stalled heads are cut off.
+#[test]
+fn f43_per_ip_connection_cap() {
+    let (_node, addr) = f43_up("f43-perip");
+    let mut held: Vec<_> = (0..8).map(|_| f43_partial_head(&addr)).collect();
+    std::thread::sleep(Duration::from_millis(300));
+    let mut ninth = f43_partial_head(&addr);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !f43_closed(&mut ninth) {
+        assert!(
+            Instant::now() < deadline,
+            "9th connection from one IP was not dropped"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        held.iter_mut().all(|s| !f43_closed(s)),
+        "the first 8 are still open"
+    );
+    std::thread::sleep(Duration::from_secs(6));
+    let fresh = f43_http(&addr, "GET", "/a.txt", &[]);
+    assert_eq!(fresh.0, 401, "{}", f43_status(&fresh));
 }

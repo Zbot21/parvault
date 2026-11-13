@@ -944,7 +944,7 @@ mod unix_vfs {
             let join_handle = std::thread::Builder::new()
                 .name("parvault-vfs-webdav".into())
                 .spawn(move || {
-                    let active = Arc::new(AtomicUsize::new(0));
+                    let slots = Arc::new(WebdavSlots::default());
                     for conn in listener.incoming() {
                         if shutdown_cl.load(Ordering::SeqCst) {
                             break;
@@ -952,7 +952,7 @@ mod unix_vfs {
                         let Ok(stream) = conn else {
                             continue;
                         };
-                        spawn_webdav_conn(stream, &vfs, &verifier, &active);
+                        spawn_webdav_conn(stream, &vfs, &verifier, &slots);
                     }
                 })?;
 
@@ -972,12 +972,12 @@ mod unix_vfs {
             verifier: WebdavVerifier,
         ) -> io::Result<()> {
             let listener = TcpListener::bind(bind_addr)?;
-            let active = Arc::new(AtomicUsize::new(0));
+            let slots = Arc::new(WebdavSlots::default());
             for conn in listener.incoming() {
                 let Ok(stream) = conn else {
                     continue;
                 };
-                spawn_webdav_conn(stream, self, &verifier, &active);
+                spawn_webdav_conn(stream, self, &verifier, &slots);
             }
             Ok(())
         }
@@ -991,6 +991,50 @@ mod unix_vfs {
 
     /// Most WebDAV connections served at once; more are dropped unanswered (pre-auth bound).
     const WEBDAV_MAX_CONNECTIONS: usize = 64;
+    /// Most WebDAV connections served at once from one source IP, so one host cannot take every
+    /// slot (F-43 QA r1); more are dropped unanswered.
+    const WEBDAV_MAX_CONNECTIONS_PER_IP: usize = 8;
+
+    /// Connection slots of one WebDAV server: a global count and a count per source IP.
+    #[derive(Default)]
+    struct WebdavSlots {
+        active: AtomicUsize,
+        per_ip: Mutex<HashMap<IpAddr, usize>>,
+    }
+
+    impl WebdavSlots {
+        /// Takes a slot for `ip`, or `false` when the global or per-IP cap is reached.
+        fn acquire(&self, ip: Option<IpAddr>) -> bool {
+            if self.active.fetch_add(1, Ordering::SeqCst) >= WEBDAV_MAX_CONNECTIONS {
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                return false;
+            }
+            if let Some(ip) = ip {
+                let mut map = self.per_ip.lock().unwrap_or_else(|p| p.into_inner());
+                let n = map.entry(ip).or_insert(0);
+                if *n >= WEBDAV_MAX_CONNECTIONS_PER_IP {
+                    drop(map);
+                    self.active.fetch_sub(1, Ordering::SeqCst);
+                    return false;
+                }
+                *n += 1;
+            }
+            true
+        }
+
+        fn release(&self, ip: Option<IpAddr>) {
+            if let Some(ip) = ip {
+                let mut map = self.per_ip.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(n) = map.get_mut(&ip) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        map.remove(&ip);
+                    }
+                }
+            }
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
     /// Longest request head accepted (431 beyond it).
     const WEBDAV_MAX_HEAD_BYTES: usize = 8192;
     /// A client must finish its whole request head within this one deadline (dropped unanswered
@@ -1005,28 +1049,28 @@ mod unix_vfs {
     const WEBDAV_502: &[u8] =
         b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
-    /// Runs one connection on its own thread, within `WEBDAV_MAX_CONNECTIONS`.
+    /// Runs one connection on its own thread, within `WEBDAV_MAX_CONNECTIONS` overall and
+    /// `WEBDAV_MAX_CONNECTIONS_PER_IP` per source IP; over either cap it is dropped unanswered.
     fn spawn_webdav_conn(
         mut stream: TcpStream,
         vfs: &VirtualVaultFs,
         verifier: &WebdavVerifier,
-        active: &Arc<AtomicUsize>,
+        slots: &Arc<WebdavSlots>,
     ) {
-        if active.fetch_add(1, Ordering::SeqCst) >= WEBDAV_MAX_CONNECTIONS {
-            active.fetch_sub(1, Ordering::SeqCst);
+        let ip = stream.peer_addr().ok().map(|a| a.ip());
+        if !slots.acquire(ip) {
             return;
         }
-        let (vfs, verifier, active_cl) = (vfs.clone(), verifier.clone(), Arc::clone(active));
+        let (vfs, verifier, slots_cl) = (vfs.clone(), verifier.clone(), Arc::clone(slots));
         let spawned = std::thread::Builder::new()
             .name("parvault-vfs-http".into())
             .stack_size(256 * 1024)
             .spawn(move || {
-                let _ = stream.set_read_timeout(Some(WEBDAV_HEAD_TIMEOUT));
                 let _ = handle_webdav_http_conn(&mut stream, &vfs, &verifier);
-                active_cl.fetch_sub(1, Ordering::SeqCst);
+                slots_cl.release(ip);
             });
         if spawned.is_err() {
-            active.fetch_sub(1, Ordering::SeqCst);
+            slots.release(ip);
         }
     }
 
