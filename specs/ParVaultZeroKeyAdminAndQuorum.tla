@@ -154,7 +154,9 @@ ScopeRootKey == "scope_root_key"
 \* that keeps `tracker_admin.seed` on its own disk (ADR-26) loses this on a disk seizure before
 \* its epoch 1 is installed.
 CurrentCouncil == IF councilLog = <<>> THEN {} ELSE councilLog[Len(councilLog)].members
-\* An honest rotation keeps a strict honest majority (Byzantine members below the quorum).
+\* @assume honest-rotation-majority: an honest rotation keeps Byzantine members below the quorum.
+\* The model uses one constant QuorumM; the code uses each manifest's own quorum field (a strict
+\* majority of its members, checked by council_manifest_decision).
 HonestMemberChoices ==
     { m \in SUBSET Council : Cardinality(m) >= QuorumM /\ Cardinality(m \cap ByzantineCouncil) < QuorumM }
 
@@ -207,9 +209,12 @@ CouncilStep ==
 Init ==
     \* Zero-Private-Key-On-VPS: VPS disk holds transport & per-node HMAC keys ONLY;
     \* ZERO Council private keys (`PrivKey(c)`) exist on the VPS filesystem.
-    \* @structural no-admin-key-persist: no code path writes a council key to the seed's disk
+    \* @structural no-admin-key-persist: a seed given `--admin-rpc-pubkey` writes no admin key to its disk
     \* @structural no-admin-key-persist: holds by construction; traced to test trust_enforcement::admin_key_never_persisted_on_seed
-    \* (`tracker_admin.seed` is never auto-generated); vpsDiskSecrets is fixed data.
+    \* That test covers the explicit-key case only. A persistent seed started WITHOUT
+    \* `--admin-rpc-pubkey` generates `tracker_admin.seed` on its disk (parvault-seed.rs,
+    \* load_or_generate_tracker_admin_identity) and roots its council on that key: F-53, outside
+    \* this model (see @assume scope-root-key-honest). vpsDiskSecrets is fixed data.
     /\ vpsDiskSecrets = {<<"vps_secret", "transport_seed">>, <<"vps_secret", "eviction_hmac_seed">>}
     /\ vpsCompromised = FALSE
     \* Any subset of the (at most QuorumM - 1) Byzantine councilors is corrupt (P-03).

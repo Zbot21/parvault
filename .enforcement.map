@@ -81,7 +81,7 @@ waive      TM-W-ORIGIN      inv=specs/ParVaultAnonymity.tla::Safety_ZeroOriginLe
 waive      TM-W-DRAIN       inv=specs/ParVaultBootstrapAndEarnedTier.tla::Safety_SeedAnchorsDrainAtOrganicThreshold reason=structural: seed shards = MaxOrganicPeers - organic by construction
 waive      TM-W-DAY1        inv=specs/ParVaultBootstrapAndEarnedTier.tla::Safety_Day1ToScaleDataAvailability reason=structural: recoverable = TierN(tier), TierK < TierN tables
 waive      TM-W-ZK-TYPE     inv=specs/ParVaultZeroKeyAdminAndQuorum.tla::TypeOK reason=type invariant, not a security property; TM-NONCE also violates it (without the nonce guard, nonce 0, meaning no challenge, is accepted and recorded)
-waive      TM-W-VPS-KEY     inv=specs/ParVaultZeroKeyAdminAndQuorum.tla::Safety_ZeroAdminPrivKeyOnVpsDisk reason=structural no-admin-key-persist + assume byzantine-below-quorum
+waive      TM-W-VPS-KEY     inv=specs/ParVaultZeroKeyAdminAndQuorum.tla::Safety_ZeroAdminPrivKeyOnVpsDisk reason=structural no-admin-key-persist for a seed given --admin-rpc-pubkey (its test covers that case only) + assume byzantine-below-quorum; a seed without it generates tracker_admin.seed on disk as its council scope root (F-53, open, not modelled)
 waive      TM-W-SUBNET-CAP  inv=specs/ParVaultConfidentialityAndTrust.tla::Safety_SubnetTrustCapsEnforced reason=assume placement-trust-cap: select_trust_weighted_peers has no production caller in v0.5.0
 waive      TM-W-LITE-TYPE   inv=specs/ParVaultLiteClientAndSeedFailover.tla::TypeOK reason=structural: type invariant
 waive      TM-W-NAS-DEATH   inv=specs/ParVaultLiteClientAndSeedFailover.tla::NasDeathSurvivableInvariant reason=assume mesh-churn-stops-at-k (MeshPeerChurn; threat model, no Rust check)
