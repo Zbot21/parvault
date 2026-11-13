@@ -424,7 +424,8 @@ mod unix_impl {
                         let peer_uid = crate::os_sys::peer_socket_ucred(stream.as_fd())
                             .ok()
                             .map(|u| u.uid);
-                        if !engine.is_peer_uid_allowed(peer_uid) {
+                        if let Err(code) = engine.peer_uid_decision(peer_uid) {
+                            tracing::warn!(code, ?peer_uid, "refused a gateway client by peer UID");
                             drop(stream);
                             continue;
                         }
@@ -467,7 +468,8 @@ mod unix_impl {
                         let peer_uid = crate::os_sys::peer_socket_ucred(stream.as_fd())
                             .ok()
                             .map(|u| u.uid);
-                        if !self.engine.is_peer_uid_allowed(peer_uid) {
+                        if let Err(code) = self.engine.peer_uid_decision(peer_uid) {
+                            tracing::warn!(code, ?peer_uid, "refused a gateway client by peer UID");
                             drop(stream);
                             continue;
                         }
@@ -500,11 +502,10 @@ mod unix_impl {
                         message: "StorePayload missing SCM_RIGHTS payload_fd".into(),
                     };
                 };
-                if engine.require_sealed_ingest_memfd()
-                    && !crate::os_sys::has_immutable_memfd_seals(owned_fd.as_fd()).unwrap_or(false)
-                {
+                if let Err(code) = engine.ingest_seal_decision(owned_fd.as_fd()) {
+                    tracing::warn!(code, "refused an unsealed ingest memfd");
                     return IpcResponse::Error {
-                        message: "unsealed ingest memfd rejected (F_SEAL_WRITE|F_SEAL_SHRINK|F_SEAL_GROW required)".into(),
+                        message: format!("unsealed ingest memfd rejected (F_SEAL_WRITE|F_SEAL_SHRINK|F_SEAL_GROW required): {code}"),
                     };
                 }
                 let (stored, local_only_stripes) = crate::storage::local_only::track(|| {
@@ -1223,10 +1224,10 @@ mod unix_impl {
 
         fn ensure_in_process_peer_uid(engine: &GatewayEngine) -> io::Result<()> {
             let uid = Some(crate::os_sys::geteuid());
-            if !engine.is_peer_uid_allowed(uid) {
+            if let Err(code) = engine.peer_uid_decision(uid) {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    format!("peer UID {uid:?} rejected by strict_allowed_peer_uids policy"),
+                    format!("peer UID {uid:?} rejected by strict_allowed_peer_uids policy: {code}"),
                 ));
             }
             Ok(())
@@ -1244,12 +1245,11 @@ mod unix_impl {
                 Self::InProcess(engine) => {
                     Self::ensure_in_process_peer_uid(engine)?;
                     let dup = crate::os_sys::dup_fd_cloexec(payload_fd)?;
-                    if engine.require_sealed_ingest_memfd()
-                        && !crate::os_sys::has_immutable_memfd_seals(dup.as_fd()).unwrap_or(false)
-                    {
+                    if let Err(code) = engine.ingest_seal_decision(dup.as_fd()) {
+                        tracing::warn!(code, "refused an unsealed ingest memfd");
                         return Err(io::Error::new(
                             io::ErrorKind::PermissionDenied,
-                            "unsealed ingest memfd rejected (F_SEAL_WRITE|F_SEAL_SHRINK|F_SEAL_GROW required)",
+                            format!("unsealed ingest memfd rejected (F_SEAL_WRITE|F_SEAL_SHRINK|F_SEAL_GROW required): {code}"),
                         ));
                     }
                     engine
