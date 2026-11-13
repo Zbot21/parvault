@@ -124,6 +124,8 @@ pub enum IpcCommand {
     FetchPayload {
         ephemeral_shard_ids: Vec<[u8; 32]>,
         output_fd: RawFd,
+        /// Checked like `FetchRange`'s, against the whole file (F-47, item 3). Appended.
+        macaroon: Option<CapabilityMacaroon>,
     },
     FetchRange {
         manifest: EphemeralShardManifest,
@@ -524,6 +526,7 @@ mod unix_impl {
             }
             IpcCommand::FetchPayload {
                 ephemeral_shard_ids,
+                macaroon,
                 ..
             } => {
                 let Some(owned_fd) = maybe_fd else {
@@ -531,7 +534,12 @@ mod unix_impl {
                         message: "FetchPayload missing SCM_RIGHTS output_fd".into(),
                     };
                 };
-                match engine.fetch_by_shard_ids_to_owned_fd(&ephemeral_shard_ids, owned_fd) {
+                match engine.fetch_by_shard_ids_to_owned_fd_with_peer_uid(
+                    &ephemeral_shard_ids,
+                    macaroon.as_ref(),
+                    peer_uid,
+                    owned_fd,
+                ) {
                     Ok(bytes_streamed) => IpcResponse::FetchSuccess { bytes_streamed },
                     Err(e) => IpcResponse::Error {
                         message: format!("FetchPayload failed: {e}"),
@@ -770,10 +778,12 @@ mod unix_impl {
             &self,
             ephemeral_shard_ids: Vec<[u8; 32]>,
             output_fd: RawFd,
+            macaroon: Option<CapabilityMacaroon>,
         ) -> anyhow::Result<u64> {
             let cmd = IpcCommand::FetchPayload {
                 ephemeral_shard_ids,
                 output_fd,
+                macaroon,
             };
             match self.send_command(&cmd, Some(output_fd)).await? {
                 IpcResponse::FetchSuccess { bytes_streamed } => Ok(bytes_streamed),
@@ -936,10 +946,12 @@ mod unix_impl {
             &self,
             ephemeral_shard_ids: Vec<[u8; 32]>,
             output_fd: RawFd,
+            macaroon: Option<CapabilityMacaroon>,
         ) -> io::Result<u64> {
             let cmd = IpcCommand::FetchPayload {
                 ephemeral_shard_ids,
                 output_fd,
+                macaroon,
             };
             match self.send_request_sync(&cmd, Some(output_fd))? {
                 IpcResponse::FetchSuccess { bytes_streamed } => Ok(bytes_streamed),
@@ -948,6 +960,21 @@ mod unix_impl {
                     "unexpected IPC response: {other:?}"
                 ))),
             }
+        }
+
+        /// Fetches a whole file (`FetchPayload`) into a fresh memfd and returns its bytes.
+        pub fn fetch_payload_bytes(
+            &self,
+            ephemeral_shard_ids: Vec<[u8; 32]>,
+            macaroon: Option<CapabilityMacaroon>,
+        ) -> io::Result<Vec<u8>> {
+            let mfd = create_memfd("parvault-payload")?;
+            let streamed = self.fetch_into_memfd(ephemeral_shard_ids, mfd.as_raw_fd(), macaroon)?;
+            let mut file = File::from(mfd);
+            file.seek(SeekFrom::Start(0))?;
+            let mut buf = vec![0u8; streamed as usize];
+            file.read_exact(&mut buf)?;
+            Ok(buf)
         }
 
         /// Fetches a targeted `[offset .. offset + len]` byte range into `output_fd` via `SCM_RIGHTS`.
@@ -1146,6 +1173,7 @@ mod unix_impl {
             &self,
             ephemeral_shard_ids: Vec<[u8; 32]>,
             output_fd: RawFd,
+            macaroon: Option<CapabilityMacaroon>,
         ) -> anyhow::Result<u64> {
             match self {
                 Self::InProcess(engine) => {
@@ -1153,14 +1181,19 @@ mod unix_impl {
                     let dup = crate::os_sys::dup_fd_cloexec(output_fd)?;
                     let eng = Arc::clone(engine);
                     tokio::task::spawn_blocking(move || {
-                        eng.fetch_by_shard_ids_to_owned_fd(&ephemeral_shard_ids, dup)
+                        eng.fetch_by_shard_ids_to_owned_fd_with_peer_uid(
+                            &ephemeral_shard_ids,
+                            macaroon.as_ref(),
+                            Some(crate::os_sys::geteuid()),
+                            dup,
+                        )
                     })
                     .await
                     .map_err(|e| anyhow::anyhow!("in-process FetchPayload join error: {e}"))?
                 }
                 Self::UnixSocket(client) => {
                     client
-                        .fetch_payload_to_fd(ephemeral_shard_ids, output_fd)
+                        .fetch_payload_to_fd(ephemeral_shard_ids, output_fd, macaroon)
                         .await
                 }
             }
@@ -1290,16 +1323,24 @@ mod unix_impl {
             &self,
             ephemeral_shard_ids: Vec<[u8; 32]>,
             output_fd: RawFd,
+            macaroon: Option<CapabilityMacaroon>,
         ) -> io::Result<u64> {
             match self {
                 Self::InProcess(engine) => {
                     Self::ensure_in_process_peer_uid(engine)?;
                     let dup = crate::os_sys::dup_fd_cloexec(output_fd)?;
                     engine
-                        .fetch_by_shard_ids_to_owned_fd(&ephemeral_shard_ids, dup)
+                        .fetch_by_shard_ids_to_owned_fd_with_peer_uid(
+                            &ephemeral_shard_ids,
+                            macaroon.as_ref(),
+                            Some(crate::os_sys::geteuid()),
+                            dup,
+                        )
                         .map_err(|e| io::Error::other(format!("FetchPayload failed: {e}")))
                 }
-                Self::UnixSocket(client) => client.fetch_into_memfd(ephemeral_shard_ids, output_fd),
+                Self::UnixSocket(client) => {
+                    client.fetch_into_memfd(ephemeral_shard_ids, output_fd, macaroon)
+                }
             }
         }
 
@@ -1354,6 +1395,37 @@ mod unix_impl {
                 }
                 Self::UnixSocket(client) => {
                     client.fetch_range_bytes(manifest, offset, len, macaroon)
+                }
+            }
+        }
+
+        /// Fetches a whole file (`FetchPayload`) synchronously and returns its bytes; the token is
+        /// checked against the whole file (F-47).
+        pub fn fetch_payload_bytes_sync(
+            &self,
+            ephemeral_shard_ids: Vec<[u8; 32]>,
+            macaroon: Option<CapabilityMacaroon>,
+        ) -> io::Result<Vec<u8>> {
+            match self {
+                Self::InProcess(engine) => {
+                    let mfd = create_memfd("parvault-payload")?;
+                    let dup = crate::os_sys::dup_fd_cloexec(mfd.as_raw_fd())?;
+                    let streamed = engine
+                        .fetch_by_shard_ids_to_owned_fd_with_peer_uid(
+                            &ephemeral_shard_ids,
+                            macaroon.as_ref(),
+                            Some(crate::os_sys::geteuid()),
+                            dup,
+                        )
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    let mut file = File::from(mfd);
+                    file.seek(SeekFrom::Start(0))?;
+                    let mut buf = vec![0u8; streamed as usize];
+                    file.read_exact(&mut buf)?;
+                    Ok(buf)
+                }
+                Self::UnixSocket(client) => {
+                    client.fetch_payload_bytes(ephemeral_shard_ids, macaroon)
                 }
             }
         }

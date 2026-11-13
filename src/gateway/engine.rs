@@ -760,7 +760,58 @@ mod unix_engine {
             ephemeral_shard_ids: &[[u8; 32]],
             output_fd: OwnedFd,
         ) -> anyhow::Result<u64> {
+            self.fetch_by_shard_ids_to_owned_fd_with_peer_uid(
+                ephemeral_shard_ids,
+                None,
+                Some(crate::os_sys::geteuid()),
+                output_fd,
+            )
+        }
+
+        /// `FetchPayload` (F-47, item 3): the peer UID and any macaroon are checked exactly as
+        /// for `FetchRange`, against the whole file, before any block-store read. The manifest
+        /// is resolved from the RAM index first, since its root and size are the caveat context.
+        pub fn fetch_by_shard_ids_to_owned_fd_with_peer_uid(
+            &self,
+            ephemeral_shard_ids: &[[u8; 32]],
+            macaroon: Option<&CapabilityMacaroon>,
+            peer_uid: Option<u32>,
+            output_fd: OwnedFd,
+        ) -> anyhow::Result<u64> {
+            if let Err(code) = self.peer_uid_decision(peer_uid) {
+                tracing::warn!(code, ?peer_uid, "refused a gateway read from a peer UID");
+                anyhow::bail!(
+                    "peer UID {:?} rejected by strict_allowed_peer_uids policy: {code}",
+                    peer_uid
+                );
+            }
             let fm = self.resolve_manifest_by_shard_ids(ephemeral_shard_ids)?;
+            let required_key = self.macaroon_root_key.read().ok().and_then(|guard| *guard);
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let ctx = AccessRequestContext {
+                manifest_root: fm.file_merkle_root,
+                offset: 0,
+                length: fm.original_file_size,
+                is_write: false,
+                now_unix_ms: now_ms,
+                peer_uid,
+            };
+            let facts = crate::gateway::engine::GatewayMacaroonFacts {
+                root_key_set: required_key.is_some(),
+                token_present: macaroon.is_some(),
+                tag_valid: match (required_key.as_ref(), macaroon) {
+                    (Some(key), Some(token)) => token.tag_valid(key),
+                    _ => false,
+                },
+                caveats_allow: macaroon.is_some_and(|t| t.evaluate_caveats(&ctx)),
+            };
+            if let Err(code) = crate::gateway::engine::gateway_macaroon_decision(&facts) {
+                tracing::warn!(code, "refused a gateway full-file fetch");
+                anyhow::bail!("Macaroon capability rejected: {code}");
+            }
             self.stream_manifest_range_to_fd(&fm, 0, fm.original_file_size, output_fd)
         }
 

@@ -6204,3 +6204,59 @@ fn f41_signed_delete_after_restart() {
     let resp = send(&sender, &node, blinded_delete(&b, &cap, host, now_ms()));
     assert!(blinded_deleted(&resp), "{resp:?}\n{}", node.log_text());
 }
+
+// --- F-47 (item 3): FetchPayload carries a macaroon, checked like FetchRange ---------------------
+
+fn gw_manifest_token(root: [u8; 32]) -> parvault::capabilities::CapabilityMacaroon {
+    gw_token(vec![
+        parvault::capabilities::Caveat::ReadOnly,
+        parvault::capabilities::Caveat::AllowedManifest(root),
+    ])
+}
+
+/// F-47 accept: a token scoped to this file's manifest fetches the whole file.
+#[test]
+fn gpay_in_scope_token_fetches_file() {
+    let (_node, sock) = gw_up("gpay-ok", &[], Some(GW_KEY));
+    let data = vec![0x47; 64 * 1024];
+    let manifest = gw_store(&sock, &data, false).unwrap();
+    let bus = parvault::gateway::GatewayBus::unix_socket(&sock);
+    let got = bus
+        .fetch_payload_bytes_sync(
+            manifest.shard_hashes.clone(),
+            Some(gw_manifest_token(manifest.file_merkle_root)),
+        )
+        .unwrap();
+    assert_eq!(got, data);
+    gate_ran("trust_enforcement::gpay_in_scope_token_fetches_file");
+}
+
+/// F-47 reject: a token scoped to another manifest cannot fetch this file in full.
+#[test]
+fn gpay_other_manifest_token_refused() {
+    let (node, sock) = gw_up("gpay-out", &[], Some(GW_KEY));
+    let data = vec![0x48; 64 * 1024];
+    let manifest = gw_store(&sock, &data, false).unwrap();
+    let bus = parvault::gateway::GatewayBus::unix_socket(&sock);
+    assert!(bus
+        .fetch_payload_bytes_sync(
+            manifest.shard_hashes.clone(),
+            Some(gw_manifest_token([0xEE; 32]))
+        )
+        .is_err());
+    assert_logged(&node, "reject.gateway_macaroon_caveat");
+    gate_ran("trust_enforcement::gpay_other_manifest_token_refused");
+}
+
+/// F-47: with a root key set, a FetchPayload with no token is refused.
+#[test]
+fn gpay_missing_token_refused() {
+    let (node, sock) = gw_up("gpay-none", &[], Some(GW_KEY));
+    let data = vec![0x49; 64 * 1024];
+    let manifest = gw_store(&sock, &data, false).unwrap();
+    let bus = parvault::gateway::GatewayBus::unix_socket(&sock);
+    assert!(bus
+        .fetch_payload_bytes_sync(manifest.shard_hashes.clone(), None)
+        .is_err());
+    assert_logged(&node, "reject.gateway_macaroon_missing");
+}

@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Security
+- **Whole-file gateway reads need a token (F-47).** `IpcCommand::FetchPayload` carries a macaroon checked against the whole file like `FetchRange` (manifest scope, range, expiry, peer UID); with a gateway root key set, a missing or out-of-scope token is refused. **Breaking (gateway protocol and library):** the `macaroon` field is appended to `FetchPayload`; `GatewayIpcClient::fetch_into_memfd`, `fetch_payload_to_fd` and `GatewayBus::fetch_into_memfd_sync` take a `macaroon` argument; new `fetch_payload_bytes(_sync)`.
 - **Ticket PoW is bounded on both sides (QA 2c D1, R2).** A client refuses a peer's ticket PoW demand above its own level + 4 bits (cap 20, `reject.ticket_pow_demand_excessive`) instead of minting forever, and a seed's admin RPC refuses `min_public_pow_bits` above 16 (`reject.required_pow_bits_excessive`), so an operator cannot lock out every new public client.
 - **Public status is coarse (F-44).** `QueryNodeStatus` reports free space rounded down to whole MiB, used space in power-of-two GiB buckets and SLA to one decimal, not exact values.
 - **Gateway identity statements are pinned (F-17).** `GatewayIdentityStatement::verify(now)` is replaced by `verify_pinned(expected_authority, now)`, which refuses another authority and a lifetime outside `(0, 30 days]`. **Breaking (library):** callers (the suite broker) must pin their authority.

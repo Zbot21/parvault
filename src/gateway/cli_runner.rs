@@ -650,7 +650,7 @@ async fn run_ipc_roundtrip_probe(
     let out_file = std::fs::File::from(out_mfd);
     let t_restore = Instant::now();
     let restored_bytes = client
-        .fetch_payload_to_fd(manifest.shard_hashes.clone(), out_file.as_raw_fd())
+        .fetch_payload_to_fd(manifest.shard_hashes.clone(), out_file.as_raw_fd(), None)
         .await?;
     let restore_ms = t_restore.elapsed().as_secs_f64() * 1000.0;
     anyhow::ensure!(
@@ -812,7 +812,7 @@ pub async fn execute_gateway_cli(
                 let out_mfd = create_memfd("selftest-out")?;
                 let out_file = std::fs::File::from(out_mfd);
                 let streamed = bus
-                    .fetch_payload_to_fd(manifest.shard_hashes.clone(), out_file.as_raw_fd())
+                    .fetch_payload_to_fd(manifest.shard_hashes.clone(), out_file.as_raw_fd(), None)
                     .await?;
                 assert_eq!(streamed, sample.len() as u64);
                 let mut roundtrip = vec![0u8; sample.len()];

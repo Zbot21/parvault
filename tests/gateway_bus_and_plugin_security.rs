@@ -181,19 +181,36 @@ async fn test_gateway_bus_in_process_vs_unix_socket_bit_for_bit_parity() {
         &payload[slice_off as usize..(slice_off + slice_len) as usize]
     );
 
-    // Full-file FetchPayload + QueryHealthStatus parity:
+    // Full-file FetchPayload + QueryHealthStatus parity (F-47: a whole-file token per manifest):
+    let full_tok = |root: [u8; 32]| {
+        CapabilityMacaroon::mint(
+            &root_key,
+            [0xAA; 32],
+            [0xBB; 32],
+            vec![Caveat::AllowedManifest(root), Caveat::ReadOnly],
+        )
+        .unwrap()
+    };
     let full_a = File::from(create_memfd_sized("full-a", payload.len() as u64).unwrap());
     let full_b = File::from(create_memfd_sized("full-b", payload.len() as u64).unwrap());
     assert_eq!(
         bus_inproc
-            .fetch_payload_to_fd(man_inproc.shard_hashes.clone(), full_a.as_raw_fd())
+            .fetch_payload_to_fd(
+                man_inproc.shard_hashes.clone(),
+                full_a.as_raw_fd(),
+                Some(full_tok(man_inproc.file_merkle_root)),
+            )
             .await
             .unwrap(),
         payload.len() as u64
     );
     assert_eq!(
         bus_sock
-            .fetch_payload_to_fd(man_sock.shard_hashes.clone(), full_b.as_raw_fd())
+            .fetch_payload_to_fd(
+                man_sock.shard_hashes.clone(),
+                full_b.as_raw_fd(),
+                Some(full_tok(man_sock.file_merkle_root)),
+            )
             .await
             .unwrap(),
         payload.len() as u64

@@ -67,7 +67,7 @@ Every request (`IpcCommand`) and response (`IpcResponse`) over `/var/run/parvaul
 | Variant | Discriminant (`u32` LE) | `SCM_RIGHTS` FD | Purpose |
 | :--- | :--- | :--- | :--- |
 | `IpcCommand::StorePayload { payload_fd: i32, bytes_len: u64, retention_policy: RetentionPolicy }` | `0` | **Required** (readable `memfd`, sealed when `--require-sealed-memfd` is active) | Streams `bytes_len` plaintext bytes in `1 MiB` stripes (`pread`), encrypts (`AES-256-GCM`), and shards (`GF(2^8)`). |
-| `IpcCommand::FetchPayload { ephemeral_shard_ids: Vec<[u8; 32]>, output_fd: i32 }` | `1` | **Required** (writable `memfd` / file) | Reconstructs and decrypts the full file directly into `output_fd` (`pwrite`). |
+| `IpcCommand::FetchPayload { ephemeral_shard_ids: Vec<[u8; 32]>, output_fd: i32, macaroon: Option<CapabilityMacaroon> }` | `1` | **Required** (writable `memfd` / file) | Verifies `macaroon` against the whole file (manifest, range, expiry, peer UID) like `FetchRange`, then reconstructs and decrypts the full file into `output_fd` (`pwrite`). With a gateway root key set, a missing token is refused (F-47). The `macaroon` field is appended in v0.5.0. |
 | `IpcCommand::FetchRange { manifest: EphemeralShardManifest, offset: u64, len: u64, output_fd: i32, macaroon: Option<CapabilityMacaroon> }` | `2` | **Required** (writable `memfd` / file) | Verifies `macaroon` in `< 1 ms` RAM (including `SO_PEERCRED` UID) and streams `[offset .. offset + len]` into `output_fd`. |
 | `IpcCommand::RegisterManifest { file_manifest: FileManifest }` | `3` | None | Indexes an existing or virtual `FileManifest` in gateway RAM and returns its `EphemeralShardManifest`. |
 | `IpcCommand::QueryHealthStatus` | `4` | None | Returns live `(iops, peer_count, por_sla_score)` telemetry. |
