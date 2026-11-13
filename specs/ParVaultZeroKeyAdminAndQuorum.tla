@@ -42,7 +42,7 @@ ASSUME
     /\ HonestCouncil \cap ByzantineCouncil = {}
     /\ StrangerSigners \cap Council = {}
     /\ HomelabOwner \notin AllSigners
-    /\ Cardinality(ByzantineCouncil) = QuorumM - 1
+    /\ Cardinality(ByzantineCouncil) <= QuorumM - 1   \* @assume byzantine-below-quorum (which of them are corrupt is chosen in Init)
     /\ Cardinality(HonestCouncil) >= QuorumM
     /\ MaxNonces >= 2
 
@@ -109,7 +109,12 @@ ValidDistinctSigners(ord, authoritySet) ==
     { s \in authoritySet : \E slot \in Slots : <<slot, s, ord.target>> \in ord.sigs }
 
 OrderMeetsCouncilQuorum(ord) ==
-    Cardinality(ValidDistinctSigners(ord, Council)) >= QuorumM
+    Cardinality(ValidDistinctSigners(ord, Council)) >= QuorumM   \* @guard quorum-count sym=src/storage/council.rs::council_manifest_decision
+
+\* The admin RPC compares the request's nonce with the connection's single active challenge
+\* (`validate_admin_rpc_slice_replay_and_auth_meta`, src/admin_rpc.rs).
+ChallengeMatches(nonce) == activeChallenge > 0 /\ nonce = activeChallenge   \* @guard nonce-fresh sym=src/admin_rpc.rs::validate_admin_rpc_slice_replay_and_auth_meta
+OrderIdFresh(id) == id \notin seenOrderIds   \* @guard order-id-fresh sym=src/storage/eviction.rs::order_admission_decision
 
 OrderMeetsPrivateRingAuth(ord) ==
     Cardinality(ValidDistinctSigners(ord, {HomelabOwner})) >= 1
@@ -117,9 +122,12 @@ OrderMeetsPrivateRingAuth(ord) ==
 Init ==
     \* Zero-Private-Key-On-VPS: VPS disk holds transport & per-node HMAC keys ONLY;
     \* ZERO Council private keys (`PrivKey(c)`) exist on the VPS filesystem.
+    \* @structural no-admin-key-persist: no code path writes a council key to the seed's disk
+    \* (`tracker_admin.seed` is never auto-generated); vpsDiskSecrets is fixed data.
     /\ vpsDiskSecrets = {<<"vps_secret", "transport_seed">>, <<"vps_secret", "eviction_hmac_seed">>}
     /\ vpsCompromised = FALSE
-    /\ attackerKeys = { PrivKey(s) : s \in (ByzantineCouncil \cup StrangerSigners) }
+    \* Any subset of the (at most QuorumM - 1) Byzantine councilors is corrupt (P-03).
+    /\ attackerKeys \in { { PrivKey(s) : s \in (B \cup StrangerSigners) } : B \in SUBSET ByzantineCouncil }
     /\ activeChallenge = 0
     /\ nextNonce = 1
     /\ consumedNonces = {}
@@ -217,10 +225,10 @@ SeedIssueFreshAdminChallenge ==
 
 \* 7. Honest operator submits co-signed `HonestAbuseOrder` over `admin_rpc` using fresh `activeChallenge`.
 HonestSubmitQuorumOrderViaAdminRpc ==
-    /\ activeChallenge > 0
+    /\ ChallengeMatches(activeChallenge)
     /\ activeChallenge \notin consumedNonces
     /\ OrderMeetsCouncilQuorum(HonestAbuseOrder)
-    /\ HonestAbuseOrder.id \notin seenOrderIds
+    /\ OrderIdFresh(HonestAbuseOrder.id)
     /\ consumedNonces' = consumedNonces \cup {activeChallenge}
     /\ acceptedRpcNonces' = Append(acceptedRpcNonces, activeChallenge)
     /\ activeChallenge' = 0
@@ -247,7 +255,7 @@ AdversarySubmitForgedOrderViaAdminRpc ==
         /\ acceptedRpcNonces' = Append(acceptedRpcNonces, activeChallenge)
         /\ activeChallenge' = 0
         /\ advRpcSubmissions' = advRpcSubmissions + 1
-        /\ IF OrderMeetsCouncilQuorum(ord) /\ ord.id \notin seenOrderIds
+        /\ IF OrderMeetsCouncilQuorum(ord) /\ OrderIdFresh(ord.id)
            THEN /\ seenOrderIds' = seenOrderIds \cup {ord.id}
                 /\ appliedOrderLog' = Append(appliedOrderLog, ord.id)
                 /\ publicSwarmEvicted' = publicSwarmEvicted \cup {ord.target}
@@ -256,22 +264,28 @@ AdversarySubmitForgedOrderViaAdminRpc ==
                    rejectedReplays, confirmedAbuseTargets, honestOrderSigs,
                    forgedOrderBuilt, tamperedOrderBuilt, privateRingEvicted>>
 
-\* 9. Adversary attempts to replay an already-consumed `challenge_nonce` or already-seen `order_id`:
-\*    strictly rejected by single-use challenge check and `seen_order_ids` FIFO!
+\* 9. Adversary replays a captured quorum order over `admin_rpc` with any nonce it has seen
+\*    (a consumed one, or the connection's current challenge). Accepted only through both
+\*    guards: the nonce must be the active challenge and the order id must be fresh.
 AdversaryAttemptReplay ==
     /\ rejectedReplays < 2
-    /\ (consumedNonces # {} \/ seenOrderIds # {})
-    /\ ( /\ \E oldNonce \in consumedNonces :
-             \* Replay of consumed nonce never matches `activeChallenge > 0 /\ activeChallenge \notin consumedNonces`
-             /\ ~(oldNonce = activeChallenge /\ oldNonce \notin consumedNonces)
-         \/ \E seenId \in seenOrderIds :
-             /\ ~(seenId \notin seenOrderIds) )
-    /\ rejectedReplays' = rejectedReplays + 1
-    /\ UNCHANGED <<vpsDiskSecrets, vpsCompromised, attackerKeys, activeChallenge, nextNonce,
-                   consumedNonces, acceptedRpcNonces, advRpcSubmissions,
+    /\ activeChallenge > 0
+    /\ OrderMeetsCouncilQuorum(HonestAbuseOrder)
+    /\ \E nonce \in consumedNonces \cup {activeChallenge} :
+        IF ChallengeMatches(nonce) /\ OrderIdFresh(HonestAbuseOrder.id)
+        THEN /\ consumedNonces' = consumedNonces \cup {nonce}
+             /\ acceptedRpcNonces' = Append(acceptedRpcNonces, nonce)
+             /\ activeChallenge' = 0
+             /\ seenOrderIds' = seenOrderIds \cup {HonestAbuseOrder.id}
+             /\ appliedOrderLog' = Append(appliedOrderLog, HonestAbuseOrder.id)
+             /\ publicSwarmEvicted' = publicSwarmEvicted \cup {HonestAbuseOrder.target}
+             /\ UNCHANGED rejectedReplays
+        ELSE /\ rejectedReplays' = rejectedReplays + 1
+             /\ UNCHANGED <<consumedNonces, acceptedRpcNonces, activeChallenge, seenOrderIds,
+                            appliedOrderLog, publicSwarmEvicted>>
+    /\ UNCHANGED <<vpsDiskSecrets, vpsCompromised, attackerKeys, nextNonce, advRpcSubmissions,
                    confirmedAbuseTargets, honestOrderSigs, forgedOrderBuilt,
-                   tamperedOrderBuilt, seenOrderIds, appliedOrderLog,
-                   publicSwarmEvicted, privateRingEvicted>>
+                   tamperedOrderBuilt, privateRingEvicted>>
 
 \* 10. Cross-mode broadcast check (`ADR-19` Strict Mode Isolation):
 \*     Even a valid `M-of-N` Public Tracker Council order sent to a `HomelabRedundancyVault`

@@ -120,14 +120,14 @@ tlc.generated.ParVaultAnonymity = 2,742
 tlc.generated.ParVaultPostQuantum = 3,514
 tlc.generated.ParVaultBootstrapAndEarnedTier = 331
 tlc.generated.ParVaultLiteClientAndSeedFailover = 212
-tlc.generated.ParVaultZeroKeyAdminAndQuorum = 2,325
+tlc.generated.ParVaultZeroKeyAdminAndQuorum = 3,434
 tlc.distinct.ParVaultProtocol = 3,040
 tlc.distinct.ParVaultConfidentialityAndTrust = 944
 tlc.distinct.ParVaultAnonymity = 441
 tlc.distinct.ParVaultPostQuantum = 927
 tlc.distinct.ParVaultBootstrapAndEarnedTier = 136
 tlc.distinct.ParVaultLiteClientAndSeedFailover = 95
-tlc.distinct.ParVaultZeroKeyAdminAndQuorum = 480
+tlc.distinct.ParVaultZeroKeyAdminAndQuorum = 832
 tlc.depth.ParVaultZeroKeyAdminAndQuorum = 14
 
 # --- Latest PUBLISHED release ----------------------------------------------------
@@ -146,9 +146,9 @@ kani_pass_compact = 28/28
 kani_harnesses.capabilities = 1
 kani_harnesses.aes = 1
 kani_harnesses.reed_solomon = 1
-tla_specs = 8
+tla_specs = 7
 wire_request_variants = 23
-tla_pass = 8 / 8
+tla_pass = 7 / 7
 adr_count = 33
 adr_last = ADR-33
 tests_unit = 106
@@ -173,6 +173,6 @@ bench.soc.headroom_32m = 22.26 MiB
 bench.soc.headroom_48m = 38.26 MiB
 bench.soc.vmhwm_reduction = 5.9x
 aes.enc.span = 496.5–589.2 MiB/s
-tlc.generated = 72,451
-tlc.distinct = 6,063
+tlc.generated = 73,560
+tlc.distinct = 6,415
 # <<< end generated
