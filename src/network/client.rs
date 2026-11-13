@@ -2807,6 +2807,34 @@ impl MeshClient {
         tier: ErasureTier,
         session_key: [u8; 32],
     ) -> anyhow::Result<Vec<String>> {
+        let placed = self.distribute_stripe_shards_partial(
+            owner_identity,
+            owner_peer_id,
+            shard_set,
+            tier,
+            session_key,
+        )?;
+        placed
+            .into_iter()
+            .enumerate()
+            .map(|(idx, peer)| {
+                peer.ok_or_else(|| {
+                    anyhow::anyhow!("failed to store shard {idx} on any reachable mesh peer")
+                })
+            })
+            .collect()
+    }
+
+    /// Like [`Self::distribute_stripe_shards`], but a shard no peer accepted is `None` instead of
+    /// failing the stripe, so the caller keeps the shards already placed on peers (QA 2e M2).
+    pub fn distribute_stripe_shards_partial(
+        &self,
+        owner_identity: &NodeIdentity,
+        owner_peer_id: &str,
+        shard_set: &StripeShardSet,
+        tier: ErasureTier,
+        session_key: [u8; 32],
+    ) -> anyhow::Result<Vec<Option<String>>> {
         let raw_peers = if !self.peers.is_empty() && self.discovery_data_dir.is_none() {
             self.peers
                 .iter()
@@ -3036,10 +3064,7 @@ impl MeshClient {
                 }
             }
 
-            let chosen = primary_peer.ok_or_else(|| {
-                anyhow::anyhow!("failed to store shard {idx} on any reachable mesh peer")
-            })?;
-            assigned_peers.push(chosen);
+            assigned_peers.push(primary_peer);
         }
 
         Ok(assigned_peers)

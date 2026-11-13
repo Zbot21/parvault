@@ -2764,6 +2764,21 @@ fn d1_gateway_store_with_only_non_ring_peers_stays_local() {
     let node = d1_up_with_pins("d1-only-node", &[&other]);
     assert!(shard_files(&node.dir) > 0, "stored locally");
     assert_eq!(shard_files(&other.dir), 0, "nothing on the non-ring peer");
+    // R3-1: the long-running mode says the data is not backed up and records the stripes.
+    let log = node.log_text();
+    assert!(
+        log.contains("kept only on this machine: NOT backed up"),
+        "{log}"
+    );
+    let listed = std::fs::read_to_string(
+        node.dir
+            .join(parvault::storage::local_only::LOCAL_ONLY_STRIPES_FILE),
+    )
+    .unwrap_or_default();
+    assert!(
+        listed.lines().any(|l| l.len() == 64),
+        "local-only list: {listed:?}"
+    );
 }
 
 /// R3-1: runs `watch-folder --once` on a ring node whose only pinned peer belongs to another
@@ -2908,4 +2923,103 @@ fn f37_ring_node_admits_real_chain() {
     let member = NodeIdentity::generate();
     let resp = handshake(&member, &node, chain_for(&member));
     assert!(accepted(&resp), "{resp:?}");
+}
+
+/// R3-1: `file store` on a ring node whose only pinned peer belongs to another ring.
+#[test]
+fn r3_file_store_local_only_exits_with_code() {
+    let other = other_ring_daemon("r3-file-other");
+    let (root, dir, reg, _log) = prepare("r3-file");
+    let file = root.path().join("doc.txt");
+    std::fs::write(&file, b"never left this machine").unwrap();
+    let mut store = parvault::network::KnownPeersStore::load(&dir);
+    let pid = other.peer_id().to_string();
+    store.upsert_pinned_multiaddr(
+        &pid,
+        &format!("{}/p2p/{pid}", other.addr),
+        None,
+        Some("daemon"),
+    );
+    store.save(&dir).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+        .arg("--data-dir")
+        .arg(&dir)
+        .args(["--no-lan-discovery", "file", "store", "--path"])
+        .arg(&file)
+        .output()
+        .expect("run file store");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(parvault::storage::local_only::EXIT_CODE_LOCAL_ONLY),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("kept only on this machine: NOT backed up"),
+        "{stdout}"
+    );
+    assert_eq!(shard_files(&other.dir), 0, "nothing on the non-ring peer");
+}
+
+/// R3-1: `parvault-sync push` through a gateway with no ring peer exits with the code, and the
+/// count crosses the socket (`IpcResponse::StoreSuccessLocalOnly`).
+#[test]
+fn r3_sync_push_local_only_exits_with_code() {
+    let (root, dir, reg, log) = prepare("r3-push");
+    let sock = root.path().join("gw.sock");
+    let folder = root.path().join("docs");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.txt"), b"pushed but not backed up").unwrap();
+    let port = free_port();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .arg("--data-dir")
+        .arg(&dir)
+        .args([
+            "--no-lan-discovery",
+            "up",
+            "--listen",
+            &format!("/ip4/127.0.0.1/tcp/{port}"),
+            "--ipc-socket",
+        ])
+        .arg(&sock);
+    let _node = spawn(cmd, root, dir, log, port);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !sock.exists() {
+        assert!(Instant::now() < deadline, "gateway socket never appeared");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let push = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_parvault-sync"))
+            .arg("--socket")
+            .arg(&sock)
+            .arg("--catalog")
+            .arg(sock.with_file_name(format!("catalog{}.bin", extra.len())))
+            .args(["push", "--folder"])
+            .arg(&folder)
+            .args(extra)
+            .output()
+            .expect("run parvault-sync push")
+    };
+    let out = push(&[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(parvault::storage::local_only::EXIT_CODE_LOCAL_ONLY),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("kept only on this machine: NOT backed up"),
+        "{stdout}"
+    );
+    let out = push(&["--allow-local-only"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
 }
