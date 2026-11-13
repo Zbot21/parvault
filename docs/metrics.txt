@@ -139,7 +139,8 @@ tlc.distinct.ParVaultBootstrapAndEarnedTier = 136
 tlc.distinct.ParVaultLiteClientAndSeedFailover = 95
 tlc.distinct.ParVaultZeroKeyAdminAndQuorum = 1,776
 tlc.distinct.ParVaultGatewayPluginBus = 7,540
-tlc.depth.ParVaultZeroKeyAdminAndQuorum = 14
+# Depth re-measured 2026-11-13 (item 4 merge; 2d-beta changed the spec): bash scripts/gen_metrics.sh --measured tlc
+tlc.depth.ParVaultZeroKeyAdminAndQuorum = 16
 tlc.depth.ParVaultGatewayPluginBus = 10
 
 # --- Latest PUBLISHED release ----------------------------------------------------
