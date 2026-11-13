@@ -988,7 +988,8 @@ mod unix_vfs {
     const WEBDAV_MAX_CONNECTIONS: usize = 64;
     /// Longest request head accepted (431 beyond it).
     const WEBDAV_MAX_HEAD_BYTES: usize = 8192;
-    /// A client must finish its request head within this (dropped unanswered otherwise).
+    /// A client must finish its whole request head within this one deadline (dropped unanswered
+    /// otherwise); each read's timeout shrinks to the time left, so a slow drip cannot hold a slot.
     const WEBDAV_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// The four 401s are byte-identical; the reason code is only logged.
@@ -1027,6 +1028,7 @@ mod unix_vfs {
     /// Reads the request head (through the blank line), or `None` after writing 431, on a
     /// timeout, or on EOF.
     fn read_webdav_head(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
+        let deadline = Instant::now() + WEBDAV_HEAD_TIMEOUT;
         let mut head = Vec::with_capacity(1024);
         let mut chunk = [0u8; 2048];
         loop {
@@ -1036,6 +1038,10 @@ mod unix_vfs {
             }
             if head.len() >= WEBDAV_MAX_HEAD_BYTES {
                 stream.write_all(WEBDAV_431)?;
+                return Ok(None);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || stream.set_read_timeout(Some(remaining)).is_err() {
                 return Ok(None);
             }
             let want = (WEBDAV_MAX_HEAD_BYTES - head.len()).min(chunk.len());

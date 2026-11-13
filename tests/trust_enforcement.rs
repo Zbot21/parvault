@@ -5088,3 +5088,36 @@ fn guid_peer_uid_not_allowed_refused() {
     assert_logged(&node, "reject.gateway_peer_uid_not_allowed");
     gate_ran("trust_enforcement::guid_peer_uid_not_allowed_refused");
 }
+
+/// F-43 (QA r1, slowloris): the request head has one absolute deadline, not a per-read timeout. A
+/// client dripping one byte a second is cut off within about the deadline (5 s), unanswered.
+#[test]
+fn f43_slow_drip_headers_cut_off() {
+    use std::io::{Read, Write};
+    let (_node, addr) = f43_up("f43-drip");
+    let mut s = std::net::TcpStream::connect(&addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+    let t0 = Instant::now();
+    let mut closed_after = None;
+    for b in b"GET /a.txt HTTP/1.1\r\nHost: x\r\nX-Slow: aaaaaaaaaaaa".iter() {
+        if s.write_all(&[*b]).is_err() {
+            closed_after = Some(t0.elapsed());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1000));
+        let mut buf = [0u8; 64];
+        match s.read(&mut buf) {
+            Ok(0) => {
+                closed_after = Some(t0.elapsed());
+                break;
+            }
+            Ok(n) => panic!("answered: {}", String::from_utf8_lossy(&buf[..n])),
+            Err(_) => {}
+        }
+    }
+    let closed_after = closed_after.expect("a 1 byte/s drip was never cut off");
+    assert!(
+        closed_after < Duration::from_secs(9),
+        "cut off only after {closed_after:?}"
+    );
+}
