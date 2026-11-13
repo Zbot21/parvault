@@ -598,6 +598,50 @@ pub fn renew_decision(facts: &RenewFacts) -> Result<(), &'static str> {
 /// The one refusal text for every failed handshake (F-30): the reason stays in the local log.
 pub const HANDSHAKE_REFUSED_TEXT: &str = "handshake refused";
 
+/// What the voucher issuer decision needs to know (F-24 issuer policy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoucherIssuerFacts {
+    /// The issuer is the ring genesis or holds an admitted ring chain on this node.
+    pub issuer_is_ring_member: bool,
+    /// The issuer is this node's configured voucher issuer (a seed's own issuer).
+    pub issuer_is_configured: bool,
+}
+
+/// A blinded-shard voucher is honoured only if its issuer is a ring member this node knows or
+/// its configured issuer; a voucher no longer certifies its own issuer (F-24). Ephemeral
+/// per-shard issuers (ADR-11) are therefore refused until anonymous credentials (v0.6.0).
+pub fn voucher_issuer_decision(facts: &VoucherIssuerFacts) -> Result<(), &'static str> {
+    if facts.issuer_is_ring_member || facts.issuer_is_configured {
+        Ok(())
+    } else {
+        Err("reject.voucher_issuer_untrusted")
+    }
+}
+
+/// Text sent to a sender whose voucher issuer is not trusted (the reason code stays in the log).
+pub const VOUCHER_ISSUER_UNTRUSTED_TEXT: &str = "voucher issuer not trusted by this node";
+
+fn voucher_issuer_allowed(
+    wot: &WebOfTrustRegistry,
+    ledger: &VoucherNullifierLedger,
+    issuer: &[u8; 32],
+    peer: &str,
+) -> bool {
+    let facts = VoucherIssuerFacts {
+        issuer_is_ring_member: (wot.genesis_pubkey() == Some(*issuer)
+            || wot.is_private_ring_peer(issuer))
+            && !wot.is_peer_quarantined(issuer),
+        issuer_is_configured: *issuer == ledger.issuer_pubkey(),
+    };
+    match voucher_issuer_decision(&facts) {
+        Ok(()) => true,
+        Err(code) => {
+            warn!(code, peer, "refused a voucher from an untrusted issuer");
+            false
+        }
+    }
+}
+
 /// The local reason code for a failed handshake (never sent on the wire).
 pub fn handshake_refusal_code(err: &crate::network::wot::WebOfTrustError) -> &'static str {
     match err {
@@ -1158,19 +1202,32 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                     error: Some(err),
                 };
             }
-            nullifier_ledger.set_trusted_issuer_pubkey(voucher.issuer_pubkey);
-            match block_store.put_blinded_shard_with_lease(
-                &blinded_id,
-                &shard_bytes,
-                capability,
-                &voucher,
+            if !voucher_issuer_allowed(
+                wot,
                 nullifier_ledger,
-                crate::storage::BlindedLeaseSpec::new(
-                    current_epoch,
-                    lease_duration_epochs,
-                    delete_verifier,
-                ),
+                &voucher.issuer_pubkey,
+                remote_peer_id,
             ) {
+                return MeshWireResponse::PutBlindedShardAck {
+                    stored: false,
+                    error: Some(VOUCHER_ISSUER_UNTRUSTED_TEXT.to_string()),
+                };
+            }
+            let issuer = voucher.issuer_pubkey;
+            match nullifier_ledger.with_trusted_issuer(issuer, |ledger| {
+                block_store.put_blinded_shard_with_lease(
+                    &blinded_id,
+                    &shard_bytes,
+                    capability,
+                    &voucher,
+                    ledger,
+                    crate::storage::BlindedLeaseSpec::new(
+                        current_epoch,
+                        lease_duration_epochs,
+                        delete_verifier,
+                    ),
+                )
+            }) {
                 Ok(_) => {
                     let _ = eviction.record_blinded_shard_ingress(
                         remote_ip,
@@ -1407,21 +1464,34 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                         error: Some(err),
                     };
                 }
-                nullifier_ledger.set_trusted_issuer_pubkey(bundle.voucher.issuer_pubkey);
+                if !voucher_issuer_allowed(
+                    wot,
+                    nullifier_ledger,
+                    &bundle.voucher.issuer_pubkey,
+                    remote_peer_id,
+                ) {
+                    return MeshWireResponse::RelayPqOnionAck {
+                        delivered: false,
+                        error: Some(VOUCHER_ISSUER_UNTRUSTED_TEXT.to_string()),
+                    };
+                }
+                let issuer = bundle.voucher.issuer_pubkey;
                 let voucher_pk = bundle.voucher.issuer_pubkey;
                 let bid = bundle.blinded_id;
-                match block_store.put_blinded_shard_with_lease(
-                    &bundle.blinded_id,
-                    &bundle.shard_bytes,
-                    bundle.capability,
-                    &bundle.voucher,
-                    nullifier_ledger,
-                    crate::storage::BlindedLeaseSpec::new(
-                        bundle.current_epoch,
-                        bundle.lease_duration_epochs,
-                        bundle.delete_verifier,
-                    ),
-                ) {
+                match nullifier_ledger.with_trusted_issuer(issuer, |ledger| {
+                    block_store.put_blinded_shard_with_lease(
+                        &bundle.blinded_id,
+                        &bundle.shard_bytes,
+                        bundle.capability,
+                        &bundle.voucher,
+                        ledger,
+                        crate::storage::BlindedLeaseSpec::new(
+                            bundle.current_epoch,
+                            bundle.lease_duration_epochs,
+                            bundle.delete_verifier,
+                        ),
+                    )
+                }) {
                     Ok(_) => {
                         let _ = eviction.record_blinded_shard_ingress(
                             remote_ip,
@@ -1463,20 +1533,33 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                                 error: Some(err),
                             };
                         }
-                        nullifier_ledger.set_trusted_issuer_pubkey(voucher.issuer_pubkey);
-                        let voucher_pk = voucher.issuer_pubkey;
-                        match block_store.put_blinded_shard_with_lease(
-                            &blinded_id,
-                            &shard_bytes,
-                            capability,
-                            &voucher,
+                        if !voucher_issuer_allowed(
+                            wot,
                             nullifier_ledger,
-                            crate::storage::BlindedLeaseSpec::new(
-                                current_epoch,
-                                lease_duration_epochs,
-                                delete_verifier,
-                            ),
+                            &voucher.issuer_pubkey,
+                            remote_peer_id,
                         ) {
+                            return MeshWireResponse::RelayPqOnionAck {
+                                delivered: false,
+                                error: Some(VOUCHER_ISSUER_UNTRUSTED_TEXT.to_string()),
+                            };
+                        }
+                        let issuer = voucher.issuer_pubkey;
+                        let voucher_pk = voucher.issuer_pubkey;
+                        match nullifier_ledger.with_trusted_issuer(issuer, |ledger| {
+                            block_store.put_blinded_shard_with_lease(
+                                &blinded_id,
+                                &shard_bytes,
+                                capability,
+                                &voucher,
+                                ledger,
+                                crate::storage::BlindedLeaseSpec::new(
+                                    current_epoch,
+                                    lease_duration_epochs,
+                                    delete_verifier,
+                                ),
+                            )
+                        }) {
                             Ok(_) => {
                                 let _ = eviction.record_blinded_shard_ingress(
                                     remote_ip,

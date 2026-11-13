@@ -346,6 +346,21 @@ impl VoucherNullifierLedger {
         self.trusted_issuer_pubkey
     }
 
+    /// Runs `f` with `issuer` as the trusted voucher issuer, then restores the configured one.
+    /// The caller decides first whether `issuer` may be trusted (F-24 issuer policy); before this,
+    /// the receiver permanently adopted whatever issuer a voucher named.
+    pub fn with_trusted_issuer<T>(
+        &mut self,
+        issuer: [u8; 32],
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let configured = std::mem::replace(&mut self.trusted_issuer_pubkey, issuer);
+        let out = f(self);
+        self.trusted_issuer_pubkey = configured;
+        out
+    }
+
+    #[cfg(test)]
     pub fn set_trusted_issuer_pubkey(&mut self, pubkey: [u8; 32]) {
         self.trusted_issuer_pubkey = pubkey;
     }

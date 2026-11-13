@@ -490,10 +490,23 @@ impl Trio {
     fn new(label: &str) -> Self {
         let keys = Keys::new();
         let tpl = template(&keys);
-        let fx = ROLES
+        let mut fx: Vec<_> = ROLES
             .iter()
             .map(|r| Fx::new(*r, &keys, tpl.path(), label))
             .collect();
+        // F-24: vouchers are honoured only from issuers a node knows, so the fixtures' voucher
+        // issuer is a ring member (a genesis-issued chain), as a real issuer would be.
+        let issuer_chain = DelegationChain {
+            hops: vec![InvitationHop::issue(
+                &keys.genesis,
+                keys.voucher_issuer.public_key_bytes(),
+                1,
+                100,
+            )],
+        };
+        for f in &mut fx {
+            f.wot.verify_and_admit_chain(&issuer_chain).unwrap();
+        }
         Self { keys, fx }
     }
     /// Admits `peer` into every fixture's ring (a genesis-issued chain), as a v0.5.0 handshake

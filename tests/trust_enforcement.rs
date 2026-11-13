@@ -1371,7 +1371,7 @@ fn f33_layered(
     relay: &Node,
     target_kem: &parvault::crypto::HybridKemPublicKey,
     target_addr: String,
-    originator: &NodeIdentity,
+    _originator: &NodeIdentity,
     seed: u8,
     relay_jitter_ms: u64,
 ) -> PqRelayedShardEnvelope {
@@ -1380,7 +1380,13 @@ fn f33_layered(
         blinded_id: b.id,
         shard_bytes: b.bytes.clone(),
         capability: b.cap,
-        voucher: AnonymousQuotaVoucher::mint(originator, 8192),
+        // F-24: the target honours only issuers it knows. It knows the relay (admitted at
+        // the last hop), not the originator, so the relay issues the voucher here; who issues
+        // onion vouchers in production is open (no shipped command originates onions).
+        voucher: AnonymousQuotaVoucher::mint(
+            &NodeIdentity::load_or_generate_in_dir(&relay.dir).unwrap(),
+            8192,
+        ),
         current_epoch: 1,
         lease_duration_epochs: 30,
         delete_verifier: b.delete_verifier,
@@ -2803,20 +2809,30 @@ fn repro_f08_quorum_below_majority_accepted() {
     gate_ran("trust_enforcement::repro_f08_quorum_below_majority_accepted");
 }
 
-/// F-24 gap (issuer policy): an admitted sender's blinded put is accepted with a voucher minted
-/// by a key the receiver does not know (the receiver trusts whichever issuer the voucher names).
+/// F-24 issuer policy accept: an admitted sender's blinded put with a voucher issued by a ring
+/// member this node knows (here the sender itself) is stored.
 #[test]
-fn repro_f24_stranger_issued_voucher_stored() {
-    let node = spawn_daemon("f24-issuer");
+fn f24_ring_issuer_voucher_redeemed() {
+    let node = spawn_daemon("f24-issuer-a");
+    let sender = key(0xA8);
+    let b = blinded(0x5A, 512);
+    let resp = send(&sender, &node, blinded_put(&b, &sender));
+    assert!(format!("{resp:?}").contains("stored: true"), "{resp:?}");
+    gate_ran("trust_enforcement::f24_ring_issuer_voucher_redeemed");
+}
+
+/// F-24 issuer policy reject: the same admitted sender with a voucher minted by a key this node
+/// does not know is refused (a voucher no longer certifies its own issuer).
+#[test]
+fn f24_stranger_issuer_voucher_refused() {
+    let node = spawn_daemon("f24-issuer-r");
     let sender = key(0xA8);
     let stranger_issuer = key(0xA9);
     let b = blinded(0x5A, 512);
     let resp = send(&sender, &node, blinded_put(&b, &stranger_issuer));
-    assert!(
-        format!("{resp:?}").contains("stored: true"),
-        "gap: stranger-issued voucher accepted: {resp:?}"
-    );
-    gate_ran("trust_enforcement::repro_f24_stranger_issued_voucher_stored");
+    assert!(format!("{resp:?}").contains("stored: false"), "{resp:?}");
+    assert_logged(&node, "reject.voucher_issuer_untrusted");
+    gate_ran("trust_enforcement::f24_stranger_issuer_voucher_refused");
 }
 
 // --- D1 (2e round 2): gateway stores with a non-ring peer configured ------------------------------
