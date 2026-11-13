@@ -94,4 +94,9 @@ open       F-35      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FIND
 claim      F-38      sym=src/network/wire_handler.rs::syndication_grant_decision accept=trust_enforcement::f38_sender_owned_grant_accepted reject=trust_enforcement::f38_foreign_owner_grant_refused code=reject.syndication_grant_not_sender bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md
 kani       F-38      sym=src/network/wire_handler.rs::syndication_grant_decision harness=proof_syndication_grant_owned_by_sender cover=grant not owned by sender
 
+# --- F-38-GRANT (2e): first writer wins while a shard is stored (L-41) ---
+claim      F-38-GRANT sym=src/por/verifier.rs::shard_rebind_decision accept=trust_enforcement::f38g_same_owner_reput_accepted reject=trust_enforcement::f38g_takeover_with_own_grant_refused code=reject.shard_bound_to_another_owner bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::PutShard
+claim      F-38-GRANT-SEED sym=src/por/verifier.rs::shard_rebind_decision accept=trust_enforcement::f38g_seed_vault_resyndication_accepted reject=trust_enforcement::f38g_seed_second_key_same_bundle_refused code=reject.shard_bound_to_another_owner bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe
+kani       F-38-GRANT sym=src/por/verifier.rs::shard_rebind_decision harness=proof_shard_rebind_first_writer_wins cover=rebind refused
+
 ratchet    R         open=19 waive=0

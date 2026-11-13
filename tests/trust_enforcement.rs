@@ -3262,8 +3262,6 @@ fn f38_lite_client_without_device_cert_syndicates() {
 
 // --- F-38-GRANT (L-41): first-writer-wins shard binding -----------------------------------------
 
-const F38G_CODE: &str = "reject.shard_bound_to_another_owner";
-
 fn put_with_commit(
     sid: ShardId,
     bytes: Vec<u8>,
@@ -3313,7 +3311,7 @@ fn f38g_takeover_with_own_grant_refused() {
         put_with_commit(sid, bytes.clone(), 0x66, Some(self_grant(&m, &sid))),
     );
     assert!(!stored(&resp), "{resp:?}");
-    assert_logged(&node, F38G_CODE);
+    assert_logged(&node, "reject.shard_bound_to_another_owner");
     assert!(read_bytes(&send(&m, &node, owner_read(&m, sid))).is_none());
     assert!(!deleted(&send(&m, &node, delete_req(&m, sid))));
     assert!(
@@ -3343,7 +3341,7 @@ fn f38g_takeover_without_grant_refused() {
     )));
     let resp = send(&m, &node, put_with_commit(sid, bytes.clone(), 0x66, None));
     assert!(!stored(&resp), "{resp:?}");
-    assert_logged(&node, F38G_CODE);
+    assert_logged(&node, "reject.shard_bound_to_another_owner");
     assert!(!deleted(&send(&m, &node, delete_req(&m, sid))));
     assert!(
         audit_ok(&victim, &node, sid, bytes.len()),
@@ -3440,6 +3438,7 @@ fn f38g_seed_vault_resyndication_accepted() {
         let resp = send(&vault, &node, req);
         assert!(synd_stored(&resp), "{resp:?}");
     }
+    gate_ran("trust_enforcement::f38g_seed_vault_resyndication_accepted");
 }
 
 /// F-38-GRANT seed reject: a second key syndicating the identical bundle under its own cert
@@ -3454,7 +3453,7 @@ fn f38g_seed_second_key_same_bundle_refused() {
     let (req2, _) = f38_syndicate(&node, &other, Some(&other));
     let resp = send(&other, &node, req2);
     assert!(!synd_stored(&resp), "{resp:?}");
-    assert_logged(&node, F38G_CODE);
+    assert_logged(&node, "reject.shard_bound_to_another_owner");
     assert!(read_bytes(&send(&other, &node, owner_read(&other, sid))).is_none());
     assert!(read_bytes(&send(&vault, &node, owner_read(&vault, sid))).is_some());
     gate_ran("trust_enforcement::f38g_seed_second_key_same_bundle_refused");

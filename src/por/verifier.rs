@@ -37,9 +37,6 @@ pub fn grant_registration_decision(facts: &GrantRegFacts) -> Result<(), &'static
     Ok(())
 }
 
-/// The refusal code of `shard_rebind_decision` (F-38-GRANT, L-41).
-pub const SHARD_BOUND_TO_ANOTHER_OWNER: &str = "reject.shard_bound_to_another_owner";
-
 /// What the shard-rebind decision needs to know (F-38-GRANT, L-41).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardRebindFacts {
@@ -82,8 +79,20 @@ pub fn shard_rebind_decision(facts: &ShardRebindFacts) -> Result<ShardBinding, &
         {
             Ok(ShardBinding::Keep)
         }
-        _ => Err(SHARD_BOUND_TO_ANOTHER_OWNER),
+        _ => Err("reject.shard_bound_to_another_owner"),
     }
+}
+
+/// The refusal code of `shard_rebind_decision`, taken from the decision itself so the code has
+/// one source (a grant naming another owner for a stored shard).
+pub fn shard_bound_to_another_owner_code() -> &'static str {
+    let facts = ShardRebindFacts {
+        stored: true,
+        existing_grant_owner: Some([0; 32]),
+        incoming_grant_owner: Some([1; 32]),
+        sender_is_accounted_owner: false,
+    };
+    shard_rebind_decision(&facts).err().unwrap_or_default()
 }
 
 /// A read or delete authorised by a grant owner applies only to shards that were stored with
@@ -503,7 +512,7 @@ impl PorVerifierEngine {
                 .get(&shard.file_key())
                 .is_some_and(|o| *o != grant.owner_pubkey)
         }) {
-            return Err(SHARD_BOUND_TO_ANOTHER_OWNER);
+            return Err(shard_bound_to_another_owner_code());
         }
         for shard in stored {
             self.shard_grant_owners

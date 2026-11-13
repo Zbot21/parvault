@@ -18,8 +18,8 @@ use crate::network::wan_rendezvous::{
 };
 use crate::network::wot::WebOfTrustRegistry;
 use crate::por::{
-    shard_rebind_decision, PorVerifierEngine, ShardBinding, ShardRebindFacts,
-    SHARD_BOUND_TO_ANOTHER_OWNER,
+    shard_bound_to_another_owner_code, shard_rebind_decision, PorVerifierEngine, ShardBinding,
+    ShardRebindFacts,
 };
 use crate::storage::{
     BlockStore, PrivacyPreservingEvictionEngine, PublicTrackerTakedownQueue,
@@ -1489,7 +1489,7 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                 // rather than re-ingest.
                 if let Err(code) = shard_rebind_decision(&facts).and_then(|b| match b {
                     ShardBinding::Bind => Ok(()),
-                    ShardBinding::Keep => Err(SHARD_BOUND_TO_ANOTHER_OWNER),
+                    ShardBinding::Keep => Err(shard_bound_to_another_owner_code()),
                 }) {
                     warn!(code, peer = %remote_peer_id, "refused a syndication of a stripe bound to another owner");
                     return MeshWireResponse::SyndicateLiteStripeAck {
