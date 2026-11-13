@@ -798,9 +798,11 @@ fn test_mechanism6_blockstore_physical_file_deletion_over_time_on_lease_expiry_a
     assert!(!store.has_blinded_shard_on_disk(&bid_x));
     let read_deleted_x =
         store.get_blinded_shard_authorized(&bid_x, &cap_x, 1_000, &read_sig_x, 1_000);
+    // The sweep removed the lease, so the read is refused before any file lookup (F-42: a
+    // shard with no registered capability is unreadable).
     assert!(
-        matches!(read_deleted_x, Err(StorageError::ShardNotFound(_))),
-        "Reading departed Node X's evicted shard must return Err(StorageError::ShardNotFound)"
+        matches!(read_deleted_x, Err(StorageError::QuotaExceeded(_))),
+        "Reading departed Node X's evicted shard must be refused: {read_deleted_x:?}"
     );
 
     // Meanwhile, Active Node Y's renewed shard_y is still intact on disk and readable!
@@ -822,9 +824,10 @@ fn test_mechanism6_blockstore_physical_file_deletion_over_time_on_lease_expiry_a
         !path_y.exists(),
         "Tombstoned .bshard file must be physically unlinked from the filesystem immediately"
     );
+    // Deleted with its lease, so the read is refused (F-42: no registered capability).
     assert!(matches!(
         store.get_blinded_shard_authorized(&bid_y, &cap_y, 1_000, &read_sig_y, 1_000),
-        Err(StorageError::ShardNotFound(_))
+        Err(StorageError::QuotaExceeded(_))
     ));
 }
 
