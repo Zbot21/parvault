@@ -102,4 +102,10 @@ claim      F-38-GRANT sym=src/por/verifier.rs::shard_rebind_decision accept=trus
 claim      F-38-GRANT-SEED sym=src/por/verifier.rs::shard_rebind_decision accept=trust_enforcement::f38g_seed_vault_resyndication_accepted reject=trust_enforcement::f38g_seed_second_key_same_bundle_refused code=reject.shard_bound_to_another_owner bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe
 kani       F-38-GRANT sym=src/por/verifier.rs::shard_rebind_decision harness=proof_shard_rebind_first_writer_wins cover=rebind refused
 
+# --- F-43 (2c): every WebDAV request needs a read-only macaroon (L-43, L-44) ---
+claim      F-43      sym=src/vfs.rs::webdav_auth_decision accept=trust_enforcement::f43_valid_bearer_reads reject=trust_enforcement::f43_no_token_unauthorized code=reject.webdav_token_missing bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-29-pure-rust-fuse-and-webdav-lazy-vfs.md
+claim      F-43-ADR33 sym=src/vfs.rs::webdav_auth_decision accept=trust_enforcement::f43_valid_bearer_reads reject=trust_enforcement::f43_other_manifest_forbidden code=reject.webdav_scope_denied bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md
+claim      F-43-PLUGIN sym=src/vfs.rs::webdav_auth_decision accept=trust_enforcement::f43_plugin_attenuated_child_reads reject=trust_enforcement::f43_plugin_sibling_token_unauthorized code=reject.webdav_token_invalid bin=parvault-fuse ref=docs/security/TRUST_FINDINGS.md
+kani       F-43      sym=src/vfs.rs::webdav_auth_decision harness=proof_webdav_auth_decision cover=valid token out of scope
+
 ratchet    R         open=9 waive=0

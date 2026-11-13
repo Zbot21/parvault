@@ -1222,3 +1222,39 @@ fn proof_shard_rebind_first_writer_wins() {
         Err(_) => {}
     }
 }
+
+/// F-43 (L-43, L-44): a WebDAV request is served only with a present, well-formed, valid,
+/// unexpired, read-only, in-scope token without a peer-UID caveat. Every token-validity failure
+/// is a 401 (`Unauthorized`), every other refusal a 403 (`Forbidden`).
+#[kani::proof]
+fn proof_webdav_auth_decision() {
+    use crate::vfs::{webdav_auth_decision, WebdavAuthFacts, WebdavAuthRefusal};
+    let facts = WebdavAuthFacts {
+        token_present: kani::any(),
+        token_parses: kani::any(),
+        tag_valid: kani::any(),
+        expired: kani::any(),
+        read_only: kani::any(),
+        peer_uid_bound: kani::any(),
+        in_scope: kani::any(),
+    };
+    let decision = webdav_auth_decision(&facts);
+    kani::cover!(decision.is_ok(), "request served");
+    kani::cover!(
+        matches!(decision, Err(WebdavAuthRefusal::Forbidden(_))),
+        "valid token out of scope"
+    );
+    let token_valid =
+        facts.token_present && facts.token_parses && facts.tag_valid && !facts.expired;
+    let allowed = token_valid && facts.read_only && !facts.peer_uid_bound && facts.in_scope;
+    // Only the outcome is checked (the &str code is checked by the claims' wire tests).
+    assert_eq!(decision.is_ok(), allowed);
+    assert_eq!(
+        matches!(decision, Err(WebdavAuthRefusal::Unauthorized(_))),
+        !token_valid
+    );
+    assert_eq!(
+        matches!(decision, Err(WebdavAuthRefusal::Forbidden(_))),
+        token_valid && !allowed
+    );
+}
