@@ -147,7 +147,7 @@ claim      G-MAC     sym=src/gateway/engine.rs::gateway_macaroon_decision accept
 claim      G-SEAL    sym=src/gateway/engine.rs::gateway_memfd_seal_decision accept=trust_enforcement::gseal_sealed_memfd_stored reject=trust_enforcement::gseal_unsealed_memfd_refused code=reject.gateway_memfd_unsealed bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md
 claim      G-UID     sym=src/gateway/engine.rs::gateway_peer_uid_decision accept=trust_enforcement::guid_allowed_peer_uid_served reject=trust_enforcement::guid_peer_uid_not_allowed_refused code=reject.gateway_peer_uid_not_allowed bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md
 kani       S-GUARD   sym=src/network/wot.rs::slash_target_decision harness=proof_slash_guard_protects_genesis_and_self cover=protected key not slashed
-kani       S-SANITIZE sym=src/sync.rs::sanitize_sync_relative_path_into harness=proof_sanitize_sync_relative_path_no_traversal cover=traversal segment rejected
+kani       S-SANITIZE sym=src/sync/common.rs::sanitize_sync_relative_path_into harness=proof_sanitize_sync_relative_path_no_traversal cover=traversal segment rejected
 
 # --- B-SEED-SYND (2c): the seed's lite fan-out runs off the swarm task, within a budget (L-46) ---
 claim      B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision accept=trust_enforcement::bseed_second_sender_accepted_while_one_job_runs reject=trust_enforcement::bseed_third_job_refused_busy code=reject.syndication_busy bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe

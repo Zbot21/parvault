@@ -579,7 +579,7 @@ impl VoucherNullifierLedger {
         if let Some(ref path) = self.persistence_path {
             let entries: Vec<([u8; 32], u64)> = self.spent.iter().map(|(n, e)| (*n, *e)).collect();
             if let Ok(bytes) = bincode::serialize(&entries) {
-                let _ = crate::storage::BlockStore::atomic_write_file(path, &bytes);
+                let _ = crate::storage::fsio::atomic_write_file(path, &bytes);
             }
         }
         Ok(())

@@ -33,6 +33,9 @@ src/crypto/pqc.rs               tla     specs/ParVaultPostQuantum.tla
 src/crypto/pqc.rs               tla     specs/ParVaultAnonymity.tla
 src/config.rs                   kani    proof_streaming_stripe_layout_all_u64_file_sizes_and_profiles
 src/config.rs                   kani    proof_router_soc_and_desktop_reed_solomon_memory_ceiling
+src/profile.rs                  full    # ErasureTier, stripe layout (moved from config.rs), used crate-wide
+src/profile.rs                  kani    proof_streaming_stripe_layout_all_u64_file_sizes_and_profiles
+src/profile.rs                  kani    proof_router_soc_and_desktop_reed_solomon_memory_ceiling
 
 # --- storage/* (BlockStore, quota, anonymity, eviction are mutually coupled) -
 src/storage/*                   lib     admin_rpc::
@@ -263,31 +266,31 @@ src/vfs.rs                      test    zero_config_lan_and_router_soc_tests    
 src/vfs.rs                      test    trust_enforcement
 src/vfs.rs                      kani    proof_vfs_block_window_power_of_two_and_zero_bounds
 src/vfs.rs                      kani    proof_fuse_header_parser_no_panic
-src/sync.rs                     lib     admin_rpc::
-src/sync.rs                     lib     capabilities::
-src/sync.rs                     lib     config::
-src/sync.rs                     lib     crypto::pqc::
-src/sync.rs                     lib     network::client::
-src/sync.rs                     lib     network::discovery::
-src/sync.rs                     lib     network::wan_rendezvous::
-src/sync.rs                     lib     network::wot::
-src/sync.rs                     lib     sharding::reed_solomon::
-src/sync.rs                     lib     storage::anonymity::
-src/sync.rs                     lib     storage::block_store::
-src/sync.rs                     lib     storage::eviction::
-src/sync.rs                     lib     sync::
-src/sync.rs                     test    confidentiality_and_trust_proofs
-src/sync.rs                     test    gateway_bus_and_plugin_security                 # spawns main
-src/sync.rs                     test    gateway_ipc_benchmark                           # spawns parvault-seed
-src/sync.rs                     test    m3_dual_mode_vfs_and_gateway_sync
-src/sync.rs                     test    red_team_hardening_tests
-src/sync.rs                     test    sync_daemon_usability_and_cli_regression_tests
-src/sync.rs                     test    tla_formal_proofs_integration
-src/sync.rs                     test    vfs_lazy_stream
-src/sync.rs                     test    zero_config_lan_and_router_soc_tests            # spawns main
-src/sync.rs                     test    trust_enforcement
-src/sync.rs                     kani    proof_sanitize_sync_relative_path_no_traversal
-src/sync.rs                     tla     specs/ParVaultLiteClientAndSeedFailover.tla
+src/sync/*                      lib     admin_rpc::
+src/sync/*                      lib     capabilities::
+src/sync/*                      lib     config::
+src/sync/*                      lib     crypto::pqc::
+src/sync/*                      lib     network::client::
+src/sync/*                      lib     network::discovery::
+src/sync/*                      lib     network::wan_rendezvous::
+src/sync/*                      lib     network::wot::
+src/sync/*                      lib     sharding::reed_solomon::
+src/sync/*                      lib     storage::anonymity::
+src/sync/*                      lib     storage::block_store::
+src/sync/*                      lib     storage::eviction::
+src/sync/*                      lib     sync::
+src/sync/*                      test    confidentiality_and_trust_proofs
+src/sync/*                      test    gateway_bus_and_plugin_security                 # spawns main
+src/sync/*                      test    gateway_ipc_benchmark                           # spawns parvault-seed
+src/sync/*                      test    m3_dual_mode_vfs_and_gateway_sync
+src/sync/*                      test    red_team_hardening_tests
+src/sync/*                      test    sync_daemon_usability_and_cli_regression_tests
+src/sync/*                      test    tla_formal_proofs_integration
+src/sync/*                      test    vfs_lazy_stream
+src/sync/*                      test    zero_config_lan_and_router_soc_tests            # spawns main
+src/sync/*                      test    trust_enforcement
+src/sync/*                      kani    proof_sanitize_sync_relative_path_no_traversal
+src/sync/*                      tla     specs/ParVaultLiteClientAndSeedFailover.tla
 
 # --- admin_rpc.rs / telemetry.rs / router_nas.rs -----------------------------
 src/admin_rpc.rs                lib     admin_rpc::
@@ -474,12 +477,12 @@ src/storage/eviction.rs         doc     docs/adr/ADR-26-verifiable-abuse-and-cou
 src/storage/quota.rs            doc     docs/SECURITY_AND_CRYPTOGRAPHY.md
 src/storage/quota.rs            doc     docs/adr/ADR-07-tier-weighted-reciprocity-ledger.md
 src/storage/quota.rs            doc     docs/adr/ADR-10-dynamic-uptime-trust-ladder.md
-src/sync.rs                     doc     AGENTS.md
-src/sync.rs                     doc     docs/EMBEDDING.md
-src/sync.rs                     doc     docs/GATEWAY_SOCKET_PROTOCOL.md
-src/sync.rs                     doc     docs/SECURITY_AND_CRYPTOGRAPHY.md
-src/sync.rs                     doc     docs/adr/ADR-14-incremental-folder-sync-engine.md
-src/sync.rs                     doc     docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md
+src/sync/*                      doc     AGENTS.md
+src/sync/*                      doc     docs/EMBEDDING.md
+src/sync/*                      doc     docs/GATEWAY_SOCKET_PROTOCOL.md
+src/sync/*                      doc     docs/SECURITY_AND_CRYPTOGRAPHY.md
+src/sync/*                      doc     docs/adr/ADR-14-incremental-folder-sync-engine.md
+src/sync/*                      doc     docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md
 src/telemetry.rs                doc     AGENTS.md
 src/telemetry.rs                doc     docs/adr/ADR-17-anonymous-census-telemetry.md
 src/vfs.rs                      doc     AGENTS.md

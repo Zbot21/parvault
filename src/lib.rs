@@ -10,6 +10,7 @@ pub mod network;
 #[cfg(unix)]
 pub mod os_sys;
 pub mod por;
+pub mod profile;
 pub mod router_nas;
 pub mod sharding;
 pub mod storage;

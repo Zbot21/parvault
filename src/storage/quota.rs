@@ -185,7 +185,7 @@ impl QuotaManager {
     fn persist(&self) {
         if let Some(ref path) = self.persistence_path {
             if let Ok(bytes) = bincode::serialize(self) {
-                let _ = crate::storage::BlockStore::atomic_write_file(path, &bytes);
+                let _ = crate::storage::fsio::atomic_write_file(path, &bytes);
             }
         }
     }

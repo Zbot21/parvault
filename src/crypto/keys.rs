@@ -501,7 +501,7 @@ impl NodeIdentity {
         }
         std::fs::create_dir_all(data_dir)
             .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
-        crate::storage::BlockStore::atomic_write_file(&path, hex::encode(pubkey).as_bytes())
+        crate::storage::fsio::atomic_write_file(&path, hex::encode(pubkey).as_bytes())
             .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))
     }
 

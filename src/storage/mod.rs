@@ -1,8 +1,11 @@
 pub mod anonymity;
 pub mod block_store;
 pub mod council;
+pub mod error;
 pub mod eviction;
+pub mod fsio;
 pub mod local_only;
+pub mod manifest;
 pub mod quota;
 
 pub use anonymity::{
@@ -12,9 +15,10 @@ pub use anonymity::{
     MAX_LEASE_EXTENSION_EPOCHS, MAX_SINGLE_VOUCHER_BYTES,
 };
 pub use block_store::{
-    BlindedLeaseSpec, BlockStore, FileManifest, GracefulDepartureReceipt, ScrubReport, ShardId,
-    SignedDhtManifestEnvelope, StorageError, StripeManifestEntry, ZeroTrustDhtStore,
-    FILE_MANIFEST_VERSION,
+    BlindedLeaseSpec, BlockStore, GracefulDepartureReceipt, ScrubReport, SignedDhtManifestEnvelope,
+    ZeroTrustDhtStore,
 };
+pub use error::StorageError;
 pub use eviction::*;
+pub use manifest::{FileManifest, ShardId, StripeManifestEntry, FILE_MANIFEST_VERSION};
 pub use quota::{PeerCreditAccount, QuotaManager, TrustLevel};
