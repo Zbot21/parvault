@@ -1733,13 +1733,16 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
         MeshWireRequest::QueryNodeStatus => {
             let rep = server.status_report(1);
             let available_bytes = rep.max_storage_bytes.saturating_sub(rep.used_storage_bytes);
+            // F-44: status is public, so capacity and SLA are coarse (power-of-two GiB buckets,
+            // like the census beacon; SLA to one decimal), never a host fingerprint.
+            let bucket = |b: u64| crate::telemetry::round_to_pow2_gib(b).saturating_mul(1 << 30);
             MeshWireResponse::NodeStatusResult {
                 peer_id: server.server_peer_id().to_string(),
                 asn: 64512,
                 region: policy.status_region().to_string(),
-                available_bytes,
-                used_bytes: rep.used_storage_bytes,
-                sla_score: rep.sla_ratio,
+                available_bytes: bucket(available_bytes),
+                used_bytes: bucket(rep.used_storage_bytes),
+                sla_score: (rep.sla_ratio * 10.0).round() / 10.0,
                 pq_kem_pubkey: Some(pq_kem.public_key()),
             }
         }

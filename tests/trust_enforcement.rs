@@ -4586,3 +4586,27 @@ fn f42_unregistered_lease_read_refused() {
     assert_logged(&node, "reject.blinded_read_no_capability");
     gate_ran("trust_enforcement::f42_unregistered_lease_read_refused");
 }
+
+/// F-44: public status reports capacity in power-of-two GiB buckets and SLA to one decimal.
+#[test]
+fn f44_public_status_is_bucketed() {
+    let node = spawn_daemon("f44");
+    let resp = send_as_stranger(&key(0xC4), &node, MeshWireRequest::QueryNodeStatus);
+    let MeshWireResponse::NodeStatusResult {
+        available_bytes,
+        used_bytes,
+        sla_score,
+        ..
+    } = resp
+    else {
+        panic!("{resp:?}");
+    };
+    const GIB: u64 = 1 << 30;
+    for v in [available_bytes, used_bytes] {
+        assert!(
+            v % GIB == 0 && (v / GIB == 0 || (v / GIB).is_power_of_two()),
+            "{v}"
+        );
+    }
+    assert_eq!((sla_score * 10.0).round() / 10.0, sla_score);
+}

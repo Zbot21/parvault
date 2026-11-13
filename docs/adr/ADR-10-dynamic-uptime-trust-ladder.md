@@ -1,6 +1,6 @@
 # ADR-10: Dynamic Uptime Trust Ladder & `/24` Subnet Concentration Caps
 
-- **Status:** Accepted — Extended by [ADR-15](ADR-15-elastic-bootstrap-and-earned-tiers.md)
+- **Status:** Superseded by F-07 (v0.5.0: earned standing is self-reported and grants nothing; see `docs/security/TRUST_FINDINGS.md`). Note: `network/placement.rs` (`max_shards_per_subnet`) still applies subnet caps from that self-reported trust level. Previously extended by [ADR-15](ADR-15-elastic-bootstrap-and-earned-tiers.md).
 - **Subsystem:** `storage::quota` / `network::behaviour`
 - **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
 
