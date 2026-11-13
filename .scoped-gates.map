@@ -515,3 +515,6 @@ src/cli/daemon.rs               doc     docs/adr/ADR-33-dual-mode-vfs-and-siblin
 scripts/install.sh              doc     website/install.sh
 website/install.sh              doc     scripts/install.sh
 deploy/*                        doc     docs/ROUTER_SOC_HARDWARE_GUIDE.md
+
+# Full runs report every failing suite, not only the first.
+@full-args test --no-fail-fast
