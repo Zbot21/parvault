@@ -346,6 +346,8 @@ tests/anonymous_telemetry_tests.rs                       test    anonymous_telem
 tests/bootstrap_and_earned_tier_tests.rs                 test    bootstrap_and_earned_tier_tests
 tests/confidentiality_and_trust_proofs.rs                test    confidentiality_and_trust_proofs
 tests/formal_verification.rs                             test    formal_verification
+tests/plugin_self_test.rs                                test    plugin_self_test
+tests/static_build_checks.rs                             test    static_build_checks
 tests/gateway_bus_and_plugin_security.rs                 test    gateway_bus_and_plugin_security
 tests/gateway_ipc_benchmark.rs                           test    gateway_ipc_benchmark
 tests/m3_dual_mode_vfs_and_gateway_sync.rs               test    m3_dual_mode_vfs_and_gateway_sync
@@ -381,6 +383,10 @@ scripts/VENDORED.md                none
 .github/workflows/*                 full    # CI defines the release gates; an edit can drop one
 scripts/docker_acceptance_gate.sh   none    # Docker gate, run by hand; not one of the 6 gates
 scripts/install.sh                  none
+scripts/check_no_runtime_deps.sh    test    static_build_checks   # L-48 no-runtime check (CI runs it too)
+scripts/check_claim_cfg.sh          test    static_build_checks   # ruling change 5 (CI runs it too)
+scripts/build_bins.sh               full    # builds every CI/release/metrics artifact; an edit can change a feature set
+.enforcement.map                    test    static_build_checks   # claim-cfg reads its sym= and harness= keys
 website/*                           none
 deploy/*                            none    # container/procd packaging; Docker gate covers it
 .gitignore                          none

@@ -50,11 +50,10 @@ jobs:
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
           fi
-          cargo build --profile soc --target ${{ matrix.target }} \
-            --bin parvault --bin parvault-seed --bin parvault-fuse --bin parvault-sync
-          mkdir -p release-dist
+          # Each binary is built with its own feature set (plan-3 ruling change 9).
+          bash scripts/build_bins.sh --profile soc --target ${{ matrix.target }} --out release-dist \
+            parvault parvault-seed parvault-fuse parvault-sync
           for bin in parvault parvault-seed parvault-fuse parvault-sync; do
-            cp "target/${{ matrix.target }}/soc/${bin}" "release-dist/${bin}-${{ matrix.target }}"
             ${{ matrix.strip }} "release-dist/${bin}-${{ matrix.target }}"
           done
           echo "### Binary sizes for ${{ matrix.target }} (--profile soc, stripped static musl):"

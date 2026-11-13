@@ -181,17 +181,19 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: No feature cfg inside claimed or Kani functions (plan-3 ruling change 5)
         run: bash scripts/check_claim_cfg.sh .
+      - name: Plugin feature sets link no tokio, libp2p, mio or quinn (L-48)
+        run: bash scripts/check_no_runtime_deps.sh .
       - name: Check minimal headless build (--no-default-features, VFS excluded)
         run: cargo check --no-default-features --features daemon-runtime --bin parvault --bin parvault-seed --bin parvault-sync
       - name: Build binaries (parvault, parvault-seed, parvault-fuse, parvault-sync)
-        run: cargo build --release --bins
+        run: bash scripts/build_bins.sh --profile release --out dist
       - name: Run all integration, formal (Stateright + TLA+ TLC), UDS zero-copy IPC & VFS test suites
         run: cargo test --release
       - name: Run binary self-tests (parvault-seed, parvault gateway, parvault-fuse, parvault-sync)
         run: |
-          ./target/release/parvault-seed self-test
-          ./target/release/parvault gateway self-test
-          bash scripts/plugin_self_test.sh ./target/release/parvault ./target/release/parvault-fuse ./target/release/parvault-sync
+          dist/parvault-seed self-test
+          dist/parvault gateway self-test
+          bash scripts/plugin_self_test.sh dist/parvault dist/parvault-fuse dist/parvault-sync
       - name: Run 13-Container Docker P2P Regression & Disaster Recovery Gate
         run: USE_GLIBC_IMAGE=1 bash scripts/docker_acceptance_gate.sh
 

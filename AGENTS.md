@@ -104,7 +104,7 @@ TLA2TOOLS_JAR=/root/tla2tools.jar cargo test --release
 cargo run --release --bin parvault-seed -- self-test
 cargo run --release --bin parvault -- gateway self-test
 # Plugin self-tests are client-only: this starts a standalone gateway, mints a token, runs both
-cargo build --release --bins && bash scripts/plugin_self_test.sh target/release/parvault target/release/parvault-fuse target/release/parvault-sync
+bash scripts/build_bins.sh --profile release --out dist && bash scripts/plugin_self_test.sh dist/parvault dist/parvault-fuse dist/parvault-sync
 
 # Run the empirical cryptography, Reed-Solomon, and /proc/self/status memory benchmark binary
 cargo run --release --bin parvault-bench -- run --payload-mib 64
@@ -119,13 +119,12 @@ bash scripts/docker_acceptance_gate.sh
 ### Static `musl` Cross-Compilation (`x86_64` & `aarch64`, `--profile soc`)
 ```bash
 # x86_64 static musl build (stripped sizes: docs/BENCHMARKS.md section 4)
-cargo build --profile soc --target x86_64-unknown-linux-musl \
-  --bin parvault --bin parvault-seed --bin parvault-fuse --bin parvault-sync
+# (build_bins.sh builds each binary with its own features, so the plugins link no tokio or libp2p)
+bash scripts/build_bins.sh --profile soc --target x86_64-unknown-linux-musl --out dist
 
 # ARM64 static musl build (OpenWrt / prplOS LXC / RPi; sizes: docs/BENCHMARKS.md section 4)
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
-  cargo build --profile soc --target aarch64-unknown-linux-musl \
-  --bin parvault --bin parvault-seed --bin parvault-fuse --bin parvault-sync
+  bash scripts/build_bins.sh --profile soc --target aarch64-unknown-linux-musl --out dist
 ```
 
 ### Kani Bounded Model Checking (<!-- metric:kani_harnesses -->`25`<!-- /metric --> Harnesses) & TLA+ TLC Formal Model Checking (<!-- metric:tla_specs -->`7`<!-- /metric --> Specs)
