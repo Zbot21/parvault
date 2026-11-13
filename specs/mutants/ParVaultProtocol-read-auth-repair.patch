@@ -1,0 +1,13 @@
+diff --git a/specs/ParVaultProtocol.tla b/specs/ParVaultProtocol.tla
+index 2850f19..e3c4870 100644
+--- a/specs/ParVaultProtocol.tla
++++ b/specs/ParVaultProtocol.tla
+@@ -33,7 +33,7 @@ ASSUME AdvKeys \cap ({Owner, Genesis, Self} \cup Witnesses) = {}   \* @assume ad
+ \* The guards: each compares a presented credential with honest state, and is used by both the
+ \* adversary's attempts (it fails) and the honest access (it passes).
+ OwnerReadOk(signer) == signer = Owner   \* @guard read-auth-owner sym=src/por/verifier.rs::grant_owner_decision
+-RepairReadOk(receipts) == Cardinality(receipts \cap Witnesses) >= MinWitnessSignatures   \* @guard read-auth-repair sym=src/por/verifier.rs::repair_read_decision
++RepairReadOk(receipts) == TRUE   \* @guard read-auth-repair sym=src/por/verifier.rs::repair_read_decision
+ ChainAdmitted(root) == root = Genesis   \* @guard wot-admission sym=src/network/wot.rs::chain_admission_decision
+ MayApplySlash(tgt) == tgt \notin {Genesis, Self}   \* @guard slash-target sym=src/network/wot.rs::slash_target_decision
+ 

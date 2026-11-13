@@ -1,0 +1,13 @@
+diff --git a/specs/ParVaultZeroKeyAdminAndQuorum.tla b/specs/ParVaultZeroKeyAdminAndQuorum.tla
+index bdfa095..f125686 100644
+--- a/specs/ParVaultZeroKeyAdminAndQuorum.tla
++++ b/specs/ParVaultZeroKeyAdminAndQuorum.tla
+@@ -110,7 +110,7 @@ ValidDistinctSigners(ord, authoritySet) ==
+     { s \in authoritySet : \E slot \in Slots : <<slot, s, ord.target>> \in ord.sigs }
+ 
+ OrderMeetsCouncilQuorum(ord) ==
+-    Cardinality(ValidDistinctSigners(ord, Council)) >= QuorumM   \* @guard quorum-count sym=src/storage/eviction.rs::tally_and_verify_quorum_raw
++    TRUE
+ 
+ \* The admin RPC compares the request's nonce with the connection's single active challenge
+ \* (`validate_admin_rpc_slice_replay_and_auth_meta`, src/admin_rpc.rs).

@@ -1,0 +1,13 @@
+diff --git a/specs/ParVaultConfidentialityAndTrust.tla b/specs/ParVaultConfidentialityAndTrust.tla
+index 55028d8..c571bf9 100644
+--- a/specs/ParVaultConfidentialityAndTrust.tla
++++ b/specs/ParVaultConfidentialityAndTrust.tla
+@@ -61,7 +61,7 @@ RecordUptimePass ==
+            nextTier == IF nextPass = 1 THEN "Verified" ELSE "Anchor"
+        IN /\ consecutivePasses' = nextPass
+           /\ subnetTrust' = [s \in Subnets |->
+-                IF subnetTrust[s] = "Slashed"   \* @guard slashed-sticky sym=src/storage/quota.rs::trust_level (N-09: nothing sets is_slashed in production v0.5.0)
++                IF FALSE
+                 THEN "Slashed"
+                 ELSE nextTier]
+     /\ UNCHANGED <<subnetShards, totalPlacedShards, adversaryShards,

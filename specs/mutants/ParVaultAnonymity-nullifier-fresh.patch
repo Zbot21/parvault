@@ -1,0 +1,13 @@
+diff --git a/specs/ParVaultAnonymity.tla b/specs/ParVaultAnonymity.tla
+index 7400f7a..5e42bf4 100644
+--- a/specs/ParVaultAnonymity.tla
++++ b/specs/ParVaultAnonymity.tla
+@@ -35,7 +35,7 @@ ASSUME
+ Senders == {"None", "OwnerNode", "RelayNode"}
+ 
+ \* The guard: a voucher nullifier is accepted only once (`VoucherNullifierLedger`).
+-NullifierFresh(v, spent) == v \notin spent   \* @guard nullifier-fresh sym=src/storage/anonymity.rs::redeem_voucher
++NullifierFresh(v, spent) == TRUE   \* @guard nullifier-fresh sym=src/storage/anonymity.rs::redeem_voucher
+ 
+ VARIABLES
+     mintedVouchers,             \* Count of owner-minted ephemeral-issuer bearer vouchers (0..MaxVouchers)

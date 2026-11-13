@@ -1,0 +1,13 @@
+diff --git a/specs/ParVaultPostQuantum.tla b/specs/ParVaultPostQuantum.tla
+index d0feb99..304e9e8 100644
+--- a/specs/ParVaultPostQuantum.tla
++++ b/specs/ParVaultPostQuantum.tla
+@@ -184,7 +184,7 @@ AdversaryAttemptKemKeySubstitutionOrDecaps ==
+ \* NIST FIPS 204 ML-DSA-65 (bound to ML_DSA_65_CONTEXT).
+ \* ----------------------------------------------------------------------------
+ \* ADR-12 verifier: a hybrid signature holds only if BOTH halves verify.
+-HybridVerifies(edValid, mlValid) == edValid /\ mlValid   \* @guard hybrid-sig-both sym=src/crypto/pqc.rs::hybrid_signature_decision
++HybridVerifies(edValid, mlValid) == edValid \/ mlValid
+ 
+ ClientSignCompositeEnvelope ==
+     /\ signedEnvelopes = {}

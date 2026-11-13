@@ -1,0 +1,13 @@
+diff --git a/specs/ParVaultBootstrapAndEarnedTier.tla b/specs/ParVaultBootstrapAndEarnedTier.tla
+index d23e851..016b042 100644
+--- a/specs/ParVaultBootstrapAndEarnedTier.tla
++++ b/specs/ParVaultBootstrapAndEarnedTier.tla
+@@ -42,7 +42,7 @@ vars == <<personalDevices, organicPeers, seedAnchors, porStreak, isSlashed,
+ 
+ \* Helper: maps (porStreak, isSlashed) to EarnedStanding tier once in the 20-peer mesh
+ EarnedTierFromStreak(streak, slashed) ==
+-    IF slashed THEN "Probationary_10of20"   \* @guard tier-respects-slash sym=src/bootstrap.rs::evaluate (EarnedStanding::evaluate; F-07 caveat: not yet on the wire path)
++    IF FALSE THEN "Probationary_10of20"   \* @guard tier-respects-slash sym=src/bootstrap.rs::evaluate (EarnedStanding::evaluate; F-07 caveat: not yet on the wire path)
+     ELSE IF streak >= 2 THEN "Homelab_16of20"
+     ELSE IF streak = 1 THEN "VerifiedMixed_16of24"
+     ELSE "Probationary_10of20"

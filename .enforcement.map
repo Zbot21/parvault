@@ -41,7 +41,33 @@ xref       X-ADR-DOC path=docs/**.md pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.
 
 # --- Formal proofs (P-01 to P-05; mutants are authored by QA) --------------------------------------
 tla-spec   T-SPECS   path=specs/*.tla
-open       T-SPECS   expect=completeness by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+# L-47 guard-removal mutants (QA, independent); each @guard line names its Rust decision via sym=.
+tla-mutant TM-READ-OWNER    spec=specs/ParVaultProtocol.tla inv=DataSecrecyInvariant patch=specs/mutants/ParVaultProtocol-read-auth-owner.patch
+tla-mutant TM-READ-REPAIR   spec=specs/ParVaultProtocol.tla inv=DataSecrecyInvariant patch=specs/mutants/ParVaultProtocol-read-auth-repair.patch
+tla-mutant TM-WOT-ADMIT     spec=specs/ParVaultProtocol.tla inv=SybilResistanceInvariant patch=specs/mutants/ParVaultProtocol-wot-admission.patch
+tla-mutant TM-SLASH-TARGET  spec=specs/ParVaultProtocol.tla inv=ProtectedKeysNeverSlashedInvariant patch=specs/mutants/ParVaultProtocol-slash-target.patch
+tla-mutant TM-NULLIFIER     spec=specs/ParVaultAnonymity.tla inv=Safety_NoVoucherDoubleSpend patch=specs/mutants/ParVaultAnonymity-nullifier-fresh.patch
+tla-mutant TM-TIER-SLASH    spec=specs/ParVaultBootstrapAndEarnedTier.tla inv=Safety_TierStrictlyEarnedByUptime patch=specs/mutants/ParVaultBootstrapAndEarnedTier-tier-respects-slash.patch
+tla-mutant TM-QUORUM        spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_NoUnauthorizedOrSubQuorumEviction patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-quorum-count.patch
+tla-mutant TM-NONCE         spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_NoNonceOrOrderReplay patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-nonce-fresh.patch
+tla-mutant TM-ORDER-ID      spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_NoNonceOrOrderReplay patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-order-id-fresh.patch
+tla-mutant TM-RING-SCOPE    spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_PrivateRingImmuneToPublicCouncil patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-ring-scope.patch
+tla-mutant TM-SLASH-STICKY  spec=specs/ParVaultConfidentialityAndTrust.tla inv=Safety_SlashedNeverTrusted patch=specs/mutants/ParVaultConfidentialityAndTrust-slashed-sticky.patch
+tla-mutant TM-HYBRID-SIG    spec=specs/ParVaultPostQuantum.tla inv=Safety_QuantumSignatureUnforgeability patch=specs/mutants/ParVaultPostQuantum-hybrid-sig-both.patch
+# L-47 invariants with no guard to remove (structural or assumption; each reason names its tag).
+waive      TM-W-DURABILITY  inv=specs/ParVaultProtocol.tla::DurabilitySafetyInvariant reason=assume bounded-epoch-churn (threat model, no Rust check)
+waive      TM-W-SLASH-BOUND inv=specs/ParVaultProtocol.tla::SlashingBoundInvariant reason=assume leaf-quarantine-not-run: record_failure is cfg(test), nothing slashes in v0.5.0 (ADR-09, N-09)
+waive      TM-W-ORIGIN      inv=specs/ParVaultAnonymity.tla::Safety_ZeroOriginLeakage reason=structural: storage node only ever observes the relay (L-38/L-39 scope)
+waive      TM-W-DRAIN       inv=specs/ParVaultBootstrapAndEarnedTier.tla::Safety_SeedAnchorsDrainAtOrganicThreshold reason=structural: seed shards = MaxOrganicPeers - organic by construction
+waive      TM-W-DAY1        inv=specs/ParVaultBootstrapAndEarnedTier.tla::Safety_Day1ToScaleDataAvailability reason=structural: recoverable = TierN(tier), TierK < TierN tables
+waive      TM-W-ZK-TYPE     inv=specs/ParVaultZeroKeyAdminAndQuorum.tla::TypeOK reason=structural: type invariant
+waive      TM-W-VPS-KEY     inv=specs/ParVaultZeroKeyAdminAndQuorum.tla::Safety_ZeroAdminPrivKeyOnVpsDisk reason=structural no-admin-key-persist + assume byzantine-below-quorum
+waive      TM-W-SUBNET-CAP  inv=specs/ParVaultConfidentialityAndTrust.tla::Safety_SubnetTrustCapsEnforced reason=assume placement-trust-cap: select_trust_weighted_peers has no production caller in v0.5.0
+waive      TM-W-LITE-TYPE   inv=specs/ParVaultLiteClientAndSeedFailover.tla::TypeOK reason=structural: type invariant
+waive      TM-W-NAS-DEATH   inv=specs/ParVaultLiteClientAndSeedFailover.tla::NasDeathSurvivableInvariant reason=assume: mesh churn stops at K (MeshPeerChurn bound)
+waive      TM-W-SELECTIVE   inv=specs/ParVaultLiteClientAndSeedFailover.tla::SelectiveBandwidthSavingInvariant reason=structural: restore downloads exactly the selected stripes
+waive      TM-W-HNDL        inv=specs/ParVaultPostQuantum.tla::Safety_HNDLConfidentialityPreserved reason=assume: at most one primitive broken per class; onion fields structural
+waive      TM-W-GROVER      inv=specs/ParVaultPostQuantum.tla::Safety_GroverBitSecurityFloor reason=assume: Grover floor constant, single cipher break
 module     P-01      path=src/network/wot.rs pattern=^(verify_and_admit_|is_peer_|apply_slashing_|slash_|record_failure) kani=required
 reach      P-01      sym=src/network/wot.rs::is_peer_trusted from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
 reach      P-01      sym=src/network/wot.rs::is_peer_trust_decision from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
@@ -166,4 +192,4 @@ kani       S-SANITIZE sym=src/sync.rs::sanitize_sync_relative_path_into harness=
 claim      B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision accept=trust_enforcement::bseed_second_sender_accepted_while_one_job_runs reject=trust_enforcement::bseed_third_job_refused_busy code=reject.syndication_busy bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe
 kani       B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision harness=proof_syndication_fanout_budget cover=syndication over budget
 
-ratchet    R         open=5 waive=16
+ratchet    R         open=4 waive=29
