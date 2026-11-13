@@ -83,6 +83,7 @@ Status values:
 | P-02 | High | Specs hardcode the properties they claim to check. | 2d-β | Reported |
 | P-03 | Medium | `ParVaultZeroKeyAdminAndQuorum`: tautological replay guard; Byzantine count fixed by `ASSUME`. | 2d-β | Reported |
 | P-04 | Medium | Earned-tier invariants are near-tautologies; no spec models pairing, rendezvous or PoW admission. | 2d-β | Reported |
+| P-04-SPECS | Medium | No TLA+ spec models SAS pairing, WAN rendezvous or PoW admission (part of P-04; the earned-tier lint findings are fixed in 2d-β). | v0.6.0 | Open by `v0.6.0` (BACKLOG B-3) |
 | P-05 | Low | Subtree slash limit is `3` in the spec cfg and `5` in Rust. | 2d-β | Reported |
 
 ## Completeness and artifact lines
