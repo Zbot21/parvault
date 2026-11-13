@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+# CodeQL alerts #1, #3, #41 (L-50): no job needs write access.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   TLA2TOOLS_JAR: /tmp/tla2tools.jar
