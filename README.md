@@ -140,6 +140,7 @@ flowchart LR
 - **Personal device rings:** the "zero storage quota tax" for linked devices is planned; nothing charges or waives quota by device certificate yet.
 - **Slow links:** each shard upload or fetch must finish within 1.2 s (about 7 Mbit/s for a 1 MiB shard); fine on a LAN, but a seed forwarding to WAN peers or a restore over a slow uplink can time out (T-SHARD-TIMEOUT). Lite syndication to the seed waits up to 30 s.
 - **Lost quota state:** if a node's `quota_state.bin` is deleted or unreadable, it starts with empty accounting, so a shard stored without a repair grant can no longer be re-put or deleted by its owner there (shards stored with a grant are unaffected; F-38-GRANT-QUOTA).
+- **WebDAV auth (F-43):** every request needs a read-only `parvault token mint` token, as `Authorization: Bearer` or as the Basic-auth password. There is no TLS, so a token sent over a LAN can be replayed until it expires: use `--ttl-secs` and keep the bind on `127.0.0.1` where you can. Windows' WebDAV client sends Basic only over HTTPS unless `BasicAuthLevel=2` is set. Tokens can be scoped to one file (`--manifest-hex`) but not to a folder, and are revoked only by rotating `macaroon_root.key` (which also invalidates plugin tokens).
 - **Public tracker:** none is hosted; `--public` needs your own `parvault-seed`.
 - **RAM:** `< 32 MiB` is a design target; the evidence is a 48 MiB cgroup Docker stage and `parvault-bench`.
 - **Eviction council (upgrade):** a node accepts council eviction orders only after `parvault council init` (ring genesis holder) or `parvault council install` (public mode). `PARVAULT_EVICTION_AUTHORITIES`, `PARVAULT_TRACKER_EVICTION_QUORUM`, the config keys `eviction_authorities` / `tracker_eviction_quorum` and the seed flags `--council-pubkeys` / `--council-quorum` are gone; in particular `PARVAULT_EVICTION_AUTHORITIES` no longer authorises keys on a seed's admin RPC: use `--admin-rpc-pubkey`. Orders signed before v0.5.0 (`-v1:`) or without an expiry are refused. An equivocating council quorum can fork the next epoch (F-39).
@@ -171,10 +172,14 @@ parvault-seed start --no-fs --in-memory-mb 256 --mode public-bootstrap --listen 
 SOCK=/var/run/parvault.sock
 parvault up --folder /mnt/usb-nas/shared --ipc-socket "$SOCK" \
   --strict-plugins --allow-peer-uid "$(id -u)" --require-sealed-memfd
-TOKEN=$(parvault token mint --read-only --ttl-secs 3600 --allow-peer-uid "$(id -u)")
+# WebDAV clients present this token (or an offline `parvault token attenuate` of it) on every
+# request (F-43). No --allow-peer-uid: a peer-UID caveat cannot be checked over TCP, and
+# --strict-plugins already pins the plugin's UID on the socket.
+TOKEN=$(parvault token mint --read-only --ttl-secs 3600)
 # The WebDAV view lists what parvault-fuse itself ingests, not folders pushed with parvault-sync
 parvault-fuse --socket "$SOCK" --macaroon "$TOKEN" \
   --cache-dir /tmp/pv-cache --cache-mib 512 webdav --listen 127.0.0.1:8088
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
 parvault-sync --socket "$SOCK" --catalog ./gw-catalog.bin push --folder ~/Documents
 parvault-sync --socket "$SOCK" --catalog ./gw-catalog.bin --macaroon "$TOKEN" pull --output /tmp/restored
 
@@ -182,6 +187,10 @@ parvault-sync --socket "$SOCK" --catalog ./gw-catalog.bin --macaroon "$TOKEN" pu
 # Needs `parvault init` and ring membership. The seed folder is stored like other data: on pinned
 # ring peers that accept it, else locally (peers of other rings and offline peers are skipped).
 parvault up --no-socket --vfs-seed-dir /mnt/usb-nas/shared --vfs-webdav-listen 127.0.0.1:8088
+# Every WebDAV request needs a read-only token from this node's data dir (F-43):
+TOKEN="$(parvault token mint --read-only --ttl-secs 86400)"
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
+# Finder, davfs2: any user name, the token as the password. rclone: --webdav-bearer-token "$TOKEN".
 
 # Execute the empirical cryptography, Reed-Solomon, and /proc/self/status memory benchmark suite (see docs/BENCHMARKS.md)
 cargo run --release --bin parvault-bench -- run --payload-mib 64

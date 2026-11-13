@@ -171,6 +171,8 @@ parvault --data-dir /var/lib/parvault up \
   --allow-peer-uid 1042 \
   --require-sealed-memfd
 
+# WebDAV clients must present ${PLUGIN_TOK} or an offline attenuation of it on every request
+# (F-43); a token with a peer-UID caveat is refused over TCP.
 parvault-fuse --socket /var/run/parvault.sock --macaroon "${PLUGIN_TOK}" webdav --listen 127.0.0.1:4918
 
 # 5. Zero-key incremental folder push & macaroon-attenuated selective pull via parvault-sync (=m)
@@ -184,6 +186,8 @@ parvault --data-dir /var/lib/parvault up \
   --vfs-seed-dir /srv/media \
   --vfs-cache-mib 64 \
   --vfs-webdav-listen 127.0.0.1:4918
+# Every request needs a read-only token minted on this data dir (F-43):
+#   curl -H "Authorization: Bearer $(parvault --data-dir /var/lib/parvault token mint --read-only --ttl-secs 3600)" http://127.0.0.1:4918/
 ```
 
 ---
