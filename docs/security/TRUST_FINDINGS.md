@@ -68,7 +68,7 @@ Status values:
 | E-WIRE | Every `MeshWireRequest` variant is covered by a claim. | Open until every variant has a claim (2b covers the admitted classes; the rest follow in 2c). |
 | D-ADR | Every accepted ADR is a claim's `adr=` or has a `noenforce` line. | Open (2c). |
 | A-DOCKER | `scripts/docker_acceptance_gate.sh` stages binaries through `stage_artifact.sh`. | Open; converted before item 7. |
-| B-DISC | `src/network/discovery.rs` has three `std::thread::sleep` calls (LAN beacon and probe loops); review whether any runs on the async runtime. | Open (2c). |
+| B-DISC | `src/network/discovery.rs` has three `std::thread::sleep` calls (LAN beacon and probe loops); review whether any runs on the async runtime. | Closed (2c, QA pending): two run on the beacon responder's dedicated thread; the third is reached from the swarm only through the onion forward, which runs on the blocking pool since F-18. `discovery.rs` is exempt; the `no-blocking` check now covers the handler modules (`wire_handler.rs`, `server_events.rs`, `cli/daemon.rs`). |
 | T-SPECS | Every spec passes the non-vacuity lint and every `INVARIANT` has a QA-authored mutant (P-02, P-04). | Open (2d-β). |
 | X-ADR, X-ADR-DOC | Every `ADR-NN` reference in code and docs names an existing ADR file. | Enforced. |
 
