@@ -4946,3 +4946,101 @@ fn f43_plugin_requires_macaroon() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// --- D-ADR gateway pairs: ADR-28 (per-frame macaroons) and ADR-32 (sealing, UID allowlist) ------
+
+/// `parvault up --ipc-socket` with `extra` flags; a pinned `macaroon_root.key` when `key` is set.
+fn gw_up(label: &str, extra: &[&str], key: Option<[u8; 32]>) -> (Node, PathBuf) {
+    let (root, dir, reg, log) = prepare(label);
+    if let Some(k) = key {
+        std::fs::write(dir.join("macaroon_root.key"), hex::encode(k)).unwrap();
+    }
+    let sock = dir.join("gw.sock");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .arg("--data-dir")
+        .arg(&dir)
+        .args([
+            "--no-lan-discovery",
+            "up",
+            "--listen",
+            common::LOOPBACK_EPHEMERAL,
+        ])
+        .arg("--ipc-socket")
+        .arg(&sock)
+        .args(extra);
+    let node = spawn(cmd, root, dir, log);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !sock.exists() {
+        assert!(Instant::now() < deadline, "no socket:\n{}", node.log_text());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    (node, sock)
+}
+
+/// Stores `data` over the socket from a memfd, sealed when `seal` is set.
+fn gw_store(
+    sock: &Path,
+    data: &[u8],
+    seal: bool,
+) -> std::io::Result<parvault::gateway::ipc::EphemeralShardManifest> {
+    use std::os::fd::{AsFd, AsRawFd};
+    let file = std::fs::File::from(
+        parvault::gateway::create_memfd_sized("gw-test", data.len() as u64).unwrap(),
+    );
+    parvault::gateway::pwrite_all(&file, 0, data).unwrap();
+    if seal {
+        parvault::os_sys::seal_memfd_immutable(file.as_fd()).unwrap();
+    }
+    parvault::gateway::GatewayBus::unix_socket(sock).store_memfd_sync(
+        file.as_raw_fd(),
+        data.len() as u64,
+        parvault::gateway::RetentionPolicy::Persistent,
+    )
+}
+
+const GW_KEY: [u8; 32] = [0x28; 32];
+
+fn gw_token(
+    caveats: Vec<parvault::capabilities::Caveat>,
+) -> parvault::capabilities::CapabilityMacaroon {
+    parvault::capabilities::CapabilityMacaroon::mint(&GW_KEY, [5; 32], [6; 32], caveats).unwrap()
+}
+
+fn gw_window() -> parvault::capabilities::CapabilityMacaroon {
+    gw_token(vec![
+        parvault::capabilities::Caveat::ReadOnly,
+        parvault::capabilities::Caveat::ByteRange {
+            offset: 0,
+            length: 4096,
+        },
+    ])
+}
+
+/// ADR-28 accept: a frame inside its attenuated macaroon's byte window is served.
+#[test]
+fn gmac_frame_inside_caveat_served() {
+    let (_node, sock) = gw_up("gmac-ok", &[], Some(GW_KEY));
+    let data = vec![0x5C; 64 * 1024];
+    let manifest = gw_store(&sock, &data, false).unwrap();
+    let bus = parvault::gateway::GatewayBus::unix_socket(&sock);
+    let got = bus
+        .fetch_range_bytes_sync(&manifest, 0, 4096, Some(gw_window()))
+        .unwrap();
+    assert_eq!(got, data[..4096]);
+    gate_ran("trust_enforcement::gmac_frame_inside_caveat_served");
+}
+
+/// ADR-28 reject: the same token on a frame outside its byte window is refused, per frame.
+#[test]
+fn gmac_frame_outside_caveat_refused() {
+    let (node, sock) = gw_up("gmac-out", &[], Some(GW_KEY));
+    let data = vec![0x5D; 64 * 1024];
+    let manifest = gw_store(&sock, &data, false).unwrap();
+    let bus = parvault::gateway::GatewayBus::unix_socket(&sock);
+    assert!(bus
+        .fetch_range_bytes_sync(&manifest, 8192, 4096, Some(gw_window()))
+        .is_err());
+    assert_logged(&node, "reject.gateway_macaroon_caveat");
+    gate_ran("trust_enforcement::gmac_frame_outside_caveat_refused");
+}

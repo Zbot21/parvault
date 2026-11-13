@@ -108,4 +108,7 @@ claim      F-43-ADR33 sym=src/vfs.rs::webdav_auth_decision accept=trust_enforcem
 claim      F-43-PLUGIN sym=src/vfs.rs::webdav_auth_decision accept=trust_enforcement::f43_plugin_attenuated_child_reads reject=trust_enforcement::f43_plugin_sibling_token_unauthorized code=reject.webdav_token_invalid bin=parvault-fuse ref=docs/security/TRUST_FINDINGS.md
 kani       F-43      sym=src/vfs.rs::webdav_auth_decision harness=proof_webdav_auth_decision cover=valid token out of scope
 
+# --- D-ADR (2c): gateway enforcement pairs ---
+claim      G-MAC     sym=src/gateway/engine.rs::gateway_macaroon_decision accept=trust_enforcement::gmac_frame_inside_caveat_served reject=trust_enforcement::gmac_frame_outside_caveat_refused code=reject.gateway_macaroon_caveat bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-28-stateless-macaroon-capability-attenuation.md
+
 ratchet    R         open=9 waive=0
