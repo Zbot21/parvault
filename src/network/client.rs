@@ -1,6 +1,4 @@
-use crate::bootstrap::{
-    BlindedShardTombstone, LiteStripeSyndicationBundle, LiteSyndicationReceipt, PersonalDeviceCert,
-};
+use crate::bootstrap::{LiteStripeSyndicationBundle, LiteSyndicationReceipt, PersonalDeviceCert};
 use crate::config::ErasureTier;
 use crate::crypto::{compute_sha256, HybridKemPublicKey, NodeIdentity, PqRelayedShardEnvelope};
 use crate::network::behaviour::{
@@ -2343,31 +2341,33 @@ impl MeshClient {
         }
     }
 
-    pub fn delete_blinded_shard_tombstone(
+    /// Deletes a blinded shard on `peer_addr` with a delete signed by its capability key for
+    /// that host (F-41). `peer_addr` must carry `/p2p/<PeerId>` (the host binding).
+    pub fn delete_blinded_shard_signed(
         &self,
         peer_addr: &str,
+        cap_identity: &NodeIdentity,
         blinded_id: BlindedShardId,
-        tombstone: BlindedShardTombstone,
     ) -> anyhow::Result<bool> {
+        let host = crate::config::NodeConfig::extract_ed25519_pubkey_from_peer_str(peer_addr)
+            .ok_or_else(|| anyhow::anyhow!("a blinded delete needs a /p2p/ host address"))?;
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let sig =
+            BlindedShardCapability::sign_delete(cap_identity, &host, &blinded_id, timestamp_ms);
         match self.send_request(
             peer_addr,
-            MeshWireRequest::DeleteBlindedShardTombstone {
+            MeshWireRequest::DeleteBlindedShardSigned {
                 blinded_id,
-                tombstone,
+                timestamp_ms,
+                sig: sig.to_vec(),
             },
         )? {
-            MeshWireResponse::DeleteBlindedShardAck { deleted, error } => {
-                if !deleted {
-                    return Err(MeshClientError::RemoteRejected {
-                        peer: peer_addr.to_string(),
-                        reason: format!("DeleteBlindedShardTombstone failed: {error:?}"),
-                    }
-                    .into());
-                }
-                Ok(true)
-            }
+            MeshWireResponse::DeleteBlindedShardAck { deleted, .. } => Ok(deleted),
             other => Err(MeshClientError::ProtocolError(format!(
-                "unexpected response to DeleteBlindedShardTombstone: {other:?}"
+                "unexpected response to DeleteBlindedShardSigned: {other:?}"
             ))
             .into()),
         }

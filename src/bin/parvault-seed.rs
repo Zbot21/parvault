@@ -2427,7 +2427,7 @@ fn run_builtin_self_test() -> anyhow::Result<()> {
         let payload_drain = vec![0xDDu8; 2048];
         let blinded_drain =
             BlindedShardId::derive(&user_master_key, &[0x33; 32], 4, &payload_drain);
-        let (_, cap_drain) =
+        let (cap_drain_identity, cap_drain) =
             BlindedShardCapability::derive_keypair(&user_master_key, &blinded_drain.locator);
         let voucher_2 = AnonymousQuotaVoucher::mint(&voucher_issuer, 4096);
         let verifier_2 =
@@ -2485,9 +2485,22 @@ fn run_builtin_self_test() -> anyhow::Result<()> {
         );
         assert!(!drain_plan.is_empty());
 
-        let tombstone =
-            BlindedShardTombstone::create(&verifier_2, blinded_drain.locator, [0x77; 16]);
-        assert!(boot_server.execute_blinded_tombstone(&blinded_drain, &tombstone)?);
+        // F-41: the owner deletes with its capability key, bound to this host.
+        let host = [0x5Au8; 32];
+        let delete_ts = seed_now_ms();
+        let delete_sig = BlindedShardCapability::sign_delete(
+            &cap_drain_identity,
+            &host,
+            &blinded_drain,
+            delete_ts,
+        );
+        assert!(boot_server.block_store().delete_blinded_shard_signed(
+            &blinded_drain,
+            delete_ts,
+            &delete_sig,
+            &host,
+            delete_ts,
+        )?);
 
         let boot_report = boot_server.status_report(21);
         assert_eq!(boot_report.used_storage_bytes, 0);

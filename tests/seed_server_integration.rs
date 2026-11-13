@@ -225,7 +225,7 @@ fn test_seed_server_public_bootstrapper_mode_blinded_storage_and_auto_drain() {
             compute_salted_commitment(&chal_nonce, &shard_bytes)
         );
 
-        stored_seed_shards.push((blinded_id, delete_verifier));
+        stored_seed_shards.push((blinded_id, cap_identity.clone()));
     }
 
     let mid_report = server.status_report(1);
@@ -259,13 +259,15 @@ fn test_seed_server_public_bootstrapper_mode_blinded_storage_and_auto_drain() {
         assert!(mig.to_organic_peer_id.starts_with("organic-pioneer-"));
     }
 
-    // Purge drained shards from the seed server using BlindedShardTombstones
-    for (blinded_id, delete_verifier) in &stored_seed_shards {
-        let tombstone =
-            BlindedShardTombstone::create(delete_verifier, blinded_id.locator, [0x99u8; 16]);
+    // Purge drained shards from the seed server with deletes signed by each shard's
+    // capability key for this host (F-41).
+    let host = [0x5Au8; 32];
+    for (blinded_id, cap_identity) in &stored_seed_shards {
+        let sig = BlindedShardCapability::sign_delete(cap_identity, &host, blinded_id, 1_000);
         let deleted = server
-            .execute_blinded_tombstone(blinded_id, &tombstone)
-            .expect("execute tombstone");
+            .block_store()
+            .delete_blinded_shard_signed(blinded_id, 1_000, &sig, &host, 1_000)
+            .expect("signed delete");
         assert!(deleted);
         assert!(!server.block_store().has_blinded_shard_on_disk(blinded_id));
     }

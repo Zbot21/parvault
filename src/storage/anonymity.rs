@@ -133,6 +133,44 @@ impl BlindedShardCapability {
         cap_identity.sign(&msg)
     }
 
+    /// Signs a delete of `blinded_id` on the host whose Ed25519 key is `host_pubkey` (F-41):
+    /// `"parvault-delete-blinded-v1" || host || locator || content_sha256 || timestamp_ms`. The
+    /// host binding stops one host replaying the delete to other replicas.
+    pub fn sign_delete(
+        cap_identity: &NodeIdentity,
+        host_pubkey: &[u8; 32],
+        blinded_id: &BlindedShardId,
+        timestamp_ms: u64,
+    ) -> [u8; 64] {
+        cap_identity.sign(&Self::delete_bytes(host_pubkey, blinded_id, timestamp_ms))
+    }
+
+    /// Verifies a delete signature by this capability key (F-41).
+    pub fn verify_delete(
+        &self,
+        host_pubkey: &[u8; 32],
+        blinded_id: &BlindedShardId,
+        timestamp_ms: u64,
+        signature: &[u8; 64],
+    ) -> bool {
+        let msg = Self::delete_bytes(host_pubkey, blinded_id, timestamp_ms);
+        NodeIdentity::verify_with_pubkey(&self.capability_pubkey, &msg, signature)
+    }
+
+    fn delete_bytes(
+        host_pubkey: &[u8; 32],
+        blinded_id: &BlindedShardId,
+        timestamp_ms: u64,
+    ) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(26 + 32 + 32 + 32 + 8);
+        msg.extend_from_slice(b"parvault-delete-blinded-v1");
+        msg.extend_from_slice(host_pubkey);
+        msg.extend_from_slice(&blinded_id.locator);
+        msg.extend_from_slice(&blinded_id.content_sha256);
+        msg.extend_from_slice(&timestamp_ms.to_be_bytes());
+        msg
+    }
+
     /// Signs a lease renewal (F-23) with the shard's capability key.
     pub fn sign_lease_renewal(
         cap_identity: &NodeIdentity,
@@ -234,6 +272,54 @@ pub fn blinded_read_decision(f: &BlindedReadFacts) -> Result<(), &'static str> {
         return Err("reject.blinded_read_sig_invalid");
     }
     Ok(())
+}
+
+/// What a blinded delete knows (F-41, L-42).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlindedDeleteFacts {
+    /// A signed delete (`DeleteBlindedShardSigned`); the MAC tombstone is never signed.
+    pub signed: bool,
+    /// The lease exists and has a registered capability key.
+    pub capability_registered: bool,
+    /// The request's id equals the stored `BlindedShardId` (locator and content hash).
+    pub id_matches: bool,
+    /// Signed within `MAX_CAPABILITY_CLOCK_SKEW_MS` of now.
+    pub fresh: bool,
+    /// Valid signature by the registered capability key, bound to this host.
+    pub sig_valid: bool,
+}
+
+/// F-41: a blinded shard is deleted before lease expiry only on a fresh signature by the
+/// lease's registered capability key, bound to this host and to the stored id.
+pub fn blinded_delete_decision(f: &BlindedDeleteFacts) -> Result<(), &'static str> {
+    if !f.signed {
+        return Err("reject.blinded_delete_unsigned");
+    }
+    if !f.capability_registered {
+        return Err("reject.blinded_delete_no_capability");
+    }
+    if !f.id_matches {
+        return Err("reject.blinded_delete_id_mismatch");
+    }
+    if !f.fresh {
+        return Err("reject.blinded_delete_stale");
+    }
+    if !f.sig_valid {
+        return Err("reject.blinded_delete_sig_invalid");
+    }
+    Ok(())
+}
+
+/// F-41: the capability bound to a locator is immutable while its lease exists (first writer
+/// wins; a same-key re-put by the owner or a handoff passes).
+pub fn blinded_rebind_decision(
+    registered: Option<[u8; 32]>,
+    incoming: [u8; 32],
+) -> Result<(), &'static str> {
+    match registered {
+        Some(pk) if pk != incoming => Err("reject.blinded_locator_bound_to_another_capability"),
+        _ => Ok(()),
+    }
 }
 
 /// Layer 3 (ADR-11): Unlinkable Bearer Storage Quota Voucher.
@@ -677,6 +763,50 @@ mod tests {
 #[cfg(test)]
 mod blinded_read_decision_tests {
     use super::*;
+
+    /// F-41: every fact must hold, in order; the rebind is first-writer-wins.
+    #[test]
+    fn blinded_delete_and_rebind_rules() {
+        let ok = BlindedDeleteFacts {
+            signed: true,
+            capability_registered: true,
+            id_matches: true,
+            fresh: true,
+            sig_valid: true,
+        };
+        assert_eq!(blinded_delete_decision(&ok), Ok(()));
+        let with = |f: &dyn Fn(&mut BlindedDeleteFacts)| {
+            let mut x = ok;
+            f(&mut x);
+            blinded_delete_decision(&x)
+        };
+        assert_eq!(
+            with(&|f| f.signed = false),
+            Err("reject.blinded_delete_unsigned")
+        );
+        assert_eq!(
+            with(&|f| f.capability_registered = false),
+            Err("reject.blinded_delete_no_capability")
+        );
+        assert_eq!(
+            with(&|f| f.id_matches = false),
+            Err("reject.blinded_delete_id_mismatch")
+        );
+        assert_eq!(
+            with(&|f| f.fresh = false),
+            Err("reject.blinded_delete_stale")
+        );
+        assert_eq!(
+            with(&|f| f.sig_valid = false),
+            Err("reject.blinded_delete_sig_invalid")
+        );
+        assert_eq!(blinded_rebind_decision(None, [1; 32]), Ok(()));
+        assert_eq!(blinded_rebind_decision(Some([1; 32]), [1; 32]), Ok(()));
+        assert_eq!(
+            blinded_rebind_decision(Some([1; 32]), [2; 32]),
+            Err("reject.blinded_locator_bound_to_another_capability")
+        );
+    }
 
     /// E-WIRE GetBlindedShard: registered capability for this locator, fresh, then the signature.
     #[test]

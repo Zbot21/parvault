@@ -230,8 +230,6 @@ pub trait WireRolePolicy {
     fn record_put_shard_admission_ip(&self) -> bool;
     /// Rows 6 and 11: blinded shards longer than this are refused; 0 disables the check.
     fn max_probationary_lease_bytes(&self) -> u64;
-    /// Row 9: route tombstones through the seed server (changes only the error text).
-    fn tombstone_via_seed_server(&self) -> bool;
     /// Row 15.
     fn status_region(&self) -> &'static str;
     /// Rows 16 and 17.
@@ -261,9 +259,6 @@ impl WireRolePolicy for DaemonWirePolicy<'_> {
     fn max_probationary_lease_bytes(&self) -> u64 {
         0
     }
-    fn tombstone_via_seed_server(&self) -> bool {
-        false
-    }
     fn status_region(&self) -> &'static str {
         "local-neighborhood"
     }
@@ -284,9 +279,6 @@ impl WireRolePolicy for SeedWirePolicy {
     }
     fn max_probationary_lease_bytes(&self) -> u64 {
         self.max_probationary_lease_bytes
-    }
-    fn tombstone_via_seed_server(&self) -> bool {
-        true
     }
     fn status_region(&self) -> &'static str {
         "seed-anchor"
@@ -385,6 +377,7 @@ pub const fn admission_class(request: &MeshWireRequest) -> AdmissionClass {
         | MeshWireRequest::RenewBlindedLease { .. }
         | MeshWireRequest::RenewBlindedLeaseSigned { .. }
         | MeshWireRequest::DeleteBlindedShardTombstone { .. }
+        | MeshWireRequest::DeleteBlindedShardSigned { .. }
         | MeshWireRequest::GetCiphertextShard { .. }
         | MeshWireRequest::DeleteShard { .. }
         | MeshWireRequest::PorAudit(_)
@@ -645,7 +638,8 @@ pub fn reject_response(request: &MeshWireRequest, reason: String) -> MeshWireRes
         | MeshWireRequest::RenewBlindedLeaseSigned { .. } => {
             MeshWireResponse::RenewBlindedLeaseAck { renewed: false }
         }
-        MeshWireRequest::DeleteBlindedShardTombstone { .. } => {
+        MeshWireRequest::DeleteBlindedShardTombstone { .. }
+        | MeshWireRequest::DeleteBlindedShardSigned { .. } => {
             MeshWireResponse::DeleteBlindedShardAck {
                 deleted: false,
                 error: Some(reason),
@@ -1317,27 +1311,54 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                 block_store.renew_blinded_shard_lease(&blinded_id, current_epoch, extension_epochs);
             MeshWireResponse::RenewBlindedLeaseAck { renewed }
         }
-        MeshWireRequest::DeleteBlindedShardTombstone {
-            blinded_id,
-            tombstone,
-        } => {
-            let result = if policy.tombstone_via_seed_server() {
-                server
-                    .execute_blinded_tombstone(&blinded_id, &tombstone)
-                    .map_err(|e| e.to_string())
-            } else {
-                block_store
-                    .delete_blinded_shard_with_tombstone(&blinded_id, &tombstone)
-                    .map_err(|e| e.to_string())
+        MeshWireRequest::DeleteBlindedShardTombstone { .. } => {
+            // F-41: a MAC tombstone is keyed by the delete verifier, which relays and hosts
+            // see; it is never authority to delete. Refused like the unsigned renew.
+            let unsigned = crate::storage::anonymity::BlindedDeleteFacts {
+                signed: false,
+                capability_registered: false,
+                id_matches: false,
+                fresh: false,
+                sig_valid: false,
             };
-            match result {
+            let code = crate::storage::anonymity::blinded_delete_decision(&unsigned)
+                .err()
+                .unwrap_or_default();
+            warn!(
+                code,
+                peer = remote_peer_id,
+                "refused an unsigned blinded tombstone"
+            );
+            MeshWireResponse::DeleteBlindedShardAck {
+                deleted: false,
+                error: Some("unsigned tombstones are refused; use DeleteBlindedShardSigned".into()),
+            }
+        }
+        MeshWireRequest::DeleteBlindedShardSigned {
+            blinded_id,
+            timestamp_ms,
+            sig,
+        } => {
+            let Ok(sig64) = <[u8; 64]>::try_from(sig.as_slice()) else {
+                return MeshWireResponse::DeleteBlindedShardAck {
+                    deleted: false,
+                    error: Some("invalid 64-byte delete signature length".into()),
+                };
+            };
+            match block_store.delete_blinded_shard_signed(
+                &blinded_id,
+                timestamp_ms,
+                &sig64,
+                &node_identity.public_key_bytes(),
+                now_unix_ms(),
+            ) {
                 Ok(deleted) => MeshWireResponse::DeleteBlindedShardAck {
                     deleted,
                     error: None,
                 },
                 Err(e) => MeshWireResponse::DeleteBlindedShardAck {
                     deleted: false,
-                    error: Some(e),
+                    error: Some(e.to_string()),
                 },
             }
         }

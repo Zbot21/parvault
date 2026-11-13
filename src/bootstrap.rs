@@ -870,39 +870,18 @@ impl BlindedShardLeaseManager {
         }
     }
 
-    /// Immediately purges a blinded shard when the owner presents a valid `BlindedShardTombstone`
-    /// (graceful departure or file deletion). Blocks cross-generation tombstone replay (`ADR-15`).
-    pub fn execute_tombstone(&mut self, tombstone: &BlindedShardTombstone) -> bool {
-        if let Some(seen_macs) = self
-            .consumed_tombstone_macs
-            .get(&tombstone.blinded_shard_id)
-        {
-            if seen_macs.contains(&tombstone.delete_proof_mac) {
-                return false;
-            }
-        }
-        let Some(entry) = self.leases.get(&tombstone.blinded_shard_id) else {
+    /// Removes the lease of `blinded_shard_id` (after a signed delete, F-41). Its next
+    /// generation is recorded so a stale grant cannot reuse it.
+    pub fn remove_lease(&mut self, blinded_shard_id: &[u8; 32]) -> bool {
+        let Some(removed) = self.leases.remove(blinded_shard_id) else {
             return false;
         };
-        if tombstone.lease_generation > 0 && tombstone.lease_generation < entry.lease_generation {
-            return false;
-        }
-        if !tombstone.verify(&entry.delete_verifier) {
-            return false;
-        }
-        let next_gen = entry.lease_generation.saturating_add(1);
-        if let Some(removed) = self.leases.remove(&tombstone.blinded_shard_id) {
-            self.used_bytes = self.used_bytes.saturating_sub(removed.size_bytes);
-            self.next_generation_by_locator
-                .insert(tombstone.blinded_shard_id, next_gen);
-            self.consumed_tombstone_macs
-                .entry(tombstone.blinded_shard_id)
-                .or_default()
-                .push(tombstone.delete_proof_mac);
-            true
-        } else {
-            false
-        }
+        self.used_bytes = self.used_bytes.saturating_sub(removed.size_bytes);
+        self.next_generation_by_locator.insert(
+            *blinded_shard_id,
+            removed.lease_generation.saturating_add(1),
+        );
+        true
     }
 
     /// Evicts shards whose `lease_expires_epoch + grace_epochs <= current_epoch` (oldest first)
@@ -1471,18 +1450,6 @@ impl ZeroTrustSeedServer {
         Ok(self
             .block_store
             .sweep_expired_blinded_shards(current_epoch)?)
-    }
-
-    /// Executes an immediate `BlindedShardTombstone` deletion (used when a shard is drained to an
-    /// organic peer or explicitly deleted by its owner) and unlinks `{locator}.bshard` from disk.
-    pub fn execute_blinded_tombstone(
-        &mut self,
-        blinded_id: &BlindedShardId,
-        tombstone: &BlindedShardTombstone,
-    ) -> Result<bool, BootstrapError> {
-        Ok(self
-            .block_store
-            .delete_blinded_shard_with_tombstone(blinded_id, tombstone)?)
     }
 
     /// Computes drain migration steps (`ElasticBootstrapEngine::plan_seed_anchor_drain`) to hand

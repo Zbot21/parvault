@@ -41,3 +41,7 @@ $$
 
 - **Consequences:** Eliminates static disk grouping, PoR key correlation, quota ledger linkage, and single-hop IP exposure; paired with hedged parallel $N$-shard reads across degraded WANs.
 - **Verification:** `specs/ParVaultAnonymity.tla` (<!-- metric:tlc.distinct.ParVaultAnonymity -->`861`<!-- /metric --> distinct states, `0` errors) and `tests/anonymity_and_degraded_net_tests.rs` (`8/8` degraded network profiles).
+
+## v0.5.0: deletes (F-41)
+
+A blinded shard is deleted before lease expiry only on a fresh Ed25519 signature by the lease's registered capability key over `"parvault-delete-blinded-v1" || host_pubkey || locator || content_sha256 || timestamp_ms` (`DeleteBlindedShardSigned`, `blinded_delete_decision`). The host binding stops one host replaying a delete to other replicas. The capability bound to a locator is immutable while its lease exists (`blinded_rebind_decision`). The MAC tombstone keyed by `delete_verifier` is refused: the verifier is visible to hosts and relays. Leases stored without a capability key cannot be deleted and expire by lease. Read, renew and delete share the capability key; it is Ed25519 only in v0.5.0.

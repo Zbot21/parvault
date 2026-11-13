@@ -1222,3 +1222,32 @@ fn proof_shard_rebind_first_writer_wins() {
         Err(_) => {}
     }
 }
+
+/// F-41: a blinded delete passes only if all five facts hold.
+#[kani::proof]
+fn proof_blinded_delete_needs_every_fact() {
+    let f = crate::storage::anonymity::BlindedDeleteFacts {
+        signed: kani::any(),
+        capability_registered: kani::any(),
+        id_matches: kani::any(),
+        fresh: kani::any(),
+        sig_valid: kani::any(),
+    };
+    let decision = crate::storage::anonymity::blinded_delete_decision(&f);
+    kani::cover!(decision.is_err(), "blinded delete refused");
+    let all = f.signed && f.capability_registered && f.id_matches && f.fresh && f.sig_valid;
+    assert_eq!(decision.is_ok(), all);
+}
+
+/// F-41: a locator's capability is first-writer-wins while its lease exists.
+#[kani::proof]
+#[kani::unwind(34)]
+fn proof_blinded_rebind_first_writer_wins() {
+    let has: bool = kani::any();
+    let registered: [u8; 32] = kani::any();
+    let incoming: [u8; 32] = kani::any();
+    let decision =
+        crate::storage::anonymity::blinded_rebind_decision(has.then_some(registered), incoming);
+    kani::cover!(decision.is_err(), "blinded rebind refused");
+    assert_eq!(decision.is_ok(), !has || registered == incoming);
+}

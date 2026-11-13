@@ -200,13 +200,14 @@ fn test_rt2_blinded_capability_pinning_clock_skew_and_tombstone_generation_repla
         "Far-future immortal capability timestamp must be rejected"
     );
 
-    // 4. [CRITICAL-CRYPTO-03] Tombstone Generation Replay Defense:
-    //    Owner deletes the shard with `tombstone_gen0`, then re-uploads the shard at epoch 15 (gen 1).
-    //    An attacker who captured `tombstone_gen0` replays it against the re-uploaded shard!
-    let tombstone_gen0 =
-        BlindedShardTombstone::create(&delete_verifier, blinded_id.locator, [0x11u8; 16]);
+    // 4. [CRITICAL-CRYPTO-03, F-41] Delete replay defense. The owner deletes with a signature by
+    //    the capability key bound to this host; after a re-upload, the captured delete is stale
+    //    (outside +/-30 s) and refused, as is a delete signed for another host.
+    let host = [0x48u8; 32];
+    let t0 = 1_000_000u64;
+    let del0 = BlindedShardCapability::sign_delete(&owner_cap_id, &host, &blinded_id, t0);
     assert!(store
-        .delete_blinded_shard_with_tombstone(&blinded_id, &tombstone_gen0)
+        .delete_blinded_shard_signed(&blinded_id, t0, &del0, &host, t0)
         .unwrap());
     assert!(!store.has_blinded_shard_on_disk(&blinded_id));
 
@@ -224,24 +225,27 @@ fn test_rt2_blinded_capability_pinning_clock_skew_and_tombstone_generation_repla
         .expect("re-upload blinded shard gen 1");
     assert!(store.has_blinded_shard_on_disk(&blinded_id));
 
-    // Attacker replays `tombstone_gen0` -> MUST BE REJECTED! Shard remains intact on disk!
+    // The captured delete replayed 31 s later -> refused (stale); the shard stays.
+    let later = t0 + 31_000;
     assert!(
         !store
-            .delete_blinded_shard_with_tombstone(&blinded_id, &tombstone_gen0)
+            .delete_blinded_shard_signed(&blinded_id, t0, &del0, &host, later)
             .unwrap(),
-        "Replayed tombstone from prior lease generation must be rejected"
+        "a captured delete outside the skew window must be refused"
     );
+    // A delete signed for another host -> refused.
+    let other_host = [0x49u8; 32];
+    let del_other =
+        BlindedShardCapability::sign_delete(&owner_cap_id, &other_host, &blinded_id, later);
+    assert!(!store
+        .delete_blinded_shard_signed(&blinded_id, later, &del_other, &host, later)
+        .unwrap());
     assert!(store.has_blinded_shard_on_disk(&blinded_id));
 
-    // Fresh generation-1 tombstone from owner succeeds
-    let tombstone_gen1 = BlindedShardTombstone::create_for_generation(
-        &delete_verifier,
-        blinded_id.locator,
-        [0x22u8; 16],
-        1,
-    );
+    // A fresh delete from the owner for this host succeeds.
+    let del1 = BlindedShardCapability::sign_delete(&owner_cap_id, &host, &blinded_id, later);
     assert!(store
-        .delete_blinded_shard_with_tombstone(&blinded_id, &tombstone_gen1)
+        .delete_blinded_shard_signed(&blinded_id, later, &del1, &host, later)
         .unwrap());
     assert!(!store.has_blinded_shard_on_disk(&blinded_id));
 }

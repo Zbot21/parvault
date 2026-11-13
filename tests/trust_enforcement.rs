@@ -4331,3 +4331,220 @@ fn f38g_keep_with_mismatched_bytes_refused() {
     );
     assert!(!deleted(&send(&third, &node, delete_req(&third, sid))));
 }
+
+// --- F-41 (L-42): blinded deletes are signed by the shard's capability key ----------------------
+
+/// A delete of `b` signed by `signer` for the host whose Ed25519 key is `host`, at `ts`.
+fn blinded_delete(b: &Blinded, signer: &NodeIdentity, host: [u8; 32], ts: u64) -> MeshWireRequest {
+    MeshWireRequest::DeleteBlindedShardSigned {
+        blinded_id: b.id,
+        timestamp_ms: ts,
+        sig: BlindedShardCapability::sign_delete(signer, &host, &b.id, ts).to_vec(),
+    }
+}
+
+fn blinded_deleted(resp: &MeshWireResponse) -> bool {
+    matches!(
+        resp,
+        MeshWireResponse::DeleteBlindedShardAck { deleted: true, .. }
+    )
+}
+
+/// Stores blinded shard `b` (seed byte `seed`) on `node` from an admitted sender.
+fn put_blinded_ok(node: &Node, sender: &NodeIdentity, b: &Blinded) {
+    let put = send(sender, node, blinded_put(b, sender));
+    assert!(format!("{put:?}").contains("stored: true"), "{put:?}");
+}
+
+fn still_served(node: &Node, sender: &NodeIdentity, b: &Blinded, cap: &NodeIdentity) -> bool {
+    format!("{:?}", send(sender, node, blinded_read(b, cap))).contains("shard_bytes: Some")
+}
+
+/// F-41 accept: the capability key holder deletes its blinded shard on this host.
+#[test]
+fn f41_capability_holder_deletes_blinded_shard() {
+    let node = spawn_daemon("f41-a");
+    let sender = key(0xC1);
+    let b = blinded(0x61, 512);
+    let cap = blinded_cap_identity(0x61, &b);
+    put_blinded_ok(&node, &sender, &b);
+    let host = node.identity().public_key_bytes();
+    let resp = send(&sender, &node, blinded_delete(&b, &cap, host, now_ms()));
+    assert!(blinded_deleted(&resp), "{resp:?}\n{}", node.log_text());
+    assert!(!still_served(&node, &sender, &b, &cap));
+    gate_ran("trust_enforcement::f41_capability_holder_deletes_blinded_shard");
+}
+
+/// F-41 reject: a relay that saw the delete verifier builds the old MAC tombstone; the host
+/// refuses every unsigned tombstone and the shard is still served.
+#[test]
+fn f41_relay_holding_verifier_cannot_delete() {
+    let node = spawn_daemon("f41-r");
+    let sender = key(0xC1);
+    let b = blinded(0x61, 512);
+    let cap = blinded_cap_identity(0x61, &b);
+    put_blinded_ok(&node, &sender, &b);
+    let tombstone = parvault::bootstrap::BlindedShardTombstone::create(
+        &b.delete_verifier,
+        b.id.locator,
+        [0x41; 16],
+    );
+    let resp = send(
+        &key(0xC2),
+        &node,
+        MeshWireRequest::DeleteBlindedShardTombstone {
+            blinded_id: b.id,
+            tombstone,
+        },
+    );
+    assert!(!blinded_deleted(&resp), "{resp:?}");
+    assert_logged(&node, "reject.blinded_delete_unsigned");
+    assert!(still_served(&node, &sender, &b, &cap));
+    gate_ran("trust_enforcement::f41_relay_holding_verifier_cannot_delete");
+}
+
+/// F-41: a delete signed for another host (replayed by host A to host B) is refused.
+#[test]
+fn f41_delete_for_another_host_refused() {
+    let node = spawn_daemon("f41-host");
+    let sender = key(0xC1);
+    let b = blinded(0x61, 512);
+    let cap = blinded_cap_identity(0x61, &b);
+    put_blinded_ok(&node, &sender, &b);
+    let other_host = key(0xC9).public_key_bytes();
+    let resp = send(
+        &sender,
+        &node,
+        blinded_delete(&b, &cap, other_host, now_ms()),
+    );
+    assert!(!blinded_deleted(&resp), "{resp:?}");
+    assert_logged(&node, "reject.blinded_delete_sig_invalid");
+    assert!(still_served(&node, &sender, &b, &cap));
+}
+
+/// F-41: a delete signed 60 s ago is refused.
+#[test]
+fn f41_stale_delete_refused() {
+    let node = spawn_daemon("f41-stale");
+    let sender = key(0xC1);
+    let b = blinded(0x61, 512);
+    let cap = blinded_cap_identity(0x61, &b);
+    put_blinded_ok(&node, &sender, &b);
+    let host = node.identity().public_key_bytes();
+    let resp = send(
+        &sender,
+        &node,
+        blinded_delete(&b, &cap, host, now_ms() - 60_000),
+    );
+    assert!(!blinded_deleted(&resp), "{resp:?}");
+    assert_logged(&node, "reject.blinded_delete_stale");
+    assert!(still_served(&node, &sender, &b, &cap));
+}
+
+/// F-41 (cross-shard delete): a valid signature for shard X sent with `blinded_id` Y deletes
+/// nothing; Y's shard survives.
+#[test]
+fn f41_signature_for_x_with_id_y_refused() {
+    let node = spawn_daemon("f41-xy");
+    let sender = key(0xC1);
+    let x = blinded(0x61, 512);
+    let y = blinded(0x62, 512);
+    put_blinded_ok(&node, &sender, &x);
+    put_blinded_ok(&node, &sender, &y);
+    let cap_x = blinded_cap_identity(0x61, &x);
+    let host = node.identity().public_key_bytes();
+    let ts = now_ms();
+    let req = MeshWireRequest::DeleteBlindedShardSigned {
+        blinded_id: y.id,
+        timestamp_ms: ts,
+        sig: BlindedShardCapability::sign_delete(&cap_x, &host, &x.id, ts).to_vec(),
+    };
+    let resp = send(&sender, &node, req);
+    assert!(!blinded_deleted(&resp), "{resp:?}");
+    assert!(still_served(
+        &node,
+        &sender,
+        &y,
+        &blinded_cap_identity(0x62, &y)
+    ));
+    assert!(still_served(&node, &sender, &x, &cap_x));
+}
+
+/// F-41 (rebind): a re-put of a stored locator with another capability is refused, and that
+/// key's delete then fails; the first capability still owns the shard.
+#[test]
+fn f41_rebind_with_another_capability_refused() {
+    let node = spawn_daemon("f41-rebind");
+    let sender = key(0xC1);
+    let b = blinded(0x61, 512);
+    let cap = blinded_cap_identity(0x61, &b);
+    put_blinded_ok(&node, &sender, &b);
+    let (thief, thief_cap) =
+        BlindedShardCapability::derive_keypair(&MasterKey::from_bytes([0x99; 32]), &b.id.locator);
+    let squat = Blinded {
+        id: b.id,
+        cap: thief_cap,
+        bytes: b.bytes.clone(),
+        delete_verifier: [0x01; 32],
+    };
+    let resp = send(&sender, &node, blinded_put(&squat, &sender));
+    assert!(format!("{resp:?}").contains("stored: false"), "{resp:?}");
+    assert_logged(&node, "reject.blinded_locator_bound_to_another_capability");
+    let host = node.identity().public_key_bytes();
+    let del = send(&sender, &node, blinded_delete(&b, &thief, host, now_ms()));
+    assert!(!blinded_deleted(&del), "{del:?}");
+    assert!(still_served(&node, &sender, &b, &cap));
+    gate_ran("trust_enforcement::f41_rebind_with_another_capability_refused");
+}
+
+/// F-41 accept on the seed: the capability holder deletes on a homelab seed too.
+#[test]
+fn f41_seed_capability_holder_deletes_blinded_shard() {
+    let node = spawn_seed("f41-seed");
+    let sender = key(0xC1);
+    let b = blinded(0x63, 512);
+    let cap = blinded_cap_identity(0x63, &b);
+    put_blinded_ok(&node, &sender, &b);
+    let host = node.identity().public_key_bytes();
+    let resp = send(&sender, &node, blinded_delete(&b, &cap, host, now_ms()));
+    assert!(blinded_deleted(&resp), "{resp:?}\n{}", node.log_text());
+    gate_ran("trust_enforcement::f41_seed_capability_holder_deletes_blinded_shard");
+}
+
+/// F-41 reject on the seed: the old MAC tombstone from the real verifier is refused.
+#[test]
+fn f41_seed_mac_tombstone_refused() {
+    let node = spawn_seed("f41-seed-r");
+    let sender = key(0xC1);
+    let b = blinded(0x63, 512);
+    let cap = blinded_cap_identity(0x63, &b);
+    put_blinded_ok(&node, &sender, &b);
+    let tombstone = parvault::bootstrap::BlindedShardTombstone::create(
+        &b.delete_verifier,
+        b.id.locator,
+        [0x42; 16],
+    );
+    let resp = send(
+        &sender,
+        &node,
+        MeshWireRequest::DeleteBlindedShardTombstone {
+            blinded_id: b.id,
+            tombstone,
+        },
+    );
+    assert!(!blinded_deleted(&resp), "{resp:?}");
+    assert_logged(&node, "reject.blinded_delete_unsigned");
+    assert!(still_served(&node, &sender, &b, &cap));
+    gate_ran("trust_enforcement::f41_seed_mac_tombstone_refused");
+}
+
+/// F-41 rebind accept: the same capability re-puts its locator (owner retry or handoff).
+#[test]
+fn f41_same_capability_reput_accepted() {
+    let node = spawn_daemon("f41-reput");
+    let sender = key(0xC1);
+    let b = blinded(0x61, 512);
+    put_blinded_ok(&node, &sender, &b);
+    put_blinded_ok(&node, &sender, &b);
+    gate_ran("trust_enforcement::f41_same_capability_reput_accepted");
+}

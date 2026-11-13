@@ -694,7 +694,8 @@ fn covering_case(req: &MeshWireRequest) -> &'static str {
         MeshWireRequest::GetBlindedShard { .. } => "get_blinded_shard",
         MeshWireRequest::RenewBlindedLease { .. }
         | MeshWireRequest::RenewBlindedLeaseSigned { .. } => "renew_blinded_lease",
-        MeshWireRequest::DeleteBlindedShardTombstone { .. } => "delete_blinded_tombstone",
+        MeshWireRequest::DeleteBlindedShardTombstone { .. }
+        | MeshWireRequest::DeleteBlindedShardSigned { .. } => "delete_blinded_tombstone",
         MeshWireRequest::MultiSegmentPorAudit(_) => "multi_segment_por_audit",
         MeshWireRequest::RelayPqOnionEnvelope { .. } => "relay_pq_onion",
         MeshWireRequest::SyndicateLiteStripe { .. } => "syndicate_lite_stripe",
@@ -1374,7 +1375,17 @@ fn renew_blinded_lease() {
     }
 }
 
-// --- 9. DeleteBlindedShardTombstone (seed error text carries a prefix) ---------------------------
+// --- 9. Blinded deletes (F-41: MAC tombstones refused; signed deletes; identical) ----------------
+
+/// A delete of `b` signed by its capability key for the fixtures' shared node key.
+fn signed_delete(b: &Blinded, ts: u64) -> MeshWireRequest {
+    let host = NodeIdentity::from_seed([0x11; 32]).public_key_bytes();
+    MeshWireRequest::DeleteBlindedShardSigned {
+        blinded_id: b.id,
+        timestamp_ms: ts,
+        sig: BlindedShardCapability::sign_delete(&b.cap_ident, &host, &b.id, ts).to_vec(),
+    }
+}
 
 #[test]
 fn delete_blinded_tombstone() {
@@ -1388,22 +1399,28 @@ fn delete_blinded_tombstone() {
         &peer,
         &put_blinded(&b, AnonymousQuotaVoucher::mint(&issuer, 8192)),
     );
-    // Forged tombstone (wrong verifier): Ok(false) everywhere.
-    let forged = BlindedShardTombstone::create(&[0xAB; 32], b.id.locator, [1; 16]);
+    // The old MAC tombstone, even from the real verifier, is refused everywhere (F-41).
+    let _ = b.delete_secret;
+    let mac = BlindedShardTombstone::create(&b.delete_verifier, b.id.locator, [1; 16]);
     let o = t.run(
         &peer,
         &MeshWireRequest::DeleteBlindedShardTombstone {
             blinded_id: b.id,
-            tombstone: forged,
+            tombstone: mac,
         },
     );
+    assert!(o[0].resp.contains("deleted: false"), "{}", o[0].resp);
+    assert_identical(&o);
+    // A stale signed delete: refused everywhere.
+    let o = t.run(&peer, &signed_delete(&b, now_ms() - 60_000));
     assert!(
         o[0].resp.contains("deleted: false, error: None"),
         "{}",
         o[0].resp
     );
     assert_identical(&o);
-    // Storage error: a directory where the .bshard file should be makes remove_file fail.
+    // Storage error: a directory where the .bshard file should be makes remove_file fail;
+    // since F-41 both roles use the same store path, so the error text is identical too.
     let b_err = blinded(23, 512);
     t.run(
         &peer,
@@ -1420,33 +1437,12 @@ fn delete_blinded_tombstone() {
         std::fs::remove_file(&f).unwrap();
         std::fs::create_dir(&f).unwrap();
     });
-    let tomb_err = BlindedShardTombstone::create(&b_err.delete_verifier, b_err.id.locator, [4; 16]);
-    let o = t.run(
-        &peer,
-        &MeshWireRequest::DeleteBlindedShardTombstone {
-            blinded_id: b_err.id,
-            tombstone: tomb_err,
-        },
-    );
+    let o = t.run(&peer, &signed_delete(&b_err, now_ms()));
     assert!(o[0].resp.contains("deleted: false"), "{}", o[0].resp);
-    // Hook tombstone_via_seed_server: identical state, seed error string gains a prefix.
-    assert_eq!(o[1], o[2]);
-    assert_eq!(o[0].changed, o[1].changed);
-    let prefixed = o[0].resp.replace(
-        "error: Some(\"",
-        "error: Some(\"Seed server storage error: ",
-    );
     assert!(o[0].resp.contains("error: Some(\""), "{}", o[0].resp);
-    assert_eq!(prefixed, o[1].resp);
-    let _ = b.delete_secret;
-    let good = BlindedShardTombstone::create(&b.delete_verifier, b.id.locator, [2; 16]);
-    let o = t.run(
-        &peer,
-        &MeshWireRequest::DeleteBlindedShardTombstone {
-            blinded_id: b.id,
-            tombstone: good,
-        },
-    );
+    assert_identical(&o);
+    // The capability holder's fresh delete: deleted everywhere.
+    let o = t.run(&peer, &signed_delete(&b, now_ms()));
     assert!(o[0].resp.contains("deleted: true"), "{}", o[0].resp);
     assert_identical(&o);
     assert_eq!(o[0].leases_delta, -1);
@@ -2259,7 +2255,14 @@ fn broadcast_eviction_order() {
     );
     let o = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(one));
     assert!(!o.iter().any(accepted), "{o:?}");
-    assert_identical(&o);
+    // Daemon and homelab seed hold this council (refused for quorum); the public seed's scope
+    // is its own admin key, so it has no council here (refused as no council).
+    assert_eq!(o[0], o[1]);
+    assert!(
+        o[2].resp.contains("reject.order_no_council"),
+        "{}",
+        o[2].resp
+    );
     let mut two = SignedBadActorEvictionOrder::issue(
         &members[0],
         target(),
@@ -2312,8 +2315,13 @@ fn seed_server_shares_the_handler_store() {
         "server must see the handler store's lease"
     );
     assert_eq!(server.status_report(1).active_blinded_leases, 1);
-    let tomb = BlindedShardTombstone::create(&b.delete_verifier, b.id.locator, [3; 16]);
-    assert!(server.execute_blinded_tombstone(&b.id, &tomb).unwrap());
+    let host = [0x33u8; 32];
+    let ts = now_ms();
+    let sig = BlindedShardCapability::sign_delete(&b.cap_ident, &host, &b.id, ts);
+    assert!(server
+        .block_store()
+        .delete_blinded_shard_signed(&b.id, ts, &sig, &host, ts)
+        .unwrap());
     assert!(
         !store.renew_blinded_shard_lease(&b.id, 3, 1),
         "deletion via the server is visible in the store"

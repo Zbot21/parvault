@@ -378,6 +378,14 @@ pub enum MeshWireRequest {
         timestamp_ms: u64,
         sig: Vec<u8>,
     },
+    /// Deletes a blinded shard on a signature by its lease's capability key over
+    /// `"parvault-delete-blinded-v1" || host || locator || content_sha256 || timestamp_ms`
+    /// (appended, F-41; replaces the forgeable `DeleteBlindedShardTombstone`, which is refused).
+    DeleteBlindedShardSigned {
+        blinded_id: BlindedShardId,
+        timestamp_ms: u64,
+        sig: Vec<u8>,
+    },
     /// Asks an admitted peer for the council manifests of `scope_root` after `from_epoch` (the
     /// requester's epoch), appended, F-08/F-09: a node that sees an order from a newer council
     /// epoch fetches the chain up to it.

@@ -1,4 +1,4 @@
-use crate::bootstrap::{BlindedShardLeaseManager, BlindedShardTombstone};
+use crate::bootstrap::BlindedShardLeaseManager;
 use crate::config::ErasureTier;
 use crate::crypto::aes::{
     compute_sha256, decrypt_manifest, decrypt_stripe, derive_dht_manifest_key, encrypt_manifest,
@@ -1101,6 +1101,18 @@ impl BlockStore {
         if actual_sha != blinded_id.content_sha256 {
             return Err(StorageError::CorruptedShard);
         }
+        // F-41: the capability bound to a locator is immutable while its lease exists; checked
+        // before the file write and before the voucher is redeemed.
+        let registered = self.registered_blinded_capability(&blinded_id.locator);
+        if let Err(code) = crate::storage::anonymity::blinded_rebind_decision(
+            registered,
+            capability.capability_pubkey,
+        ) {
+            tracing::warn!(code, "refused a blinded re-put with another capability");
+            return Err(StorageError::QuotaExceeded(
+                "blinded locator bound to another capability".into(),
+            ));
+        }
 
         if let Some(ref mem) = self.in_memory {
             let shard_size = shard_bytes.len() as u64;
@@ -1336,21 +1348,54 @@ impl BlockStore {
         Ok(deleted_ids)
     }
 
-    /// Immediately verifies a `BlindedShardTombstone` and physically deletes `{locator}.bshard`
-    /// from disk (or zero-wipes in RAM).
-    pub fn delete_blinded_shard_with_tombstone(
+    /// The capability key registered with the lease of `locator`, if any.
+    pub fn registered_blinded_capability(&self, locator: &[u8; 32]) -> Option<[u8; 32]> {
+        self.blinded_leases
+            .lock()
+            .ok()
+            .and_then(|mgr| mgr.lease_entry(locator).and_then(|e| e.capability_pubkey))
+    }
+
+    /// Deletes a blinded shard on a delete signed by its lease's registered capability key for
+    /// this host (`host_pubkey`), fresh within 30 s, naming the stored id (F-41,
+    /// `blinded_delete_decision`). Only the stored shard of that id is unlinked.
+    pub fn delete_blinded_shard_signed(
         &self,
         blinded_id: &BlindedShardId,
-        tombstone: &BlindedShardTombstone,
+        timestamp_ms: u64,
+        sig: &[u8; 64],
+        host_pubkey: &[u8; 32],
+        now_ms: u64,
     ) -> Result<bool, StorageError> {
-        let authorized = {
-            let mut mgr = self
-                .blinded_leases
-                .lock()
-                .expect("blinded_leases mutex poisoned");
-            mgr.execute_tombstone(tombstone)
+        let registered = self.registered_blinded_capability(&blinded_id.locator);
+        let stored_id = self
+            .blinded_id_by_locator
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&blinded_id.locator).copied());
+        let facts = crate::storage::anonymity::BlindedDeleteFacts {
+            signed: true,
+            capability_registered: registered.is_some(),
+            id_matches: stored_id == Some(*blinded_id),
+            fresh: timestamp_ms.abs_diff(now_ms) <= crate::storage::MAX_CAPABILITY_CLOCK_SKEW_MS,
+            sig_valid: registered.is_some_and(|pk| {
+                BlindedShardCapability {
+                    locator: blinded_id.locator,
+                    capability_pubkey: pk,
+                }
+                .verify_delete(host_pubkey, blinded_id, timestamp_ms, sig)
+            }),
         };
-        if !authorized {
+        if let Err(code) = crate::storage::anonymity::blinded_delete_decision(&facts) {
+            tracing::warn!(code, "refused a blinded shard delete");
+            return Ok(false);
+        }
+        let removed = self
+            .blinded_leases
+            .lock()
+            .expect("blinded_leases mutex poisoned")
+            .remove_lease(&blinded_id.locator);
+        if !removed {
             return Ok(false);
         }
         if let Ok(mut id_map) = self.blinded_id_by_locator.lock() {
