@@ -1145,8 +1145,14 @@ impl WebOfTrustRegistry {
         quarantined: bool,
         private_member: bool,
         public_member: bool,
-    ) -> bool {
-        !quarantined && (is_genesis || private_member || public_member)
+    ) -> Result<(), &'static str> {
+        if quarantined {
+            return Err("reject.peer_quarantined");
+        }
+        if !(is_genesis || private_member || public_member) {
+            return Err("reject.peer_not_member");
+        }
+        Ok(())
     }
 
     pub fn is_peer_trusted(&self, peer_pubkey: &[u8; 32]) -> bool {
@@ -1158,6 +1164,7 @@ impl WebOfTrustRegistry {
             !quarantined && !is_genesis && self.is_private_ring_peer(peer_pubkey),
             !quarantined && !is_genesis && self.is_public_commons_peer(peer_pubkey),
         )
+        .is_ok()
     }
 
     /// Records a handshake or PoR failure for `offender_pubkey`.

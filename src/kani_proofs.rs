@@ -1354,13 +1354,14 @@ fn proof_syndication_fanout_budget() {
 fn proof_peer_trust_never_quarantined() {
     let (g, q, pr, pu): (bool, bool, bool, bool) =
         (kani::any(), kani::any(), kani::any(), kani::any());
-    let trusted = crate::network::wot::WebOfTrustRegistry::is_peer_trust_decision(g, q, pr, pu);
-    kani::cover!(!trusted && q, "quarantined peer refused");
-    kani::cover!(trusted, "member trusted");
+    let d = crate::network::wot::WebOfTrustRegistry::is_peer_trust_decision(g, q, pr, pu);
+    kani::cover!(d.is_err() && q, "quarantined peer refused");
+    kani::cover!(d.is_ok(), "member trusted");
+    // Only the outcome is checked (the &str code by the wire tests).
     if q {
-        assert!(!trusted);
+        assert!(d.is_err());
     } else {
-        assert_eq!(trusted, g || pr || pu);
+        assert_eq!(d.is_ok(), g || pr || pu);
     }
 }
 
