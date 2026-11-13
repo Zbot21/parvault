@@ -413,57 +413,11 @@ pub fn webdav_auth_decision(facts: &WebdavAuthFacts) -> Result<(), WebdavAuthRef
     Ok(())
 }
 
-/// Longest token text accepted from a header (`PARVAULT-MAC-V1:` plus the hex of the largest
-/// compact token), checked before hex decoding.
-pub const WEBDAV_MAX_TOKEN_CHARS: usize = crate::capabilities::COMPACT_MACAROON_PREFIX.len()
-    + 2 * crate::capabilities::MAX_COMPACT_MACAROON_BYTES;
-
-/// The token a request presents.
-pub enum PresentedToken {
-    /// No `Authorization` header, or a scheme other than Bearer or Basic.
-    Missing,
-    /// Bearer or Basic, but not a well-formed token within the length cap.
-    Malformed,
-    Token(CapabilityMacaroon),
-}
-
-/// Extracts the token from an `Authorization` header value: `Bearer <token>`, or `Basic
-/// base64(<user>:<token>)` split at the first colon (D-1). Lengths are capped before decoding.
-pub fn presented_webdav_token(authorization: Option<&str>) -> PresentedToken {
-    let Some(value) = authorization.map(str::trim) else {
-        return PresentedToken::Missing;
-    };
-    let (scheme, rest) = value.split_once(' ').unwrap_or((value, ""));
-    let rest = rest.trim();
-    let token_text = if scheme.eq_ignore_ascii_case("bearer") {
-        rest.to_string()
-    } else if scheme.eq_ignore_ascii_case("basic") {
-        use base64::Engine as _;
-        // base64 of "<user>:<token>": allow up to 256 bytes of user name.
-        if rest.len() > (WEBDAV_MAX_TOKEN_CHARS + 257).div_ceil(3) * 4 {
-            return PresentedToken::Malformed;
-        }
-        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(rest) else {
-            return PresentedToken::Malformed;
-        };
-        let Ok(text) = String::from_utf8(raw) else {
-            return PresentedToken::Malformed;
-        };
-        match text.split_once(':') {
-            Some((_user, password)) => password.to_string(),
-            None => return PresentedToken::Malformed,
-        }
-    } else {
-        return PresentedToken::Missing;
-    };
-    if token_text.len() > WEBDAV_MAX_TOKEN_CHARS {
-        return PresentedToken::Malformed;
-    }
-    match CapabilityMacaroon::from_compact_token(&token_text) {
-        Ok(t) => PresentedToken::Token(t),
-        Err(_) => PresentedToken::Malformed,
-    }
-}
+// Token extraction moved to `http_edge` (item 3, #codehealth: one edge for WebDAV and status).
+pub use crate::http_edge::{
+    presented_token as presented_webdav_token, PresentedToken,
+    MAX_TOKEN_CHARS as WEBDAV_MAX_TOKEN_CHARS,
+};
 
 /// How a WebDAV server checks a token's chain. Required by both constructors (no
 /// unauthenticated server). Deliberately not `Debug`: it holds the root key or a pinned token.
@@ -493,7 +447,7 @@ mod unix_vfs {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
     use std::os::fd::AsRawFd;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// RAII handle controlling a background HTTP `Range` (`206 Partial Content`) + WebDAV server
     /// spawned via [`VirtualVaultFs::spawn_webdav_server`].
@@ -944,7 +898,7 @@ mod unix_vfs {
             let join_handle = std::thread::Builder::new()
                 .name("parvault-vfs-webdav".into())
                 .spawn(move || {
-                    let slots = Arc::new(WebdavSlots::default());
+                    let slots = Arc::new(EdgeSlots::new(WEBDAV_MAX_CONNECTIONS));
                     for conn in listener.incoming() {
                         if shutdown_cl.load(Ordering::SeqCst) {
                             break;
@@ -972,7 +926,7 @@ mod unix_vfs {
             verifier: WebdavVerifier,
         ) -> io::Result<()> {
             let listener = TcpListener::bind(bind_addr)?;
-            let slots = Arc::new(WebdavSlots::default());
+            let slots = Arc::new(EdgeSlots::new(WEBDAV_MAX_CONNECTIONS));
             for conn in listener.incoming() {
                 let Ok(stream) = conn else {
                     continue;
@@ -991,114 +945,22 @@ mod unix_vfs {
 
     /// Most WebDAV connections served at once; more are dropped unanswered (pre-auth bound).
     const WEBDAV_MAX_CONNECTIONS: usize = 64;
-    /// Most WebDAV connections served at once from one source IP, so one host cannot take every
-    /// slot (F-43 QA r1); more are dropped unanswered.
-    const WEBDAV_MAX_CONNECTIONS_PER_IP: usize = 8;
+    use crate::http_edge::{
+        read_request_head as read_webdav_head, spawn_edge_conn, EdgeSlots, RESP_403 as WEBDAV_403,
+        RESP_502 as WEBDAV_502, WEBDAV_401,
+    };
 
-    /// Connection slots of one WebDAV server: a global count and a count per source IP.
-    #[derive(Default)]
-    struct WebdavSlots {
-        active: AtomicUsize,
-        per_ip: Mutex<HashMap<IpAddr, usize>>,
-    }
-
-    impl WebdavSlots {
-        /// Takes a slot for `ip`, or `false` when the global or per-IP cap is reached.
-        fn acquire(&self, ip: Option<IpAddr>) -> bool {
-            if self.active.fetch_add(1, Ordering::SeqCst) >= WEBDAV_MAX_CONNECTIONS {
-                self.active.fetch_sub(1, Ordering::SeqCst);
-                return false;
-            }
-            if let Some(ip) = ip {
-                let mut map = self.per_ip.lock().unwrap_or_else(|p| p.into_inner());
-                let n = map.entry(ip).or_insert(0);
-                if *n >= WEBDAV_MAX_CONNECTIONS_PER_IP {
-                    drop(map);
-                    self.active.fetch_sub(1, Ordering::SeqCst);
-                    return false;
-                }
-                *n += 1;
-            }
-            true
-        }
-
-        fn release(&self, ip: Option<IpAddr>) {
-            if let Some(ip) = ip {
-                let mut map = self.per_ip.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(n) = map.get_mut(&ip) {
-                    *n = n.saturating_sub(1);
-                    if *n == 0 {
-                        map.remove(&ip);
-                    }
-                }
-            }
-            self.active.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-    /// Longest request head accepted (431 beyond it).
-    const WEBDAV_MAX_HEAD_BYTES: usize = 8192;
-    /// A client must finish its whole request head within this one deadline (dropped unanswered
-    /// otherwise); each read's timeout shrinks to the time left, so a slow drip cannot hold a slot.
-    const WEBDAV_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
-
-    /// The four 401s are byte-identical; the reason code is only logged.
-    const WEBDAV_401: &[u8] = b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"parvault-webdav\"\r\nWWW-Authenticate: Basic realm=\"parvault-webdav\", charset=\"UTF-8\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-    const WEBDAV_403: &[u8] =
-        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-    const WEBDAV_431: &[u8] = b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-    const WEBDAV_502: &[u8] =
-        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-
-    /// Runs one connection on its own thread, within `WEBDAV_MAX_CONNECTIONS` overall and
-    /// `WEBDAV_MAX_CONNECTIONS_PER_IP` per source IP; over either cap it is dropped unanswered.
+    /// Runs one connection on its own thread within the server's slots (shared edge).
     fn spawn_webdav_conn(
-        mut stream: TcpStream,
+        stream: TcpStream,
         vfs: &VirtualVaultFs,
         verifier: &WebdavVerifier,
-        slots: &Arc<WebdavSlots>,
+        slots: &Arc<EdgeSlots>,
     ) {
-        let ip = stream.peer_addr().ok().map(|a| a.ip());
-        if !slots.acquire(ip) {
-            return;
-        }
-        let (vfs, verifier, slots_cl) = (vfs.clone(), verifier.clone(), Arc::clone(slots));
-        let spawned = std::thread::Builder::new()
-            .name("parvault-vfs-http".into())
-            .stack_size(256 * 1024)
-            .spawn(move || {
-                let _ = handle_webdav_http_conn(&mut stream, &vfs, &verifier);
-                slots_cl.release(ip);
-            });
-        if spawned.is_err() {
-            slots.release(ip);
-        }
-    }
-
-    /// Reads the request head (through the blank line), or `None` after writing 431, on a
-    /// timeout, or on EOF.
-    fn read_webdav_head(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
-        let deadline = Instant::now() + WEBDAV_HEAD_TIMEOUT;
-        let mut head = Vec::with_capacity(1024);
-        let mut chunk = [0u8; 2048];
-        loop {
-            if let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") {
-                head.truncate(end + 4);
-                return Ok(Some(head));
-            }
-            if head.len() >= WEBDAV_MAX_HEAD_BYTES {
-                stream.write_all(WEBDAV_431)?;
-                return Ok(None);
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() || stream.set_read_timeout(Some(remaining)).is_err() {
-                return Ok(None);
-            }
-            let want = (WEBDAV_MAX_HEAD_BYTES - head.len()).min(chunk.len());
-            match stream.read(&mut chunk[..want]) {
-                Ok(0) | Err(_) => return Ok(None),
-                Ok(n) => head.extend_from_slice(&chunk[..n]),
-            }
-        }
+        let (vfs, verifier) = (vfs.clone(), verifier.clone());
+        spawn_edge_conn(stream, slots, "parvault-vfs-http", move |stream| {
+            let _ = handle_webdav_http_conn(stream, &vfs, &verifier);
+        });
     }
 
     fn now_unix_ms() -> u64 {
