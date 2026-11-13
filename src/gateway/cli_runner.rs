@@ -619,13 +619,19 @@ async fn run_ipc_roundtrip_probe(
     let sha256_in = hex::encode(in_hasher.finalize());
 
     let t_store = Instant::now();
-    let manifest = client
-        .store_sealed_payload_fd(
+    let (manifest, local_only_stripes) = client
+        .store_sealed_payload_fd_counted(
             in_file.as_raw_fd(),
             total_bytes,
             RetentionPolicy::Persistent,
         )
         .await?;
+    if local_only_stripes > 0 {
+        eprintln!(
+            "[parvault] {}",
+            crate::storage::local_only::summary_line(local_only_stripes)
+        );
+    }
     let upload_ms = t_store.elapsed().as_secs_f64() * 1000.0;
     drop(in_file);
 
@@ -789,13 +795,19 @@ pub async fn execute_gateway_cli(
                 let sample = vec![0x5Au8; 2 * 1024 * 1024];
                 pwrite_all(&in_file, 0, &sample)?;
 
-                let manifest = bus
-                    .store_sealed_payload_fd(
+                let (manifest, local_only_stripes) = bus
+                    .store_sealed_payload_fd_counted(
                         in_file.as_raw_fd(),
                         sample.len() as u64,
                         RetentionPolicy::Ephemeral,
                     )
                     .await?;
+                if local_only_stripes > 0 {
+                    eprintln!(
+                        "[parvault] self-test: {}",
+                        crate::storage::local_only::summary_line(local_only_stripes)
+                    );
+                }
 
                 let out_mfd = create_memfd("selftest-out")?;
                 let out_file = std::fs::File::from(out_mfd);
