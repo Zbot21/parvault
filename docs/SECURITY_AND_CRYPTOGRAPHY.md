@@ -149,7 +149,7 @@ To protect long-lived backup shards and P2P envelopes against **Harvest-Now, Dec
 
 ## 7. Machine-Checked Formal Verification & Test Suite Matrix
 
-> **TLA+ claim accounting (L-47, 2d-β):** the specs carry <!-- metric:tla.guards -->`11`<!-- /metric --> `@guard` checks, each traced to one Rust decision function and covered by a guard-removal mutant; <!-- metric:tla.structural -->`7`<!-- /metric --> `@structural` properties that hold by construction (for example, no wire message carries a key) and are **not** model-checked; and <!-- metric:tla.assumptions -->`6`<!-- /metric --> `@assume` threat-model bounds. Invariants that were true only because a flag was hard-coded `FALSE` were removed from the model rather than kept as vacuous claims.
+> **TLA+ claim accounting (L-47, 2d-β):** the specs carry <!-- metric:tla.guards -->`11`<!-- /metric --> `@guard` checks, each traced to one Rust decision function and covered by a guard-removal mutant; <!-- metric:tla.structural -->`7`<!-- /metric --> `@structural` properties that hold by construction (for example, no wire message carries a key) and are **not** model-checked; and <!-- metric:tla.assumptions -->`9`<!-- /metric --> `@assume` threat-model bounds. Invariants that were true only because a flag was hard-coded `FALSE` were removed from the model rather than kept as vacuous claims.
 
 > [!IMPORTANT]
 > **Scope & Abstraction Boundaries of Formal Models (`A5`, `D1`):**

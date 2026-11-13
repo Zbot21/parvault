@@ -57,17 +57,17 @@ tla-mutant TM-HYBRID-SIG    spec=specs/ParVaultPostQuantum.tla inv=Safety_Quantu
 waive      TM-W-DURABILITY  inv=specs/ParVaultProtocol.tla::DurabilitySafetyInvariant reason=assume bounded-epoch-churn (threat model, no Rust check)
 waive      TM-W-SLASH-BOUND inv=specs/ParVaultProtocol.tla::SlashingBoundInvariant reason=assume leaf-quarantine-not-run: record_failure is cfg(test), nothing slashes in v0.5.0 (ADR-09, N-09)
 waive      TM-W-PROTECTED    inv=specs/ParVaultProtocol.tla::ProtectedKeysNeverSlashedInvariant reason=assume slash-target-not-run: slash_target_decision is called only from cfg(test) may_slash; nothing slashes in v0.5.0 (ADR-09, N-09)
-waive      TM-W-ORIGIN      inv=specs/ParVaultAnonymity.tla::Safety_ZeroOriginLeakage reason=structural: storage node only ever observes the relay (L-38/L-39 scope)
+waive      TM-W-ORIGIN      inv=specs/ParVaultAnonymity.tla::Safety_ZeroOriginLeakage reason=observedSender conjunct structural (only RelayNode is ever recorded, L-38/L-39 scope); the ephemeralIssuerIds conjunct is also broken by TM-NULLIFIER, so nullifier-fresh covers it in part
 waive      TM-W-DRAIN       inv=specs/ParVaultBootstrapAndEarnedTier.tla::Safety_SeedAnchorsDrainAtOrganicThreshold reason=structural: seed shards = MaxOrganicPeers - organic by construction
 waive      TM-W-DAY1        inv=specs/ParVaultBootstrapAndEarnedTier.tla::Safety_Day1ToScaleDataAvailability reason=structural: recoverable = TierN(tier), TierK < TierN tables
-waive      TM-W-ZK-TYPE     inv=specs/ParVaultZeroKeyAdminAndQuorum.tla::TypeOK reason=structural: type invariant
+waive      TM-W-ZK-TYPE     inv=specs/ParVaultZeroKeyAdminAndQuorum.tla::TypeOK reason=type invariant, not a security property; TM-NONCE also violates it (without the nonce guard, nonce 0, meaning no challenge, is accepted and recorded)
 waive      TM-W-VPS-KEY     inv=specs/ParVaultZeroKeyAdminAndQuorum.tla::Safety_ZeroAdminPrivKeyOnVpsDisk reason=structural no-admin-key-persist + assume byzantine-below-quorum
 waive      TM-W-SUBNET-CAP  inv=specs/ParVaultConfidentialityAndTrust.tla::Safety_SubnetTrustCapsEnforced reason=assume placement-trust-cap: select_trust_weighted_peers has no production caller in v0.5.0
 waive      TM-W-LITE-TYPE   inv=specs/ParVaultLiteClientAndSeedFailover.tla::TypeOK reason=structural: type invariant
-waive      TM-W-NAS-DEATH   inv=specs/ParVaultLiteClientAndSeedFailover.tla::NasDeathSurvivableInvariant reason=assume: mesh churn stops at K (MeshPeerChurn bound)
+waive      TM-W-NAS-DEATH   inv=specs/ParVaultLiteClientAndSeedFailover.tla::NasDeathSurvivableInvariant reason=assume mesh-churn-stops-at-k (MeshPeerChurn; threat model, no Rust check)
 waive      TM-W-SELECTIVE   inv=specs/ParVaultLiteClientAndSeedFailover.tla::SelectiveBandwidthSavingInvariant reason=structural: restore downloads exactly the selected stripes
-waive      TM-W-HNDL        inv=specs/ParVaultPostQuantum.tla::Safety_HNDLConfidentialityPreserved reason=assume: at most one primitive broken per class; onion fields structural
-waive      TM-W-GROVER      inv=specs/ParVaultPostQuantum.tla::Safety_GroverBitSecurityFloor reason=assume: Grover floor constant, single cipher break
+waive      TM-W-HNDL        inv=specs/ParVaultPostQuantum.tla::Safety_HNDLConfidentialityPreserved reason=assume one-break-per-class (AdversaryChooseCapability); onion exposes_* fields structural
+waive      TM-W-GROVER      inv=specs/ParVaultPostQuantum.tla::Safety_GroverBitSecurityFloor reason=assume grover-quadratic-only (ActivateGroverSearch) and one-break-per-class for the cipher cap
 module     P-01      path=src/network/wot.rs pattern=^(verify_and_admit_|is_peer_|apply_slashing_|slash_|record_failure) kani=required
 reach      P-01      sym=src/network/wot.rs::is_peer_trusted from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
 reach      P-01      sym=src/network/wot.rs::is_peer_trust_decision from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md

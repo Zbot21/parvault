@@ -94,6 +94,7 @@ AdversaryChooseCapability(prim) ==
     /\ prim \in AllPrimitives
     /\ prim \notin adversaryBroken
     /\ LET nextBroken == adversaryBroken \cup {prim}
+       \* @assume one-break-per-class: at most one KEM, one signature and one cipher primitive is ever broken (Safety_HNDLConfidentialityPreserved rests on it)
        IN /\ Cardinality(nextBroken \cap KemPrimitives) <= 1
           /\ Cardinality(nextBroken \cap SigPrimitives) <= 1
           /\ Cardinality(nextBroken \cap CipherPrimitives) <= 1
@@ -108,7 +109,7 @@ AdversaryChooseCapability(prim) ==
 ActivateGroverSearch ==
     /\ ~groverApplied
     /\ groverApplied'          = TRUE
-    /\ effectiveSymmetricBits' = ClassicalAesBits \div 2
+    /\ effectiveSymmetricBits' = ClassicalAesBits \div 2   \* @assume grover-quadratic-only: a CRQC gains at most Grover's quadratic speedup on AES-256 (Safety_GroverBitSecurityFloor rests on it)
     /\ UNCHANGED <<x25519Keys, mlKemKeys, ed25519Keys, mlDsaKeys,
                    adversaryBroken, hkdfSha512BoundPk, kemTranscripts,
                    signedEnvelopes, onionLayers, kemAttackAttempted,

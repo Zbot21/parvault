@@ -68,7 +68,7 @@ SeedServerCatastrophicFailure ==
 
 \* Environmental Fault B: Up to (N - K) external mesh nodes drop offline concurrently.
 MeshPeerChurn ==
-    /\ meshHealthyShards > K
+    /\ meshHealthyShards > K   \* @assume mesh-churn-stops-at-k: churn never takes the mesh below K healthy shards (threat model; NasDeathSurvivableInvariant rests on it)
     /\ meshHealthyShards' = meshHealthyShards - 1
     /\ UNCHANGED <<liteUploadedFiles, syndicatedFiles, seedAlive,
                    selectiveRestoredCount,
