@@ -6189,3 +6189,50 @@ fn council_public_first_epoch_not_auto_installed() {
     );
     assert!(!order_accepted(&r), "{r:?}");
 }
+
+/// L-47 @structural no-admin-key-persist: after an authenticated admin RPC session, no file under
+/// the seed's data dir holds the admin's secret key bytes, and no `tracker_admin.seed` is created.
+#[test]
+fn admin_key_never_persisted_on_seed() {
+    let admin_seed = [0xA7u8; 32];
+    let admin = NodeIdentity::from_seed(admin_seed);
+    let (seed, admin_addr) = bseed_seed("no-admin-key", &[], &admin);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let resp = rt.block_on(parvault::admin_rpc::send_admin_rpc_with_identity(
+        &admin_addr,
+        None,
+        &admin,
+        &parvault::admin_rpc::SeedAdminRequest::GetSeedTelemetry,
+    ));
+    assert!(resp.is_ok(), "{:?}", resp.err());
+    let mut stack = vec![seed.dir.clone()];
+    let mut scanned = 0;
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            assert_ne!(
+                p.file_name().unwrap(),
+                "tracker_admin.seed",
+                "{}",
+                p.display()
+            );
+            let bytes = std::fs::read(&p).unwrap_or_default();
+            scanned += 1;
+            assert!(
+                !bytes.windows(32).any(|w| w == admin_seed),
+                "admin secret key bytes found in {}",
+                p.display()
+            );
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains(&hex::encode(admin_seed)),
+                "admin secret key hex found in {}",
+                p.display()
+            );
+        }
+    }
+    assert!(scanned > 0, "the seed wrote no files to scan");
+}
