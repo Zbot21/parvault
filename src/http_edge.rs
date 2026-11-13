@@ -19,6 +19,10 @@ pub const EDGE_MAX_HEAD_BYTES: usize = 8192;
 /// A client must finish its whole request head within this one deadline (dropped unanswered
 /// otherwise); each read's timeout shrinks to the time left, so a slow drip cannot hold a slot.
 pub const EDGE_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
+/// Each write to the client must make progress within this (QA item 3, plan-3 §2): a client
+/// that stops reading cannot hold a slot. Per write call, so long transfers to a reading client
+/// are not cut.
+pub const EDGE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The WebDAV 401: byte-identical for every reason; the reason code is only logged.
 pub const WEBDAV_401: &[u8] = b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"parvault-webdav\"\r\nWWW-Authenticate: Basic realm=\"parvault-webdav\", charset=\"UTF-8\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -142,6 +146,10 @@ where
 {
     let ip = stream.peer_addr().ok().map(|a| a.ip());
     if !slots.acquire(ip) {
+        return;
+    }
+    if stream.set_write_timeout(Some(EDGE_WRITE_TIMEOUT)).is_err() {
+        slots.release(ip);
         return;
     }
     let slots_cl = Arc::clone(slots);
@@ -353,6 +361,23 @@ mod tests {
     const SOCK: StatusTransport = StatusTransport::Socket {
         peer_uid: Some(1000),
     };
+
+    /// QA item 3, defect 3: every edge connection (WebDAV and status) gets a write deadline, so
+    /// a client that stops reading cannot hold a slot.
+    #[test]
+    fn edge_conn_has_write_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let slots = Arc::new(EdgeSlots::new(4));
+        spawn_edge_conn(server, &slots, "edge-test", move |s| {
+            let _ = tx.send(s.write_timeout().unwrap());
+        });
+        let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(got, Some(EDGE_WRITE_TIMEOUT));
+    }
 
     /// The 33rd connection to a 32-slot server is refused (spread over IPs so the per-IP cap
     /// does not hit first); the 9th from one IP is refused; releasing frees a slot.

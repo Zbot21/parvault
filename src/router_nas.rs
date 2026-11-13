@@ -269,9 +269,12 @@ fn handle_status_conn(
     }
 }
 
+/// QA item 3: no scripts, no external loads, no framing; the dashboard's inline `<style>` only.
+const STATUS_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'";
+
 fn send_response(stream: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) -> io::Result<()> {
     let head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: {STATUS_CSP}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes())?;

@@ -23,6 +23,6 @@ for _ in $(seq 1 200); do
   sleep 0.1
 done
 [[ -S "$SOCK" ]] || { cat "$WORK/gateway.log"; echo "gateway socket not up after 20 s" >&2; exit 1; }
-TOKEN=$("$PV" --data-dir "$WORK/data" token mint --macaroon-key-hex "$KEY")
-(cd "$WORK" && "$FUSE" --socket "$SOCK" --macaroon "$TOKEN" self-test)
-(cd "$WORK" && "$SYNC" --socket "$SOCK" --macaroon "$TOKEN" self-test)
+( umask 077; "$PV" --data-dir "$WORK/data" token mint --macaroon-key-hex "$KEY" > "$WORK/plugin.token" )
+(cd "$WORK" && "$FUSE" --socket "$SOCK" --macaroon-file "$WORK/plugin.token" self-test)
+(cd "$WORK" && "$SYNC" --socket "$SOCK" --macaroon-file "$WORK/plugin.token" self-test)

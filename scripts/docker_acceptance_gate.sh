@@ -662,7 +662,8 @@ docker run -d --name parvault-status-sidecar \
             --ipc-socket /run/pv/gw.sock --macaroon-root-key-hex "$SIDE_KEY" > /tmp/daemon.log 2>&1 &
         i=0; while [ ! -S /run/pv/gw.sock ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i+1)); done
         cd /tmp/sidecar-cwd
-        exec /usr/local/bin/parvault-status --socket /run/pv/gw.sock --listen 0.0.0.0:4081 --macaroon "$SIDE_TOKEN"'
+        (umask 077; printf "%s\n" "$SIDE_TOKEN" > /run/pv/status.token)
+        exec /usr/local/bin/parvault-status --socket /run/pv/gw.sock --listen 0.0.0.0:4081 --macaroon-file /run/pv/status.token'
 SIDE_UP=0
 for _ in $(seq 1 100); do
     if docker logs parvault-status-sidecar 2>&1 | grep -q "Status Server listening"; then SIDE_UP=1; break; fi
