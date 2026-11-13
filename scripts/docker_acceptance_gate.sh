@@ -324,6 +324,14 @@ docker exec -w /tmp/lite-client-state parvault-client /usr/local/bin/parvault \
     --vault-namespace "lite-failover-ns" \
     --once
 
+# B-SEED-SYND (L-46): the seed logs its in-lock handler time and its off-task fan-out time.
+LITE_SYND_TIMES="$(docker logs parvault-seed-0 2>&1 | grep -E 'lite syndication (ingested on the seed|fan-out finished)' || true)"
+echo "$LITE_SYND_TIMES"
+if ! echo "$LITE_SYND_TIMES" | grep -q 'handler_ms=' || ! echo "$LITE_SYND_TIMES" | grep -q 'job_ms='; then
+    echo "ERROR: stage 7: parvault-seed-0 logged no lite syndication handler/job durations"
+    exit 1
+fi
+
 # Simulate NAS / Seed Server death by stopping parvault-seed-0, then recover the Lite-Client vault
 # from mesh peers only. By design a successful lite syndication deletes the client's local shards
 # (src/cli/folder.rs, after syndication), so there is nothing to wipe: instead assert the lite run
