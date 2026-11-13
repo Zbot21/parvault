@@ -34,7 +34,8 @@ no-blocking B-DISC   path=src/cli/daemon.rs
 no-blocking B-SEED-SYND path=src/bootstrap.rs
 no-blocking B-SEED-SYND path=src/bin/parvault-seed.rs
 
-# --- ADR cross-references (existence only; F-16's keyword table is curated in its own item) --------
+# --- ADR cross-references (existence only for now; F-16's keyword table is docs/adr/xref-keywords.txt,
+# switched on with expect= once the legacy-number citations are renumbered, 2d-beta) ---------------
 xref       X-ADR     path=src/**.rs pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md
 xref       X-ADR-DOC path=docs/**.md pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md
 
