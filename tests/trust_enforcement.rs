@@ -595,6 +595,27 @@ fn f05_public_ticket_one_bit_short_refused() {
     gate_ran("trust_enforcement::f05_public_ticket_one_bit_short_refused");
 }
 
+/// Ticket bits: a client whose default ticket is below the node's bits learns
+/// `required_pow_bits` from the refusal, re-mints once, and is admitted (its shard is stored).
+/// The default is 0 bits: a hashcash mint overshoots its target, so a mint at 11 bits meets 12
+/// half the time; at 0 bits the chance of skipping the refusal is 2^-12.
+#[test]
+fn ticket_client_remints_at_required_bits() {
+    let node = spawn_public_daemon("tbits-a");
+    let stranger = key(0xA6);
+    let c = MeshClient::new(stranger.clone(), Vec::new(), None)
+        .with_admission(AdmissionSource::default().with_public_tickets(0));
+    // A `/p2p/` address states the verifier key, so the only refusal is for the bits.
+    let addr = format!("{}/p2p/{}", node.addr, node.peer_id());
+    let (sid, bytes) = shard(0x16, 1024);
+    let put = c
+        .send_request(&addr, put_shard("", sid, bytes, None))
+        .unwrap();
+    assert!(stored(&put), "{put:?}\n{}", node.log_text());
+    assert_logged(&node, "reject.ticket_insufficient_pow");
+    gate_ran("trust_enforcement::ticket_client_remints_at_required_bits");
+}
+
 /// F-29 reject: a ticket at the required bits but 20 minutes old is refused (freshness window).
 #[test]
 fn f29_stale_ticket_refused() {
