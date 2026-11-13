@@ -164,10 +164,41 @@ def check(root, bl):
             if name not in captured:
                 problems.append(f"{b.where()}: placeholder <{name}> has no earlier capture (capture it or skip the block)")
         captured |= {n for n, _ in b.ann["capture"]}
+    problems += claim_problems(root)
     for p in problems:
         print("[FAIL]", p)
     print(f"doc-commands: {len(bl)} block(s), {len(bl) - skips} run, {skips} skipped (ratchet {ratchet})")
     return not problems
+
+
+CLAIMS = "docs/claims-pending.txt"
+CLAIM_TAG = {"planned": "<!-- claim: planned -->(planned)", "stubbed": "<!-- claim: stubbed -->(stub)"}
+CLAIM_RE = re.compile(r"<!--\s*claim:\s*(\w+)\s*-->(\(\w+\))?")
+
+
+def claim_problems(root):
+    """Every pending audit claim (docs/claims-pending.txt) carries its label on its line, and
+    every label in the docs is a known marker followed by its visible tag."""
+    problems, rows = [], []
+    for n, line in enumerate(open(os.path.join(root, CLAIMS), encoding="utf-8"), 1):
+        if line.strip() and not line.startswith("#"):
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) != 4 or parts[2] not in CLAIM_TAG:
+                problems.append(f"{CLAIMS}:{n}: want 'file | anchor | planned|stubbed | audit row'")
+                continue
+            rows.append(parts)
+    for doc, anchor, label, ref in rows:
+        hits = [l for l in open(os.path.join(root, doc), encoding="utf-8") if anchor in l]
+        if not hits:
+            problems.append(f"{doc}: claim anchor '{anchor}' not found: fixed? remove its {CLAIMS} row")
+        elif not any(CLAIM_TAG[label] in l for l in hits):
+            problems.append(f"{doc}: '{anchor}' ({ref}) lacks '{CLAIM_TAG[label]}'")
+    for doc in DOCS:
+        for n, l in enumerate(open(os.path.join(root, doc), encoding="utf-8"), 1):
+            for m in CLAIM_RE.finditer(l):
+                if m.group(1) not in CLAIM_TAG or not l[m.start():].startswith(CLAIM_TAG[m.group(1)]):
+                    problems.append(f"{doc}:{n}: claim marker must be one of {list(CLAIM_TAG.values())}")
+    return problems
 
 
 def sh(args, **kw):

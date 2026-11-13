@@ -25,7 +25,7 @@ Neighborhood Cloud lets your computers, your home server, and your friends' or n
    - By default (**`--tier homelab`, `16-of-20`**), **any 16 pieces** reconstruct your file using only **1.25x** storage, so 4 pieces can be lost. `--tier consumer` (`10-of-20`) survives losing 10 pieces at 2x storage. You choose the tier; it does not change on its own yet.
    - **With one paired router, all 20 pieces sit on that router.** That protects against bit rot on its disk, not against losing the router. Spread pieces by adding more ring members.
 3. **Step 3 — What the Machines Holding Your Pieces Can See:**
-   Only encrypted bytes: they cannot read your files. They do see which ring member sent each piece, and the piece file names show which pieces belong to the same stripe. Hiding that (blinded names and relaying uploads through a neighbor) is planned for the CLI.
+   Only encrypted bytes: they cannot read your files. They do see which ring member sent each piece, and the piece file names show which pieces belong to the same stripe. <!-- claim: planned -->(planned) Hiding that (blinded names and relaying uploads through a neighbor) in the CLI.
 
 ```mermaid
 flowchart LR
@@ -238,7 +238,7 @@ For example, the BIP-39 test vector `legal winner thank year wave sausage worth 
 ---
 
 ### Recipe B: Link Personal Devices with Zero Reciprocity Tax (`issue-device-cert`)
-To link machines into a private Day-1 Personal Ring (the planned zero storage quota tax for linked devices is not applied yet):
+To link machines into a private Day-1 Personal Ring (<!-- claim: planned -->(planned) zero storage quota tax for linked devices: not applied yet):
 <!-- doc-cmd: skip reason="the certificate and the issuer's owner key come from two machines' output" -->
 ```bash
 # 1. On your laptop, issue a certificate for your desktop or NAS. For a lite seed
@@ -333,7 +333,7 @@ Clients that cannot send a Bearer token (Finder, davfs2, Windows) use any user n
 
 ## 5. Planned: The Automatic "Trust & Storage Ladder"
 
-**Not active yet.** Today `watch-folder` and `up` use the tier you pass with `--tier`: `consumer` (10-of-20), `homelab` (16-of-20, the default), `mixed` (16-of-24) or `relay` (20-of-24). The ladder below is the design: a node would climb it based on how many peers are around and how reliably it stays online.
+<!-- claim: planned -->(planned) **Not active yet.** Today `watch-folder` and `up` use the tier you pass with `--tier`: `consumer` (10-of-20), `homelab` (16-of-20, the default), `mixed` (16-of-24) or `relay` (20-of-24). The ladder below is the design: a node would climb it based on how many peers are around and how reliably it stays online.
 
 | Stage | Who Is Connected? | Puzzle Pieces (`K-of-N`) | How Many Machines Can Die at Once? | Storage Space Needed per `100 GB` Backed Up |
 | :--- | :--- | :---: | :---: | :---: |
