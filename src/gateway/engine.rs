@@ -621,6 +621,8 @@ mod unix_engine {
                         self.block_store
                             .put_shard(&self.owner_peer_id, &shard_id, shard_bytes)?;
                     }
+                    self.block_store
+                        .record_local_only_stripe(&shard_set.stripe_merkle_root);
                     let (_, _, n_total) = effective_tier.params();
                     vec![(*self.owner_peer_id).clone(); n_total]
                 };

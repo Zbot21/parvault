@@ -155,6 +155,8 @@ parvault watch-folder \
   --snapshot-out ./documents.manifest.bin \
   --prune-deleted \
   --once
+# If no ring peer takes the data, this prints "N stripe(s) kept only on this machine: NOT backed up"
+# and exits with code 3: nothing left this machine. Pass --allow-local-only to accept that.
 
 # Restore a single file or the whole directory tree (keep PARVAULT_SEED_PHRASE set and pass the
 # same namespace if you backed up with a phrase; without one, omit --vault-namespace)
@@ -240,8 +242,9 @@ If a spammer or illegal content is detected, administrators can purge matching s
 parvault evict --ip 203.0.113.42 --reason "Spam flood"
 
 # Purge and permanently block an illegal content stripe across mesh peers:
-# --merkle-root takes a stripe Merkle root (each shard file name starts with its first 16 hex
-# characters); a folder Merkle root matches no shard.
+# --merkle-root takes a full 64-hex stripe Merkle root. `parvault list-snapshot --snapshot <file>`
+# prints each file's stripe roots (`stripe N root=...`); an abuse report names the stripe too.
+# File and folder roots are not stripe roots (they only coincide for a one-stripe file).
 parvault evict --merkle-root <STRIPE_MERKLE_ROOT_HEX> --propagate
 ```
 
