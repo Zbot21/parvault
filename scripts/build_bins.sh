@@ -15,12 +15,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "$OUT" ]] || { echo "build_bins.sh: --out is required" >&2; exit 2; }
-[[ ${#BINS[@]} -gt 0 ]] || BINS=(parvault parvault-seed parvault-fuse parvault-sync)
+[[ ${#BINS[@]} -gt 0 ]] || BINS=(parvault parvault-seed parvault-fuse parvault-sync parvault-status)
 features_for() {
   case "$1" in
     parvault|parvault-seed|parvault-bench) echo "" ;;                      # default (daemon-runtime, vfs)
     parvault-fuse) echo "--no-default-features --features vfs" ;;
     parvault-sync) echo "--no-default-features --features ipc-client" ;;
+    parvault-status) echo "--no-default-features --features status-ui" ;;
     *) echo "build_bins.sh: no feature set for $1" >&2; return 2 ;;
   esac
 }

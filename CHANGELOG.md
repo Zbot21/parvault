@@ -42,6 +42,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `--no-lan-discovery` turns mDNS off; mDNS never feeds Kademlia, admission does.
 
 ### Added
+- **`parvault-status` sidecar (item 3).** The status page as its own binary, built with `--no-default-features --features status-ui` (no tokio, no libp2p). It holds no key, pins one read-only `--macaroon`, reads the snapshot with `QueryStatus` over the gateway socket, and has no default `--listen`. Against a pre-v0.5.0 daemon it exits with a message saying so. Shipped in releases for both musl targets.
 - File manifests are version 2: each stripe records a chunk Merkle root per shard (`shard_chunk_roots`, `por::chunk_merkle`, `4 KiB` chunks) for storage audits. Version-1 manifests and folder snapshots still decode, with no roots (unauditable). The audit loop does not issue challenges yet.
 - `MeshWireRequest::AdmitPublicTicket` / `MeshWireResponse::AdmitPublicTicketAck` (appended; existing indices unchanged) and `parvault wot init` / `invite` / `install-chain`.
 

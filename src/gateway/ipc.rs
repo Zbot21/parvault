@@ -810,6 +810,13 @@ mod unix_impl {
                 IpcResponse::StatusSnapshot(_) => {
                     Err(io::Error::other("QueryStatus: snapshot over its size caps"))
                 }
+                // A pre-v0.5.0 daemon cannot decode command 5 and says so.
+                IpcResponse::Error { message } if message.starts_with("invalid IPC command") => {
+                    Err(io::Error::other(format!(
+                        "the daemon on {} predates v0.5.0 and has no QueryStatus; upgrade it ({message})",
+                        self.socket_path.display()
+                    )))
+                }
                 IpcResponse::Error { message } => Err(io::Error::other(message)),
                 other => Err(io::Error::other(format!(
                     "unexpected QueryStatus response: {other:?}"

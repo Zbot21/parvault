@@ -26,6 +26,11 @@ path = "src/bin/parvault-sync.rs"
 required-features = ["ipc-client"]
 
 [[bin]]
+name = "parvault-status"
+path = "src/bin/parvault-status.rs"
+required-features = ["status-ui"]
+
+[[bin]]
 name = "parvault-bench"
 path = "src/bin/parvault-bench.rs"
 required-features = ["daemon-runtime"]

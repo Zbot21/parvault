@@ -44,7 +44,7 @@ if [[ "${1:-}" == "--measured" ]]; then
     [[ -n "${CARGO_TARGET_DIR:-}" ]] || fail "--measured sizes needs CARGO_TARGET_DIR"
     for target in aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
       arch="${target%%-*}"
-      for bin in parvault parvault-seed parvault-fuse parvault-sync; do
+      for bin in parvault parvault-seed parvault-fuse parvault-sync parvault-status; do
         bash scripts/build_bins.sh --profile soc --target "$target" --out "$CARGO_TARGET_DIR/measured" "$bin" >&2
         bytes="$(stat -c %s "$CARGO_TARGET_DIR/measured/$bin-$target")"
         [[ "$bytes" =~ ^[1-9][0-9]*$ ]] || fail "no size for $bin ($target)"

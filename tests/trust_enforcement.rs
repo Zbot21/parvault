@@ -6562,3 +6562,219 @@ fn status_http_query_string_token_refused() {
         "URL token in the node log"
     );
 }
+
+// --- Item 3: the parvault-status sidecar (no key; pinned token; status over the socket) --------
+
+struct StatusSidecar {
+    _gateway: Node,
+    child: Child,
+    log: PathBuf,
+    addr: std::net::SocketAddr,
+}
+
+impl Drop for StatusSidecar {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn status_sidecar_log(s: &StatusSidecar) -> String {
+    std::fs::read_to_string(&s.log).unwrap_or_default()
+}
+
+/// A daemon with a gateway socket under GW_KEY, and `parvault-status` pinned to a ReadOnly root
+/// token, serving on an ephemeral loopback port.
+fn status_sidecar_up(label: &str) -> StatusSidecar {
+    let (gateway, sock) = gw_up(label, &[], Some(GW_KEY));
+    let log = gateway.dir.join("parvault-status.log");
+    let f = std::fs::File::create(&log).unwrap();
+    // Its own empty working directory: whatever it writes would show up here.
+    let cwd = gateway.dir.join("sidecar-cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let child = Command::new(common::plugin_bin(
+        "parvault-status",
+        env!("CARGO_BIN_EXE_parvault-status"),
+    ))
+    .current_dir(&cwd)
+    .args(["--listen", "127.0.0.1:0", "--macaroon", &ro_token()])
+    .arg("--socket")
+    .arg(&sock)
+    .stdout(Stdio::from(f.try_clone().unwrap()))
+    .stderr(Stdio::from(f))
+    .spawn()
+    .unwrap();
+    let mut side = StatusSidecar {
+        _gateway: gateway,
+        child,
+        log,
+        addr: "127.0.0.1:1".parse().unwrap(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let text = status_sidecar_log(&side);
+        if let Some(rest) = text.split("Status Server listening on http://").nth(1) {
+            side.addr = rest.split_whitespace().next().unwrap().parse().unwrap();
+            return side;
+        }
+        assert!(Instant::now() < deadline, "no sidecar listener:\n{text}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// STATUS-AUTH accept (bin=parvault-status): the pinned token reads the daemon's status.
+#[test]
+fn status_sidecar_readonly_served() {
+    let s = status_sidecar_up("ss-ok");
+    let (code, raw) = status_get(
+        s.addr,
+        &host_of(s.addr),
+        Some(format!("Bearer {}", ro_token())),
+    );
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&raw));
+    assert!(String::from_utf8_lossy(&raw).contains(env!("CARGO_PKG_VERSION")));
+    gate_ran("trust_enforcement::status_sidecar_readonly_served");
+}
+
+/// STATUS-AUTH reject (bin=parvault-status): no token, the fixed 401.
+#[test]
+fn status_sidecar_no_token_unauthorized() {
+    let s = status_sidecar_up("ss-none");
+    let (code, raw) = status_get(s.addr, &host_of(s.addr), None);
+    assert_eq!(
+        (code, raw.as_slice()),
+        (401, parvault::http_edge::STATUS_401)
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !status_sidecar_log(&s).contains("reject.status_token_missing") {
+        assert!(Instant::now() < deadline, "{}", status_sidecar_log(&s));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    gate_ran("trust_enforcement::status_sidecar_no_token_unauthorized");
+}
+
+/// STATUS-HOST accept (bin=parvault-status).
+#[test]
+fn status_sidecar_ip_host_served() {
+    let s = status_sidecar_up("ss-host-ok");
+    let host = format!("localhost:{}", s.addr.port());
+    assert_eq!(
+        status_get(s.addr, &host, Some(format!("Bearer {}", ro_token()))).0,
+        200
+    );
+    gate_ran("trust_enforcement::status_sidecar_ip_host_served");
+}
+
+/// STATUS-HOST reject (bin=parvault-status): a DNS-name Host is refused with a valid token.
+#[test]
+fn status_sidecar_dns_host_refused() {
+    let s = status_sidecar_up("ss-host-bad");
+    let host = format!("rebind.example:{}", s.addr.port());
+    assert_eq!(
+        status_get(s.addr, &host, Some(format!("Bearer {}", ro_token()))).0,
+        403
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !status_sidecar_log(&s).contains("reject.status_host_mismatch") {
+        assert!(Instant::now() < deadline, "{}", status_sidecar_log(&s));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    gate_ran("trust_enforcement::status_sidecar_dns_host_refused");
+}
+
+/// The pinned parent: an offline attenuation is served; a sibling root token (valid under the
+/// daemon key, but not the pinned chain) is refused by the sidecar itself.
+#[test]
+fn status_sidecar_pinned_parent_chain() {
+    let s = status_sidecar_up("ss-chain");
+    let child = gw_token(vec![parvault::capabilities::Caveat::ReadOnly])
+        .attenuate(parvault::capabilities::Caveat::ExpiresAtUnixMs(
+            u64::MAX / 2,
+        ))
+        .unwrap()
+        .to_compact_token();
+    assert_eq!(
+        status_get(s.addr, &host_of(s.addr), Some(format!("Bearer {child}"))).0,
+        200
+    );
+    let sibling = parvault::capabilities::CapabilityMacaroon::mint(
+        &GW_KEY,
+        [9; 32],
+        [6; 32],
+        vec![parvault::capabilities::Caveat::ReadOnly],
+    )
+    .unwrap()
+    .to_compact_token();
+    assert_eq!(
+        status_get(s.addr, &host_of(s.addr), Some(format!("Bearer {sibling}"))).0,
+        401
+    );
+}
+
+/// The sidecar holds no key: its source never reads a root key or master key, and it runs from
+/// a directory with no key file.
+#[test]
+fn status_sidecar_holds_no_key() {
+    let src = include_str!("../src/bin/parvault-status.rs");
+    for banned in [
+        "macaroon_root",
+        "MasterKey",
+        "load_or_create",
+        "root_key",
+        "data_dir",
+    ] {
+        assert!(!src.contains(banned), "parvault-status mentions {banned}");
+    }
+    let s = status_sidecar_up("ss-nokey");
+    assert_eq!(
+        status_get(
+            s.addr,
+            &host_of(s.addr),
+            Some(format!("Bearer {}", ro_token()))
+        )
+        .0,
+        200
+    );
+    let written: Vec<_> = std::fs::read_dir(s._gateway.dir.join("sidecar-cwd"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
+    assert!(written.is_empty(), "the sidecar wrote {written:?}");
+}
+
+/// A new sidecar against a daemon older than v0.5.0 (which answers an unknown command with
+/// "invalid IPC command ...") exits with a clear message instead of serving.
+#[test]
+fn status_sidecar_old_daemon_clear_message() {
+    use bincode::Options;
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("old.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let _ = parvault::gateway::ipc::recv_frame_with_optional_fd(&mut stream);
+            let resp = parvault::gateway::ipc::IpcResponse::Error {
+                message: "invalid IPC command bincode: invalid value: integer `5`".into(),
+            };
+            let bytes = bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .allow_trailing_bytes()
+                .serialize(&resp)
+                .unwrap();
+            let _ = parvault::gateway::ipc::send_frame_with_optional_fd(&mut stream, &bytes, None);
+        }
+    });
+    let out = Command::new(common::plugin_bin(
+        "parvault-status",
+        env!("CARGO_BIN_EXE_parvault-status"),
+    ))
+    .args(["--listen", "127.0.0.1:0", "--macaroon", &ro_token()])
+    .arg("--socket")
+    .arg(&sock)
+    .output()
+    .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("predates v0.5.0"), "{err}");
+}
