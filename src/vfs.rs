@@ -480,6 +480,8 @@ impl WebdavVerifier {
     fn chain_ok(&self, token: &CapabilityMacaroon) -> bool {
         match self {
             Self::RootKey(key) => token.tag_valid(key),
+            // L-44 item 4: on a plugin block-cache hit the read never reaches the gateway, so this
+            // check (plus the caveat evaluation in `webdav_auth_decision`) is the only check.
             Self::PinnedParent(parent) => crate::capabilities::is_attenuation_of(parent, token),
         }
     }
@@ -826,6 +828,9 @@ mod unix_vfs {
                 let blk_start = blk_idx.saturating_mul(bsz);
                 let blk_len = stub.size_bytes.saturating_sub(blk_start).min(bsz);
 
+                // F-43 (L-44 item 4): a cache hit is served without a gateway `FetchRange`, so for
+                // WebDAV the edge `webdav_auth_decision` (for the plugin host: `is_attenuation_of`
+                // against the pinned token) is the only check on this read.
                 let cached = self.cache.lock().unwrap().get(ino, blk_idx)?;
                 let blk_bytes = match cached {
                     Some(hit_bytes) => hit_bytes,
