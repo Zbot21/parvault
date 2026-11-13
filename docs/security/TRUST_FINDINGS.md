@@ -84,6 +84,7 @@ Status values:
 | ID | Line | Status |
 | :--- | :--- | :--- |
 | E-WIRE | Every `MeshWireRequest` variant is covered by a claim. | Passes (2c): all 23 variants are covered, except `QueryNodeStatus` (public by design, bucketed values, F-44) and `LookupWanRendezvous` (the slot code authorises; registration capped; public-slot enumeration under F-22), excluded by architect ruling. |
+| ADR-08 | A wire frame longer than `MAX_WIRE_FRAME_BYTES` (32 MiB) is refused from its length prefix, before allocation (`wire_frame_decision`, `reject.wire_frame_oversized`; log code only, the codec answers nothing). | Claim (2c D-ADR): pair over a real libp2p connection. |
 | E-POR | `PorAudit` and `MultiSegmentPorAudit` read disk only for the session-key holder's fresh, unseen, HMAC-valid challenge (`por_prescreen_decision`). | Claim (2c item 5). |
 | E-BREAD | `GetBlindedShard` serves bytes only for the lease's capability key, this locator, a fresh token and a valid signature (`blinded_read_decision`, F-40). | Claim (2c item 5). |
 | E-ABUSE | `SubmitAbuseTakedownReport` queues only a reporter-signed report with a working burden of proof (`abuse_report_decision`). | Claim (2c item 5). |

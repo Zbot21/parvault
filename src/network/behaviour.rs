@@ -26,6 +26,16 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 /// stream natively with zero fragmentation.
 pub const MAX_WIRE_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
+/// ADR-08: a frame longer than the codec's limit (`MAX_WIRE_FRAME_BYTES`) is refused from its
+/// length prefix, before any buffer is reserved.
+pub fn wire_frame_decision(len: usize, max_frame_bytes: usize) -> Result<(), &'static str> {
+    if len > max_frame_bytes {
+        Err("reject.wire_frame_oversized")
+    } else {
+        Ok(())
+    }
+}
+
 /// High-speed zero-expansion `bincode` wire codec for `/parvault/wire/1.0.0`.
 #[derive(Debug, Clone)]
 pub struct BincodeWireCodec {
@@ -99,7 +109,8 @@ impl BincodeWireCodec {
                 "wire frame length overflows usize",
             )
         })?;
-        if len > self.max_frame_bytes {
+        if let Err(code) = wire_frame_decision(len, self.max_frame_bytes) {
+            tracing::warn!(code, len, "refused a wire frame before allocating it");
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(

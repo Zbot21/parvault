@@ -4610,3 +4610,85 @@ fn f44_public_status_is_bucketed() {
     }
     assert_eq!((sla_score * 10.0).round() / 10.0, sla_score);
 }
+
+// --- ADR-08: oversized wire frames are refused in the codec ---------------------------------------
+
+/// Sends `req` to `node` over a real libp2p connection from a test swarm whose own codec allows
+/// frames up to 64 MiB (so the node's 32 MiB limit is what decides). `Some(response)` or `None`
+/// if the request failed (stream reset, timeout).
+fn raw_wire_request(node: &Node, req: MeshWireRequest) -> Option<MeshWireResponse> {
+    use libp2p::request_response::{self, ProtocolSupport};
+    use parvault::network::behaviour::BincodeWireCodec;
+    let target = node.peer_id();
+    let addr: Multiaddr = node.addr.parse().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async move {
+        let mut swarm =
+            libp2p::SwarmBuilder::with_existing_identity(key(0xD8).to_libp2p_keypair().unwrap())
+                .with_tokio()
+                .with_tcp(
+                    libp2p::tcp::Config::default(),
+                    libp2p::noise::Config::new,
+                    libp2p::yamux::Config::default,
+                )
+                .unwrap()
+                .with_behaviour(|_| {
+                    request_response::Behaviour::with_codec(
+                        BincodeWireCodec {
+                            max_frame_bytes: 64 * 1024 * 1024,
+                        },
+                        [(
+                            libp2p::StreamProtocol::new("/parvault/wire/1.0.0"),
+                            ProtocolSupport::Full,
+                        )],
+                        request_response::Config::default()
+                            .with_request_timeout(Duration::from_secs(20)),
+                    )
+                })
+                .unwrap()
+                .build();
+        swarm.add_peer_address(target, addr);
+        swarm.behaviour_mut().send_request(&target, req);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+        while tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                ev = swarm.select_next_some() => match ev {
+                    SwarmEvent::Behaviour(request_response::Event::Message {
+                        message: request_response::Message::Response { response, .. },
+                        ..
+                    }) => return Some(response),
+                    SwarmEvent::Behaviour(request_response::Event::OutboundFailure { .. }) => {
+                        return None
+                    }
+                    _ => {}
+                },
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+        }
+        None
+    })
+}
+
+/// ADR-08 accept: a frame within the limit is read and answered over a real connection.
+#[test]
+fn adr08_frame_within_limit_answered() {
+    let node = spawn_daemon("adr08-a");
+    let resp = raw_wire_request(&node, MeshWireRequest::QueryNodeStatus);
+    assert!(
+        matches!(resp, Some(MeshWireResponse::NodeStatusResult { .. })),
+        "{resp:?}"
+    );
+    gate_ran("trust_enforcement::adr08_frame_within_limit_answered");
+}
+
+/// ADR-08 reject: a 33 MiB frame is refused from its length prefix; no response is produced.
+#[test]
+fn adr08_oversized_frame_refused() {
+    let node = spawn_daemon("adr08-r");
+    let (sid, _) = shard(0x38, 16);
+    let req = put_shard("", sid, vec![0u8; 33 * 1024 * 1024], None);
+    let resp = raw_wire_request(&node, req);
+    assert!(resp.is_none(), "{resp:?}");
+    assert_logged(&node, "reject.wire_frame_oversized");
+    gate_ran("trust_enforcement::adr08_oversized_frame_refused");
+}
