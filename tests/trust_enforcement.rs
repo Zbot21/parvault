@@ -4005,3 +4005,34 @@ fn ewire_unadmitted_peer_council_manifest_refused() {
     assert_logged(&node, "reject.peer_not_admitted");
     gate_ran("trust_enforcement::ewire_unadmitted_peer_council_manifest_refused");
 }
+
+/// F-40 reject: a blinded-read token signed by the capability key but 60 s old (outside the
+/// +/-30 s window) is refused; the same holder's fresh token is served
+/// (`ewire_blinded_read_by_capability_holder_served`).
+#[test]
+fn f40_stale_blinded_read_token_refused() {
+    let node = spawn_daemon("f40-stale");
+    let sender = key(0xB3);
+    let b = blinded(0x5B, 512);
+    let put = send(&sender, &node, blinded_put(&b, &sender));
+    assert!(format!("{put:?}").contains("stored: true"), "{put:?}");
+    let ts = now_ms() - 60_000;
+    let cap = blinded_cap_identity(0x5B, &b);
+    let stale = MeshWireRequest::GetBlindedShard {
+        blinded_id: b.id,
+        capability: b.cap,
+        timestamp_ms: ts,
+        read_sig: BlindedShardCapability::sign_read_token(&cap, &b.id.locator, ts).to_vec(),
+    };
+    let resp = send(&sender, &node, stale);
+    assert!(
+        format!("{resp:?}").contains("shard_bytes: None"),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.blinded_read_stale");
+    let fresh = send(&sender, &node, blinded_read(&b, &cap));
+    assert!(
+        format!("{fresh:?}").contains("shard_bytes: Some"),
+        "{fresh:?}"
+    );
+}
