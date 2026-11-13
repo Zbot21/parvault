@@ -128,8 +128,13 @@ impl PersonalDeviceCert {
             &self.device_label,
             self.issued_unix_secs,
         );
-        if !HybridPqSigningKeypair::verify(&self.owner_root_pubkey, &digest, &self.owner_signature)
-        {
+        let halves = HybridPqSigningKeypair::verify_halves(
+            &self.owner_root_pubkey,
+            &digest,
+            &self.owner_signature,
+        );
+        if let Err(code) = crate::crypto::pqc::hybrid_signature_decision(&halves) {
+            tracing::warn!(code, device = %self.device_peer_id, "refused a personal device cert");
             return Err(BootstrapError::InvalidPersonalDeviceCert);
         }
         Ok(())

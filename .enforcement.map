@@ -118,6 +118,8 @@ claim      ADR-22    sym=src/network/discovery.rs::beacon_decision accept=trust_
 
 claim      ADR-07    sym=src/storage/quota.rs::quota_decision accept=trust_enforcement::adr07_shard_within_peer_quota_stored reject=trust_enforcement::adr07_shard_over_peer_quota_refused code=reject.peer_quota_exceeded bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-07-tier-weighted-reciprocity-ledger.md covers=MeshWireRequest::PutShard
 
+claim      ADR-12    sym=src/crypto/pqc.rs::hybrid_signature_decision accept=trust_enforcement::f25_device_cert_of_sender_accepted reject=trust_enforcement::adr12_cert_with_bad_ml_dsa_half_refused code=reject.hybrid_sig_ml_dsa_invalid bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-12-asymmetric-post-quantum-hybrids.md
+
 # --- D-ADR (architect ruling on 2c-dadr-classification.md): ADRs with no runtime claim ---
 noenforce  N-01      adr=docs/adr/ADR-01-streaming-stripes-and-encrypt-before-shard.md reason=client pipeline order; no peer can violate it; unit and Kani in sharding and crypto::aes
 noenforce  N-06      adr=docs/adr/ADR-06-hybrid-locality-and-70-30-placement.md reason=client-side placement policy (performance); no peer-facing promise

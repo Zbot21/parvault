@@ -4808,3 +4808,30 @@ fn adr07_shard_over_peer_quota_refused() {
     assert_logged(&node, "reject.peer_quota_exceeded");
     gate_ran("trust_enforcement::adr07_shard_over_peer_quota_refused");
 }
+
+// --- ADR-12: hybrid signatures need both halves ------------------------------------------------------
+
+/// ADR-12 reject: a device cert whose Ed25519 half is valid but whose ML-DSA-65 half is broken is
+/// refused by the seed (accept: `f25_device_cert_of_sender_accepted`).
+#[test]
+fn adr12_cert_with_bad_ml_dsa_half_refused() {
+    let node = spawn_seed("adr12-r");
+    let device = key(0xC5);
+    let mut req = syndicate(&node, &device);
+    if let MeshWireRequest::SyndicateLiteStripe { cert, .. } = &mut req {
+        cert.owner_signature.ml_dsa_65_sig[100] ^= 0x01;
+    }
+    let resp = send(&device, &node, req);
+    assert!(
+        !matches!(
+            resp,
+            MeshWireResponse::SyndicateLiteStripeAck {
+                receipt: Some(_),
+                ..
+            }
+        ),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.hybrid_sig_ml_dsa_invalid");
+    gate_ran("trust_enforcement::adr12_cert_with_bad_ml_dsa_half_refused");
+}
