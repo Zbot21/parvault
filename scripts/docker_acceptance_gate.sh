@@ -39,7 +39,10 @@ BUILD_CTX="/tmp/parvault-acceptance-image"
 rm -rf "$BUILD_CTX"
 mkdir -p "$BUILD_CTX"
 
-if [ "${USE_GLIBC_IMAGE:-0}" != "1" ] && rustup target list --installed 2>/dev/null | grep -q "x86_64-unknown-linux-musl"; then
+# Capture before grepping: with pipefail, `cmd | grep -q` fails when grep exits early and cmd
+# gets SIGPIPE.
+INSTALLED_TARGETS="$(rustup target list --installed 2>/dev/null || true)"
+if [ "${USE_GLIBC_IMAGE:-0}" != "1" ] && grep -q "x86_64-unknown-linux-musl" <<<"$INSTALLED_TARGETS"; then
     cargo build --release --target x86_64-unknown-linux-musl --bin parvault --bin parvault-seed
     cp target/x86_64-unknown-linux-musl/release/parvault "$BUILD_CTX/parvault"
     cp target/x86_64-unknown-linux-musl/release/parvault-seed "$BUILD_CTX/parvault-seed"
@@ -153,12 +156,26 @@ docker run -d --name parvault-outsider \
     sleep 3600
 docker exec parvault-outsider /usr/local/bin/parvault --data-dir /var/lib/outsider --no-lan-discovery wot init
 docker exec parvault-outsider sh -c 'echo "outsider data" > /tmp/outsider.txt'
-if docker exec parvault-outsider /usr/local/bin/parvault --data-dir /var/lib/outsider --no-lan-discovery \
-    --peers /ip4/172.28.0.11/tcp/4001 file store --path /tmp/outsider.txt; then
+# The outsider is refused, keeps the stripe locally, says it is not backed up and exits 3.
+set +e
+OUTSIDER_OUT="$(docker exec parvault-outsider /usr/local/bin/parvault --data-dir /var/lib/outsider \
+    --no-lan-discovery --peers /ip4/172.28.0.11/tcp/4001 file store --path /tmp/outsider.txt 2>&1)"
+OUTSIDER_RC=$?
+set -e
+echo "$OUTSIDER_OUT"
+if [ "$OUTSIDER_RC" -ne 3 ] || ! grep -q "NOT backed up" <<<"$OUTSIDER_OUT"; then
+    echo "ERROR: the outsider's store did not report NOT backed up with exit 3 (exit $OUTSIDER_RC)"
+    exit 1
+fi
+OUTSIDER_ROOT="$(awk '/File Merkle Root/ {print $5}' <<<"$OUTSIDER_OUT")"
+NODE1_SHARDS="$(docker exec parvault-node-1 sh -c 'ls /var/lib/parvault/.parvault-data/shards 2>/dev/null' || true)"
+if [ -n "$OUTSIDER_ROOT" ] && grep -q "^${OUTSIDER_ROOT:0:16}" <<<"$NODE1_SHARDS"; then
     echo "ERROR: a non-member stored data on a ring node"
     exit 1
 fi
-if ! docker logs parvault-node-1 2>&1 | grep -q "reject.peer_not_admitted"; then
+# Capture the log first: `docker logs | grep -q` fails under pipefail once the log is long.
+NODE1_LOG="$(docker logs parvault-node-1 2>&1)"
+if ! grep -q "reject.peer_not_admitted" <<<"$NODE1_LOG"; then
     echo "ERROR: the ring node did not log the refusal"
     exit 1
 fi
@@ -276,7 +293,9 @@ docker exec parvault-client sh -cex '
     sha256sum /workspace/lite_source/laptop_note.txt > /tmp/expected_lite.sha256
 '
 SEED_PUBKEY_HEX="$(docker exec parvault-seed-0 /usr/local/bin/parvault-seed identity --data-dir /var/lib/parvault-seed | awk '/Owner PQ Public Key Hex/ {print $7}')"
-DEVICE_CERT_TOKEN="$(docker exec parvault-seed-0 /usr/local/bin/parvault-seed issue-device-cert --data-dir /var/lib/parvault-seed --device-peer-id parvault-peer-lite-laptop --device-label laptop | awk '/Shareable Token/ {print $4}')"
+# The cert must name the client's own Device Peer ID (F-25): read it from `parvault identity`.
+LITE_DEVICE_ID="$(docker exec -w /tmp/lite-client-state parvault-client /usr/local/bin/parvault identity 2>/dev/null | awk '/Device Peer ID/ {print $5}')"
+DEVICE_CERT_TOKEN="$(docker exec parvault-seed-0 /usr/local/bin/parvault-seed issue-device-cert --data-dir /var/lib/parvault-seed --device-peer-id "$LITE_DEVICE_ID" --device-label laptop | awk '/Shareable Token/ {print $4}')"
 
 docker exec -w /tmp/lite-client-state parvault-client /usr/local/bin/parvault \
     --peers "$PEERS_CSV" \
@@ -329,7 +348,7 @@ docker exec parvault-node-6 sh -cex '
 '
 SCRUB_OUT="$(docker exec -w /var/lib/parvault parvault-node-6 /usr/local/bin/parvault scrub)"
 echo "$SCRUB_OUT"
-echo "$SCRUB_OUT" | grep -q "corrupted_quarantined_shards : 1"
+grep -q "corrupted_quarantined_shards : 1" <<<"$SCRUB_OUT"
 
 # Restart parvault-node-6 and parvault-node-7 to prove persistent disk state across daemon restarts
 docker restart parvault-node-6 parvault-node-7

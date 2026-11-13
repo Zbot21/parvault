@@ -181,12 +181,13 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
 
             let seed_str = seed_dir.to_string_lossy().to_string();
             if is_network_peer_addr(&seed_str) {
-                let (snap, n) =
-                    parvault::storage::local_only::track(|| engine.sync_folder_once(&folder));
-                pass_local_only += n;
-                let mut snap = snap?;
+                // Stored locally first; counted after syndication below.
+                let mut snap = engine.sync_folder_once(&folder)?;
+                // The seed checks that the device cert names the sender (F-25), and the cert is
+                // issued for the Device Peer ID that `parvault identity` prints: send as this
+                // node. The repair grant below is still signed by the vault owner.
                 let net_client = MeshClient::new(
-                    owner_identity.clone(),
+                    NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?,
                     mesh_client.all_network_endpoints(),
                     Some(seed_str.clone()),
                 )
@@ -251,8 +252,20 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                                     receipt_count += 1;
                                     let has_net =
                                         syndicated_peers.iter().any(|p| is_network_peer_addr(p));
+                                    // Shards the seed kept itself are labelled with its server id,
+                                    // not an address: record them as the seed's multiaddr, as the
+                                    // all-on-seed branch does, so they count as off this machine.
                                     stripe_meta.assigned_peers = if has_net {
                                         syndicated_peers
+                                            .into_iter()
+                                            .map(|p| {
+                                                if is_network_peer_addr(&p) {
+                                                    p
+                                                } else {
+                                                    seed_str.clone()
+                                                }
+                                            })
+                                            .collect()
                                     } else {
                                         vec![seed_str.clone(); stripe_meta.shard_hashes.len()]
                                     };
@@ -277,6 +290,20 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                         let _ = store_with_net.save_manifest(&master_key, &entry.manifest);
                     }
                 }
+                // The first local pass counted every new stripe as local-only; after
+                // syndication, report only the stripes still below k shards on peers (R3-1).
+                pass_local_only = snap
+                    .files
+                    .values()
+                    .flat_map(|f| f.manifest.stripes.iter())
+                    .filter(|s| {
+                        s.assigned_peers
+                            .iter()
+                            .filter(|p| is_network_peer_addr(p))
+                            .count()
+                            < s.k_data
+                    })
+                    .count() as u64;
                 if let Some(ref env) = snap.signed_dht_envelope {
                     let _ = net_client
                         .put_dht_envelope(DhtWireEnvelope::ClassicalManifest(env.clone()));

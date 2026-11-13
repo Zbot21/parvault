@@ -796,8 +796,10 @@ fn f04_seed_syndication_accounted_to_seed() {
         expected_stripe_merkle_root: set.stripe_merkle_root,
         expected_shard_hashes: set.shard_hashes.clone(),
     };
-    let resp = send(
-        &device,
+    // The seed re-uploads all n shards to its peer inside the request before it answers, which
+    // can exceed the client's default 1.2 s under a loaded gate run: allow 10 s.
+    let resp = send_with(
+        client(&device).with_timeout(Duration::from_secs(10)),
         &seed,
         MeshWireRequest::SyndicateLiteStripe {
             cert,
