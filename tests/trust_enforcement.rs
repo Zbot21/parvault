@@ -6532,3 +6532,21 @@ fn status_http_creates_root_key_and_verifies() {
         200
     );
 }
+
+/// L-52: the token goes only in the Authorization header. A token in the query string (or
+/// path) is ignored, so the request gets the fixed 401, and the URL token is not logged.
+#[test]
+fn status_http_query_string_token_refused() {
+    let (node, addr) = status_up("sh-query", Some(GW_KEY));
+    let tok = ro_token();
+    for path in [
+        format!("/api/v1/health?token={tok}"),
+        format!("/?macaroon={tok}"),
+    ] {
+        let req = format!("GET {path} HTTP/1.1\r\nHost: {}\r\n\r\n", host_of(addr));
+        let raw = http_raw(addr, &[req.as_bytes()]);
+        assert_eq!(raw, parvault::http_edge::STATUS_401);
+    }
+    assert_logged(&node, "reject.status_token_missing");
+    assert!(!node.log_text().contains(tok.as_str()), "URL token in the node log");
+}
