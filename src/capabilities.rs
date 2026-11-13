@@ -35,6 +35,31 @@ pub const MACAROON_CAVEAT_DOMAIN: &[u8] = b"parvault-macaroon-caveat-v1:";
 /// Domain separator for composite `Ed25519 + ML-DSA-65` [`GatewayIdentityStatement`] signatures.
 pub const GATEWAY_STATEMENT_DOMAIN: &[u8] = b"parvault-gateway-identity-statement-v1:";
 
+/// Longest lifetime of a [`GatewayIdentityStatement`] (`expires - issued`): 30 days (F-17).
+pub const MAX_GATEWAY_STATEMENT_LIFETIME_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+/// F-17: a gateway statement counts only if its authority is the one the verifier pinned and its
+/// expiry is bounded (`issued < expires <= issued + 30 days`) and not yet passed.
+pub fn gateway_statement_decision(
+    authority_pinned: bool,
+    issued_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+    now_unix_ms: u64,
+) -> Result<(), &'static str> {
+    if !authority_pinned {
+        return Err("reject.gateway_authority_unpinned");
+    }
+    if expires_at_unix_ms <= issued_at_unix_ms
+        || expires_at_unix_ms - issued_at_unix_ms > MAX_GATEWAY_STATEMENT_LIFETIME_MS
+    {
+        return Err("reject.gateway_statement_unbounded");
+    }
+    if now_unix_ms > expires_at_unix_ms {
+        return Err("reject.gateway_statement_expired");
+    }
+    Ok(())
+}
+
 /// Compact shareable ASCII prefix for `CapabilityMacaroon` tokens (`ADR-28` / `ADR-32`).
 pub const COMPACT_MACAROON_PREFIX: &str = "PARVAULT-MAC-V1:";
 
@@ -733,17 +758,34 @@ impl GatewayIdentityStatement {
         })
     }
 
-    /// Verifies structural bounds, expiration (`expires_at_unix_ms == 0 || now_unix_ms <= expires_at_unix_ms`),
-    /// AND both legs of the composite `Ed25519 + NIST FIPS 204 ML-DSA-65` signature.
-    pub fn verify(&self, now_unix_ms: u64) -> bool {
+    /// Verifies the statement against the authority the caller pinned (F-17): the decision
+    /// ([`gateway_statement_decision`]: pinned authority, bounded and unexpired lifetime), the
+    /// structural bounds, and both legs of the composite `Ed25519 + ML-DSA-65` signature. There is
+    /// no unpinned verify: a statement signed by any other authority is refused.
+    pub fn verify_pinned(
+        &self,
+        expected_authority: &HybridPqPublicKey,
+        now_unix_ms: u64,
+    ) -> Result<(), &'static str> {
+        gateway_statement_decision(
+            self.authority_pq_pubkey == *expected_authority,
+            self.issued_at_unix_ms,
+            self.expires_at_unix_ms,
+            now_unix_ms,
+        )?;
+        if self.verify_signature() {
+            Ok(())
+        } else {
+            Err("reject.gateway_statement_invalid")
+        }
+    }
+
+    fn verify_signature(&self) -> bool {
         if self.gateway_id.is_empty()
             || self.gateway_id.len() > MAX_GATEWAY_ID_BYTES
             || self.ed25519_transport_pubkey == [0u8; 32]
             || self.noise_static_x25519_pubkey == [0u8; 32]
         {
-            return false;
-        }
-        if self.expires_at_unix_ms != 0 && now_unix_ms > self.expires_at_unix_ms {
             return false;
         }
         let payload = Self::canonical_sign_bytes(
@@ -786,17 +828,39 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    /// F-17 gap: `GatewayIdentityStatement::verify` accepts a statement signed by any authority
-    /// (nothing pins the expected one) and treats expiry `0` as permanent.
+    /// F-17 accept: a statement from the pinned authority with a bounded lifetime verifies.
     #[test]
-    fn repro_f17_statement_authority_unpinned_and_permanent() {
+    fn f17_pinned_authority_statement_accepted() {
+        let authority = HybridPqSigningKeypair::generate().unwrap();
+        let stmt =
+            GatewayIdentityStatement::issue(&authority, "gw-1", [0x11; 32], [0x22; 32], 1, 60_000)
+                .unwrap();
+        assert_eq!(stmt.verify_pinned(&authority.public_key(), 30_000), Ok(()));
+    }
+
+    /// F-17 reject: a validly signed statement from another authority is refused, and so is a
+    /// pinned one that never expires or outlives 30 days.
+    #[test]
+    fn f17_unpinned_authority_statement_refused() {
+        let pinned = HybridPqSigningKeypair::generate().unwrap();
         let rogue = HybridPqSigningKeypair::generate().unwrap();
         let stmt =
-            GatewayIdentityStatement::issue(&rogue, "gw-1", [0x11; 32], [0x22; 32], 1, 0).unwrap();
-        assert!(
-            stmt.verify(u64::MAX / 2),
-            "gap: a rogue authority's never-expiring statement verifies"
+            GatewayIdentityStatement::issue(&rogue, "gw-1", [0x11; 32], [0x22; 32], 1, 60_000)
+                .unwrap();
+        assert_eq!(
+            stmt.verify_pinned(&pinned.public_key(), 30_000),
+            Err("reject.gateway_authority_unpinned")
         );
+        for expires in [0, 1 + MAX_GATEWAY_STATEMENT_LIFETIME_MS + 1] {
+            let stmt = GatewayIdentityStatement::issue(
+                &pinned, "gw-1", [0x11; 32], [0x22; 32], 1, expires,
+            )
+            .unwrap();
+            assert_eq!(
+                stmt.verify_pinned(&pinned.public_key(), 2),
+                Err("reject.gateway_statement_unbounded")
+            );
+        }
     }
 
     #[test]
@@ -918,12 +982,19 @@ mod tests {
         )
         .expect("issue statement");
 
-        assert!(stmt.verify(25_000));
-        assert!(!stmt.verify(60_001)); // Expired
+        let pinned = authority.public_key();
+        assert_eq!(stmt.verify_pinned(&pinned, 25_000), Ok(()));
+        assert_eq!(
+            stmt.verify_pinned(&pinned, 60_001),
+            Err("reject.gateway_statement_expired")
+        );
 
         let mut tampered = stmt.clone();
         tampered.noise_static_x25519_pubkey[0] ^= 0xFF;
-        assert!(!tampered.verify(25_000));
+        assert_eq!(
+            tampered.verify_pinned(&pinned, 25_000),
+            Err("reject.gateway_statement_invalid")
+        );
     }
 
     #[test]

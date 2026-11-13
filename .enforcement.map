@@ -63,7 +63,7 @@ claim      F-25-DHT  sym=src/network/wire_handler.rs::admission_decision accept=
 # Each 2b fix adds its claim line (a differential pair rewritten from its reproduction in
 # tests/trust_enforcement.rs) in the same commit. A claim cannot be declared before its check
 # function exists (an unknown sym is an error even under expect=claim-missing).
-# Findings with no line yet (no check function exists to name): F-07, F-08, F-09, F-12, F-17
+# Findings with no line yet (no check function exists to name): F-07, F-08, F-09, F-12
 #   (2c); F-22, F-26 (2c); F-24 issuer policy (2c).
 
 claim      F-36      sym=src/por/verifier.rs::shard_delete_decision accept=trust_enforcement::f36_storer_deletes_its_shard reject=trust_enforcement::f36_other_key_cannot_delete_shard code=reject.delete_not_shard_owner bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::DeleteShard
@@ -81,8 +81,9 @@ claim      F-08      sym=src/storage/eviction.rs::apply_signed_eviction_order_wi
 open       F-08      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 claim      F-09      sym=src/storage/eviction.rs::apply_signed_eviction_order_with_quorum accept=trust_enforcement::f09_fresh_order_applied reject=trust_enforcement::f09_stale_or_replayed_order_refused code=reject.eviction_order_stale bin=parvault ref=docs/security/TRUST_FINDINGS.md
 open       F-09      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
-claim      F-17      sym=src/capabilities.rs::verify accept=trust_enforcement::f17_pinned_authority_statement_accepted reject=trust_enforcement::f17_unpinned_authority_statement_refused code=reject.gateway_statement_unpinned bin=parvault ref=docs/security/TRUST_FINDINGS.md
-open       F-17      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+# F-17 has no core wire or CLI consumer (only the suite broker verifies statements): a Kani
+# line on the decision, plus unit tests capabilities::tests::f17_* (accept and reject).
+kani       F-17      sym=src/capabilities.rs::gateway_statement_decision harness=proof_gateway_statement_pinned_and_bounded cover=statement unpinned or unbounded
 claim      F-24-ISSUER sym=src/network/wire_handler.rs::voucher_issuer_decision accept=trust_enforcement::f24_ring_issuer_voucher_redeemed reject=trust_enforcement::f24_stranger_issuer_voucher_refused code=reject.voucher_issuer_untrusted bin=parvault ref=docs/security/TRUST_FINDINGS.md
 claim      F-34      sym=src/por/verifier.rs::verify_audit_response accept=trust_enforcement::f34_chunk_proof_verified reject=trust_enforcement::f34_wrong_chunk_proof_refused code=reject.por_chunk_proof_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md
 open       F-34      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
@@ -92,4 +93,4 @@ claim      F-35      sym=src/storage/anonymity.rs::voucher_freshness_decision ac
 claim      F-38      sym=src/network/wire_handler.rs::syndication_grant_decision accept=trust_enforcement::f38_sender_owned_grant_accepted reject=trust_enforcement::f38_foreign_owner_grant_refused code=reject.syndication_grant_not_sender bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md
 kani       F-38      sym=src/network/wire_handler.rs::syndication_grant_decision harness=proof_syndication_grant_owned_by_sender cover=grant not owned by sender
 
-ratchet    R         open=12 waive=0
+ratchet    R         open=11 waive=0

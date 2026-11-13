@@ -1148,3 +1148,20 @@ fn proof_syndication_grant_owned_by_sender() {
     // without a bound; the code itself is checked by the claim's wire test.
     assert_eq!(decision.is_ok(), expected_ok);
 }
+
+/// F-17: a gateway statement is accepted only from the pinned authority with a lifetime in
+/// `(0, 30 days]` that has not passed.
+#[kani::proof]
+fn proof_gateway_statement_pinned_and_bounded() {
+    let pinned: bool = kani::any();
+    let issued: u64 = kani::any();
+    let expires: u64 = kani::any();
+    let now: u64 = kani::any();
+    let decision = crate::capabilities::gateway_statement_decision(pinned, issued, expires, now);
+    kani::cover!(decision.is_err(), "statement unpinned or unbounded");
+    let expected_ok = pinned
+        && expires > issued
+        && expires - issued <= crate::capabilities::MAX_GATEWAY_STATEMENT_LIFETIME_MS
+        && now <= expires;
+    assert_eq!(decision.is_ok(), expected_ok);
+}
