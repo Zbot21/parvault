@@ -1867,10 +1867,10 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
             let council = crate::storage::council::council_from_manifest(data_dir, council_root);
             // An order from a newer council epoch: refused below, and the newer manifest is
             // fetched in the background from peers this node admitted (bounded).
-            if let (Some(root), Some(c), Some(mc)) =
-                (council_root, council.as_ref(), block_store.mesh_client())
-            {
-                if order.council_epoch > c.epoch {
+            // With no manifest yet (epoch 0) the fetch asks for the chain from epoch 1, which
+            // must verify against this node's own scope root (QA 2c D6).
+            if let (Some(root), Some(mc)) = (council_root, block_store.mesh_client()) {
+                if order.council_epoch > council.as_ref().map_or(0, |c| c.epoch) {
                     let admitted: Vec<String> = mc
                         .all_network_endpoints()
                         .into_iter()

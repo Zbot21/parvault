@@ -5787,3 +5787,55 @@ fn evict_propagate_refused_when_quorum_needs_cosigners() {
     assert!(!out.status.success(), "{text}");
     assert!(text.contains("reject.evict_needs_cosignatures"), "{text}");
 }
+
+/// QA 2c D6: a node with no council manifest that sees a council order fetches epoch 1 from an
+/// admitted peer (verified against its own ring genesis), then applies the same order.
+#[test]
+fn council_first_epoch_fetched_when_none_installed() {
+    let members = vec![key(0x81), key(0x82), key(0x83)];
+    let ahead = spawn_daemon("cfirst-ahead");
+    let out = council_cli(&ahead, &council_init_args(&members, 2));
+    assert!(out.status.success(), "{}", combined(&out));
+    let (root_dir, dir, reg, log) = prepare("cfirst-behind");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .arg("--data-dir")
+        .arg(&dir)
+        .args([
+            "--no-lan-discovery",
+            "--peers",
+            &format!("{}/p2p/{}", ahead.addr, ahead.peer_id()),
+            "daemon",
+            "start",
+            "--listen",
+            common::LOOPBACK_EPHEMERAL,
+        ]);
+    let behind = spawn(cmd, root_dir, dir, log);
+    // `behind` admits `ahead` when `ahead`'s key handshakes with it.
+    let _ = send(
+        &ahead.identity(),
+        &behind,
+        MeshWireRequest::GetCouncilManifest {
+            scope_root: genesis().public_key_bytes(),
+            from_epoch: 0,
+        },
+    );
+    let order = council_order(&[&members[0], &members[1]], ban_ip(88), 1);
+    let r = send(
+        &key(0x88),
+        &behind,
+        MeshWireRequest::BroadcastEvictionOrder(order.clone()),
+    );
+    assert!(!order_accepted(&r), "{r:?}");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while council_epoch_of(&behind) < 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(council_epoch_of(&behind), 1, "{}", behind.log_text());
+    let r = send(
+        &key(0x88),
+        &behind,
+        MeshWireRequest::BroadcastEvictionOrder(order),
+    );
+    assert!(order_accepted(&r), "{r:?}\n{}", behind.log_text());
+}
