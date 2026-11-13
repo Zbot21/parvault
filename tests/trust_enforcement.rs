@@ -4753,3 +4753,182 @@ fn f43_token_never_logged() {
         assert!(!log.contains(&body[body.len() - 64..]), "tag in log");
     }
 }
+
+// --- F-43-PLUGIN: `parvault-fuse webdav` accepts only its pinned token or attenuations of it ----
+
+/// A gateway (`parvault up --ipc-socket`, root key `F43_ROOT_KEY`) and `parvault-fuse webdav`
+/// pinned to `pinned`, serving `a.txt`. Killed on drop.
+struct F43Plugin {
+    _gateway: Node,
+    fuse: Child,
+    log: PathBuf,
+    addr: String,
+}
+
+impl Drop for F43Plugin {
+    fn drop(&mut self) {
+        let _ = self.fuse.kill();
+        let _ = self.fuse.wait();
+    }
+}
+
+/// The pinned plugin token: full rights (ingest writes through the gateway) until far future.
+fn f43_plugin_parent() -> parvault::capabilities::CapabilityMacaroon {
+    parvault::capabilities::CapabilityMacaroon::mint(
+        &F43_ROOT_KEY,
+        [0x31; 32],
+        [0x32; 32],
+        vec![parvault::capabilities::Caveat::ExpiresAtUnixMs(u64::MAX)],
+    )
+    .unwrap()
+}
+
+fn f43_plugin_up(label: &str) -> F43Plugin {
+    let (root, dir, reg, log) = prepare(label);
+    std::fs::write(dir.join("macaroon_root.key"), hex::encode(F43_ROOT_KEY)).unwrap();
+    let sock = dir.join("parvault.sock");
+    let seed = dir.join("plugin-seed");
+    std::fs::create_dir_all(&seed).unwrap();
+    std::fs::write(seed.join("a.txt"), F43_BODY).unwrap();
+    let cache = dir.join("plugin-cache");
+    let fuse_log = dir.join("fuse.log");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .arg("--data-dir")
+        .arg(&dir)
+        .args([
+            "--no-lan-discovery",
+            "up",
+            "--listen",
+            common::LOOPBACK_EPHEMERAL,
+        ])
+        .arg("--ipc-socket")
+        .arg(&sock);
+    let gateway = spawn(cmd, root, dir, log);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !sock.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "no gateway socket:\n{}",
+            gateway.log_text()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let file = std::fs::File::create(&fuse_log).unwrap();
+    let mut fuse = Command::new(env!("CARGO_BIN_EXE_parvault-fuse"))
+        .arg("--socket")
+        .arg(&sock)
+        .arg("--cache-dir")
+        .arg(&cache)
+        .arg("--macaroon")
+        .arg(f43_plugin_parent().to_compact_token())
+        .args(["webdav", "--listen", "127.0.0.1:0", "--seed-dir"])
+        .arg(&seed)
+        .env("RUST_LOG", "info")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::from(file.try_clone().unwrap()))
+        .stderr(Stdio::from(file))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let text = std::fs::read_to_string(&fuse_log).unwrap_or_default();
+        if let Some(addr) = text
+            .lines()
+            .find_map(|l| l.split("WebDAV VFS on http://").nth(1))
+            .and_then(|r| r.split_whitespace().next())
+        {
+            return F43Plugin {
+                _gateway: gateway,
+                fuse,
+                log: fuse_log,
+                addr: addr.to_string(),
+            };
+        }
+        if let Ok(Some(status)) = fuse.try_wait() {
+            panic!(
+                "parvault-fuse exited ({status}):\n{text}\ngateway:\n{}",
+                gateway.log_text()
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "parvault-fuse not serving:\n{text}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// F-43-PLUGIN accept: a read-only attenuation of the pinned token reads the file.
+#[test]
+fn f43_plugin_attenuated_child_reads() {
+    let p = f43_plugin_up("f43-plugin-ok");
+    let child = f43_plugin_parent()
+        .attenuate(parvault::capabilities::Caveat::ReadOnly)
+        .unwrap()
+        .to_compact_token();
+    let (status, body) = f43_http(&p.addr, "GET", "/a.txt", &[f43_bearer(&child)]);
+    assert_eq!(
+        status,
+        200,
+        "{}\nfuse:\n{}",
+        String::from_utf8_lossy(&body),
+        std::fs::read_to_string(&p.log).unwrap_or_default()
+    );
+    assert!(
+        body.ends_with(F43_BODY),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    gate_ran("trust_enforcement::f43_plugin_attenuated_child_reads");
+}
+
+/// F-43-PLUGIN reject: a sibling token under the same root key (another nonce) is not an
+/// attenuation of the pinned token: 401.
+#[test]
+fn f43_plugin_sibling_token_unauthorized() {
+    let p = f43_plugin_up("f43-plugin-sib");
+    let sibling = f43_ro(vec![]);
+    let (status, body) = f43_http(&p.addr, "GET", "/a.txt", &[f43_bearer(&sibling)]);
+    assert_eq!(status, 401, "{}", String::from_utf8_lossy(&body));
+    assert!(!body.ends_with(F43_BODY));
+    let log = std::fs::read_to_string(&p.log).unwrap_or_default();
+    assert!(log.contains("reject.webdav_token_invalid"), "{log}");
+    gate_ran("trust_enforcement::f43_plugin_sibling_token_unauthorized");
+}
+
+/// F-43-PLUGIN reject: same nonce and issuer but missing the pinned token's caveat: 401.
+#[test]
+fn f43_plugin_child_missing_parent_caveat_unauthorized() {
+    let p = f43_plugin_up("f43-plugin-missing");
+    let missing = parvault::capabilities::CapabilityMacaroon::mint(
+        &F43_ROOT_KEY,
+        [0x31; 32],
+        [0x32; 32],
+        vec![parvault::capabilities::Caveat::ReadOnly],
+    )
+    .unwrap()
+    .to_compact_token();
+    let (status, body) = f43_http(&p.addr, "GET", "/a.txt", &[f43_bearer(&missing)]);
+    assert_eq!(status, 401, "{}", String::from_utf8_lossy(&body));
+}
+
+/// F-43-PLUGIN: `parvault-fuse webdav` refuses to start without a pinned `--macaroon`.
+#[test]
+fn f43_plugin_requires_macaroon() {
+    let root = temp_root("f43-plugin-nomac");
+    let out = common::output_within_deadline(
+        Command::new(env!("CARGO_BIN_EXE_parvault-fuse"))
+            .arg("--socket")
+            .arg(root.path().join("none.sock"))
+            .arg("--cache-dir")
+            .arg(root.path().join("c"))
+            .args(["webdav", "--listen", "127.0.0.1:0"]),
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("webdav needs --macaroon"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

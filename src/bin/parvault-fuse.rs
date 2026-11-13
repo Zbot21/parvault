@@ -76,6 +76,13 @@ enum FuseCommand {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Refusals (e.g. F-43 WebDAV reason codes) are logged through `tracing`.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("parvault=info,warn")),
+        )
+        .init();
     let cli = FuseCli::parse();
     let default_macaroon = match cli
         .macaroon
@@ -128,6 +135,11 @@ fn main() -> anyhow::Result<()> {
                 vfs.serve_fuse_fd_blocking(dev_file)?;
             }
             FuseCommand::Webdav { listen, seed_dir } => {
+                // F-43 (L-44): every request must present this token or an offline attenuation
+                // of it; the plugin holds no root key, so there is no server without one.
+                let pinned = default_macaroon.clone().ok_or_else(|| {
+                    anyhow::anyhow!("webdav needs --macaroon: every request must present it or an attenuation of it (F-43)")
+                })?;
                 let vfs = VirtualVaultFs::new(&cli.socket, &cli.cache_dir, cache_bytes)?
                     .with_default_macaroon(default_macaroon);
                 if let Some(dir) = seed_dir {
@@ -137,11 +149,16 @@ fn main() -> anyhow::Result<()> {
                         dir.display()
                     );
                 }
+                let handle = vfs.spawn_webdav_server(
+                    &listen,
+                    parvault::vfs::WebdavVerifier::PinnedParent(pinned),
+                )?;
                 println!(
-                    "[parvault-fuse] serving HTTP-Range / WebDAV VFS on http://{listen} (gateway={})",
+                    "[parvault-fuse] serving HTTP-Range / WebDAV VFS on http://{} (gateway={})",
+                    handle.local_addr(),
                     cli.socket.display()
                 );
-                vfs.serve_webdav_blocking(&listen)?;
+                handle.wait();
             }
             FuseCommand::Sync { folder } => {
                 let vfs = VirtualVaultFs::new(&cli.socket, &cli.cache_dir, cache_bytes)?

@@ -335,7 +335,7 @@ fn verify_embedding_doc_snippet(root_key: &[u8; 32]) -> anyhow::Result<()> {
         capabilities::{CapabilityMacaroon, Caveat},
         gateway::{GatewayBus, RetentionPolicy, DEFAULT_IPC_SOCKET_PATH},
         sync::{sanitize_sync_relative_path, GatewayFolderSync},
-        vfs::VirtualVaultFs,
+        vfs::{VirtualVaultFs, WebdavVerifier},
     };
     use std::path::Path;
 
@@ -357,7 +357,8 @@ fn verify_embedding_doc_snippet(root_key: &[u8; 32]) -> anyhow::Result<()> {
 
     let vfs = VirtualVaultFs::with_bus(bus, Path::new("/tmp/pv-vfs-cache"), 64 * 1024 * 1024)?
         .with_default_macaroon(Some(read_token));
-    let mut webdav = vfs.spawn_webdav_server("127.0.0.1:0")?;
+    // F-43: every WebDAV request must present a read-only token under this root key.
+    let mut webdav = vfs.spawn_webdav_server("127.0.0.1:0", WebdavVerifier::RootKey(*root_key))?;
     let _addr = webdav.local_addr();
     webdav.shutdown();
     Ok(())
@@ -462,15 +463,28 @@ fn test_dual_mode_vfs_no_socket_inprocess_vs_unix_socket_webdav_range_and_lru() 
     assert!(stats_inproc.evictions >= 2);
 
     // Live stoppable `spawn_webdav_server` HTTP 206 Partial Content Range test on `--no-socket` VFS
+    // F-43: a read-only token under the server's root key on every request.
+    let webdav_key = [0x5A; 32];
+    let webdav_token = parvault::capabilities::CapabilityMacaroon::mint(
+        &webdav_key,
+        [1; 32],
+        [2; 32],
+        vec![parvault::capabilities::Caveat::ReadOnly],
+    )
+    .unwrap()
+    .to_compact_token();
     let mut webdav_handle = vfs_inproc
-        .spawn_webdav_server("127.0.0.1:0")
+        .spawn_webdav_server(
+            "127.0.0.1:0",
+            parvault::vfs::WebdavVerifier::RootKey(webdav_key),
+        )
         .expect("spawn_webdav_server");
     let addr = webdav_handle.local_addr();
 
     {
         let mut conn = TcpStream::connect(addr).expect("connect webdav");
         let req = format!(
-            "GET /media/clip.bin HTTP/1.1\r\nHost: {addr}\r\nRange: bytes=1048590-2097209\r\nConnection: close\r\n\r\n"
+            "GET /media/clip.bin HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {webdav_token}\r\nRange: bytes=1048590-2097209\r\nConnection: close\r\n\r\n"
         );
         conn.write_all(req.as_bytes()).unwrap();
         let mut raw_resp = Vec::new();

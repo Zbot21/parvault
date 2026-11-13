@@ -224,7 +224,14 @@ pub(crate) async fn run_daemon(
             );
         }
         if let Some(ref webdav_addr) = opts.vfs_webdav_listen {
-            let handle = vfs.spawn_webdav_server(webdav_addr)?;
+            // F-43: fail closed without a root key (daemon_cmds loads or creates one).
+            let root_key = opts.macaroon_root_key.ok_or_else(|| {
+                anyhow::anyhow!("built-in WebDAV needs a macaroon root key (F-43)")
+            })?;
+            let handle = vfs.spawn_webdav_server(
+                webdav_addr,
+                parvault::vfs::WebdavVerifier::RootKey(root_key),
+            )?;
             println!(
                 "[parvault] Built-in VFS WebDAV listening on http://{} (in-process GatewayBus, socket={})",
                 handle.local_addr(),

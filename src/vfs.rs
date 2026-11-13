@@ -351,13 +351,147 @@ pub const fn parse_fuse_read_in(payload: &[u8]) -> Option<FuseReadIn> {
     })
 }
 
+/// F-43 (L-43, L-44): what the WebDAV auth decision needs to know about one request. Token
+/// facts are known before any path lookup; `in_scope` (manifest and per-method byte-range
+/// caveats) is `true` in the pre-lookup pass and evaluated after the lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebdavAuthFacts {
+    /// An `Authorization: Bearer` or `Basic` header was sent.
+    pub token_present: bool,
+    /// It holds a well-formed `PARVAULT-MAC-V1:` token (Basic: as the password).
+    pub token_parses: bool,
+    /// The token's HMAC chain is valid (root key), or it attenuates the pinned token (plugin).
+    pub tag_valid: bool,
+    /// An `ExpiresAtUnixMs` caveat has passed.
+    pub expired: bool,
+    /// The token carries `ReadOnly` (required: the root key is shared with the gateway).
+    pub read_only: bool,
+    /// The token carries `AllowedPeerUid`, which has no meaning over TCP.
+    pub peer_uid_bound: bool,
+    /// Manifest and (for `GET`) byte-range caveats allow this path and range.
+    pub in_scope: bool,
+}
+
+/// A refused WebDAV request: `Unauthorized` answers 401 (byte-identical for every code),
+/// `Forbidden` answers 403. The code is only logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebdavAuthRefusal {
+    Unauthorized(&'static str),
+    Forbidden(&'static str),
+}
+
+/// F-43: every WebDAV request needs a valid, unexpired, read-only macaroon that covers it.
+pub fn webdav_auth_decision(facts: &WebdavAuthFacts) -> Result<(), WebdavAuthRefusal> {
+    if !facts.token_present {
+        return Err(WebdavAuthRefusal::Unauthorized(
+            "reject.webdav_token_missing",
+        ));
+    }
+    if !facts.token_parses {
+        return Err(WebdavAuthRefusal::Unauthorized(
+            "reject.webdav_token_malformed",
+        ));
+    }
+    if !facts.tag_valid {
+        return Err(WebdavAuthRefusal::Unauthorized(
+            "reject.webdav_token_invalid",
+        ));
+    }
+    if facts.expired {
+        return Err(WebdavAuthRefusal::Unauthorized(
+            "reject.webdav_token_expired",
+        ));
+    }
+    if !facts.read_only {
+        return Err(WebdavAuthRefusal::Forbidden(
+            "reject.webdav_token_not_read_only",
+        ));
+    }
+    if facts.peer_uid_bound || !facts.in_scope {
+        return Err(WebdavAuthRefusal::Forbidden("reject.webdav_scope_denied"));
+    }
+    Ok(())
+}
+
+/// Longest token text accepted from a header (`PARVAULT-MAC-V1:` plus the hex of the largest
+/// compact token), checked before hex decoding.
+pub const WEBDAV_MAX_TOKEN_CHARS: usize = crate::capabilities::COMPACT_MACAROON_PREFIX.len()
+    + 2 * crate::capabilities::MAX_COMPACT_MACAROON_BYTES;
+
+/// The token a request presents.
+pub enum PresentedToken {
+    /// No `Authorization` header, or a scheme other than Bearer or Basic.
+    Missing,
+    /// Bearer or Basic, but not a well-formed token within the length cap.
+    Malformed,
+    Token(CapabilityMacaroon),
+}
+
+/// Extracts the token from an `Authorization` header value: `Bearer <token>`, or `Basic
+/// base64(<user>:<token>)` split at the first colon (D-1). Lengths are capped before decoding.
+pub fn presented_webdav_token(authorization: Option<&str>) -> PresentedToken {
+    let Some(value) = authorization.map(str::trim) else {
+        return PresentedToken::Missing;
+    };
+    let (scheme, rest) = value.split_once(' ').unwrap_or((value, ""));
+    let rest = rest.trim();
+    let token_text = if scheme.eq_ignore_ascii_case("bearer") {
+        rest.to_string()
+    } else if scheme.eq_ignore_ascii_case("basic") {
+        use base64::Engine as _;
+        // base64 of "<user>:<token>": allow up to 256 bytes of user name.
+        if rest.len() > (WEBDAV_MAX_TOKEN_CHARS + 257).div_ceil(3) * 4 {
+            return PresentedToken::Malformed;
+        }
+        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(rest) else {
+            return PresentedToken::Malformed;
+        };
+        let Ok(text) = String::from_utf8(raw) else {
+            return PresentedToken::Malformed;
+        };
+        match text.split_once(':') {
+            Some((_user, password)) => password.to_string(),
+            None => return PresentedToken::Malformed,
+        }
+    } else {
+        return PresentedToken::Missing;
+    };
+    if token_text.len() > WEBDAV_MAX_TOKEN_CHARS {
+        return PresentedToken::Malformed;
+    }
+    match CapabilityMacaroon::from_compact_token(&token_text) {
+        Ok(t) => PresentedToken::Token(t),
+        Err(_) => PresentedToken::Malformed,
+    }
+}
+
+/// How a WebDAV server checks a token's chain. Required by both constructors (no
+/// unauthenticated server). Deliberately not `Debug`: it holds the root key or a pinned token.
+#[derive(Clone)]
+pub enum WebdavVerifier {
+    /// The daemon's macaroon root key (built-in host).
+    RootKey([u8; 32]),
+    /// The plugin's pinned `--macaroon`: a request token must be it or an offline attenuation of
+    /// it (`capabilities::is_attenuation_of`).
+    PinnedParent(CapabilityMacaroon),
+}
+
+impl WebdavVerifier {
+    fn chain_ok(&self, token: &CapabilityMacaroon) -> bool {
+        match self {
+            Self::RootKey(key) => token.tag_valid(key),
+            Self::PinnedParent(parent) => crate::capabilities::is_attenuation_of(parent, token),
+        }
+    }
+}
+
 #[cfg(unix)]
 mod unix_vfs {
     use super::*;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
     use std::os::fd::AsRawFd;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// RAII handle controlling a background HTTP `Range` (`206 Partial Content`) + WebDAV server
     /// spawned via [`VirtualVaultFs::spawn_webdav_server`].
@@ -370,6 +504,13 @@ mod unix_vfs {
     impl VfsWebdavServerHandle {
         pub fn local_addr(&self) -> SocketAddr {
             self.local_addr
+        }
+
+        /// Blocks until the server thread exits (for a foreground server, e.g. `parvault-fuse`).
+        pub fn wait(mut self) {
+            if let Some(h) = self.join_handle.take() {
+                let _ = h.join();
+            }
         }
 
         pub fn shutdown(&mut self) {
@@ -657,6 +798,16 @@ mod unix_vfs {
             offset: u64,
             length: u64,
         ) -> io::Result<(Vec<u8>, Duration)> {
+            self.read_range_with_ttfb_as(ino, offset, length, None)
+        }
+
+        fn read_range_with_ttfb_as(
+            &self,
+            ino: u64,
+            offset: u64,
+            length: u64,
+            explicit_macaroon: Option<CapabilityMacaroon>,
+        ) -> io::Result<(Vec<u8>, Duration)> {
             let t0 = Instant::now();
             let stub = self.getattr(ino).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("inode {ino} not found"))
@@ -689,9 +840,9 @@ mod unix_vfs {
                 let blk_bytes = match cached {
                     Some(hit_bytes) => hit_bytes,
                     None => {
-                        let effective_mac = stub
-                            .macaroon
+                        let effective_mac = explicit_macaroon
                             .clone()
+                            .or_else(|| stub.macaroon.clone())
                             .or_else(|| self.default_macaroon.clone());
                         let fetched = self.bus.fetch_range_bytes_sync(
                             &manifest,
@@ -721,6 +872,20 @@ mod unix_vfs {
         /// Convenience POSIX `pread`-equivalent returning the requested byte range.
         pub fn read_at(&self, ino: u64, offset: u64, length: u64) -> io::Result<Vec<u8>> {
             let (bytes, _ttfb) = self.read_range_with_ttfb(ino, offset, length)?;
+            Ok(bytes)
+        }
+
+        /// Like `read_at`, presenting `macaroon` on every gateway `FetchRange` (F-43: the WebDAV
+        /// request's own verified token, so the gateway checks it again per frame).
+        pub fn read_at_with_macaroon(
+            &self,
+            ino: u64,
+            offset: u64,
+            length: u64,
+            macaroon: CapabilityMacaroon,
+        ) -> io::Result<Vec<u8>> {
+            let (bytes, _ttfb) =
+                self.read_range_with_ttfb_as(ino, offset, length, Some(macaroon))?;
             Ok(bytes)
         }
 
@@ -780,8 +945,14 @@ mod unix_vfs {
         }
 
         /// Spawns a background stoppable HTTP `Range` (`206 Partial Content`) + WebDAV
-        /// (`OPTIONS` / `PROPFIND`) server returning an RAII [`VfsWebdavServerHandle`].
-        pub fn spawn_webdav_server(&self, bind_addr: &str) -> io::Result<VfsWebdavServerHandle> {
+        /// (`OPTIONS` / `PROPFIND`) server returning an RAII [`VfsWebdavServerHandle`]. Every
+        /// request must present a token `verifier` accepts (F-43); there is no unauthenticated
+        /// constructor.
+        pub fn spawn_webdav_server(
+            &self,
+            bind_addr: &str,
+            verifier: WebdavVerifier,
+        ) -> io::Result<VfsWebdavServerHandle> {
             let listener = TcpListener::bind(bind_addr)?;
             listener.set_nonblocking(false)?;
             let local_addr = listener.local_addr()?;
@@ -792,22 +963,15 @@ mod unix_vfs {
             let join_handle = std::thread::Builder::new()
                 .name("parvault-vfs-webdav".into())
                 .spawn(move || {
+                    let active = Arc::new(AtomicUsize::new(0));
                     for conn in listener.incoming() {
                         if shutdown_cl.load(Ordering::SeqCst) {
                             break;
                         }
-                        let Ok(mut stream) = conn else {
+                        let Ok(stream) = conn else {
                             continue;
                         };
-                        let vfs_conn = vfs.clone();
-                        std::thread::Builder::new()
-                            .name("parvault-vfs-http".into())
-                            .stack_size(256 * 1024)
-                            .spawn(move || {
-                                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                                let _ = handle_webdav_http_conn(&mut stream, &vfs_conn);
-                            })
-                            .ok();
+                        spawn_webdav_conn(stream, &vfs, &verifier, &active);
                     }
                 })?;
 
@@ -819,17 +983,20 @@ mod unix_vfs {
         }
 
         /// Serves an unprivileged HTTP `Range` (`206 Partial Content`) + WebDAV (`OPTIONS` /
-        /// `PROPFIND`) endpoint for locked-down `prplOS` / `RDK-B` LXC containers without `/dev/fuse`.
-        pub fn serve_webdav_blocking(&self, bind_addr: &str) -> io::Result<()> {
+        /// `PROPFIND`) endpoint for locked-down `prplOS` / `RDK-B` LXC containers without
+        /// `/dev/fuse`. Every request must present a token `verifier` accepts (F-43).
+        pub fn serve_webdav_blocking(
+            &self,
+            bind_addr: &str,
+            verifier: WebdavVerifier,
+        ) -> io::Result<()> {
             let listener = TcpListener::bind(bind_addr)?;
+            let active = Arc::new(AtomicUsize::new(0));
             for conn in listener.incoming() {
-                let Ok(mut stream) = conn else {
+                let Ok(stream) = conn else {
                     continue;
                 };
-                let vfs = self.clone();
-                std::thread::spawn(move || {
-                    let _ = handle_webdav_http_conn(&mut stream, &vfs);
-                });
+                spawn_webdav_conn(stream, self, &verifier, &active);
             }
             Ok(())
         }
@@ -841,16 +1008,129 @@ mod unix_vfs {
         }
     }
 
-    fn handle_webdav_http_conn(
-        stream: &mut std::net::TcpStream,
+    /// Most WebDAV connections served at once; more are dropped unanswered (pre-auth bound).
+    const WEBDAV_MAX_CONNECTIONS: usize = 64;
+    /// Longest request head accepted (431 beyond it).
+    const WEBDAV_MAX_HEAD_BYTES: usize = 8192;
+    /// A client must finish its request head within this (dropped unanswered otherwise).
+    const WEBDAV_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// The four 401s are byte-identical; the reason code is only logged.
+    const WEBDAV_401: &[u8] = b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"parvault-webdav\"\r\nWWW-Authenticate: Basic realm=\"parvault-webdav\", charset=\"UTF-8\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const WEBDAV_403: &[u8] =
+        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const WEBDAV_431: &[u8] = b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const WEBDAV_502: &[u8] =
+        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    /// Runs one connection on its own thread, within `WEBDAV_MAX_CONNECTIONS`.
+    fn spawn_webdav_conn(
+        mut stream: TcpStream,
         vfs: &VirtualVaultFs,
-    ) -> io::Result<()> {
-        let mut req_buf = [0u8; 8192];
-        let n = stream.read(&mut req_buf)?;
-        if n == 0 {
-            return Ok(());
+        verifier: &WebdavVerifier,
+        active: &Arc<AtomicUsize>,
+    ) {
+        if active.fetch_add(1, Ordering::SeqCst) >= WEBDAV_MAX_CONNECTIONS {
+            active.fetch_sub(1, Ordering::SeqCst);
+            return;
         }
-        let req_str = String::from_utf8_lossy(&req_buf[..n]);
+        let (vfs, verifier, active_cl) = (vfs.clone(), verifier.clone(), Arc::clone(active));
+        let spawned = std::thread::Builder::new()
+            .name("parvault-vfs-http".into())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let _ = stream.set_read_timeout(Some(WEBDAV_HEAD_TIMEOUT));
+                let _ = handle_webdav_http_conn(&mut stream, &vfs, &verifier);
+                active_cl.fetch_sub(1, Ordering::SeqCst);
+            });
+        if spawned.is_err() {
+            active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Reads the request head (through the blank line), or `None` after writing 431, on a
+    /// timeout, or on EOF.
+    fn read_webdav_head(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
+        let mut head = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 2048];
+        loop {
+            if let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                head.truncate(end + 4);
+                return Ok(Some(head));
+            }
+            if head.len() >= WEBDAV_MAX_HEAD_BYTES {
+                stream.write_all(WEBDAV_431)?;
+                return Ok(None);
+            }
+            let want = (WEBDAV_MAX_HEAD_BYTES - head.len()).min(chunk.len());
+            match stream.read(&mut chunk[..want]) {
+                Ok(0) | Err(_) => return Ok(None),
+                Ok(n) => head.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+
+    fn now_unix_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Answers a refusal (401 or 403) and logs only its code and the peer address.
+    fn refuse_webdav(stream: &mut TcpStream, refusal: WebdavAuthRefusal) -> io::Result<()> {
+        let peer = stream
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        let (code, body) = match refusal {
+            WebdavAuthRefusal::Unauthorized(code) => (code, WEBDAV_401),
+            WebdavAuthRefusal::Forbidden(code) => (code, WEBDAV_403),
+        };
+        tracing::warn!(code, peer = %peer, "refused a WebDAV request");
+        stream.write_all(body)?;
+        stream.flush()
+    }
+
+    /// Whether `token`'s manifest caveats allow `node`, and (for `GET` of a file) its byte-range
+    /// caveats allow `[offset, offset + length)`. A manifest-scoped token covers only its own
+    /// file, never a collection or a missing path (no existence oracle).
+    fn webdav_scope_ok(
+        token: &CapabilityMacaroon,
+        node: Option<&VfsStubNode>,
+        get_range: Option<(u64, u64)>,
+    ) -> bool {
+        use crate::capabilities::{AccessRequestContext, Caveat};
+        let file_root = node
+            .filter(|n| !n.is_dir)
+            .and_then(|n| n.manifest.as_ref())
+            .map(|m| m.file_merkle_root);
+        let (offset, length) = get_range.unwrap_or((0, 0));
+        let ctx = AccessRequestContext {
+            manifest_root: file_root.unwrap_or([0u8; 32]),
+            offset,
+            length,
+            is_write: false,
+            now_unix_ms: now_unix_ms(),
+            peer_uid: None,
+        };
+        token.caveats.iter().all(|c| match c {
+            Caveat::AllowedManifest(_) => file_root.is_some() && c.allows(&ctx),
+            Caveat::ByteRange { .. } => get_range.is_none_or(|_| c.allows(&ctx)),
+            _ => true,
+        })
+    }
+
+    fn handle_webdav_http_conn(
+        stream: &mut TcpStream,
+        vfs: &VirtualVaultFs,
+        verifier: &WebdavVerifier,
+    ) -> io::Result<()> {
+        use crate::capabilities::Caveat;
+        let Some(head) = read_webdav_head(stream)? else {
+            return Ok(());
+        };
+        let req_str = String::from_utf8_lossy(&head);
         let mut lines = req_str.lines();
         let Some(request_line) = lines.next() else {
             return Ok(());
@@ -860,12 +1140,15 @@ mod unix_vfs {
         let raw_path = parts.next().unwrap_or("/");
 
         let mut range_header: Option<(u64, Option<u64>)> = None;
+        let mut authorization: Option<&str> = None;
         for hdr in lines {
             if hdr.is_empty() {
                 break;
             }
             if let Some((k, v)) = hdr.split_once(':') {
-                if k.eq_ignore_ascii_case("range") {
+                if k.eq_ignore_ascii_case("authorization") {
+                    authorization = Some(v);
+                } else if k.eq_ignore_ascii_case("range") {
                     if let Some(spec) = v.trim().strip_prefix("bytes=") {
                         if let Some((s, e)) = spec.split_once('-') {
                             if let Ok(start) = s.trim().parse::<u64>() {
@@ -876,6 +1159,56 @@ mod unix_vfs {
                     }
                 }
             }
+        }
+
+        // F-43 pass 1: token checks before any lookup (no existence oracle).
+        let presented = presented_webdav_token(authorization);
+        let token = match &presented {
+            PresentedToken::Token(t) => Some(t),
+            _ => None,
+        };
+        let now = now_unix_ms();
+        let mut facts = WebdavAuthFacts {
+            token_present: !matches!(presented, PresentedToken::Missing),
+            token_parses: token.is_some(),
+            tag_valid: token.is_some_and(|t| verifier.chain_ok(t)),
+            expired: token.is_some_and(|t| {
+                t.caveats
+                    .iter()
+                    .any(|c| matches!(c, Caveat::ExpiresAtUnixMs(e) if now > *e))
+            }),
+            read_only: token.is_some_and(|t| t.caveats.contains(&Caveat::ReadOnly)),
+            peer_uid_bound: token.is_some_and(|t| {
+                t.caveats
+                    .iter()
+                    .any(|c| matches!(c, Caveat::AllowedPeerUid(_)))
+            }),
+            in_scope: true,
+        };
+        if let Err(refusal) = webdav_auth_decision(&facts) {
+            return refuse_webdav(stream, refusal);
+        }
+        let Some(token) = token.cloned() else {
+            return Ok(());
+        };
+
+        // F-43 pass 2: manifest and per-method byte-range caveats against the looked-up node.
+        let node = vfs.lookup_path(raw_path);
+        let get_range = match (method, &node) {
+            ("GET", Some(n)) if !n.is_dir => Some(match range_header {
+                Some((start, end_opt)) => {
+                    let end_incl = end_opt
+                        .unwrap_or_else(|| n.size_bytes.saturating_sub(1))
+                        .min(n.size_bytes.saturating_sub(1));
+                    (start, end_incl.saturating_sub(start) + 1)
+                }
+                None => (0, n.size_bytes),
+            }),
+            _ => None,
+        };
+        facts.in_scope = method == "OPTIONS" || webdav_scope_ok(&token, node.as_ref(), get_range);
+        if let Err(refusal) = webdav_auth_decision(&facts) {
+            return refuse_webdav(stream, refusal);
         }
 
         match method {
@@ -940,7 +1273,13 @@ mod unix_vfs {
                         .min(node.size_bytes.saturating_sub(1));
                     let len = end_incl.saturating_sub(start) + 1;
                     let body = if method == "GET" {
-                        vfs.read_at(node.ino, start, len)?
+                        match vfs.read_at_with_macaroon(node.ino, start, len, token.clone()) {
+                            Ok(b) => b,
+                            Err(_) => {
+                                stream.write_all(WEBDAV_502)?;
+                                return stream.flush();
+                            }
+                        }
                     } else {
                         Vec::new()
                     };
@@ -954,16 +1293,40 @@ mod unix_vfs {
                         stream.write_all(&body)?;
                     }
                 } else {
+                    // Read the first block before promising a 200 and a length, so a failed
+                    // read answers 502 instead of a silently truncated body.
+                    let first = if method == "GET" && node.size_bytes > 0 {
+                        match vfs.read_at_with_macaroon(
+                            node.ino,
+                            0,
+                            DEFAULT_VFS_BLOCK_BYTES as u64,
+                            token.clone(),
+                        ) {
+                            Ok(b) => b,
+                            Err(_) => {
+                                stream.write_all(WEBDAV_502)?;
+                                return stream.flush();
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
                     let hdr = format!(
                         "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\n\r\n",
                         node.size_bytes
                     );
                     stream.write_all(hdr.as_bytes())?;
                     if method == "GET" {
-                        let mut off = 0u64;
-                        while off < node.size_bytes {
-                            let chunk =
-                                vfs.read_at(node.ino, off, DEFAULT_VFS_BLOCK_BYTES as u64)?;
+                        stream.write_all(&first)?;
+                        let mut off = first.len() as u64;
+                        while off < node.size_bytes && !first.is_empty() {
+                            // A mid-body failure closes the connection short of Content-Length.
+                            let chunk = vfs.read_at_with_macaroon(
+                                node.ino,
+                                off,
+                                DEFAULT_VFS_BLOCK_BYTES as u64,
+                                token.clone(),
+                            )?;
                             if chunk.is_empty() {
                                 break;
                             }
