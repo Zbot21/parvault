@@ -1,8 +1,7 @@
 diff --git a/specs/ParVaultZeroKeyAdminAndQuorum.tla b/specs/ParVaultZeroKeyAdminAndQuorum.tla
-index b423315..21e554f 100644
 --- a/specs/ParVaultZeroKeyAdminAndQuorum.tla
 +++ b/specs/ParVaultZeroKeyAdminAndQuorum.tla
-@@ -118,7 +118,7 @@ ValidDistinctSigners(ord, authoritySet) ==
+@@ -125,7 +125,7 @@
      { s \in authoritySet : \E slot \in Slots : <<slot, s, ord.target>> \in ord.sigs }
  
  OrderMeetsCouncilQuorum(ord) ==

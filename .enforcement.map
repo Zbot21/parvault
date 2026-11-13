@@ -59,6 +59,7 @@ reach      TR-QUORUM-COUNT sym=src/storage/eviction.rs::tally_and_verify_quorum_
 reach      TR-NONCE-FRESH sym=src/admin_rpc.rs::validate_admin_rpc_slice_replay_and_auth_meta from=src/bin/parvault-seed.rs::main
 reach      TR-ORDER-ID-FRESH sym=src/storage/eviction.rs::replay_slot_check from=src/network/wire_handler.rs::handle_mesh_wire_request
 reach      TR-RING-SCOPE sym=src/storage/council.rs::council_from_manifest from=src/network/wire_handler.rs::handle_mesh_wire_request
+reach      TR-COUNCIL-MANIFEST sym=src/storage/council.rs::council_manifest_decision from=src/bin/parvault-seed.rs::main
 # L-47 guard-removal mutants (QA, independent); each @guard line names its Rust decision via sym=.
 tla-mutant TM-READ-OWNER    spec=specs/ParVaultProtocol.tla inv=DataSecrecyInvariant patch=specs/mutants/ParVaultProtocol-read-auth-owner.patch
 tla-mutant TM-READ-REPAIR   spec=specs/ParVaultProtocol.tla inv=DataSecrecyInvariant patch=specs/mutants/ParVaultProtocol-read-auth-repair.patch
@@ -66,6 +67,7 @@ tla-mutant TM-WOT-ADMIT     spec=specs/ParVaultProtocol.tla inv=SybilResistanceI
 tla-mutant TM-NULLIFIER     spec=specs/ParVaultAnonymity.tla inv=Safety_NoVoucherDoubleSpend patch=specs/mutants/ParVaultAnonymity-nullifier-fresh.patch
 tla-mutant TM-TIER-SLASH    spec=specs/ParVaultBootstrapAndEarnedTier.tla inv=Safety_TierStrictlyEarnedByUptime patch=specs/mutants/ParVaultBootstrapAndEarnedTier-tier-respects-slash.patch
 tla-mutant TM-QUORUM        spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_NoUnauthorizedOrSubQuorumEviction patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-quorum-count.patch
+tla-mutant TM-COUNCIL-MANIFEST spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_CouncilChainAuthorised patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-council-manifest.patch
 tla-mutant TM-NONCE         spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_NoNonceOrOrderReplay patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-nonce-fresh.patch
 tla-mutant TM-ORDER-ID      spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_NoNonceOrOrderReplay patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-order-id-fresh.patch
 tla-mutant TM-RING-SCOPE    spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_PrivateRingImmuneToPublicCouncil patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-ring-scope.patch

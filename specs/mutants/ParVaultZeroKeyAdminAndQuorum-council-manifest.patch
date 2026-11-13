@@ -1,0 +1,12 @@
+diff --git a/specs/ParVaultZeroKeyAdminAndQuorum.tla b/specs/ParVaultZeroKeyAdminAndQuorum.tla
+--- a/specs/ParVaultZeroKeyAdminAndQuorum.tla
++++ b/specs/ParVaultZeroKeyAdminAndQuorum.tla
+@@ -162,7 +162,7 @@
+     /\ m.shapeOk
+     /\ m.scope = ScopeRoot
+     /\ m.epoch = Len(councilLog) + 1
+-    /\ IF councilLog = <<>> THEN ScopeRootKey \in m.signers ELSE Cardinality(m.signers \cap CurrentCouncil) >= QuorumM   \* @guard council-manifest sym=src/storage/council.rs::council_manifest_decision
++    /\ TRUE
+ 
+ \* `install_council_manifest`: the installed manifest again is a no-op that succeeds; otherwise
+ \* the decision runs and a refusal changes nothing.
