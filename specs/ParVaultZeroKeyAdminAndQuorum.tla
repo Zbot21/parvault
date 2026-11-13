@@ -305,7 +305,7 @@ AdversaryAttemptReplay ==
                    confirmedAbuseTargets, honestOrderSigs, forgedOrderBuilt,
                    tamperedOrderBuilt, privateRingEvicted, ownerOrderSigned>>
 
-\* 10. Cross-mode broadcast check (`ADR-26` Strict Mode Isolation):
+\* 10. Cross-mode council broadcast check (`ADR-26` Strict Mode Isolation):
 \*     A quorum-signed Public Tracker Council order and the owner's own order both reach a
 \*     `HomelabRedundancyVault` (`PrivateRing`) node, which evaluates each ONLY against
 \*     `{HomelabOwner}`. A rejected order changes nothing (no counter is bumped).

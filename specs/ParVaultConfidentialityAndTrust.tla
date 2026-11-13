@@ -26,7 +26,7 @@ Subnets       == 1..6
 
 TrustLevels == {"Untrusted", "Verified", "Anchor", "Slashed"}
 
-\* Tiered subnet shard concentration caps (ADR-10):
+\* Tiered trust-ladder subnet shard concentration caps (ADR-10):
 \* - "Untrusted" (Probationary): max 1 shard per /24 subnet
 \* - "Verified"  (Neighbor):     max 2 shards per /24 subnet
 \* - "Anchor"    (High-Uptime):  max 4 shards per /24 subnet (< K = 16)

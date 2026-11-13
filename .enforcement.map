@@ -41,6 +41,8 @@ xref       X-ADR-DOC path=docs/**.md pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.
 # Root docs except CHANGELOG.md, whose released sections keep the ADR numbers of their release (history).
 xref       X-ADR-ROOT path=[!C]*.md pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md expect=docs/adr/xref-keywords.txt
 xref       X-ADR-CONTRIB path=CONTRIBUTING.md pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md expect=docs/adr/xref-keywords.txt
+# Prose citations in specs; the @traceability adr lists are resolved by tla-trace.
+xref       X-ADR-SPEC path=specs/*.tla pattern=[(`]ADR-(\d+) target=docs/adr/ADR-{}-*.md expect=docs/adr/xref-keywords.txt
 
 # --- Formal proofs (P-01 to P-05; mutants are authored by QA) --------------------------------------
 tla-spec   T-SPECS   path=specs/*.tla
