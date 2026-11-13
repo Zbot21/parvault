@@ -9,6 +9,13 @@ use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixDatagram;
 use std::time::Duration;
 
+/// Writes this test's gate sentinel (`suite` line in `.enforcement.map`), after its workload.
+fn gate_ran(name: &str) {
+    if let Ok(dir) = std::env::var("GATES_SENTINEL_DIR") {
+        std::fs::write(std::path::Path::new(&dir).join(name), b"ran").expect("sentinel");
+    }
+}
+
 const FUSE_FORGET: u32 = 2;
 const FUSE_GETATTR: u32 = 3;
 const FUSE_INTERRUPT: u32 = 36;
@@ -79,4 +86,5 @@ fn no_reply_opcodes_get_no_reply_and_the_loop_keeps_serving() {
         .join()
         .unwrap()
         .expect("the loop ends cleanly on DESTROY");
+    gate_ran("vfs_fuse_protocol::no_reply_opcodes_get_no_reply_and_the_loop_keeps_serving");
 }

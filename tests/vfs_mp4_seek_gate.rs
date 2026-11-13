@@ -29,6 +29,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// Writes this test's gate sentinel (`suite` line in `.enforcement.map`), after its workload.
+fn gate_ran(name: &str) {
+    if let Ok(dir) = std::env::var("GATES_SENTINEL_DIR") {
+        std::fs::write(std::path::Path::new(&dir).join(name), b"ran").expect("sentinel");
+    }
+}
+
 const MIB: u64 = 1024 * 1024;
 const CACHE_BYTES: u64 = 3 * MIB;
 const SEEK_SECS: &str = "12";
@@ -428,6 +435,7 @@ fn fuse_mount_mp4_probe_and_random_seek() {
         .join()
         .unwrap()
         .expect("FUSE loop ends cleanly on unmount");
+    gate_ran("vfs_mp4_seek_gate::fuse_mount_mp4_probe_and_random_seek");
 }
 
 #[test]
@@ -523,6 +531,7 @@ fn webdav_206_mp4_probe_and_random_seek() {
     );
     let s = vfs.cache_stats();
     assert!(s.used_bytes <= s.capacity_bytes);
+    gate_ran("vfs_mp4_seek_gate::webdav_206_mp4_probe_and_random_seek");
 }
 
 /// The standalone `parvault-fuse mount-fd` plugin process: same probe and seek, peak RSS < 16 MiB.
@@ -607,6 +616,7 @@ fn parvault_fuse_plugin_mount_rss_under_16_mib() {
         hwm_kib < 16 * 1024,
         format!("{hwm_kib} KiB"),
     );
+    gate_ran("vfs_mp4_seek_gate::parvault_fuse_plugin_mount_rss_under_16_mib");
 }
 
 trait WaitOrKill {

@@ -14,6 +14,13 @@ use std::net::TcpStream;
 use std::path::Path;
 use std::time::Duration;
 
+/// Writes this test's gate sentinel (`suite` line in `.enforcement.map`), after its workload.
+fn gate_ran(name: &str) {
+    if let Ok(dir) = std::env::var("GATES_SENTINEL_DIR") {
+        std::fs::write(std::path::Path::new(&dir).join(name), b"ran").expect("sentinel");
+    }
+}
+
 const MIB: u64 = 1024 * 1024;
 const BLOCKS: u64 = 12;
 const ROOT: [u8; 32] = [0x6B; 32];
@@ -100,4 +107,5 @@ fn plain_get_still_streams_the_whole_file() {
     );
     assert_eq!(resp.len() - split, (BLOCKS * MIB) as usize, "body length");
     assert!(resp[split..] == content()[..], "body differs");
+    gate_ran("vfs_webdav_plain_get::plain_get_still_streams_the_whole_file");
 }
