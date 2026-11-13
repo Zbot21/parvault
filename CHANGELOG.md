@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+- **The FUSE mount no longer dies on the kernel's first FORGET.** The `/dev/fuse` loop replied ENOSYS to FORGET, BATCH_FORGET and INTERRUPT, which take no reply; the kernel refused the reply with ENOENT and the loop exited, leaving the mount `ENOTCONN`. Those three now get no reply, and an ENOENT on a reply is not fatal (plan-5 D-1).
+
+### Added
+- **Mounted-filesystem MP4 gate (design ledger §7.2).** `tests/vfs_mp4_seek_gate.rs` mounts the vault through the real kernel (`fusermount3`, no root) and over WebDAV `HTTP 206` with a ReadOnly bearer token. Real `ffprobe` must probe a 12 MiB H.264 file with at most 2 cache misses and no middle stripe fetched. `ffmpeg -ss` must decode the same frames as the local file within a 3 MiB cache. The cold mid-file read must take < 50 ms, and the `parvault-fuse` plugin's peak RSS must stay < 16 MiB. The time and RSS budgets are asserted in release builds; under `GATES_REQUIRE_REAL=1` a missing tool or a debug run fails.
+
 ### Security
 - **`parvault token inspect` redacts the tag.** The HMAC tag is the bearer secret, so it now prints as `<redacted>` (text and JSON) unless `--show-tag` is given, as with the macaroon `Debug` output (F-43, L-44 item 8).
 - **The status page needs a read-only token and an IP-literal Host (F-46 fixed, item 3).** `parvault up --status-http` / `daemon start --status-http` now refuse a request without a valid, read-only, unscoped token (only in the `Authorization` header: `Bearer`, or the token as the Basic password; a `?token=` in the URL is ignored; fixed 401; L-52) and a DNS-name `Host` (403). The server moved from tokio to a blocking `std` listener on the HTTP edge it now shares with WebDAV (32 connections, 8 per IP, 8 KiB heads, 5 s deadline), behind the new `status-ui` feature. With `--status-http` set the daemon creates the gateway macaroon root key if there is none. **Breaking:** scripts that read `/api/v1/health` without a token get 401.
