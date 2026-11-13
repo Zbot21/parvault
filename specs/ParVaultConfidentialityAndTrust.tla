@@ -38,12 +38,10 @@ VARIABLES
     consecutivePasses,  \* Accumulated PoR audit epochs (0..MaxPasses)
     totalPlacedShards,  \* Total shards allocated across honest subnets (0..N)
     adversaryShards,    \* Ciphertext shards observed/colluded by adversary (0..N)
-    hasMasterKey,       \* Whether remote storage/witness nodes possess K_user (always FALSE)
-    plaintextExposed,   \* Whether adversary can reconstruct & decrypt user plaintext
     adversarySlashed    \* Whether the faulting subnet has been slashed and quarantined
 
 vars == <<subnetTrust, subnetShards, consecutivePasses, totalPlacedShards,
-          adversaryShards, hasMasterKey, plaintextExposed, adversarySlashed>>
+          adversaryShards, adversarySlashed>>
 
 Init ==
     /\ subnetTrust       = [s \in Subnets |-> "Untrusted"]
@@ -51,8 +49,6 @@ Init ==
     /\ consecutivePasses = 0
     /\ totalPlacedShards = 0
     /\ adversaryShards   = 0
-    /\ hasMasterKey      = FALSE
-    /\ plaintextExposed  = FALSE
     /\ adversarySlashed  = FALSE
 
 \* Action 1: RecordUptimePass
@@ -69,7 +65,7 @@ RecordUptimePass ==
                 THEN "Slashed"
                 ELSE nextTier]
     /\ UNCHANGED <<subnetShards, totalPlacedShards, adversaryShards,
-                   hasMasterKey, plaintextExposed, adversarySlashed>>
+                   adversarySlashed>>
 
 \* Action 2: AllocateShardToSubnet(s)
 \* Allocates a shard to the next canonical honest subnet `s` that has remaining capacity
@@ -85,7 +81,7 @@ AllocateShardToSubnet(s) ==
     /\ subnetShards' = [subnetShards EXCEPT ![s] = subnetShards[s] + 1]
     /\ totalPlacedShards' = totalPlacedShards + 1
     /\ UNCHANGED <<subnetTrust, consecutivePasses, adversaryShards,
-                   hasMasterKey, plaintextExposed, adversarySlashed>>
+                   adversarySlashed>>
 
 \* Action 3: AdversaryCollude
 \* Models an adversary compromising:
@@ -100,12 +96,7 @@ AdversaryCollude ==
                         [] adversaryShards = 4  -> 15
                         [] adversaryShards = 15 -> N
                         [] OTHER                -> N
-           keyTransmittedToPeers == FALSE
-           nextHasMasterKey      == (keyTransmittedToPeers /\ nextAdv >= K)
-           canDecrypt            == (nextAdv >= K /\ nextHasMasterKey)
-       IN /\ adversaryShards'  = nextAdv
-          /\ hasMasterKey'     = nextHasMasterKey
-          /\ plaintextExposed' = canDecrypt
+       IN adversaryShards' = nextAdv
     /\ UNCHANGED <<subnetTrust, subnetShards, consecutivePasses,
                    totalPlacedShards, adversarySlashed>>
 
@@ -117,8 +108,7 @@ ByzantineFaultAndSlash ==
     /\ subnetTrust' = [subnetTrust EXCEPT ![FaultySubnet] = "Slashed"]
     /\ subnetShards' = [subnetShards EXCEPT ![FaultySubnet] = 0]
     /\ adversarySlashed' = TRUE
-    /\ UNCHANGED <<consecutivePasses, totalPlacedShards, adversaryShards,
-                   hasMasterKey, plaintextExposed>>
+    /\ UNCHANGED <<consecutivePasses, totalPlacedShards, adversaryShards>>
 
 \* Terminal stuttering step once all 20 shards are placed and the faulty subnet is slashed.
 Idle ==
@@ -143,12 +133,10 @@ Spec ==
 \* SAFETY INVARIANTS
 \* ============================================================================
 
-\* 1. Zero-Knowledge Confidentiality:
-\* The adversary never exposes plaintext in any reachable state because either
-\* they hold < K shards OR they lack the client-only AES-256-GCM master key.
-Safety_ZeroKnowledgeConfidentiality ==
-    /\ plaintextExposed = FALSE
-    /\ hasMasterKey = FALSE
+\* Zero-knowledge confidentiality: the adversary may collude every shard, and still never
+\* decrypts, because K_user never leaves the client: @structural ciphertext-only-egress. AES-256-GCM
+\* encryption precedes Reed-Solomon encoding (`encrypt_stripe`, ADR-01) and no wire message carries
+\* a key. Not model-checked (L-47 item 2); hasMasterKey and plaintextExposed were constant FALSE.
 
 \* 2. Subnet Trust Caps Enforced:
 \* Every subnet strictly respects its tier ceiling (1 for Untrusted, 2 for Verified,
