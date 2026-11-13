@@ -45,6 +45,14 @@ open       T-SPECS   expect=completeness by=v0.5.0 ref=docs/security/TRUST_FINDI
 # M5a phase C: the gateway plugin bus spec is traced (the seven older specs join when 2d-beta merges).
 tla-trace  T-TRACE-GW path=specs/ParVaultGatewayPluginBus.tla complete=specs/ParVaultGatewayPluginBus.tla
 enum       E-IPC     sym=src/gateway/ipc.rs::IpcCommand spec=specs/ParVaultGatewayPluginBus.tla
+# QA (qa-2c-council) guard-removal mutants for the gateway plugin bus spec.
+tla-mutant TM-GPB-UID      spec=specs/ParVaultGatewayPluginBus.tla inv=OnlyAllowedUidsServed patch=specs/mutants/ParVaultGatewayPluginBus-uid-allowlist.patch
+tla-mutant TM-GPB-MAC      spec=specs/ParVaultGatewayPluginBus.tla inv=NoReadWithoutCapability patch=specs/mutants/ParVaultGatewayPluginBus-macaroon-frame.patch
+tla-mutant TM-GPB-UIDCAV   spec=specs/ParVaultGatewayPluginBus.tla inv=NoReadWithoutCapability patch=specs/mutants/ParVaultGatewayPluginBus-macaroon-uid-caveat.patch
+tla-mutant TM-GPB-SEAL     spec=specs/ParVaultGatewayPluginBus.tla inv=StoredPayloadImmutable patch=specs/mutants/ParVaultGatewayPluginBus-memfd-seal.patch
+tla-mutant TM-GPB-STATUS   spec=specs/ParVaultGatewayPluginBus.tla inv=StatusOnlyWithIssuedToken patch=specs/mutants/ParVaultGatewayPluginBus-status-auth.patch
+tla-mutant TM-GPB-FETCHPAY spec=specs/ParVaultGatewayPluginBus.tla inv=NoReadWithoutCapability patch=specs/mutants/ParVaultGatewayPluginBus-fetch-payload-macaroon.patch
+waive TM-GPB-W-TYPE inv=specs/ParVaultGatewayPluginBus.tla::TypeOK reason=structural: type invariant
 reach      TR-UID-ALLOWLIST sym=src/gateway/engine.rs::gateway_peer_uid_decision from=src/gateway/server.rs::spawn
 reach      TR-MACAROON-FRAME sym=src/gateway/engine.rs::gateway_macaroon_decision from=src/gateway/server.rs::execute_engine_command
 reach      TR-MACAROON-UID-CAVEAT sym=src/capabilities.rs::evaluate_caveats from=src/gateway/server.rs::execute_engine_command
@@ -164,4 +172,4 @@ kani       S-SANITIZE sym=src/sync/common.rs::sanitize_sync_relative_path_into h
 claim      B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision accept=trust_enforcement::bseed_second_sender_accepted_while_one_job_runs reject=trust_enforcement::bseed_third_job_refused_busy code=reject.syndication_busy bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe
 kani       B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision harness=proof_syndication_fanout_budget cover=syndication over budget
 
-ratchet    R         open=7 waive=11
+ratchet    R         open=7 waive=12

@@ -1,0 +1,13 @@
+diff --git a/specs/ParVaultGatewayPluginBus.tla b/specs/ParVaultGatewayPluginBus.tla
+index 902e877..1dce622 100644
+--- a/specs/ParVaultGatewayPluginBus.tla
++++ b/specs/ParVaultGatewayPluginBus.tla
+@@ -86,7 +86,7 @@ vars == <<allowlistSet, rootKeySet, requireSealed, snapshotPublished, conns, las
+           lastStatus, lastUnauth, stored>>
+ 
+ \* --- Guards (each mirrors one Rust decision) -------------------------------------------
+-UidAdmitted(u) == ~allowlistSet \/ u \in Allowlist   \* @guard uid-allowlist sym=src/gateway/engine.rs::gateway_peer_uid_decision
++UidAdmitted(u) == TRUE   \* @guard uid-allowlist sym=src/gateway/engine.rs::gateway_peer_uid_decision
+ \* The sym is broader than this check: the UID comparison is the AllowedPeerUid arm of `allows` (capabilities.rs:284).
+ UidCaveatOk(t, u) == t.uid \in {"none", u}   \* @guard macaroon-uid-caveat sym=src/capabilities.rs::evaluate_caveats
+ \* gateway_macaroon_decision: with a root key a frame needs a token with a valid tag; any

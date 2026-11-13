@@ -1,0 +1,13 @@
+diff --git a/specs/ParVaultGatewayPluginBus.tla b/specs/ParVaultGatewayPluginBus.tla
+index 902e877..7ad5976 100644
+--- a/specs/ParVaultGatewayPluginBus.tla
++++ b/specs/ParVaultGatewayPluginBus.tla
+@@ -131,7 +131,7 @@ FetchRange(u, t) ==
+ \* Item 3 gives FetchPayload the same per-frame check (before it, FetchPayload had none).
+ FetchPayload(u, t) ==
+     /\ u \in conns
+-    /\ ReadAuthorized(t, u)   \* @guard fetch-payload-macaroon sym=src/gateway/engine.rs::fetch_by_shard_ids_to_owned_fd_with_peer_uid
++    /\ TRUE   \* @guard fetch-payload-macaroon sym=src/gateway/engine.rs::fetch_by_shard_ids_to_owned_fd_with_peer_uid
+     /\ lastRead' = <<u, t>>
+     /\ UNCHANGED <<allowlistSet, rootKeySet, requireSealed, snapshotPublished, conns,
+                    lastStatus, lastUnauth, stored>>

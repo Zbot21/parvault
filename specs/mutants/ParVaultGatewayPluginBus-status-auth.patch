@@ -1,0 +1,13 @@
+diff --git a/specs/ParVaultGatewayPluginBus.tla b/specs/ParVaultGatewayPluginBus.tla
+index 902e877..97ab678 100644
+--- a/specs/ParVaultGatewayPluginBus.tla
++++ b/specs/ParVaultGatewayPluginBus.tla
+@@ -99,7 +99,7 @@ IngestSealedOk(sealed) == ~requireSealed \/ sealed   \* @guard memfd-seal sym=sr
+ \* unscoped token whose AllowedPeerUid (if any) is the caller's.
+ StatusAuthorized(t, u) ==
+     /\ rootKeySet /\ snapshotPublished
+-    /\ t /= NoToken /\ t.key = "root" /\ t.scope = "any" /\ UidCaveatOk(t, u)   \* @guard status-auth sym=src/http_edge.rs::status_auth_decision
++    /\ TRUE
+ 
+ Init ==
+     /\ allowlistSet \in BOOLEAN

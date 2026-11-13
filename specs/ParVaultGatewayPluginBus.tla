@@ -87,18 +87,19 @@ vars == <<allowlistSet, rootKeySet, requireSealed, snapshotPublished, conns, las
 
 \* --- Guards (each mirrors one Rust decision) -------------------------------------------
 UidAdmitted(u) == ~allowlistSet \/ u \in Allowlist   \* @guard uid-allowlist sym=src/gateway/engine.rs::gateway_peer_uid_decision
+\* The sym is broader than this check: the UID comparison is the AllowedPeerUid arm of `allows` (capabilities.rs:284).
 UidCaveatOk(t, u) == t.uid \in {"none", u}   \* @guard macaroon-uid-caveat sym=src/capabilities.rs::evaluate_caveats
 \* gateway_macaroon_decision: with a root key a frame needs a token with a valid tag; any
 \* token it carries must allow this frame (scope and peer UID).
-ReadAuthorized(t, u) ==   \* @guard macaroon-frame sym=src/gateway/engine.rs::gateway_macaroon_decision
-    /\ rootKeySet => (t /= NoToken /\ t.key = "root")
+ReadAuthorized(t, u) ==
+    /\ rootKeySet => (t /= NoToken /\ t.key = "root")   \* @guard macaroon-frame sym=src/gateway/engine.rs::gateway_macaroon_decision
     /\ t /= NoToken => (UidCaveatOk(t, u) /\ t.scope \in {"in", "any"})
 IngestSealedOk(sealed) == ~requireSealed \/ sealed   \* @guard memfd-seal sym=src/gateway/engine.rs::gateway_memfd_seal_decision
 \* status_auth_decision: a verifier (root key) and a snapshot, then a valid, ReadOnly,
 \* unscoped token whose AllowedPeerUid (if any) is the caller's.
-StatusAuthorized(t, u) ==   \* @guard status-auth sym=src/http_edge.rs::status_auth_decision
+StatusAuthorized(t, u) ==
     /\ rootKeySet /\ snapshotPublished
-    /\ t /= NoToken /\ t.key = "root" /\ t.scope = "any" /\ UidCaveatOk(t, u)
+    /\ t /= NoToken /\ t.key = "root" /\ t.scope = "any" /\ UidCaveatOk(t, u)   \* @guard status-auth sym=src/http_edge.rs::status_auth_decision
 
 Init ==
     /\ allowlistSet \in BOOLEAN
