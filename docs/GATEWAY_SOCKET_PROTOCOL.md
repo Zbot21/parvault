@@ -158,6 +158,7 @@ PLUGIN_TOK="$(parvault token attenuate \
   --allow-peer-uid 1042)"
 
 # 3. Inspect caveats and optionally verify in < 1 ms RAM against a simulated request
+#    (the tag, the bearer secret, prints as <redacted> unless --show-tag is given)
 parvault token inspect \
   --token "${PLUGIN_TOK}" \
   --verify-key-hex "$(cat /var/lib/parvault/macaroon_root.key)" \
