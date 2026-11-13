@@ -3449,3 +3449,36 @@ fn f38g_evicted_then_new_owner_rebinds() {
     assert!(!deleted(&send(&old, &node, delete_req(&old, sid))));
     assert!(deleted(&send(&new, &node, delete_req(&new, sid))));
 }
+
+/// F-38-GRANT `Keep` with the wrong bytes: a third party carrying the owner's grant but bytes
+/// that do not match the shard hash is acked `stored: false`, and nothing changes: the owner
+/// still reads its original bytes and its session commit still answers audits.
+#[test]
+fn f38g_keep_with_mismatched_bytes_refused() {
+    let node = spawn_daemon("f38g-keep-bad");
+    let owner = key(0xDF);
+    let third = key(0xE0);
+    let (sid, bytes) = shard(0x67, 1024);
+    let grant = self_grant(&owner, &sid);
+    assert!(stored(&send(
+        &owner,
+        &node,
+        put_shard("", sid, bytes.clone(), Some(grant.clone()))
+    )));
+    let forged = vec![0x99; bytes.len()];
+    let r = send(
+        &third,
+        &node,
+        put_with_commit(sid, forged, 0x66, Some(grant)),
+    );
+    assert!(!stored(&r), "{r:?}");
+    assert_eq!(
+        read_bytes(&send(&owner, &node, owner_read(&owner, sid))),
+        Some(bytes.clone())
+    );
+    assert!(
+        audit_ok(&owner, &node, sid, bytes.len()),
+        "session commit replaced"
+    );
+    assert!(!deleted(&send(&third, &node, delete_req(&third, sid))));
+}
