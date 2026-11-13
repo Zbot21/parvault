@@ -72,8 +72,11 @@ flowchart LR
 
 ### Step 1: Initialize Your Vault (`parvault init`)
 On your computer, home server, or router, generate cryptographic keys and a `config.toml`:
+<!-- doc-cmd: node router -->
 ```bash
 parvault init --profile router-soc --watch /mnt/usb-nas/shared --label "Home-NAS"
+# Start your ring, once, before `parvault up`: only ring members can store data on each other
+parvault wot init
 ```
 It prints the data directory, the node's peer ids and its owner fingerprint. It prints no recovery phrase: see Recipe A for how recovery works.
 
@@ -81,6 +84,9 @@ It prints the data directory, the node's peer ids and its owner fingerprint. It 
 
 ### Step 2: Turn on Turnkey Cloud-NAS Appliance Mode (`parvault up`)
 On your router, closet NAS, or Raspberry Pi, launch everything with one command:
+<!-- doc-cmd: node router -->
+<!-- doc-cmd: background ready="Embedded Status Server listening" -->
+<!-- doc-cmd: capture PAIRING_CODE="Home LAN Pairing Code: (\S+)" -->
 ```bash
 parvault up \
   --profile router-soc \
@@ -101,6 +107,7 @@ The status page needs a read-only token on every request (v0.5.0): run `parvault
 ### Step 3: Auto-Discover & Pair with 4 Words (`parvault discover` & `join`)
 On your laptop or workstation (connected to the same home Wi-Fi/LAN):
 
+<!-- doc-cmd: node laptop -->
 ```bash
 # 1. Scan your home network (zero IP addresses required!)
 parvault discover
@@ -116,9 +123,10 @@ Home-NAS           | router-nas   | /ip4/192.168.1.1/tcp/4001/p2p/12D3KooWBPqPNY
 Discovered 1 verified peer(s). Pinned in .parvault-data/known_peers.json.
 ```
 
+<!-- doc-cmd: node laptop -->
 ```bash
-# 2. Pair permanently using the 4-word code shown on your router
-parvault join --code shield-copper-alpine-matrix
+# 2. Pair permanently using the 4-word code shown on your router (e.g. shield-copper-alpine-matrix)
+parvault join --code <PAIRING_CODE>
 ```
 Output:
 ```text
@@ -129,13 +137,27 @@ Pinned Multiaddr: /ip4/192.168.1.1/tcp/4001/p2p/12D3KooWBPqPNYp6...
 ---
 
 ### Step 3b: Join the Ring (Required to Store Data)
-Pairing finds and pins your router; storing data on it needs ring membership. Start the ring once on the router (before `parvault up`), then invite each device:
+Pairing finds and pins your router; storing data on it needs ring membership. The router started the ring in Step 1; invite each device. On the laptop, note its "Ed25519 Public Key":
 
+<!-- doc-cmd: node laptop -->
+<!-- doc-cmd: capture LAPTOP_ED25519_KEY="Ed25519 Public Key \(hex\): ([0-9a-f]{64})" -->
 ```bash
-parvault wot init                                   # router, once
-parvault identity                                   # laptop: note "Ed25519 Public Key"
-parvault wot invite --peer <LAPTOP_ED25519_KEY>     # router: prints a token
-parvault wot install-chain --token <TOKEN>          # laptop
+parvault identity
+```
+
+On the router, invite it; this prints a token:
+
+<!-- doc-cmd: node router -->
+<!-- doc-cmd: capture TOKEN="^([0-9a-f]{128,})" -->
+```bash
+parvault wot invite --peer <LAPTOP_ED25519_KEY>
+```
+
+On the laptop, install the token:
+
+<!-- doc-cmd: node laptop -->
+```bash
+parvault wot install-chain --token <TOKEN>
 ```
 
 A device outside the ring is refused with `peer not admitted; v0.5.0 requires ring admission`.
@@ -145,7 +167,9 @@ A device outside the ring is refused with `peer not admitted; v0.5.0 requires ri
 ### Step 4: Back Up and Sync Folders (Zero IP Flags!)
 Backup and restore commands find your paired storage nodes automatically; storing on them needs ring membership (Step 3b):
 
+<!-- doc-cmd: node laptop -->
 ```bash
+mkdir -p ~/Documents && echo "example" > ~/Documents/tax-return.pdf   # a file to back up
 # Optional: a recovery phrase makes this folder recoverable on a new machine (Recipe A).
 # Write the phrase down offline; parvault stores it nowhere.
 export PARVAULT_SEED_PHRASE="$(parvault new-seed-phrase)"; echo "$PARVAULT_SEED_PHRASE"
@@ -176,6 +200,7 @@ parvault restore-folder \
 ### Step 5: Zero-Pairing Public Commons Quickstart (`--public`)
 Public Commons mode connects to a public swarm (analogous to a public BitTorrent tracker). **No public tracker is hosted today**: run your own `parvault-seed start --mode public-bootstrap` and use its address.
 
+<!-- doc-cmd: skip reason="no public tracker is hosted (the docs say so)" -->
 ```bash
 parvault watch-folder \
   --folder ~/Documents \
@@ -195,11 +220,13 @@ parvault watch-folder \
 What if your laptop is lost or destroyed? A folder can be recovered on a new machine **only if you backed it up with a recovery phrase**, and only while ring members holding its pieces are still reachable. `parvault init` prints no phrase, and folders served by `parvault up --folder` have no phrase recovery.
 
 1. Before anything goes wrong, make a phrase and back up with it (write the phrase down offline; it is never stored):
+<!-- doc-cmd: node laptop -->
 ```bash
 export PARVAULT_SEED_PHRASE="$(parvault new-seed-phrase)"; echo "$PARVAULT_SEED_PHRASE"
 parvault watch-folder --folder ~/Documents --vault-namespace documents --once
 ```
 2. On the new machine, which must reach the ring's nodes, recover with the same phrase and namespace. Ring membership gates storing and publishing, not reading. Anyone holding the owner's recovery key can restore from any reachable member without an invitation; it cannot store until invited. Members serve only ciphertext.
+<!-- doc-cmd: skip reason="a new machine that reaches the ring; the Docker gate (stage 10) runs recover-from-seed" -->
 ```bash
 export PARVAULT_SEED_PHRASE="<your 24 words>"
 parvault recover-from-seed --vault-namespace documents --out-dir ./recovered-after-fire
@@ -212,6 +239,7 @@ For example, the BIP-39 test vector `legal winner thank year wave sausage worth 
 
 ### Recipe B: Link Personal Devices with Zero Reciprocity Tax (`issue-device-cert`)
 To link machines into a private Day-1 Personal Ring (the planned zero storage quota tax for linked devices is not applied yet):
+<!-- doc-cmd: skip reason="the certificate and the issuer's owner key come from two machines' output" -->
 ```bash
 # 1. On your laptop, issue a certificate for your desktop or NAS. For a lite seed
 #    (watch-folder --lite-seed-dir), certify the "Vault Device Peer ID" that
@@ -230,6 +258,7 @@ parvault-seed verify-device-cert --data-dir /mnt/nas/parvault-seed \
 ---
 
 ### Recipe C: Scrub for Silent Disk Bit-Rot & Check Uptime Status
+<!-- doc-cmd: node laptop -->
 ```bash
 # Check node storage quota and the standing tiers:
 parvault status
@@ -243,6 +272,7 @@ parvault scrub
 ### Recipe D: Evict a Bad Actor or Content Takedown (`parvault evict`, `ADR-25`, `ADR-26`)
 If a spammer or illegal content is detected, administrators can purge matching shards with zero-wipe `0x00` disk shredding and block future ingress without storing any plaintext IPs on disk:
 
+<!-- doc-cmd: skip reason="needs a stripe root from an abuse report; the Docker gate (stages 7b, 9) runs evict" -->
 ```bash
 # Evict an abusive IP address and purge all associated shards:
 parvault evict --ip 203.0.113.42 --reason "Spam flood"
@@ -259,6 +289,7 @@ parvault evict --merkle-root <STRIPE_MERKLE_ROOT_HEX> --propagate
 ### Recipe E: Report Abusive Content & Public Tracker Administration (`ADR-26`)
 This needs a public tracker you run yourself (none is hosted today). On Public Commons swarms (`--public`), random users cannot grief or evict honest users. To report illegal content, submit a cryptographic burden-of-proof report (`parvault report-abuse`). The Public Tracker Operator reviews cryptographic proofs and issues official eviction orders:
 
+<!-- doc-cmd: skip reason="no public tracker is hosted (the docs say so)" -->
 ```bash
 # 1. Reporter: submit leaked manifest and key proving illegal content distribution:
 parvault report-abuse \
@@ -281,6 +312,13 @@ parvault-seed admin emergency-evict --data-dir /mnt/nas/parvault-seed --ip 203.0
 
 `parvault up --no-socket --vfs-seed-dir <DIR> --vfs-webdav-listen 127.0.0.1:8088` serves your vault as a WebDAV drive. Every request needs a read-only token from the same data directory:
 
+<!-- doc-cmd: node laptop -->
+<!-- doc-cmd: background ready="WebDAV" -->
+```bash
+parvault up --no-socket --vfs-seed-dir ~/Documents --vfs-webdav-listen 127.0.0.1:8088
+```
+
+<!-- doc-cmd: node laptop -->
 ```bash
 TOKEN="$(parvault token mint --read-only --ttl-secs 86400)"
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/

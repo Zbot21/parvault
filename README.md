@@ -41,6 +41,7 @@ Designed to run identically on multi-terabyte homelab NAS servers and memory-con
 
 ## 60-Second Quickstart (Zero-IP Home Network & Cloud-NAS)
 
+<!-- doc-cmd: skip reason="router and laptop on two machines; QUICKSTART steps 1-4 run the same commands across two containers" -->
 ```bash
 # 1. Initialize keys and a config.toml on the router
 parvault init --profile router-soc --watch /mnt/usb-nas/shared --label "Router-NAS"
@@ -152,6 +153,7 @@ flowchart LR
 
 ## Build & Verification Commands
 
+<!-- doc-cmd: skip reason="needs the Rust toolchain and this repository; CI's rust-tests job runs these" -->
 ```bash
 # Run all unit, integration, mathematical proof, Stateright, TLA+ TLC, GatewayBus, VFS & GatewayFolderSync tests
 # (the TLA+ tests need tla2tools.jar; point TLA2TOOLS_JAR at your copy)
@@ -165,37 +167,80 @@ cargo run --release --bin parvault-seed -- self-test
 cargo run --release --bin parvault -- gateway self-test
 # Plugin self-tests are client-only: this starts a standalone gateway, mints a token, runs both
 bash scripts/build_bins.sh --profile release --out dist && bash scripts/plugin_self_test.sh dist/parvault dist/parvault-fuse dist/parvault-sync
+```
 
-# Launch a zero-filesystem, RAM-capped seed node (zero directories or files created on disk)
+Launch a zero-filesystem, RAM-capped seed node (zero directories or files created on disk):
+<!-- doc-cmd: node seed -->
+<!-- doc-cmd: background ready="Zero-Trust Seed & Redundancy Server Status Report" -->
+```bash
 parvault-seed start --no-fs --in-memory-mb 256 --mode public-bootstrap --listen /ip4/0.0.0.0/tcp/4002
+```
 
-# Launch single-daemon Cloud-NAS + hardened UDS plugin host, mint an offline-attenuatable token, and run =m plugins.
-# Needs `parvault init` and `parvault wot init` (or a chain from `wot install-chain`) first.
-# /var/run needs root; any directory you can write works for the socket.
+Launch single-daemon Cloud-NAS + hardened UDS plugin host, mint an offline-attenuatable token, and run `=m` plugins. The daemon needs a node and a ring first; `/var/run` needs root, but any directory you can write works for the socket:
+<!-- doc-cmd: node plugins -->
+```bash
+parvault init
+parvault wot init        # or join an existing ring with `parvault wot install-chain`
 SOCK=/var/run/parvault.sock
+```
+<!-- doc-cmd: node plugins -->
+<!-- doc-cmd: background ready="Zero-Copy IPC Gateway listening" -->
+```bash
 parvault up --folder /mnt/usb-nas/shared --ipc-socket "$SOCK" \
   --strict-plugins --allow-peer-uid "$(id -u)" --require-sealed-memfd
+```
+<!-- doc-cmd: node plugins -->
+```bash
 # WebDAV clients present this token (or an offline `parvault token attenuate` of it) on every
 # request (F-43). No --allow-peer-uid: a peer-UID caveat cannot be checked over TCP, and
 # --strict-plugins already pins the plugin's UID on the socket.
 TOKEN=$(parvault token mint --read-only --ttl-secs 3600)
 ( umask 077; printf '%s\n' "$TOKEN" > ./plugin.token )   # --macaroon-file: not visible in the process list
+```
+<!-- doc-cmd: node plugins -->
+<!-- doc-cmd: background ready="serving HTTP-Range / WebDAV VFS" -->
+```bash
 # The WebDAV view lists what parvault-fuse itself ingests, not folders pushed with parvault-sync
 parvault-fuse --socket "$SOCK" --macaroon-file ./plugin.token \
   --cache-dir /tmp/pv-cache --cache-mib 512 webdav --listen 127.0.0.1:8088
+```
+<!-- doc-cmd: node plugins -->
+```bash
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
+```
+With no ring peer to take the data, `push` keeps it on this machine and exits with code 3 ("N stripe(s) kept only on this machine: NOT backed up"):
+<!-- doc-cmd: node plugins -->
+<!-- doc-cmd: expect-exit 3 -->
+```bash
+mkdir -p ~/Documents && echo "hello" > ~/Documents/hello.txt   # something to push
 parvault-sync --socket "$SOCK" --catalog ./gw-catalog.bin push --folder ~/Documents
+```
+<!-- doc-cmd: node plugins -->
+```bash
 parvault-sync --socket "$SOCK" --catalog ./gw-catalog.bin --macaroon-file ./plugin.token pull --output /tmp/restored
+```
 
-# Or host WebDAV VFS built-in (=y) inside parvault with --no-socket (zero .sock file on disk!).
-# Needs `parvault init` and ring membership. The seed folder is stored like other data: on pinned
-# ring peers that accept it, else locally (peers of other rings and offline peers are skipped).
+Or host WebDAV VFS built-in (`=y`) inside `parvault` with `--no-socket` (zero `.sock` file on disk). This needs a node and ring membership too. The seed folder is stored like other data: on pinned ring peers that accept it, else locally (peers of other rings and offline peers are skipped):
+<!-- doc-cmd: node vfs -->
+```bash
+parvault init && parvault wot init
+mkdir -p /mnt/usb-nas/shared
+```
+<!-- doc-cmd: node vfs -->
+<!-- doc-cmd: background ready="WebDAV" -->
+```bash
 parvault up --no-socket --vfs-seed-dir /mnt/usb-nas/shared --vfs-webdav-listen 127.0.0.1:8088
+```
+<!-- doc-cmd: node vfs -->
+```bash
 # Every WebDAV request needs a read-only token from this node's data dir (F-43):
 TOKEN="$(parvault token mint --read-only --ttl-secs 86400)"
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
 # Finder, davfs2: any user name, the token as the password. rclone: --webdav-bearer-token "$TOKEN".
+```
 
+<!-- doc-cmd: skip reason="needs the Rust toolchain, Docker, or cross linkers and this repository; CI's rust-tests and release jobs run these" -->
+```bash
 # Execute the empirical cryptography, Reed-Solomon, and /proc/self/status memory benchmark suite (see docs/BENCHMARKS.md)
 cargo run --release --bin parvault-bench -- run --payload-mib 64
 
