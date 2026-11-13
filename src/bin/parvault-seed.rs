@@ -16,8 +16,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use libp2p::{futures::StreamExt, swarm::SwarmEvent, Multiaddr};
 use parvault::network::server_events::ServerSwarmEvents;
 use parvault::network::wire_handler::{
-    extract_ip_from_multiaddr, handle_seed_wire_request, resolve_seed_council_and_quorum,
-    SeedWireHandlerCtx,
+    extract_ip_from_multiaddr, handle_seed_wire_request, SeedWireHandlerCtx,
 };
 use parvault::{
     admin_rpc::{
@@ -140,14 +139,6 @@ enum SeedCommand {
         /// Authorized 64-char hex Ed25519 operator public key(s) for Zero-Key-On-VPS Admin RPC (`--admin-rpc-pubkey <HEX>`)
         #[arg(long, visible_alias = "admin-rpc-pubkeys", value_delimiter = ',')]
         admin_rpc_pubkey: Vec<String>,
-
-        /// Optional Federated M-of-N Public Tracker Council 64-char hex Ed25519 public keys (`--council-pubkeys <CSV>`)
-        #[arg(long, visible_alias = "council-pubkey", value_delimiter = ',')]
-        council_pubkeys: Vec<String>,
-
-        /// Optional explicit M-of-N tracker eviction quorum threshold override
-        #[arg(long)]
-        council_quorum: Option<usize>,
 
         /// Zero-filesystem mode for read-only containers (`docker run --read-only`) and NAND/eMMC routers (`0` disk writes)
         #[arg(long, default_value_t = false)]
@@ -429,8 +420,6 @@ async fn main() -> anyhow::Result<()> {
             no_lan_discovery,
             admin_rpc_listen,
             admin_rpc_pubkey,
-            council_pubkeys,
-            council_quorum,
             no_fs,
             in_memory_mb,
             identity_env,
@@ -445,17 +434,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            let mut explicit_council_pks = Vec::new();
-            for raw_hex in &council_pubkeys {
-                if !raw_hex.trim().is_empty() {
-                    let pk = parse_hex_32(raw_hex, "--council-pubkeys")?;
-                    if !explicit_council_pks.contains(&pk) {
-                        explicit_council_pks.push(pk);
-                    }
-                }
-            }
-            let has_external_admin_keys =
-                !explicit_admin_pks.is_empty() || !explicit_council_pks.is_empty();
+            let has_external_admin_keys = !explicit_admin_pks.is_empty();
             let in_memory_mode = no_fs || in_memory_mb.is_some();
 
             let discovery_port = resolve_seed_lan_port(lan_discovery_port);
@@ -529,7 +508,7 @@ async fn main() -> anyhow::Result<()> {
                     mode_marker.as_bytes(),
                 );
                 // Zero-Private-Key-On-VPS invariant (`ADR-19`): NEVER auto-generate `tracker_admin.seed`
-                // when `--admin-rpc-pubkey` or `--council-pubkeys` is supplied!
+                // when `--admin-rpc-pubkey` is supplied!
                 if mode == CliSeedMode::PublicBootstrap
                     && (!has_external_admin_keys || data_dir.join("tracker_admin.seed").exists())
                 {
@@ -620,8 +599,6 @@ async fn main() -> anyhow::Result<()> {
                 no_lan_discovery,
                 admin_rpc_listen,
                 explicit_admin_pks,
-                explicit_council_pks,
-                council_quorum,
                 effective_peers,
             })
             .await?;
@@ -1018,8 +995,7 @@ async fn main() -> anyhow::Result<()> {
                 );
                 println!("Node Transport Peer ID      : {}", node_id.device_peer_id());
                 println!(
-                    "Council Config Snippet      : eviction_authorities = [\"{}\"]",
-                    hex::encode(admin_id.public_key_bytes())
+                    "Council                     : sign epoch 1 with this key and install it on nodes with `parvault council install`"
                 );
             }
             SeedAdminAction::ListTakedowns { data_dir } => {
@@ -1273,15 +1249,10 @@ async fn main() -> anyhow::Result<()> {
                 let quota = QuotaManager::new(500 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
                 let block_store = BlockStore::new(&data_dir, quota)?;
                 let mut eviction = PrivacyPreservingEvictionEngine::load_or_init(&data_dir)?;
-                let genesis_pk =
-                    parvault::network::admission::server_ring_genesis(&data_dir, None, true)?;
-                let (council, min_quorum) = resolve_seed_council_and_quorum(
+                // A public tracker's council is rooted at its own admin key.
+                let (council, min_quorum) = parvault::storage::council::council_members_and_quorum(
                     &data_dir,
-                    SeedServerMode::PublicNetworkBootstrapper,
                     Some(admin_id.public_key_bytes()),
-                    &[],
-                    None,
-                    genesis_pk,
                 );
                 let now_ms = seed_now_ms();
                 for order in &orders {
@@ -1700,8 +1671,6 @@ struct SeedListenerConfig {
     no_lan_discovery: bool,
     admin_rpc_listen: Option<SocketAddr>,
     explicit_admin_pks: Vec<[u8; 32]>,
-    explicit_council_pks: Vec<[u8; 32]>,
-    council_quorum: Option<usize>,
     effective_peers: Vec<String>,
 }
 
@@ -1716,15 +1685,12 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
         no_lan_discovery,
         admin_rpc_listen,
         explicit_admin_pks,
-        explicit_council_pks,
-        council_quorum,
         effective_peers,
     } = cfg;
     let start_instant = Instant::now();
     let in_memory_mode = block_store.is_in_memory();
     let data_dir = block_store.root_dir().to_path_buf();
-    let has_external_admin_keys =
-        !explicit_admin_pks.is_empty() || !explicit_council_pks.is_empty();
+    let has_external_admin_keys = !explicit_admin_pks.is_empty();
     let local_tracker_admin = if in_memory_mode {
         if !has_external_admin_keys {
             Some(node_identity.clone())
@@ -1738,16 +1704,8 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
     };
     let local_tracker_admin_pk = local_tracker_admin.as_ref().map(|id| id.public_key_bytes());
 
-    let mut extra_council_pks = Vec::new();
-    for pk in explicit_council_pks.iter().chain(explicit_admin_pks.iter()) {
-        if *pk != [0u8; 32] && !extra_council_pks.contains(pk) {
-            extra_council_pks.push(*pk);
-        }
-    }
     let advertised_admin_pk = if server.mode() == SeedServerMode::PublicNetworkBootstrapper {
-        local_tracker_admin_pk
-            .or_else(|| explicit_admin_pks.first().copied())
-            .or_else(|| explicit_council_pks.first().copied())
+        local_tracker_admin_pk.or_else(|| explicit_admin_pks.first().copied())
     } else {
         None
     };
@@ -1850,11 +1808,7 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
 
     let _admin_rpc_handle = if let Some(bind_addr) = admin_rpc_listen {
         let mut allowed_pks: Vec<[u8; 32]> = Vec::new();
-        for pk in explicit_admin_pks
-            .iter()
-            .chain(explicit_council_pks.iter())
-            .copied()
-        {
+        for pk in explicit_admin_pks.iter().copied() {
             if pk != [0u8; 32] && !allowed_pks.contains(&pk) {
                 allowed_pks.push(pk);
             }
@@ -1862,19 +1816,6 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
         if let Some(local_admin_pk) = local_tracker_admin_pk {
             if !allowed_pks.contains(&local_admin_pk) {
                 allowed_pks.push(local_admin_pk);
-            }
-        }
-        if let Ok(env_auth) = std::env::var("PARVAULT_EVICTION_AUTHORITIES") {
-            for part in env_auth.split(',') {
-                if let Ok(bytes) = hex::decode(part.trim()) {
-                    if bytes.len() == 32 {
-                        let mut pk = [0u8; 32];
-                        pk.copy_from_slice(&bytes);
-                        if pk != [0u8; 32] && !allowed_pks.contains(&pk) {
-                            allowed_pks.push(pk);
-                        }
-                    }
-                }
             }
         }
         if allowed_pks.is_empty() {
@@ -1888,7 +1829,6 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
         let rpc_data_dir = data_dir.clone();
         let rpc_node_id = node_identity.clone();
         let rpc_peer_id_str = local_peer_id.to_string();
-        let rpc_extra_council = extra_council_pks.clone();
         let rpc_effective_peers = effective_peers.clone();
 
         let (bound_rpc_addr, handle) =
@@ -1902,10 +1842,10 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
                         node_identity: &rpc_node_id,
                         local_peer_id_str: &rpc_peer_id_str,
                         seed_mode,
-                        local_tracker_admin_pk,
-                        extra_council_pks: &rpc_extra_council,
-                        council_quorum,
-                        genesis_pubkey,
+                        council_root: match seed_mode {
+                            SeedServerMode::PublicNetworkBootstrapper => advertised_admin_pk,
+                            SeedServerMode::HomelabRedundancyVault => genesis_pubkey,
+                        },
                         effective_peers: &rpc_effective_peers,
                         start_instant,
                     },
@@ -1999,9 +1939,6 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
                                     data_dir: &data_dir,
                                     node_identity: &node_identity,
                                     advertised_admin_pk,
-                                    local_tracker_admin_pk,
-                                    extra_council_pks: &extra_council_pks,
-                                    council_quorum,
                                     max_probationary_lease_bytes,
                                     genesis_pubkey,
                                     block_store: &block_store,
@@ -2076,10 +2013,8 @@ struct SeedAdminRpcCtx<'a> {
     node_identity: &'a NodeIdentity,
     local_peer_id_str: &'a str,
     seed_mode: SeedServerMode,
-    local_tracker_admin_pk: Option<[u8; 32]>,
-    extra_council_pks: &'a [[u8; 32]],
-    council_quorum: Option<usize>,
-    genesis_pubkey: Option<[u8; 32]>,
+    /// Scope root of this seed's council: its ring genesis, else its own tracker admin key.
+    council_root: Option<[u8; 32]>,
     effective_peers: &'a [String],
     start_instant: Instant,
 }
@@ -2095,10 +2030,7 @@ fn handle_seed_admin_rpc_request(
         node_identity,
         local_peer_id_str,
         seed_mode,
-        local_tracker_admin_pk,
-        extra_council_pks,
-        council_quorum,
-        genesis_pubkey,
+        council_root,
         effective_peers,
         start_instant,
     } = ctx;
@@ -2122,14 +2054,9 @@ fn handle_seed_admin_rpc_request(
                 .iter()
                 .filter(|e| matches!(e.status, TakedownReviewStatus::PendingAdminReview))
                 .count();
-            let (_, min_quorum) = resolve_seed_council_and_quorum(
-                data_dir,
-                seed_mode,
-                local_tracker_admin_pk,
-                extra_council_pks,
-                council_quorum,
-                genesis_pubkey,
-            );
+            let min_quorum =
+                parvault::storage::council::council_from_manifest(data_dir, council_root)
+                    .map_or(0, |m| m.quorum as usize);
             let mode_str = match seed_mode {
                 SeedServerMode::PublicNetworkBootstrapper => "public-bootstrap",
                 SeedServerMode::HomelabRedundancyVault => "homelab-vault",
@@ -2211,14 +2138,8 @@ fn handle_seed_admin_rpc_request(
                     message: "Refused: ExecuteSignedEvictionBatch is strictly disabled in homelab-vault private mode".to_string(),
                 };
             }
-            let (council, min_quorum) = resolve_seed_council_and_quorum(
-                data_dir,
-                seed_mode,
-                local_tracker_admin_pk,
-                extra_council_pks,
-                council_quorum,
-                genesis_pubkey,
-            );
+            let (council, min_quorum) =
+                parvault::storage::council::council_members_and_quorum(data_dir, council_root);
             let local_pk = node_identity.public_key_bytes();
             let now_ms = seed_now_ms();
 

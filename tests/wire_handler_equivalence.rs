@@ -85,8 +85,8 @@ use parvault::network::wire_handler::{
 use parvault::network::{
     derive_slot_key_from_code, node_identity_libp2p_peer_id, seal_public_tracker_card,
     seal_wan_peer_card, DelegationChain, DhtEnvelopeKind, DhtWireEnvelope, InvitationHop,
-    KnownPeersStore, MeshWireRequest, MeshWireResponse, PublicCommonsTicket, TrustPoolMode,
-    WanPeerCard, WanRendezvousRegistry, WebOfTrustRegistry, DEFAULT_PUBLIC_WOT_POW_BITS,
+    MeshWireRequest, MeshWireResponse, PublicCommonsTicket, TrustPoolMode, WanPeerCard,
+    WanRendezvousRegistry, WebOfTrustRegistry, DEFAULT_PUBLIC_WOT_POW_BITS,
     PUBLIC_COMMONS_SWARM_SLOT,
 };
 use parvault::por::{
@@ -106,12 +106,9 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
-/// Serialises cases that read or set the eviction-council environment variables.
+/// Serialises cases that read or set process environment variables.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
-const ENV_VARS: [&str; 2] = [
-    "PARVAULT_EVICTION_AUTHORITIES",
-    "PARVAULT_TRACKER_EVICTION_QUORUM",
-];
+const ENV_VARS: [&str; 0] = [];
 const SEED_DEFAULT_LEASE_LIMIT: u64 = 64 * 1024 * 1024; // run_seed_listener_loop's value
 
 fn env_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -320,9 +317,6 @@ impl Fx {
                         data_dir: &self.dir,
                         node_identity: &self.node,
                         advertised_admin_pk: advertised,
-                        local_tracker_admin_pk: Some(self.admin_pk),
-                        extra_council_pks: &[],
-                        council_quorum: None,
                         max_probationary_lease_bytes: self.max_lease,
                         genesis_pubkey: Some(self.genesis),
                         block_store: &self.store,
@@ -2164,112 +2158,58 @@ fn broadcast_eviction_order() {
     assert!(!o.iter().any(accepted));
     assert_identical(&o);
 
-    // Tracker admin key: only the public seed trusts its local tracker admin.
-    let mut t = Trio::new("evict-admin");
-    let order =
-        SignedBadActorEvictionOrder::issue(&t.keys.admin, target(), "tracker-admin", now_ms(), 0);
-    let o = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(order));
-    assert_eq!(
-        o.iter().map(accepted).collect::<Vec<_>>(),
-        vec![false, false, true],
-        "{o:?}"
-    );
-    let target_ip: std::net::IpAddr = "192.0.2.200".parse().unwrap();
-    assert_eq!(
-        t.fx.iter()
-            .map(|f| f.blocked(target_ip))
-            .collect::<Vec<_>>(),
-        vec![false, false, true],
-        "only an accepted order blocks"
-    );
-
-    // Genesis key: trusted by the homelab seed (and by the daemon's own council resolver).
-    let mut t = Trio::new("evict-genesis");
-    let order =
-        SignedBadActorEvictionOrder::issue(&t.keys.genesis, target(), "genesis", now_ms(), 0);
-    let o = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(order));
-    let genesis_pattern: Vec<bool> = o.iter().map(accepted).collect();
-    assert!(genesis_pattern[1], "homelab seed trusts genesis: {o:?}");
-    assert!(
-        !genesis_pattern[2],
-        "public seed does not trust genesis: {o:?}"
-    );
-    let daemon_trusts_genesis = genesis_pattern[0];
-
-    // Authority from the environment (read per request by both resolvers).
-    let env_auth = NodeIdentity::from_seed([0x76; 32]);
-    let mut t = Trio::new("evict-env");
-    std::env::set_var(
-        "PARVAULT_EVICTION_AUTHORITIES",
-        hex::encode(env_auth.public_key_bytes()),
-    );
-    std::env::set_var("PARVAULT_TRACKER_EVICTION_QUORUM", "1");
-    let order = SignedBadActorEvictionOrder::issue(&env_auth, target(), "env", now_ms(), 0);
-    let o = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(order));
-    for v in ENV_VARS {
-        std::env::remove_var(v);
+    // F-08: one resolver (the signed council manifest), so every row is identical across roles.
+    // No manifest: neither the genesis nor the tracker admin alone is a council.
+    for (label, signer) in [("evict-genesis", 0u8), ("evict-admin", 1u8)] {
+        let mut t = Trio::new(label);
+        let key = if signer == 0 {
+            t.keys.genesis.clone()
+        } else {
+            t.keys.admin.clone()
+        };
+        let order = SignedBadActorEvictionOrder::issue(&key, target(), label, now_ms(), 0);
+        let o = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(order));
+        assert!(!o.iter().any(accepted), "{label}: {o:?}");
+        assert_identical(&o);
     }
-    let env_pattern: Vec<bool> = o.iter().map(accepted).collect();
 
-    // Pinned tracker admin in known_peers.json: the public daemon trusts it alone; the public seed
-    // adds it to its local admin (council of 2, default quorum 2), so one signature is not enough.
-    let pinned = NodeIdentity::from_seed([0x77; 32]);
-    let mut t = Trio::new("evict-pinned");
-    t.each(|fx, _| {
-        let mut kp = KnownPeersStore::load(&fx.dir);
-        kp.pin_tracker_admin_pubkey("tracker.example:4001", pinned.public_key_bytes());
-        kp.save(&fx.dir).unwrap();
-    });
-    let order = SignedBadActorEvictionOrder::issue(&pinned, target(), "pinned", now_ms(), 0);
-    let o = t.run(
-        &peer,
-        &MeshWireRequest::BroadcastEvictionOrder(order.clone()),
-    );
-    let pinned_private: Vec<bool> = o.iter().map(accepted).collect();
-    t.each(|fx, _| fx.public_mode = true);
-    let o2 = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(order));
-    let daemon_public_pinned = accepted(&o2[0]);
-
-    // pinned_tracker_admins.json: read only by the daemon resolver, and only in public mode.
-    let file_admin = NodeIdentity::from_seed([0x79; 32]);
-    let mut t = Trio::new("evict-pinned-file");
-    t.each(|fx, _| {
-        let list = vec![hex::encode(file_admin.public_key_bytes())];
-        std::fs::write(
-            fx.dir.join("pinned_tracker_admins.json"),
-            serde_json::to_string(&list).unwrap(),
+    // A genesis-signed 2-of-3 manifest: two members' signatures pass, one does not.
+    let members: Vec<NodeIdentity> = (0x81..=0x83u8)
+        .map(|b| NodeIdentity::from_seed([b; 32]))
+        .collect();
+    let mut t = Trio::new("evict-council");
+    t.each(|fx, keys| {
+        let mut m = parvault::storage::council::CouncilManifest::new(
+            keys.genesis.public_key_bytes(),
+            1,
+            members.iter().map(|m| m.public_key_bytes()).collect(),
+            2,
+            1,
+        );
+        m.sign(&keys.genesis);
+        parvault::storage::council::install_council_manifest(
+            &fx.dir,
+            &m,
+            keys.genesis.public_key_bytes(),
         )
         .unwrap();
-        fx.public_mode = true;
     });
-    let order =
-        SignedBadActorEvictionOrder::issue(&file_admin, target(), "pinned-file", now_ms(), 0);
-    let o = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(order));
-    let pinned_file: Vec<bool> = o.iter().map(accepted).collect();
-
-    // Pinned characterisation of today's council resolution, per role
-    // (hook eviction_council): [daemon, seed homelab, seed public].
+    let one = SignedBadActorEvictionOrder::issue(&members[0], target(), "one", now_ms(), 0);
+    let o = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(one));
+    assert!(!o.iter().any(accepted), "{o:?}");
+    assert_identical(&o);
+    let mut two = SignedBadActorEvictionOrder::issue(&members[0], target(), "two", now_ms(), 0);
+    assert!(two.add_cosignature(&members[1]));
+    let o = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(two));
+    // [daemon, seed homelab, seed public]: the scope root follows the mode, not the role. The
+    // private daemon and the homelab seed are rooted at the genesis; a public seed at its own
+    // tracker admin key, so a genesis-rooted council is not its council.
     assert_eq!(
-        (
-            daemon_trusts_genesis,
-            env_pattern,
-            pinned_private,
-            daemon_public_pinned,
-            pinned_file
-        ),
-        (
-            DAEMON_TRUSTS_GENESIS,
-            vec![true, true, true],
-            vec![false, false, false],
-            true,
-            vec![true, false, false]
-        ),
-        "council resolution changed"
+        o.iter().map(accepted).collect::<Vec<_>>(),
+        vec![true, true, false],
+        "{o:?}"
     );
 }
-
-/// Today's daemon resolver trusts the genesis key in private mode.
-const DAEMON_TRUSTS_GENESIS: bool = true;
 
 // --- the seed's shared-store assumption --------------------------------------------------------
 

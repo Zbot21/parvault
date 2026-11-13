@@ -2818,6 +2818,8 @@ fn ban_ip(last: u8) -> parvault::storage::EvictionTarget {
 #[test]
 fn repro_f09_stale_permanent_order_accepted() {
     let node = spawn_daemon("f09");
+    let out = council_cli(&node, &council_init_args(&[genesis()], 1));
+    assert!(out.status.success(), "{}", combined(&out));
     let issued = now_ms() - 400 * 24 * 3600 * 1000;
     let order = parvault::storage::SignedBadActorEvictionOrder::issue(
         &genesis(),
@@ -2838,38 +2840,112 @@ fn repro_f09_stale_permanent_order_accepted() {
     gate_ran("trust_enforcement::repro_f09_stale_permanent_order_accepted");
 }
 
-/// F-08 gap: with three configured eviction authorities and the quorum set to 1 (below a
-/// majority), an order signed by one authority alone is accepted.
-#[test]
-fn repro_f08_quorum_below_majority_accepted() {
-    let members = [key(0x81), key(0x82), key(0x83)];
-    let list: Vec<String> = members
-        .iter()
-        .map(|m| hex::encode(m.public_key_bytes()))
-        .collect();
-    let (root, dir, reg, log) = prepare("f08");
-    let port = free_port();
-    let mut cmd = daemon_command(&dir, &reg, port);
-    cmd.env("PARVAULT_EVICTION_AUTHORITIES", list.join(","))
-        .env("PARVAULT_TRACKER_EVICTION_QUORUM", "1");
-    let node = spawn(cmd, root, dir, log, port);
-    let order = parvault::storage::SignedBadActorEvictionOrder::issue(
-        &members[0],
-        ban_ip(81),
-        "one of three",
+/// Runs `parvault council <args>` on `node`'s data directory as the ring genesis holder.
+fn council_cli(node: &Node, args: &[String]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+        .env(
+            "PARVAULT_LAN_REGISTRY_DIR",
+            node.dir.parent().unwrap().join("lan-registry"),
+        )
+        .env("RUST_LOG", "info")
+        .env("NO_COLOR", "1")
+        .arg("--data-dir")
+        .arg(&node.dir)
+        .args(["--no-lan-discovery", "council"])
+        .args(args)
+        .output()
+        .expect("run parvault council")
+}
+
+/// `council init` arguments for `members` at `quorum`.
+fn council_init_args(members: &[NodeIdentity], quorum: usize) -> Vec<String> {
+    let mut args = vec!["init".to_string()];
+    for m in members {
+        args.push("--member".into());
+        args.push(hex::encode(m.public_key_bytes()));
+    }
+    args.push("--quorum".into());
+    args.push(quorum.to_string());
+    args
+}
+
+/// An order against `target` signed by `signers[0]` and co-signed by the rest, for the node's
+/// current council epoch.
+fn council_order(
+    signers: &[&NodeIdentity],
+    target: parvault::storage::EvictionTarget,
+) -> parvault::storage::SignedBadActorEvictionOrder {
+    let mut order = parvault::storage::SignedBadActorEvictionOrder::issue(
+        signers[0],
+        target,
+        "council",
         now_ms(),
         now_ms() + 3_600_000,
     );
+    for s in &signers[1..] {
+        assert!(order.add_cosignature(s));
+    }
+    order
+}
+
+/// F-08 accept: with a genesis-signed 2-of-3 council manifest installed, an order signed by two
+/// members is applied.
+#[test]
+fn f08_majority_council_order_applied() {
+    let node = spawn_daemon("f08-a");
+    let members = [key(0x81), key(0x82), key(0x83)];
+    let out = council_cli(&node, &council_init_args(&members, 2));
+    assert!(out.status.success(), "{}", combined(&out));
+    let order = council_order(&[&members[0], &members[1]], ban_ip(81));
     let resp = send(
         &key(0x84),
         &node,
         MeshWireRequest::BroadcastEvictionOrder(order),
     );
+    assert!(order_accepted(&resp), "{resp:?}\n{}", node.log_text());
+    gate_ran("trust_enforcement::f08_majority_council_order_applied");
+}
+
+/// F-08 reject: a 1-of-3 council (below a majority) is refused at init, so no manifest exists and
+/// an order signed by one member alone is refused.
+#[test]
+fn f08_below_majority_quorum_refused() {
+    let node = spawn_daemon("f08-r");
+    let members = [key(0x81), key(0x82), key(0x83)];
+    let out = council_cli(&node, &council_init_args(&members, 1));
+    let text = combined(&out);
+    assert!(!out.status.success(), "{text}");
     assert!(
-        order_accepted(&resp),
-        "gap: 1-of-3 order accepted: {resp:?}"
+        text.contains("reject.council_quorum_below_majority"),
+        "{text}"
     );
-    gate_ran("trust_enforcement::repro_f08_quorum_below_majority_accepted");
+    let order = council_order(&[&members[0]], ban_ip(81));
+    let resp = send(
+        &key(0x84),
+        &node,
+        MeshWireRequest::BroadcastEvictionOrder(order),
+    );
+    assert!(!order_accepted(&resp), "{resp:?}");
+    gate_ran("trust_enforcement::f08_below_majority_quorum_refused");
+}
+
+/// Local owner (1-of-1) applies only on the signing node: a peer with a 2-of-3 council refuses an
+/// order signed by the sender's own key, like any order without a manifest quorum.
+#[test]
+fn council_peer_refuses_another_nodes_local_owner_order() {
+    let node = spawn_daemon("f08-lo");
+    let members = [key(0x81), key(0x82), key(0x83)];
+    let out = council_cli(&node, &council_init_args(&members, 2));
+    assert!(out.status.success(), "{}", combined(&out));
+    let sender = key(0x85);
+    let order = council_order(&[&sender], ban_ip(85));
+    let resp = send(
+        &sender,
+        &node,
+        MeshWireRequest::BroadcastEvictionOrder(order),
+    );
+    assert!(!order_accepted(&resp), "{resp:?}");
 }
 
 /// F-24 issuer policy accept: an admitted sender's blinded put with a voucher issued by a ring

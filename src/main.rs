@@ -140,6 +140,7 @@ fn command_needs_network_discovery(cmd: &Commands) -> bool {
             | Commands::Scrub
             | Commands::Token { .. }
             | Commands::Wot { .. }
+            | Commands::Council { .. }
             | Commands::Gateway { .. }
     )
 }
@@ -286,6 +287,10 @@ async fn main() -> anyhow::Result<()> {
         return parvault::gateway::execute_token_cli(action, &cfg.data_dir);
     }
 
+    if let Commands::Council { action } = cli.command {
+        return cli::council::run(action, &cfg, public_mode);
+    }
+
     if let Commands::Gateway { opts, action } = cli.command {
         return parvault::gateway::execute_gateway_cli(opts, action, &cfg, cli.profile, &cli.peers)
             .await;
@@ -365,6 +370,7 @@ async fn main() -> anyhow::Result<()> {
         | Commands::NewSeedPhrase
         | Commands::Token { .. }
         | Commands::Wot { .. }
+        | Commands::Council { .. }
         | Commands::Gateway { .. } => {
             unreachable!("handled above")
         }

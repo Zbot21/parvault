@@ -23,7 +23,7 @@ Status values:
 | F-05 | High | Public-commons PoW admission has no wire carrier and no production caller. | 2b | Fixed (QA pending): `AdmitPublicTicket`, `public_ticket_decision`, claim F-05 |
 | F-06 | High | The PoR audit loop is not wired: nothing issues challenges or verifies responses. | 2c | Read |
 | F-07 | High | Earned tiers are self-credited by the seed answering its own challenges. | 2c | Fixed (QA pending): no network path credits a node for answering (the `on_por_pass` hook, the blinded-read credit and the fabricated peer count are gone); standing is self-reported in status and telemetry (L-29). `simulate_por_heartbeats` remains for the self-test only |
-| F-08 | High | The eviction council is local TOFU state with no membership epoch; quorum can be configured below majority. | 2c | Reported |
+| F-08 | High | The eviction council is local TOFU state with no membership epoch; quorum can be configured below majority. | 2c | Fixed (QA pending): a signed, epoch-versioned council manifest is the only council source (`council_from_manifest`); `council_manifest_decision` enforces a strict majority and the epoch chain (claim F-08). Env, config and seed-flag council inputs are removed. Residual: an equivocating quorum can fork epoch n+1 (F-39). |
 | F-09 | Medium | Eviction orders: `issued_at_ms` unchecked, expiry `0` permanent, replay FIFO rolls over. | 2c | Reported |
 | F-10 | Medium | The DHT reader does not bind `owner_pubkey` (a squatted `u64::MAX` wins); a raw Kademlia `put` bypasses the monotonic store. | 2b | Fixed (QA pending): reader bound to its own identity (`dht_candidate_decision`, claim F-10a); a post-quantum manifest has no owner binding yet, so the reader refuses it (`reject.dht_owner_unbindable`, fail closed; wire test `pqdht_unbindable_pq_manifest_refused`); Kademlia records filtered (`kad_record_decision`, claim F-10b) |
 | F-11 | Medium | `--no-lan-discovery` does not disable mDNS; mDNS peers enter Kademlia with no admission check. | 2b | Fixed (QA pending): `--no-lan-discovery` turns mDNS off without changing the Kademlia mode; mDNS never feeds Kademlia, admission does (`kad_routing_decision`, claim F-11) |
@@ -93,6 +93,7 @@ Claim lines in `.enforcement.map` use the finding id, or the finding id with a s
 | F-10b | F-10, inbound Kademlia records. |
 | F-24-ONION | F-24 admission at onion final delivery, single-layer branch (forwarding is admitted too since F-33). |
 | F-33 | Onion relay entry needs an admitted sender (L-38). |
+| F-39 | Low | A quorum of council epoch n can sign two different epoch n+1 manifests; nodes keep the successor they install first, and no node can prove the fork to another. | 2c | Accepted for v0.5.0 (documented in ADR-26); equivocation evidence is v0.6.0 |
 | F-33-BUDGET | Per-sender and total in-flight forward budget at a relay. |
 | F-24-LAYERED | F-24 admission at onion final delivery, layered branch (`open_final_target_pq`). |
 | F-25-DHT | F-25 admission for `PutDhtEnvelope`. |

@@ -21,6 +21,13 @@ ValidSigners(Order) = ({issuer_pubkey} union {cosigner_k}) intersect TrustedCoun
 Authorized(Order)   <=> |ValidSigners(Order)| >= M  AND  now_ms <= expires_at_ms
 ```
 
+### Council manifest (v0.5.0, F-08)
+
+- The council is a signed, epoch-versioned `CouncilManifest { scope_root, epoch, members, quorum, issued_at_ms, signatures }` (`storage::council`), not config, env or CLI input. Epoch 1 is signed by the scope root, which follows the node's mode: in private mode the ring genesis (no public tracker authority affects a private ring); in public mode the pinned tracker admin key, and on a public seed its own tracker admin key. Epoch `n + 1` needs a quorum of epoch `n`'s members and the same scope root. `council_manifest_decision` refuses fewer than one or more than 64 members, a quorum that is not a strict majority (`reject.council_quorum_below_majority`), and any break in the chain (`reject.council_epoch_chain`).
+- One resolver, `council_from_manifest`, serves the daemon, the seed and the seed admin RPC. With no manifest, a node accepts no council orders. `PARVAULT_EVICTION_AUTHORITIES`, `PARVAULT_TRACKER_EVICTION_QUORUM`, the config keys `eviction_authorities` / `tracker_eviction_quorum` and the seed flags `--council-pubkeys` / `--council-quorum` are removed.
+- **Local owner (1-of-1).** An order signed by the receiving node's own key applies on that node only. No other node counts that key, so a peer receiving the order refuses it like any order without a manifest quorum.
+- **Known limit: equivocation.** A quorum of epoch `n` that signs two different epoch `n + 1` manifests forks the council: each node keeps the successor it installs first, and no node can prove the equivocation to another. Registered in `docs/security/TRUST_FINDINGS.md`.
+
 ## Consequences & Verification
 
 - **Consequences:** Eliminates false-positive framing ($2^{-128}$), VPS admin-key theft, private-ring overreach, and single-operator rogue takedowns.

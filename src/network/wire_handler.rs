@@ -11,7 +11,6 @@ use crate::crypto::{HybridKemKeypair, NodeIdentity};
 use crate::network::behaviour::{
     DhtEnvelopeKind, DhtWireEnvelope, MeshWireRequest, MeshWireResponse,
 };
-use crate::network::discovery::KnownPeersStore;
 use crate::network::wan_rendezvous::{
     open_public_tracker_card, reflect_observed_wan_multiaddr, WanRendezvousRegistry,
     PUBLIC_COMMONS_SWARM_SLOT,
@@ -19,8 +18,7 @@ use crate::network::wan_rendezvous::{
 use crate::network::wot::WebOfTrustRegistry;
 use crate::por::PorVerifierEngine;
 use crate::storage::{
-    BlockStore, PrivacyPreservingEvictionEngine, PublicTrackerTakedownQueue,
-    SignedBadActorEvictionOrder, VoucherNullifierLedger,
+    BlockStore, PrivacyPreservingEvictionEngine, PublicTrackerTakedownQueue, VoucherNullifierLedger,
 };
 use libp2p::Multiaddr;
 use std::net::IpAddr;
@@ -47,67 +45,6 @@ fn now_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Resolves the eviction council and quorum for a `parvault-seed` node.
-pub fn resolve_seed_council_and_quorum(
-    data_dir: &Path,
-    mode: SeedServerMode,
-    local_tracker_admin_pubkey: Option<[u8; 32]>,
-    extra_council_pubkeys: &[[u8; 32]],
-    cli_quorum_override: Option<usize>,
-    genesis_pubkey: Option<[u8; 32]>,
-) -> (Vec<[u8; 32]>, usize) {
-    let mut council = Vec::new();
-    let mut push_pk = |pk: [u8; 32]| {
-        if pk != [0u8; 32] && !council.contains(&pk) {
-            council.push(pk);
-        }
-    };
-    if let Ok(env_auth) = std::env::var("PARVAULT_EVICTION_AUTHORITIES") {
-        for part in env_auth.split(',') {
-            if let Ok(bytes) = hex::decode(part.trim()) {
-                if bytes.len() == 32 {
-                    let mut pk = [0u8; 32];
-                    pk.copy_from_slice(&bytes);
-                    push_pk(pk);
-                }
-            }
-        }
-    }
-    let env_quorum = std::env::var("PARVAULT_TRACKER_EVICTION_QUORUM")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok());
-    let quorum_override = cli_quorum_override.or(env_quorum);
-
-    match mode {
-        SeedServerMode::PublicNetworkBootstrapper => {
-            if let Some(pk) = local_tracker_admin_pubkey {
-                push_pk(pk);
-            }
-            for pk in extra_council_pubkeys {
-                push_pk(*pk);
-            }
-            if !data_dir.as_os_str().is_empty() {
-                for pk in KnownPeersStore::load(data_dir).pinned_tracker_admin_pubkeys() {
-                    push_pk(pk);
-                }
-            }
-            let min_quorum = quorum_override
-                .unwrap_or_else(|| {
-                    SignedBadActorEvictionOrder::default_tracker_quorum_threshold(council.len())
-                })
-                .max(1);
-            (council, min_quorum)
-        }
-        SeedServerMode::HomelabRedundancyVault => {
-            if let Some(pk) = genesis_pubkey {
-                push_pk(pk);
-            }
-            let min_quorum = quorum_override.unwrap_or(1).max(1);
-            (council, min_quorum)
-        }
-    }
-}
-
 /// State borrowed by the daemon wire handler for one request.
 pub struct DaemonWireHandlerCtx<'a> {
     pub cfg: &'a NodeConfig,
@@ -130,9 +67,6 @@ pub struct SeedWireHandlerCtx<'a> {
     pub data_dir: &'a Path,
     pub node_identity: &'a NodeIdentity,
     pub advertised_admin_pk: Option<[u8; 32]>,
-    pub local_tracker_admin_pk: Option<[u8; 32]>,
-    pub extra_council_pks: &'a [[u8; 32]],
-    pub council_quorum: Option<usize>,
     pub max_probationary_lease_bytes: u64,
     pub genesis_pubkey: Option<[u8; 32]>,
     pub block_store: &'a BlockStore,
@@ -163,6 +97,16 @@ pub fn handle_daemon_wire_request(
         public_mode: ctx.public_mode,
     };
     let state = WireState {
+        data_dir: &ctx.cfg.data_dir,
+        council_root: crate::storage::council::council_scope_root(
+            &ctx.cfg.data_dir,
+            ctx.genesis_pubkey,
+            ctx.public_mode,
+            &ctx.block_store
+                .mesh_client()
+                .map(|mc| mc.pinned_tracker_admin_pubkeys())
+                .unwrap_or_default(),
+        ),
         node_identity: ctx.node_identity,
         genesis_pubkey: ctx.genesis_pubkey,
         block_store: ctx.block_store,
@@ -191,14 +135,17 @@ pub fn handle_seed_wire_request(
     ctx: SeedWireHandlerCtx<'_>,
 ) -> WireReply {
     let policy = SeedWirePolicy {
-        data_dir: ctx.data_dir,
         advertised_admin_pk: ctx.advertised_admin_pk,
-        local_tracker_admin_pk: ctx.local_tracker_admin_pk,
-        extra_council_pks: ctx.extra_council_pks,
-        council_quorum: ctx.council_quorum,
         max_probationary_lease_bytes: ctx.max_probationary_lease_bytes,
     };
     let state = WireState {
+        data_dir: ctx.data_dir,
+        // A public seed's council is rooted at its own tracker admin key; a homelab seed's at
+        // its ring genesis.
+        council_root: match ctx.server.mode() {
+            SeedServerMode::PublicNetworkBootstrapper => ctx.advertised_admin_pk,
+            SeedServerMode::HomelabRedundancyVault => ctx.genesis_pubkey,
+        },
         node_identity: ctx.node_identity,
         genesis_pubkey: ctx.genesis_pubkey,
         block_store: ctx.block_store,
@@ -244,6 +191,10 @@ impl<'a> WirePeer<'a> {
 
 /// Node state the handler reads and mutates for one request.
 pub struct WireState<'a> {
+    /// Where the council manifest lives (`council_from_manifest`).
+    pub data_dir: &'a Path,
+    /// This role's council scope root (`council_scope_root`), resolved at the entry point.
+    pub council_root: Option<[u8; 32]>,
     pub node_identity: &'a NodeIdentity,
     pub genesis_pubkey: Option<[u8; 32]>,
     pub block_store: &'a BlockStore,
@@ -270,7 +221,7 @@ pub struct WireState<'a> {
 /// | 16, 17 | Register / Lookup rendezvous | `tracker_admin_pubkey: None` | advertised admin key |
 /// | 16 | Register on the public slot | no extra record | records every advertised card IP |
 /// | 18 | `SubmitAbuseTakedownReport` | always queued | refused unless public bootstrapper |
-/// | 19 | `BroadcastEvictionOrder` | `NodeConfig` council resolver | `resolve_seed_council_and_quorum` |
+/// | 19 | `BroadcastEvictionOrder` | identical since F-08: `council_from_manifest` | identical |
 pub trait WireRolePolicy {
     /// Row 2.
     fn record_put_shard_admission_ip(&self) -> bool;
@@ -286,13 +237,6 @@ pub trait WireRolePolicy {
     fn record_public_card_ips(&self) -> bool;
     /// Row 18: `Err(reason)` refuses the report before it reaches the queue.
     fn takedown_gate(&self, mode: SeedServerMode) -> Result<(), String>;
-    /// Row 19: the eviction council and minimum quorum.
-    fn eviction_council(
-        &self,
-        block_store: &BlockStore,
-        mode: SeedServerMode,
-        genesis_pubkey: Option<[u8; 32]>,
-    ) -> (Vec<[u8; 32]>, usize);
 }
 
 /// Policy of the `parvault` daemon.
@@ -302,12 +246,8 @@ pub struct DaemonWirePolicy<'a> {
 }
 
 /// Policy of `parvault-seed`. Built per request from live seed state.
-pub struct SeedWirePolicy<'a> {
-    pub data_dir: &'a Path,
+pub struct SeedWirePolicy {
     pub advertised_admin_pk: Option<[u8; 32]>,
-    pub local_tracker_admin_pk: Option<[u8; 32]>,
-    pub extra_council_pks: &'a [[u8; 32]],
-    pub council_quorum: Option<usize>,
     pub max_probationary_lease_bytes: u64,
 }
 
@@ -333,30 +273,9 @@ impl WireRolePolicy for DaemonWirePolicy<'_> {
     fn takedown_gate(&self, _mode: SeedServerMode) -> Result<(), String> {
         Ok(())
     }
-    fn eviction_council(
-        &self,
-        block_store: &BlockStore,
-        _mode: SeedServerMode,
-        genesis_pubkey: Option<[u8; 32]>,
-    ) -> (Vec<[u8; 32]>, usize) {
-        let mut pinned_admins =
-            KnownPeersStore::load(&self.cfg.data_dir).pinned_tracker_admin_pubkeys();
-        if let Some(mc) = block_store.mesh_client() {
-            for pk in mc.pinned_tracker_admin_pubkeys() {
-                if !pinned_admins.contains(&pk) {
-                    pinned_admins.push(pk);
-                }
-            }
-        }
-        self.cfg.resolve_eviction_council_and_quorum(
-            genesis_pubkey,
-            &pinned_admins,
-            self.public_mode,
-        )
-    }
 }
 
-impl WireRolePolicy for SeedWirePolicy<'_> {
+impl WireRolePolicy for SeedWirePolicy {
     fn record_put_shard_admission_ip(&self) -> bool {
         true
     }
@@ -380,21 +299,6 @@ impl WireRolePolicy for SeedWirePolicy<'_> {
             return Err("abuse takedown queue disabled in homelab-vault private mode".to_string());
         }
         Ok(())
-    }
-    fn eviction_council(
-        &self,
-        _block_store: &BlockStore,
-        mode: SeedServerMode,
-        genesis_pubkey: Option<[u8; 32]>,
-    ) -> (Vec<[u8; 32]>, usize) {
-        resolve_seed_council_and_quorum(
-            self.data_dir,
-            mode,
-            self.local_tracker_admin_pk,
-            self.extra_council_pks,
-            self.council_quorum,
-            genesis_pubkey,
-        )
     }
 }
 
@@ -925,8 +829,10 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
         return rejection;
     }
     let WireState {
+        data_dir,
+        council_root,
         node_identity,
-        genesis_pubkey,
+        genesis_pubkey: _,
         block_store,
         server,
         wot,
@@ -1836,8 +1742,9 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
             }
         }
         MeshWireRequest::BroadcastEvictionOrder(order) => {
+            // One resolver for both roles (F-08): the installed, signed council manifest.
             let (council, min_quorum) =
-                policy.eviction_council(block_store, server.mode(), genesis_pubkey);
+                crate::storage::council::council_members_and_quorum(data_dir, council_root);
             let local_pk = node_identity.public_key_bytes();
             match eviction.apply_signed_eviction_order_with_quorum(
                 &order,
@@ -2079,13 +1986,15 @@ mod tests {
                 true,
             ),
             (
-                MeshWireRequest::BroadcastEvictionOrder(SignedBadActorEvictionOrder::issue(
-                    &id,
-                    EvictionTarget::BlindedLocator([9; 32]),
-                    "t",
-                    1,
-                    0,
-                )),
+                MeshWireRequest::BroadcastEvictionOrder(
+                    crate::storage::SignedBadActorEvictionOrder::issue(
+                        &id,
+                        EvictionTarget::BlindedLocator([9; 32]),
+                        "t",
+                        1,
+                        0,
+                    ),
+                ),
                 "EvictionOrderAck",
                 true,
             ),

@@ -1763,6 +1763,24 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
 
     // Pre-generate tracker_admin.seed so we know its pubkey for assertions
     let tracker_admin_id = load_or_generate_tracker_admin_identity(&tracker_dir).unwrap();
+    // F-08: the tracker admin signs epoch 1 of a 1-of-1 council; the tracker (its own admin key)
+    // and the public daemon (which pins that key at registration) install it.
+    let mut admin_council = parvault::storage::council::CouncilManifest::new(
+        tracker_admin_id.public_key_bytes(),
+        1,
+        vec![tracker_admin_id.public_key_bytes()],
+        1,
+        1,
+    );
+    admin_council.sign(&tracker_admin_id);
+    for d in [&tracker_dir, &pub_daemon_dir] {
+        parvault::storage::council::install_council_manifest(
+            d,
+            &admin_council,
+            tracker_admin_id.public_key_bytes(),
+        )
+        .expect("install the tracker admin's council");
+    }
 
     let mut guards = ChildGuard::new();
     guards.push(
@@ -2235,14 +2253,33 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
         listen_tcp: council_daemon_maddr.clone(),
         lan_discovery_enabled: false,
         trust_mode: TrustPoolMode::PublicCommons,
-        eviction_authorities: vec![
-            hex::encode(op1_id.public_key_bytes()),
-            hex::encode(op2_id.public_key_bytes()),
-            hex::encode(op3_id.public_key_bytes()),
-        ],
-        tracker_eviction_quorum: None, // Automatic `default_tracker_quorum_threshold(3)` == 2!
         ..NodeConfig::default()
     };
+    // The council is a signed manifest (F-08): op1 is the pinned public-mode scope root and signs
+    // epoch 1 of a 2-of-3 council of the three operators.
+    fs::write(
+        council_daemon_dir.join("pinned_tracker_admins.json"),
+        format!("[\"{}\"]", hex::encode(op1_id.public_key_bytes())),
+    )
+    .unwrap();
+    let mut council_manifest = parvault::storage::council::CouncilManifest::new(
+        op1_id.public_key_bytes(),
+        1,
+        vec![
+            op1_id.public_key_bytes(),
+            op2_id.public_key_bytes(),
+            op3_id.public_key_bytes(),
+        ],
+        2,
+        1,
+    );
+    council_manifest.sign(&op1_id);
+    parvault::storage::council::install_council_manifest(
+        &council_daemon_dir,
+        &council_manifest,
+        op1_id.public_key_bytes(),
+    )
+    .expect("install the 2-of-3 council manifest");
     council_cfg.min_free_disk_bytes = 64 * 1024 * 1024;
     let council_cfg_path = council_daemon_dir.join("config.toml");
     fs::write(

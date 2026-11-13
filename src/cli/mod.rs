@@ -1,6 +1,7 @@
 //! Command implementations of the `parvault` binary, moved verbatim out of `main.rs`.
 
 pub(crate) mod abuse;
+pub(crate) mod council;
 pub(crate) mod daemon;
 pub(crate) mod daemon_cmds;
 pub(crate) mod early;
