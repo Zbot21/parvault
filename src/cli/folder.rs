@@ -41,6 +41,38 @@ pub(crate) async fn diff_folder(env: CliEnv, command: Commands) -> anyhow::Resul
 /// reported NOT backed up.
 pub(crate) const LITE_SYNDICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// B-SEED-SYND (L-46): waits before each retry of a stripe the seed refused as busy
+/// (`reject.syndication_busy`); after the last one the stripe stays "not backed up" for the next
+/// pass.
+pub(crate) const SYNDICATION_BUSY_BACKOFF: [std::time::Duration; 3] = [
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(10),
+];
+
+/// Runs `attempt`, retrying after each `SYNDICATION_BUSY_BACKOFF` wait while the seed answers
+/// busy; any other result (success or another error) returns at once.
+pub(crate) fn with_busy_backoff<T>(
+    mut attempt: impl FnMut() -> anyhow::Result<T>,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> anyhow::Result<T> {
+    let mut waits = SYNDICATION_BUSY_BACKOFF.iter();
+    loop {
+        match attempt() {
+            Err(e)
+                if e.to_string()
+                    .contains(parvault::network::server_events::SYNDICATION_BUSY_TEXT) =>
+            {
+                match waits.next() {
+                    Some(wait) => sleep(*wait),
+                    None => return Err(e),
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
 /// The client for `SyndicateLiteStripe` to the seed only: `base` with
 /// `LITE_SYNDICATION_TIMEOUT`. The timeout is per request, so `base` (used for the manifest and
 /// snapshot DHT puts to every mesh endpoint) keeps the default.
@@ -258,11 +290,18 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                                     Vec::new(),
                                     snap.tier,
                                 );
-                                match syndication_client.syndicate_lite_stripe_with_grant(
-                                    &seed_str,
-                                    cert.clone(),
-                                    bundle,
-                                    Some(grant),
+                                // B-SEED-SYND (L-46): a busy seed is retried after 2, 5
+                                // and 10 s, then the stripe is left for the next pass.
+                                match with_busy_backoff(
+                                    || {
+                                        syndication_client.syndicate_lite_stripe_with_grant(
+                                            &seed_str,
+                                            cert.clone(),
+                                            bundle.clone(),
+                                            Some(grant.clone()),
+                                        )
+                                    },
+                                    std::thread::sleep,
                                 ) {
                                     Err(e) => tracing::error!(
                                         code = "error.lite_syndication_failed",
@@ -689,6 +728,51 @@ pub(crate) async fn recover_from_seed(env: CliEnv, command: Commands) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn busy() -> anyhow::Error {
+        anyhow::anyhow!(
+            "SyndicateLiteStripe rejected: Some({:?})",
+            parvault::network::server_events::SYNDICATION_BUSY_TEXT
+        )
+    }
+
+    /// B-SEED-SYND: a busy seed is retried after 2, 5 and 10 s, then given up; other errors and
+    /// success return at once.
+    #[test]
+    fn busy_seed_backoff_schedule() {
+        use std::time::Duration;
+        // Busy three times, then accepted: three waits, 2/5/10 s, then Ok.
+        let mut calls = 0;
+        let mut slept = Vec::new();
+        let r = with_busy_backoff(
+            || {
+                calls += 1;
+                if calls <= 3 {
+                    Err(busy())
+                } else {
+                    Ok(calls)
+                }
+            },
+            |d| slept.push(d),
+        );
+        assert_eq!(r.unwrap(), 4);
+        assert_eq!(slept, [2, 5, 10].map(Duration::from_secs).to_vec());
+        // Busy every time: three waits, then the busy error.
+        let mut slept = Vec::new();
+        let r: anyhow::Result<()> = with_busy_backoff(|| Err(busy()), |d| slept.push(d));
+        assert!(r.is_err() && slept.len() == 3);
+        // Another error: no retry.
+        let mut slept = Vec::new();
+        let mut calls = 0;
+        let r: anyhow::Result<()> = with_busy_backoff(
+            || {
+                calls += 1;
+                Err(anyhow::anyhow!("device cert does not name the sender"))
+            },
+            |d| slept.push(d),
+        );
+        assert!(r.is_err() && slept.is_empty() && calls == 1);
+    }
 
     /// Only the seed-syndication client waits `LITE_SYNDICATION_TIMEOUT`; the base client that
     /// carries the DHT puts keeps the default (QA 2e r3).
