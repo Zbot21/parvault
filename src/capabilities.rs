@@ -308,6 +308,26 @@ fn chain_caveat_tag(prev_tag: &[u8; 32], caveat: &Caveat) -> [u8; 32] {
     out
 }
 
+impl std::fmt::Debug for CapabilityMacaroon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapabilityMacaroon")
+            .field("nonce_id_prefix", &hex::encode(&self.nonce_id[..4]))
+            .field("caveats", &self.caveats)
+            .field("tag", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for MacaroonSliceView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MacaroonSliceView")
+            .field("nonce_id_prefix", &hex::encode(&self.nonce_id[..4]))
+            .field("caveats", &self.caveats)
+            .field("tag", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
 /// F-43 (L-44 item 4): whether `child` is `parent` itself or an offline attenuation of it,
 /// checked without the root key. Same `nonce_id` and `issuer_fingerprint`; `child`'s caveats begin
 /// with exactly `parent`'s; at most `MAX_MACAROON_CAVEATS` in total; `child`'s tag equals the chain
@@ -364,7 +384,8 @@ pub const fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
 
 /// Borrowed zero-allocation view over a [`CapabilityMacaroon`] used by in-RAM slice verifiers
 /// and Kani formal proof harnesses.
-#[derive(Debug, Clone, Copy)]
+/// `Debug` is manual and redacts the tag, as for [`CapabilityMacaroon`].
+#[derive(Clone, Copy)]
 pub struct MacaroonSliceView<'a> {
     pub nonce_id: &'a [u8; 32],
     pub issuer_fingerprint: &'a [u8; 32],
@@ -379,7 +400,9 @@ pub type DecodedCompactMacaroon<const MAX_C: usize> =
 
 /// HMAC-SHA256 chained capability token enabling zero-knowledge, `< 1 ms` RAM-only authorization
 /// of constrained manifest and byte-range reads without sharing `MasterKey` or `root_key`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `Debug` is manual and redacts the tag (the bearer secret) so a stray `{:?}` cannot leak a
+/// usable token (F-43, L-44 item 8).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityMacaroon {
     pub nonce_id: [u8; 32],
     pub issuer_fingerprint: [u8; 32],
@@ -1416,6 +1439,16 @@ mod f43_attenuation_tests {
         assert!(is_attenuation_of(&p, &grandchild));
         assert!(p.tag_valid(&K) && grandchild.tag_valid(&K));
         assert!(!p.tag_valid(&[0x44; 32]));
+    }
+
+    /// L-44 item 8: `{:?}` of a token never prints its tag (or its full nonce).
+    #[test]
+    fn debug_redacts_the_tag() {
+        let p = parent();
+        let text = format!("{p:?} {:?}", p.attenuate(Caveat::ReadOnly).unwrap());
+        assert!(!text.contains(&hex::encode(p.tag)), "{text}");
+        assert!(!text.contains(&hex::encode(p.nonce_id)), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
     }
 
     #[test]
