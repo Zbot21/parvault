@@ -586,6 +586,11 @@ pub const HANDSHAKE_REFUSED_TEXT: &str = "handshake refused";
 pub fn handshake_refusal_code(err: &crate::network::wot::WebOfTrustError) -> &'static str {
     match err {
         crate::network::wot::WebOfTrustError::QuarantinedSubtree => "reject.handshake_quarantined",
+        // The code comes from its declared check, so it is built in one place (F-37).
+        crate::network::wot::WebOfTrustError::NoRing => {
+            crate::network::wot::WebOfTrustRegistry::ring_handshake_decision(None)
+                .expect_err("no genesis is always refused")
+        }
         _ => "reject.handshake_chain_invalid",
     }
 }
