@@ -92,7 +92,7 @@ Status values:
 | E-BREAD | `GetBlindedShard` serves bytes only for the lease's capability key, this locator, a fresh token and a valid signature (`blinded_read_decision`, F-40). | Claim (2c item 5). |
 | E-ABUSE | `SubmitAbuseTakedownReport` queues only a reporter-signed report with a working burden of proof (`abuse_report_decision`). | Claim (2c item 5). |
 | E-COUNCIL | `GetCouncilManifest` answers only admitted peers (`admission_decision`). | Claim (2c item 5). |
-| D-ADR | Every accepted ADR is a claim's `adr=` or has a `noenforce` line. | Open (2c). |
+| D-ADR | Every accepted ADR is a claim's `adr=` or has a `noenforce` line. | Passes (2c): per the architect's ruling on `architecture/plans/2c-dadr-classification.md`; ADR-09 is `noenforce` (no wire input slashes in v0.5.0) with the S-GUARD Kani line, a deviation on the architect's sign-off list. |
 | A-DOCKER | `scripts/docker_acceptance_gate.sh` stages binaries through `stage_artifact.sh`. | Open; converted before item 7. |
 | B-DISC | `src/network/discovery.rs` has three `std::thread::sleep` calls (LAN beacon and probe loops); review whether any runs on the async runtime. | Closed (2c, QA pending): two run on the beacon responder's dedicated thread; the third is reached from the swarm only through the onion forward, which runs on the blocking pool since F-18. `discovery.rs` is exempt; the `no-blocking` check now covers the handler modules (`wire_handler.rs`, `server_events.rs`, `cli/daemon.rs`). |
 | T-SPECS | Every spec passes the non-vacuity lint and every `INVARIANT` has a QA-authored mutant (P-02, P-04). | Open (2d-β). |
@@ -127,6 +127,7 @@ Claim lines in `.enforcement.map` use the finding id, or the finding id with a s
 | G-MAC | Info | D-ADR claim for ADR-28: a gateway read frame whose attenuated macaroon is outside its caveat is refused, per frame (`gateway_macaroon_decision`). | 2c | Enforced (QA pending) |
 | G-SEAL | Info | D-ADR claim for ADR-32: under `--require-sealed-memfd` an unsealed ingest memfd is refused (`gateway_memfd_seal_decision`). | 2c | Enforced (QA pending) |
 | G-UID | Info | D-ADR claim for ADR-32: under `--allow-peer-uid` a client whose `SO_PEERCRED` UID is not listed is refused (`gateway_peer_uid_decision`). | 2c | Enforced (QA pending) |
+| S-GUARD | Info | D-ADR `kani` line for ADR-09: `proof_slash_guard_protects_genesis_and_self` (the genesis and the node's own keys are never slash targets). ADR-09 is `noenforce`: no wire input slashes in v0.5.0 (architect sign-off list). | 2c | Kani line (2c) |
 | S-SANITIZE | Info | D-ADR `kani` line for ADR-33: `proof_sanitize_sync_relative_path_no_traversal` now covers a rejected `..` segment and an accepted nested path (ADR-33 itself is linked by claim F-43-ADR33). | 2c | Enforced (QA pending; Kani not yet run) |
 | F-33-BUDGET | Per-sender and total in-flight forward budget at a relay. |
 | F-24-LAYERED | F-24 admission at onion final delivery, layered branch (`open_final_target_pq`). |

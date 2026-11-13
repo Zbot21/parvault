@@ -1296,3 +1296,15 @@ fn proof_webdav_auth_decision() {
         token_valid && !allowed
     );
 }
+
+/// ADR-09 / F-01: the slash guard never lets the genesis or the node's own keys be slashed.
+#[kani::proof]
+fn proof_slash_guard_protects_genesis_and_self() {
+    let facts = crate::network::wot::SlashTargetFacts {
+        is_genesis: kani::any(),
+        is_protected: kani::any(),
+    };
+    let decision = crate::network::wot::WebOfTrustRegistry::slash_target_decision(&facts);
+    kani::cover!(decision.is_err(), "protected key not slashed");
+    assert_eq!(decision.is_ok(), !facts.is_genesis && !facts.is_protected);
+}
