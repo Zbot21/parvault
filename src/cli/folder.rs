@@ -256,6 +256,9 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                                     } else {
                                         vec![seed_str.clone(); stripe_meta.shard_hashes.len()]
                                     };
+                                    // Every shard is now on the seed or its peers (QA 2e M2).
+                                    store_with_net
+                                        .forget_local_only_stripe(&stripe_meta.stripe_merkle_root);
                                     for (idx, &sh_hash) in
                                         stripe_meta.shard_hashes.iter().enumerate()
                                     {
