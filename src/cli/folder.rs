@@ -36,6 +36,21 @@ pub(crate) async fn diff_folder(env: CliEnv, command: Commands) -> anyhow::Resul
 }
 
 /// The recovery phrase from `--seed-phrase` or `PARVAULT_SEED_PHRASE`, if any.
+/// How long a lite client waits for a seed to ack one `SyndicateLiteStripe`. The seed
+/// erasure-encodes, checks (F-38-GRANT, every shard) and stores the whole stripe before it acks,
+/// so the client default (1.2 s) times out on a slow or loaded seed and the stripe is then
+/// reported NOT backed up.
+pub(crate) const LITE_SYNDICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The client a lite client syndicates stripes to its seed with, sending as `owner_identity`.
+pub(crate) fn lite_syndication_client(
+    owner_identity: NodeIdentity,
+    endpoints: Vec<String>,
+    seed: String,
+) -> MeshClient {
+    MeshClient::new(owner_identity, endpoints, Some(seed)).with_timeout(LITE_SYNDICATION_TIMEOUT)
+}
+
 pub(crate) fn effective_seed_phrase(arg: Option<String>) -> Option<String> {
     arg.or_else(|| std::env::var("PARVAULT_SEED_PHRASE").ok())
         .map(|s| s.trim().to_string())
@@ -187,10 +202,10 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                 // device cert to name the sender, so send as the vault owner identity that signs
                 // the grant. Its id is the Vault Device Peer ID `parvault identity --seed-phrase`
                 // prints. Only the seed is contacted for syndication.
-                let net_client = MeshClient::new(
+                let net_client = lite_syndication_client(
                     owner_identity.clone(),
                     mesh_client.all_network_endpoints(),
-                    Some(seed_str.clone()),
+                    seed_str.clone(),
                 )
                 .with_data_dir_discovery(cfg.data_dir.clone(), lan_port);
                 let store_with_net = block_store.clone().with_mesh_client(net_client.clone());
@@ -668,4 +683,25 @@ pub(crate) async fn recover_from_seed(env: CliEnv, command: Commands) -> anyhow:
         println!("Files Restored     : {}", recovered_count);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The seed-syndication client waits `LITE_SYNDICATION_TIMEOUT`, not the 1.2 s default.
+    #[test]
+    fn lite_syndication_client_uses_the_long_timeout() {
+        let client = lite_syndication_client(
+            NodeIdentity::from_seed([0x31; 32]),
+            Vec::new(),
+            "/ip4/127.0.0.1/tcp/1".to_string(),
+        );
+        assert_eq!(client.request_timeout(), LITE_SYNDICATION_TIMEOUT);
+        assert!(
+            LITE_SYNDICATION_TIMEOUT
+                > MeshClient::new(NodeIdentity::from_seed([0x32; 32]), Vec::new(), None)
+                    .request_timeout()
+        );
+    }
 }
