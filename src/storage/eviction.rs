@@ -1601,8 +1601,15 @@ struct PersistedEvictionIndexV1 {
 
 impl From<PersistedEvictionIndexV1> for PersistedEvictionIndex {
     fn from(v: PersistedEvictionIndexV1) -> Self {
-        // Legacy ids carry no expiry: kept for good (they may be permanent orders).
-        let seen_order_expiry_ms = vec![u64::MAX; v.seen_order_ids_fifo.len()];
+        // Legacy ids are dropped: they belong to `-v1:` orders, which no longer verify under
+        // the `-v2:` domain and so cannot be replayed; keeping them would only take capacity
+        // from the refuse-when-full cache.
+        if !v.seen_order_ids_fifo.is_empty() {
+            tracing::info!(
+                dropped = v.seen_order_ids_fifo.len(),
+                "dropped pre-v0.5.0 eviction replay ids (v1 orders no longer verify)"
+            );
+        }
         Self {
             blocked_ip_tags: v.blocked_ip_tags,
             blocked_subnet_tags: v.blocked_subnet_tags,
@@ -1614,8 +1621,8 @@ impl From<PersistedEvictionIndexV1> for PersistedEvictionIndex {
             blinded_shards: v.blinded_shards,
             pubkeys_by_ip_tag: v.pubkeys_by_ip_tag,
             pubkeys_by_subnet_tag: v.pubkeys_by_subnet_tag,
-            seen_order_ids_fifo: v.seen_order_ids_fifo,
-            seen_order_expiry_ms,
+            seen_order_ids_fifo: VecDeque::new(),
+            seen_order_expiry_ms: Vec::new(),
         }
     }
 }
@@ -2461,7 +2468,7 @@ impl PrivacyPreservingEvictionEngine {
         }
         self.replay_slot_check(order, now_ms)?;
         let report = self.evict_target_unpersisted(&order.target, block_store)?;
-        self.record_seen_order(order);
+        self.record_seen_order(order, now_ms);
 
         self.persist_index()?;
         Ok(report)
@@ -2509,7 +2516,7 @@ impl PrivacyPreservingEvictionEngine {
         }
         self.replay_slot_check(order, now_ms)?;
         let report = self.evict_target_unpersisted(&order.target, block_store)?;
-        self.record_seen_order(order);
+        self.record_seen_order(order, now_ms);
 
         self.persist_index()?;
         Ok(report)
@@ -2540,10 +2547,12 @@ impl PrivacyPreservingEvictionEngine {
         Ok(())
     }
 
-    /// Records an applied order's id until its expiry (`0`, permanent, is kept for good).
-    fn record_seen_order(&mut self, order: &SignedBadActorEvictionOrder) {
+    /// Records an applied order's id until its expiry. An order without one (`0`; only the
+    /// local trusted-authority path admits it) is kept for the longest order lifetime, so no id
+    /// holds a slot forever.
+    fn record_seen_order(&mut self, order: &SignedBadActorEvictionOrder, now_ms: u64) {
         let expiry = if order.expires_at_ms == 0 {
-            u64::MAX
+            now_ms.saturating_add(MAX_ORDER_LIFETIME_MS)
         } else {
             order.expires_at_ms
         };
@@ -3042,7 +3051,8 @@ mod tests {
     const GOLDEN_ORDER_V2_SIG_R: &str =
         "33d4dcdd4aa32a3a87d6347f676befe0bddbfaf1d5ab4c35301501cb8fc3baa8";
 
-    /// An index written before F-09 (no replay expiries) still loads; its ids are kept.
+    /// An index written before F-09 (no replay expiries) still loads; its replay ids (of `-v1:`
+    /// orders, which no longer verify) are dropped and take no capacity.
     #[test]
     fn legacy_eviction_index_loads() {
         #[derive(Serialize, Default)]
@@ -3062,15 +3072,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut v1 = V1::default();
         v1.blocked_pubkeys.insert([9; 32]);
-        v1.seen_order_ids_fifo.push_back([7; 32]);
+        for i in 0..MAX_SEEN_EVICTION_ORDER_IDS as u32 {
+            let mut id = [7u8; 32];
+            id[..4].copy_from_slice(&i.to_be_bytes());
+            v1.seen_order_ids_fifo.push_back(id);
+        }
         fs::write(
             dir.path().join("eviction_index.bin"),
             bounded_bincode_options().serialize(&v1).unwrap(),
         )
         .unwrap();
         let engine = PrivacyPreservingEvictionEngine::load_or_init(dir.path()).unwrap();
-        assert!(engine.seen_order_ids_set.contains(&[7; 32]));
-        assert_eq!(engine.index.seen_order_expiry_ms, vec![u64::MAX]);
+        assert!(engine.seen_order_ids_set.is_empty());
+        assert!(engine.index.seen_order_ids_fifo.is_empty());
+        assert!(engine.index.seen_order_expiry_ms.is_empty());
         assert!(engine.index.blocked_pubkeys.contains(&[9; 32]));
     }
 
