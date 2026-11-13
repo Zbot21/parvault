@@ -69,6 +69,8 @@ Global options (available on all subcommands):
 | `parvault wot invite` | `--peer <PUBKEY_HEX>` *(required)* | Prints a ring invitation token (the chain and the ring's genesis key) admitting that key. Needs the ring secret from `parvault wot init` (or `PARVAULT_GENESIS_SEED_HEX`). |
 | `parvault wot install-chain` | `--token <HEX>` *(required)* | Verifies the invitation against its ring key, pins that key (`ring_genesis.pub`) and installs the chain; the node then serves the ring and presents the chain before storing on ring peers. |
 
+> **Council re-pin (public mode):** after re-pinning to another tracker key, delete `<data_dir>/council_manifest.bin` and run `parvault council install` with the new tracker's manifest; until then the node has no council and accepts no council orders.
+
 ### 2.3 Continuous Folder Sync, Diff & Disaster Recovery
 | Command | Flags & Arguments | Description |
 | :--- | :--- | :--- |

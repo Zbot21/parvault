@@ -6236,3 +6236,18 @@ fn admin_key_never_persisted_on_seed() {
     }
     assert!(scanned > 0, "the seed wrote no files to scan");
 }
+
+/// Architect 2c sign-off check: the blinded id map survives a daemon restart, so a signed delete
+/// works afterwards (no re-put needed).
+#[test]
+fn f41_signed_delete_after_restart() {
+    let mut node = spawn_daemon("f41-restart");
+    let sender = key(0xC1);
+    let b = blinded(0x65, 512);
+    let cap = blinded_cap_identity(0x65, &b);
+    put_blinded_ok(&node, &sender, &b);
+    node.restart_daemon_without_wot_state();
+    let host = node.identity().public_key_bytes();
+    let resp = send(&sender, &node, blinded_delete(&b, &cap, host, now_ms()));
+    assert!(blinded_deleted(&resp), "{resp:?}\n{}", node.log_text());
+}
