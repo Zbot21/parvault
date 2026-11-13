@@ -194,11 +194,15 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                 let store_with_net = block_store.clone().with_mesh_client(net_client.clone());
                 let mut receipt_count = 0usize;
                 for entry in snap.files.values_mut() {
-                    let needs_syndication = entry
-                        .manifest
-                        .stripes
-                        .iter()
-                        .any(|s| !s.assigned_peers.iter().any(|p| is_network_peer_addr(p)));
+                    // A stripe with fewer than k shards on peers is not backed up (QA 2e M2-1).
+                    let backed_up = |s: &parvault::storage::StripeManifestEntry| {
+                        s.assigned_peers
+                            .iter()
+                            .filter(|p| is_network_peer_addr(p))
+                            .count()
+                            >= s.k_data
+                    };
+                    let needs_syndication = entry.manifest.stripes.iter().any(|s| !backed_up(s));
                     if !needs_syndication {
                         continue;
                     }
@@ -207,11 +211,7 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                         use std::io::{Read, Seek, SeekFrom};
                         let stripe_cap = entry.manifest.stripe_size_bytes.max(1024);
                         for stripe_meta in &mut entry.manifest.stripes {
-                            if stripe_meta
-                                .assigned_peers
-                                .iter()
-                                .any(|p| is_network_peer_addr(p))
-                            {
+                            if backed_up(stripe_meta) {
                                 continue;
                             }
                             let start = stripe_meta.stripe_index * (stripe_cap as u64);

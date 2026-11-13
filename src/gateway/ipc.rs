@@ -741,12 +741,27 @@ mod unix_impl {
             bytes_len: u64,
             retention: RetentionPolicy,
         ) -> anyhow::Result<EphemeralShardManifest> {
+            let (manifest, local_only_stripes) = self
+                .store_sealed_payload_fd_counted(fd, bytes_len, retention)
+                .await?;
+            crate::storage::local_only::note(local_only_stripes);
+            Ok(manifest)
+        }
+
+        /// Like [`Self::store_sealed_payload_fd`], returning the local-only stripe count.
+        pub async fn store_sealed_payload_fd_counted(
+            &self,
+            fd: RawFd,
+            bytes_len: u64,
+            retention: RetentionPolicy,
+        ) -> anyhow::Result<(EphemeralShardManifest, u64)> {
             let dup = crate::os_sys::dup_fd_cloexec(fd)?;
             if !crate::os_sys::has_immutable_memfd_seals(dup.as_fd())? {
                 crate::os_sys::seal_memfd_immutable(dup.as_fd())?;
             }
             drop(dup);
-            self.store_payload_fd(fd, bytes_len, retention).await
+            self.store_payload_fd_counted(fd, bytes_len, retention)
+                .await
         }
 
         /// Reconstructs the full payload identified by `ephemeral_shard_ids` directly into `output_fd` via `SCM_RIGHTS`.
@@ -801,11 +816,23 @@ mod unix_impl {
             bytes: &[u8],
             retention_policy: RetentionPolicy,
         ) -> anyhow::Result<EphemeralShardManifest> {
+            let (manifest, local_only_stripes) =
+                self.store_bytes_counted(bytes, retention_policy).await?;
+            crate::storage::local_only::note(local_only_stripes);
+            Ok(manifest)
+        }
+
+        /// Like [`Self::store_bytes`], returning the local-only stripe count.
+        pub async fn store_bytes_counted(
+            &self,
+            bytes: &[u8],
+            retention_policy: RetentionPolicy,
+        ) -> anyhow::Result<(EphemeralShardManifest, u64)> {
             let mfd = create_memfd_sized("parvault-store", bytes.len() as u64)?;
             let file = File::from(mfd);
             pwrite_all(&file, 0, bytes)?;
             let _ = crate::os_sys::seal_memfd_immutable(file.as_fd());
-            self.store_payload_fd(file.as_raw_fd(), bytes.len() as u64, retention_policy)
+            self.store_payload_fd_counted(file.as_raw_fd(), bytes.len() as u64, retention_policy)
                 .await
         }
 
@@ -1080,6 +1107,20 @@ mod unix_impl {
             bytes_len: u64,
             retention: RetentionPolicy,
         ) -> anyhow::Result<EphemeralShardManifest> {
+            let (manifest, local_only_stripes) = self
+                .store_sealed_payload_fd_counted(fd, bytes_len, retention)
+                .await?;
+            crate::storage::local_only::note(local_only_stripes);
+            Ok(manifest)
+        }
+
+        /// Like [`Self::store_sealed_payload_fd`], returning the local-only stripe count.
+        pub async fn store_sealed_payload_fd_counted(
+            &self,
+            fd: RawFd,
+            bytes_len: u64,
+            retention: RetentionPolicy,
+        ) -> anyhow::Result<(EphemeralShardManifest, u64)> {
             match self {
                 Self::InProcess(engine) => {
                     Self::ensure_in_process_peer_uid(engine)?;
@@ -1088,12 +1129,12 @@ mod unix_impl {
                         crate::os_sys::seal_memfd_immutable(dup.as_fd())?;
                     }
                     drop(dup);
-                    // One store path, so the local-only count is carried the same way (R3-1).
-                    self.store_payload_fd(fd, bytes_len, retention).await
+                    self.store_payload_fd_counted(fd, bytes_len, retention)
+                        .await
                 }
                 Self::UnixSocket(client) => {
                     client
-                        .store_sealed_payload_fd(fd, bytes_len, retention)
+                        .store_sealed_payload_fd_counted(fd, bytes_len, retention)
                         .await
                 }
             }

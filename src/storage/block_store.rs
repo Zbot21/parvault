@@ -2007,13 +2007,16 @@ impl BlockStore {
         // R3-1: without k shards on peers the stripe cannot be rebuilt without this machine.
         if remote < shard_set.k_data {
             self.record_local_only_stripe(&shard_set.stripe_merkle_root);
+        } else {
+            // k or more shards on peers: recoverable without this machine (QA 2e M2-2).
+            self.forget_local_only_stripe(&shard_set.stripe_merkle_root);
         }
         Ok((assigned, true))
     }
 
-    /// Records a stripe whose shards are all on this machine (not backed up, R3-1): counted on
-    /// the calling thread for the command summary and listed in the data directory for
-    /// `parvault status`.
+    /// Records a stripe that cannot be rebuilt without this machine (fewer than `k` shards on
+    /// peers; not backed up, R3-1): counted on the calling thread for the command summary and
+    /// listed in the data directory for `parvault status`.
     pub fn record_local_only_stripe(&self, stripe_root: &Hash32) {
         crate::storage::local_only::note(1);
         if self.is_in_memory() {

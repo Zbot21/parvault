@@ -2730,6 +2730,10 @@ fn r3_watch_once_allow_local_only_exits_zero() {
         r3_watch_once_with_only_non_ring_peer("r3-allow-local-only", &["--allow-local-only"]);
     assert_eq!(code, Some(0), "{stdout}");
     assert!(
+        stdout.contains("Files Synced       : 1"),
+        "nothing was stored:\n{stdout}"
+    );
+    assert!(
         stdout.contains("kept only on this machine: NOT backed up"),
         "{stdout}"
     );
@@ -2834,15 +2838,14 @@ fn r3_file_store_local_only_exits_with_code() {
         Some("daemon"),
     );
     store.save(&dir).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
-        .env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
         .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
         .arg("--data-dir")
         .arg(&dir)
         .args(["--no-lan-discovery", "file", "store", "--path"])
-        .arg(&file)
-        .output()
-        .expect("run file store");
+        .arg(&file);
+    let out = common::output_within_deadline(&mut cmd);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         out.status.code(),
@@ -2915,4 +2918,135 @@ fn r3_sync_push_local_only_exits_with_code() {
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );
+}
+
+/// QA 2e M2: a ring peer whose per-owner grace quota fits only a few shards. The store keeps the
+/// shards that reached the peer, writes only the rest locally, lists the stripe (fewer than k
+/// remote), exits 3, and restores byte-for-byte. A second store with a roomy peer pinned first
+/// places every shard remotely and adds no entry.
+#[test]
+fn r3_partial_placement_keeps_remote_shards() {
+    const TIER_K: usize = 10; // consumer: 10-of-20
+    const TIER_N: usize = 20;
+    let peer = {
+        let (root, dir, reg, log) = prepare("r3-partial-peer");
+        std::fs::write(
+            dir.join("config.toml"),
+            "max_storage_bytes = 1073741824\nbootstrap_grace_bytes = 20000\n",
+        )
+        .unwrap();
+        let port = free_port();
+        let cmd = daemon_command(&dir, &reg, port);
+        spawn(cmd, root, dir, log, port)
+    };
+    let (root, dir, reg, _log) = prepare("r3-partial-client");
+    let file = root.path().join("doc.bin");
+    let data: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&file, &data).unwrap();
+    let mut store = parvault::network::KnownPeersStore::load(&dir);
+    let pid = peer.peer_id().to_string();
+    store.upsert_pinned_multiaddr(
+        &pid,
+        &format!("{}/p2p/{pid}", peer.addr),
+        None,
+        Some("daemon"),
+    );
+    store.save(&dir).unwrap();
+    let key_hex = hex::encode([0x4Bu8; 32]);
+    let run = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+        cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+            .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+            .arg("--data-dir")
+            .arg(&dir)
+            .arg("--no-lan-discovery")
+            .args(args);
+        common::output_within_deadline(&mut cmd)
+    };
+    let out = run(&[
+        "file",
+        "store",
+        "--tier",
+        "consumer",
+        "--key-hex",
+        &key_hex,
+        "--path",
+        file.to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let remote = shard_files(&peer.dir);
+    let local = shard_files(&dir);
+    assert!(
+        remote > 0 && remote < TIER_K,
+        "remote={remote}\n{stdout}\npeer log:\n{}",
+        peer.log_text()
+    );
+    assert_eq!(local, TIER_N - remote, "only the missing shards are local");
+    assert_eq!(
+        out.status.code(),
+        Some(parvault::storage::local_only::EXIT_CODE_LOCAL_ONLY),
+        "{stdout}"
+    );
+    let listed =
+        std::fs::read_to_string(dir.join(parvault::storage::local_only::LOCAL_ONLY_STRIPES_FILE))
+            .unwrap_or_default();
+    assert_eq!(listed.lines().count(), 1, "{listed:?}");
+    let root_hex = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("File Merkle Root : "))
+        .expect("root printed")
+        .trim()
+        .to_string();
+    let restored = root.path().join("restored.bin");
+    let out = run(&[
+        "file",
+        "restore",
+        &root_hex,
+        "--output",
+        restored.to_str().unwrap(),
+        "--key-hex",
+        &key_hex,
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&restored).unwrap(),
+        data,
+        "restore byte-for-byte"
+    );
+
+    // A roomy ring peer pinned first takes every shard: no new entry, exit 0.
+    let roomy = spawn_daemon("r3-partial-roomy");
+    let mut store = parvault::network::KnownPeersStore::load(&dir);
+    let rid = roomy.peer_id().to_string();
+    store.upsert_pinned_multiaddr(
+        &rid,
+        &format!("{}/p2p/{rid}", roomy.addr),
+        None,
+        Some("daemon"),
+    );
+    store.save(&dir).unwrap();
+    let out = run(&[
+        "file",
+        "store",
+        "--tier",
+        "consumer",
+        "--key-hex",
+        &key_hex,
+        "--path",
+        file.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let listed =
+        std::fs::read_to_string(dir.join(parvault::storage::local_only::LOCAL_ONLY_STRIPES_FILE))
+            .unwrap_or_default();
+    assert_eq!(listed.lines().count(), 1, "no new entry: {listed:?}");
 }
