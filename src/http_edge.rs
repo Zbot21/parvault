@@ -1,6 +1,8 @@
 //! Client-side HTTP edge decisions shared by the daemon and the plugins (`ipc-client`).
 //! Item 3 adds [`status_auth_decision`]; commit 5 moves the shared HTTP edge (header caps,
 //! timeouts, connection caps, Bearer/Basic extraction) here.
+//!
+//! Formal model: `specs/ParVaultGatewayPluginBus.tla` (guards `status-auth`).
 
 use crate::capabilities::{CapabilityMacaroon, Caveat};
 

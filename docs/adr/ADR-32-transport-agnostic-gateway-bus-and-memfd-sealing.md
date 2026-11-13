@@ -1,6 +1,7 @@
 # ADR-32: Transport-Agnostic `GatewayBus`, Mandatory `memfd` Sealing (`F_ADD_SEALS`) & `SO_PEERCRED` Plugin Isolation
 
 - **Status:** Accepted (`v0.5.0`)
+- **Formal model:** `specs/ParVaultGatewayPluginBus.tla`
 - **Subsystem:** `gateway` / `capabilities` / `os_sys` / `main` / `bin/parvault-fuse`
 - **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
 - **Wire Specification:** [`docs/GATEWAY_SOCKET_PROTOCOL.md`](../GATEWAY_SOCKET_PROTOCOL.md)

@@ -127,8 +127,8 @@ CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
   bash scripts/build_bins.sh --profile soc --target aarch64-unknown-linux-musl --out dist
 ```
 
-### Kani Bounded Model Checking (<!-- metric:kani_harnesses -->`25`<!-- /metric --> Harnesses) & TLA+ TLC Formal Model Checking (<!-- metric:tla_specs -->`7`<!-- /metric --> Specs)
-All **<!-- metric:kani_harnesses -->25<!-- /metric -->** Kani symbolic harnesses (`cargo kani`) and all **<!-- metric:tla_specs -->7<!-- /metric -->** TLA+ specifications in `specs/` must complete with **0 errors** (see [`docs/SAFETY_AND_LINT_AUDIT.md`](docs/SAFETY_AND_LINT_AUDIT.md)):
+### Kani Bounded Model Checking (<!-- metric:kani_harnesses -->`25`<!-- /metric --> Harnesses) & TLA+ TLC Formal Model Checking (<!-- metric:tla_specs -->`8`<!-- /metric --> Specs)
+All **<!-- metric:kani_harnesses -->25<!-- /metric -->** Kani symbolic harnesses (`cargo kani`) and all **<!-- metric:tla_specs -->8<!-- /metric -->** TLA+ specifications in `specs/` must complete with **0 errors** (see [`docs/SAFETY_AND_LINT_AUDIT.md`](docs/SAFETY_AND_LINT_AUDIT.md)):
 ```bash
 bash scripts/verify_formal_proofs.sh
 
@@ -141,4 +141,4 @@ java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config specs/ParVaultBootstr
 java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config specs/ParVaultLiteClientAndSeedFailover.cfg specs/ParVaultLiteClientAndSeedFailover.tla
 java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -config specs/ParVaultZeroKeyAdminAndQuorum.cfg specs/ParVaultZeroKeyAdminAndQuorum.tla
 ```
-- **Automatic TLA+ Execution in `cargo test` (`tests/tla_formal_proofs_integration.rs`):** Setting `TLA2TOOLS_JAR=/path/to/tla2tools.jar` (configured automatically in `.github/workflows/ci.yml`) runs all **<!-- metric:tla_specs -->7<!-- /metric -->** TLA+ formal specifications directly inside `cargo test --release`.
+- **Automatic TLA+ Execution in `cargo test` (`tests/tla_formal_proofs_integration.rs`):** Setting `TLA2TOOLS_JAR=/path/to/tla2tools.jar` (configured automatically in `.github/workflows/ci.yml`) runs all **<!-- metric:tla_specs -->8<!-- /metric -->** TLA+ formal specifications directly inside `cargo test --release`.

@@ -4,6 +4,8 @@
 //! on kernel `memfd` descriptors), `< 1 ms` zero-disk-I/O RAM `CapabilityMacaroon` verification,
 //! bounded `PinnedRingBudget` admission/eviction, and 40-lane single-wave hedged parallel `libp2p`
 //! TCP + Noise XX shard distribution & reconstruction (`TTFB < 60 ms` under `15ms / 2% loss`).
+//!
+//! Formal model: `specs/ParVaultGatewayPluginBus.tla` (guards `uid-allowlist`, `macaroon-frame`, `memfd-seal`, `fetch-payload-macaroon`).
 
 use crate::config::ErasureTier;
 

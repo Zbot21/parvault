@@ -121,6 +121,7 @@ tlc.generated.ParVaultPostQuantum = 3,514
 tlc.generated.ParVaultBootstrapAndEarnedTier = 1,091
 tlc.generated.ParVaultLiteClientAndSeedFailover = 212
 tlc.generated.ParVaultZeroKeyAdminAndQuorum = 2,325
+tlc.generated.ParVaultGatewayPluginBus = 215,120
 tlc.distinct.ParVaultProtocol = 800
 tlc.distinct.ParVaultConfidentialityAndTrust = 944
 tlc.distinct.ParVaultAnonymity = 861
@@ -128,7 +129,9 @@ tlc.distinct.ParVaultPostQuantum = 927
 tlc.distinct.ParVaultBootstrapAndEarnedTier = 360
 tlc.distinct.ParVaultLiteClientAndSeedFailover = 95
 tlc.distinct.ParVaultZeroKeyAdminAndQuorum = 480
+tlc.distinct.ParVaultGatewayPluginBus = 7,540
 tlc.depth.ParVaultZeroKeyAdminAndQuorum = 14
+tlc.depth.ParVaultGatewayPluginBus = 10
 
 # --- Latest PUBLISHED release ----------------------------------------------------
 # The newest tag that exists on GitHub with its release assets. Install and fetch
@@ -146,15 +149,15 @@ kani_pass_compact = 25/25
 kani_harnesses.capabilities = 1
 kani_harnesses.aes = 1
 kani_harnesses.reed_solomon = 1
-tla_specs = 7
+tla_specs = 8
 wire_request_variants = 23
-tla_pass = 7 / 7
+tla_pass = 8 / 8
 adr_count = 33
 adr_last = ADR-33
 tests_unit = 107
-tests_integration = 295
-tests_total = 402
-tests_pass = 402 / 402
+tests_integration = 296
+tests_total = 403
+tests_pass = 403 / 403
 size.parvault.aarch64 = 6.08 MiB
 size.parvault-seed.aarch64 = 4.20 MiB
 size.parvault-fuse.aarch64 = 2.94 MiB
@@ -173,6 +176,6 @@ bench.soc.headroom_32m = 22.26 MiB
 bench.soc.headroom_48m = 38.26 MiB
 bench.soc.vmhwm_reduction = 5.9x
 aes.enc.span = 496.5–589.2 MiB/s
-tlc.generated = 17,054
-tlc.distinct = 4,467
+tlc.generated = 232,174
+tlc.distinct = 12,007
 # <<< end generated

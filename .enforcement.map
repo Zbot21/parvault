@@ -42,6 +42,15 @@ xref       X-ADR-DOC path=docs/**.md pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.
 tla-spec   T-SPECS   path=specs/*.tla
 open       T-SPECS   expect=tla-lint by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 open       T-SPECS   expect=completeness by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+# M5a phase C: the gateway plugin bus spec is traced (the seven older specs join when 2d-beta merges).
+tla-trace  T-TRACE-GW path=specs/ParVaultGatewayPluginBus.tla complete=specs/ParVaultGatewayPluginBus.tla
+enum       E-IPC     sym=src/gateway/ipc.rs::IpcCommand spec=specs/ParVaultGatewayPluginBus.tla
+reach      TR-UID-ALLOWLIST sym=src/gateway/engine.rs::gateway_peer_uid_decision from=src/gateway/server.rs::spawn
+reach      TR-MACAROON-FRAME sym=src/gateway/engine.rs::gateway_macaroon_decision from=src/gateway/server.rs::execute_engine_command
+reach      TR-MACAROON-UID-CAVEAT sym=src/capabilities.rs::evaluate_caveats from=src/gateway/server.rs::execute_engine_command
+reach      TR-MEMFD-SEAL sym=src/gateway/engine.rs::gateway_memfd_seal_decision from=src/gateway/server.rs::execute_engine_command
+reach      TR-STATUS-AUTH sym=src/http_edge.rs::status_auth_decision from=src/gateway/server.rs::execute_engine_command
+reach      TR-FETCH-PAYLOAD-MACAROON sym=src/gateway/engine.rs::fetch_by_shard_ids_to_owned_fd_with_peer_uid from=src/gateway/server.rs::execute_engine_command
 module     P-01      path=src/network/wot.rs pattern=^(verify_and_admit_|is_peer_|apply_slashing_|slash_|record_failure) kani=required
 open       P-01      expect=completeness by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 
