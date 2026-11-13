@@ -535,7 +535,7 @@ pub struct FolderSyncDiff {
     pub total_upload_bytes: u64,
 }
 
-/// Complete, cryptographically verifiable snapshot of a backed-up directory tree (ADR-10).
+/// Complete, cryptographically verifiable snapshot of a backed-up directory tree (ADR-14).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FolderSnapshotManifest {
     pub version: u64,
@@ -631,7 +631,7 @@ pub mod snapshot_v1 {
     }
 }
 
-/// Lightweight file metadata entry returned by `FolderSyncEngine::list_snapshot_catalog` (`ADR-17`)
+/// Lightweight file metadata entry returned by `FolderSyncEngine::list_snapshot_catalog` (`ADR-20`)
 /// allowing a Lite Client to browse its remote/local vault catalog with zero shard downloads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogFileMetadata {
@@ -643,7 +643,7 @@ pub struct CatalogFileMetadata {
 }
 
 /// Summary report returned by `FolderSyncEngine::restore_selective_subset` and
-/// `FolderSyncEngine::restore_selective_with_seed_fallback` (`ADR-17`).
+/// `FolderSyncEngine::restore_selective_with_seed_fallback` (`ADR-20`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectiveRestoreReport {
     pub route_used: LiteRestoreRoute,
@@ -979,7 +979,7 @@ impl FolderSyncEngine {
         })
     }
 
-    /// Validates and resolves a relative restore path inside `target_dir` (`ADR-15` Path-Traversal Defense).
+    /// Validates and resolves a relative restore path inside `target_dir` (`ADR-19` Path-Traversal Defense).
     /// Strictly rejects `..` (`ParentDir`), `/` (`RootDir`), Windows drive/UNC prefixes (`Prefix`),
     /// backslashes, colons, null bytes, key/entry mismatches, and symlink traversal.
     pub fn resolve_safe_restore_path(
@@ -1104,7 +1104,7 @@ impl FolderSyncEngine {
         Ok(restored_count)
     }
 
-    /// Lists all file entries in a `FolderSnapshotManifest` (`ADR-17`) so a Lite Client can browse
+    /// Lists all file entries in a `FolderSnapshotManifest` (`ADR-20`) so a Lite Client can browse
     /// its remote vault catalog ("Cloud-Away-From-Home") with zero shard downloads.
     pub fn list_snapshot_catalog(snapshot: &FolderSnapshotManifest) -> Vec<CatalogFileMetadata> {
         snapshot
@@ -1149,7 +1149,7 @@ impl FolderSyncEngine {
         false
     }
 
-    /// Selective On-Demand Subset Restore (`ADR-17`):
+    /// Selective On-Demand Subset Restore (`ADR-20`):
     /// Restores **only** the files in `snapshot` matching `filters` (exact paths, directory prefixes,
     /// or `*`/`?` globs) without downloading or reconstructing any other files in the vault.
     pub fn restore_selective_subset(
@@ -1198,7 +1198,7 @@ impl FolderSyncEngine {
         })
     }
 
-    /// Lite-Client Folder Sync via Paired `ZeroTrustSeedServer` (`ADR-17`):
+    /// Lite-Client Folder Sync via Paired `ZeroTrustSeedServer` (`ADR-20`):
     ///
     /// 1. Encrypts modified files on the laptop (`K_user` never leaves the laptop).
     /// 2. Sends a `1.0x` encrypted ciphertext stripe bundle (`LiteStripeSyndicationBundle`)
@@ -1261,7 +1261,7 @@ impl FolderSyncEngine {
     /// Reconstructs and decrypts a single stripe (`stripe_meta`) for a Lite Client, automatically
     /// using the 1-hop `seed_server` fast-path if online (`ViaSeedServerFastPath`) OR seamlessly
     /// failing over to `mesh_peer_stores` (`DirectFromMeshPeersFallback`) if the NAS / `seed_server`
-    /// is dead or unreachable (`ADR-17`).
+    /// is dead or unreachable (`ADR-20`).
     fn reconstruct_and_decrypt_stripe_with_fallback(
         &self,
         manifest: &FileManifest,
@@ -1365,7 +1365,7 @@ impl FolderSyncEngine {
         Ok((pt, LiteRestoreRoute::DirectFromMeshPeersFallback))
     }
 
-    /// Selective Restore with Automatic NAS-Death Mesh Failover (`ADR-17`):
+    /// Selective Restore with Automatic NAS-Death Mesh Failover (`ADR-20`):
     ///
     /// Restores only the files matching `filters` into `target_dir`:
     /// - When `seed_server` is `Some` (NAS online / "Cloud-Away-From-Home"), fetches directly from
@@ -1440,7 +1440,7 @@ impl FolderSyncEngine {
         })
     }
 
-    /// Partial Stripe / Byte-Range Restore (`ADR-17`):
+    /// Partial Stripe / Byte-Range Restore (`ADR-20`):
     ///
     /// Reconstructs and decrypts **only** the 16 MiB stripe(s) overlapping `[offset, offset + length)`
     /// (`byte_range = (offset, length)`) of `relative_path` (via `seed_server` fast-path or direct
@@ -1804,7 +1804,7 @@ mod gateway_sync {
     /// Zero-key sibling incremental folder synchronizer communicating exclusively over [`GatewayBus`]
     /// (`GatewayBus::InProcess` or `GatewayBus::UnixSocket`).
     ///
-    /// ### Architectural Invariant (`ADR-33`)
+    /// ### Architectural Invariant (`ADR-33` zero-key sync)
     /// Holds **zero** `MasterKey` and **zero** `NodeIdentity` fields: encryption, Reed-Solomon
     /// erasure coding, and `CapabilityMacaroon` verification remain isolated inside `GatewayEngine`.
     pub struct GatewayFolderSync {

@@ -1,4 +1,4 @@
-//! Zero-IP Online WAN Rendezvous, STUN-over-Noise Reflection & Dynamic-IP Peering (ADR-18).
+//! Zero-IP Online WAN Rendezvous, STUN-over-Noise Reflection & Dynamic-IP Peering (ADR-23).
 //!
 //! Provides zero-knowledge 4-word pairing, dynamic-IP presence heartbeats,
 //! public commons tracker announcements, and STUN-over-Noise external address reflection

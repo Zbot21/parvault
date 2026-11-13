@@ -1,6 +1,6 @@
 //! Standalone Zero-Trust Seed & Redundancy Server CLI (`parvault-seed`).
 //!
-//! Operates in two zero-plaintext modes (`ADR-13`):
+//! Operates in two zero-plaintext seed-server modes (`ADR-16`):
 //! 1. `homelab-vault` (`SeedServerMode::HomelabRedundancyVault`):
 //!    Dedicated 24/7 backup/redundancy vault for a homelab owner's personal devices
 //!    (authenticated via post-quantum `PersonalDeviceCert`s with zero reciprocity quota charge)
@@ -258,7 +258,7 @@ enum SeedCommand {
         keep_local: bool,
     },
 
-    /// Evict and zero-shred (0x00) shards linked to a bad-actor IP, subnet, PeerId, Ed25519 pubkey, Merkle root, or blinded locator (ADR-19)
+    /// Evict and zero-shred (0x00) shards linked to a bad-actor IP, subnet, PeerId, Ed25519 pubkey, Merkle root, or blinded locator (ADR-25)
     Evict {
         /// Seed server data directory
         #[arg(long, default_value = "./.parvault-seed-data")]
@@ -297,7 +297,7 @@ enum SeedCommand {
         propagate: bool,
     },
 
-    /// Public Tracker Operator governance, abuse takedown review queue, emergency warrants, and M-of-N council co-signing (ADR-19)
+    /// Public Tracker Operator governance, abuse takedown review queue, emergency warrants, and M-of-N council co-signing (ADR-26)
     Admin {
         #[command(subcommand)]
         action: SeedAdminAction,
@@ -507,7 +507,7 @@ async fn main() -> anyhow::Result<()> {
                     &data_dir.join("seed_mode.txt"),
                     mode_marker.as_bytes(),
                 );
-                // Zero-Private-Key-On-VPS invariant (`ADR-19`): NEVER auto-generate `tracker_admin.seed`
+                // Zero-Private-Key-On-VPS invariant (`ADR-26`): NEVER auto-generate `tracker_admin.seed`
                 // when `--admin-rpc-pubkey` is supplied!
                 if mode == CliSeedMode::PublicBootstrap
                     && (!has_external_admin_keys || data_dir.join("tracker_admin.seed").exists())

@@ -91,7 +91,7 @@ pub struct BlindedShardCapability {
     pub capability_pubkey: [u8; 32],
 }
 
-/// Maximum bidirectional NTP clock-skew tolerance (30 seconds) for `BlindedShardCapability` read tokens (`ADR-15`).
+/// Maximum bidirectional NTP clock-skew tolerance (30 seconds) for `BlindedShardCapability` read tokens (`ADR-19`).
 pub const MAX_CAPABILITY_CLOCK_SKEW_MS: u64 = 30_000;
 
 /// Domain tag of a signed lease renewal (F-23).
@@ -225,7 +225,7 @@ impl BlindedShardCapability {
     }
 
     /// Verifies a read/repair token while enforcing a symmetric $\pm 30\text{ s}$ NTP clock-skew
-    /// window around `now_unix_ms` (`ADR-15`), rejecting both expired tokens and far-future
+    /// clock-skew window around `now_unix_ms` (`ADR-19`), rejecting both expired tokens and far-future
     /// `timestamp_ms = u64::MAX` "immortal token" exploits.
     pub fn verify_read_token_with_skew(
         &self,
@@ -261,7 +261,7 @@ pub struct BlindedReadFacts {
     pub sig_valid: bool,
 }
 
-/// ADR-11 / ADR-15 / E-WIRE GetBlindedShard: bytes are served only to the holder of the lease's
+/// ADR-11 / ADR-19 / E-WIRE GetBlindedShard: bytes are served only to the holder of the lease's
 /// capability key, for this locator, with a fresh signature (a captured token expires in 30 s).
 pub fn blinded_read_decision(f: &BlindedReadFacts) -> Result<(), &'static str> {
     if !f.capability_known {
@@ -461,11 +461,11 @@ impl AnonymousQuotaVoucher {
     }
 }
 
-/// Maximum number of spent voucher nullifiers retained in the bounded FIFO replay cache (`ADR-16`).
+/// Maximum number of spent voucher nullifiers retained in the bounded FIFO replay cache (`ADR-19`).
 pub const MAX_VOUCHER_NULLIFIER_ENTRIES: usize = 65_536;
 
 /// Anti-double-spend nullifier ledger tracking redeemed `AnonymousQuotaVoucher` nonces
-/// with a strict 65,536-entry FIFO ceiling (`ADR-16`).
+/// with a strict 65,536-entry FIFO ceiling (`ADR-19`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoucherNullifierLedger {
     trusted_issuer_pubkey: [u8; 32],

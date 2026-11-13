@@ -85,14 +85,14 @@ pub fn ticket_pow_demand_decision(demanded: u8, own_bits: u8) -> Result<(), &'st
 /// Domain separator for `PublicCommonsTicket` Hashcash PoW and Ed25519 self-attestation.
 pub const PUBLIC_COMMONS_POW_DOMAIN: &[u8] = b"parvault-public-wot-pow-v1:";
 
-/// Canonical deterministic seed domain for open Public Commons trackers (`ADR-18`).
+/// Canonical deterministic seed domain for open Public Commons trackers (`ADR-24`).
 pub const PUBLIC_COMMONS_GENESIS_SEED_DOMAIN: &[u8] = b"parvault-public-commons-open-wot-v1";
 
 const fn default_public_wot_pow_bits() -> u8 {
     DEFAULT_PUBLIC_WOT_POW_BITS
 }
 
-/// Trust admission mode for a `WebOfTrustRegistry` pool (`ADR-18`).
+/// Trust admission mode for a `WebOfTrustRegistry` pool (`ADR-24`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TrustPoolMode {
     /// Strict Private Ring-of-Trust: only peers presenting a valid `DelegationChain`
@@ -187,7 +187,7 @@ pub enum WebOfTrustError {
 pub type WotError = WebOfTrustError;
 
 /// Self-signed Hashcash Proof-of-Work admission ticket allowing any stranger node to join a
-/// `PublicCommons` or `Hybrid` pool without pre-pairing or join codes (`ADR-18`).
+/// `PublicCommons` or `Hybrid` pool without pre-pairing or join codes (`ADR-24`).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PublicCommonsTicket {
     pub peer_pubkey: [u8; 32],
@@ -598,7 +598,7 @@ pub struct WebOfTrustRegistry {
     branch_slash_counts: HashMap<[u8; 32], u32>,
     /// Explicitly quarantined leaf or branch public keys.
     quarantined_keys: HashSet<[u8; 32]>,
-    /// Anti-replay ledger of processed `(reporter_pubkey, offender_pubkey, nonce)` slashing tuples (`ADR-15`).
+    /// Anti-replay ledger of processed `(reporter_pubkey, offender_pubkey, nonce)` slashing tuples (`ADR-05`).
     seen_slashing_nonces: HashSet<([u8; 32], [u8; 32], u64)>,
     /// Bounded FIFO queue ordering `seen_slashing_nonces` so RAM usage never exceeds `MAX_SEEN_SLASHING_NONCES`.
     seen_slashing_fifo: VecDeque<([u8; 32], [u8; 32], u64)>,
@@ -635,7 +635,7 @@ pub struct WebOfTrustRegistry {
 }
 
 impl WebOfTrustRegistry {
-    /// Canonical deterministic seed domain for open Public Commons trackers (`ADR-18`).
+    /// Canonical deterministic seed domain for open Public Commons trackers (`ADR-24`).
     pub const PUBLIC_COMMONS_GENESIS_SEED_DOMAIN: &[u8] = PUBLIC_COMMONS_GENESIS_SEED_DOMAIN;
 
     /// Derives the deterministic Ed25519 Genesis public key shared across Public Commons trackers.
@@ -1024,7 +1024,7 @@ impl WebOfTrustRegistry {
     }
 
     /// Verifies and admits a stranger peer's self-signed Hashcash `PublicCommonsTicket` when
-    /// operating in `PublicCommons` or `Hybrid` mode (`ADR-18`).
+    /// operating in `PublicCommons` or `Hybrid` mode (`ADR-24`).
     /// P-01: a public-commons ticket is admitted only outside private-ring mode, for a key that
     /// is not quarantined, with valid proof of work.
     pub fn verify_and_admit_public_ticket_decision(
@@ -1235,7 +1235,7 @@ impl WebOfTrustRegistry {
 
     /// Processes a signed `SlashingEvidence` message received via Gossipsub.
     /// Deduplicates `(reporter_pubkey, offender_pubkey, nonce)` so replayed evidence cannot
-    /// repeatedly increment `record_failure` (`ADR-15`). Test-only: nothing applies peer evidence
+    /// repeatedly increment `record_failure` (`ADR-05`). Test-only: nothing applies peer evidence
     /// in `v0.5.0` (slashing is local; architect 2b sign-off).
     #[cfg(test)]
     pub fn apply_slashing_evidence(&mut self, evidence: &SlashingEvidence) -> bool {

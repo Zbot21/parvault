@@ -1730,7 +1730,7 @@ impl MeshClient {
         }
     }
 
-    /// Returns all TOFU-pinned `tracker_admin_pubkey` keys learned from Public Trackers (`ADR-19`).
+    /// Returns all TOFU-pinned `tracker_admin_pubkey` keys learned from Public Trackers (`ADR-26`).
     pub fn pinned_tracker_admin_pubkeys(&self) -> Vec<[u8; 32]> {
         let mut out = Vec::new();
         if let Ok(guard) = self.tracker_admin_pubkeys.lock() {
@@ -2026,7 +2026,7 @@ impl MeshClient {
         Ok(out)
     }
 
-    /// Submits a cryptographically verifiable abuse takedown report (`ADR-19`) to `tracker_addr`,
+    /// Submits a cryptographically verifiable abuse takedown report (`ADR-26`) to `tracker_addr`,
     /// returning `(report_id, verified_plaintext_sha256)` once queued for Public Tracker Admin review.
     pub fn submit_abuse_takedown_report_detailed(
         &self,
@@ -2059,7 +2059,7 @@ impl MeshClient {
         }
     }
 
-    /// Submits a cryptographically verifiable abuse takedown report (`ADR-19`) to `tracker_addr`,
+    /// Submits a cryptographically verifiable abuse takedown report (`ADR-26`) to `tracker_addr`,
     /// returning the queued `report_id` when cryptographic burden-of-proof verification succeeds.
     pub fn submit_abuse_takedown_report(
         &self,

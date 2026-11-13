@@ -56,7 +56,7 @@ pub const DEFAULT_STRIPE_SIZE_BYTES: usize = 16 * 1024 * 1024;
 /// Balanced streaming stripe size (4 MiB) for 24/7 Homelab NAS nodes.
 pub const HOMELAB_NAS_STRIPE_SIZE_BYTES: usize = 4 * 1024 * 1024;
 
-/// Ultra-low-RAM streaming stripe size (1 MiB) for OpenWrt / prplOS / ARM64 Router SoCs (ADR-18).
+/// Ultra-low-RAM streaming stripe size (1 MiB) for OpenWrt / prplOS / ARM64 Router SoCs (ADR-21).
 pub const ROUTER_SOC_STRIPE_SIZE_BYTES: usize = 1024 * 1024;
 
 /// Minimum streaming stripe size floor (`64 KiB`).
@@ -65,7 +65,7 @@ pub const MIN_STRIPE_SIZE_BYTES: usize = 64 * 1024;
 /// Maximum logical file size supported by the streaming pipeline (`u64::MAX` bytes).
 pub const MAX_FILE_BYTES: u64 = u64::MAX;
 
-/// Strict Router-SoC peak concurrent per-stripe RAM ceiling (`32 MiB`, `ADR-01` / `ADR-18`).
+/// Strict Router-SoC peak concurrent per-stripe RAM ceiling (`32 MiB`, `ADR-01` / `ADR-21`).
 pub const ROUTER_SOC_MAX_STRIPE_MEMORY_BYTES: usize = 32 * 1024 * 1024;
 
 /// AES-256-GCM authentication tag overhead per encrypted stripe (`16` bytes).
@@ -124,7 +124,7 @@ pub const fn compute_stripe_layout_for_size(
     }
 }
 
-/// Default UDP port for signed Home LAN zero-IP auto-discovery (`ADR-18`).
+/// Default UDP port for signed Home LAN zero-IP auto-discovery (`ADR-22`).
 pub const DEFAULT_LAN_DISCOVERY_PORT: u16 = 4009;
 
 /// Default Proof-of-Retrievability (PoR) latency ceiling (300 ms).
@@ -155,7 +155,7 @@ const fn default_lan_discovery_port() -> u16 {
     DEFAULT_LAN_DISCOVERY_PORT
 }
 
-/// Hardware resource profiles tuning stripe sizing, disk safety guards, and peer fanout (`ADR-18`).
+/// Hardware resource profiles tuning stripe sizing, disk safety guards, and peer fanout (`ADR-21`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum, Default)]
 pub enum HardwareProfile {
     /// Workstation / laptop profile (`16 MiB` stripes, `5 GiB` disk guard, `128` max connections)
@@ -501,7 +501,7 @@ pub enum Commands {
         #[arg(long, default_value_t = 64, value_name = "MIB")]
         vfs_cache_mib: u64,
     },
-    /// Evict a bad actor or illegal content (0x00 zero-wipe + unlink + keyed HMAC ingress firewall, zero plaintext IPs on disk — ADR-19).
+    /// Evict a bad actor or illegal content (0x00 zero-wipe + unlink + keyed HMAC ingress firewall, zero plaintext IPs on disk — ADR-25).
     Evict {
         /// Evict all shards uploaded from this IPv4/IPv6 address and block future ingress via keyed HMAC tag.
         #[arg(long, value_name = "IP")]
@@ -535,7 +535,7 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         propagate: bool,
     },
-    /// Submit a cryptographically verifiable illegal-content abuse report (AES-256-GCM burden-of-proof) to a Public Tracker Admin queue (`ADR-19`).
+    /// Submit a cryptographically verifiable illegal-content abuse report (AES-256-GCM burden-of-proof) to a Public Tracker Admin queue (`ADR-26`).
     ReportAbuse {
         /// Path to the leaked encrypted `.manifest.bin` (or serialized `FileManifest`) file.
         #[arg(long, value_name = "PATH")]
@@ -625,7 +625,7 @@ pub enum Commands {
         #[arg(long)]
         key_hex: Option<String>,
     },
-    /// Continuously watch and back up a local directory tree to the Neighborhood Cloud mesh (ADR-10).
+    /// Continuously watch and back up a local directory tree to the Neighborhood Cloud mesh (ADR-14).
     WatchFolder {
         /// Path to the local directory to back up.
         #[arg(long)]
@@ -679,15 +679,15 @@ pub enum Commands {
         #[arg(long)]
         catalog_out: Option<PathBuf>,
 
-        /// Optional paired `parvault-seed` Multiaddr (e.g. `/ip4/10.42.1.10/tcp/4002`) or local directory for Lite-Client 1.0x stripe syndication (ADR-17).
+        /// Optional paired `parvault-seed` Multiaddr (e.g. `/ip4/10.42.1.10/tcp/4002`) or local directory for Lite-Client 1.0x stripe syndication (ADR-20).
         #[arg(long, visible_alias = "lite-seed-addr")]
         lite_seed_dir: Option<PathBuf>,
 
-        /// Optional PersonalDeviceCert file or `PARVAULT-CERT-V1:` token for Lite-Client seed authentication (ADR-17).
+        /// Optional PersonalDeviceCert file or `PARVAULT-CERT-V1:` token for Lite-Client seed authentication (ADR-20).
         #[arg(long)]
         device_cert: Option<String>,
     },
-    /// Browse and list all files, sizes, and stripe counts in a Folder Snapshot Manifest without downloading shards (ADR-17).
+    /// Browse and list all files, sizes, and stripe counts in a Folder Snapshot Manifest without downloading shards (ADR-20).
     ListSnapshot {
         /// Path to the `.manifest.bin` folder snapshot file.
         #[arg(long)]
@@ -720,7 +720,7 @@ pub enum Commands {
         #[arg(long)]
         file: Option<String>,
 
-        /// Optional comma-separated glob or directory prefix filter (e.g. `"docs/*.md,src/"`) for selective partial restore (ADR-17).
+        /// Optional comma-separated glob or directory prefix filter (e.g. `"docs/*.md,src/"`) for selective partial restore (ADR-20).
         #[arg(long)]
         filter: Option<String>,
     },
@@ -748,7 +748,7 @@ pub enum Commands {
         )]
         out_dir: PathBuf,
 
-        /// Optional comma-separated glob or directory prefix filter to selectively recover only needed files (ADR-17).
+        /// Optional comma-separated glob or directory prefix filter to selectively recover only needed files (ADR-20).
         #[arg(long)]
         filter: Option<String>,
     },
@@ -940,7 +940,7 @@ pub struct NodeConfig {
     /// Optional BitTorrent-style Public Commons tracker Multiaddrs (`--tracker` / `PARVAULT_TRACKERS`).
     #[serde(default, alias = "trackers")]
     pub public_trackers: Vec<String>,
-    /// Trust admission mode (`"private"` default, `"public"`, or `"hybrid"` — `ADR-18`).
+    /// Trust admission mode (`"private"` default, `"public"`, or `"hybrid"` — `ADR-24`).
     #[serde(default)]
     pub trust_mode: crate::network::wot::TrustPoolMode,
     /// Optional explicitly advertised public WAN Multiaddrs (`--external-addr` / `PARVAULT_EXTERNAL_ADDRS`).

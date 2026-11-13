@@ -50,7 +50,7 @@ pub enum StorageError {
     ManifestFormat(String),
 }
 
-/// Summary report returned by `BlockStore::scrub_all_shards` (`ADR-15` background bit-rot scrubber).
+/// Summary report returned by `BlockStore::scrub_all_shards` (`ADR-19` background bit-rot scrubber).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScrubReport {
     pub verified_healthy_shards: usize,
@@ -131,7 +131,7 @@ impl GracefulDepartureReceipt {
 }
 
 /// Byte-Epoch lease and deletion-verifier parameters attached to an anonymized `.bshard` upload
-/// (`ADR-11` + `ADR-13`).
+/// (`ADR-11` blinded leases + `ADR-19` lease pinning).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlindedLeaseSpec {
     pub current_epoch: u64,
@@ -766,7 +766,7 @@ impl BlockStore {
             .cloned()
     }
 
-    /// Crash-safe atomic file persistence (`ADR-15`):
+    /// Crash-safe atomic file persistence (`ADR-19`):
     /// Writes `bytes` to a sibling `.tmp.<nonce>` staging file in the same directory,
     /// flushes kernel buffers to physical storage via `File::sync_all()`, and atomically
     /// renames (`fs::rename`) over `target_path` so power loss mid-write can never truncate
@@ -1083,7 +1083,7 @@ impl BlockStore {
     }
 
     /// Persists an anonymized `BlindedShardId` to `{locator}.bshard` on disk with an explicit
-    /// Byte-Epoch lease (`lease.current_epoch + lease.lease_duration_epochs`) and `delete_verifier` (`ADR-11` + `ADR-13`).
+    /// Byte-Epoch lease (`lease.current_epoch + lease.lease_duration_epochs`) and `delete_verifier` (`ADR-11` + `ADR-19`).
     /// If disk capacity is reached, automatically evicts and physically unlinks expired `.bshard` files on disk.
     pub fn put_blinded_shard_with_lease(
         &self,
@@ -1444,7 +1444,7 @@ impl BlockStore {
     }
 
     /// Reads an anonymized `BlindedShardId` from disk (or RAM) if and only if the caller presents a valid
-    /// Ed25519 signature under the shard's registered `BlindedShardCapability` key (ADR-11 / ADR-15).
+    /// Ed25519 signature under the shard's registered `BlindedShardCapability` key (ADR-11 / ADR-19).
     pub fn get_blinded_shard_authorized(
         &self,
         blinded_id: &BlindedShardId,
@@ -1453,7 +1453,7 @@ impl BlockStore {
         read_sig: &[u8],
         now_ms: u64,
     ) -> Result<Vec<u8>, StorageError> {
-        // ADR-15: the capability key must be the one registered with the lease (no caller-supplied
+        // ADR-19: the capability key must be the one registered with the lease (no caller-supplied
         // key substitution), name this locator, be signed within +/-30 s, and verify.
         let registered = self.blinded_leases.lock().ok().and_then(|mgr| {
             mgr.lease_entry(&blinded_id.locator)
@@ -1498,7 +1498,7 @@ impl BlockStore {
         Ok(bytes)
     }
 
-    /// Background Local Bit-Rot Scrubber (`ADR-15`):
+    /// Background Local Bit-Rot Scrubber (`ADR-19`):
     /// Scans all `.shard` and `.bshard` files on disk, recomputes their cryptographic leaf/content
     /// hashes, and automatically unlinks and quarantines any silently corrupted files before a remote
     /// PoR challenge or restore egress request can trigger a slashing penalty.
@@ -2717,7 +2717,7 @@ impl ZeroTrustDhtStore {
         self.pq_records.get(dht_key)
     }
 
-    /// Validates and stores an `EncryptedVaultCatalogEnvelope` (`ADR-15` disaster recovery root catalog)
+    /// Validates and stores an `EncryptedVaultCatalogEnvelope` (`ADR-18` disaster recovery root catalog)
     /// enforcing Ed25519 signature validity, owner key immutability, and strict version monotonicity.
     pub fn put_vault_catalog_envelope(
         &mut self,

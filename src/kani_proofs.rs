@@ -1077,7 +1077,7 @@ fn proof_fuse_header_parser_no_panic() {
 }
 
 /// Proves `sanitize_sync_relative_path_into` / `sanitize_sync_relative_path` (`src/sync.rs`,
-/// `ADR-33`) never panics across arbitrary symbolic `[u8; 10]` inputs of any length `0..=10`
+/// `ADR-33` path sanitization) never panics across arbitrary symbolic `[u8; 10]` inputs of any length `0..=10`
 /// (`0` heap `Vec` allocations) and strictly rejects empty outputs, NUL bytes, leading/trailing
 /// `/` or `\`, Windows drive colons (`:`), duplicate `//`, and `.` or `..` path-traversal
 /// segments, while preserving exact normalization idempotence on every accepted path.
