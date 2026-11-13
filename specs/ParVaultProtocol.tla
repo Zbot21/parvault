@@ -7,7 +7,7 @@ CONSTANTS
     RepairWatermark,    \* Proactive repair trigger threshold (e.g., 18)
     MaxEpochChurn,      \* Maximum node failures within a single repair window (<= N - K)
     MaxLeafFailures,    \* Maximum invalid handshakes / failed PoR audits before leaf slashing (3)
-    MaxSubtreeSlashes   \* Maximum slashed children before parent inviter branch is pruned (M = 3)
+    MaxSubtreeSlashes   \* Maximum slashed children before parent inviter branch is pruned (M = 5, `DEFAULT_SUBTREE_SLASH_LIMIT` in `src/network/wot.rs`)
 
 ASSUME
     /\ K > 0
