@@ -1251,3 +1251,26 @@ fn proof_blinded_rebind_first_writer_wins() {
     kani::cover!(decision.is_err(), "blinded rebind refused");
     assert_eq!(decision.is_ok(), !has || registered == incoming);
 }
+
+/// B-SEED-SYND (L-46): a lite syndication is admitted only while both counters are under their
+/// caps (2 in flight per node, 1 per sender), and admitting one more from any admitted state
+/// never exceeds either cap.
+#[kani::proof]
+fn proof_syndication_fanout_budget() {
+    use crate::network::server_events::{
+        syndication_fanout_decision, MAX_SYNDICATIONS_IN_FLIGHT, MAX_SYNDICATIONS_PER_SENDER,
+    };
+    let total: usize = kani::any();
+    let sender: usize = kani::any();
+    kani::assume(total < 1 << 16 && sender <= total);
+    let decision = syndication_fanout_decision(total, sender);
+    kani::cover!(decision.is_err(), "syndication over budget");
+    kani::cover!(decision.is_ok(), "syndication admitted");
+    let under = total < MAX_SYNDICATIONS_IN_FLIGHT && sender < MAX_SYNDICATIONS_PER_SENDER;
+    // Only the outcome is checked (the &str code is checked by the claim's wire test).
+    assert_eq!(decision.is_ok(), under);
+    if decision.is_ok() {
+        assert!(total + 1 <= MAX_SYNDICATIONS_IN_FLIGHT);
+        assert!(sender + 1 <= MAX_SYNDICATIONS_PER_SENDER);
+    }
+}
