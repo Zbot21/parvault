@@ -909,30 +909,136 @@ pub fn token_from_args(
         .map_err(|e| format!("invalid token: {e}"))
 }
 
-/// Reads a token file, refusing one that group or others can read (mode `& 0o077 != 0`).
+/// Largest `--macaroon-file` read (a compact token is a few KiB at most).
+pub const MAX_TOKEN_FILE_BYTES: u64 = 16 * 1024;
+
+/// Reads a token file (QA item 3). It is opened without following a symlink and without
+/// blocking (so a FIFO cannot hang the caller), then checked on the open descriptor, so there
+/// is no check-then-open race: a regular file, owned by this effective UID, that group and
+/// others cannot read, at most [`MAX_TOKEN_FILE_BYTES`].
 fn read_owner_only_token_file(path: &std::path::Path) -> Result<String, String> {
-    let meta = std::fs::metadata(path)
-        .map_err(|e| format!("cannot read --macaroon-file {}: {e}", path.display()))?;
+    use std::io::Read;
+    let shown = path.display();
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
+    let file = {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|e| {
+                format!("cannot open --macaroon-file {shown}: {e} (a symlink is refused)")
+            })?;
+        let meta = file
+            .metadata()
+            .map_err(|e| format!("cannot stat --macaroon-file {shown}: {e}"))?;
+        if !meta.file_type().is_file() {
+            return Err(format!("--macaroon-file {shown} is not a regular file"));
+        }
+        let euid = crate::os_sys::geteuid();
+        if meta.uid() != euid {
+            return Err(format!(
+                "--macaroon-file {shown} is owned by uid {}, not by this user (uid {euid})",
+                meta.uid()
+            ));
+        }
         if meta.mode() & 0o077 != 0 {
             return Err(format!(
-                "--macaroon-file {} is readable by group or others (mode {:o}); chmod 600 it",
-                path.display(),
+                "--macaroon-file {shown} is readable by group or others (mode {:o}); chmod 600 it",
                 meta.mode() & 0o777
             ));
         }
+        if meta.len() > MAX_TOKEN_FILE_BYTES {
+            return Err(format!(
+                "--macaroon-file {shown} is larger than {MAX_TOKEN_FILE_BYTES} bytes"
+            ));
+        }
+        file
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("cannot open --macaroon-file {shown}: {e}"))?;
+    let mut text = String::new();
+    file.take(MAX_TOKEN_FILE_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("cannot read --macaroon-file {shown}: {e}"))?;
+    if text.len() as u64 > MAX_TOKEN_FILE_BYTES {
+        return Err(format!(
+            "--macaroon-file {shown} is larger than {MAX_TOKEN_FILE_BYTES} bytes"
+        ));
     }
-    let _ = &meta;
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read --macaroon-file {}: {e}", path.display()))?;
     Ok(text.trim().to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // QA item 3 re-check: the token file is opened without following links, checked on the
+    // open descriptor, and read with a bound.
+    #[cfg(unix)]
+    fn private_file(dir: &std::path::Path, name: &str, body: &[u8]) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        p
+    }
+
+    #[cfg(unix)]
+    fn a_token() -> String {
+        CapabilityMacaroon::mint(&[7; 32], [1; 32], [2; 32], vec![Caveat::ReadOnly])
+            .unwrap()
+            .to_compact_token()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_private_regular_file_read() {
+        let d = tempfile::tempdir().unwrap();
+        let f = private_file(d.path(), "t", format!("{}\n", a_token()).as_bytes());
+        assert!(token_from_args(None, Some(&f)).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_symlink_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let f = private_file(d.path(), "t", a_token().as_bytes());
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&f, &link).unwrap();
+        let err = token_from_args(None, Some(&link)).unwrap_err();
+        assert!(err.contains("cannot open"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_fifo_refused_without_blocking() {
+        let d = tempfile::tempdir().unwrap();
+        let fifo = d.path().join("fifo");
+        assert!(std::process::Command::new("mkfifo")
+            .arg("-m")
+            .arg("600")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let err = token_from_args(None, Some(&fifo)).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_oversized_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let f = private_file(
+            d.path(),
+            "big",
+            &vec![b'a'; MAX_TOKEN_FILE_BYTES as usize + 1],
+        );
+        let err = token_from_args(None, Some(&f)).unwrap_err();
+        assert!(err.contains("larger than"), "{err}");
+    }
     use std::time::Instant;
 
     /// F-17 accept: a statement from the pinned authority with a bounded lifetime verifies.
