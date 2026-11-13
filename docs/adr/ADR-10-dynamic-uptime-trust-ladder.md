@@ -1,6 +1,7 @@
 # ADR-10: Dynamic Uptime Trust Ladder & `/24` Subnet Concentration Caps
 
-- **Status:** Superseded by F-07 (v0.5.0: earned standing is self-reported and grants nothing; see `docs/security/TRUST_FINDINGS.md`). Note: `network/placement.rs` (`max_shards_per_subnet`) still applies subnet caps from that self-reported trust level. Previously extended by [ADR-15](ADR-15-elastic-bootstrap-and-earned-tiers.md).
+- **Status:** Superseded by F-07 (v0.5.0: earned standing is self-reported and grants nothing; see `docs/security/TRUST_FINDINGS.md`). Note: `network/placement.rs` (`select_trust_weighted_peers`, via `max_shards_per_subnet`) defines subnet caps from that self-reported trust level, but production placement never calls it (F-48, by `v0.6.0`). Previously extended by [ADR-15](ADR-15-elastic-bootstrap-and-earned-tiers.md).
+- **Formal model:** `specs/ParVaultConfidentialityAndTrust.tla`
 - **Subsystem:** `storage::quota` / `network::behaviour`
 - **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
 
@@ -24,4 +25,4 @@ Static per-subnet shard limits create an unappealing dilemma: capping every subn
 ## Consequences & Verification
 
 - **Consequences:** Rewards proven 24/7 homelab anchors with higher utilization while keeping unproven subnets strictly contained at 1 shard.
-- **Verification:** `specs/ParVaultConfidentialityAndTrust.tla` (`Safety_ZeroKnowledgeConfidentiality`, `Safety_SubnetTrustCapsEnforced`, `Safety_SlashedNeverTrusted`) and `tests/confidentiality_and_trust_proofs.rs`.
+- **Verification:** `specs/ParVaultConfidentialityAndTrust.tla` model-checks `Safety_SlashedNeverTrusted` (mutant-covered). `Safety_SubnetTrustCapsEnforced` is waived (`@assume placement-trust-cap`: production placement does not apply the cap, F-48), and zero-knowledge confidentiality is `@structural ciphertext-only-egress`, not model-checked. Unit checks: `tests/confidentiality_and_trust_proofs.rs`.

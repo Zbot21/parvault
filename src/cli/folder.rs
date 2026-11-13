@@ -443,7 +443,7 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
         println!("Deleted Tombstones : {}", snapshot.deleted_tombstones.len());
         if lite_receipts_count > 0 {
             println!(
-                "Lite Mode Syndicated: {} stripes cached on seed & syndicated (ADR-17)",
+                "Lite Mode Syndicated: {} stripes cached on seed & syndicated (ADR-20)",
                 lite_receipts_count
             );
         }
@@ -519,7 +519,7 @@ pub(crate) async fn list_snapshot(env: CliEnv, command: Commands) -> anyhow::Res
     let raw_snapshot = std::fs::read(&snapshot)?;
     let snapshot_manifest = FolderSnapshotManifest::decode_bytes(&raw_snapshot)?;
     let entries = FolderSyncEngine::list_snapshot_catalog(&snapshot_manifest);
-    println!("=== ParVault Vault Snapshot Catalog (Zero-Shard-Download Browse, ADR-17) ===");
+    println!("=== ParVault Vault Snapshot Catalog (Zero-Shard-Download Browse, ADR-20) ===");
     println!("Snapshot File      : {}", snapshot.display());
     println!("Snapshot Version   : {}", snapshot_manifest.version);
     println!(
@@ -602,7 +602,7 @@ pub(crate) async fn restore_folder(env: CliEnv, command: Commands) -> anyhow::Re
             .filter(|s| !s.is_empty())
             .collect();
         let report = engine.restore_selective_subset(&snapshot_manifest, &filters, &out_dir)?;
-        println!("=== Neighborhood Cloud Selective Subset Restore Verified (ADR-17) ===");
+        println!("=== Neighborhood Cloud Selective Subset Restore Verified (ADR-20) ===");
         println!("Restored Directory : {}", out_dir.display());
         println!("Files Restored     : {:?}", report.files_restored);
         println!("Files Skipped      : {}", report.files_skipped);
@@ -699,7 +699,7 @@ pub(crate) async fn recover_from_seed(env: CliEnv, command: Commands) -> anyhow:
         let engine =
             FolderSyncEngine::new(recovery_store, master_key, owner_identity, snapshot.tier);
         let report = engine.restore_selective_subset(&snapshot, &filters, &out_dir)?;
-        println!("=== ParVault Selective Disaster Recovery From Seed Phrase Complete (ADR-17) ===");
+        println!("=== ParVault Selective Disaster Recovery From Seed Phrase Complete (ADR-18) ===");
         println!("Vault Namespace    : {}", vault_namespace);
         println!("Files Restored     : {:?}", report.files_restored);
         println!("Files Skipped      : {}", report.files_skipped);

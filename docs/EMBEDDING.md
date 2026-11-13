@@ -141,4 +141,4 @@ fn plugin_sync_and_vfs(root_key: &[u8; 32]) -> anyhow::Result<()> {
 | `parvault::sync` | Key-bearing `FolderSyncEngine`, zero-key `GatewayFolderSync` & `GatewayFolderCatalog` (`ADR-33`), `sanitize_sync_relative_path` (`sanitize_sync_relative_path_into`), `.parvaultignore` filtering (`ParvaultIgnore`), byte-range hydration, and encrypted catalog export/recovery. |
 | `parvault::network` | `libp2p` `Noise_XX + Yamux` Kademlia/RPC swarm, signed LAN UDP beacons (`UDP 4009`), 4-word BIP-39 SAS pairing, and STUN-over-Noise WAN rendezvous (`WanPeerCard`). |
 | `parvault::admin_rpc` | Forward-secret `X25519 + ChaCha20-Poly1305` + `Ed25519` challenge-authenticated wire protocol for zero-private-key-on-VPS seed administration. |
-| `parvault::telemetry` | Opt-in privacy-preserving `AnonymousTelemetryBeacon` (`ADR-15` coarse region, power-of-two GiB bucketing, epoch nullifiers, and Hashcash PoW). |
+| `parvault::telemetry` | Opt-in privacy-preserving `AnonymousTelemetryBeacon` (`ADR-17` coarse region, power-of-two GiB bucketing, epoch nullifiers, and Hashcash PoW). |

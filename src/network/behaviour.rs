@@ -60,7 +60,7 @@ impl BincodeWireCodec {
             .with_limit(limit as u64)
     }
 
-    /// Bounded wire-frame deserializer (`ADR-15` Pre-Auth Heap OOM Bomb Defense):
+    /// Bounded wire-frame deserializer (`ADR-08` Pre-Auth Heap OOM Bomb Defense):
     /// Caps `bincode`'s internal allocation budget (`Vec::with_capacity`) to `buf.len()`
     /// so a 16-byte malicious frame claiming a `Vec<u8>` of length `u64::MAX` is rejected
     /// immediately with `io::ErrorKind::InvalidData` instead of crashing the daemon with OOM.
@@ -224,7 +224,7 @@ pub enum DhtWireEnvelope {
     VaultCatalog(EncryptedVaultCatalogEnvelope),
 }
 
-/// Signed WAN rendezvous entry stored under a blinded 32-byte slot key (ADR-18).
+/// Signed WAN rendezvous entry stored under a blinded 32-byte slot key (ADR-23).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedWanRendezvousEntry {
     pub slot_key: [u8; 32],
@@ -372,7 +372,7 @@ pub enum MeshWireRequest {
     },
     /// Look up all fresh WAN rendezvous entries stored under a blinded slot key.
     LookupWanRendezvous { slot_key: [u8; 32] },
-    /// Submit a cryptographically verifiable abuse takedown report against illegal content (ADR-19).
+    /// Submit a cryptographically verifiable abuse takedown report against illegal content (ADR-26).
     SubmitAbuseTakedownReport(crate::storage::VerifiableAbuseReport),
     /// Broadcast a signed bad-actor or illegal-content eviction order across peers (ADR-19).
     BroadcastEvictionOrder(crate::storage::SignedBadActorEvictionOrder),
@@ -542,7 +542,7 @@ pub const fn ipv6_same_slash48(a: Ipv6Addr, b: Ipv6Addr) -> bool {
 }
 
 /// Checks whether `ip` is a globally routable unicast IP address suitable for public Kademlia DHT
-/// routing tables (`ADR-15` Bogon / Loopback / RFC1918 / CGNAT Poisoning Filter).
+/// routing tables (`ADR-02` Bogon / Loopback / RFC1918 / CGNAT Poisoning Filter).
 pub const fn is_routable_public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -574,7 +574,7 @@ pub const fn is_routable_public_ip(ip: IpAddr) -> bool {
 }
 
 /// Embedded compact offline IP-to-ASN classifier with deterministic private subnet mapping
-/// for Docker (`10.42.0.0/16`) and Shadow simulations (ADR-06 / ADR-15).
+/// for Docker (`10.42.0.0/16`) and Shadow simulations (ADR-06).
 pub fn classify_ip_asn(ip: IpAddr, override_asn: Option<u32>) -> u32 {
     if let Some(asn) = override_asn {
         return asn;

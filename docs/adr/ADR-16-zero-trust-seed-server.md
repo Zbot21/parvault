@@ -1,6 +1,7 @@
 # ADR-16: Dedicated Zero-Trust Seed & Redundancy Server (`parvault-seed`)
 
 - **Status:** Accepted — Extended by [ADR-30](ADR-30-filesystem-free-in-memory-seed-mode.md)
+- **Formal model:** `specs/ParVaultZeroKeyAdminAndQuorum.tla`
 - **Subsystem:** `bin/parvault-seed` / `bootstrap`
 - **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
 

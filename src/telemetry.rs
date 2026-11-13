@@ -1,4 +1,4 @@
-//! # Zero-Knowledge Anonymous Network Census & Extent Telemetry (`ADR-14`)
+//! # Zero-Knowledge Anonymous Network Census & Extent Telemetry (`ADR-17`)
 //!
 //! Enables foundation operators and community dashboards to measure:
 //! - Total active network population (`unique_active_nodes` + Kademlia DHT cross-check),
@@ -25,11 +25,11 @@ type HmacSha256 = Hmac<Sha256>;
 /// Bytes per Gibibyte (`2^30`).
 pub const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
 
-/// Maximum plausible single-node committed storage bucket (`65,536 GiB` = `64 TiB`, `ADR-15`)
+/// Maximum plausible single-node committed storage bucket (`65,536 GiB` = `64 TiB`, `ADR-17`)
 /// to block single-beacon `u64::MAX` / `4 ZiB` capacity-poisoning attacks.
 pub const MAX_SINGLE_NODE_BUCKET_GIB: u64 = 65_536;
 
-/// Maximum unique beacons retained per epoch in `NetworkCensusAggregator` to bound RAM usage (`ADR-15`).
+/// Maximum unique beacons retained per epoch in `NetworkCensusAggregator` to bound RAM usage (`ADR-17`).
 pub const MAX_BEACONS_PER_EPOCH: usize = 250_000;
 
 #[derive(Debug, Error)]
@@ -99,7 +99,7 @@ pub const fn earned_standing_label(standing: EarnedStanding) -> &'static str {
     }
 }
 
-/// Zero-Knowledge Anonymous Telemetry Beacon (`ADR-14`).
+/// Zero-Knowledge Anonymous Telemetry Beacon (`ADR-17`).
 ///
 /// Emitted once per epoch (optionally inside a 1-hop `PqRelayedShardEnvelope` onion wrapper)
 /// to allow operators to compute a `NetworkCensusReport` without learning the node's `PeerId`,
@@ -116,7 +116,7 @@ pub struct AnonymousTelemetryBeacon {
     pub coarse_region: String,
     /// Node role (`PersonalDevice`, `OrganicCommunityPeer`, or `FoundationSeedAnchor`).
     pub role: PeerRole,
-    /// Current cryptographically earned redundancy standing (`ADR-13`).
+    /// Current cryptographically earned redundancy standing (`ADR-15`).
     /// Self-reported by the sender (F-07): nothing verifies it, and the MAC only binds it to the
     /// beacon.
     pub earned_standing: EarnedStanding,
@@ -128,7 +128,7 @@ pub struct AnonymousTelemetryBeacon {
     pub observed_dht_routing_peers: u32,
     /// Integrity MAC (`HMAC-SHA256(epoch_nullifier, canonical_fields)`) protecting beacon fields in transit.
     pub beacon_mac: [u8; 32],
-    /// Stateless zero-knowledge Hashcash micro-puzzle nonce (`ADR-15` anti-Sybil telemetry defense).
+    /// Stateless zero-knowledge Hashcash micro-puzzle nonce (`ADR-17` anti-Sybil telemetry defense).
     #[serde(default)]
     pub pow_nonce: u64,
     /// Leading zero bits required/solved by `pow_nonce`.
@@ -237,7 +237,7 @@ impl AnonymousTelemetryBeacon {
     }
 
     /// Constructs a new `AnonymousTelemetryBeacon` and solves a zero-knowledge Hashcash Proof-of-Work
-    /// puzzle of `pow_difficulty_bits` leading zero bits (`ADR-15` Sybil-resistant census).
+    /// puzzle of `pow_difficulty_bits` leading zero bits (`ADR-17` Sybil-resistant census).
     #[allow(clippy::too_many_arguments)]
     pub fn create_with_pow(
         node_secret_seed: &[u8; 32],
@@ -367,7 +367,7 @@ impl AnonymousTelemetryBeacon {
     }
 }
 
-/// Aggregated Zero-Knowledge Network Census Report for a single epoch (`ADR-14`).
+/// Aggregated Zero-Knowledge Network Census Report for a single epoch (`ADR-17`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NetworkCensusReport {
     /// Epoch index covered by this census report.
@@ -517,7 +517,7 @@ impl NetworkCensusReport {
     }
 }
 
-/// Deduplicating Zero-Knowledge Telemetry Census Aggregator run by Seed Anchors (`ADR-14` / `ADR-15`).
+/// Deduplicating Zero-Knowledge Telemetry Census Aggregator run by Seed Anchors (`ADR-17`).
 #[derive(Debug, Clone, Default)]
 pub struct NetworkCensusAggregator {
     epoch_id: u64,
@@ -536,7 +536,7 @@ impl NetworkCensusAggregator {
     }
 
     /// Creates a Sybil-hardened census aggregator requiring at least `min_pow_bits` of stateless
-    /// Hashcash Proof-of-Work on every ingested `AnonymousTelemetryBeacon` (`ADR-15`).
+    /// Hashcash Proof-of-Work on every ingested `AnonymousTelemetryBeacon` (`ADR-17`).
     pub fn with_min_pow_bits(epoch_id: u64, min_pow_bits: u8) -> Self {
         Self {
             epoch_id,
@@ -644,7 +644,7 @@ impl NetworkCensusAggregator {
         let median_dht_population = if dht_samples.is_empty() {
             0
         } else if dht_samples.len() >= 4 {
-            // Tukey Interquartile Range (IQR) outlier trimming before computing median (`ADR-15`)
+            // Tukey Interquartile Range (IQR) outlier trimming before computing median (`ADR-17`)
             let q1 = dht_samples[dht_samples.len() / 4];
             let q3 = dht_samples[(dht_samples.len() * 3) / 4];
             let iqr = q3.saturating_sub(q1);

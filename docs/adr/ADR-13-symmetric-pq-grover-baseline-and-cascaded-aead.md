@@ -1,6 +1,7 @@
 # ADR-13: Symmetric Post-Quantum Grover Baseline (`AES-256-GCM`) & Dual-Cipher Cascaded AEAD (`PqVaultMasterKey`)
 
 - **Status:** Accepted
+- **Formal model:** `specs/ParVaultPostQuantum.tla`
 - **Subsystem:** `crypto::aes` / `crypto::pqc` / `crypto::keys`
 - **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
 

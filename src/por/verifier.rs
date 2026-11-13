@@ -1,3 +1,4 @@
+//! Formal model: `specs/ParVaultProtocol.tla` (guards `read-auth-owner`, `read-auth-repair`).
 use crate::config::ErasureTier;
 use crate::crypto::keys::NodeIdentity;
 use crate::por::challenger::{
@@ -587,7 +588,8 @@ impl PorVerifierEngine {
         )
     }
 
-    /// Constructs and signs a domain-separated owner shard-delete token (`ADR-15`).
+    /// Constructs and signs a domain-separated owner shard-delete token.
+    /// A signed delete as in `ADR-19` (no ADR covers owner deletes of unblinded shards).
     pub fn sign_owner_shard_delete_token(
         owner: &NodeIdentity,
         shard_id: &ShardId,
@@ -730,7 +732,7 @@ impl PorVerifierEngine {
         })
     }
 
-    /// Constructs and signs a domain-separated owner shard-read token (`ADR-15`), preventing
+    /// Constructs and signs a domain-separated owner shard-read token (`ADR-04`), preventing
     /// cross-protocol signature replay of public `RepairGrant` or DHT manifest signatures.
     pub fn sign_owner_shard_read_token(
         owner: &NodeIdentity,
@@ -747,7 +749,7 @@ impl PorVerifierEngine {
         (owner_pub, payload, sig)
     }
 
-    /// Authorizes a raw ciphertext shard read request for restore or offline witness repair (ADR-04 / ADR-15).
+    /// Authorizes a raw ciphertext shard read request for restore or offline witness repair (ADR-04).
     /// Raw bytes are NEVER served unless either:
     /// - The file owner signs a domain-separated `"parvault-owner-shard-read-v1:"` token bound to `shard_id`, OR
     /// - A valid `RepairGrant` is presented along with `>= 2` distinct witness-signed failure receipts.

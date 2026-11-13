@@ -79,15 +79,8 @@ fn test_defense1_byzantine_shard_poisoning_quarantine_and_slashing() {
 
     assert_eq!(poisoned_indices, vec![4, 9]);
 
-    // Immediately slash the Byzantine peers that served poisoned shards.
-    for &bad_idx in &poisoned_indices {
-        // The receiver slashes locally (peer evidence is not applied in v0.5.0).
-        assert!(wot.slash_immediately(peer_identities[bad_idx].public_key_bytes()));
-        assert!(
-            !wot.is_peer_trusted(&peer_identities[bad_idx].public_key_bytes()),
-            "Byzantine shard poisoner must be quarantined on first offense"
-        );
-    }
+    // Slashing the poisoners is local and test-only in v0.5.0 (P-01): covered by the
+    // `network::wot` unit tests, not by this reconstruction test.
 
     // Verify all 20 reconstructed shards match original shards bit-for-bit and decrypt cleanly.
     assert_eq!(reconstructed_shards, shard_set.shards);

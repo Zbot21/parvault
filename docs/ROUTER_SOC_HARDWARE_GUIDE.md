@@ -263,7 +263,7 @@ mkdir -p /etc/parvault /mnt/nas/.parvault-data /mnt/nas/shared
 ### Configuration File (`/etc/parvault/router.toml`)
 Copy `deploy/router-soc/parvault-router.toml`:
 ```toml
-# ParVault v0.5.0 Turnkey Router Cloud-NAS Configuration (ADR-18)
+# ParVault v0.5.0 Turnkey Router Cloud-NAS Configuration (ADR-21)
 # Designed for OpenWrt / prplOS / ARM64 & x86_64 Gateway SoCs (<= 32-48 MiB cgroup RAM)
 
 hardware_profile = "router-soc"
@@ -284,11 +284,11 @@ default_tier = "Consumer"
 max_storage_bytes = 34359738368   # 32 GiB shared pool allocation
 min_free_disk_bytes = 67108864    # 64 MiB safety floor preventing router flash/mount exhaustion
 
-# Zero-IP Home LAN Auto-Discovery (ADR-18)
+# Zero-IP Home LAN Auto-Discovery (ADR-22)
 lan_discovery_enabled = true
 lan_discovery_port = 4009
 
-# Embedded Router NAS HTTP Status & Telemetry Dashboard (ADR-18)
+# Embedded Router NAS HTTP Status & Telemetry Dashboard (ADR-21)
 status_http_bind = "0.0.0.0:4080"
 
 # Node Identification
@@ -519,7 +519,7 @@ To display ParVault status directly inside the OpenWrt LuCI Web Interface, creat
      ```
 2. **Flash Wear Mitigation:**
    - Always point `--data-dir` and `--folder` to an attached USB drive or NVMe SSD, **never** to the router's internal SPI NOR/NAND flash (`/overlay` or rootfs). Internal router flash typically has limited write cycles and small block sizes.
-   - ParVault enforces an internal `4x` write amplification cap and LRU quota release to prevent storage wear griefing (`ADR-07` / `ADR-15`).
+   - ParVault enforces an internal `4x` write amplification cap and LRU quota release to prevent storage wear griefing (`ADR-07` / `ADR-19`).
 3. **Firewall & Routing Policy:**
    - LAN auto-discovery (`UDP 4009`) and status server (`TCP 4080`) are bound to LAN interfaces only. If desired, block WAN access to port `4080` in `/etc/config/firewall`:
      ```text
