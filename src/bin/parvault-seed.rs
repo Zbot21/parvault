@@ -1955,6 +1955,9 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
 
     loop {
         tokio::select! {
+            Some(done) = server_events.next_deferred(), if server_events.has_deferred() => {
+                server_events.send_deferred(&mut swarm, done);
+            }
             event = swarm.select_next_some() => {
                 let unhandled = server_events.handle(&mut swarm, event, |peer_str, remote_addr, request| {
                             let mut st = shared

@@ -24,7 +24,6 @@ open       F-06      expect=reach by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 
 # --- Blocking calls on handler paths --------------------------------------------------------------
 no-blocking F-18     path=src/network/wire_handler.rs
-open       F-18      expect=no-blocking by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 no-blocking B-DISC   path=src/network/discovery.rs
 open       B-DISC    expect=no-blocking by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 
@@ -72,4 +71,4 @@ claim      F-23      sym=src/network/wire_handler.rs::renew_decision accept=trus
 claim      F-33      sym=src/network/wire_handler.rs::handle_mesh_wire_request accept=trust_enforcement::f33_admitted_originator_relayed reject=trust_enforcement::f33_relay_budget_exceeded_refused code=reject.onion_relay_budget bin=parvault ref=docs/security/TRUST_FINDINGS.md
 open       F-33      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 
-ratchet    R         open=11 waive=0
+ratchet    R         open=10 waive=0

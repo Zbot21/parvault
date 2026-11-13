@@ -155,7 +155,7 @@ pub fn handle_daemon_wire_request(
     remote_addr: Option<&Multiaddr>,
     request: MeshWireRequest,
     ctx: DaemonWireHandlerCtx<'_>,
-) -> MeshWireResponse {
+) -> WireReply {
     let policy = DaemonWirePolicy {
         cfg: ctx.cfg,
         public_mode: ctx.public_mode,
@@ -173,7 +173,7 @@ pub fn handle_daemon_wire_request(
         eviction: ctx.eviction,
         takedown_queue: ctx.takedown_queue,
     };
-    handle_mesh_wire_request(
+    handle_mesh_wire_reply(
         &WirePeer::new(remote_peer_id, remote_addr),
         request,
         state,
@@ -187,7 +187,7 @@ pub fn handle_seed_wire_request(
     remote_addr: Option<&Multiaddr>,
     request: MeshWireRequest,
     ctx: SeedWireHandlerCtx<'_>,
-) -> MeshWireResponse {
+) -> WireReply {
     let policy = SeedWirePolicy {
         data_dir: ctx.data_dir,
         advertised_admin_pk: ctx.advertised_admin_pk,
@@ -209,7 +209,7 @@ pub fn handle_seed_wire_request(
         eviction: ctx.eviction,
         takedown_queue: ctx.takedown_queue,
     };
-    handle_mesh_wire_request(
+    handle_mesh_wire_reply(
         &WirePeer::new(remote_peer_id, remote_addr),
         request,
         state,
@@ -744,12 +744,117 @@ fn lease_limit_error(len: usize, limit: u64) -> Option<String> {
         .then(|| format!("shard length {len} exceeds max_probationary_lease_bytes {limit}"))
 }
 
-/// Handles one inbound `MeshWireRequest` for either role.
-pub fn handle_mesh_wire_request<P: WireRolePolicy>(
+/// Handles one inbound `MeshWireRequest` for either role. Onion relay forwards come back as
+/// [`WireReply::Deferred`] so the swarm task never waits on the jitter or the next hop (F-18).
+pub fn handle_mesh_wire_reply<P: WireRolePolicy>(
+    peer: &WirePeer<'_>,
+    request: MeshWireRequest,
+    st: WireState<'_>,
+    policy: &P,
+) -> WireReply {
+    let mut deferred = None;
+    let response = handle_mesh_wire_request(peer, request, st, policy, &mut deferred);
+    match deferred {
+        Some(job) => WireReply::Deferred(Box::new(job)),
+        None => WireReply::Ready(Box::new(response)),
+    }
+}
+
+/// What a handler returns: a response now, or a relay forward to run off the swarm task.
+pub enum WireReply {
+    Ready(Box<MeshWireResponse>),
+    Deferred(Box<RelayForward>),
+}
+
+impl WireReply {
+    /// The immediate response, or `None` for a deferred relay forward.
+    pub fn ready(self) -> Option<MeshWireResponse> {
+        match self {
+            WireReply::Ready(r) => Some(*r),
+            WireReply::Deferred(_) => None,
+        }
+    }
+}
+
+/// Last relay: forward the envelope to the final target with its lease.
+struct FinalHop {
+    next_hop: String,
+    envelope: crate::crypto::pqc::PqRelayedShardEnvelope,
+    capability: crate::storage::BlindedShardCapability,
+    voucher: crate::storage::AnonymousQuotaVoucher,
+    lease: crate::storage::BlindedLeaseSpec,
+}
+
+enum RelayHop {
+    Final(Box<FinalHop>),
+    /// Middle relay: forward the peeled inner layer after the envelope's jitter.
+    Layered {
+        target: String,
+        inner: crate::crypto::pqc::PqRelayedShardEnvelope,
+    },
+}
+
+/// An onion relay forward taken off the swarm task (F-18): the jitter is a tokio sleep and the
+/// blocking forward runs on the blocking pool, outside any handler lock. The relay still delays
+/// each forward by the envelope's jitter, so the next hop sees the same timing as before.
+pub struct RelayForward {
+    client: crate::network::MeshClient,
+    delay_ms: u64,
+    hop: RelayHop,
+}
+
+impl RelayForward {
+    /// Waits out the jitter, then forwards on the blocking pool and returns the ack to send.
+    pub async fn run(self) -> MeshWireResponse {
+        if self.delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+        }
+        match tokio::task::spawn_blocking(move || self.forward()).await {
+            Ok(r) => r,
+            Err(e) => relay_ack(Err(format!("relay forward task failed: {e}"))),
+        }
+    }
+
+    fn forward(self) -> MeshWireResponse {
+        let result = match self.hop {
+            RelayHop::Final(hop) => {
+                let FinalHop {
+                    next_hop,
+                    envelope,
+                    capability,
+                    voucher,
+                    lease,
+                } = *hop;
+                self.client
+                    .relay_pq_onion_envelope(&next_hop, None, envelope, capability, voucher, lease)
+            }
+            RelayHop::Layered { target, inner } => {
+                self.client.relay_layered_pq_onion_envelope(&target, inner)
+            }
+        };
+        relay_ack(result.map_err(|e| e.to_string()))
+    }
+}
+
+fn relay_ack(result: Result<(), String>) -> MeshWireResponse {
+    match result {
+        Ok(()) => MeshWireResponse::RelayPqOnionAck {
+            delivered: true,
+            error: None,
+        },
+        Err(e) => MeshWireResponse::RelayPqOnionAck {
+            delivered: false,
+            error: Some(e),
+        },
+    }
+}
+
+fn handle_mesh_wire_request<P: WireRolePolicy>(
     peer: &WirePeer<'_>,
     request: MeshWireRequest,
     mut st: WireState<'_>,
     policy: &P,
+    deferred: &mut Option<RelayForward>,
 ) -> MeshWireResponse {
     let class = admission_class(&request);
     if let Some(rejection) = admit(peer, &request, class, &mut st) {
@@ -1230,27 +1335,22 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
             }
             if let Some(next_hop) = target_peer_addr {
                 if let Some(client) = block_store.mesh_client() {
-                    match client.relay_pq_onion_envelope(
-                        &next_hop,
-                        None,
-                        envelope,
-                        capability,
-                        voucher,
-                        crate::storage::BlindedLeaseSpec::new(
-                            current_epoch,
-                            lease_duration_epochs,
-                            delete_verifier,
-                        ),
-                    ) {
-                        Ok(()) => MeshWireResponse::RelayPqOnionAck {
-                            delivered: true,
-                            error: None,
-                        },
-                        Err(e) => MeshWireResponse::RelayPqOnionAck {
-                            delivered: false,
-                            error: Some(e.to_string()),
-                        },
-                    }
+                    *deferred = Some(RelayForward {
+                        client: client.clone(),
+                        delay_ms: 0,
+                        hop: RelayHop::Final(Box::new(FinalHop {
+                            next_hop,
+                            envelope,
+                            capability,
+                            voucher,
+                            lease: crate::storage::BlindedLeaseSpec::new(
+                                current_epoch,
+                                lease_duration_epochs,
+                                delete_verifier,
+                            ),
+                        })),
+                    });
+                    relay_ack(Err("deferred".to_string()))
                 } else {
                     MeshWireResponse::RelayPqOnionAck {
                         delivered: false,
@@ -1258,22 +1358,16 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                     }
                 }
             } else if let Ok(hop) = envelope.peel_relay_hop_pq(pq_kem) {
-                if envelope.jitter_delay_ms > 0 {
-                    std::thread::sleep(Duration::from_millis(envelope.jitter_delay_ms.min(250)));
-                }
                 if let Some(client) = block_store.mesh_client() {
-                    match client
-                        .relay_layered_pq_onion_envelope(&hop.target_peer_addr, hop.inner_envelope)
-                    {
-                        Ok(()) => MeshWireResponse::RelayPqOnionAck {
-                            delivered: true,
-                            error: None,
+                    *deferred = Some(RelayForward {
+                        client: client.clone(),
+                        delay_ms: envelope.jitter_delay_ms.min(250),
+                        hop: RelayHop::Layered {
+                            target: hop.target_peer_addr,
+                            inner: hop.inner_envelope,
                         },
-                        Err(e) => MeshWireResponse::RelayPqOnionAck {
-                            delivered: false,
-                            error: Some(e.to_string()),
-                        },
-                    }
+                    });
+                    relay_ack(Err("deferred".to_string()))
                 } else {
                     MeshWireResponse::RelayPqOnionAck {
                         delivered: false,

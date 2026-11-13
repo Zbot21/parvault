@@ -80,6 +80,7 @@ use parvault::crypto::pqc::{HybridPqSigningKeypair, PqOnionFinalBundle};
 use parvault::crypto::{HybridKemKeypair, MasterKey, NodeIdentity, PqRelayedShardEnvelope};
 use parvault::network::wire_handler::{
     handle_daemon_wire_request, handle_seed_wire_request, DaemonWireHandlerCtx, SeedWireHandlerCtx,
+    WireReply,
 };
 use parvault::network::{
     derive_slot_key_from_code, node_identity_libp2p_peer_id, seal_public_tracker_card,
@@ -286,7 +287,7 @@ impl Fx {
     }
 
     fn call(&mut self, peer: &Peer, req: MeshWireRequest) -> MeshWireResponse {
-        match self.role {
+        let reply = match self.role {
             Role::Daemon => handle_daemon_wire_request(
                 &peer.id,
                 Some(&peer.addr),
@@ -336,6 +337,15 @@ impl Fx {
                     },
                 )
             }
+        };
+        // Relay forwards are deferred off the swarm task (F-18); run them to completion here.
+        match reply {
+            WireReply::Ready(r) => *r,
+            WireReply::Deferred(job) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on((*job).run()),
         }
     }
 
