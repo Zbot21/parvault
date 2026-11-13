@@ -2056,8 +2056,8 @@ mod tests {
             .collect();
         assert_eq!(
             admitted.len(),
-            4,
-            "PutShard, SyndicateLiteStripe, PutDhtEnvelope, PutBlindedShard: {admitted:?}"
+            5,
+            "PutShard, SyndicateLiteStripe, PutDhtEnvelope, PutBlindedShard, RelayPqOnionEnvelope (F-33): {admitted:?}"
         );
         assert_eq!(
             admission_class(&MeshWireRequest::QueryNodeStatus),
