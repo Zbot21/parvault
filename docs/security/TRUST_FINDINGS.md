@@ -83,7 +83,7 @@ Status values:
 
 | ID | Line | Status |
 | :--- | :--- | :--- |
-| E-WIRE | Every `MeshWireRequest` variant is covered by a claim. | Open until every variant has a claim (2b covers the admitted classes; the rest follow in 2c). |
+| E-WIRE | Every `MeshWireRequest` variant is covered by a claim. | Passes (2c): all 23 variants are covered, except `QueryNodeStatus` (public by design, bucketed values, F-44) and `LookupWanRendezvous` (the slot code authorises; registration capped; public-slot enumeration under F-22), excluded by architect ruling. |
 | E-POR | `PorAudit` and `MultiSegmentPorAudit` read disk only for the session-key holder's fresh, unseen, HMAC-valid challenge (`por_prescreen_decision`). | Claim (2c item 5). |
 | E-BREAD | `GetBlindedShard` serves bytes only for the lease's capability key, this locator, a fresh token and a valid signature (`blinded_read_decision`, F-40). | Claim (2c item 5). |
 | E-ABUSE | `SubmitAbuseTakedownReport` queues only a reporter-signed report with a working burden of proof (`abuse_report_decision`). | Claim (2c item 5). |
