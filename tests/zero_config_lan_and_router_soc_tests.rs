@@ -14,6 +14,8 @@
 //!    Reporter Burden-of-Proof (`VerifiableAbuseReport`), Emergency Warrant Eviction, Strict
 //!    `PrivateRing` Isolation, and `2-of-3` Federated Public Tracker Operator Council Quorum.
 
+mod common;
+
 use parvault::{
     config::NodeConfig,
     crypto::{MasterKey, NodeIdentity},
@@ -36,7 +38,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// v0.5.0 requires ring admission for storage: every process these tests start (and every
@@ -198,10 +200,6 @@ fn test_1_zero_ip_home_lan_auto_discovery_4word_pairing_and_cli_backup_restore()
     let seed_bin = env!("CARGO_BIN_EXE_parvault-seed");
     let disc_port = reserve_free_udp_port();
 
-    let seed_port = reserve_free_tcp_port();
-    let node1_port = reserve_free_tcp_port();
-    let node2_port = reserve_free_tcp_port();
-
     let seed_dir = base.join("seed_node");
     let node1_dir = base.join("router_node_1");
     let node2_dir = base.join("router_node_2");
@@ -234,7 +232,7 @@ fn test_1_zero_ip_home_lan_auto_discovery_4word_pairing_and_cli_backup_restore()
     let mut guards = ChildGuard::new();
 
     // 1. Spin up 1 parvault-seed + 2 parvault storage nodes on ephemeral ports
-    guards.push(
+    let (seed_child, _seed_addr) = common::spawn_on_ephemeral_port(
         Command::new(seed_bin)
             .env("PARVAULT_LAN_REGISTRY_DIR", &registry_dir)
             .args([
@@ -242,19 +240,17 @@ fn test_1_zero_ip_home_lan_auto_discovery_4word_pairing_and_cli_backup_restore()
                 "--mode",
                 "homelab-vault",
                 "--listen",
-                &format!("/ip4/127.0.0.1/tcp/{seed_port}"),
+                common::LOOPBACK_EPHEMERAL,
                 "--lan-discovery-port",
                 &disc_port.to_string(),
                 "--data-dir",
             ])
-            .arg(&seed_dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn parvault-seed"),
+            .arg(&seed_dir),
+        &base.join("seed_node.log"),
     );
+    guards.push(seed_child);
 
-    guards.push(
+    let (node1_child, node1_addr) = common::spawn_on_ephemeral_port(
         Command::new(parvault_bin)
             .env("PARVAULT_LAN_REGISTRY_DIR", &registry_dir)
             .arg("--data-dir")
@@ -266,16 +262,14 @@ fn test_1_zero_ip_home_lan_auto_discovery_4word_pairing_and_cli_backup_restore()
                 &disc_port.to_string(),
                 "up",
                 "--listen",
-                &format!("/ip4/127.0.0.1/tcp/{node1_port}"),
+                common::LOOPBACK_EPHEMERAL,
                 "--pair",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn router_node_1"),
+            ]),
+        &base.join("router_node_1.log"),
     );
+    guards.push(node1_child);
 
-    guards.push(
+    let (node2_child, _node2_addr) = common::spawn_on_ephemeral_port(
         Command::new(parvault_bin)
             .env("PARVAULT_LAN_REGISTRY_DIR", &registry_dir)
             .arg("--data-dir")
@@ -288,17 +282,12 @@ fn test_1_zero_ip_home_lan_auto_discovery_4word_pairing_and_cli_backup_restore()
                 "daemon",
                 "start",
                 "--listen",
-                &format!("/ip4/127.0.0.1/tcp/{node2_port}"),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn router_node_2"),
+                common::LOOPBACK_EPHEMERAL,
+            ]),
+        &base.join("router_node_2.log"),
     );
+    guards.push(node2_child);
 
-    for port in [seed_port, node1_port, node2_port] {
-        wait_for_tcp_port(port, Duration::from_secs(10));
-    }
     wait_for_beacon_files(&registry_dir, 3, Duration::from_secs(10));
 
     // 2. Run `parvault discover --json` with ZERO `--peers` and ZERO IP addresses
@@ -346,7 +335,7 @@ fn test_1_zero_ip_home_lan_auto_discovery_4word_pairing_and_cli_backup_restore()
             "pair",
             "--once",
             "--listen",
-            &format!("/ip4/127.0.0.1/tcp/{node1_port}"),
+            &node1_addr,
         ])
         .output()
         .expect("run parvault pair --once");
@@ -547,16 +536,14 @@ fn test_2_dhcp_ip_port_change_self_healing() {
     let parvault_bin = env!("CARGO_BIN_EXE_parvault");
     let disc_port = reserve_free_udp_port();
 
-    let port_a1 = reserve_free_tcp_port();
-    let port_b1 = reserve_free_tcp_port();
     let node_a_dir = base.join("nas_node_a");
     let node_b_dir = base.join("nas_node_b");
     fs::create_dir_all(&node_a_dir).unwrap();
     fs::create_dir_all(&node_b_dir).unwrap();
 
-    let mut phase1_guards = ChildGuard::new();
-    for (dir, port) in [(&node_a_dir, port_a1), (&node_b_dir, port_b1)] {
-        phase1_guards.push(
+    // Starts a router-soc storage daemon on `dir` at an ephemeral port; returns it and its port.
+    let spawn_node = |dir: &Path, log: &str| -> (Child, u16) {
+        let (child, addr) = common::spawn_on_ephemeral_port(
             Command::new(parvault_bin)
                 .env("PARVAULT_LAN_REGISTRY_DIR", &registry_dir)
                 .arg("--data-dir")
@@ -569,16 +556,18 @@ fn test_2_dhcp_ip_port_change_self_healing() {
                     "daemon",
                     "start",
                     "--listen",
-                    &format!("/ip4/127.0.0.1/tcp/{port}"),
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn phase1 daemon"),
+                    common::LOOPBACK_EPHEMERAL,
+                ]),
+            &base.join(log),
         );
-    }
-    wait_for_tcp_port(port_a1, Duration::from_secs(10));
-    wait_for_tcp_port(port_b1, Duration::from_secs(10));
+        (child, common::tcp_port_of(&addr))
+    };
+
+    let mut phase1_guards = ChildGuard::new();
+    let (child_a1, port_a1) = spawn_node(&node_a_dir, "phase1_node_a.log");
+    phase1_guards.push(child_a1);
+    let (child_b1, port_b1) = spawn_node(&node_b_dir, "phase1_node_b.log");
+    phase1_guards.push(child_b1);
     wait_for_beacon_files(&registry_dir, 2, Duration::from_secs(10));
 
     let client_dir = base.join("laptop_client");
@@ -627,40 +616,29 @@ fn test_2_dhcp_ip_port_change_self_healing() {
         let _ = fs::remove_file(entry.path());
     }
 
-    let mut port_a2 = reserve_free_tcp_port();
-    while port_a2 == port_a1 || port_a2 == port_b1 {
-        port_a2 = reserve_free_tcp_port();
-    }
-    let mut port_b2 = reserve_free_tcp_port();
-    while port_b2 == port_a1 || port_b2 == port_b1 || port_b2 == port_a2 {
-        port_b2 = reserve_free_tcp_port();
-    }
-
+    // The restarted daemons must come up on ports different from every phase-1 port (and from
+    // each other); the kernel rarely reuses a just-freed ephemeral port, so retry a few times.
+    let spawn_on_new_port = |dir: &Path, log: &str, used: &[u16]| -> (Child, u16) {
+        for _ in 0..5 {
+            let (mut child, port) = spawn_node(dir, log);
+            if !used.contains(&port) {
+                return (child, port);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        panic!("phase2 daemon kept binding an already-used port {used:?}");
+    };
     let mut phase2_guards = ChildGuard::new();
-    for (dir, port) in [(&node_a_dir, port_a2), (&node_b_dir, port_b2)] {
-        phase2_guards.push(
-            Command::new(parvault_bin)
-                .env("PARVAULT_LAN_REGISTRY_DIR", &registry_dir)
-                .arg("--data-dir")
-                .arg(dir)
-                .args([
-                    "--profile",
-                    "router-soc",
-                    "--lan-discovery-port",
-                    &disc_port.to_string(),
-                    "daemon",
-                    "start",
-                    "--listen",
-                    &format!("/ip4/127.0.0.1/tcp/{port}"),
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn phase2 daemon on new port"),
-        );
-    }
-    wait_for_tcp_port(port_a2, Duration::from_secs(10));
-    wait_for_tcp_port(port_b2, Duration::from_secs(10));
+    let (child_a2, port_a2) =
+        spawn_on_new_port(&node_a_dir, "phase2_node_a.log", &[port_a1, port_b1]);
+    phase2_guards.push(child_a2);
+    let (child_b2, port_b2) = spawn_on_new_port(
+        &node_b_dir,
+        "phase2_node_b.log",
+        &[port_a1, port_b1, port_a2],
+    );
+    phase2_guards.push(child_b2);
     wait_for_beacon_files(&registry_dir, 2, Duration::from_secs(10));
 
     // Client still has stale `port_a1` & `port_b1` in `known_peers.json` — `MeshClient::with_data_dir_discovery`
@@ -713,14 +691,12 @@ fn test_3_interoperable_router_soc_1mib_homelab_4mib_desktop_16mib_streaming_str
 
     let parvault_bin = env!("CARGO_BIN_EXE_parvault");
     let disc_port = reserve_free_udp_port();
-    let daemon_port_1 = reserve_free_tcp_port();
-    let daemon_port_2 = reserve_free_tcp_port();
 
     let mut guards = ChildGuard::new();
-    for (idx, port) in [daemon_port_1, daemon_port_2].into_iter().enumerate() {
+    for idx in 0..2 {
         let ndir = base.join(format!("storage_daemon_{idx}"));
         fs::create_dir_all(&ndir).unwrap();
-        guards.push(
+        let (child, _addr) = common::spawn_on_ephemeral_port(
             Command::new(parvault_bin)
                 .env("PARVAULT_LAN_REGISTRY_DIR", &registry_dir)
                 .arg("--data-dir")
@@ -733,16 +709,12 @@ fn test_3_interoperable_router_soc_1mib_homelab_4mib_desktop_16mib_streaming_str
                     "daemon",
                     "start",
                     "--listen",
-                    &format!("/ip4/127.0.0.1/tcp/{port}"),
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn storage daemon"),
+                    common::LOOPBACK_EPHEMERAL,
+                ]),
+            &base.join(format!("storage_daemon_{idx}.log")),
         );
+        guards.push(child);
     }
-    wait_for_tcp_port(daemon_port_1, Duration::from_secs(10));
-    wait_for_tcp_port(daemon_port_2, Duration::from_secs(10));
     wait_for_beacon_files(&registry_dir, 2, Duration::from_secs(10));
 
     // Deterministic 5 MiB payload (`5 * 1024 * 1024` bytes)
@@ -880,8 +852,6 @@ fn test_4_embedded_router_nas_status_server_http_and_html_dashboard() {
 
     let parvault_bin = env!("CARGO_BIN_EXE_parvault");
     let disc_port = reserve_free_udp_port();
-    let router_p2p_port = reserve_free_tcp_port();
-    let neighbor_p2p_port = reserve_free_tcp_port();
     let status_http_port = reserve_free_tcp_port();
 
     let router_dir = base.join("router_appliance");
@@ -892,7 +862,7 @@ fn test_4_embedded_router_nas_status_server_http_and_html_dashboard() {
     let mut guards = ChildGuard::new();
 
     // Spin up a neighbor LAN peer so `/api/v1/peers` on the router appliance populates automatically
-    guards.push(
+    let (neighbor_child, _neighbor_addr) = common::spawn_on_ephemeral_port(
         Command::new(parvault_bin)
             .env("PARVAULT_LAN_REGISTRY_DIR", &registry_dir)
             .arg("--data-dir")
@@ -903,17 +873,14 @@ fn test_4_embedded_router_nas_status_server_http_and_html_dashboard() {
                 "daemon",
                 "start",
                 "--listen",
-                &format!("/ip4/127.0.0.1/tcp/{neighbor_p2p_port}"),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn neighbor daemon"),
+                common::LOOPBACK_EPHEMERAL,
+            ]),
+        &base.join("neighbor_daemon.log"),
     );
-    wait_for_tcp_port(neighbor_p2p_port, Duration::from_secs(10));
+    guards.push(neighbor_child);
 
     // Spin up turnkey `parvault up --profile router-soc --status-http 127.0.0.1:<port> --pair`
-    guards.push(
+    let (router_child, router_p2p_addr) = common::spawn_on_ephemeral_port(
         Command::new(parvault_bin)
             .env("PARVAULT_LAN_REGISTRY_DIR", &registry_dir)
             .arg("--data-dir")
@@ -925,20 +892,17 @@ fn test_4_embedded_router_nas_status_server_http_and_html_dashboard() {
                 &disc_port.to_string(),
                 "up",
                 "--listen",
-                &format!("/ip4/127.0.0.1/tcp/{router_p2p_port}"),
+                common::LOOPBACK_EPHEMERAL,
                 "--status-http",
                 &format!("127.0.0.1:{status_http_port}"),
                 "--folder",
             ])
             .arg(&watched_usb)
-            .arg("--pair")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn router-soc appliance"),
+            .arg("--pair"),
+        &base.join("router_appliance.log"),
     );
+    guards.push(router_child);
 
-    wait_for_tcp_port(router_p2p_port, Duration::from_secs(10));
     wait_for_tcp_port(status_http_port, Duration::from_secs(10));
     wait_for_beacon_files(&registry_dir, 2, Duration::from_secs(10));
 
@@ -952,7 +916,7 @@ fn test_4_embedded_router_nas_status_server_http_and_html_dashboard() {
             "pair",
             "--once",
             "--listen",
-            &format!("/ip4/127.0.0.1/tcp/{router_p2p_port}"),
+            &router_p2p_addr,
         ])
         .output()
         .expect("query router SAS code");
@@ -1056,10 +1020,6 @@ fn test_5_zero_ip_online_wan_rendezvous_stun_reflection_and_ddns_ip_rotation() {
     let parvault_bin = env!("CARGO_BIN_EXE_parvault");
     let seed_bin = env!("CARGO_BIN_EXE_parvault-seed");
 
-    let seed_port = reserve_free_tcp_port();
-    let alice_port_1 = reserve_free_tcp_port();
-    let seed_maddr = format!("/ip4/127.0.0.1/tcp/{seed_port}");
-
     let seed_dir = base.join("wan_seed_anchor");
     let alice_dir = base.join("alice_home_router");
     let bob_dir = base.join("bob_remote_laptop");
@@ -1070,7 +1030,7 @@ fn test_5_zero_ip_online_wan_rendezvous_stun_reflection_and_ddns_ip_rotation() {
     let mut guards = ChildGuard::new();
 
     // 1. Start Online WAN Rendezvous Anchor (`parvault-seed` with `--no-lan-discovery`)
-    guards.push(
+    let (seed_child, seed_maddr) = common::spawn_on_ephemeral_port(
         Command::new(seed_bin)
             .args([
                 "start",
@@ -1078,39 +1038,40 @@ fn test_5_zero_ip_online_wan_rendezvous_stun_reflection_and_ddns_ip_rotation() {
                 "homelab-vault",
                 "--no-lan-discovery",
                 "--listen",
-                &seed_maddr,
+                common::LOOPBACK_EPHEMERAL,
                 "--data-dir",
             ])
-            .arg(&seed_dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn WAN seed anchor"),
+            .arg(&seed_dir),
+        &base.join("wan_seed_anchor.log"),
     );
-    wait_for_tcp_port(seed_port, Duration::from_secs(10));
+    guards.push(seed_child);
+    let seed_port = common::tcp_port_of(&seed_maddr);
+
+    // Starts Alice's daemon (`--no-lan-discovery`, isolated registry dir) at an ephemeral port.
+    let spawn_alice = |log: &str| -> (Child, u16) {
+        let (child, addr) = common::spawn_on_ephemeral_port(
+            Command::new(parvault_bin)
+                .env("PARVAULT_LAN_REGISTRY_DIR", &empty_reg_alice)
+                .arg("--data-dir")
+                .arg(&alice_dir)
+                .args([
+                    "--no-lan-discovery",
+                    "--seed-addr",
+                    &seed_maddr,
+                    "up",
+                    "--wan",
+                    "--listen",
+                    common::LOOPBACK_EPHEMERAL,
+                ]),
+            &base.join(log),
+        );
+        (child, common::tcp_port_of(&addr))
+    };
 
     // 2. Start Alice's daemon in City A (`--no-lan-discovery`, isolated registry dir)
     let mut alice_guard = ChildGuard::new();
-    alice_guard.push(
-        Command::new(parvault_bin)
-            .env("PARVAULT_LAN_REGISTRY_DIR", &empty_reg_alice)
-            .arg("--data-dir")
-            .arg(&alice_dir)
-            .args([
-                "--no-lan-discovery",
-                "--seed-addr",
-                &seed_maddr,
-                "up",
-                "--wan",
-                "--listen",
-                &format!("/ip4/127.0.0.1/tcp/{alice_port_1}"),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn Alice WAN daemon"),
-    );
-    wait_for_tcp_port(alice_port_1, Duration::from_secs(10));
+    let (alice_child_1, alice_port_1) = spawn_alice("alice_1.log");
+    alice_guard.push(alice_child_1);
 
     // Alice publishes encrypted 4-word `WanPeerCard` to `seed_maddr` (also exercising STUN-over-Noise reflection!)
     let pair_wan_out = Command::new(parvault_bin)
@@ -1219,10 +1180,21 @@ fn test_5_zero_ip_online_wan_rendezvous_stun_reflection_and_ddns_ip_rotation() {
     //    (b) Restart Alice on a brand-new port `alice_port_2`, publish updated WAN presence, and restore from Bob!
     drop(alice_guard);
 
-    let mut alice_port_2 = reserve_free_tcp_port();
-    while alice_port_2 == alice_port_1 || alice_port_2 == seed_port {
-        alice_port_2 = reserve_free_tcp_port();
+    // Restart Alice's live daemon on a brand-new port `alice_port_2` (the kernel rarely reuses a
+    // just-freed ephemeral port, so retry a few times) before publishing the rotated endpoint.
+    let mut alice_restart = None;
+    for attempt in 0..5 {
+        let (mut child, port) = spawn_alice(&format!("alice_2_attempt{attempt}.log"));
+        if port != alice_port_1 && port != seed_port {
+            alice_restart = Some((child, port));
+            break;
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
+    let (alice_child_2, alice_port_2) =
+        alice_restart.expect("Alice restart kept binding an already-used port");
+    guards.push(alice_child_2);
 
     let bob_client = MeshClient::new(
         NodeIdentity::load_or_generate_in_dir(&bob_dir).unwrap(),
@@ -1288,28 +1260,7 @@ fn test_5_zero_ip_online_wan_rendezvous_stun_reflection_and_ddns_ip_rotation() {
         "Bob must resolve Alice's rotated endpoint via encrypted WAN DDNS: {resolved_ddns:?}"
     );
 
-    // Restart Alice's live daemon on `alice_port_2` and update Bob's pinned address via DDNS/WAN pair
-    guards.push(
-        Command::new(parvault_bin)
-            .env("PARVAULT_LAN_REGISTRY_DIR", &empty_reg_alice)
-            .arg("--data-dir")
-            .arg(&alice_dir)
-            .args([
-                "--no-lan-discovery",
-                "--seed-addr",
-                &seed_maddr,
-                "up",
-                "--wan",
-                "--listen",
-                &format!("/ip4/127.0.0.1/tcp/{alice_port_2}"),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn Alice on rotated port"),
-    );
-    wait_for_tcp_port(alice_port_2, Duration::from_secs(10));
-
+    // Alice's live daemon already runs on `alice_port_2`; update Bob's pinned address via DDNS/WAN pair
     // Re-publish Alice's rotated port to WAN rendezvous & let Bob re-sync and restore the file!
     let _ = Command::new(parvault_bin)
         .env("PARVAULT_LAN_REGISTRY_DIR", &empty_reg_alice)
@@ -1378,15 +1329,13 @@ fn test_6_zero_pairing_public_tracker_swarm() {
     let parvault_bin = env!("CARGO_BIN_EXE_parvault");
     let seed_bin = env!("CARGO_BIN_EXE_parvault-seed");
 
-    let tracker_port = reserve_free_tcp_port();
-    let tracker_maddr = format!("/ip4/127.0.0.1/tcp/{tracker_port}");
     let tracker_dir = base.join("public_tracker_seed");
     fs::create_dir_all(&tracker_dir).unwrap();
 
     let mut guards = ChildGuard::new();
 
     // 1. Spin up 1 `parvault-seed --mode public-bootstrap` tracker
-    guards.push(
+    let (tracker_child, tracker_maddr) = common::spawn_on_ephemeral_port(
         Command::new(seed_bin)
             .args([
                 "start",
@@ -1394,29 +1343,21 @@ fn test_6_zero_pairing_public_tracker_swarm() {
                 "public-bootstrap",
                 "--no-lan-discovery",
                 "--listen",
-                &tracker_maddr,
+                common::LOOPBACK_EPHEMERAL,
                 "--data-dir",
             ])
-            .arg(&tracker_dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn public-bootstrap tracker"),
+            .arg(&tracker_dir),
+        &base.join("public_tracker_seed.log"),
     );
-    wait_for_tcp_port(tracker_port, Duration::from_secs(10));
+    guards.push(tracker_child);
 
     // 2. Spin up 3 completely unacquainted stranger `--public --tracker <seed>` storage daemons
-    let stranger_ports = [
-        reserve_free_tcp_port(),
-        reserve_free_tcp_port(),
-        reserve_free_tcp_port(),
-    ];
     let mut stranger_dirs = Vec::new();
-    for (idx, port) in stranger_ports.iter().enumerate() {
+    for idx in 0..3 {
         let sdir = base.join(format!("stranger_daemon_{idx}"));
         fs::create_dir_all(&sdir).unwrap();
         stranger_dirs.push(sdir.clone());
-        guards.push(
+        let (child, _addr) = common::spawn_on_ephemeral_port(
             Command::new(parvault_bin)
                 .env("PARVAULT_LAN_REGISTRY_DIR", &empty_lan)
                 .arg("--data-dir")
@@ -1428,16 +1369,11 @@ fn test_6_zero_pairing_public_tracker_swarm() {
                     &tracker_maddr,
                     "up",
                     "--listen",
-                    &format!("/ip4/127.0.0.1/tcp/{port}"),
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn stranger --public daemon"),
+                    common::LOOPBACK_EPHEMERAL,
+                ]),
+            &base.join(format!("stranger_daemon_{idx}.log")),
         );
-    }
-    for port in stranger_ports {
-        wait_for_tcp_port(port, Duration::from_secs(10));
+        guards.push(child);
     }
 
     // Poll `parvault --public --tracker <seed> discover --json` from a 4th stranger client until all 3 daemons appear
@@ -1746,14 +1682,6 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
     let parvault_bin = env!("CARGO_BIN_EXE_parvault");
     let seed_bin = env!("CARGO_BIN_EXE_parvault-seed");
 
-    let tracker_port = reserve_free_tcp_port();
-    let pub_daemon_port = reserve_free_tcp_port();
-    let priv_daemon_port = reserve_free_tcp_port();
-
-    let tracker_maddr = format!("/ip4/127.0.0.1/tcp/{tracker_port}");
-    let pub_daemon_maddr = format!("/ip4/127.0.0.1/tcp/{pub_daemon_port}");
-    let priv_daemon_maddr = format!("/ip4/127.0.0.1/tcp/{priv_daemon_port}");
-
     let tracker_dir = base.join("gov_public_tracker");
     let pub_daemon_dir = base.join("gov_public_daemon");
     let priv_daemon_dir = base.join("gov_private_ring_daemon");
@@ -1765,7 +1693,7 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
     let tracker_admin_id = load_or_generate_tracker_admin_identity(&tracker_dir).unwrap();
 
     let mut guards = ChildGuard::new();
-    guards.push(
+    let (tracker_child, tracker_maddr) = common::spawn_on_ephemeral_port(
         Command::new(seed_bin)
             .args([
                 "start",
@@ -1773,18 +1701,15 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
                 "public-bootstrap",
                 "--no-lan-discovery",
                 "--listen",
-                &tracker_maddr,
+                common::LOOPBACK_EPHEMERAL,
                 "--data-dir",
             ])
-            .arg(&tracker_dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn gov public tracker"),
+            .arg(&tracker_dir),
+        &base.join("gov_public_tracker.log"),
     );
-    wait_for_tcp_port(tracker_port, Duration::from_secs(10));
+    guards.push(tracker_child);
 
-    guards.push(
+    let (pub_daemon_child, pub_daemon_maddr) = common::spawn_on_ephemeral_port(
         Command::new(parvault_bin)
             .env("PARVAULT_LAN_REGISTRY_DIR", &empty_lan)
             .arg("--data-dir")
@@ -1796,15 +1721,13 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
                 &tracker_maddr,
                 "up",
                 "--listen",
-                &pub_daemon_maddr,
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn gov public daemon"),
+                common::LOOPBACK_EPHEMERAL,
+            ]),
+        &base.join("gov_public_daemon.log"),
     );
+    guards.push(pub_daemon_child);
 
-    guards.push(
+    let (priv_daemon_child, priv_daemon_maddr) = common::spawn_on_ephemeral_port(
         Command::new(parvault_bin)
             .env("PARVAULT_LAN_REGISTRY_DIR", &empty_lan)
             .arg("--data-dir")
@@ -1814,16 +1737,11 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
                 "daemon",
                 "start",
                 "--listen",
-                &priv_daemon_maddr,
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn private ring daemon"),
+                common::LOOPBACK_EPHEMERAL,
+            ]),
+        &base.join("gov_private_ring_daemon.log"),
     );
-
-    wait_for_tcp_port(pub_daemon_port, Duration::from_secs(10));
-    wait_for_tcp_port(priv_daemon_port, Duration::from_secs(10));
+    guards.push(priv_daemon_child);
 
     // Wait for `pub_daemon` to register with `tracker_maddr` and pin `tracker_admin_pubkey`
     let probe_client = MeshClient::new(NodeIdentity::generate(), vec![], None);
@@ -2159,7 +2077,7 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
             "homelab-vault",
             "--no-lan-discovery",
             "--listen",
-            &format!("/ip4/127.0.0.1/tcp/{}", reserve_free_tcp_port()),
+            common::LOOPBACK_EPHEMERAL,
             "--once",
             "--data-dir",
         ])
@@ -2225,14 +2143,12 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
     let rogue4_id = load_or_generate_tracker_admin_identity(&rogue4_dir).unwrap();
 
     // Spin up a live `--public` storage daemon pinned to the 3-operator council (`2-of-3` majority quorum!)
-    let council_daemon_port = reserve_free_tcp_port();
-    let council_daemon_maddr = format!("/ip4/127.0.0.1/tcp/{council_daemon_port}");
     let council_daemon_dir = base.join("council_guarded_daemon");
     fs::create_dir_all(&council_daemon_dir).unwrap();
 
     let mut council_cfg = NodeConfig {
         data_dir: council_daemon_dir.clone(),
-        listen_tcp: council_daemon_maddr.clone(),
+        listen_tcp: common::LOOPBACK_EPHEMERAL.to_string(),
         lan_discovery_enabled: false,
         trust_mode: TrustPoolMode::PublicCommons,
         eviction_authorities: vec![
@@ -2251,7 +2167,7 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
     )
     .unwrap();
 
-    guards.push(
+    let (council_child, council_daemon_maddr) = common::spawn_on_ephemeral_port(
         Command::new(parvault_bin)
             .env("PARVAULT_LAN_REGISTRY_DIR", &empty_lan)
             .arg("--config")
@@ -2264,14 +2180,11 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
                 "daemon",
                 "start",
                 "--listen",
-                &council_daemon_maddr,
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn 2-of-3 council daemon"),
+                common::LOOPBACK_EPHEMERAL,
+            ]),
+        &base.join("council_guarded_daemon.log"),
     );
-    wait_for_tcp_port(council_daemon_port, Duration::from_secs(10));
+    guards.push(council_child);
 
     // Store a target stripe on `council_daemon`
     let council_uploader_dir = base.join("council_uploader");

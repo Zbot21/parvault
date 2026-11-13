@@ -29,7 +29,6 @@ use parvault::sharding::encode_ciphertext_stripe;
 use parvault::storage::{AnonymousQuotaVoucher, BlindedShardCapability, BlindedShardId, ShardId};
 use parvault::sync::{EncryptedVaultCatalogEnvelope, FolderSnapshotManifest};
 use sha2::{Digest, Sha256};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -55,24 +54,6 @@ fn temp_root(label: &str) -> TempDir {
         .prefix(&format!("pv-trust-{label}-"))
         .tempdir()
         .expect("temp root")
-}
-
-/// Ports handed out in this process; parallel tests never get the same one.
-static USED_PORTS: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-
-fn free_port() -> u16 {
-    let mut used = USED_PORTS.lock().unwrap();
-    loop {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        if !used.contains(&port) {
-            used.push(port);
-            return port;
-        }
-    }
 }
 
 fn wait_for_port(port: u16) {
@@ -143,24 +124,20 @@ fn prepare(label: &str) -> (TempDir, PathBuf, PathBuf, PathBuf) {
     (root, dir, reg, log)
 }
 
-fn spawn(mut cmd: Command, root: TempDir, dir: PathBuf, log: PathBuf, port: u16) -> Node {
+fn spawn(mut cmd: Command, root: TempDir, dir: PathBuf, log: PathBuf) -> Node {
     cmd.env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED));
-    spawn_as_is(cmd, root, dir, log, port)
+    spawn_as_is(cmd, root, dir, log)
 }
 
 /// Like `spawn`, but the binary gets no ring genesis from the environment.
-fn spawn_without_ring_env(
-    mut cmd: Command,
-    root: TempDir,
-    dir: PathBuf,
-    log: PathBuf,
-    port: u16,
-) -> Node {
+fn spawn_without_ring_env(mut cmd: Command, root: TempDir, dir: PathBuf, log: PathBuf) -> Node {
     cmd.env_remove("PARVAULT_GENESIS_SEED_HEX");
-    spawn_as_is(cmd, root, dir, log, port)
+    spawn_as_is(cmd, root, dir, log)
 }
 
-fn spawn_as_is(mut cmd: Command, root: TempDir, dir: PathBuf, log: PathBuf, port: u16) -> Node {
+/// Spawns a daemon told to listen on `common::LOOPBACK_EPHEMERAL`; `addr` is the address it
+/// reports binding (never a port reserved and released first: see `common::LOOPBACK_EPHEMERAL`).
+fn spawn_as_is(mut cmd: Command, root: TempDir, dir: PathBuf, log: PathBuf) -> Node {
     let log_file = std::fs::File::create(&log).unwrap();
     let child = cmd
         .env("RUST_LOG", "info")
@@ -175,33 +152,21 @@ fn spawn_as_is(mut cmd: Command, root: TempDir, dir: PathBuf, log: PathBuf, port
         child,
         dir,
         log,
-        addr: format!("/ip4/127.0.0.1/tcp/{port}"),
+        addr: String::new(),
         _root: root,
     };
-    // Ready when the binary itself reports listening on its address (an open port alone may
-    // belong to another process).
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let log = node.log_text();
-        if log.contains("istening on") && log.contains(&node.addr) {
-            break;
-        }
-        if let Ok(Some(status)) = node.child.try_wait() {
-            panic!("binary exited ({status}) before listening:\n{log}");
-        }
-        assert!(
-            Instant::now() < deadline,
-            "binary not listening on {}:\n{log}",
-            node.addr
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    wait_for_port(port);
+    let log_path = node.log.clone();
+    node.addr = common::wait_for_listen_addr(
+        &mut node.child,
+        || std::fs::read_to_string(&log_path).unwrap_or_default(),
+        Duration::from_secs(20),
+    );
+    wait_for_port(common::tcp_port_of(&node.addr));
     node
 }
 
 /// `parvault daemon start` on loopback with LAN discovery off, provisioned with the ring genesis.
-fn daemon_command(dir: &Path, reg: &Path, port: u16) -> Command {
+fn daemon_command(dir: &Path, reg: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
     cmd.env("PARVAULT_LAN_REGISTRY_DIR", reg)
         .arg("--data-dir")
@@ -211,32 +176,32 @@ fn daemon_command(dir: &Path, reg: &Path, port: u16) -> Command {
             "daemon",
             "start",
             "--listen",
-            &format!("/ip4/127.0.0.1/tcp/{port}"),
+            common::LOOPBACK_EPHEMERAL,
         ]);
     cmd
 }
 
 fn spawn_daemon(label: &str) -> Node {
     let (root, dir, reg, log) = prepare(label);
-    let port = free_port();
-    let cmd = daemon_command(&dir, &reg, port);
-    spawn(cmd, root, dir, log, port)
+    let cmd = daemon_command(&dir, &reg);
+    spawn(cmd, root, dir, log)
 }
 
 impl Node {
-    /// Restarts this daemon on the same data directory and port, first deleting its persisted
-    /// Web-of-Trust state (as if its admissions were lost).
+    /// Restarts this daemon on the same data directory (on a new ephemeral port, which `addr`
+    /// then names), first deleting its persisted Web-of-Trust state (as if its admissions were
+    /// lost).
     fn restart_daemon_without_wot_state(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_file(self.dir.join("wot_state.bin"));
-        let port: u16 = self.addr.rsplit('/').next().unwrap().parse().unwrap();
         let reg = self.dir.parent().unwrap().join("lan-registry");
+        let offset = self.log_text().len();
         let log_file = std::fs::OpenOptions::new()
             .append(true)
             .open(&self.log)
             .unwrap();
-        self.child = daemon_command(&self.dir, &reg, port)
+        self.child = daemon_command(&self.dir, &reg)
             .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
             .env("RUST_LOG", "info")
             .env("NO_COLOR", "1")
@@ -244,11 +209,16 @@ impl Node {
             .stderr(Stdio::from(log_file))
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(Instant::now() < deadline, "daemon did not come back");
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        let log = self.log.clone();
+        self.addr = common::wait_for_listen_addr(
+            &mut self.child,
+            || {
+                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                text.get(offset..).unwrap_or_default().to_string()
+            },
+            Duration::from_secs(20),
+        );
+        wait_for_port(common::tcp_port_of(&self.addr));
         std::thread::sleep(Duration::from_millis(300));
     }
 }
@@ -256,7 +226,6 @@ impl Node {
 /// `parvault --public daemon start`: public-commons mode (tickets admit strangers).
 fn spawn_public_daemon(label: &str) -> Node {
     let (root, dir, reg, log) = prepare(label);
-    let port = free_port();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
     cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
         .arg("--data-dir")
@@ -267,9 +236,9 @@ fn spawn_public_daemon(label: &str) -> Node {
             "daemon",
             "start",
             "--listen",
-            &format!("/ip4/127.0.0.1/tcp/{port}"),
+            common::LOOPBACK_EPHEMERAL,
         ]);
-    spawn(cmd, root, dir, log, port)
+    spawn(cmd, root, dir, log)
 }
 
 /// `parvault-seed start --mode homelab-vault` on loopback, provisioned with the ring genesis. Its
@@ -281,7 +250,6 @@ fn spawn_seed(label: &str) -> Node {
 /// `spawn_seed` with `--peers` (the mesh peers it syndicates to).
 fn spawn_seed_with_peers(label: &str, peers: &[&str]) -> Node {
     let (root, dir, reg, log) = prepare(label);
-    let port = free_port();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault-seed"));
     if !peers.is_empty() {
         cmd.arg("--peers").arg(peers.join(","));
@@ -293,11 +261,11 @@ fn spawn_seed_with_peers(label: &str, peers: &[&str]) -> Node {
             "homelab-vault",
             "--no-lan-discovery",
             "--listen",
-            &format!("/ip4/127.0.0.1/tcp/{port}"),
+            common::LOOPBACK_EPHEMERAL,
             "--data-dir",
         ])
         .arg(&dir);
-    spawn(cmd, root, dir, log, port)
+    spawn(cmd, root, dir, log)
 }
 
 /// An in-process wire client speaking as `ident`, a ring member: it self-issues its chain from
@@ -2176,14 +2144,7 @@ fn invitee_serves_the_ring() {
     assert!(install.status.success(), "{}", out_text(&install));
     assert!(inv_dir.join("ring_genesis.pub").exists());
     assert!(!inv_dir.join("ring_genesis.seed").exists());
-    let port = free_port();
-    let node = spawn_without_ring_env(
-        daemon_command(&inv_dir, &reg, port),
-        inv_root,
-        inv_dir,
-        log,
-        port,
-    );
+    let node = spawn_without_ring_env(daemon_command(&inv_dir, &reg), inv_root, inv_dir, log);
     let (sid, bytes) = shard(0x41, 512);
     let member = send(&key(0xD8), &node, put_shard("", sid, bytes, None));
     assert!(stored(&member), "{member:?}\n{}", node.log_text());
@@ -2213,7 +2174,7 @@ fn daemon_without_ring_refuses_to_start() {
             .arg("--data-dir")
             .arg(root.path().join("d"))
             .args(["--no-lan-discovery", "daemon", "start", "--listen"])
-            .arg(format!("/ip4/127.0.0.1/tcp/{}", free_port())),
+            .arg(common::LOOPBACK_EPHEMERAL),
     );
     let text = out_text(&out);
     assert!(!out.status.success(), "{text}");
@@ -2282,7 +2243,7 @@ fn conflicting_genesis_sources_refuse_to_start() {
             .arg("--data-dir")
             .arg(&dir)
             .args(["--no-lan-discovery", "daemon", "start", "--listen"])
-            .arg(format!("/ip4/127.0.0.1/tcp/{}", free_port())),
+            .arg(common::LOOPBACK_EPHEMERAL),
     );
     let text = out_text(&out);
     assert!(!out.status.success(), "{text}");
@@ -2580,10 +2541,9 @@ fn w03_missing_folder_fails() {
 
 fn other_ring_daemon(label: &str) -> Node {
     let (root, dir, reg, log) = prepare(label);
-    let port = free_port();
-    let mut cmd = daemon_command(&dir, &reg, port);
+    let mut cmd = daemon_command(&dir, &reg);
     cmd.env("PARVAULT_GENESIS_SEED_HEX", hex::encode([0x99u8; 32]));
-    spawn_as_is(cmd, root, dir, log, port)
+    spawn_as_is(cmd, root, dir, log)
 }
 
 /// Runs a ring node's `up --no-socket --vfs-seed-dir` with `pins` pinned (in that order, as LAN
@@ -2603,8 +2563,6 @@ fn d1_up_with_pins(label: &str, pins: &[&Node]) -> Node {
         store.upsert_pinned_multiaddr(&pid, &format!("{}/p2p/{pid}", n.addr), None, Some("daemon"));
     }
     store.save(&dir).unwrap();
-    let port = free_port();
-    let webdav = free_port();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
     cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
         .arg("--data-dir")
@@ -2614,13 +2572,13 @@ fn d1_up_with_pins(label: &str, pins: &[&Node]) -> Node {
             "up",
             "--no-socket",
             "--listen",
-            &format!("/ip4/127.0.0.1/tcp/{port}"),
+            common::LOOPBACK_EPHEMERAL,
             "--vfs-webdav-listen",
-            &format!("127.0.0.1:{webdav}"),
+            "127.0.0.1:0",
             "--vfs-seed-dir",
         ])
         .arg(&seed_dir);
-    let node = spawn(cmd, root, dir, log, port);
+    let node = spawn(cmd, root, dir, log);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let text = node.log_text();
@@ -2744,7 +2702,6 @@ fn r3_watch_once_allow_local_only_exits_zero() {
 /// A public-commons daemon with no ring: no genesis from the environment or the data dir.
 fn spawn_ticket_only_daemon(label: &str) -> Node {
     let (root, dir, reg, log) = prepare(label);
-    let port = free_port();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
     cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
         .arg("--data-dir")
@@ -2755,9 +2712,9 @@ fn spawn_ticket_only_daemon(label: &str) -> Node {
             "daemon",
             "start",
             "--listen",
-            &format!("/ip4/127.0.0.1/tcp/{port}"),
+            common::LOOPBACK_EPHEMERAL,
         ]);
-    spawn_without_ring_env(cmd, root, dir, log, port)
+    spawn_without_ring_env(cmd, root, dir, log)
 }
 
 /// F-37: a one-hop chain "signed" by the all-zero key, a small-order Ed25519 point. With
@@ -2870,7 +2827,6 @@ fn r3_sync_push_local_only_exits_with_code() {
     let folder = root.path().join("docs");
     std::fs::create_dir_all(&folder).unwrap();
     std::fs::write(folder.join("a.txt"), b"pushed but not backed up").unwrap();
-    let port = free_port();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
     cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
         .arg("--data-dir")
@@ -2879,11 +2835,11 @@ fn r3_sync_push_local_only_exits_with_code() {
             "--no-lan-discovery",
             "up",
             "--listen",
-            &format!("/ip4/127.0.0.1/tcp/{port}"),
+            common::LOOPBACK_EPHEMERAL,
             "--ipc-socket",
         ])
         .arg(&sock);
-    let _node = spawn(cmd, root, dir, log, port);
+    let _node = spawn(cmd, root, dir, log);
     let deadline = Instant::now() + Duration::from_secs(30);
     while !sock.exists() {
         assert!(Instant::now() < deadline, "gateway socket never appeared");
@@ -2937,9 +2893,8 @@ fn r3_partial_placement_keeps_remote_shards() {
             "max_storage_bytes = 1073741824\nbootstrap_grace_bytes = 20000\n",
         )
         .unwrap();
-        let port = free_port();
-        let cmd = daemon_command(&dir, &reg, port);
-        spawn(cmd, root, dir, log, port)
+        let cmd = daemon_command(&dir, &reg);
+        spawn(cmd, root, dir, log)
     };
     let (root, dir, reg, _log) = prepare("r3-partial-client");
     let file = root.path().join("doc.bin");
