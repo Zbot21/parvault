@@ -1408,8 +1408,15 @@ mod unix_vfs {
         pkt.extend_from_slice(&hdr.to_ne_bytes());
         pkt.extend_from_slice(body);
         match dev.write_all(&pkt) {
-            // The kernel already dropped this request (interrupted or aborted): not fatal.
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+            // The kernel already dropped this request (interrupted or aborted): not fatal. Logged,
+            // so a reply with a wrong `unique` (the same errno) is not silent.
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                tracing::debug!(
+                    unique,
+                    "FUSE reply refused with ENOENT (request already gone)"
+                );
+                Ok(())
+            }
             other => other,
         }
     }
@@ -1421,6 +1428,8 @@ mod unix_vfs {
                 Ok(0) => return Ok(()),
                 Ok(n) => n,
                 Err(e) if e.raw_os_error() == Some(libc::ENODEV) => return Ok(()),
+                // An aborted request (ENOENT) or a signal: read the next one, as libfuse does.
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             };

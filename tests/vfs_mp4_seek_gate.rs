@@ -583,8 +583,25 @@ fn parvault_fuse_plugin_mount_rss_under_16_mib() {
         .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
         .expect("VmHWM");
     eprintln!("plugin peak RSS: {hwm_kib} KiB");
+    // The plugin's own LRU cache dir stays within --cache-mib 3.
+    let plugin_cache: u64 = std::fs::read_dir(tmp.path().join("plugin-cache"))
+        .unwrap()
+        .filter_map(|e| e.ok()?.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum();
+    eprintln!("plugin cache dir: {plugin_cache} B");
+    assert!(
+        plugin_cache <= CACHE_BYTES,
+        "plugin cache {plugin_cache} B > 3 MiB"
+    );
     drop(mount);
-    let _ = plugin.wait_timeout_or_kill();
+    // Unmounting ends the plugin's FUSE loop: it must exit by itself, successfully.
+    let exit = plugin.wait_timeout_or_kill().unwrap();
+    assert!(
+        exit.is_some_and(|s| s.success()),
+        "the plugin did not exit cleanly after unmount: {exit:?}"
+    );
     assert_budget(
         "plugin peak RSS < 16 MiB",
         hwm_kib < 16 * 1024,
@@ -593,20 +610,23 @@ fn parvault_fuse_plugin_mount_rss_under_16_mib() {
 }
 
 trait WaitOrKill {
-    fn wait_timeout_or_kill(&mut self) -> std::io::Result<()>;
+    /// `Some(status)` if it exited within 5 s, `None` if it had to be killed.
+    fn wait_timeout_or_kill(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
 }
 
 impl WaitOrKill for std::process::Child {
-    fn wait_timeout_or_kill(&mut self) -> std::io::Result<()> {
+    fn wait_timeout_or_kill(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while self.try_wait()?.is_none() {
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(Some(status));
+            }
             if Instant::now() > deadline {
                 self.kill()?;
                 self.wait()?;
-                break;
+                return Ok(None);
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        Ok(())
     }
 }
