@@ -25,7 +25,7 @@ VARIABLES
     organicPeers,                   \* Reachable OrganicCommunityPeer count (0 -> 4 -> 10 -> 20)
     seedAnchors,                    \* Reachable FoundationSeedAnchor fallback nodes (20)
     porStreak,                      \* Audited PoR uptime streak (0..3)
-    isSlashed,                      \* Whether the honest node is slashed (FALSE)
+    isSlashed,                      \* Whether the honest node has been slashed (an external event)
     byzantinePeerSlashed,           \* Whether a faulting probationary peer was slashed (BOOLEAN)
     unauthorizedEscalationRejected, \* TRUE once a premature --tier homelab request is rejected
     earnedTier,                     \* Current EarnedStanding tier name
@@ -33,18 +33,16 @@ VARIABLES
     activeN,                        \* Current Reed-Solomon total stripe shards N
     recoverableShards,              \* Currently available/recoverable shards for the stripe
     seedAnchorShardsHeld,           \* Shards currently held by FoundationSeedAnchor nodes (0..20)
-    seedAnchorsDrained,             \* TRUE once plan_seed_anchor_drain migrates all seed shards
-    sybilCountOnSubnet,             \* Number of Sybil nodes sharing one /24 subnet (1..5)
-    subnetSybilMultiplier           \* Aggregate /24 standby credit minted per epoch (always 1)
+    seedAnchorsDrained             \* TRUE once plan_seed_anchor_drain migrates all seed shards
 
 vars == <<personalDevices, organicPeers, seedAnchors, porStreak, isSlashed,
           byzantinePeerSlashed, unauthorizedEscalationRejected, earnedTier,
           activeK, activeN, recoverableShards, seedAnchorShardsHeld,
-          seedAnchorsDrained, sybilCountOnSubnet, subnetSybilMultiplier>>
+          seedAnchorsDrained>>
 
 \* Helper: maps (porStreak, isSlashed) to EarnedStanding tier once in the 20-peer mesh
 EarnedTierFromStreak(streak, slashed) ==
-    IF slashed THEN "Probationary_10of20"
+    IF slashed THEN "Probationary_10of20"   \* @guard tier-respects-slash sym=src/bootstrap.rs::evaluate (EarnedStanding::evaluate; F-07 caveat: not yet on the wire path)
     ELSE IF streak >= 2 THEN "Homelab_16of20"
     ELSE IF streak = 1 THEN "VerifiedMixed_16of24"
     ELSE "Probationary_10of20"
@@ -77,8 +75,6 @@ Init ==
     /\ recoverableShards              = 3
     /\ seedAnchorShardsHeld           = 0
     /\ seedAnchorsDrained             = FALSE
-    /\ sybilCountOnSubnet             = 1
-    /\ subnetSybilMultiplier          = 1
 
 \* Action 1: PairSecondPersonalDevice (Mechanism 1 — Day-1 Personal Device Ring)
 \* User pairs a second personal device (e.g. Laptop + Home NAS) via composite
@@ -93,8 +89,7 @@ PairSecondPersonalDevice ==
     /\ recoverableShards' = 3
     /\ UNCHANGED <<organicPeers, seedAnchors, porStreak, isSlashed,
                    byzantinePeerSlashed, unauthorizedEscalationRejected,
-                   seedAnchorShardsHeld, seedAnchorsDrained,
-                   sybilCountOnSubnet, subnetSybilMultiplier>>
+                   seedAnchorShardsHeld, seedAnchorsDrained>>
 
 \* Action 2: BootstrapOnFoundationSeedAnchors (Mechanism 2 — Seed Anchor Fallback)
 \* When the node enters the wider mesh with 0 organic peers, it starts in the mandatory
@@ -110,7 +105,7 @@ BootstrapOnFoundationSeedAnchors ==
     /\ seedAnchorShardsHeld' = 20
     /\ UNCHANGED <<personalDevices, organicPeers, seedAnchors, porStreak,
                    isSlashed, byzantinePeerSlashed, unauthorizedEscalationRejected,
-                   seedAnchorsDrained, sybilCountOnSubnet, subnetSybilMultiplier>>
+                   seedAnchorsDrained>>
 
 \* Action 3: AttemptUnauthorizedHomelabEscalation
 \* A probationary or mid-tier node (porStreak < 2) attempts to self-select "Homelab_16of20"
@@ -123,8 +118,7 @@ AttemptUnauthorizedHomelabEscalation ==
     \* earnedTier remains strictly bounded by porStreak (never "Homelab_16of20")
     /\ UNCHANGED <<personalDevices, organicPeers, seedAnchors, porStreak,
                    isSlashed, byzantinePeerSlashed, earnedTier, activeK, activeN,
-                   recoverableShards, seedAnchorShardsHeld, seedAnchorsDrained,
-                   sybilCountOnSubnet, subnetSybilMultiplier>>
+                   recoverableShards, seedAnchorShardsHeld, seedAnchorsDrained>>
 
 \* Action 4: OrganicPeersJoinAndDrainSeedAnchors (Mechanism 2 — Auto-Drain)
 \* As organic community peers join (0 -> 4 -> 10 -> 20), shards are progressively
@@ -143,8 +137,7 @@ OrganicPeersJoinAndDrainSeedAnchors ==
           /\ seedAnchorsDrained' = (nextOrganic = MaxOrganicPeers /\ nextSeedHeld = 0)
     /\ UNCHANGED <<personalDevices, seedAnchors, porStreak, isSlashed,
                    byzantinePeerSlashed, unauthorizedEscalationRejected,
-                   earnedTier, activeK, activeN, recoverableShards,
-                   sybilCountOnSubnet, subnetSybilMultiplier>>
+                   earnedTier, activeK, activeN, recoverableShards>>
 
 \* Action 5: AccruePorUptimeAndZeroKnowledgeReshard (Mechanism 3 & 4)
 \* Honest node passes sustained PoR uptime epochs (porStreak: 0 -> 1 -> 2 -> 3)
@@ -167,23 +160,24 @@ AccruePorUptimeAndZeroKnowledgeReshard ==
           /\ recoverableShards' = nextN
     /\ UNCHANGED <<personalDevices, organicPeers, seedAnchors, isSlashed,
                    byzantinePeerSlashed, unauthorizedEscalationRejected,
-                   seedAnchorShardsHeld, seedAnchorsDrained,
-                   sybilCountOnSubnet, subnetSybilMultiplier>>
+                   seedAnchorShardsHeld, seedAnchorsDrained>>
 
-\* Action 6: SybilSubnetStandbySpawn (Mechanism 4 — /24 Subnet Sybil Damper)
-\* An attacker spins up additional Sybil VMs (1..5) on a single /24 subnet to farm
-\* Pioneer Standby Uptime credits. Because each node's standby credit is multiplied
-\* by (1 / M_subnet), the aggregate subnet multiplier remains invariant at 1.
-SybilSubnetStandbySpawn ==
-    /\ sybilCountOnSubnet < MaxSybilNodesOnSubnet
-    /\ LET nextSybils == sybilCountOnSubnet + 1
-           \* M_subnet nodes each receiving (1 / M_subnet) = 1 aggregate subnet unit
-           aggMultiplier == (nextSybils \div nextSybils)
-       IN /\ sybilCountOnSubnet'    = nextSybils
-          /\ subnetSybilMultiplier' = aggMultiplier
+\* The honest node is slashed (an external event; what slashes it is not modelled). Its tier is
+\* re-evaluated through the same EarnedTierFromStreak, so it leaves the earned tiers.
+\* The former SybilSubnetStandbySpawn action and Safety_SubnetSybilQuotaConservation are removed:
+\* no Rust function enforces the aggregate per-subnet standby credit (it was `x \div x`, P-04);
+\* `canonical_sybil_subnet_key` only buckets addresses. Not model-checked (L-47 item 7).
+HonestNodeSlashed ==
+    /\ ~isSlashed
+    /\ earnedTier /= "PersonalRing_2of3"
+    /\ LET nextTier == EarnedTierFromStreak(porStreak, TRUE)
+       IN /\ isSlashed'         = TRUE
+          /\ earnedTier'        = nextTier
+          /\ activeK'           = TierK(nextTier)
+          /\ activeN'           = TierN(nextTier)
+          /\ recoverableShards' = TierN(nextTier)
     /\ UNCHANGED <<personalDevices, organicPeers, seedAnchors, porStreak,
-                   isSlashed, byzantinePeerSlashed, unauthorizedEscalationRejected,
-                   earnedTier, activeK, activeN, recoverableShards,
+                   byzantinePeerSlashed, unauthorizedEscalationRejected,
                    seedAnchorShardsHeld, seedAnchorsDrained>>
 
 \* Action 7: SlashByzantinePeer
@@ -195,16 +189,14 @@ SlashByzantinePeer ==
     /\ UNCHANGED <<personalDevices, organicPeers, seedAnchors, porStreak,
                    isSlashed, unauthorizedEscalationRejected, earnedTier,
                    activeK, activeN, recoverableShards, seedAnchorShardsHeld,
-                   seedAnchorsDrained, sybilCountOnSubnet, subnetSybilMultiplier>>
+                   seedAnchorsDrained>>
 
 \* Terminal stuttering step once organic self-sufficiency and earned Homelab tier are reached.
 Idle ==
     /\ organicPeers = MaxOrganicPeers
     /\ seedAnchorsDrained = TRUE
     /\ seedAnchorShardsHeld = 0
-    /\ porStreak = MaxPorStreak
-    /\ earnedTier = "Homelab_16of20"
-    /\ sybilCountOnSubnet = MaxSybilNodesOnSubnet
+    /\ (isSlashed \/ (porStreak = MaxPorStreak /\ earnedTier = "Homelab_16of20"))
     /\ byzantinePeerSlashed = TRUE
     /\ UNCHANGED vars
 
@@ -214,7 +206,7 @@ Next ==
     \/ AttemptUnauthorizedHomelabEscalation
     \/ OrganicPeersJoinAndDrainSeedAnchors
     \/ AccruePorUptimeAndZeroKnowledgeReshard
-    \/ SybilSubnetStandbySpawn
+    \/ HonestNodeSlashed
     \/ SlashByzantinePeer
     \/ Idle
 
@@ -241,14 +233,6 @@ Safety_SeedAnchorsDrainAtOrganicThreshold ==
     /\ ((organicPeers >= 20 /\ seedAnchorsDrained) => seedAnchorShardsHeld = 0)
     /\ (seedAnchorShardsHeld <= SeedAnchorPoolSize)
 
-\* 3. Subnet Sybil Quota Conservation:
-\* Aggregate standby credit minted by a /24 subnet with sybilCountOnSubnet (1..5)
-\* nodes never exceeds 1 unit per epoch.
-Safety_SubnetSybilQuotaConservation ==
-    /\ sybilCountOnSubnet \in 1..MaxSybilNodesOnSubnet
-    /\ subnetSybilMultiplier <= 1
-    /\ subnetSybilMultiplier = 1
-
 \* 4. Day-1-to-Scale Data Availability:
 \* In every reachable state from 0 organic peers (Personal Ring / Seed Anchor fallback)
 \* to 20+ organic peers across all elastic re-sharding transitions, recoverableShards >= activeK.
@@ -265,6 +249,7 @@ Safety_Day1ToScaleDataAvailability ==
 \* Every fair execution eventually drains all Foundation Seed Anchors to 0 shards
 \* and promotes the sustained high-uptime node to the 16-of-20 Homelab tier.
 Liveness_EventualOrganicSelfSufficiencyAndEarnedTier ==
-    <> (seedAnchorShardsHeld = 0 /\ earnedTier = "Homelab_16of20")
+    \* Scoped by L-47: a node that is slashed never earns Homelab.
+    <> (seedAnchorShardsHeld = 0 /\ (earnedTier = "Homelab_16of20" \/ isSlashed))
 
 =============================================================================

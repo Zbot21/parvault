@@ -41,7 +41,6 @@ xref       X-ADR-DOC path=docs/**.md pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.
 
 # --- Formal proofs (P-01 to P-05; mutants are authored by QA) --------------------------------------
 tla-spec   T-SPECS   path=specs/*.tla
-open       T-SPECS   expect=tla-lint by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 open       T-SPECS   expect=completeness by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 module     P-01      path=src/network/wot.rs pattern=^(verify_and_admit_|is_peer_|apply_slashing_|slash_|record_failure) kani=required
 reach      P-01      sym=src/network/wot.rs::is_peer_trusted from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
@@ -167,4 +166,4 @@ kani       S-SANITIZE sym=src/sync.rs::sanitize_sync_relative_path_into harness=
 claim      B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision accept=trust_enforcement::bseed_second_sender_accepted_while_one_job_runs reject=trust_enforcement::bseed_third_job_refused_busy code=reject.syndication_busy bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe
 kani       B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision harness=proof_syndication_fanout_budget cover=syndication over budget
 
-ratchet    R         open=6 waive=16
+ratchet    R         open=5 waive=16
