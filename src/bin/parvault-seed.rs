@@ -58,7 +58,7 @@ use tracing::{info, warn};
 #[command(
     name = "parvault-seed",
     version,
-    about = "Standalone Zero-Trust Seed & Redundancy Server for ParVault (ADR-13)"
+    about = "Standalone Zero-Trust Seed & Redundancy Server for ParVault (ADR-16)"
 )]
 struct SeedCli {
     /// Optional comma-separated list of mesh peer Multiaddrs or `host:port` endpoints (`PARVAULT_PEERS`).
@@ -779,7 +779,7 @@ async fn main() -> anyhow::Result<()> {
                 &grown_candidates,
             );
 
-            println!("=== ParVault Seed Server Elastic Auto-Drain Plan (ADR-12 / ADR-13) ===");
+            println!("=== ParVault Seed Server Elastic Auto-Drain Plan (ADR-15) ===");
             println!("Data Directory            : {}", data_dir.display());
             println!("Seed Anchor Peer ID       : {}", server.server_peer_id());
             println!("Target Shard Count (N)    : {}", target_n);
@@ -799,7 +799,7 @@ async fn main() -> anyhow::Result<()> {
             let corrupted_quarantined_shards = report.quarantined_corrupted_shards.len()
                 + report.quarantined_corrupted_blinded_locators.len();
             let total_shards_scanned = healthy_shards + corrupted_quarantined_shards;
-            println!("=== ParVault Seed Server Local Bit-Rot Scrub Report (ADR-15) ===");
+            println!("=== ParVault Seed Server Local Bit-Rot Scrub Report (ADR-19) ===");
             println!("Data Directory               : {}", data_dir.display());
             println!("total_shards_scanned         : {}", total_shards_scanned);
             println!(
@@ -994,7 +994,7 @@ async fn main() -> anyhow::Result<()> {
             SeedAdminAction::ShowAuthority { data_dir } => {
                 let admin_id = load_or_generate_tracker_admin_identity(&data_dir)?;
                 let node_id = NodeIdentity::load_or_generate_in_dir(&data_dir)?;
-                println!("=== ParVault Public Tracker Admin Authority (ADR-19) ===");
+                println!("=== ParVault Public Tracker Admin Authority (ADR-26) ===");
                 println!("Data Directory              : {}", data_dir.display());
                 println!(
                     "Tracker Admin Pubkey (hex)  : {}",
@@ -1009,7 +1009,7 @@ async fn main() -> anyhow::Result<()> {
                 let queue = PublicTrackerTakedownQueue::load_or_init(&data_dir)?;
                 let entries = queue.list_entries();
                 let emergencies = queue.list_emergency_actions();
-                println!("=== ParVault Public Tracker Takedown Governance Queue (ADR-19) ===");
+                println!("=== ParVault Public Tracker Takedown Governance Queue (ADR-26) ===");
                 println!("Data Directory              : {}", data_dir.display());
                 println!("Queued Abuse Reports        : {}", entries.len());
                 for entry in &entries {
@@ -1057,7 +1057,7 @@ async fn main() -> anyhow::Result<()> {
                 let entry = queue.get_entry(&rid).ok_or_else(|| {
                     anyhow::anyhow!("Takedown report {} not found in queue", hex::encode(rid))
                 })?;
-                println!("=== ParVault Verifiable Abuse Report Inspection (ADR-19) ===");
+                println!("=== ParVault Verifiable Abuse Report Inspection (ADR-26) ===");
                 println!(
                     "Report ID                   : {}",
                     hex::encode(entry.report.report_id)
@@ -1127,7 +1127,7 @@ async fn main() -> anyhow::Result<()> {
                         remote_purge.merge(&rep);
                     }
                 }
-                println!("=== ParVault Public Tracker Takedown Approved (ADR-19) ===");
+                println!("=== ParVault Public Tracker Takedown Approved (ADR-26) ===");
                 println!("Report ID                   : {}", hex::encode(rid));
                 println!(
                     "Admin Signer Pubkey         : {}",
@@ -1288,7 +1288,7 @@ async fn main() -> anyhow::Result<()> {
                     .map(|o| 1 + o.cosignatures.len())
                     .unwrap_or(0);
                 println!(
-                    "=== ParVault Tracker Council Co-Signature Applied (M-of-N Quorum, ADR-19) ==="
+                    "=== ParVault Tracker Council Co-Signature Applied (M-of-N Quorum, ADR-26) ==="
                 );
                 println!(
                     "Cosigner Admin Pubkey       : {}",
@@ -1332,7 +1332,7 @@ fn print_status_report(
     report: &parvault::bootstrap::SeedServerStatusReport,
 ) -> anyhow::Result<()> {
     println!("========================================================================");
-    println!("  ParVault Zero-Trust Seed & Redundancy Server Status Report (ADR-13)     ");
+    println!("  ParVault Zero-Trust Seed & Redundancy Server Status Report (ADR-16)     ");
     println!("========================================================================");
     println!("Operating Mode            : {:?}", report.mode);
     println!("Assigned PeerRole         : {:?}", report.peer_role);
@@ -1401,7 +1401,7 @@ fn is_seed_homelab_mode(data_dir: &Path) -> bool {
 fn ensure_public_tracker_mode(data_dir: &Path, subcommand: &str) -> anyhow::Result<()> {
     if is_seed_homelab_mode(data_dir) {
         anyhow::bail!(
-            "Refused: `parvault-seed admin {subcommand}` is strictly disabled in `homelab-vault` (PrivateRing) mode (ADR-19 Strict Mode Isolation)"
+            "Refused: `parvault-seed admin {subcommand}` is strictly disabled in `homelab-vault` (PrivateRing) mode (ADR-26 Strict Mode Isolation)"
         );
     }
     Ok(())
