@@ -50,6 +50,20 @@ fn now_unix_ms() -> u64 {
 /// zero-pairing admission (~0.5–2 ms on tiny router SoCs).
 pub const DEFAULT_PUBLIC_WOT_POW_BITS: u8 = 12;
 
+/// Most PoW bits a node may require of tickets (QA 2c R2): what a default client still re-mints
+/// (`DEFAULT_PUBLIC_WOT_POW_BITS + 4`, see `ticket_pow_demand_decision`).
+pub const MAX_REQUIRED_PUBLIC_POW_BITS: u8 = DEFAULT_PUBLIC_WOT_POW_BITS + 4;
+
+/// QA 2c R2: an operator may not require more ticket PoW than clients will mint, or every new
+/// public client is locked out.
+pub fn required_pow_bits_decision(bits: u8) -> Result<(), &'static str> {
+    if bits > MAX_REQUIRED_PUBLIC_POW_BITS {
+        Err("reject.required_pow_bits_excessive")
+    } else {
+        Ok(())
+    }
+}
+
 /// Hard ceiling on ticket PoW a client will mint (QA 2c D1): about a million hashes.
 pub const MAX_TICKET_POW_BITS: u8 = 20;
 
@@ -717,7 +731,8 @@ impl WebOfTrustRegistry {
     /// Updates the pool's `TrustPoolMode` and minimum required `PublicCommonsTicket` PoW difficulty.
     pub fn set_trust_pool_mode(&mut self, mode: TrustPoolMode, min_pow_bits: u8) {
         self.trust_pool_mode = mode;
-        self.min_public_pow_bits = min_pow_bits;
+        // Backstop for R2: never require more than clients will mint.
+        self.min_public_pow_bits = min_pow_bits.min(MAX_REQUIRED_PUBLIC_POW_BITS);
         self.persist();
     }
 
@@ -1239,6 +1254,25 @@ impl WebOfTrustRegistry {
 
 #[cfg(test)]
 mod tests {
+    /// QA 2c R2: a node may require at most what a default client re-mints (16 bits).
+    #[test]
+    fn required_pow_bits_are_capped() {
+        use super::*;
+        assert_eq!(required_pow_bits_decision(16), Ok(()));
+        assert_eq!(
+            required_pow_bits_decision(17),
+            Err("reject.required_pow_bits_excessive")
+        );
+        assert_eq!(
+            ticket_pow_demand_decision(MAX_REQUIRED_PUBLIC_POW_BITS, DEFAULT_PUBLIC_WOT_POW_BITS),
+            Ok(()),
+            "every requirement a node may set is one a default client accepts"
+        );
+        let mut wot = WebOfTrustRegistry::new([1; 32], 3);
+        wot.set_trust_pool_mode(TrustPoolMode::PublicCommons, 30);
+        assert_eq!(wot.min_public_pow_bits(), MAX_REQUIRED_PUBLIC_POW_BITS);
+    }
+
     /// QA 2c D1: a peer's PoW demand is capped, and mint never searches past the ceiling.
     #[test]
     fn ticket_pow_demand_is_bounded() {

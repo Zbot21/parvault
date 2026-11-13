@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Security
+- **Ticket PoW is bounded on both sides (QA 2c D1, R2).** A client refuses a peer's ticket PoW demand above its own level + 4 bits (cap 20, `reject.ticket_pow_demand_excessive`) instead of minting forever, and a seed's admin RPC refuses `min_public_pow_bits` above 16 (`reject.required_pow_bits_excessive`), so an operator cannot lock out every new public client.
 - **Public status is coarse (F-44).** `QueryNodeStatus` reports free space rounded down to whole MiB, used space in power-of-two GiB buckets and SLA to one decimal, not exact values.
 - **Gateway identity statements are pinned (F-17).** `GatewayIdentityStatement::verify(now)` is replaced by `verify_pinned(expected_authority, now)`, which refuses another authority and a lifetime outside `(0, 30 days]`. **Breaking (library):** callers (the suite broker) must pin their authority.
 - **Post-quantum DHT manifests fail closed (PQ-DHT).** The DHT reader refuses `PostQuantumManifest` candidates (`reject.dht_owner_unbindable`) until an owner PQ key is bound to an identity.

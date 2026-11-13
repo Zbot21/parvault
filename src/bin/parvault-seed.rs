@@ -2287,9 +2287,17 @@ fn handle_seed_admin_rpc_request(
             min_public_pow_bits,
             max_probationary_lease_bytes,
         } => {
-            if min_public_pow_bits > 32 {
+            if let Err(code) =
+                parvault::network::wot::required_pow_bits_decision(min_public_pow_bits)
+            {
+                tracing::warn!(code, min_public_pow_bits, "refused a PoW requirement");
                 return SeedAdminResponse::Error {
-                    message: format!("invalid min_public_pow_bits {min_public_pow_bits} (max 32)"),
+                    message: format!(
+                        "invalid min_public_pow_bits {min_public_pow_bits}: at most {} \
+                         (clients re-mint up to their default + 4 bits; more would lock out \
+                         every new public client)",
+                        parvault::network::wot::MAX_REQUIRED_PUBLIC_POW_BITS
+                    ),
                 };
             }
             let mut st = shared
