@@ -5,6 +5,7 @@
 # --- No silent skips ------------------------------------------------------------------------------
 skips      K-1       path=tests/*.rs
 suite      S-DOCKER  test=docker_acceptance_gate::docker_acceptance_gate needs=docker
+suite      S-NOFS    test=gateway_ipc_benchmark::test_parvault_seed_no_fs_zero_disk_and_ram_cap_enforcement needs=cmd:sh
 
 # --- Artifact provenance (A-DOCKER: the gate copies from the build directory; convert before item 7)
 artifact   A-DOCKER  script=scripts/docker_acceptance_gate.sh bin=parvault suite=docker_acceptance_gate::docker_acceptance_gate

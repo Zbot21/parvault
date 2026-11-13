@@ -30,6 +30,13 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
+/// Writes this test's gate sentinel (ADR-30 `suite` line in `.enforcement.map`).
+fn gate_ran(name: &str) {
+    if let Ok(dir) = std::env::var("GATES_SENTINEL_DIR") {
+        std::fs::write(std::path::Path::new(&dir).join(name), b"ran").expect("sentinel");
+    }
+}
+
 fn fill_deterministic_1mib(buf: &mut [u8], stripe_idx: u64) {
     let mut state = stripe_idx
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -354,4 +361,5 @@ fn test_parvault_seed_no_fs_zero_disk_and_ram_cap_enforcement() {
     assert_eq!(purge.zero_wiped_bytes, 128 * 1024);
     assert!(!mem_store.has_blinded_shard_on_disk(&last_bid_opt.unwrap()));
     assert!(!forbidden_data_dir.exists());
+    gate_ran("gateway_ipc_benchmark::test_parvault_seed_no_fs_zero_disk_and_ram_cap_enforcement");
 }
