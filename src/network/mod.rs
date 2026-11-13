@@ -1,6 +1,7 @@
 pub mod admission;
 pub mod behaviour;
 pub mod client;
+pub mod council_fetch;
 pub mod discovery;
 pub mod placement;
 pub mod rate_limit;

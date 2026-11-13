@@ -699,7 +699,9 @@ fn covering_case(req: &MeshWireRequest) -> &'static str {
         MeshWireRequest::RegisterWanRendezvous { .. } => "register_wan_rendezvous",
         MeshWireRequest::LookupWanRendezvous { .. } => "lookup_wan_rendezvous",
         MeshWireRequest::SubmitAbuseTakedownReport(_) => "submit_abuse_takedown",
-        MeshWireRequest::BroadcastEvictionOrder(_) => "broadcast_eviction_order",
+        MeshWireRequest::BroadcastEvictionOrder(_) | MeshWireRequest::GetCouncilManifest { .. } => {
+            "broadcast_eviction_order"
+        }
         MeshWireRequest::AdmitPublicTicket(_) => "admit_public_ticket",
     }
 }
@@ -2194,6 +2196,18 @@ fn broadcast_eviction_order() {
         )
         .unwrap();
     });
+    // GetCouncilManifest: an unadmitted peer gets nothing; an admitted one gets the manifest of
+    // the scope it names, from every role that holds it.
+    let genesis_root = t.keys.genesis.public_key_bytes();
+    let ask = MeshWireRequest::GetCouncilManifest {
+        scope_root: genesis_root,
+    };
+    let o = t.run(&peer, &ask);
+    assert!(o.iter().all(|x| !x.resp.contains("Some(")), "{o:?}");
+    t.admit(&peer);
+    let o = t.run(&peer, &ask);
+    assert!(o.iter().all(|x| x.resp.contains("epoch: 1")), "{o:?}");
+    assert_identical(&o);
     let one = SignedBadActorEvictionOrder::issue(&members[0], target(), "one", now_ms(), 0);
     let o = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(one));
     assert!(!o.iter().any(accepted), "{o:?}");

@@ -378,6 +378,9 @@ pub enum MeshWireRequest {
         timestamp_ms: u64,
         sig: Vec<u8>,
     },
+    /// Asks an admitted peer for its installed council manifest of `scope_root` (appended,
+    /// F-08/F-09: a node that sees an order from a newer council epoch fetches it).
+    GetCouncilManifest { scope_root: [u8; 32] },
 }
 
 /// Wire-level response messages exchanged over `/parvault/wire/1.0.0`.
@@ -481,6 +484,10 @@ pub enum MeshWireResponse {
         verifier_pubkey: [u8; 32],
         /// The PoW bits this node requires.
         required_pow_bits: u8,
+    },
+    /// Result of `GetCouncilManifest` (appended): the installed manifest of that scope, if any.
+    CouncilManifestResult {
+        manifest: Option<crate::storage::council::CouncilManifest>,
     },
 }
 

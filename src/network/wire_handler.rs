@@ -387,7 +387,8 @@ pub const fn admission_class(request: &MeshWireRequest) -> AdmissionClass {
         | MeshWireRequest::PorAudit(_)
         | MeshWireRequest::MultiSegmentPorAudit(_)
         | MeshWireRequest::GetDhtEnvelope { .. } => AdmissionClass::SelfAuthorised,
-        MeshWireRequest::RelayPqOnionEnvelope { .. } => AdmissionClass::AdmittedPeer,
+        MeshWireRequest::RelayPqOnionEnvelope { .. }
+        | MeshWireRequest::GetCouncilManifest { .. } => AdmissionClass::AdmittedPeer,
         MeshWireRequest::SubmitAbuseTakedownReport(_)
         | MeshWireRequest::BroadcastEvictionOrder(_) => AdmissionClass::CouncilSigned,
         // v0.5.0: blinded-shard vouchers are self-certifying (F-24), so a blinded put needs an
@@ -614,6 +615,9 @@ pub fn reject_response(request: &MeshWireRequest, reason: String) -> MeshWireRes
             verifier_pubkey: [0u8; 32],
             required_pow_bits: 0,
         },
+        MeshWireRequest::GetCouncilManifest { .. } => {
+            MeshWireResponse::CouncilManifestResult { manifest: None }
+        }
         MeshWireRequest::PutShard { .. } => MeshWireResponse::PutShardAck {
             stored: false,
             error: Some(reason),
@@ -1741,6 +1745,14 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                 },
             }
         }
+        MeshWireRequest::GetCouncilManifest { scope_root } => {
+            MeshWireResponse::CouncilManifestResult {
+                manifest: crate::storage::council::council_from_manifest(
+                    data_dir,
+                    Some(scope_root),
+                ),
+            }
+        }
         MeshWireRequest::BroadcastEvictionOrder(order) => {
             // One resolver for both roles (F-08): the installed, signed council manifest.
             let (council, min_quorum) =
@@ -1790,7 +1802,7 @@ mod tests {
         FileManifest, ShardId, SignedDhtManifestEnvelope, VerifiableAbuseReport,
     };
 
-    /// One request per variant (19), each paired with the response variant name it must
+    /// One request per variant, each paired with the response variant name it must
     /// produce on rejection and whether that response carries the reason string.
     fn all_requests() -> Vec<(MeshWireRequest, &'static str, bool)> {
         let id = NodeIdentity::from_seed([7; 32]);
@@ -2005,13 +2017,20 @@ mod tests {
                 "AdmitPublicTicketAck",
                 true,
             ),
+            (
+                MeshWireRequest::GetCouncilManifest {
+                    scope_root: [3; 32],
+                },
+                "CouncilManifestResult",
+                false,
+            ),
         ]
     }
 
     #[test]
     fn reject_response_matches_each_variant() {
         let reqs = all_requests();
-        assert_eq!(reqs.len(), 20);
+        assert_eq!(reqs.len(), 21);
         for (req, expected, carries_reason) in &reqs {
             let resp = format!("{:?}", reject_response(req, "admission-denied".into()));
             assert!(resp.starts_with(expected), "{expected}: {resp}");
@@ -2079,8 +2098,8 @@ mod tests {
             .collect();
         assert_eq!(
             admitted.len(),
-            5,
-            "PutShard, SyndicateLiteStripe, PutDhtEnvelope, PutBlindedShard, RelayPqOnionEnvelope (F-33): {admitted:?}"
+            6,
+            "PutShard, SyndicateLiteStripe, PutDhtEnvelope, PutBlindedShard, RelayPqOnionEnvelope (F-33), GetCouncilManifest: {admitted:?}"
         );
         assert_eq!(
             admission_class(&MeshWireRequest::QueryNodeStatus),
