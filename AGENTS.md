@@ -90,6 +90,16 @@ Every code change or PR **must** preserve these 7 invariants:
 
 ## 4. Build, Test, Multi-Container Docker & Formal Verification Commands
 
+### Cargo features (v0.5.0, item 3)
+| Feature | Adds | Binaries |
+| :-- | :-- | :-- |
+| `ipc-client` | gateway socket client, IPC wire types, client-side crypto and decisions (`http_edge`); no tokio, no libp2p | `parvault-sync` |
+| `vfs` (`ipc-client`) | lazy VFS, pure-Rust FUSE, WebDAV | `parvault-fuse` |
+| `status-ui` (`ipc-client`) | status page (`router_nas`) on the shared HTTP edge | `parvault-status` |
+| `daemon-runtime` (`ipc-client`, `status-ui`, tokio, libp2p) | the daemon: ring, storage engine, gateway server | `parvault`, `parvault-seed`, `parvault-bench` |
+
+`default = ["daemon-runtime", "vfs", "status-ui"]`. Build release binaries with `scripts/build_bins.sh`, which gives each binary only its own features; `scripts/check_no_runtime_deps.sh` fails if tokio, libp2p, mio or quinn reach a plugin feature set. A local-only daemon without tokio is not offered: the storage engine needs the ring client.
+
 ### Rust Unit, Integration, Mathematical & Red-Team Suites
 ```bash
 # Check formatting, lints, and --no-default-features compilation

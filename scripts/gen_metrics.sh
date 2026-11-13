@@ -164,7 +164,7 @@ for k, v in static.items():
         mib = num(v) / 1048576
         sizes.setdefault(m.group(2), []).append(mib)
         out.append((f"size.{m.group(1)}.{m.group(2)}", f"{mib:.2f} MiB"))
-BINS = ("parvault", "parvault-seed", "parvault-fuse", "parvault-sync")
+BINS = ("parvault", "parvault-seed", "parvault-fuse", "parvault-sync", "parvault-status")
 missing = [f"size.{b}.{a}.bytes" for a in ("aarch64", "x86_64") for b in BINS
            if f"size.{b}.{a}.bytes" not in static]
 if missing:
