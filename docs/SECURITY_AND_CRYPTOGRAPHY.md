@@ -149,6 +149,8 @@ To protect long-lived backup shards and P2P envelopes against **Harvest-Now, Dec
 
 ## 7. Machine-Checked Formal Verification & Test Suite Matrix
 
+> **TLA+ claim accounting (L-47, 2d-β):** the specs carry <!-- metric:tla.guards -->`9`<!-- /metric --> `@guard` checks, each traced to one Rust decision function and covered by a guard-removal mutant; <!-- metric:tla.structural -->`7`<!-- /metric --> `@structural` properties that hold by construction (for example, no wire message carries a key) and are **not** model-checked; and <!-- metric:tla.assumptions -->`3`<!-- /metric --> `@assume` threat-model bounds. Invariants that were true only because a flag was hard-coded `FALSE` were removed from the model rather than kept as vacuous claims.
+
 > [!IMPORTANT]
 > **Scope & Abstraction Boundaries of Formal Models (`A5`, `D1`):**
 > - **Kani Rust Bounded Model Checking (`cargo kani`, `src/kani_proofs.rs`, `src/crypto/aes.rs`, `src/sharding/reed_solomon.rs`):** Bit-precise CBMC symbolic verification (`kani::any()`) directly over **compiled production Rust functions** — proving absence of panics, integer/slice overflows, divide-by-zero, framing allocation bombs, replay window bypasses, duplicate-signer quorum inflation, keyed-HMAC domain collisions, Macaroon privilege escalation, and `RouterSoc` (`< 32 MiB`) stripe memory budget overruns across all symbolic inputs.
