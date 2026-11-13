@@ -97,7 +97,7 @@ jobs:
             parvault-fuse-x86_64-unknown-linux-musl parvault-fuse-aarch64-unknown-linux-musl \
             parvault-sync-x86_64-unknown-linux-musl parvault-sync-aarch64-unknown-linux-musl \
             parvault-status-x86_64-unknown-linux-musl parvault-status-aarch64-unknown-linux-musl \
-            parvault-router-soc-bundle.tar.gz > SHA256SUMS
+            parvault-router-soc-bundle.tar.gz install.sh > SHA256SUMS
           cat SHA256SUMS
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

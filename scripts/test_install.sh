@@ -23,4 +23,24 @@ PARVAULT_BASE_URL="http://127.0.0.1:$PORT/$VERSION" PARVAULT_INSTALL_DIR="$WORK/
 for b in parvault parvault-seed parvault-fuse parvault-sync parvault-status; do
   [[ -x "$WORK/bin/$b" ]] || { echo "not installed: $b" >&2; exit 1; }
 done
+
+# Negative controls (release QA 7): each must make install.sh fail and install nothing.
+must_fail() {  # <label> <expected message> <assets dir> [base url]
+  local dest="$WORK/neg-$1"; mkdir -p "$dest"
+  if PARVAULT_BASE_URL="${4:-http://127.0.0.1:$PORT/$3}" PARVAULT_INSTALL_DIR="$dest" \
+      sh "$ROOT/scripts/install.sh" >"$WORK/neg-$1.log" 2>&1; then
+    echo "test_install: FAIL: install.sh accepted $1" >&2; cat "$WORK/neg-$1.log" >&2; exit 1
+  fi
+  # It must fail for the right reason, not e.g. a network error.
+  grep -qF "$2" "$WORK/neg-$1.log" || { echo "test_install: FAIL: $1 failed without '$2'" >&2; cat "$WORK/neg-$1.log" >&2; exit 1; }
+  [[ -z "$(ls -A "$dest")" ]] || { echo "test_install: FAIL: $1 installed files" >&2; exit 1; }
+  echo "negative control ok: $1 ($2)"
+}
+cp -r "$ASSETS" "$WORK/srv/tampered-bin"
+printf 'x' >> "$WORK/srv/tampered-bin/parvault-$T"
+must_fail tampered-binary "FAILED" tampered-bin
+cp -r "$ASSETS" "$WORK/srv/tampered-sums"
+sed -i "s/^[0-9a-f]\{64\}  parvault-sync-$T\$/$(printf '0%.0s' $(seq 64))  parvault-sync-$T/" "$WORK/srv/tampered-sums/SHA256SUMS"
+must_fail tampered-sums-line "FAILED" tampered-sums
+must_fail plain-http-off-loopback "plain http only to 127.0.0.1 or localhost" "$VERSION" "http://example.invalid/$VERSION"
 echo "test_install: PASS ($VERSION, $T)"

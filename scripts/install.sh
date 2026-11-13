@@ -6,7 +6,8 @@ REPO="${PARVAULT_REPO:-Zbot21/parvault}"
 INSTALL_DIR="${PARVAULT_INSTALL_DIR:-/usr/local/bin}"
 # The default version is this release's own tag: every ParVault release is a pre-release, so
 # GitHub has no "Latest" release to resolve. gen_metrics.sh fails if it differs from Cargo.toml's
-# version, and release.yml fails if it differs from the tag. PARVAULT_VERSION=latest still works.
+# version, and release.yml fails if it differs from the tag. PARVAULT_VERSION=latest asks GitHub
+# for its "Latest" release, which does not exist (404) while every release is a pre-release.
 VERSION="${PARVAULT_VERSION:-v0.5.0}"
 BINS="${PARVAULT_BINS:-parvault parvault-seed parvault-fuse parvault-sync parvault-status}"
 
@@ -24,11 +25,19 @@ case "$ARCH" in
     ;;
 esac
 
-# HTTPS only, except for PARVAULT_BASE_URL (scripts/test_install.sh serves local assets).
+# HTTPS only. PARVAULT_BASE_URL (scripts/test_install.sh serves local assets) may use plain
+# http only to 127.0.0.1 or localhost.
 PROTO="=https"
 if [ -n "${PARVAULT_BASE_URL:-}" ]; then
   BASE_URL="$PARVAULT_BASE_URL"
-  PROTO="=https,http"
+  case "$BASE_URL" in
+    https://*) ;;
+    http://127.0.0.1/*|http://127.0.0.1:*|http://localhost/*|http://localhost:*) PROTO="=http" ;;
+    *)
+      echo "PARVAULT_BASE_URL: plain http only to 127.0.0.1 or localhost; use https for anything else" >&2
+      exit 1
+      ;;
+  esac
 elif [ "$VERSION" = "latest" ]; then
   BASE_URL="https://github.com/${REPO}/releases/latest/download"
 else
