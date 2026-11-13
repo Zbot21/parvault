@@ -249,8 +249,20 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                                     receipt_count += 1;
                                     let has_net =
                                         syndicated_peers.iter().any(|p| is_network_peer_addr(p));
+                                    // Shards the seed kept itself are labelled with its server id,
+                                    // not an address: record them as the seed's multiaddr, as the
+                                    // all-on-seed branch does, so they count as off this machine.
                                     stripe_meta.assigned_peers = if has_net {
                                         syndicated_peers
+                                            .into_iter()
+                                            .map(|p| {
+                                                if is_network_peer_addr(&p) {
+                                                    p
+                                                } else {
+                                                    seed_str.clone()
+                                                }
+                                            })
+                                            .collect()
                                     } else {
                                         vec![seed_str.clone(); stripe_meta.shard_hashes.len()]
                                     };
