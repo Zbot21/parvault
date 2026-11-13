@@ -10,6 +10,7 @@ suite      S-FUSE-PROTO test=vfs_fuse_protocol::no_reply_opcodes_get_no_reply_an
 suite      S-MP4-FUSE test=vfs_mp4_seek_gate::fuse_mount_mp4_probe_and_random_seek needs=cmd:ffmpeg,cmd:ffprobe,cmd:fusermount3   # plan-5 / ledger §7.2
 suite      S-MP4-DAV test=vfs_mp4_seek_gate::webdav_206_mp4_probe_and_random_seek needs=cmd:ffmpeg,cmd:ffprobe   # plan-5 / ledger §7.2
 suite      S-MP4-RSS test=vfs_mp4_seek_gate::parvault_fuse_plugin_mount_rss_under_16_mib needs=cmd:ffmpeg,cmd:ffprobe,cmd:fusermount3   # plan-5 / ledger §7.2
+suite      S-DAV-GET  test=vfs_webdav_plain_get::plain_get_still_streams_the_whole_file needs=cmd:sh   # plan-5: a plain GET streams the whole file (B-23 guard)
 
 # --- Artifact provenance (A-DOCKER: the gate copies from the build directory; convert before item 7)
 artifact   A-DOCKER  script=scripts/docker_acceptance_gate.sh bin=parvault suite=docker_acceptance_gate::docker_acceptance_gate

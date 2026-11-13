@@ -264,6 +264,7 @@ src/vfs.rs                      test    sync_daemon_usability_and_cli_regression
 src/vfs.rs                      test    vfs_lazy_stream
 src/vfs.rs                      test    vfs_fuse_protocol
 src/vfs.rs                      test    vfs_mp4_seek_gate
+src/vfs.rs                      test    vfs_webdav_plain_get
 src/bin/parvault-fuse.rs        test    vfs_mp4_seek_gate
 src/vfs.rs                      test    zero_config_lan_and_router_soc_tests            # spawns main
 src/vfs.rs                      test    trust_enforcement

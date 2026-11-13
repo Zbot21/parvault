@@ -4,6 +4,11 @@
 //! ReadOnly bearer token, with an LRU cache (3 MiB) smaller than the video (≈12 MiB). Frame digests are compared with
 //! the same file read from local disk, so no golden values are pinned.
 //!
+//! Under latency (the Docker netem leg) an abandoned open-ended `Range: bytes=N-` can make the
+//! WebDAV edge hydrate up to about one TCP window of extra blocks (B-23, v0.6.0); that leg logs
+//! the miss set and asserts only the time and cache budgets. FUSE and the no-delay WebDAV leg keep
+//! the full `misses <= 2`, no-middle-stripe asserts.
+//!
 //! Skip rule: a missing `/dev/fuse`, `fusermount3`, `ffmpeg` or `ffprobe` prints `SKIPPED: ...`;
 //! under `GATES_REQUIRE_REAL=1` it fails instead. `tc netem` needs root: that leg runs only in the
 //! Docker gate (stage 12c).
@@ -96,6 +101,11 @@ fn ttfb_budget() -> Duration {
             .and_then(|v| v.parse().ok())
             .unwrap_or(50),
     )
+}
+
+/// Set by the Docker gate's netem leg (`PARVAULT_VFS_GATE_LATENCY=1`).
+fn under_latency() -> bool {
+    std::env::var("PARVAULT_VFS_GATE_LATENCY").as_deref() == Ok("1")
 }
 
 /// The plugin binary: `PARVAULT_FUSE_BIN` (the Docker gate runs this test binary in a container),
@@ -445,15 +455,23 @@ fn webdav_206_mp4_probe_and_random_seek() {
     let s = vfs.cache_stats();
     let fetched = cached_blocks(&cache);
     eprintln!("B1 probe: misses={} blocks={fetched:?}", s.misses);
-    assert!(
-        s.misses <= 2,
-        "probe fetched {} blocks: {fetched:?}",
-        s.misses
-    );
-    assert!(
-        fetched.iter().all(|b| *b < 2),
-        "probe hydrated a middle stripe: {fetched:?}"
-    );
+    if under_latency() {
+        // Architect ruling (plan-5, B-23): under latency an abandoned `Range: bytes=N-` can
+        // hydrate up to about one TCP window of extra blocks, so the netem leg logs the miss set
+        // and asserts only the time and cache budgets.
+        eprintln!("B1 under latency: miss set logged, not asserted (B-23)");
+    } else {
+        assert!(
+            s.misses <= 2,
+            "probe fetched {} blocks: {fetched:?}",
+            s.misses
+        );
+        assert!(
+            fetched.iter().all(|b| *b < 2),
+            "probe hydrated a middle stripe: {fetched:?}"
+        );
+    }
+    assert!(s.used_bytes <= s.capacity_bytes);
 
     // B3: cold time-to-first-byte of a Range request at the mid keyframe (the HTTP hop is what
     // the Docker gate's netem stage delays).
