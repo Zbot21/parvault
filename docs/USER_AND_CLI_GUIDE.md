@@ -63,7 +63,7 @@ Global options (available on all subcommands):
 | `parvault issue-device-cert` | `--device-peer-id <ID>` *(required)*<br>`--device-label <LABEL>` *(default: `"personal-device"`)*<br>`--cert-out <PATH>` *(optional)* | Signs a post-quantum composite `PersonalDeviceCert` (`Ed25519 + NIST FIPS 204 ML-DSA-65`) authorizing `<device-peer-id>` to store shards on your Personal Device Ring at `0.0x` quota cost. Outputs both JSON and a compact `PARVAULT-CERT-V1:<hex>` token. |
 | `parvault verify-device-cert` | `--cert <PATH_OR_JSON_OR_TOKEN>` *(required)*<br>`--owner-pq-pubkey-hex <HEX>` *(optional)* | Cryptographically verifies a `PersonalDeviceCert` from a `.json` file, raw JSON string, or `PARVAULT-CERT-V1:<hex>` token against the expected Owner PQ Public Key. |
 | `parvault council init` | `--member <PUBKEY_HEX>` *(repeat)*, `--quorum <N>` *(required)* | Signs and installs epoch 1 of this ring's eviction council with the ring genesis held here. The quorum must be a strict majority. Prints the manifest hex for `council install` on other nodes. |
-| `parvault council install` | `--manifest <HEX>` *(required)* | Installs a council manifest: epoch 1 signed by the scope root (ring genesis; in `--public` mode the pinned tracker admin key), or the next epoch signed by a quorum of the installed one. |
+| `parvault council install` | `--manifest <HEX>` *(required)* | Installs a council manifest: epoch 1 signed by the scope root (ring genesis; in `--public` mode the pinned tracker admin key), or the next epoch signed by a quorum of the installed one. No shipped tool signs a public-mode or later-epoch manifest yet: those come with `parvault-control` (item 6). |
 | `parvault council show` | *(none)* | Prints the installed council (scope root, epoch, quorum, members) and its hex manifest. A node with none accepts no council eviction orders. |
 | `parvault wot init` | *(none)* | Starts a new ring on this node: creates the ring genesis secret (`<data_dir>/ring_genesis.seed`, `0600`). The only way a genesis is created; refused if the node is already in a ring. |
 | `parvault wot invite` | `--peer <PUBKEY_HEX>` *(required)* | Prints a ring invitation token (the chain and the ring's genesis key) admitting that key. Needs the ring secret from `parvault wot init` (or `PARVAULT_GENESIS_SEED_HEX`). |
@@ -349,7 +349,7 @@ All evicted shards are overwritten with `0x00` zero bytes across their entire fi
 ### 4.7 Public Tracker Abuse Reporting & Admin Takedown Workflow (`parvault report-abuse`, `parvault-seed admin`, `ADR-19`)
 
 In `--public` (\"Public Commons / Public Tracker\") swarms, storage nodes store encrypted ciphertext shards without knowing what data they contain. To prevent griefing and vigilantism:
-1. **Anti-Griefing Governance:** Random public peers cannot issue eviction orders. Public storage nodes reject eviction broadcasts from arbitrary peers (`accepted: false`). They accept eviction orders **only** with a quorum of the installed council manifest (`parvault council show`; epoch 1 signed by the pinned tracker admin key in public mode), or an order signed by the node's own key, which applies on that node only.
+1. **Anti-Griefing Governance:** Random public peers cannot issue eviction orders. Public storage nodes reject eviction broadcasts from arbitrary peers (`accepted: false`). They accept eviction orders **only** with a quorum of the installed council manifest (`parvault council show`; epoch 1 signed by the pinned tracker admin key in public mode), or an order signed by the node's own key, which applies on that node only. Until `parvault-control` (item 6) ships, a public tracker cannot sign that manifest with a shipped tool.
 2. **Reporter Burden-of-Proof:** Because the network is zero-knowledge, the burden of proof rests entirely on the reporting entity. If illegal content is being publicly shared via ParVault, the distributor had to publish a `(FileManifest, MasterKey)` bundle so recipients could download and view it. The reporter submits this bundle to the Public Tracker Operator.
 3. **Cryptographic Proof Pipeline:** The tracker verifies:
    - Sample shard leaf hashes match `stripe.shard_hashes` and `stripe.stripe_merkle_root` in the manifest.
@@ -416,7 +416,7 @@ parvault-seed admin cosign-eviction \
 > [!IMPORTANT]
 > **Strict Mode Isolation & M-of-N Quorum Invariants:**
 > - In `TrustPoolMode::PrivateRing` (family or homelab rings), nodes **unconditionally ignore and reject** external `tracker_admin_pubkey` eviction orders. Unilateral tracker admin actions can never affect private rings.
-> - In `TrustPoolMode::PublicCommons` / `Hybrid` (`--public`), the council is the manifest signed by the pinned `tracker_admin_pubkey` (`parvault council install`); arbitrary public peers are rejected.
+> - In `TrustPoolMode::PublicCommons` / `Hybrid` (`--public`), the council is the manifest signed by the pinned `tracker_admin_pubkey` (`parvault council install`; signing it comes with `parvault-control`, item 6); arbitrary public peers are rejected.
 > - The council manifest's quorum must be a strict majority (`2·quorum > members`), so a single rogue council member cannot evict alone; orders carry the council epoch, expire within 365 days and are refused when stale (F-08, F-09).
 
 ---

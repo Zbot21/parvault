@@ -1002,7 +1002,7 @@ async fn main() -> anyhow::Result<()> {
                 );
                 println!("Node Transport Peer ID      : {}", node_id.device_peer_id());
                 println!(
-                    "Council                     : sign epoch 1 with this key and install it on nodes with `parvault council install`"
+                    "Council                     : this key roots the public-mode eviction council; signing its manifests comes with parvault-control (item 6)"
                 );
             }
             SeedAdminAction::ListTakedowns { data_dir } => {
