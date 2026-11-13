@@ -324,7 +324,17 @@ docker exec -w /tmp/lite-client-state parvault-client /usr/local/bin/parvault \
 
 # Simulate NAS / Seed Server death by stopping parvault-seed-0, then recover Lite-Client vault directly from mesh peers!
 # Wipe the client's local shards first, so the restore cannot read them (F-38 ruling).
-docker exec parvault-client sh -c 'rm -rf /tmp/lite-client-state/.parvault-data/shards /tmp/lite-client-state/.parvault-data/shard_index.bin'
+LITE_SHARD_DIR=/tmp/lite-client-state/.parvault-data/shards
+LITE_LOCAL_SHARDS="$(docker exec parvault-client sh -c "ls -1 $LITE_SHARD_DIR/*.shard 2>/dev/null | wc -l")"
+if [ "${LITE_LOCAL_SHARDS:-0}" -lt 1 ]; then
+    echo "ERROR: stage 7: $LITE_SHARD_DIR is missing or holds no shards; the wipe would be vacuous"
+    exit 1
+fi
+docker exec parvault-client sh -c "rm -rf $LITE_SHARD_DIR /tmp/lite-client-state/.parvault-data/shard_index.bin"
+if docker exec parvault-client test -e "$LITE_SHARD_DIR"; then
+    echo "ERROR: stage 7: $LITE_SHARD_DIR survived the wipe"
+    exit 1
+fi
 docker stop parvault-seed-0
 docker exec -w /tmp/lite-client-state parvault-client /usr/local/bin/parvault \
     --peers "$PEERS_CSV" \
