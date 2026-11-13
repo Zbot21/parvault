@@ -335,7 +335,7 @@ fn verify_embedding_doc_snippet(root_key: &[u8; 32]) -> anyhow::Result<()> {
         capabilities::{CapabilityMacaroon, Caveat},
         gateway::{GatewayBus, RetentionPolicy, DEFAULT_IPC_SOCKET_PATH},
         sync::{sanitize_sync_relative_path, GatewayFolderSync},
-        vfs::VirtualVaultFs,
+        vfs::{VirtualVaultFs, WebdavVerifier},
     };
     use std::path::Path;
 
@@ -357,7 +357,8 @@ fn verify_embedding_doc_snippet(root_key: &[u8; 32]) -> anyhow::Result<()> {
 
     let vfs = VirtualVaultFs::with_bus(bus, Path::new("/tmp/pv-vfs-cache"), 64 * 1024 * 1024)?
         .with_default_macaroon(Some(read_token));
-    let mut webdav = vfs.spawn_webdav_server("127.0.0.1:0")?;
+    // F-43: every WebDAV request must present a read-only token under this root key.
+    let mut webdav = vfs.spawn_webdav_server("127.0.0.1:0", WebdavVerifier::RootKey(*root_key))?;
     let _addr = webdav.local_addr();
     webdav.shutdown();
     Ok(())
@@ -462,15 +463,28 @@ fn test_dual_mode_vfs_no_socket_inprocess_vs_unix_socket_webdav_range_and_lru() 
     assert!(stats_inproc.evictions >= 2);
 
     // Live stoppable `spawn_webdav_server` HTTP 206 Partial Content Range test on `--no-socket` VFS
+    // F-43: a read-only token under the server's root key on every request.
+    let webdav_key = [0x5A; 32];
+    let webdav_token = parvault::capabilities::CapabilityMacaroon::mint(
+        &webdav_key,
+        [1; 32],
+        [2; 32],
+        vec![parvault::capabilities::Caveat::ReadOnly],
+    )
+    .unwrap()
+    .to_compact_token();
     let mut webdav_handle = vfs_inproc
-        .spawn_webdav_server("127.0.0.1:0")
+        .spawn_webdav_server(
+            "127.0.0.1:0",
+            parvault::vfs::WebdavVerifier::RootKey(webdav_key),
+        )
         .expect("spawn_webdav_server");
     let addr = webdav_handle.local_addr();
 
     {
         let mut conn = TcpStream::connect(addr).expect("connect webdav");
         let req = format!(
-            "GET /media/clip.bin HTTP/1.1\r\nHost: {addr}\r\nRange: bytes=1048590-2097209\r\nConnection: close\r\n\r\n"
+            "GET /media/clip.bin HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {webdav_token}\r\nRange: bytes=1048590-2097209\r\nConnection: close\r\n\r\n"
         );
         conn.write_all(req.as_bytes()).unwrap();
         let mut raw_resp = Vec::new();
@@ -786,4 +800,79 @@ fn test_tampered_gateway_catalog_path_traversal_rejected() {
         b"untouched canary",
         "outside canary must never be overwritten or unlinked"
     );
+}
+
+/// F-43 (Addendum A ruling): an in-process VFS over a gateway with a macaroon root key reads only
+/// with a default macaroon (the daemon mints a ReadOnly one in memory for built-in WebDAV and
+/// FUSE). Without it, the read fails, and the WebDAV edge answers 502 before any status line, for
+/// GET and Range, instead of a truncated 200.
+#[test]
+fn f43_builtin_vfs_reads_with_root_key_and_502_without_token() {
+    use parvault::capabilities::{CapabilityMacaroon, Caveat};
+    use parvault::vfs::{VirtualVaultFs, WebdavVerifier};
+    use std::io::{Read, Write};
+    let key = [0x61; 32];
+    let tmp = tempdir().expect("tempdir");
+    let seed_dir = tmp.path().join("seed");
+    fs::create_dir_all(&seed_dir).unwrap();
+    let body = deterministic_bytes(61, 300 * 1024);
+    fs::write(seed_dir.join("doc.bin"), &body).unwrap();
+    let engine = Arc::new(
+        GatewayEngine::new(
+            tmp.path().join("store"),
+            MasterKey::generate(),
+            GatewayConfig {
+                stripe_size_bytes: HardwareProfile::RouterSoc.stripe_size_bytes(),
+                tier: ErasureTier::Consumer,
+                peers: Vec::new(),
+                macaroon_root_key: Some(key),
+                strict_allowed_peer_uids: None,
+                require_sealed_ingest_memfd: true,
+            },
+        )
+        .unwrap(),
+    );
+    let bare = VirtualVaultFs::with_bus(
+        GatewayBus::in_process(Arc::clone(&engine)),
+        tmp.path().join("cache-bare"),
+        2 * 1024 * 1024,
+    )
+    .unwrap();
+    assert_eq!(bare.ingest_local_directory(&seed_dir).unwrap(), 1);
+    let node = bare.lookup_path("/doc.bin").unwrap();
+    assert!(
+        bare.read_at(node.ino, 0, 4096).is_err(),
+        "a root key gates every FetchRange"
+    );
+
+    // The WebDAV edge: a valid client token, but the VFS cannot read: 502, no 200 promise.
+    let client = CapabilityMacaroon::mint(&key, [3; 32], [4; 32], vec![Caveat::ReadOnly])
+        .unwrap()
+        .to_compact_token();
+    let mut server = bare
+        .spawn_webdav_server("127.0.0.1:0", WebdavVerifier::RootKey(key))
+        .unwrap();
+    let addr = server.local_addr();
+    for range in ["", "Range: bytes=0-\r\n"] {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.write_all(
+            format!("GET /doc.bin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {client}\r\n{range}Connection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        assert!(
+            out.starts_with(b"HTTP/1.1 502"),
+            "{range:?}: {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+    server.shutdown();
+
+    // With the daemon's in-memory ReadOnly token as the default macaroon, reads work.
+    let internal =
+        CapabilityMacaroon::mint(&key, [7; 32], [0; 32], vec![Caveat::ReadOnly]).unwrap();
+    let vfs = bare.with_default_macaroon(Some(internal));
+    assert_eq!(vfs.read_at(node.ino, 0, body.len() as u64).unwrap(), body);
 }

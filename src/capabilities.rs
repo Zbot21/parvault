@@ -308,6 +308,50 @@ fn chain_caveat_tag(prev_tag: &[u8; 32], caveat: &Caveat) -> [u8; 32] {
     out
 }
 
+impl std::fmt::Debug for CapabilityMacaroon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapabilityMacaroon")
+            .field("nonce_id_prefix", &hex::encode(&self.nonce_id[..4]))
+            .field("caveats", &self.caveats)
+            .field("tag", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for MacaroonSliceView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MacaroonSliceView")
+            .field("nonce_id_prefix", &hex::encode(&self.nonce_id[..4]))
+            .field("caveats", &self.caveats)
+            .field("tag", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+/// F-43 (L-44 item 4): whether `child` is `parent` itself or an offline attenuation of it,
+/// checked without the root key. Same `nonce_id` and `issuer_fingerprint`; `child`'s caveats begin
+/// with exactly `parent`'s; at most `MAX_MACAROON_CAVEATS` in total; `child`'s tag equals the chain
+/// recomputed from `parent`'s tag over the extra caveats (zero extras: equal tags), compared in
+/// constant time. Caveats are not evaluated here.
+///
+/// For `parvault-fuse webdav`, a block-cache hit never reaches the gateway, so this check (with
+/// the WebDAV edge's caveat evaluation) is the only check on that read (L-44 item 4).
+pub fn is_attenuation_of(parent: &CapabilityMacaroon, child: &CapabilityMacaroon) -> bool {
+    if !ct_eq_32(&parent.nonce_id, &child.nonce_id)
+        || !ct_eq_32(&parent.issuer_fingerprint, &child.issuer_fingerprint)
+        || child.caveats.len() > MAX_MACAROON_CAVEATS
+        || child.caveats.len() < parent.caveats.len()
+        || child.caveats[..parent.caveats.len()] != parent.caveats[..]
+    {
+        return false;
+    }
+    let mut tag = parent.tag;
+    for caveat in &child.caveats[parent.caveats.len()..] {
+        tag = chain_caveat_tag(&tag, caveat);
+    }
+    ct_eq_32(&tag, &child.tag)
+}
+
 /// Constant-time 32-byte tag equality check (zero early-exit timing side channels).
 #[inline]
 pub const fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
@@ -343,7 +387,8 @@ pub const fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
 
 /// Borrowed zero-allocation view over a [`CapabilityMacaroon`] used by in-RAM slice verifiers
 /// and Kani formal proof harnesses.
-#[derive(Debug, Clone, Copy)]
+/// `Debug` is manual and redacts the tag, as for [`CapabilityMacaroon`].
+#[derive(Clone, Copy)]
 pub struct MacaroonSliceView<'a> {
     pub nonce_id: &'a [u8; 32],
     pub issuer_fingerprint: &'a [u8; 32],
@@ -358,7 +403,9 @@ pub type DecodedCompactMacaroon<const MAX_C: usize> =
 
 /// HMAC-SHA256 chained capability token enabling zero-knowledge, `< 1 ms` RAM-only authorization
 /// of constrained manifest and byte-range reads without sharing `MasterKey` or `root_key`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `Debug` is manual and redacts the tag (the bearer secret) so a stray `{:?}` cannot leak a
+/// usable token (F-43, L-44 item 8).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityMacaroon {
     pub nonce_id: [u8; 32],
     pub issuer_fingerprint: [u8; 32],
@@ -441,6 +488,20 @@ impl CapabilityMacaroon {
             compute_root_macaroon_tag,
             chain_caveat_tag,
         )
+    }
+
+    /// Whether this token's HMAC chain is valid under `root_key`, in constant time. Caveats are
+    /// not evaluated: callers check them against the request separately (F-43 WebDAV edge).
+    pub fn tag_valid(&self, root_key: &[u8; 32]) -> bool {
+        Self::mint_slice_tag_with(
+            root_key,
+            &self.nonce_id,
+            &self.issuer_fingerprint,
+            &self.caveats,
+            compute_root_macaroon_tag,
+            chain_caveat_tag,
+        )
+        .is_ok_and(|expected| ct_eq_32(&expected, &self.tag))
     }
 
     /// Publicly attenuates this Macaroon parameterized by `chain_prf` (`attenuate` instantiates
@@ -1353,5 +1414,80 @@ mod kani_proofs {
             CapabilityMacaroon::decode_compact_into::<2>(&wire_two[..used_two]).err(),
             Some(CapabilityError::TooManyCaveats(over as usize))
         );
+    }
+}
+
+#[cfg(test)]
+mod f43_attenuation_tests {
+    use super::*;
+
+    const K: [u8; 32] = [0x43; 32];
+
+    fn parent() -> CapabilityMacaroon {
+        CapabilityMacaroon::mint(&K, [1; 32], [2; 32], vec![Caveat::ReadOnly]).unwrap()
+    }
+
+    #[test]
+    fn pinned_token_and_its_attenuation_accepted() {
+        let p = parent();
+        assert!(is_attenuation_of(&p, &p));
+        let child = p.attenuate(Caveat::ExpiresAtUnixMs(u64::MAX)).unwrap();
+        assert!(is_attenuation_of(&p, &child));
+        let grandchild = child
+            .attenuate(Caveat::ByteRange {
+                offset: 0,
+                length: 9,
+            })
+            .unwrap();
+        assert!(is_attenuation_of(&p, &grandchild));
+        assert!(p.tag_valid(&K) && grandchild.tag_valid(&K));
+        assert!(!p.tag_valid(&[0x44; 32]));
+    }
+
+    /// L-44 item 8: `{:?}` of a token never prints its tag (or its full nonce).
+    #[test]
+    fn debug_redacts_the_tag() {
+        let p = parent();
+        let text = format!("{p:?} {:?}", p.attenuate(Caveat::ReadOnly).unwrap());
+        assert!(!text.contains(&hex::encode(p.tag)), "{text}");
+        assert!(!text.contains(&hex::encode(p.nonce_id)), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+    }
+
+    #[test]
+    fn sibling_and_prefix_violations_refused() {
+        let p = parent();
+        // A sibling under the same root key (other nonce) is not an attenuation.
+        let sibling =
+            CapabilityMacaroon::mint(&K, [9; 32], [2; 32], vec![Caveat::ReadOnly]).unwrap();
+        assert!(!is_attenuation_of(&p, &sibling));
+        // Same nonce and issuer but missing the parent's caveat (minted from the root).
+        let p2 = CapabilityMacaroon::mint(
+            &K,
+            [1; 32],
+            [2; 32],
+            vec![Caveat::ReadOnly, Caveat::ExpiresAtUnixMs(5)],
+        )
+        .unwrap();
+        let missing = CapabilityMacaroon::mint(
+            &K,
+            [1; 32],
+            [2; 32],
+            vec![
+                Caveat::ReadOnly,
+                Caveat::ByteRange {
+                    offset: 0,
+                    length: 1,
+                },
+            ],
+        )
+        .unwrap();
+        assert!(!is_attenuation_of(&p2, &missing));
+        // A forged tag on a correct caveat list.
+        let mut forged = p.attenuate(Caveat::ExpiresAtUnixMs(7)).unwrap();
+        forged.tag[0] ^= 1;
+        assert!(!is_attenuation_of(&p, &forged));
+        // A child shorter than the parent.
+        assert!(!is_attenuation_of(&p2, &p));
     }
 }

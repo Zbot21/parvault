@@ -211,21 +211,32 @@ fn test_vfs_lazy_fetch_latency() {
     );
 
     // 4. Verify unprivileged HTTP Range (206 Partial Content) + WebDAV PROPFIND server at 4.5 GiB:
-    let http_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    let http_addr = http_listener.local_addr().unwrap();
-    drop(http_listener);
-    let vfs_http = vfs.clone();
-    let addr_str = http_addr.to_string();
-    std::thread::spawn(move || {
-        let _ = vfs_http.serve_webdav_blocking(&addr_str);
-    });
-    std::thread::sleep(Duration::from_millis(30));
+    // F-43: the server binds an ephemeral port itself and needs a read-only token per request.
+    let webdav_key = [0x5A; 32];
+    let token = parvault::capabilities::CapabilityMacaroon::mint(
+        &webdav_key,
+        [1; 32],
+        [2; 32],
+        vec![parvault::capabilities::Caveat::ReadOnly],
+    )
+    .unwrap()
+    .to_compact_token();
+    let webdav = vfs
+        .spawn_webdav_server(
+            "127.0.0.1:0",
+            parvault::vfs::WebdavVerifier::RootKey(webdav_key),
+        )
+        .expect("spawn webdav");
+    let http_addr = webdav.local_addr();
 
     // WebDAV PROPFIND check:
     {
         let mut stream = TcpStream::connect(http_addr).expect("connect webdav");
         stream
-            .write_all(b"PROPFIND /vault HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .write_all(
+                format!("PROPFIND /vault HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
             .unwrap();
         let mut resp = String::new();
         stream.read_to_string(&mut resp).unwrap();
@@ -239,7 +250,7 @@ fn test_vfs_lazy_fetch_latency() {
         let range_end = range_start + 4096 - 1;
         let mut stream = TcpStream::connect(http_addr).expect("connect http range");
         let req = format!(
-            "GET /vault/dataset_10gib.bin HTTP/1.1\r\nHost: localhost\r\nRange: bytes={range_start}-{range_end}\r\nConnection: close\r\n\r\n"
+            "GET /vault/dataset_10gib.bin HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nRange: bytes={range_start}-{range_end}\r\nConnection: close\r\n\r\n"
         );
         stream.write_all(req.as_bytes()).unwrap();
         let mut raw = Vec::new();

@@ -1091,6 +1091,15 @@ fn proof_sanitize_sync_relative_path_no_traversal() {
     let mut out_buf = [0u8; 10];
     let result =
         sanitize_sync_relative_path_into(&raw_bytes[..slice_len], &mut out_buf[..slice_len]);
+    // Non-vacuity (ADR-33): a `..` traversal segment is rejected, and a nested path is accepted.
+    kani::cover!(
+        result.is_none() && slice_len == 2 && raw_bytes[0] == b'.' && raw_bytes[1] == b'.',
+        "traversal segment rejected"
+    );
+    kani::cover!(
+        result.is_some_and(|n| out_buf[..n].contains(&b'/')),
+        "nested relative path accepted"
+    );
 
     if slice_len == 0 || raw_bytes[0] == b'/' || raw_bytes[0] == b'\\' {
         assert!(result.is_none());
@@ -1250,4 +1259,40 @@ fn proof_blinded_rebind_first_writer_wins() {
         crate::storage::anonymity::blinded_rebind_decision(has.then_some(registered), incoming);
     kani::cover!(decision.is_err(), "blinded rebind refused");
     assert_eq!(decision.is_ok(), !has || registered == incoming);
+}
+
+/// F-43 (L-43, L-44): a WebDAV request is served only with a present, well-formed, valid,
+/// unexpired, read-only, in-scope token without a peer-UID caveat. Every token-validity failure
+/// is a 401 (`Unauthorized`), every other refusal a 403 (`Forbidden`).
+#[kani::proof]
+fn proof_webdav_auth_decision() {
+    use crate::vfs::{webdav_auth_decision, WebdavAuthFacts, WebdavAuthRefusal};
+    let facts = WebdavAuthFacts {
+        token_present: kani::any(),
+        token_parses: kani::any(),
+        tag_valid: kani::any(),
+        expired: kani::any(),
+        read_only: kani::any(),
+        peer_uid_bound: kani::any(),
+        in_scope: kani::any(),
+    };
+    let decision = webdav_auth_decision(&facts);
+    kani::cover!(decision.is_ok(), "request served");
+    kani::cover!(
+        matches!(decision, Err(WebdavAuthRefusal::Forbidden(_))),
+        "valid token out of scope"
+    );
+    let token_valid =
+        facts.token_present && facts.token_parses && facts.tag_valid && !facts.expired;
+    let allowed = token_valid && facts.read_only && !facts.peer_uid_bound && facts.in_scope;
+    // Only the outcome is checked (the &str code is checked by the claims' wire tests).
+    assert_eq!(decision.is_ok(), allowed);
+    assert_eq!(
+        matches!(decision, Err(WebdavAuthRefusal::Unauthorized(_))),
+        !token_valid
+    );
+    assert_eq!(
+        matches!(decision, Err(WebdavAuthRefusal::Forbidden(_))),
+        token_valid && !allowed
+    );
 }

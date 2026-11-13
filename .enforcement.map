@@ -133,4 +133,16 @@ noenforce  N-27      adr=docs/adr/ADR-27-zero-copy-uds-gateway-and-hedged-pool.m
 noenforce  N-30      adr=docs/adr/ADR-30-filesystem-free-in-memory-seed-mode.md reason=resource mode, no peer-facing promise; "0 files created" is checked by gateway_ipc_benchmark::test_parvault_seed_no_fs_zero_disk_and_ram_cap_enforcement
 noenforce  N-31      adr=docs/adr/ADR-31-unsafe-remediation-and-os-sys-ffi-boundary.md reason=enforced by audit_workspace_hardening.sh and crate attributes, not at runtime
 
+# --- F-43 (2c): every WebDAV request needs a read-only macaroon (L-43, L-44) ---
+claim      F-43      sym=src/vfs.rs::webdav_auth_decision accept=trust_enforcement::f43_valid_bearer_reads reject=trust_enforcement::f43_no_token_unauthorized code=reject.webdav_token_missing bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-29-pure-rust-fuse-and-webdav-lazy-vfs.md
+claim      F-43-ADR33 sym=src/vfs.rs::webdav_auth_decision accept=trust_enforcement::f43_valid_bearer_reads reject=trust_enforcement::f43_other_manifest_forbidden code=reject.webdav_scope_denied bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md
+claim      F-43-PLUGIN sym=src/vfs.rs::webdav_auth_decision accept=trust_enforcement::f43_plugin_attenuated_child_reads reject=trust_enforcement::f43_plugin_sibling_token_unauthorized code=reject.webdav_token_invalid bin=parvault-fuse ref=docs/security/TRUST_FINDINGS.md
+kani       F-43      sym=src/vfs.rs::webdav_auth_decision harness=proof_webdav_auth_decision cover=valid token out of scope
+
+# --- D-ADR (2c): gateway enforcement pairs ---
+claim      G-MAC     sym=src/gateway/engine.rs::gateway_macaroon_decision accept=trust_enforcement::gmac_frame_inside_caveat_served reject=trust_enforcement::gmac_frame_outside_caveat_refused code=reject.gateway_macaroon_caveat bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-28-stateless-macaroon-capability-attenuation.md
+claim      G-SEAL    sym=src/gateway/engine.rs::gateway_memfd_seal_decision accept=trust_enforcement::gseal_sealed_memfd_stored reject=trust_enforcement::gseal_unsealed_memfd_refused code=reject.gateway_memfd_unsealed bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md
+claim      G-UID     sym=src/gateway/engine.rs::gateway_peer_uid_decision accept=trust_enforcement::guid_allowed_peer_uid_served reject=trust_enforcement::guid_peer_uid_not_allowed_refused code=reject.gateway_peer_uid_not_allowed bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md
+kani       S-SANITIZE sym=src/sync.rs::sanitize_sync_relative_path_into harness=proof_sanitize_sync_relative_path_no_traversal cover=traversal segment rejected
+
 ratchet    R         open=8 waive=10
