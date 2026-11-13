@@ -2828,3 +2828,84 @@ fn r3_watch_once_allow_local_only_exits_zero() {
         "{stdout}"
     );
 }
+
+/// A public-commons daemon with no ring: no genesis from the environment or the data dir.
+fn spawn_ticket_only_daemon(label: &str) -> Node {
+    let (root, dir, reg, log) = prepare(label);
+    let port = free_port();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .arg("--data-dir")
+        .arg(&dir)
+        .args([
+            "--no-lan-discovery",
+            "--public",
+            "daemon",
+            "start",
+            "--listen",
+            &format!("/ip4/127.0.0.1/tcp/{port}"),
+        ]);
+    spawn_without_ring_env(cmd, root, dir, log, port)
+}
+
+/// F-37: a one-hop chain "signed" by the all-zero key, a small-order Ed25519 point. With
+/// `R` = identity and `s` = 0, a non-strict verifier accepts it whenever the challenge hash is
+/// 0 mod 4, so the forger varies `issued_at` until its own verifier accepts (about 4 tries).
+/// Under strict verification no attempt verifies; the last one is sent anyway.
+fn f37_zero_rooted_chain(leaf: &NodeIdentity) -> DelegationChain {
+    let zero = [0u8; 32];
+    let mut sig_r = [0u8; 32];
+    sig_r[0] = 1;
+    let sig_s = [0u8; 32];
+    let mut sig = [0u8; 64];
+    sig[..32].copy_from_slice(&sig_r);
+    let base = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut hop = None;
+    for t in 0..256u64 {
+        let issued = base - t;
+        let msg = InvitationHop::canonical_sign_bytes(&zero, &leaf.public_key_bytes(), 1, issued);
+        hop = Some(InvitationHop {
+            inviter_pubkey: zero,
+            invitee_pubkey: leaf.public_key_bytes(),
+            depth: 1,
+            issued_at_unix_secs: issued,
+            sig_r,
+            sig_s,
+        });
+        if NodeIdentity::verify_with_pubkey(&zero, &msg, &sig) {
+            break;
+        }
+    }
+    DelegationChain {
+        hops: vec![hop.expect("one attempt")],
+    }
+}
+
+/// F-37: a node outside any ring refuses every chain, including one rooted at the zero key.
+#[test]
+fn f37_ticket_only_node_refuses_zero_rooted_chain() {
+    let node = spawn_ticket_only_daemon("f37-ticket-only");
+    let stranger = NodeIdentity::generate();
+    let resp = handshake(&stranger, &node, f37_zero_rooted_chain(&stranger));
+    assert!(
+        !accepted(&resp),
+        "forged zero-rooted chain admitted: {resp:?}"
+    );
+    assert!(
+        node.log_text().contains("reject.handshake_no_ring"),
+        "{}",
+        node.log_text()
+    );
+}
+
+/// F-37: a ring node still admits a real chain.
+#[test]
+fn f37_ring_node_admits_real_chain() {
+    let node = spawn_daemon("f37-ring");
+    let member = NodeIdentity::generate();
+    let resp = handshake(&member, &node, chain_for(&member));
+    assert!(accepted(&resp), "{resp:?}");
+}

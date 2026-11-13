@@ -207,7 +207,7 @@ fn template(keys: &Keys) -> TempDir {
     let dir = root.path().to_path_buf();
     let genesis = keys.genesis.public_key_bytes();
     let _ = BlockStore::new(&dir, QuotaManager::new(512 * 1024 * 1024, 64 * 1024 * 1024)).unwrap();
-    let _ = WebOfTrustRegistry::with_persistence_dir(genesis, 3, &dir);
+    let _ = WebOfTrustRegistry::with_persistence_dir(Some(genesis), 3, &dir);
     let _ = PorVerifierEngine::with_persistence_dir(300, &dir);
     let _ = VoucherNullifierLedger::with_persistence_dir(genesis, &dir);
     let _ = HybridKemKeypair::load_or_generate_in_dir(&dir).unwrap();
@@ -270,7 +270,7 @@ impl Fx {
             node: NodeIdentity::from_seed([0x11; 32]),
             genesis,
             public_mode: false,
-            wot: WebOfTrustRegistry::with_persistence_dir(genesis, 3, &dir),
+            wot: WebOfTrustRegistry::with_persistence_dir(Some(genesis), 3, &dir),
             por: PorVerifierEngine::with_persistence_dir(300, &dir),
             nullifiers: VoucherNullifierLedger::with_persistence_dir(genesis, &dir),
             kem: HybridKemKeypair::load_or_generate_in_dir(&dir).unwrap(),
@@ -295,7 +295,7 @@ impl Fx {
                 DaemonWireHandlerCtx {
                     cfg: &self.cfg,
                     node_identity: &self.node,
-                    genesis_pubkey: self.genesis,
+                    genesis_pubkey: Some(self.genesis),
                     public_mode: self.public_mode,
                     block_store: &self.store,
                     wot: &mut self.wot,
@@ -324,7 +324,7 @@ impl Fx {
                         extra_council_pks: &[],
                         council_quorum: None,
                         max_probationary_lease_bytes: self.max_lease,
-                        genesis_pubkey: self.genesis,
+                        genesis_pubkey: Some(self.genesis),
                         block_store: &self.store,
                         server: &mut self.server,
                         wot: &mut self.wot,
