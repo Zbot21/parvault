@@ -325,7 +325,9 @@ docker exec -w /tmp/lite-client-state parvault-client /usr/local/bin/parvault \
     --once
 
 # B-SEED-SYND (L-46): the seed logs its in-lock handler time and its off-task fan-out time.
-LITE_SYND_TIMES="$(docker logs parvault-seed-0 2>&1 | grep -E 'lite syndication (ingested on the seed|fan-out finished)' || true)"
+# The seed logs with ANSI colours (field "handler_ms<ESC>[0m<ESC>[2m=84"); strip them first.
+LITE_SYND_TIMES="$(docker logs parvault-seed-0 2>&1 | sed 's/\x1b\[[0-9;]*m//g' \
+    | grep -E 'lite syndication (ingested on the seed|fan-out finished)' || true)"
 echo "$LITE_SYND_TIMES"
 if ! echo "$LITE_SYND_TIMES" | grep -q 'handler_ms=' || ! echo "$LITE_SYND_TIMES" | grep -q 'job_ms='; then
     echo "ERROR: stage 7: parvault-seed-0 logged no lite syndication handler/job durations"
