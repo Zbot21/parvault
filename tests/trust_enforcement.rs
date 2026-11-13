@@ -5753,3 +5753,37 @@ fn ticket_excessive_pow_demand_refused_fast() {
         .expect("the client must not hang minting a 255-bit ticket");
     assert!(!out.contains("stored: true"), "{out}");
 }
+
+/// QA 2c D3: under a council quorum above 1, `evict --propagate` refuses up front (a single
+/// signature would be refused by every peer); cosigning arrives with parvault-control.
+#[test]
+fn evict_propagate_refused_when_quorum_needs_cosigners() {
+    let node = spawn_daemon("evict-q2");
+    let me = node.identity();
+    let out = council_cli(
+        &node,
+        &council_init_args(&[me.clone(), key(0x82), key(0x83)], 2),
+    );
+    assert!(out.status.success(), "{}", combined(&out));
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+        .env(
+            "PARVAULT_LAN_REGISTRY_DIR",
+            node.dir.parent().unwrap().join("lan-registry"),
+        )
+        .env("RUST_LOG", "info")
+        .arg("--data-dir")
+        .arg(&node.dir)
+        .args([
+            "--no-lan-discovery",
+            "evict",
+            "--ip",
+            "192.0.2.79",
+            "--propagate",
+        ])
+        .output()
+        .expect("run parvault evict");
+    let text = combined(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("reject.evict_needs_cosignatures"), "{text}");
+}

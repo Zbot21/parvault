@@ -42,6 +42,21 @@ pub(crate) async fn evict(env: CliEnv, command: Commands) -> anyhow::Result<()> 
                  (`parvault council show`); the local eviction above was applied"
             );
         };
+        // QA 2c D3: a single-signed order cannot reach a quorum above 1, so every peer would
+        // refuse it; cosigning (collecting the other members' signatures) is parvault-control's.
+        if council.quorum > 1 {
+            tracing::warn!(
+                code = "reject.evict_needs_cosignatures",
+                quorum = council.quorum,
+                "not propagating a single-signed eviction order"
+            );
+            anyhow::bail!(
+                "--propagate needs {} cosignatures (council quorum {}); cosigning arrives with \
+                 parvault-control (item 6). The local eviction above was applied.",
+                council.quorum - 1,
+                council.quorum
+            );
+        }
         let council_epoch = council.epoch;
         let now_ms = now_unix_ms();
         let expires_ms = now_ms.saturating_add(parvault::storage::DEFAULT_ORDER_LIFETIME_MS);
