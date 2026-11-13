@@ -32,9 +32,9 @@ CONSTANTS
 
 Council == HonestCouncil \cup ByzantineCouncil
 AllSigners == Council \cup StrangerSigners
-Targets == {"AbuseTarget", "InnocentTarget"}
+Targets == {"AbuseTarget", "InnocentTarget", "OwnerTarget"}
 Slots == {"primary", "cosig1", "cosig2"}
-OrderIds == {"ord_abuse", "ord_forged_dup", "ord_tampered"}
+OrderIds == {"ord_abuse", "ord_forged_dup", "ord_tampered", "ord_owner"}
 HomelabOwner == "homelab_owner"
 
 ASSUME
@@ -63,12 +63,13 @@ VARIABLES
     seenOrderIds,           \* Anti-replay FIFO set of applied eviction order_ids
     appliedOrderLog,        \* Sequence of applied eviction order_ids (proves zero order_id replay)
     publicSwarmEvicted,     \* Targets zero-shredded (0x00) on Public Commons nodes
-    privateRingEvicted      \* Targets zero-shredded on PrivateRing / HomelabVault nodes
+    privateRingEvicted,     \* Targets zero-shredded on PrivateRing / HomelabVault nodes
+    ownerOrderSigned        \* TRUE once the HomelabOwner signs an eviction order for its own ring
 
 vars == <<vpsDiskSecrets, vpsCompromised, attackerKeys, activeChallenge, nextNonce,
           consumedNonces, acceptedRpcNonces, rejectedReplays, advRpcSubmissions,
           confirmedAbuseTargets, honestOrderSigs, forgedOrderBuilt, tamperedOrderBuilt,
-          seenOrderIds, appliedOrderLog, publicSwarmEvicted, privateRingEvicted>>
+          seenOrderIds, appliedOrderLog, publicSwarmEvicted, privateRingEvicted, ownerOrderSigned>>
 
 \* Helper: Private key token for a signer identity.
 PrivKey(s) == <<"priv", s>>
@@ -109,15 +110,22 @@ ValidDistinctSigners(ord, authoritySet) ==
     { s \in authoritySet : \E slot \in Slots : <<slot, s, ord.target>> \in ord.sigs }
 
 OrderMeetsCouncilQuorum(ord) ==
-    Cardinality(ValidDistinctSigners(ord, Council)) >= QuorumM   \* @guard quorum-count sym=src/storage/council.rs::council_manifest_decision
+    Cardinality(ValidDistinctSigners(ord, Council)) >= QuorumM   \* @guard quorum-count sym=src/storage/eviction.rs::tally_and_verify_quorum_raw
 
 \* The admin RPC compares the request's nonce with the connection's single active challenge
 \* (`validate_admin_rpc_slice_replay_and_auth_meta`, src/admin_rpc.rs).
 ChallengeMatches(nonce) == activeChallenge > 0 /\ nonce = activeChallenge   \* @guard nonce-fresh sym=src/admin_rpc.rs::validate_admin_rpc_slice_replay_and_auth_meta
-OrderIdFresh(id) == id \notin seenOrderIds   \* @guard order-id-fresh sym=src/storage/eviction.rs::order_admission_decision
+OrderIdFresh(id) == id \notin seenOrderIds   \* @guard order-id-fresh sym=src/storage/eviction.rs::replay_slot_check
 
+\* A PrivateRing node resolves its order authority from the manifest whose scope root is its
+\* genesis (owner) key (council_scope_root / council_from_manifest), never the public council.
 OrderMeetsPrivateRingAuth(ord) ==
-    Cardinality(ValidDistinctSigners(ord, {HomelabOwner})) >= 1
+    Cardinality(ValidDistinctSigners(ord, {HomelabOwner})) >= 1   \* @guard ring-scope sym=src/storage/council.rs::council_from_manifest
+
+\* The owner's own eviction order for its ring (the honest accept path of ring-scope).
+OwnerRingOrder ==
+    [id |-> "ord_owner", target |-> "OwnerTarget",
+     sigs |-> {<<"primary", HomelabOwner, "OwnerTarget">>}]
 
 Init ==
     \* Zero-Private-Key-On-VPS: VPS disk holds transport & per-node HMAC keys ONLY;
@@ -143,6 +151,7 @@ Init ==
     /\ appliedOrderLog = <<>>
     /\ publicSwarmEvicted = {}
     /\ privateRingEvicted = {}
+    /\ ownerOrderSigned = FALSE
 
 \* 1. Cryptographic Burden-of-Proof Abuse Report (`VerifiableAbuseReport`):
 \*    Authenticates "AbuseTarget" via AES-256-GCM + Merkle proof and queues for review
@@ -153,7 +162,7 @@ SubmitVerifiedAbuseReport ==
     /\ UNCHANGED <<vpsDiskSecrets, vpsCompromised, attackerKeys, activeChallenge, nextNonce,
                    consumedNonces, acceptedRpcNonces, rejectedReplays, advRpcSubmissions,
                    honestOrderSigs, forgedOrderBuilt, tamperedOrderBuilt,
-                   seenOrderIds, appliedOrderLog, publicSwarmEvicted, privateRingEvicted>>
+                   seenOrderIds, appliedOrderLog, publicSwarmEvicted, privateRingEvicted, ownerOrderSigned>>
 
 \* 2. Adversary compromises the front-line VPS disk (`root` read of `/var/lib/parvault-seed`):
 \*    Copies all of `vpsDiskSecrets` into `attackerKeys`.
@@ -165,7 +174,7 @@ AdversarySeizeVpsDisk ==
                    acceptedRpcNonces, rejectedReplays, advRpcSubmissions,
                    confirmedAbuseTargets, honestOrderSigs, forgedOrderBuilt,
                    tamperedOrderBuilt, seenOrderIds, appliedOrderLog,
-                   publicSwarmEvicted, privateRingEvicted>>
+                   publicSwarmEvicted, privateRingEvicted, ownerOrderSigned>>
 
 \* 3. Honest council operators (`parvault-control` on out-of-band laptops) issue & co-sign
 \*    eviction order for a cryptographically verified abuse target.
@@ -177,7 +186,7 @@ HonestIssuePrimarySig ==
     /\ UNCHANGED <<vpsDiskSecrets, vpsCompromised, attackerKeys, activeChallenge, nextNonce,
                    consumedNonces, acceptedRpcNonces, rejectedReplays, advRpcSubmissions,
                    confirmedAbuseTargets, forgedOrderBuilt, tamperedOrderBuilt,
-                   seenOrderIds, appliedOrderLog, publicSwarmEvicted, privateRingEvicted>>
+                   seenOrderIds, appliedOrderLog, publicSwarmEvicted, privateRingEvicted, ownerOrderSigned>>
 
 HonestAddCosignature ==
     /\ "AbuseTarget" \in confirmedAbuseTargets
@@ -189,7 +198,7 @@ HonestAddCosignature ==
     /\ UNCHANGED <<vpsDiskSecrets, vpsCompromised, attackerKeys, activeChallenge, nextNonce,
                    consumedNonces, acceptedRpcNonces, rejectedReplays, advRpcSubmissions,
                    confirmedAbuseTargets, forgedOrderBuilt, tamperedOrderBuilt,
-                   seenOrderIds, appliedOrderLog, publicSwarmEvicted, privateRingEvicted>>
+                   seenOrderIds, appliedOrderLog, publicSwarmEvicted, privateRingEvicted, ownerOrderSigned>>
 
 \* 4. Adversary crafts duplicate-signer / sub-quorum order targeting "InnocentTarget"
 \*    using compromised VPS secrets + M - 1 Byzantine councilors + stranger keys.
@@ -199,7 +208,7 @@ AdversaryBuildDuplicateSignerOrder ==
     /\ UNCHANGED <<vpsDiskSecrets, vpsCompromised, attackerKeys, activeChallenge, nextNonce,
                    consumedNonces, acceptedRpcNonces, rejectedReplays, advRpcSubmissions,
                    confirmedAbuseTargets, honestOrderSigs, tamperedOrderBuilt,
-                   seenOrderIds, appliedOrderLog, publicSwarmEvicted, privateRingEvicted>>
+                   seenOrderIds, appliedOrderLog, publicSwarmEvicted, privateRingEvicted, ownerOrderSigned>>
 
 \* 5. Adversary intercepts an honest-signed order and mutates `target` to "InnocentTarget"
 \*    while appending M - 1 rogue council co-signatures.
@@ -210,7 +219,7 @@ AdversaryBuildTamperedTargetOrder ==
     /\ UNCHANGED <<vpsDiskSecrets, vpsCompromised, attackerKeys, activeChallenge, nextNonce,
                    consumedNonces, acceptedRpcNonces, rejectedReplays, advRpcSubmissions,
                    confirmedAbuseTargets, honestOrderSigs, forgedOrderBuilt,
-                   seenOrderIds, appliedOrderLog, publicSwarmEvicted, privateRingEvicted>>
+                   seenOrderIds, appliedOrderLog, publicSwarmEvicted, privateRingEvicted, ownerOrderSigned>>
 
 \* 6. Seed `admin_rpc` issues a fresh single-use 32-byte `challenge_nonce` (`SeedAdminHello`).
 SeedIssueFreshAdminChallenge ==
@@ -222,7 +231,7 @@ SeedIssueFreshAdminChallenge ==
                    acceptedRpcNonces, rejectedReplays, advRpcSubmissions,
                    confirmedAbuseTargets, honestOrderSigs, forgedOrderBuilt,
                    tamperedOrderBuilt, seenOrderIds, appliedOrderLog,
-                   publicSwarmEvicted, privateRingEvicted>>
+                   publicSwarmEvicted, privateRingEvicted, ownerOrderSigned>>
 
 \* 7. Honest operator submits co-signed `HonestAbuseOrder` over `admin_rpc` using fresh `activeChallenge`.
 HonestSubmitQuorumOrderViaAdminRpc ==
@@ -239,7 +248,7 @@ HonestSubmitQuorumOrderViaAdminRpc ==
     /\ UNCHANGED <<vpsDiskSecrets, vpsCompromised, attackerKeys, nextNonce,
                    rejectedReplays, advRpcSubmissions, confirmedAbuseTargets,
                    honestOrderSigs, forgedOrderBuilt, tamperedOrderBuilt,
-                   privateRingEvicted>>
+                   privateRingEvicted, ownerOrderSigned>>
 
 \* 8. Adversary submits forged or payload-mutated order over `admin_rpc` (using a fresh challenge,
 \*    signed by a Byzantine councilor on the allowlist): `admin_rpc` consumes the single-use
@@ -260,10 +269,10 @@ AdversarySubmitForgedOrderViaAdminRpc ==
            THEN /\ seenOrderIds' = seenOrderIds \cup {ord.id}
                 /\ appliedOrderLog' = Append(appliedOrderLog, ord.id)
                 /\ publicSwarmEvicted' = publicSwarmEvicted \cup {ord.target}
-           ELSE /\ UNCHANGED <<seenOrderIds, appliedOrderLog, publicSwarmEvicted>>
+           ELSE /\ UNCHANGED <<seenOrderIds, appliedOrderLog, publicSwarmEvicted, ownerOrderSigned>>
     /\ UNCHANGED <<vpsDiskSecrets, vpsCompromised, attackerKeys, nextNonce,
                    rejectedReplays, confirmedAbuseTargets, honestOrderSigs,
-                   forgedOrderBuilt, tamperedOrderBuilt, privateRingEvicted>>
+                   forgedOrderBuilt, tamperedOrderBuilt, privateRingEvicted, ownerOrderSigned>>
 
 \* 9. Adversary replays a captured quorum order over `admin_rpc` with any nonce it has seen
 \*    (a consumed one, or the connection's current challenge). Accepted only through both
@@ -283,27 +292,37 @@ AdversaryAttemptReplay ==
              /\ UNCHANGED rejectedReplays
         ELSE /\ rejectedReplays' = rejectedReplays + 1
              /\ UNCHANGED <<consumedNonces, acceptedRpcNonces, activeChallenge, seenOrderIds,
-                            appliedOrderLog, publicSwarmEvicted>>
+                            appliedOrderLog, publicSwarmEvicted, ownerOrderSigned>>
     /\ UNCHANGED <<vpsDiskSecrets, vpsCompromised, attackerKeys, nextNonce, advRpcSubmissions,
                    confirmedAbuseTargets, honestOrderSigs, forgedOrderBuilt,
-                   tamperedOrderBuilt, privateRingEvicted>>
+                   tamperedOrderBuilt, privateRingEvicted, ownerOrderSigned>>
 
 \* 10. Cross-mode broadcast check (`ADR-19` Strict Mode Isolation):
-\*     Even a valid `M-of-N` Public Tracker Council order sent to a `HomelabRedundancyVault`
-\*     (`PrivateRing`) node is evaluated ONLY against `{HomelabOwner}`, never `Council`.
-BroadcastCouncilOrderToPrivateRing ==
-    /\ honestOrderSigs # {}
-    /\ OrderMeetsCouncilQuorum(HonestAbuseOrder)
-    /\ rejectedReplays < 2
-    /\ IF OrderMeetsPrivateRingAuth(HonestAbuseOrder)
-       THEN privateRingEvicted' = privateRingEvicted \cup {HonestAbuseOrder.target}
-       ELSE UNCHANGED privateRingEvicted
-    /\ rejectedReplays' = rejectedReplays + 1
+\*     A quorum-signed Public Tracker Council order and the owner's own order both reach a
+\*     `HomelabRedundancyVault` (`PrivateRing`) node, which evaluates each ONLY against
+\*     `{HomelabOwner}`. A rejected order changes nothing (no counter is bumped).
+HomelabOwnerSignsRingOrder ==
+    /\ ~ownerOrderSigned
+    /\ ownerOrderSigned' = TRUE
     /\ UNCHANGED <<vpsDiskSecrets, vpsCompromised, attackerKeys, activeChallenge, nextNonce,
-                   consumedNonces, acceptedRpcNonces, advRpcSubmissions,
+                   consumedNonces, acceptedRpcNonces, rejectedReplays, advRpcSubmissions,
                    confirmedAbuseTargets, honestOrderSigs, forgedOrderBuilt,
                    tamperedOrderBuilt, seenOrderIds, appliedOrderLog,
-                   publicSwarmEvicted>>
+                   publicSwarmEvicted, privateRingEvicted>>
+
+RingCandidateOrders ==
+    (IF OrderMeetsCouncilQuorum(HonestAbuseOrder) THEN {HonestAbuseOrder} ELSE {})
+    \cup (IF ownerOrderSigned THEN {OwnerRingOrder} ELSE {})
+
+ApplyOrderOnPrivateRing(ord) ==
+    /\ OrderMeetsPrivateRingAuth(ord)
+    /\ ord.target \notin privateRingEvicted
+    /\ privateRingEvicted' = privateRingEvicted \cup {ord.target}
+    /\ UNCHANGED <<vpsDiskSecrets, vpsCompromised, attackerKeys, activeChallenge, nextNonce,
+                   consumedNonces, acceptedRpcNonces, rejectedReplays, advRpcSubmissions,
+                   confirmedAbuseTargets, honestOrderSigs, forgedOrderBuilt,
+                   tamperedOrderBuilt, seenOrderIds, appliedOrderLog,
+                   publicSwarmEvicted, ownerOrderSigned>>
 
 Idle ==
     /\ "AbuseTarget" \in publicSwarmEvicted
@@ -320,7 +339,8 @@ Next ==
     \/ HonestSubmitQuorumOrderViaAdminRpc
     \/ AdversarySubmitForgedOrderViaAdminRpc
     \/ AdversaryAttemptReplay
-    \/ BroadcastCouncilOrderToPrivateRing
+    \/ HomelabOwnerSignsRingOrder
+    \/ \E ord \in RingCandidateOrders : ApplyOrderOnPrivateRing(ord)
     \/ Idle
 
 Spec ==
@@ -363,8 +383,6 @@ Safety_ZeroAdminPrivKeyOnVpsDisk ==
 Safety_NoUnauthorizedOrSubQuorumEviction ==
     /\ "InnocentTarget" \notin publicSwarmEvicted
     /\ publicSwarmEvicted \subseteq confirmedAbuseTargets
-    /\ ~OrderMeetsCouncilQuorum(ForgedDuplicateSignerOrder)
-    /\ ~OrderMeetsCouncilQuorum(TamperedTargetOrder)
 
 \* INVARIANT 3 (Strict Nonce & Order-ID Anti-Replay):
 \* Every accepted `admin_rpc` request uses a strictly unique `challenge_nonce`, and
@@ -377,9 +395,9 @@ Safety_NoNonceOrOrderReplay ==
     /\ activeChallenge # 0 => activeChallenge \notin consumedNonces
 
 \* INVARIANT 4 (Strict PrivateRing / Homelab Mode Isolation):
-\* Public Tracker Council orders can never zero-shred shards on a PrivateRing / Homelab node.
+\* Only the HomelabOwner's own orders can zero-shred shards on a PrivateRing / Homelab node; a Public Tracker Council order never can.
 Safety_PrivateRingImmuneToPublicCouncil ==
-    privateRingEvicted = {}
+    privateRingEvicted \subseteq (IF ownerOrderSigned THEN {OwnerRingOrder.target} ELSE {})
 
 \* LIVENESS PROPERTY:
 \* Despite VPS disk compromise and M - 1 Byzantine councilors, confirmed abuse is eventually
