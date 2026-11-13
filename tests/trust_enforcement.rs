@@ -4331,3 +4331,425 @@ fn f38g_keep_with_mismatched_bytes_refused() {
     );
     assert!(!deleted(&send(&third, &node, delete_req(&third, sid))));
 }
+
+// --- F-43 (L-43): every built-in WebDAV request needs a macaroon token --------------------------
+
+const F43_ROOT_KEY: [u8; 32] = [0x43; 32];
+const F43_BODY: &[u8] = b"f43 webdav content, only for token holders";
+
+/// `parvault up --no-socket` with built-in WebDAV on an ephemeral port, its macaroon root key
+/// pinned to `F43_ROOT_KEY` (`<data_dir>/macaroon_root.key`) and `a.txt` in the seed folder.
+/// Returns the node and the WebDAV `host:port`.
+fn f43_up(label: &str) -> (Node, String) {
+    let (root, dir, reg, log) = prepare(label);
+    std::fs::write(dir.join("macaroon_root.key"), hex::encode(F43_ROOT_KEY)).unwrap();
+    let seed_dir = root.path().join("shared");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    std::fs::write(seed_dir.join("a.txt"), F43_BODY).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .arg("--data-dir")
+        .arg(&dir)
+        .args([
+            "--no-lan-discovery",
+            "up",
+            "--no-socket",
+            "--listen",
+            common::LOOPBACK_EPHEMERAL,
+            "--vfs-webdav-listen",
+            "127.0.0.1:0",
+            "--vfs-seed-dir",
+        ])
+        .arg(&seed_dir);
+    let node = spawn(cmd, root, dir, log);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let text = node.log_text();
+        let addr = text
+            .lines()
+            .find_map(|l| l.split("WebDAV listening on http://").nth(1))
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(str::to_string);
+        if let (Some(addr), true) = (addr, text.contains("Ingested built-in VFS seed directory")) {
+            return (node, addr);
+        }
+        assert!(Instant::now() < deadline, "WebDAV not up:\n{text}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn f43_token(root_key: &[u8; 32], caveats: Vec<parvault::capabilities::Caveat>) -> String {
+    parvault::capabilities::CapabilityMacaroon::mint(root_key, [0x11; 32], [0x22; 32], caveats)
+        .unwrap()
+        .to_compact_token()
+}
+
+/// One raw HTTP/1.1 request; returns (status code, full response bytes).
+fn f43_http(addr: &str, method: &str, path: &str, headers: &[String]) -> (u16, Vec<u8>) {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    for h in headers {
+        req.push_str(h);
+        req.push_str("\r\n");
+    }
+    req.push_str("\r\n");
+    s.write_all(req.as_bytes()).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let status = String::from_utf8_lossy(&out)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    (status, out)
+}
+
+fn f43_bearer(token: &str) -> String {
+    format!("Authorization: Bearer {token}")
+}
+
+/// Standard base64 (RFC 4648, padded), for the Basic-auth test only.
+fn f43_base64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(A[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+fn f43_assert_unauthorized(node: &Node, resp: &(u16, Vec<u8>), code: &str) {
+    let text = String::from_utf8_lossy(&resp.1);
+    assert_eq!(resp.0, 401, "{text}");
+    assert!(text.contains("WWW-Authenticate: Bearer"), "{text}");
+    assert!(
+        !text.contains(std::str::from_utf8(F43_BODY).unwrap()),
+        "{text}"
+    );
+    assert_logged(node, code);
+}
+
+/// F-43 reject: a request with no token is refused with 401 and a Bearer challenge.
+#[test]
+fn f43_no_token_unauthorized() {
+    let (node, addr) = f43_up("f43-none");
+    let resp = f43_http(&addr, "GET", "/a.txt", &[]);
+    f43_assert_unauthorized(&node, &resp, "reject.webdav_token_missing");
+    gate_ran("trust_enforcement::f43_no_token_unauthorized");
+}
+
+/// F-43 reject: a token minted under another root key is refused with 401.
+#[test]
+fn f43_wrong_root_key_unauthorized() {
+    let (node, addr) = f43_up("f43-wrong");
+    let token = f43_token(&[0x99; 32], vec![]);
+    let resp = f43_http(&addr, "GET", "/a.txt", &[f43_bearer(&token)]);
+    f43_assert_unauthorized(&node, &resp, "reject.webdav_token_invalid");
+}
+
+/// F-43 reject: an expired token is refused with 401 (not 403).
+#[test]
+fn f43_expired_token_unauthorized() {
+    let (node, addr) = f43_up("f43-expired");
+    let token = f43_token(
+        &F43_ROOT_KEY,
+        vec![parvault::capabilities::Caveat::ExpiresAtUnixMs(1)],
+    );
+    let resp = f43_http(&addr, "GET", "/a.txt", &[f43_bearer(&token)]);
+    f43_assert_unauthorized(&node, &resp, "reject.webdav_token_expired");
+}
+
+/// F-43 accept: a valid Bearer token reads the file (200) and a byte range of it (206).
+#[test]
+fn f43_valid_bearer_reads() {
+    let (_node, addr) = f43_up("f43-bearer");
+    let token = f43_token(
+        &F43_ROOT_KEY,
+        vec![parvault::capabilities::Caveat::ReadOnly],
+    );
+    let (status, body) = f43_http(&addr, "GET", "/a.txt", &[f43_bearer(&token)]);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(
+        body.ends_with(F43_BODY),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let (status, body) = f43_http(
+        &addr,
+        "GET",
+        "/a.txt",
+        &[f43_bearer(&token), "Range: bytes=4-9".to_string()],
+    );
+    assert_eq!(status, 206, "{}", String::from_utf8_lossy(&body));
+    assert!(
+        body.ends_with(&F43_BODY[4..10]),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    gate_ran("trust_enforcement::f43_valid_bearer_reads");
+}
+
+/// F-43 accept (D-1 fallback): the token as the Basic-auth password, any user name, reads the
+/// file (200).
+#[test]
+fn f43_valid_basic_password_reads() {
+    let (_node, addr) = f43_up("f43-basic");
+    let token = f43_token(
+        &F43_ROOT_KEY,
+        vec![parvault::capabilities::Caveat::ReadOnly],
+    );
+    let basic = format!(
+        "Authorization: Basic {}",
+        f43_base64(format!("anyone:{token}").as_bytes())
+    );
+    let (status, body) = f43_http(&addr, "GET", "/a.txt", &[basic]);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(
+        body.ends_with(F43_BODY),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+fn f43_ro(extra: Vec<parvault::capabilities::Caveat>) -> String {
+    let mut c = vec![parvault::capabilities::Caveat::ReadOnly];
+    c.extend(extra);
+    f43_token(&F43_ROOT_KEY, c)
+}
+
+fn f43_status(resp: &(u16, Vec<u8>)) -> String {
+    String::from_utf8_lossy(&resp.1).into_owned()
+}
+
+/// F-43: the four 401s (missing, malformed, wrong key, expired) are byte-identical, carry the
+/// Bearer and Basic challenges, and no response carries CORS headers.
+#[test]
+fn f43_unauthorized_responses_identical() {
+    let (_node, addr) = f43_up("f43-ident");
+    let expired = f43_ro(vec![parvault::capabilities::Caveat::ExpiresAtUnixMs(1)]);
+    let wrong = f43_token(&[0x99; 32], vec![parvault::capabilities::Caveat::ReadOnly]);
+    let responses = [
+        f43_http(&addr, "GET", "/a.txt", &[]),
+        f43_http(
+            &addr,
+            "GET",
+            "/a.txt",
+            &["Authorization: Bearer PARVAULT-MAC-V1:zz".into()],
+        ),
+        f43_http(&addr, "GET", "/a.txt", &[f43_bearer(&wrong)]),
+        f43_http(&addr, "GET", "/a.txt", &[f43_bearer(&expired)]),
+    ];
+    for r in &responses {
+        assert_eq!(r.0, 401, "{}", f43_status(r));
+        assert_eq!(r.1, responses[0].1, "401s differ");
+    }
+    let text = f43_status(&responses[0]);
+    assert!(text.contains("WWW-Authenticate: Basic"), "{text}");
+    let ok = f43_http(&addr, "GET", "/a.txt", &[f43_bearer(&f43_ro(vec![]))]);
+    assert!(
+        !f43_status(&ok).contains("Access-Control-"),
+        "{}",
+        f43_status(&ok)
+    );
+}
+
+/// F-43 reject: OPTIONS also needs a token.
+#[test]
+fn f43_options_requires_token() {
+    let (node, addr) = f43_up("f43-options");
+    let resp = f43_http(&addr, "OPTIONS", "/", &[]);
+    f43_assert_unauthorized(&node, &resp, "reject.webdav_token_missing");
+}
+
+/// F-43 reject: Basic auth carrying a token minted under another key is refused with 401.
+#[test]
+fn f43_basic_wrong_token_unauthorized() {
+    let (node, addr) = f43_up("f43-basic-bad");
+    let token = f43_token(&[0x98; 32], vec![parvault::capabilities::Caveat::ReadOnly]);
+    let basic = format!(
+        "Authorization: Basic {}",
+        f43_base64(format!("u:{token}").as_bytes())
+    );
+    let resp = f43_http(&addr, "GET", "/a.txt", &[basic]);
+    f43_assert_unauthorized(&node, &resp, "reject.webdav_token_invalid");
+}
+
+/// F-43 reject (L-44 item 3): a valid token without the ReadOnly caveat is refused with 403.
+#[test]
+fn f43_token_without_read_only_forbidden() {
+    let (node, addr) = f43_up("f43-rw");
+    let token = f43_token(&F43_ROOT_KEY, vec![]);
+    let resp = f43_http(&addr, "GET", "/a.txt", &[f43_bearer(&token)]);
+    assert_eq!(resp.0, 403, "{}", f43_status(&resp));
+    assert_logged(&node, "reject.webdav_token_not_read_only");
+}
+
+/// F-43 reject: a peer-UID-bound token has no meaning over TCP and is refused with 403.
+#[test]
+fn f43_peer_uid_token_forbidden() {
+    let (node, addr) = f43_up("f43-uid");
+    let token = f43_ro(vec![parvault::capabilities::Caveat::AllowedPeerUid(0)]);
+    let resp = f43_http(&addr, "GET", "/a.txt", &[f43_bearer(&token)]);
+    assert_eq!(resp.0, 403, "{}", f43_status(&resp));
+    assert_logged(&node, "reject.webdav_scope_denied");
+}
+
+/// F-43 reject: a token scoped to another manifest gets 403 for this file.
+#[test]
+fn f43_other_manifest_forbidden() {
+    let (node, addr) = f43_up("f43-other");
+    let token = f43_ro(vec![parvault::capabilities::Caveat::AllowedManifest(
+        [0x55; 32],
+    )]);
+    let resp = f43_http(&addr, "GET", "/a.txt", &[f43_bearer(&token)]);
+    assert_eq!(resp.0, 403, "{}", f43_status(&resp));
+    assert_logged(&node, "reject.webdav_scope_denied");
+    gate_ran("trust_enforcement::f43_other_manifest_forbidden");
+}
+
+/// F-43 (no existence oracle): a manifest-scoped token gets 403, never 404, for a path that does
+/// not exist, and 403 for a collection listing.
+#[test]
+fn f43_manifest_token_no_existence_oracle() {
+    let (_node, addr) = f43_up("f43-oracle");
+    let token = f43_ro(vec![parvault::capabilities::Caveat::AllowedManifest(
+        [0x55; 32],
+    )]);
+    let missing = f43_http(&addr, "GET", "/no-such-file.txt", &[f43_bearer(&token)]);
+    assert_eq!(missing.0, 403, "{}", f43_status(&missing));
+    let listing = f43_http(
+        &addr,
+        "PROPFIND",
+        "/",
+        &[f43_bearer(&token), "Depth: 1".into()],
+    );
+    assert_eq!(listing.0, 403, "{}", f43_status(&listing));
+}
+
+/// F-43 reject: a ByteRange token reading outside its window with GET is refused with 403;
+/// HEAD is not range-checked (L-44 item 5) and succeeds.
+#[test]
+fn f43_byte_range_caveat_applies_to_get_only() {
+    let (_node, addr) = f43_up("f43-range");
+    let token = f43_ro(vec![parvault::capabilities::Caveat::ByteRange {
+        offset: 0,
+        length: 4,
+    }]);
+    let outside = f43_http(
+        &addr,
+        "GET",
+        "/a.txt",
+        &[f43_bearer(&token), "Range: bytes=10-20".into()],
+    );
+    assert_eq!(outside.0, 403, "{}", f43_status(&outside));
+    let whole = f43_http(&addr, "GET", "/a.txt", &[f43_bearer(&token)]);
+    assert_eq!(
+        whole.0,
+        403,
+        "no Range means the whole file: {}",
+        f43_status(&whole)
+    );
+    let head = f43_http(&addr, "HEAD", "/a.txt", &[f43_bearer(&token)]);
+    assert_eq!(head.0, 200, "{}", f43_status(&head));
+}
+
+/// F-43 accept: a full-vault read-only token lists the root collection (207).
+#[test]
+fn f43_valid_token_lists_collection() {
+    let (_node, addr) = f43_up("f43-list");
+    let resp = f43_http(
+        &addr,
+        "PROPFIND",
+        "/",
+        &[f43_bearer(&f43_ro(vec![])), "Depth: 1".into()],
+    );
+    assert_eq!(resp.0, 207, "{}", f43_status(&resp));
+    assert!(f43_status(&resp).contains("a.txt"), "{}", f43_status(&resp));
+}
+
+/// F-43 pre-auth bound: headers over 8 KiB get 431 and no content.
+#[test]
+fn f43_oversized_headers_431() {
+    let (_node, addr) = f43_up("f43-431");
+    let pad = format!("X-Pad: {}", "a".repeat(9000));
+    let resp = f43_http(&addr, "GET", "/a.txt", &[pad, f43_bearer(&f43_ro(vec![]))]);
+    assert_eq!(resp.0, 431, "{}", f43_status(&resp));
+    assert!(!resp.1.ends_with(F43_BODY));
+}
+
+/// F-43 pre-auth bound: a client that never finishes its headers is dropped with no response.
+#[test]
+fn f43_stalled_headers_dropped() {
+    use std::io::{Read, Write};
+    let (_node, addr) = f43_up("f43-stall");
+    let mut s = std::net::TcpStream::connect(&addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    s.write_all(b"GET /a.txt HTTP/1.1\r\nHost: x\r\n").unwrap();
+    let t0 = Instant::now();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+    assert!(
+        t0.elapsed() < Duration::from_secs(15),
+        "not dropped: {:?}",
+        t0.elapsed()
+    );
+}
+
+/// F-43 accept: headers split across two TCP writes are reassembled.
+#[test]
+fn f43_split_headers_accepted() {
+    use std::io::{Read, Write};
+    let (_node, addr) = f43_up("f43-split");
+    let token = f43_ro(vec![]);
+    let req = format!(
+        "GET /a.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\nAuthorization: Bearer {token}\r\n\r\n"
+    );
+    let (a, b) = req.as_bytes().split_at(40);
+    let mut s = std::net::TcpStream::connect(&addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    s.write_all(a).unwrap();
+    s.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    s.write_all(b).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    assert!(
+        out.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+    assert!(out.ends_with(F43_BODY), "{}", String::from_utf8_lossy(&out));
+}
+
+/// F-43 (L-44 item 8): neither a refused nor an accepted request puts the token, or its tag,
+/// in the daemon log.
+#[test]
+fn f43_token_never_logged() {
+    let (node, addr) = f43_up("f43-log");
+    let good = f43_ro(vec![]);
+    let bad = f43_token(&[0x97; 32], vec![parvault::capabilities::Caveat::ReadOnly]);
+    let _ = f43_http(&addr, "GET", "/a.txt", &[f43_bearer(&bad)]);
+    let _ = f43_http(&addr, "GET", "/a.txt", &[f43_bearer(&good)]);
+    assert_logged(&node, "reject.webdav_token_invalid");
+    let log = node.log_text();
+    for t in [&good, &bad] {
+        let body = t.trim_start_matches("PARVAULT-MAC-V1:");
+        assert!(!log.contains(body), "token in log");
+        assert!(!log.contains(&body[body.len() - 64..]), "tag in log");
+    }
+}
