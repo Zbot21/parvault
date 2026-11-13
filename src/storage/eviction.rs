@@ -2460,6 +2460,22 @@ impl PrivacyPreservingEvictionEngine {
         now_ms: u64,
         block_store: &BlockStore,
     ) -> Result<EvictionPurgeReport, StorageError> {
+        // F-09, one rule everywhere: the same freshness and bounded expiry as council orders.
+        // The authority here is local (an issuer applying its own orders), so no council epoch.
+        let facts = OrderFacts {
+            local_owner: true,
+            council_epoch: order.council_epoch,
+            manifest_epoch: None,
+            issued_at_ms: order.issued_at_ms,
+            expires_at_ms: order.expires_at_ms,
+            now_ms,
+        };
+        if let Err(code) = order_admission_decision(&facts) {
+            tracing::warn!(code, order = %hex::encode(order.order_id), "refused an eviction order");
+            return Err(StorageError::Crypto(CryptoError::InvalidKeyMaterial(
+                format!("rejected SignedBadActorEvictionOrder: {code}"),
+            )));
+        }
         if !order.verify_against_trusted_authorities(trusted_authorities, now_ms) {
             return Err(StorageError::Crypto(CryptoError::InvalidKeyMaterial(
                 "rejected SignedBadActorEvictionOrder: invalid signature, untrusted issuer, or expired"
@@ -2547,9 +2563,8 @@ impl PrivacyPreservingEvictionEngine {
         Ok(())
     }
 
-    /// Records an applied order's id until its expiry. An order without one (`0`; only the
-    /// local trusted-authority path admits it) is kept for the longest order lifetime, so no id
-    /// holds a slot forever.
+    /// Records an applied order's id until its expiry (always set: both apply paths refuse
+    /// `expires_at_ms = 0`; the fallback only guards the invariant).
     fn record_seen_order(&mut self, order: &SignedBadActorEvictionOrder, now_ms: u64) {
         let expiry = if order.expires_at_ms == 0 {
             now_ms.saturating_add(MAX_ORDER_LIFETIME_MS)
@@ -3554,19 +3569,19 @@ mod tests {
             EvictionTarget::StripeMerkleRoot(illegal_root),
             long_reason,
             1_000_000,
-            0,
+            1_000_000 + 3_600_000,
             0,
         );
         assert!(valid_order.reason.len() <= MAX_EVICTION_REASON_BYTES);
         assert!(valid_order.verify_signature());
-        assert!(valid_order.verify_against_trusted_authorities(&authorities, 9_999_999));
+        assert!(valid_order.verify_against_trusted_authorities(&authorities, 1_000_005));
 
         let rogue_order = SignedBadActorEvictionOrder::issue(
             &rogue_actor,
             EvictionTarget::StripeMerkleRoot(honest_root),
             "forged takedown",
             1_000_000,
-            0,
+            1_000_000 + 3_600_000,
             0,
         );
         assert!(engine
@@ -3583,6 +3598,18 @@ mod tests {
         );
         assert!(engine
             .apply_signed_eviction_order(&expired_order, &authorities, 2_001, &store)
+            .is_err());
+        // F-09, one rule everywhere: a trusted authority's permanent order is refused too.
+        let permanent_order = SignedBadActorEvictionOrder::issue(
+            &trusted_seed,
+            EvictionTarget::StripeMerkleRoot(illegal_root),
+            "permanent",
+            1_000_000,
+            0,
+            0,
+        );
+        assert!(engine
+            .apply_signed_eviction_order(&permanent_order, &authorities, 1_000_005, &store)
             .is_err());
 
         let report = engine
