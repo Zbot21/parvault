@@ -24,7 +24,7 @@ use libp2p::Multiaddr;
 use std::net::IpAddr;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Returns the first IPv4 / IPv6 address in a multiaddr.
 pub fn extract_ip_from_multiaddr(addr: &Multiaddr) -> Option<std::net::IpAddr> {
@@ -1755,14 +1755,36 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
         }
         MeshWireRequest::BroadcastEvictionOrder(order) => {
             // One resolver for both roles (F-08): the installed, signed council manifest.
-            let (council, min_quorum) =
-                crate::storage::council::council_members_and_quorum(data_dir, council_root);
+            let council = crate::storage::council::council_from_manifest(data_dir, council_root);
+            // An order from a newer council epoch: refused below, and the newer manifest is
+            // fetched in the background from peers this node admitted (bounded).
+            if let (Some(root), Some(c), Some(mc)) =
+                (council_root, council.as_ref(), block_store.mesh_client())
+            {
+                if order.council_epoch > c.epoch {
+                    let admitted: Vec<String> = mc
+                        .all_network_endpoints()
+                        .into_iter()
+                        .filter(|ep| {
+                            crate::config::NodeConfig::extract_ed25519_pubkey_from_peer_str(ep)
+                                .is_some_and(|pk| wot.is_peer_trusted(&pk))
+                        })
+                        .collect();
+                    if let Err(code) = crate::network::council_fetch::spawn_council_fetch(
+                        mc.clone(),
+                        admitted,
+                        data_dir.to_path_buf(),
+                        root,
+                    ) {
+                        info!(code, "no council manifest fetch started");
+                    }
+                }
+            }
             let local_pk = node_identity.public_key_bytes();
             match eviction.apply_signed_eviction_order_with_quorum(
                 &order,
                 Some(&local_pk),
-                &council,
-                min_quorum,
+                council.as_ref(),
                 now_unix_ms(),
                 block_store,
             ) {
@@ -2004,6 +2026,7 @@ mod tests {
                         EvictionTarget::BlindedLocator([9; 32]),
                         "t",
                         1,
+                        0,
                         0,
                     ),
                 ),

@@ -345,8 +345,14 @@ impl Fx {
 
     /// Bans `target` directly in the eviction engine (setup only; not a handler call).
     fn ban(&mut self, keys: &Keys, target: EvictionTarget) {
-        let order =
-            SignedBadActorEvictionOrder::issue(&keys.admin, target, "fixture-ban", now_ms(), 0);
+        let order = SignedBadActorEvictionOrder::issue(
+            &keys.admin,
+            target,
+            "fixture-ban",
+            now_ms(),
+            now_ms() + 3_600_000,
+            0,
+        );
         self.eviction
             .apply_signed_eviction_order(
                 &order,
@@ -2141,8 +2147,14 @@ fn broadcast_eviction_order() {
 
     // Local owner (the node's own key) is accepted by every role.
     let mut t = Trio::new("evict-local");
-    let order =
-        SignedBadActorEvictionOrder::issue(&t.keys.node, target(), "local-owner", now_ms(), 0);
+    let order = SignedBadActorEvictionOrder::issue(
+        &t.keys.node,
+        target(),
+        "local-owner",
+        now_ms(),
+        now_ms() + 3_600_000,
+        0,
+    );
     let o = t.run(
         &peer,
         &MeshWireRequest::BroadcastEvictionOrder(order.clone()),
@@ -2169,7 +2181,14 @@ fn broadcast_eviction_order() {
         } else {
             t.keys.admin.clone()
         };
-        let order = SignedBadActorEvictionOrder::issue(&key, target(), label, now_ms(), 0);
+        let order = SignedBadActorEvictionOrder::issue(
+            &key,
+            target(),
+            label,
+            now_ms(),
+            now_ms() + 3_600_000,
+            1,
+        );
         let o = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(order));
         assert!(!o.iter().any(accepted), "{label}: {o:?}");
         assert_identical(&o);
@@ -2208,11 +2227,25 @@ fn broadcast_eviction_order() {
     let o = t.run(&peer, &ask);
     assert!(o.iter().all(|x| x.resp.contains("epoch: 1")), "{o:?}");
     assert_identical(&o);
-    let one = SignedBadActorEvictionOrder::issue(&members[0], target(), "one", now_ms(), 0);
+    let one = SignedBadActorEvictionOrder::issue(
+        &members[0],
+        target(),
+        "one",
+        now_ms(),
+        now_ms() + 3_600_000,
+        1,
+    );
     let o = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(one));
     assert!(!o.iter().any(accepted), "{o:?}");
     assert_identical(&o);
-    let mut two = SignedBadActorEvictionOrder::issue(&members[0], target(), "two", now_ms(), 0);
+    let mut two = SignedBadActorEvictionOrder::issue(
+        &members[0],
+        target(),
+        "two",
+        now_ms(),
+        now_ms() + 3_600_000,
+        1,
+    );
     assert!(two.add_cosignature(&members[1]));
     let o = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(two));
     // [daemon, seed homelab, seed public]: the scope root follows the mode, not the role. The

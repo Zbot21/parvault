@@ -190,6 +190,7 @@ fn proof_eviction_quorum_sub_threshold_and_duplicate_signer_rejected() {
             sig_r: &sig_r,
             sig_s: &sig_s,
             cosignatures: &cosigs,
+            council_epoch: 0,
         },
         &council,
         min_quorum,
@@ -246,11 +247,12 @@ fn proof_eviction_quorum_authorized_distinct_signers_and_expiry() {
         issued_at_ms,
         expires_at_ms,
         &issuer_pubkey,
+        0,
     )
     .expect("fits in 256-byte stack preimage");
 
     let ufcma_verify = |pk: &[u8; 32], msg: &[u8], sig: &[u8; 64]| -> bool {
-        if !slice_eq_bounded::<132>(msg, &signed_buf[..signed_len]) {
+        if !slice_eq_bounded::<140>(msg, &signed_buf[..signed_len]) {
             return false;
         }
         if *pk == council[0] {
@@ -275,6 +277,7 @@ fn proof_eviction_quorum_authorized_distinct_signers_and_expiry() {
             sig_r: &sig_r,
             sig_s: &sig_s,
             cosignatures: &cosigs,
+            council_epoch: 0,
         },
         &council,
         min_quorum,
@@ -297,6 +300,7 @@ fn proof_eviction_quorum_authorized_distinct_signers_and_expiry() {
             sig_r: &sig_r,
             sig_s: &sig_s,
             cosignatures: &cosigs,
+            council_epoch: 0,
         },
         &council,
         min_quorum,
@@ -320,7 +324,8 @@ fn symbolic_eviction_target_32b() -> EvictionTarget {
 /// Proves `SignedBadActorEvictionOrder::encode_signing_payload_stack` (backing
 /// `canonical_sign_bytes` and `tally_and_verify_quorum_raw`) is strictly collision-free across
 /// ALL symbolic mutations to `order_id`, `target` (IPv4, IPv6, Pubkey, MerkleRoot, BlindedLocator),
-/// `reason` (content & length), `issued_at_ms`, `expires_at_ms`, and `issuer_pubkey`.
+/// `reason` (content & length), `issued_at_ms`, `expires_at_ms`, `issuer_pubkey` and
+/// `council_epoch` (F-09, `-v2:`).
 #[kani::proof]
 fn proof_eviction_signing_payload_collision_free_across_all_fields() {
     let order_id: [u8; 32] = kani::any();
@@ -335,7 +340,7 @@ fn proof_eviction_signing_payload_collision_free_across_all_fields() {
     let mut_expires: u64 = kani::any();
     let mut_issuer: [u8; 32] = kani::any();
 
-    // 1. Disjoint preimage lengths across V4 (131B), V6 (143B), and 32-byte digest targets (158B),
+    // 1. Disjoint preimage lengths across V4 (139B), V6 (151B), and 32-byte digest targets (166B),
     //    plus variable `reason` length (`3B` vs `4B`), prevent all cross-length-class collisions:
     let t_v4 = EvictionTarget::IpAddress(IpAddr::V4(Ipv4Addr::from(kani::any::<[u8; 4]>())));
     let t_v6 = EvictionTarget::IpAddress(IpAddr::V6(Ipv6Addr::from(kani::any::<[u8; 16]>())));
@@ -348,6 +353,7 @@ fn proof_eviction_signing_payload_collision_free_across_all_fields() {
         issued_at_ms,
         expires_at_ms,
         &issuer_pubkey,
+        0,
     )
     .expect("fits in 256B");
     let (_, len_v6) = SignedBadActorEvictionOrder::encode_signing_payload_stack(
@@ -357,8 +363,11 @@ fn proof_eviction_signing_payload_collision_free_across_all_fields() {
         mut_issued,
         mut_expires,
         &mut_issuer,
+        0,
     )
     .expect("fits in 256B");
+    let epoch_a: u64 = kani::any();
+    let mut_epoch: u64 = kani::any();
     let (buf_32_a, len_32_a) = SignedBadActorEvictionOrder::encode_signing_payload_stack(
         &order_id,
         &t_32,
@@ -366,6 +375,7 @@ fn proof_eviction_signing_payload_collision_free_across_all_fields() {
         issued_at_ms,
         expires_at_ms,
         &issuer_pubkey,
+        epoch_a,
     )
     .expect("fits in 256B");
     assert!(len_v4 != len_v6 && len_v4 != len_32_a && len_v6 != len_32_a);
@@ -377,6 +387,7 @@ fn proof_eviction_signing_payload_collision_free_across_all_fields() {
         issued_at_ms,
         expires_at_ms,
         &issuer_pubkey,
+        0,
     )
     .expect("fits in 256B");
     assert_ne!(short_len, len_32_a);
@@ -391,18 +402,20 @@ fn proof_eviction_signing_payload_collision_free_across_all_fields() {
         mut_issued,
         mut_expires,
         &mut_issuer,
+        mut_epoch,
     )
     .expect("fits in 256B");
-    assert_eq!(len_32_a, 158);
-    assert_eq!(len_32_b, 158);
+    assert_eq!(len_32_a, 166);
+    assert_eq!(len_32_b, 166);
     assert_eq!(
-        slice_eq_bounded::<158>(&buf_32_a[..158], &buf_32_b[..158]),
+        slice_eq_bounded::<166>(&buf_32_a[..166], &buf_32_b[..166]),
         mut_order_id == order_id
             && eviction_target_eq_fixed(&mut_t32, &t_32)
             && mut_reason == reason_a
             && mut_issued == issued_at_ms
             && mut_expires == expires_at_ms
             && mut_issuer == issuer_pubkey
+            && mut_epoch == epoch_a
     );
 }
 

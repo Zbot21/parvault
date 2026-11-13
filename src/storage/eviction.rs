@@ -23,7 +23,16 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 type HmacSha256 = Hmac<Sha256>;
 
 /// Domain separator for `SignedBadActorEvictionOrder` Ed25519 signatures (`ADR-19`).
-pub const EVICTION_ORDER_DOMAIN: &[u8] = b"parvault-bad-actor-eviction-order-v1:";
+/// `-v2:` (F-09) binds the council epoch; `-v1:` orders no longer verify.
+pub const EVICTION_ORDER_DOMAIN: &[u8] = b"parvault-bad-actor-eviction-order-v2:";
+/// An order may be issued at most this far in the future (clock skew), F-09.
+pub const MAX_ORDER_FUTURE_SKEW_MS: u64 = 5 * 60 * 1000;
+/// An order older than this is stale, F-09.
+pub const MAX_ORDER_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+/// Lifetime of orders this crate issues on its own (takedowns, emergency evictions, CLI).
+pub const DEFAULT_ORDER_LIFETIME_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+/// Longest order lifetime (`expires - issued`); `0` (permanent) is refused, F-09.
+pub const MAX_ORDER_LIFETIME_MS: u64 = 365 * 24 * 60 * 60 * 1000;
 /// Domain separator for `VerifiableAbuseReport` reporter Ed25519 signatures (`ADR-19`).
 pub const ABUSE_REPORT_DOMAIN: &[u8] = b"parvault-verifiable-abuse-report-v1:";
 /// Maximum byte length of `SignedBadActorEvictionOrder::reason`.
@@ -126,6 +135,7 @@ pub struct EvictionOrderSliceView<'a> {
     pub sig_r: &'a [u8; 32],
     pub sig_s: &'a [u8; 32],
     pub cosignatures: &'a [TrackerOperatorCosignature],
+    pub council_epoch: u64,
 }
 
 /// Cryptographically signed bad-actor or illegal-content eviction order (`ADR-19`)
@@ -143,6 +153,10 @@ pub struct SignedBadActorEvictionOrder {
     pub sig_s: [u8; 32],
     #[serde(default)]
     pub cosignatures: Vec<TrackerOperatorCosignature>,
+    /// Epoch of the council manifest this order is for (F-09; signed). Appended: on the bincode
+    /// wire an order without it does not decode; in JSON it defaults to `0`, which no manifest has.
+    #[serde(default)]
+    pub council_epoch: u64,
 }
 
 impl SignedBadActorEvictionOrder {
@@ -159,6 +173,7 @@ impl SignedBadActorEvictionOrder {
             sig_r: &self.sig_r,
             sig_s: &self.sig_s,
             cosignatures: &self.cosignatures,
+            council_epoch: self.council_epoch,
         }
     }
 
@@ -180,6 +195,7 @@ impl SignedBadActorEvictionOrder {
         reason: impl Into<String>,
         issued_at_ms: u64,
         expires_at_ms: u64,
+        council_epoch: u64,
     ) -> Self {
         let mut order_id = [0u8; 32];
         OsRng.fill_bytes(&mut order_id);
@@ -192,6 +208,7 @@ impl SignedBadActorEvictionOrder {
             issued_at_ms,
             expires_at_ms,
             &issuer_pubkey,
+            council_epoch,
         );
         let sig = issuer.sign(&msg);
         let mut sig_r = [0u8; 32];
@@ -209,7 +226,43 @@ impl SignedBadActorEvictionOrder {
             sig_r,
             sig_s,
             cosignatures: Vec::new(),
+            council_epoch,
         }
+    }
+
+    /// An unsigned order (signature zero) for a signer that holds its key elsewhere (control's
+    /// admin RPC signer): sign [`Self::canonical_sign_bytes`] and attach it with
+    /// [`Self::with_signature`]. `reason` is truncated to 256 bytes at a UTF-8 boundary. Use
+    /// this instead of a struct literal; fields may be appended.
+    #[allow(clippy::too_many_arguments)]
+    pub fn unsigned(
+        order_id: [u8; 32],
+        target: EvictionTarget,
+        reason: impl Into<String>,
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+        issuer_pubkey: [u8; 32],
+        council_epoch: u64,
+    ) -> Self {
+        Self {
+            order_id,
+            target,
+            reason: truncate_utf8_bytes(reason.into(), MAX_EVICTION_REASON_BYTES),
+            issued_at_ms,
+            expires_at_ms,
+            issuer_pubkey,
+            sig_r: [0u8; 32],
+            sig_s: [0u8; 32],
+            cosignatures: Vec::new(),
+            council_epoch,
+        }
+    }
+
+    /// Attaches the issuer's 64-byte Ed25519 signature over [`Self::canonical_sign_bytes`].
+    pub fn with_signature(mut self, sig: &[u8; 64]) -> Self {
+        self.sig_r.copy_from_slice(&sig[..32]);
+        self.sig_s.copy_from_slice(&sig[32..]);
+        self
     }
 
     /// Appends an `Ed25519` co-signature over `self.canonical_sign_bytes()` from an independent
@@ -251,6 +304,7 @@ impl SignedBadActorEvictionOrder {
             self.issued_at_ms,
             self.expires_at_ms,
             &self.issuer_pubkey,
+            self.council_epoch,
         )
     }
 
@@ -291,6 +345,7 @@ impl SignedBadActorEvictionOrder {
             self.issued_at_ms,
             self.expires_at_ms,
             &self.issuer_pubkey,
+            self.council_epoch,
         ) {
             verify_fn(&self.issuer_pubkey, &stack_buf[..len], &sig)
         } else {
@@ -331,6 +386,7 @@ impl SignedBadActorEvictionOrder {
             sig_r,
             sig_s,
             cosignatures,
+            council_epoch,
         } = order;
         if trusted_council_pubkeys.is_empty()
             || *issuer_pubkey == [0u8; 32]
@@ -356,6 +412,7 @@ impl SignedBadActorEvictionOrder {
             issued_at_ms,
             expires_at_ms,
             issuer_pubkey,
+            council_epoch,
         );
         let msg_slice: &[u8] = if let Some((ref arr, len)) = stack_opt {
             &arr[..len]
@@ -367,6 +424,7 @@ impl SignedBadActorEvictionOrder {
                 issued_at_ms,
                 expires_at_ms,
                 issuer_pubkey,
+                council_epoch,
             );
             heap_fallback.as_slice()
         };
@@ -519,6 +577,7 @@ impl SignedBadActorEvictionOrder {
         issued_at_ms: u64,
         expires_at_ms: u64,
         issuer_pubkey: &[u8; 32],
+        council_epoch: u64,
     ) -> Option<([u8; 256], usize)> {
         let target_len = match target {
             EvictionTarget::IpAddress(IpAddr::V4(_)) => 6,
@@ -534,7 +593,7 @@ impl SignedBadActorEvictionOrder {
             .checked_add(target_len)?
             .checked_add(4)?
             .checked_add(reason_bytes.len())?
-            .checked_add(8 + 8 + 32)?;
+            .checked_add(8 + 8 + 32 + 8)?;
         if total > 256 {
             return None;
         }
@@ -593,6 +652,7 @@ impl SignedBadActorEvictionOrder {
         push_bytes(&mut buf, &mut pos, &issued_at_ms.to_be_bytes());
         push_bytes(&mut buf, &mut pos, &expires_at_ms.to_be_bytes());
         push_bytes(&mut buf, &mut pos, issuer_pubkey);
+        push_bytes(&mut buf, &mut pos, &council_epoch.to_be_bytes());
         Some((buf, pos))
     }
 
@@ -603,6 +663,7 @@ impl SignedBadActorEvictionOrder {
         issued_at_ms: u64,
         expires_at_ms: u64,
         issuer_pubkey: &[u8; 32],
+        council_epoch: u64,
     ) -> Vec<u8> {
         Self::encode_signing_payload_bytes(
             order_id,
@@ -611,6 +672,7 @@ impl SignedBadActorEvictionOrder {
             issued_at_ms,
             expires_at_ms,
             issuer_pubkey,
+            council_epoch,
         )
     }
 
@@ -621,6 +683,7 @@ impl SignedBadActorEvictionOrder {
         issued_at_ms: u64,
         expires_at_ms: u64,
         issuer_pubkey: &[u8; 32],
+        council_epoch: u64,
     ) -> Vec<u8> {
         if let Some((arr, len)) = Self::encode_signing_payload_stack(
             order_id,
@@ -629,6 +692,7 @@ impl SignedBadActorEvictionOrder {
             issued_at_ms,
             expires_at_ms,
             issuer_pubkey,
+            council_epoch,
         ) {
             return arr[..len].to_vec();
         }
@@ -674,6 +738,7 @@ impl SignedBadActorEvictionOrder {
         buf.extend_from_slice(&issued_at_ms.to_be_bytes());
         buf.extend_from_slice(&expires_at_ms.to_be_bytes());
         buf.extend_from_slice(issuer_pubkey);
+        buf.extend_from_slice(&council_epoch.to_be_bytes());
         buf
     }
 }
@@ -1168,6 +1233,9 @@ impl PublicTrackerTakedownQueue {
             clean_note.clone()
         };
 
+        let council_epoch =
+            crate::storage::council::load_council_manifest(eviction_engine.data_dir())
+                .map_or(0, |m| m.epoch);
         let mut orders = Vec::new();
         for stripe_root in &self.entries[idx].proof_outcome.stripe_merkle_roots {
             orders.push(SignedBadActorEvictionOrder::issue(
@@ -1175,7 +1243,8 @@ impl PublicTrackerTakedownQueue {
                 EvictionTarget::StripeMerkleRoot(*stripe_root),
                 order_reason.clone(),
                 now_ms,
-                0,
+                now_ms.saturating_add(DEFAULT_ORDER_LIFETIME_MS),
+                council_epoch,
             ));
         }
 
@@ -1185,7 +1254,8 @@ impl PublicTrackerTakedownQueue {
                 EvictionTarget::IpAddress(bad_ip),
                 order_reason.clone(),
                 now_ms,
-                0,
+                now_ms.saturating_add(DEFAULT_ORDER_LIFETIME_MS),
+                council_epoch,
             ));
             for cohort_pk in eviction_engine.resolve_pubkeys_for_ip(bad_ip) {
                 orders.push(SignedBadActorEvictionOrder::issue(
@@ -1193,7 +1263,8 @@ impl PublicTrackerTakedownQueue {
                     EvictionTarget::PeerOrIssuerPubkey(cohort_pk),
                     order_reason.clone(),
                     now_ms,
-                    0,
+                    now_ms.saturating_add(DEFAULT_ORDER_LIFETIME_MS),
+                    council_epoch,
                 ));
             }
         }
@@ -1358,12 +1429,16 @@ impl PublicTrackerTakedownQueue {
             clean_ref.clone()
         };
 
+        let council_epoch =
+            crate::storage::council::load_council_manifest(eviction_engine.data_dir())
+                .map_or(0, |m| m.epoch);
         let mut orders = vec![SignedBadActorEvictionOrder::issue(
             admin_identity,
             target.clone(),
             order_reason.clone(),
             now_ms,
-            0,
+            now_ms.saturating_add(DEFAULT_ORDER_LIFETIME_MS),
+            council_epoch,
         )];
 
         match &target {
@@ -1374,7 +1449,8 @@ impl PublicTrackerTakedownQueue {
                         EvictionTarget::PeerOrIssuerPubkey(pk),
                         order_reason.clone(),
                         now_ms,
-                        0,
+                        now_ms.saturating_add(DEFAULT_ORDER_LIFETIME_MS),
+                        council_epoch,
                     ));
                 }
             }
@@ -1385,7 +1461,8 @@ impl PublicTrackerTakedownQueue {
                         EvictionTarget::PeerOrIssuerPubkey(pk),
                         order_reason.clone(),
                         now_ms,
-                        0,
+                        now_ms.saturating_add(DEFAULT_ORDER_LIFETIME_MS),
+                        council_epoch,
                     ));
                 }
             }
@@ -1466,6 +1543,83 @@ struct BlindedShardAttribution {
     voucher_issuer_pubkey: [u8; 32],
 }
 
+/// Inputs of [`order_admission_decision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderFacts {
+    /// Signed by this node's own key (local owner, 1-of-1: applies on this node only).
+    pub local_owner: bool,
+    pub council_epoch: u64,
+    /// Epoch of the installed council manifest, if any.
+    pub manifest_epoch: Option<u64>,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub now_ms: u64,
+}
+
+/// F-09: an order is admitted only for the installed council epoch (local-owner orders need no
+/// council), issued within `[now - 7 days, now + 5 min]`, with an expiry in `(issued, issued +
+/// 365 days]` that has not passed. Checked before the quorum and the replay cache.
+pub fn order_admission_decision(f: &OrderFacts) -> Result<(), &'static str> {
+    if !f.local_owner {
+        match f.manifest_epoch {
+            None => return Err("reject.order_no_council"),
+            Some(e) if f.council_epoch > e => return Err("reject.order_council_epoch_ahead"),
+            Some(e) if f.council_epoch != e => return Err("reject.order_council_epoch"),
+            Some(_) => {}
+        }
+    }
+    if f.issued_at_ms > f.now_ms.saturating_add(MAX_ORDER_FUTURE_SKEW_MS)
+        || f.issued_at_ms.saturating_add(MAX_ORDER_AGE_MS) < f.now_ms
+    {
+        return Err("reject.order_stale");
+    }
+    if f.expires_at_ms <= f.issued_at_ms || f.expires_at_ms - f.issued_at_ms > MAX_ORDER_LIFETIME_MS
+    {
+        return Err("reject.order_unbounded_expiry");
+    }
+    if f.now_ms > f.expires_at_ms {
+        return Err("reject.order_expired");
+    }
+    Ok(())
+}
+
+/// The persisted index as written before F-09 (no replay expiries); read once and converted.
+#[derive(Debug, Default, Deserialize)]
+struct PersistedEvictionIndexV1 {
+    blocked_ip_tags: HashSet<[u8; 32]>,
+    blocked_subnet_tags: HashSet<[u8; 32]>,
+    blocked_peer_id_tags: HashSet<[u8; 32]>,
+    blocked_pubkeys: HashSet<[u8; 32]>,
+    tombstoned_merkle_roots: HashSet<[u8; 32]>,
+    tombstoned_blinded_locators: HashSet<[u8; 32]>,
+    regular_shards: HashMap<ShardId, RegularShardAttribution>,
+    blinded_shards: HashMap<[u8; 32], BlindedShardAttribution>,
+    pubkeys_by_ip_tag: HashMap<[u8; 32], HashSet<[u8; 32]>>,
+    pubkeys_by_subnet_tag: HashMap<[u8; 32], HashSet<[u8; 32]>>,
+    seen_order_ids_fifo: VecDeque<[u8; 32]>,
+}
+
+impl From<PersistedEvictionIndexV1> for PersistedEvictionIndex {
+    fn from(v: PersistedEvictionIndexV1) -> Self {
+        // Legacy ids carry no expiry: kept for good (they may be permanent orders).
+        let seen_order_expiry_ms = vec![u64::MAX; v.seen_order_ids_fifo.len()];
+        Self {
+            blocked_ip_tags: v.blocked_ip_tags,
+            blocked_subnet_tags: v.blocked_subnet_tags,
+            blocked_peer_id_tags: v.blocked_peer_id_tags,
+            blocked_pubkeys: v.blocked_pubkeys,
+            tombstoned_merkle_roots: v.tombstoned_merkle_roots,
+            tombstoned_blinded_locators: v.tombstoned_blinded_locators,
+            regular_shards: v.regular_shards,
+            blinded_shards: v.blinded_shards,
+            pubkeys_by_ip_tag: v.pubkeys_by_ip_tag,
+            pubkeys_by_subnet_tag: v.pubkeys_by_subnet_tag,
+            seen_order_ids_fifo: v.seen_order_ids_fifo,
+            seen_order_expiry_ms,
+        }
+    }
+}
+
 /// On-disk persisted state (`<data_dir>/eviction_index.bin`).
 /// By type-level construction, this struct graph contains ZERO `String` fields and ZERO `IpAddr`
 /// octets — every persisted identifier is either a 32-byte per-node `HMAC-SHA256` digest, a
@@ -1483,6 +1637,9 @@ struct PersistedEvictionIndex {
     pubkeys_by_ip_tag: HashMap<[u8; 32], HashSet<[u8; 32]>>,
     pubkeys_by_subnet_tag: HashMap<[u8; 32], HashSet<[u8; 32]>>,
     seen_order_ids_fifo: VecDeque<[u8; 32]>,
+    /// Expiry of each seen order, index-aligned with `seen_order_ids_fifo` (F-09: an id is kept
+    /// until its order expires; a full cache refuses new orders instead of evicting).
+    seen_order_expiry_ms: Vec<u64>,
 }
 
 /// 4-Vector Privacy-Preserving Bad-Actor & Illegal-Content Shard Eviction Engine (`ADR-19`).
@@ -1550,7 +1707,12 @@ impl PrivacyPreservingEvictionEngine {
                     ),
                 )));
             }
-            bounded_bincode_options().deserialize(&raw)?
+            match bounded_bincode_options().deserialize::<PersistedEvictionIndex>(&raw) {
+                Ok(index) => index,
+                Err(_) => bounded_bincode_options()
+                    .deserialize::<PersistedEvictionIndexV1>(&raw)?
+                    .into(),
+            }
         } else {
             PersistedEvictionIndex::default()
         };
@@ -2297,80 +2459,121 @@ impl PrivacyPreservingEvictionEngine {
                     .into(),
             )));
         }
-        if self.seen_order_ids_set.contains(&order.order_id) {
-            return Err(StorageError::QuotaExceeded(
-                "duplicate_replayed_eviction_order".into(),
-            ));
-        }
-
+        self.replay_slot_check(order, now_ms)?;
         let report = self.evict_target_unpersisted(&order.target, block_store)?;
-
-        while self.seen_order_ids_set.len() >= MAX_SEEN_EVICTION_ORDER_IDS {
-            if let Some(oldest) = self.index.seen_order_ids_fifo.pop_front() {
-                self.seen_order_ids_set.remove(&oldest);
-            } else {
-                break;
-            }
-        }
-        self.seen_order_ids_set.insert(order.order_id);
-        self.index.seen_order_ids_fifo.push_back(order.order_id);
+        self.record_seen_order(order);
 
         self.persist_index()?;
         Ok(report)
     }
 
-    /// Applies a `SignedBadActorEvictionOrder` enforcing **both** local hardware owner sovereignty
-    /// (`1-of-1` when signed by `local_owner_pubkey`) and **`M-of-N` Federated Public Tracker
-    /// Operator Council Quorum** (`min_quorum` distinct valid signers in `trusted_council_pubkeys`,
-    /// `ADR-19` Part 3). Prevents both unvetted stranger trackers (`0` votes) and any single rogue
-    /// council tracker (`1 < min_quorum`) from unilaterally wiping peers' shards to steal storage.
+    /// Applies an order in this order (F-08/F-09): [`order_admission_decision`] (the installed
+    /// council's epoch, freshness, bounded expiry), then the quorum of `council` (or the node's
+    /// own signature for a local-owner 1-of-1 order, which applies on this node only), then the
+    /// replay cache (ids kept until expiry; full refuses). Every refusal logs its `reject.*` code.
     pub fn apply_signed_eviction_order_with_quorum(
         &mut self,
         order: &SignedBadActorEvictionOrder,
         local_owner_pubkey: Option<&[u8; 32]>,
-        trusted_council_pubkeys: &[[u8; 32]],
-        min_quorum: usize,
+        council: Option<&crate::storage::council::CouncilManifest>,
         now_ms: u64,
         block_store: &BlockStore,
     ) -> Result<EvictionPurgeReport, StorageError> {
-        if order.expires_at_ms != 0 && now_ms > order.expires_at_ms {
-            return Err(StorageError::Crypto(CryptoError::InvalidKeyMaterial(
-                "rejected SignedBadActorEvictionOrder: expired".into(),
-            )));
+        let refuse = |code: &'static str| {
+            tracing::warn!(code, order = %hex::encode(order.order_id), "refused an eviction order");
+            Err(StorageError::Crypto(CryptoError::InvalidKeyMaterial(
+                format!("rejected SignedBadActorEvictionOrder: {code}"),
+            )))
+        };
+        let local_owner = local_owner_pubkey.is_some_and(|pk| *pk == order.issuer_pubkey);
+        let facts = OrderFacts {
+            local_owner,
+            council_epoch: order.council_epoch,
+            manifest_epoch: council.map(|c| c.epoch),
+            issued_at_ms: order.issued_at_ms,
+            expires_at_ms: order.expires_at_ms,
+            now_ms,
+        };
+        if let Err(code) = order_admission_decision(&facts) {
+            return refuse(code);
         }
-
-        let is_local_owner = local_owner_pubkey.is_some_and(|pk| *pk == order.issuer_pubkey)
-            && order.verify_signature();
-        let has_council_quorum =
-            order.verify_against_quorum(trusted_council_pubkeys, min_quorum, now_ms);
-
-        if !is_local_owner && !has_council_quorum {
-            return Err(StorageError::Crypto(CryptoError::InvalidKeyMaterial(
-                "rejected SignedBadActorEvictionOrder: insufficient M-of-N tracker council quorum or untrusted issuer"
-                    .into(),
-            )));
+        // Quorum before the replay cache: an unauthorised order never takes a cache slot.
+        let authorised = if local_owner {
+            order.verify_signature()
+        } else {
+            council
+                .is_some_and(|c| order.verify_against_quorum(&c.members, c.quorum as usize, now_ms))
+        };
+        if !authorised {
+            return refuse("reject.order_quorum");
         }
+        self.replay_slot_check(order, now_ms)?;
+        let report = self.evict_target_unpersisted(&order.target, block_store)?;
+        self.record_seen_order(order);
 
+        self.persist_index()?;
+        Ok(report)
+    }
+
+    /// Refuses a replayed order, and a new one when the replay cache is full after dropping
+    /// expired ids (F-09: ids are never evicted early, so the cache cannot roll over).
+    fn replay_slot_check(
+        &mut self,
+        order: &SignedBadActorEvictionOrder,
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
         if self.seen_order_ids_set.contains(&order.order_id) {
             return Err(StorageError::QuotaExceeded(
                 "duplicate_replayed_eviction_order".into(),
             ));
         }
-
-        let report = self.evict_target_unpersisted(&order.target, block_store)?;
-
-        while self.seen_order_ids_set.len() >= MAX_SEEN_EVICTION_ORDER_IDS {
-            if let Some(oldest) = self.index.seen_order_ids_fifo.pop_front() {
-                self.seen_order_ids_set.remove(&oldest);
-            } else {
-                break;
-            }
+        self.prune_expired_seen_orders(now_ms);
+        if self.seen_order_ids_set.len() >= MAX_SEEN_EVICTION_ORDER_IDS {
+            tracing::warn!(
+                code = "reject.order_replay_cache_full",
+                "refused an eviction order"
+            );
+            return Err(StorageError::QuotaExceeded(
+                "rejected SignedBadActorEvictionOrder: reject.order_replay_cache_full".into(),
+            ));
         }
+        Ok(())
+    }
+
+    /// Records an applied order's id until its expiry (`0`, permanent, is kept for good).
+    fn record_seen_order(&mut self, order: &SignedBadActorEvictionOrder) {
+        let expiry = if order.expires_at_ms == 0 {
+            u64::MAX
+        } else {
+            order.expires_at_ms
+        };
         self.seen_order_ids_set.insert(order.order_id);
         self.index.seen_order_ids_fifo.push_back(order.order_id);
+        self.index.seen_order_expiry_ms.push(expiry);
+    }
 
-        self.persist_index()?;
-        Ok(report)
+    /// Drops seen order ids whose orders have expired (they can no longer be admitted anyway).
+    fn prune_expired_seen_orders(&mut self, now_ms: u64) {
+        let index = &mut self.index;
+        index
+            .seen_order_expiry_ms
+            .resize(index.seen_order_ids_fifo.len(), u64::MAX);
+        let mut kept_ids = VecDeque::with_capacity(index.seen_order_ids_fifo.len());
+        let mut kept_exp = Vec::with_capacity(index.seen_order_ids_fifo.len());
+        for (id, exp) in index
+            .seen_order_ids_fifo
+            .drain(..)
+            .zip(index.seen_order_expiry_ms.drain(..))
+        {
+            if exp >= now_ms {
+                kept_ids.push_back(id);
+                kept_exp.push(exp);
+            } else {
+                self.seen_order_ids_set.remove(&id);
+            }
+        }
+        index.seen_order_ids_fifo = kept_ids;
+        index.seen_order_expiry_ms = kept_exp;
     }
 
     fn evict_target_unpersisted(
@@ -2738,6 +2941,165 @@ mod tests {
 
     fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// F-09: epoch, freshness and expiry, in that order; local-owner orders need no council.
+    #[test]
+    fn order_admission_decision_rules() {
+        let day = 24 * 60 * 60 * 1000;
+        let now = 1_000 * day;
+        let ok = OrderFacts {
+            local_owner: false,
+            council_epoch: 3,
+            manifest_epoch: Some(3),
+            issued_at_ms: now,
+            expires_at_ms: now + day,
+            now_ms: now,
+        };
+        assert_eq!(order_admission_decision(&ok), Ok(()));
+        let with = |f: &dyn Fn(&mut OrderFacts)| {
+            let mut x = ok;
+            f(&mut x);
+            order_admission_decision(&x)
+        };
+        assert_eq!(
+            with(&|f| f.manifest_epoch = None),
+            Err("reject.order_no_council")
+        );
+        assert_eq!(
+            with(&|f| f.council_epoch = 4),
+            Err("reject.order_council_epoch_ahead")
+        );
+        assert_eq!(
+            with(&|f| f.council_epoch = 2),
+            Err("reject.order_council_epoch")
+        );
+        assert_eq!(
+            with(&|f| {
+                f.local_owner = true;
+                f.manifest_epoch = None;
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            with(&|f| f.issued_at_ms = now - 8 * day),
+            Err("reject.order_stale")
+        );
+        assert_eq!(
+            with(&|f| f.issued_at_ms = now + 6 * 60 * 1000),
+            Err("reject.order_stale")
+        );
+        assert_eq!(
+            with(&|f| f.expires_at_ms = 0),
+            Err("reject.order_unbounded_expiry")
+        );
+        assert_eq!(
+            with(&|f| f.expires_at_ms = now + 366 * day),
+            Err("reject.order_unbounded_expiry")
+        );
+        assert_eq!(
+            with(&|f| {
+                f.issued_at_ms = now - 2 * day;
+                f.expires_at_ms = now - day;
+            }),
+            Err("reject.order_expired")
+        );
+    }
+
+    /// The `-v2:` signing payload binds the council epoch (golden vectors; control checks the
+    /// same bytes).
+    #[test]
+    fn order_v2_golden_vector() {
+        let issuer = NodeIdentity::from_seed([5; 32]);
+        let order = SignedBadActorEvictionOrder::unsigned(
+            [1; 32],
+            EvictionTarget::IpAddress("192.0.2.1".parse().unwrap()),
+            "golden",
+            1_000,
+            2_000,
+            issuer.public_key_bytes(),
+            7,
+        );
+        let bytes = order.canonical_sign_bytes();
+        assert!(bytes.starts_with(b"parvault-bad-actor-eviction-order-v2:"));
+        assert!(bytes.ends_with(&7u64.to_be_bytes()));
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&issuer.sign(&bytes));
+        let order = order.with_signature(&sig);
+        assert!(order.verify_signature());
+        let mut other_epoch = order.clone();
+        other_epoch.council_epoch = 8;
+        assert!(!other_epoch.verify_signature());
+        assert_eq!(
+            hex::encode(crate::crypto::compute_sha256(&bytes)),
+            GOLDEN_ORDER_V2_SHA256
+        );
+        assert_eq!(hex::encode(order.sig_r), GOLDEN_ORDER_V2_SIG_R);
+    }
+
+    const GOLDEN_ORDER_V2_SHA256: &str =
+        "903d0f36e3e342f2047680eaf0f6136b355aa853ca91e43411424a4d4fd71fd5";
+    const GOLDEN_ORDER_V2_SIG_R: &str =
+        "33d4dcdd4aa32a3a87d6347f676befe0bddbfaf1d5ab4c35301501cb8fc3baa8";
+
+    /// An index written before F-09 (no replay expiries) still loads; its ids are kept.
+    #[test]
+    fn legacy_eviction_index_loads() {
+        #[derive(Serialize, Default)]
+        struct V1 {
+            blocked_ip_tags: HashSet<[u8; 32]>,
+            blocked_subnet_tags: HashSet<[u8; 32]>,
+            blocked_peer_id_tags: HashSet<[u8; 32]>,
+            blocked_pubkeys: HashSet<[u8; 32]>,
+            tombstoned_merkle_roots: HashSet<[u8; 32]>,
+            tombstoned_blinded_locators: HashSet<[u8; 32]>,
+            regular_shards: HashMap<ShardId, RegularShardAttribution>,
+            blinded_shards: HashMap<[u8; 32], BlindedShardAttribution>,
+            pubkeys_by_ip_tag: HashMap<[u8; 32], HashSet<[u8; 32]>>,
+            pubkeys_by_subnet_tag: HashMap<[u8; 32], HashSet<[u8; 32]>>,
+            seen_order_ids_fifo: VecDeque<[u8; 32]>,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut v1 = V1::default();
+        v1.blocked_pubkeys.insert([9; 32]);
+        v1.seen_order_ids_fifo.push_back([7; 32]);
+        fs::write(
+            dir.path().join("eviction_index.bin"),
+            bounded_bincode_options().serialize(&v1).unwrap(),
+        )
+        .unwrap();
+        let engine = PrivacyPreservingEvictionEngine::load_or_init(dir.path()).unwrap();
+        assert!(engine.seen_order_ids_set.contains(&[7; 32]));
+        assert_eq!(engine.index.seen_order_expiry_ms, vec![u64::MAX]);
+        assert!(engine.index.blocked_pubkeys.contains(&[9; 32]));
+    }
+
+    /// A full replay cache refuses a new order instead of evicting an unexpired id; expired ids
+    /// free their slots.
+    #[test]
+    fn full_replay_cache_refuses_until_ids_expire() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = PrivacyPreservingEvictionEngine::load_or_init(dir.path()).unwrap();
+        for i in 0..MAX_SEEN_EVICTION_ORDER_IDS as u64 {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&i.to_be_bytes());
+            engine.seen_order_ids_set.insert(id);
+            engine.index.seen_order_ids_fifo.push_back(id);
+            engine.index.seen_order_expiry_ms.push(5_000);
+        }
+        let issuer = NodeIdentity::from_seed([6; 32]);
+        let order = SignedBadActorEvictionOrder::issue(
+            &issuer,
+            EvictionTarget::BlindedLocator([1; 32]),
+            "x",
+            1_000,
+            9_000,
+            1,
+        );
+        assert!(engine.replay_slot_check(&order, 4_000).is_err());
+        assert_eq!(engine.seen_order_ids_set.len(), MAX_SEEN_EVICTION_ORDER_IDS);
+        assert!(engine.replay_slot_check(&order, 6_000).is_ok());
+        assert!(engine.seen_order_ids_set.is_empty());
     }
 
     #[test]
@@ -3178,6 +3540,7 @@ mod tests {
             long_reason,
             1_000_000,
             0,
+            0,
         );
         assert!(valid_order.reason.len() <= MAX_EVICTION_REASON_BYTES);
         assert!(valid_order.verify_signature());
@@ -3188,6 +3551,7 @@ mod tests {
             EvictionTarget::StripeMerkleRoot(honest_root),
             "forged takedown",
             1_000_000,
+            0,
             0,
         );
         assert!(engine
@@ -3200,6 +3564,7 @@ mod tests {
             "expired",
             1_000,
             2_000,
+            0,
         );
         assert!(engine
             .apply_signed_eviction_order(&expired_order, &authorities, 2_001, &store)
@@ -3311,6 +3676,7 @@ mod tests {
             EvictionTarget::StripeMerkleRoot(honest_stripe.stripe_merkle_root),
             "griefer peer eviction attempt",
             5_001,
+            0,
             0,
         );
         assert!(engine
@@ -3576,6 +3942,13 @@ mod tests {
         ];
         let min_quorum =
             SignedBadActorEvictionOrder::default_tracker_quorum_threshold(council.len());
+        let manifest = crate::storage::council::CouncilManifest::new(
+            [0x42; 32],
+            1,
+            council.to_vec(),
+            min_quorum as u32,
+            1,
+        );
         assert_eq!(
             min_quorum, 2,
             "3-tracker federation must default to 2-of-3 quorum"
@@ -3616,7 +3989,8 @@ mod tests {
             EvictionTarget::StripeMerkleRoot(honest_root),
             "stranger capacity-theft attempt",
             20_000,
-            0,
+            20_000 + 3_600_000,
+            1,
         );
         // Even if stranger tries to self-cosign or duplicate!
         assert!(!stranger_order.add_cosignature(&unvetted_stranger_tracker));
@@ -3625,8 +3999,7 @@ mod tests {
             .apply_signed_eviction_order_with_quorum(
                 &stranger_order,
                 Some(&local_node_owner.public_key_bytes()),
-                &council,
-                min_quorum,
+                Some(&manifest),
                 20_001,
                 &store,
             )
@@ -3639,7 +4012,8 @@ mod tests {
             EvictionTarget::StripeMerkleRoot(honest_root),
             "unilateral rogue insider wipe",
             20_005,
-            0,
+            20_005 + 3_600_000,
+            1,
         );
         assert_eq!(rogue_single_order.valid_council_signer_count(&council), 1);
         assert!(!rogue_single_order.verify_against_quorum(&council, min_quorum, 20_006));
@@ -3647,8 +4021,7 @@ mod tests {
             .apply_signed_eviction_order_with_quorum(
                 &rogue_single_order,
                 Some(&local_node_owner.public_key_bytes()),
-                &council,
-                min_quorum,
+                Some(&manifest),
                 20_006,
                 &store,
             )
@@ -3662,14 +4035,14 @@ mod tests {
             EvictionTarget::StripeMerkleRoot(bad_root),
             "verified illegal stripe takedown",
             20_010,
-            0,
+            20_010 + 3_600_000,
+            1,
         );
         assert!(engine
             .apply_signed_eviction_order_with_quorum(
                 &council_order,
                 Some(&local_node_owner.public_key_bytes()),
-                &council,
-                min_quorum,
+                Some(&manifest),
                 20_011,
                 &store,
             )
@@ -3685,8 +4058,7 @@ mod tests {
             .apply_signed_eviction_order_with_quorum(
                 &council_order,
                 Some(&local_node_owner.public_key_bytes()),
-                &council,
-                min_quorum,
+                Some(&manifest),
                 20_012,
                 &store,
             )
@@ -3701,14 +4073,14 @@ mod tests {
             EvictionTarget::StripeMerkleRoot(local_root),
             "local hardware owner cleanup",
             20_020,
-            0,
+            20_020 + 3_600_000,
+            1,
         );
         let local_purge = engine
             .apply_signed_eviction_order_with_quorum(
                 &local_owner_order,
                 Some(&local_node_owner.public_key_bytes()),
-                &council,
-                min_quorum,
+                Some(&manifest),
                 20_021,
                 &store,
             )
@@ -3735,6 +4107,7 @@ mod tests {
             "equivalence check",
             10_000,
             20_000,
+            0,
         );
         assert!(order.add_cosignature(&c2));
 

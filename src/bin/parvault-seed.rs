@@ -914,12 +914,17 @@ async fn main() -> anyhow::Result<()> {
                     load_or_generate_tracker_admin_identity(&data_dir)?
                 };
                 let now_ms = seed_now_ms();
+                let expires_ms =
+                    now_ms.saturating_add(parvault::storage::DEFAULT_ORDER_LIFETIME_MS);
+                let council_epoch = parvault::storage::council::load_council_manifest(&data_dir)
+                    .map_or(0, |m| m.epoch);
                 let mut orders = vec![SignedBadActorEvictionOrder::issue(
                     &issuer,
                     target.clone(),
                     reason.clone(),
                     now_ms,
-                    0,
+                    expires_ms,
+                    council_epoch,
                 )];
                 match &target {
                     EvictionTarget::IpAddress(bad_ip) => {
@@ -929,7 +934,8 @@ async fn main() -> anyhow::Result<()> {
                                 EvictionTarget::PeerOrIssuerPubkey(pk),
                                 reason.clone(),
                                 now_ms,
-                                0,
+                                expires_ms,
+                                council_epoch,
                             ));
                         }
                     }
@@ -940,7 +946,8 @@ async fn main() -> anyhow::Result<()> {
                                 EvictionTarget::PeerOrIssuerPubkey(pk),
                                 reason.clone(),
                                 now_ms,
-                                0,
+                                expires_ms,
+                                council_epoch,
                             ));
                         }
                     }
@@ -1250,7 +1257,7 @@ async fn main() -> anyhow::Result<()> {
                 let block_store = BlockStore::new(&data_dir, quota)?;
                 let mut eviction = PrivacyPreservingEvictionEngine::load_or_init(&data_dir)?;
                 // A public tracker's council is rooted at its own admin key.
-                let (council, min_quorum) = parvault::storage::council::council_members_and_quorum(
+                let council = parvault::storage::council::council_from_manifest(
                     &data_dir,
                     Some(admin_id.public_key_bytes()),
                 );
@@ -1259,8 +1266,7 @@ async fn main() -> anyhow::Result<()> {
                     if let Ok(rep) = eviction.apply_signed_eviction_order_with_quorum(
                         order,
                         None,
-                        &council,
-                        min_quorum,
+                        council.as_ref(),
                         now_ms,
                         &block_store,
                     ) {
@@ -2138,8 +2144,7 @@ fn handle_seed_admin_rpc_request(
                     message: "Refused: ExecuteSignedEvictionBatch is strictly disabled in homelab-vault private mode".to_string(),
                 };
             }
-            let (council, min_quorum) =
-                parvault::storage::council::council_members_and_quorum(data_dir, council_root);
+            let council = parvault::storage::council::council_from_manifest(data_dir, council_root);
             let local_pk = node_identity.public_key_bytes();
             let now_ms = seed_now_ms();
 
@@ -2152,8 +2157,7 @@ fn handle_seed_admin_rpc_request(
                     match st.eviction.apply_signed_eviction_order_with_quorum(
                         order,
                         Some(&local_pk),
-                        &council,
-                        min_quorum,
+                        council.as_ref(),
                         now_ms,
                         block_store,
                     ) {

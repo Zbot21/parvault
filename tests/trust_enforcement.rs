@@ -2813,31 +2813,59 @@ fn ban_ip(last: u8) -> parvault::storage::EvictionTarget {
     parvault::storage::EvictionTarget::IpAddress(format!("192.0.2.{last}").parse().unwrap())
 }
 
-/// F-09 gap: a ring-genesis order issued 400 days ago with no expiry (`expires_at_ms = 0`,
-/// permanent) is accepted.
+/// F-09 accept: a fresh, bounded order for the installed council epoch is applied once.
 #[test]
-fn repro_f09_stale_permanent_order_accepted() {
-    let node = spawn_daemon("f09");
+fn f09_fresh_order_applied() {
+    let node = spawn_daemon("f09-a");
     let out = council_cli(&node, &council_init_args(&[genesis()], 1));
     assert!(out.status.success(), "{}", combined(&out));
-    let issued = now_ms() - 400 * 24 * 3600 * 1000;
-    let order = parvault::storage::SignedBadActorEvictionOrder::issue(
-        &genesis(),
-        ban_ip(91),
-        "stale",
-        issued,
-        0,
-    );
+    let order = council_order(&[&genesis()], ban_ip(91), 1);
     let resp = send(
         &key(0x91),
         &node,
         MeshWireRequest::BroadcastEvictionOrder(order),
     );
-    assert!(
-        order_accepted(&resp),
-        "gap: stale permanent order accepted: {resp:?}"
+    assert!(order_accepted(&resp), "{resp:?}\n{}", node.log_text());
+    gate_ran("trust_enforcement::f09_fresh_order_applied");
+}
+
+/// F-09 reject: the same council refuses an order issued 400 days ago with no expiry, and a
+/// replay of an applied order.
+#[test]
+fn f09_stale_or_replayed_order_refused() {
+    let node = spawn_daemon("f09-r");
+    let out = council_cli(&node, &council_init_args(&[genesis()], 1));
+    assert!(out.status.success(), "{}", combined(&out));
+    let issued = now_ms() - 400 * 24 * 3600 * 1000;
+    let stale = parvault::storage::SignedBadActorEvictionOrder::issue(
+        &genesis(),
+        ban_ip(92),
+        "stale",
+        issued,
+        0,
+        1,
     );
-    gate_ran("trust_enforcement::repro_f09_stale_permanent_order_accepted");
+    let resp = send(
+        &key(0x91),
+        &node,
+        MeshWireRequest::BroadcastEvictionOrder(stale),
+    );
+    assert!(!order_accepted(&resp), "{resp:?}");
+    assert_logged(&node, "reject.order_stale");
+    let fresh = council_order(&[&genesis()], ban_ip(93), 1);
+    let first = send(
+        &key(0x91),
+        &node,
+        MeshWireRequest::BroadcastEvictionOrder(fresh.clone()),
+    );
+    assert!(order_accepted(&first), "{first:?}");
+    let replay = send(
+        &key(0x91),
+        &node,
+        MeshWireRequest::BroadcastEvictionOrder(fresh),
+    );
+    assert!(!order_accepted(&replay), "{replay:?}");
+    gate_ran("trust_enforcement::f09_stale_or_replayed_order_refused");
 }
 
 /// Runs `parvault council <args>` on `node`'s data directory as the ring genesis holder.
@@ -2875,6 +2903,7 @@ fn council_init_args(members: &[NodeIdentity], quorum: usize) -> Vec<String> {
 fn council_order(
     signers: &[&NodeIdentity],
     target: parvault::storage::EvictionTarget,
+    council_epoch: u64,
 ) -> parvault::storage::SignedBadActorEvictionOrder {
     let mut order = parvault::storage::SignedBadActorEvictionOrder::issue(
         signers[0],
@@ -2882,6 +2911,7 @@ fn council_order(
         "council",
         now_ms(),
         now_ms() + 3_600_000,
+        council_epoch,
     );
     for s in &signers[1..] {
         assert!(order.add_cosignature(s));
@@ -2897,7 +2927,7 @@ fn f08_majority_council_order_applied() {
     let members = [key(0x81), key(0x82), key(0x83)];
     let out = council_cli(&node, &council_init_args(&members, 2));
     assert!(out.status.success(), "{}", combined(&out));
-    let order = council_order(&[&members[0], &members[1]], ban_ip(81));
+    let order = council_order(&[&members[0], &members[1]], ban_ip(81), 1);
     let resp = send(
         &key(0x84),
         &node,
@@ -2920,7 +2950,7 @@ fn f08_below_majority_quorum_refused() {
         text.contains("reject.council_quorum_below_majority"),
         "{text}"
     );
-    let order = council_order(&[&members[0]], ban_ip(81));
+    let order = council_order(&[&members[0]], ban_ip(81), 1);
     let resp = send(
         &key(0x84),
         &node,
@@ -2939,13 +2969,135 @@ fn council_peer_refuses_another_nodes_local_owner_order() {
     let out = council_cli(&node, &council_init_args(&members, 2));
     assert!(out.status.success(), "{}", combined(&out));
     let sender = key(0x85);
-    let order = council_order(&[&sender], ban_ip(85));
+    let order = council_order(&[&sender], ban_ip(85), 1);
     let resp = send(
         &sender,
         &node,
         MeshWireRequest::BroadcastEvictionOrder(order),
     );
     assert!(!order_accepted(&resp), "{resp:?}");
+}
+
+/// Two daemons of one ring, both at council epoch 1; `ahead` also holds epoch 2 (or, if
+/// `forged`, an epoch-2 manifest written to disk that does not chain). `behind` has `ahead` as
+/// its peer and has admitted it. Returns `(behind, ahead, members)`.
+fn council_pair(label: &str, forged: bool) -> (Node, Node, Vec<NodeIdentity>) {
+    use parvault::storage::council::CouncilManifest;
+    let members = vec![key(0x81), key(0x82), key(0x83)];
+    let ahead = spawn_daemon(&format!("{label}-ahead"));
+    let out = council_cli(&ahead, &council_init_args(&members, 2));
+    assert!(out.status.success(), "{}", combined(&out));
+    let epoch1_hex = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .last()
+        .unwrap()
+        .trim()
+        .to_string();
+    let root = genesis().public_key_bytes();
+    let mut next = CouncilManifest::new(
+        root,
+        2,
+        members.iter().map(|m| m.public_key_bytes()).collect(),
+        2,
+        now_ms(),
+    );
+    if forged {
+        next.sign(&key(0x99));
+        next.sign(&key(0x98));
+        std::fs::write(ahead.dir.join("council_manifest.bin"), next.to_bytes()).unwrap();
+    } else {
+        next.sign(&members[0]);
+        next.sign(&members[1]);
+        let out = council_cli(
+            &ahead,
+            &[
+                "install".into(),
+                "--manifest".into(),
+                hex::encode(next.to_bytes()),
+            ],
+        );
+        assert!(out.status.success(), "{}", combined(&out));
+    }
+    let (root_dir, dir, reg, log) = prepare(&format!("{label}-behind"));
+    let port = free_port();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .arg("--data-dir")
+        .arg(&dir)
+        .args([
+            "--no-lan-discovery",
+            "--peers",
+            &format!("{}/p2p/{}", ahead.addr, ahead.peer_id()),
+            "daemon",
+            "start",
+            "--listen",
+            &format!("/ip4/127.0.0.1/tcp/{port}"),
+        ]);
+    let behind = spawn(cmd, root_dir, dir, log, port);
+    let out = council_cli(
+        &behind,
+        &["install".into(), "--manifest".into(), epoch1_hex],
+    );
+    assert!(out.status.success(), "{}", combined(&out));
+    // `behind` admits `ahead` when `ahead`'s key handshakes with it.
+    let r = send(
+        &ahead.identity(),
+        &behind,
+        MeshWireRequest::GetCouncilManifest { scope_root: root },
+    );
+    assert!(
+        matches!(
+            r,
+            MeshWireResponse::CouncilManifestResult { manifest: Some(_) }
+        ),
+        "{r:?}"
+    );
+    (behind, ahead, members)
+}
+
+fn council_epoch_of(node: &Node) -> u64 {
+    parvault::storage::council::load_council_manifest(&node.dir).map_or(0, |m| m.epoch)
+}
+
+/// An order from council epoch 2 reaching a node at epoch 1 is refused, the node fetches epoch 2
+/// from its admitted peer in the background, and the same order is then accepted.
+#[test]
+fn council_epoch_ahead_order_fetches_and_then_applies() {
+    let (behind, _ahead, members) = council_pair("cfetch", false);
+    let order = council_order(&[&members[0], &members[1]], ban_ip(86), 2);
+    let r = send(
+        &key(0x86),
+        &behind,
+        MeshWireRequest::BroadcastEvictionOrder(order.clone()),
+    );
+    assert!(!order_accepted(&r), "{r:?}");
+    assert_logged(&behind, "reject.order_council_epoch_ahead");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while council_epoch_of(&behind) < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(council_epoch_of(&behind), 2, "{}", behind.log_text());
+    let r = send(
+        &key(0x86),
+        &behind,
+        MeshWireRequest::BroadcastEvictionOrder(order),
+    );
+    assert!(order_accepted(&r), "{r:?}\n{}", behind.log_text());
+}
+
+/// A fetched manifest that does not chain from the installed epoch is not installed.
+#[test]
+fn council_fetch_refuses_a_forged_chain() {
+    let (behind, _ahead, members) = council_pair("cforge", true);
+    let order = council_order(&[&members[0], &members[1]], ban_ip(87), 2);
+    let r = send(
+        &key(0x87),
+        &behind,
+        MeshWireRequest::BroadcastEvictionOrder(order),
+    );
+    assert!(!order_accepted(&r), "{r:?}");
+    assert_logged(&behind, "reject.council_epoch_chain");
+    assert_eq!(council_epoch_of(&behind), 1);
 }
 
 /// F-24 issuer policy accept: an admitted sender's blinded put with a voucher issued by a ring

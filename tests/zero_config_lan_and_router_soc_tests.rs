@@ -1943,7 +1943,8 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
         EvictionTarget::StripeMerkleRoot(honest_stripe0_root),
         "griefer-trying-to-delete-honest-data",
         now_ms,
-        0,
+        now_ms + 3_600_000,
+        1,
     );
     let griefer_evict_res =
         griefer_client.broadcast_eviction_order(&pub_daemon_maddr, forged_evict_order);
@@ -1958,7 +1959,8 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
         EvictionTarget::IpAddress(bad_ip),
         "public-tracker-admin-order",
         now_ms,
-        0,
+        now_ms + 3_600_000,
+        1,
     );
     let priv_res =
         griefer_client.broadcast_eviction_order(&priv_daemon_maddr, admin_order_against_private);
@@ -2280,6 +2282,13 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
         op1_id.public_key_bytes(),
     )
     .expect("install the 2-of-3 council manifest");
+    // op1 stamps its orders with the council epoch it holds.
+    parvault::storage::council::install_council_manifest(
+        &op1_dir,
+        &council_manifest,
+        op1_id.public_key_bytes(),
+    )
+    .expect("install the council on op1");
     council_cfg.min_free_disk_bytes = 64 * 1024 * 1024;
     let council_cfg_path = council_daemon_dir.join("config.toml");
     fs::write(
@@ -2367,7 +2376,8 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
         EvictionTarget::StripeMerkleRoot(target_stripe_root),
         "unvetted-rogue-tracker-wipe",
         now_ms,
-        0,
+        now_ms + 3_600_000,
+        1,
     );
     assert!(
         probe_client
