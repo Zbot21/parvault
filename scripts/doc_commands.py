@@ -29,7 +29,9 @@ DOCS = ["README.md", "QUICKSTART.md"]
 OUT = "docs/doc-commands.txt"
 RATCHET = "docs/doc-commands.ratchet"
 ANN_RE = re.compile(r"^\s*<!--\s*doc-cmd:\s*(.*?)\s*-->\s*$")
-FENCE_RE = re.compile(r"^(\s*)```\s*([A-Za-z0-9_+-]*)\s*$")
+# GitHub renders ``` and ~~~ fences of any length >= 3; the closing run is the same character,
+# at least as long.
+FENCE_RE = re.compile(r"^(\s*)(`{3,}|~{3,})\s*([A-Za-z0-9_+-]*)\s*$")
 SHELL_LANGS = {"bash", "sh"}
 # Fences that hold no commands to run. Any other fence (bare, console, shell, zsh, ...) fails the
 # check unless it carries a doc-cmd annotation, so a runnable block cannot hide from the gate.
@@ -123,18 +125,26 @@ def blocks(root, docs=DOCS):
                 continue
             f = FENCE_RE.match(lines[i])
             if f:
-                indent, lang = f.group(1), f.group(2).lower()
+                indent, run, lang = f.group(1), f.group(2), f.group(3).lower()
                 annotated = pending != empty
+                close = re.compile("^" + re.escape(run[0]) + "{" + str(len(run)) + ",}$")
                 start, body = i + 1, []
                 i += 1
-                while i < len(lines) and lines[i].strip() != "```":
+                while i < len(lines) and not close.match(lines[i].strip()):
                     body.append(lines[i])
                     i += 1
                 if lang in SHELL_LANGS and not indent:
                     found.append(Block(doc, start, body, pending))
                 elif lang in SHELL_LANGS:
                     problems.append(f"{doc}:{start}: indented ```{lang} fence: the gate runs only column-0 shell fences; unindent it")
-                elif lang not in NON_COMMAND_LANGS and not annotated:
+                elif annotated:
+                    # A non-shell fence can only be skipped (counted by the ratchet); any other
+                    # annotation would make the check accept a block the runner never runs.
+                    if set(k for k, v in pending.items() if v) == {"skip"}:
+                        found.append(Block(doc, start, body, pending))
+                    else:
+                        problems.append(f"{doc}:{start}: ```{lang or '(bare)'} fence carries a doc-cmd annotation other than skip: only skip is allowed on a non-shell fence")
+                elif lang not in NON_COMMAND_LANGS:
                     problems.append(f"{doc}:{start}: ```{lang or '(bare)'} fence is neither a shell block nor an allowlisted language ({', '.join(sorted(NON_COMMAND_LANGS))}): use ```bash or annotate it")
                 pending = dict(empty, env=[], capture=[])
             elif lines[i].strip():
@@ -408,6 +418,22 @@ $ parvault init
   ```bash
   echo indented
   ```
+~~~bash
+echo tilde-fence
+~~~
+````bash
+echo four-backtick-fence
+```
+echo still-inside
+````
+<!-- doc-cmd: env X=1 -->
+```console
+$ annotated-but-not-shell
+```
+<!-- doc-cmd: skip reason="example output" -->
+```console
+$ skipped-console
+```
 """
 
 
@@ -423,13 +449,17 @@ def selftest():
         print(("[PASS] " if cond else "[FAIL] ") + what)
         ok = ok and cond
 
-    expect(len(bl) == 4, f"4 runnable shell blocks found (got {len(bl)})")
+    runnable = [b for b in bl if "skip" not in b.ann]
+    expect(len(runnable) == 6, f"6 runnable shell blocks, including ~~~bash and ````bash (got {len(runnable)})")
+    expect(any("still-inside" in "\n".join(b.commands()) for b in bl), "a ``` line inside a ````bash fence stays in the block")
+    expect(any("```console fence" in p and "only skip" in p for p in problems), "a non-shell fence annotated with env fails the check")
+    expect(sum(1 for b in bl if "skip" in b.ann) == 1, "a skipped ```console fence counts toward the ratchet")
     expect(any("```console" in p for p in problems), "an unannotated ```console fence fails the check")
     expect(any("indented ```bash" in p for p in problems), "an indented ```bash fence fails the check")
     expect(not any("```mermaid fence" in p for p in problems), "an allowlisted ```mermaid fence passes")
     node = LocalNode("selftest", None, None)
     try:
-        res = run_blocks(bl, lambda b: node, ready_timeout=10)
+        res = run_blocks(bl[:4], lambda b: node, ready_timeout=10)
     finally:
         node.close()
     st = [s for _, s, _ in res]
