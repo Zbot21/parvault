@@ -275,6 +275,22 @@ parvault-seed admin emergency-evict --data-dir /mnt/nas/parvault-seed --ip 203.0
 
 ---
 
+### Recipe F: Browse Your Vault over WebDAV (Token Required)
+
+`parvault up --no-socket --vfs-seed-dir <DIR> --vfs-webdav-listen 127.0.0.1:8088` serves your vault as a WebDAV drive. Every request needs a read-only token from the same data directory:
+
+```bash
+TOKEN="$(parvault token mint --read-only --ttl-secs 86400)"
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
+```
+
+Clients that cannot send a Bearer token (Finder, davfs2, Windows) use any user name and the token as the password.
+
+> [!WARNING]
+> There is no TLS in `v0.5.0`. On loopback (`127.0.0.1`) nothing leaves the machine, but over a LAN the token travels **in clear** and anyone who sees it can read your vault until it expires. Keep `--ttl-secs` short. Built-in TLS is planned for `v0.6.0`.
+
+**Windows:** its WebDAV client sends Basic auth over plain HTTP only after you allow it. In an administrator prompt run `reg add HKLM\SYSTEM\CurrentControlSet\Services\WebClient\Parameters /v BasicAuthLevel /t REG_DWORD /d 2 /f`, then restart the `WebClient` service (`net stop webclient && net start webclient`).
+
 ## 5. Planned: The Automatic "Trust & Storage Ladder"
 
 **Not active yet.** Today `watch-folder` and `up` use the tier you pass with `--tier`: `consumer` (10-of-20), `homelab` (16-of-20, the default), `mixed` (16-of-24) or `relay` (20-of-24). The ladder below is the design: a node would climb it based on how many peers are around and how reliably it stays online.
