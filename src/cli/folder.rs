@@ -35,7 +35,6 @@ pub(crate) async fn diff_folder(env: CliEnv, command: Commands) -> anyhow::Resul
     Ok(())
 }
 
-/// The recovery phrase from `--seed-phrase` or `PARVAULT_SEED_PHRASE`, if any.
 /// How long a lite client waits for a seed to ack one `SyndicateLiteStripe`. The seed
 /// erasure-encodes, checks (F-38-GRANT, every shard) and stores the whole stripe before it acks,
 /// so the client default (1.2 s) times out on a slow or loaded seed and the stripe is then
@@ -49,6 +48,7 @@ pub(crate) fn lite_syndication_client(base: &MeshClient) -> MeshClient {
     base.clone().with_timeout(LITE_SYNDICATION_TIMEOUT)
 }
 
+/// The recovery phrase from `--seed-phrase` or `PARVAULT_SEED_PHRASE`, if any.
 pub(crate) fn effective_seed_phrase(arg: Option<String>) -> Option<String> {
     arg.or_else(|| std::env::var("PARVAULT_SEED_PHRASE").ok())
         .map(|s| s.trim().to_string())
