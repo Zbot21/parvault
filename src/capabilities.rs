@@ -333,6 +333,9 @@ impl std::fmt::Debug for MacaroonSliceView<'_> {
 /// with exactly `parent`'s; at most `MAX_MACAROON_CAVEATS` in total; `child`'s tag equals the chain
 /// recomputed from `parent`'s tag over the extra caveats (zero extras: equal tags), compared in
 /// constant time. Caveats are not evaluated here.
+///
+/// For `parvault-fuse webdav`, a block-cache hit never reaches the gateway, so this check (with
+/// the WebDAV edge's caveat evaluation) is the only check on that read (L-44 item 4).
 pub fn is_attenuation_of(parent: &CapabilityMacaroon, child: &CapabilityMacaroon) -> bool {
     if !ct_eq_32(&parent.nonce_id, &child.nonce_id)
         || !ct_eq_32(&parent.issuer_fingerprint, &child.issuer_fingerprint)
