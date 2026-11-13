@@ -1,5 +1,5 @@
 diff --git a/specs/ParVaultProtocol.tla b/specs/ParVaultProtocol.tla
-index 2850f19..b4356f2 100644
+index 1e9a0c0..52f379a 100644
 --- a/specs/ParVaultProtocol.tla
 +++ b/specs/ParVaultProtocol.tla
 @@ -34,7 +34,7 @@ ASSUME AdvKeys \cap ({Owner, Genesis, Self} \cup Witnesses) = {}   \* @assume ad
@@ -8,6 +8,6 @@ index 2850f19..b4356f2 100644
  RepairReadOk(receipts) == Cardinality(receipts \cap Witnesses) >= MinWitnessSignatures   \* @guard read-auth-repair sym=src/por/verifier.rs::repair_read_decision
 -ChainAdmitted(root) == root = Genesis   \* @guard wot-admission sym=src/network/wot.rs::chain_admission_decision
 +ChainAdmitted(root) == TRUE   \* @guard wot-admission sym=src/network/wot.rs::chain_admission_decision
- MayApplySlash(tgt) == tgt \notin {Genesis, Self}   \* @guard slash-target sym=src/network/wot.rs::slash_target_decision
+ MayApplySlash(tgt) == tgt \notin {Genesis, Self}   \* @assume slash-target-not-run: wot.rs::slash_target_decision's only caller (may_slash) is #[cfg(test)]; no production slasher in v0.5.0 (ADR-09, N-09)
  
  VARIABLES

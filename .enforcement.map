@@ -45,7 +45,6 @@ tla-spec   T-SPECS   path=specs/*.tla
 tla-mutant TM-READ-OWNER    spec=specs/ParVaultProtocol.tla inv=DataSecrecyInvariant patch=specs/mutants/ParVaultProtocol-read-auth-owner.patch
 tla-mutant TM-READ-REPAIR   spec=specs/ParVaultProtocol.tla inv=DataSecrecyInvariant patch=specs/mutants/ParVaultProtocol-read-auth-repair.patch
 tla-mutant TM-WOT-ADMIT     spec=specs/ParVaultProtocol.tla inv=SybilResistanceInvariant patch=specs/mutants/ParVaultProtocol-wot-admission.patch
-tla-mutant TM-SLASH-TARGET  spec=specs/ParVaultProtocol.tla inv=ProtectedKeysNeverSlashedInvariant patch=specs/mutants/ParVaultProtocol-slash-target.patch
 tla-mutant TM-NULLIFIER     spec=specs/ParVaultAnonymity.tla inv=Safety_NoVoucherDoubleSpend patch=specs/mutants/ParVaultAnonymity-nullifier-fresh.patch
 tla-mutant TM-TIER-SLASH    spec=specs/ParVaultBootstrapAndEarnedTier.tla inv=Safety_TierStrictlyEarnedByUptime patch=specs/mutants/ParVaultBootstrapAndEarnedTier-tier-respects-slash.patch
 tla-mutant TM-QUORUM        spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_NoUnauthorizedOrSubQuorumEviction patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-quorum-count.patch
@@ -57,6 +56,7 @@ tla-mutant TM-HYBRID-SIG    spec=specs/ParVaultPostQuantum.tla inv=Safety_Quantu
 # L-47 invariants with no guard to remove (structural or assumption; each reason names its tag).
 waive      TM-W-DURABILITY  inv=specs/ParVaultProtocol.tla::DurabilitySafetyInvariant reason=assume bounded-epoch-churn (threat model, no Rust check)
 waive      TM-W-SLASH-BOUND inv=specs/ParVaultProtocol.tla::SlashingBoundInvariant reason=assume leaf-quarantine-not-run: record_failure is cfg(test), nothing slashes in v0.5.0 (ADR-09, N-09)
+waive      TM-W-PROTECTED    inv=specs/ParVaultProtocol.tla::ProtectedKeysNeverSlashedInvariant reason=assume slash-target-not-run: slash_target_decision is called only from cfg(test) may_slash; nothing slashes in v0.5.0 (ADR-09, N-09)
 waive      TM-W-ORIGIN      inv=specs/ParVaultAnonymity.tla::Safety_ZeroOriginLeakage reason=structural: storage node only ever observes the relay (L-38/L-39 scope)
 waive      TM-W-DRAIN       inv=specs/ParVaultBootstrapAndEarnedTier.tla::Safety_SeedAnchorsDrainAtOrganicThreshold reason=structural: seed shards = MaxOrganicPeers - organic by construction
 waive      TM-W-DAY1        inv=specs/ParVaultBootstrapAndEarnedTier.tla::Safety_Day1ToScaleDataAvailability reason=structural: recoverable = TierN(tier), TierK < TierN tables
@@ -192,4 +192,4 @@ kani       S-SANITIZE sym=src/sync.rs::sanitize_sync_relative_path_into harness=
 claim      B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision accept=trust_enforcement::bseed_second_sender_accepted_while_one_job_runs reject=trust_enforcement::bseed_third_job_refused_busy code=reject.syndication_busy bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe
 kani       B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision harness=proof_syndication_fanout_budget cover=syndication over budget
 
-ratchet    R         open=4 waive=29
+ratchet    R         open=4 waive=30

@@ -35,7 +35,7 @@ ASSUME AdvKeys \cap ({Owner, Genesis, Self} \cup Witnesses) = {}   \* @assume ad
 OwnerReadOk(signer) == signer = Owner   \* @guard read-auth-owner sym=src/por/verifier.rs::grant_owner_decision
 RepairReadOk(receipts) == Cardinality(receipts \cap Witnesses) >= MinWitnessSignatures   \* @guard read-auth-repair sym=src/por/verifier.rs::repair_read_decision
 ChainAdmitted(root) == root = Genesis   \* @guard wot-admission sym=src/network/wot.rs::chain_admission_decision
-MayApplySlash(tgt) == tgt \notin {Genesis, Self}   \* @guard slash-target sym=src/network/wot.rs::slash_target_decision
+MayApplySlash(tgt) == tgt \notin {Genesis, Self}   \* @assume slash-target-not-run: wot.rs::slash_target_decision's only caller (may_slash) is #[cfg(test)]; no production slasher in v0.5.0 (ADR-09, N-09)
 
 VARIABLES
     activeShards,           \* Number of currently healthy shards in the cohort (K..N)
