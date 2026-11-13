@@ -942,15 +942,16 @@ fn spawn_swarm_worker(
 /// backed by a persistent background `Swarm` actor that reuses encrypted connections, enforces
 /// TOFU / explicit `PeerId` pinning, and records live RTT & topology telemetry.
 /// The DHT reader's owner binding (F-10a): a candidate counts only if the reading identity
-/// sealed it.
+/// sealed it. A candidate whose owner cannot be bound to an identity (`None`: a post-quantum
+/// manifest, signed by a hybrid key no identity is bound to yet) is refused: fail closed.
 pub fn dht_candidate_decision(
-    candidate_owner: [u8; 32],
+    candidate_owner: Option<[u8; 32]>,
     expected_owner: [u8; 32],
 ) -> Result<(), &'static str> {
-    if candidate_owner == expected_owner {
-        Ok(())
-    } else {
-        Err("reject.dht_owner_mismatch")
+    match candidate_owner {
+        None => Err("reject.dht_owner_unbindable"),
+        Some(owner) if owner == expected_owner => Ok(()),
+        Some(_) => Err("reject.dht_owner_mismatch"),
     }
 }
 
@@ -2662,17 +2663,20 @@ impl MeshClient {
     ) -> Option<u64> {
         let version = Self::self_consistent_version(dht_key, kind, env)?;
         // F-10a: classical manifests and vault catalogs are sealed by the identity that reads
-        // them back; a self-consistent envelope signed by anyone else is a squat.
+        // them back; a self-consistent envelope signed by anyone else is a squat. A post-quantum
+        // manifest has no owner binding yet, so it is refused (PQ-DHT, fail closed).
         let owner = match env {
             DhtWireEnvelope::ClassicalManifest(m) => Some(m.owner_pubkey),
             DhtWireEnvelope::VaultCatalog(m) => Some(m.owner_pubkey),
             DhtWireEnvelope::PostQuantumManifest(_) => None,
         };
-        if let Some(owner) = owner {
-            if let Err(code) = dht_candidate_decision(owner, self.identity.public_key_bytes()) {
-                warn!(code, owner = %hex::encode(owner), "ignored a DHT envelope from another owner");
-                return None;
-            }
+        if let Err(code) = dht_candidate_decision(owner, self.identity.public_key_bytes()) {
+            warn!(
+                code,
+                owner = %owner.map(hex::encode).unwrap_or_default(),
+                "ignored a DHT envelope not bound to this owner"
+            );
+            return None;
         }
         Some(version)
     }
@@ -3181,6 +3185,21 @@ impl IpLocalityExt for IpAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PQ-DHT: an owner that cannot be bound is refused; the F-10a binding is unchanged.
+    #[test]
+    fn dht_candidate_decision_fails_closed_on_unbindable_owner() {
+        let me = [7u8; 32];
+        assert_eq!(dht_candidate_decision(Some(me), me), Ok(()));
+        assert_eq!(
+            dht_candidate_decision(Some([8u8; 32]), me),
+            Err("reject.dht_owner_mismatch")
+        );
+        assert_eq!(
+            dht_candidate_decision(None, me),
+            Err("reject.dht_owner_unbindable")
+        );
+    }
 
     #[test]
     fn test_parse_peer_multiaddr_preserves_p2p_peer_id() {

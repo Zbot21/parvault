@@ -1954,6 +1954,47 @@ fn f10a_squatted_catalog_ignored() {
     gate_ran("trust_enforcement::f10a_squatted_catalog_ignored");
 }
 
+/// PQ-DHT reject: a post-quantum manifest cannot be bound to the reading owner (no owner PQ key
+/// is bound to an identity yet), so the reader refuses it even when it is self-consistent and an
+/// admitted peer serves it.
+#[test]
+fn pqdht_unbindable_pq_manifest_refused() {
+    let node = spawn_daemon("pqdht-r");
+    let member = key(0xC8);
+    let canonical = parvault::crypto::validate_recovery_seed_phrase_or_passphrase(PHRASE).unwrap();
+    let pq = PqVaultMasterKey::from_recovery_seed_phrase(&canonical, "default");
+    let signer = HybridPqSigningKeypair::generate().unwrap();
+    let dht_key = [0x78; 32];
+    let env = parvault::crypto::pqc::PqSignedDhtManifestEnvelope::seal_pq(
+        &pq,
+        &signer,
+        dht_key,
+        1,
+        b"manifest",
+    )
+    .unwrap();
+    let put = send(
+        &member,
+        &node,
+        MeshWireRequest::PutDhtEnvelope(DhtWireEnvelope::PostQuantumManifest(env)),
+    );
+    assert!(
+        matches!(
+            put,
+            MeshWireResponse::PutDhtEnvelopeAck { stored: true, .. }
+        ),
+        "{put:?}"
+    );
+    let reader = MeshClient::new(member.clone(), vec![node.addr.clone()], None)
+        .with_admission(AdmissionSource::from_genesis(genesis()));
+    let got = reader.get_dht_envelope(
+        &dht_key,
+        parvault::network::DhtEnvelopeKind::PostQuantumManifest,
+    );
+    assert!(got.is_err(), "a PQ manifest was accepted");
+    gate_ran("trust_enforcement::pqdht_unbindable_pq_manifest_refused");
+}
+
 /// Runs one Kademlia query from a fresh client swarm against `node` and returns its result.
 fn kad_query(
     node: &Node,
