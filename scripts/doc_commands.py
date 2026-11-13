@@ -2,10 +2,12 @@
 """L-34 docs-commands gate (plan-7 section 3): every command block in README.md and QUICKSTART.md
 runs verbatim against the release binaries, or carries a reasoned skip.
 
-  extract   write docs/doc-commands.txt (one command per line, checked in for review)
-  check     fail if docs/doc-commands.txt is stale, a block is malformed, or the skip count
-            differs from docs/doc-commands.ratchet
-  run BIN   run every non-skipped block in Docker (ubuntu:24.04, BIN on PATH, no toolchain)
+  extract          write docs/doc-commands.txt (one command per line, checked in for review)
+  check [--base R] fail if docs/doc-commands.txt is stale, a block or fence is malformed, the
+                   skip count differs from docs/doc-commands.ratchet, or (with --base) the
+                   ratchet grew since git ref R (CI passes the merge base: skips never increase)
+  run BIN          run every non-skipped block in Docker (ubuntu:24.04, BIN on PATH, no toolchain)
+  selftest         the runner's positive controls on fixture docs, locally (no Docker)
 
 Annotations: HTML comments on the lines right before a ```bash or ```sh fence.
   <!-- doc-cmd: skip reason="..." -->        not run; listed in the summary; counted by the ratchet
@@ -27,7 +29,12 @@ DOCS = ["README.md", "QUICKSTART.md"]
 OUT = "docs/doc-commands.txt"
 RATCHET = "docs/doc-commands.ratchet"
 ANN_RE = re.compile(r"^\s*<!--\s*doc-cmd:\s*(.*?)\s*-->\s*$")
-FENCE_RE = re.compile(r"^```(bash|sh)\s*$")
+FENCE_RE = re.compile(r"^(\s*)```\s*([A-Za-z0-9_+-]*)\s*$")
+SHELL_LANGS = {"bash", "sh"}
+# Fences that hold no commands to run. Any other fence (bare, console, shell, zsh, ...) fails the
+# check unless it carries a doc-cmd annotation, so a runnable block cannot hide from the gate.
+NON_COMMAND_LANGS = {"mermaid", "text", "json", "toml", "yaml", "html", "javascript", "js", "rust",
+                     "diff", "ini", "csv", "xml"}
 PLACEHOLDER_RE = re.compile(r"<([A-Z][A-Z0-9_]*)>")
 IMAGE = "parvault-doc-commands:ubuntu-24.04"
 BLOCK_TIMEOUT = 180
@@ -101,30 +108,41 @@ def merge(a, b):
     return a
 
 
-def blocks(root):
-    found = []
-    for doc in DOCS:
+def blocks(root, docs=DOCS):
+    """The shell blocks of `docs`, and the problems found in their fences and annotations."""
+    found, problems = [], []
+    empty = {"env": [], "capture": []}
+    for doc in docs:
         lines = open(os.path.join(root, doc), encoding="utf-8").read().split("\n")
-        pending, i = {"env": [], "capture": []}, 0
+        pending, i = dict(empty, env=[], capture=[]), 0
         while i < len(lines):
             m = ANN_RE.match(lines[i])
             if m:
                 pending = merge(pending, parse_ann(m.group(1), f"{doc}:{i + 1}"))
                 i += 1
                 continue
-            if FENCE_RE.match(lines[i]):
+            f = FENCE_RE.match(lines[i])
+            if f:
+                indent, lang = f.group(1), f.group(2).lower()
+                annotated = pending != empty
                 start, body = i + 1, []
                 i += 1
                 while i < len(lines) and lines[i].strip() != "```":
                     body.append(lines[i])
                     i += 1
-                found.append(Block(doc, start, body, pending))
-                pending = {"env": [], "capture": []}
+                if lang in SHELL_LANGS and not indent:
+                    found.append(Block(doc, start, body, pending))
+                elif lang in SHELL_LANGS:
+                    problems.append(f"{doc}:{start}: indented ```{lang} fence: the gate runs only column-0 shell fences; unindent it")
+                elif lang not in NON_COMMAND_LANGS and not annotated:
+                    problems.append(f"{doc}:{start}: ```{lang or '(bare)'} fence is neither a shell block nor an allowlisted language ({', '.join(sorted(NON_COMMAND_LANGS))}): use ```bash or annotate it")
+                pending = dict(empty, env=[], capture=[])
             elif lines[i].strip():
-                if pending != {"env": [], "capture": []}:
-                    sys.exit(f"{doc}:{i + 1}: doc-cmd annotation not directly before a bash/sh block")
+                if pending != empty:
+                    problems.append(f"{doc}:{i + 1}: doc-cmd annotation not directly before a bash/sh block")
+                    pending = dict(empty, env=[], capture=[])
             i += 1
-    return found
+    return found, problems
 
 
 def render(bl):
@@ -146,8 +164,14 @@ def render(bl):
     return "\n".join(out) + "\n"
 
 
-def check(root, bl):
-    problems = []
+def base_ratchet(root, ref):
+    """The ratchet value at git ref `ref`, or None if the file did not exist there."""
+    r = subprocess.run(["git", "-C", root, "show", f"{ref}:{RATCHET}"], capture_output=True, text=True)
+    return int(r.stdout.split()[1]) if r.returncode == 0 else None
+
+
+def check(root, bl, fence_problems, base=None):
+    problems = list(fence_problems)
     want = render(bl)
     have = open(os.path.join(root, OUT), encoding="utf-8").read() if os.path.exists(os.path.join(root, OUT)) else ""
     if want != have:
@@ -156,6 +180,10 @@ def check(root, bl):
     ratchet = int(open(os.path.join(root, RATCHET)).read().split()[1])
     if skips != ratchet:
         problems.append(f"{skips} skipped block(s) but {RATCHET} says {ratchet}; update it in the same commit")
+    if base:
+        before = base_ratchet(root, base)
+        if before is not None and ratchet > before:
+            problems.append(f"the skip ratchet grew from {before} (at {base}) to {ratchet}: skips may only decrease")
     captured = set()
     for b in bl:
         if "skip" in b.ann:
@@ -205,82 +233,117 @@ def sh(args, **kw):
     return subprocess.run(args, capture_output=True, text=True, **kw)
 
 
-def run(root, bindir, bl):
-    bindir = os.path.realpath(bindir)
-    if sh(["docker", "image", "inspect", IMAGE]).returncode != 0:
-        df = ("FROM ubuntu:24.04\nRUN apt-get update -o Acquire::Retries=3 && apt-get install -y "
-              "--no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*\n")
-        r = subprocess.run(["docker", "build", "-t", IMAGE, "-"], input=df, text=True)
+class DockerNode:
+    """One container per document and node; blocks run there as files, stdin closed."""
+    tmp = "/tmp"
+
+    def __init__(self, name, net, bindir):
+        self.name = name
+        sh(["docker", "rm", "-f", name])
+        r = sh(["docker", "run", "-d", "--name", name, "--network", net, "--hostname", name.rsplit("-", 1)[-1],
+                "-v", f"{bindir}:/opt/parvault/bin:ro",
+                "-e", "PATH=/opt/parvault/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "-w", "/root", IMAGE, "sleep", "infinity"])
         if r.returncode:
-            sys.exit("cannot build the doc-commands image")
-    net = "pvdoc-net"
-    sh(["docker", "network", "create", net])
-    containers, results, captures = {}, [], {}
+            sys.exit(f"cannot start {name}: {r.stderr}")
 
-    def container(doc, node):
-        name = f"pvdoc-{re.sub(r'[^a-z0-9]', '', doc.lower())}-{node}"
-        if name not in containers:
-            sh(["docker", "rm", "-f", name])
-            r = sh(["docker", "run", "-d", "--name", name, "--network", net, "--hostname", node,
-                    "-v", f"{bindir}:/opt/parvault/bin:ro",
-                    "-e", "PATH=/opt/parvault/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                    "-w", "/root", IMAGE, "sleep", "infinity"])
-            if r.returncode:
-                sys.exit(f"cannot start {name}: {r.stderr}")
-            containers[name] = True
-        return name
+    def put(self, path, content):
+        r = subprocess.run(["docker", "exec", "-i", self.name, "sh", "-c", f"cat > {path}"],
+                           input=content, capture_output=True, text=True)
+        if r.returncode:
+            sys.exit(f"cannot write {path} in {self.name}: {r.stderr}")
 
-    try:
-        for n, b in enumerate(bl):
-            if "skip" in b.ann:
-                results.append((b, "SKIP", b.ann["skip"]))
-                continue
-            c = container(b.doc, b.ann.get("node", "main"))
-            cmds = "\n".join(b.commands())
-            for name, val in captures.items():
-                cmds = cmds.replace(f"<{name}>", val)
-            env = "".join(f"export {shlex.quote(kv.split('=', 1)[0])}={shlex.quote(kv.split('=', 1)[1])}\n"
-                          for kv in b.ann["env"])
-            # set -a: plain assignments (SOCK=..., TOKEN=...) carry to later blocks, as in one shell.
-            pre = "set -a -e -o pipefail\n[ -f ~/.doc-env ] && . ~/.doc-env\n" + env
-            if "ready" in b.ann:
-                log = f"/tmp/doc-bg-{n}.log"
-                script = pre + cmds + "\n"
-                sh(["docker", "exec", "-d", c, "bash", "-c", f"exec > {log} 2>&1\n{script}"])
-                out, ok, deadline = "", False, time.time() + READY_TIMEOUT
-                while time.time() < deadline:
-                    out = sh(["docker", "exec", c, "cat", log]).stdout
-                    if b.ann["ready"] in out:
-                        ok = True
-                        break
-                    time.sleep(0.5)
-                status = "PASS" if ok else "FAIL"
-                detail = "ready" if ok else f"'{b.ann['ready']}' not seen in {READY_TIMEOUT}s:\n{out[-2000:]}"
+    def exec(self, cmd, timeout=None, detach=False):
+        args = ["docker", "exec"] + (["-d"] if detach else []) + [self.name, "bash", "-c", cmd]
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+
+    def close(self):
+        sh(["docker", "rm", "-f", self.name])
+
+
+class LocalNode:
+    """The same interface on this machine, in a temp HOME (selftest only)."""
+
+    def __init__(self, name, net, bindir):
+        import tempfile
+        self.home = tempfile.mkdtemp(prefix="pvdoc-selftest-")
+        self.tmp = self.home
+
+    def put(self, path, content):
+        open(path, "w").write(content)
+
+    def exec(self, cmd, timeout=None, detach=False):
+        env = dict(os.environ, HOME=self.home)
+        if detach:
+            subprocess.Popen(["bash", "-c", cmd], cwd=self.home, env=env, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            return subprocess.CompletedProcess([], 0, "", "")
+        return subprocess.run(["bash", "-c", cmd], cwd=self.home, env=env, capture_output=True, text=True,
+                              timeout=timeout, stdin=subprocess.DEVNULL)
+
+    def close(self):
+        import shutil
+        r = self.exec("for f in *.pid; do [ -f \"$f\" ] && kill \"$(cat \"$f\")\" 2>/dev/null; done; true")
+        shutil.rmtree(self.home, ignore_errors=True)
+
+
+def run_blocks(bl, node_for, ready_timeout=READY_TIMEOUT):
+    """Runs `bl` in order; returns [(block, PASS|FAIL|SKIP, detail)]."""
+    results, captures = [], {}
+    for n, b in enumerate(bl):
+        if "skip" in b.ann:
+            results.append((b, "SKIP", b.ann["skip"]))
+            continue
+        node = node_for(b)
+        cmds = "\n".join(b.commands())
+        for name, val in captures.items():
+            cmds = cmds.replace(f"<{name}>", val)
+        env = "".join(f"export {shlex.quote(kv.split('=', 1)[0])}={shlex.quote(kv.split('=', 1)[1])}\n"
+                      for kv in b.ann["env"])
+        # set -a: plain assignments (SOCK=..., TOKEN=...) carry to later blocks, as in one shell.
+        pre = "set -a -o pipefail\n[ -f ~/.doc-env ] && . ~/.doc-env\n" + env
+        script = f"{node.tmp}/doc-block-{n}.sh"
+        if "ready" in b.ann:
+            log, pid = f"{node.tmp}/doc-bg-{n}.log", f"{node.tmp}/doc-bg-{n}.pid"
+            node.put(script, pre + cmds + "\n")
+            node.exec(f"echo $$ > {pid}; exec bash -e {script} < /dev/null > {log} 2>&1", detach=True)
+            out, status, detail, deadline = "", "FAIL", "", time.time() + ready_timeout
+            while time.time() < deadline:
+                out = node.exec(f"cat {log} 2>/dev/null").stdout
+                alive = node.exec(f"[ -s {pid} ] && kill -0 \"$(cat {pid})\" 2>/dev/null").returncode == 0
+                if b.ann["ready"] in out and alive:
+                    status, detail = "PASS", "ready"
+                    break
+                if not alive and node.exec(f"[ -s {pid} ]").returncode == 0:
+                    detail = f"exited before it was ready:\n{out[-2000:]}"
+                    break
+                time.sleep(0.5)
             else:
-                script = pre + "trap 'export -p > ~/.doc-env' EXIT\n" + cmds + "\n"
-                try:
-                    r = subprocess.run(["docker", "exec", "-i", c, "bash", "-s"], input=script,
-                                       capture_output=True, text=True, timeout=BLOCK_TIMEOUT)
-                    out, rc = r.stdout + r.stderr, r.returncode
-                except subprocess.TimeoutExpired as e:
-                    out, rc = f"timed out after {BLOCK_TIMEOUT}s", None
-                want = b.ann.get("expect", 0)
-                status = "PASS" if rc == want else "FAIL"
-                detail = f"exit {rc}" + ("" if rc == want else f" (want {want}):\n{out[-3000:]}")
-            for name, rx in b.ann["capture"]:
-                m = re.search(rx, out, re.M)
-                if m:
-                    captures[name] = m.group(1)
-                elif status == "PASS":
-                    status, detail = "FAIL", f"capture {name}: /{rx}/ matched nothing:\n{out[-2000:]}"
-            results.append((b, status, detail))
-            print(f"[{status}] {b.where()} ({b.ann.get('node', 'main')}): {detail.splitlines()[0] if detail else ''}", flush=True)
-            if status == "FAIL":
-                print(detail, flush=True)
-    finally:
-        for c in containers:
-            sh(["docker", "rm", "-f", c])
-        sh(["docker", "network", "rm", net])
+                detail = f"'{b.ann['ready']}' not seen in {ready_timeout}s:\n{out[-2000:]}"
+        else:
+            node.put(script, pre + "trap 'export -p > ~/.doc-env' EXIT\n" + cmds + "\n")
+            try:
+                r = node.exec(f"bash -e {script} < /dev/null", timeout=BLOCK_TIMEOUT)
+                out, rc = r.stdout + r.stderr, r.returncode
+            except subprocess.TimeoutExpired:
+                out, rc = f"timed out after {BLOCK_TIMEOUT}s", None
+            want = b.ann.get("expect", 0)
+            status = "PASS" if rc == want else "FAIL"
+            detail = f"exit {rc}" + ("" if rc == want else f" (want {want}):\n{out[-3000:]}")
+        for name, rx in b.ann["capture"]:
+            m = re.search(rx, out, re.M)
+            if m:
+                captures[name] = m.group(1)
+            elif status == "PASS":
+                status, detail = "FAIL", f"capture {name}: /{rx}/ matched nothing:\n{out[-2000:]}"
+        results.append((b, status, detail))
+        print(f"[{status}] {b.where()} ({b.ann.get('node', 'main')}): {detail.splitlines()[0] if detail else ''}", flush=True)
+        if status == "FAIL":
+            print(detail, flush=True)
+    return results
+
+
+def summarize(results):
     print("\nSkipped blocks:")
     for b, s, d in results:
         if s == "SKIP":
@@ -291,20 +354,107 @@ def run(root, bindir, bl):
     return not fails
 
 
+def run(root, bindir, bl):
+    bindir = os.path.realpath(bindir)
+    if sh(["docker", "image", "inspect", IMAGE]).returncode != 0:
+        df = ("FROM ubuntu:24.04\nRUN apt-get update -o Acquire::Retries=3 && apt-get install -y "
+              "--no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*\n")
+        if subprocess.run(["docker", "build", "-t", IMAGE, "-"], input=df, text=True).returncode:
+            sys.exit("cannot build the doc-commands image")
+    net = "pvdoc-net"
+    sh(["docker", "network", "create", net])
+    nodes = {}
+
+    def node_for(b):
+        name = f"pvdoc-{re.sub(r'[^a-z0-9]', '', b.doc.lower())}-{b.ann.get('node', 'main')}"
+        if name not in nodes:
+            nodes[name] = DockerNode(name, net, bindir)
+        return nodes[name]
+
+    try:
+        return summarize(run_blocks(bl, node_for))
+    finally:
+        for nd in nodes.values():
+            nd.close()
+        sh(["docker", "network", "rm", net])
+
+
+SELFTEST_DOC = """# fixture
+<!-- doc-cmd: capture AFTER="(after-stdin)" -->
+```bash
+cat >/dev/null
+echo after-stdin
+```
+```bash
+cat >/dev/null; false
+```
+<!-- doc-cmd: background ready="never-printed" -->
+```bash
+echo starting; exit 1
+```
+<!-- doc-cmd: background ready="READY-LINE" -->
+```bash
+echo READY-LINE; sleep 30
+```
+```mermaid
+graph LR
+```
+```console
+$ parvault init
+```
+  ```bash
+  echo indented
+  ```
+"""
+
+
+def selftest():
+    import tempfile
+    root = tempfile.mkdtemp(prefix="pvdoc-fixture-")
+    open(os.path.join(root, "FIXTURE.md"), "w").write(SELFTEST_DOC)
+    bl, problems = blocks(root, ["FIXTURE.md"])
+    ok = True
+
+    def expect(cond, what):
+        nonlocal ok
+        print(("[PASS] " if cond else "[FAIL] ") + what)
+        ok = ok and cond
+
+    expect(len(bl) == 4, f"4 runnable shell blocks found (got {len(bl)})")
+    expect(any("```console" in p for p in problems), "an unannotated ```console fence fails the check")
+    expect(any("indented ```bash" in p for p in problems), "an indented ```bash fence fails the check")
+    expect(not any("```mermaid fence" in p for p in problems), "an allowlisted ```mermaid fence passes")
+    node = LocalNode("selftest", None, None)
+    try:
+        res = run_blocks(bl, lambda b: node, ready_timeout=10)
+    finally:
+        node.close()
+    st = [s for _, s, _ in res]
+    expect(st[0] == "PASS", "a command reading stdin does not swallow the rest of its block")
+    expect(st[1] == "FAIL", "'cat >/dev/null; false' fails its block")
+    expect(st[2] == "FAIL" and "exited before it was ready" in res[2][2], "a background block that dies is not ready")
+    expect(st[3] == "PASS", "a live background block that prints its ready line is ready")
+    print("doc-commands selftest: " + ("PASS" if ok else "FAIL"))
+    return ok
+
+
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("extract", "check", "run"):
+    if len(sys.argv) < 2 or sys.argv[1] not in ("extract", "check", "run", "selftest"):
         sys.exit(__doc__)
+    if sys.argv[1] == "selftest":
+        sys.exit(0 if selftest() else 1)
     root = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
-    bl = blocks(root)
+    bl, problems = blocks(root)
     if sys.argv[1] == "extract":
         open(os.path.join(root, OUT), "w", encoding="utf-8").write(render(bl))
         print(f"wrote {OUT}: {len(bl)} block(s)")
     elif sys.argv[1] == "check":
-        sys.exit(0 if check(root, bl) else 1)
+        base = sys.argv[3] if len(sys.argv) == 4 and sys.argv[2] == "--base" else None
+        sys.exit(0 if check(root, bl, problems, base) else 1)
     else:
         if len(sys.argv) != 3:
             sys.exit("run needs the directory holding the release binaries")
-        if not check(root, bl):
+        if not check(root, bl, problems):
             sys.exit(1)
         sys.exit(0 if run(root, sys.argv[2], bl) else 1)
 

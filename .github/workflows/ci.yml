@@ -216,8 +216,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: docs/doc-commands.txt is current, blocks are annotated, skip ratchet matches
-        run: bash scripts/doc_commands.sh check
+        with:
+          fetch-depth: 0   # the merge base, for the skip ratchet
+      - name: docs/doc-commands.txt is current, fences are annotated, skips never increase
+        run: |
+          base_branch="${GITHUB_BASE_REF:-main}"
+          git fetch --no-tags origin "$base_branch"
+          base="$(git merge-base HEAD "origin/$base_branch")"
+          bash scripts/doc_commands.sh check --base "$base"
+      - name: Runner positive controls (stdin closed, failures fail, dead daemons are not ready)
+        run: bash scripts/doc_commands.sh selftest
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release binaries (each with its own features)
