@@ -3383,3 +3383,31 @@ fn repro_syndication_grant_from_foreign_owner() {
     );
     gate_ran("trust_enforcement::repro_syndication_grant_from_foreign_owner");
 }
+
+/// F-35 accept: a fresh voucher from a trusted issuer is redeemed.
+#[test]
+fn f35_fresh_voucher_redeemed() {
+    let node = spawn_daemon("f35-a");
+    let sender = key(0xB5);
+    let b = blinded(0x5B, 512);
+    let resp = send(&sender, &node, blinded_put(&b, &sender));
+    assert!(format!("{resp:?}").contains("stored: true"), "{resp:?}");
+    gate_ran("trust_enforcement::f35_fresh_voucher_redeemed");
+}
+
+/// F-35 reject: the same sender and issuer with an expired voucher is refused (a voucher no
+/// longer outlives its nullifier).
+#[test]
+fn f35_expired_voucher_refused() {
+    let node = spawn_daemon("f35-r");
+    let sender = key(0xB5);
+    let b = blinded(0x5B, 512);
+    let mut req = blinded_put(&b, &sender);
+    if let MeshWireRequest::PutBlindedShard { voucher, .. } = &mut req {
+        *voucher = AnonymousQuotaVoucher::mint_expiring(&sender, 8192, now_ms() - 1);
+    }
+    let resp = send(&sender, &node, req);
+    assert!(format!("{resp:?}").contains("stored: false"), "{resp:?}");
+    assert_logged(&node, "reject.voucher_expired");
+    gate_ran("trust_enforcement::f35_expired_voucher_refused");
+}

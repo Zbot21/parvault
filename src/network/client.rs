@@ -2540,6 +2540,7 @@ impl MeshClient {
             issuer_pubkey: [0u8; 32],
             sig_r: [0u8; 32],
             sig_s: [0u8; 32],
+            expires_at_ms: 0,
         };
         self.send_onion(
             relay_peer_addr,

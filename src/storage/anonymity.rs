@@ -10,7 +10,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashMap;
 use x25519_dalek::PublicKey as X25519Public;
 use zeroize::Zeroize;
 
@@ -220,15 +220,60 @@ pub struct AnonymousQuotaVoucher {
     pub issuer_pubkey: [u8; 32],
     pub sig_r: [u8; 32],
     pub sig_s: [u8; 32],
+    /// Appended (F-35): the voucher is redeemable until this time (signed). A spent nonce is
+    /// remembered until then, so a voucher cannot be replayed once its nullifier is dropped.
+    pub expires_at_ms: u64,
+}
+
+/// Default voucher lifetime when minting (F-35).
+pub const DEFAULT_VOUCHER_TTL_MS: u64 = 30 * 24 * 3600 * 1000;
+/// Longest lifetime a receiver accepts (F-35).
+pub const MAX_VOUCHER_TTL_MS: u64 = 90 * 24 * 3600 * 1000;
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// A voucher is redeemable only before its expiry and at most 90 days ahead (F-35).
+pub fn voucher_freshness_decision(expires_at_ms: u64, now_ms: u64) -> Result<(), &'static str> {
+    if expires_at_ms <= now_ms {
+        return Err("reject.voucher_expired");
+    }
+    if expires_at_ms > now_ms.saturating_add(MAX_VOUCHER_TTL_MS) {
+        return Err("reject.voucher_expiry_unbounded");
+    }
+    Ok(())
+}
+
+/// A new nullifier is recorded only while the ledger, after dropping expired entries, has room;
+/// when full the voucher is refused rather than evicting a live nullifier (F-35).
+pub fn nullifier_cache_decision(live_entries: usize) -> Result<(), &'static str> {
+    if live_entries >= MAX_VOUCHER_NULLIFIER_ENTRIES {
+        Err("reject.voucher_cache_full")
+    } else {
+        Ok(())
+    }
 }
 
 impl AnonymousQuotaVoucher {
     /// Mints a fresh single-use bearer storage voucher for up to `max_bytes` using `OsRng` (`E4`).
     pub fn mint(issuer: &NodeIdentity, max_bytes: u64) -> Self {
+        Self::mint_expiring(
+            issuer,
+            max_bytes,
+            now_unix_ms().saturating_add(DEFAULT_VOUCHER_TTL_MS),
+        )
+    }
+
+    /// Mints a voucher that expires at `expires_at_ms` (F-35).
+    pub fn mint_expiring(issuer: &NodeIdentity, max_bytes: u64, expires_at_ms: u64) -> Self {
         let mut voucher_nonce = [0u8; 32];
         OsRng.fill_bytes(&mut voucher_nonce);
         let issuer_pubkey = issuer.public_key_bytes();
-        let msg = Self::canonical_bytes(&voucher_nonce, max_bytes, &issuer_pubkey);
+        let msg = Self::canonical_bytes(&voucher_nonce, max_bytes, &issuer_pubkey, expires_at_ms);
         let sig = issuer.sign(&msg);
         let mut sig_r = [0u8; 32];
         let mut sig_s = [0u8; 32];
@@ -241,6 +286,7 @@ impl AnonymousQuotaVoucher {
             issuer_pubkey,
             sig_r,
             sig_s,
+            expires_at_ms,
         }
     }
 
@@ -270,7 +316,12 @@ impl AnonymousQuotaVoucher {
         {
             return false;
         }
-        let msg = Self::canonical_bytes(&self.voucher_nonce, self.max_bytes, &self.issuer_pubkey);
+        let msg = Self::canonical_bytes(
+            &self.voucher_nonce,
+            self.max_bytes,
+            &self.issuer_pubkey,
+            self.expires_at_ms,
+        );
         let mut sig = [0u8; 64];
         sig[..32].copy_from_slice(&self.sig_r);
         sig[32..].copy_from_slice(&self.sig_s);
@@ -281,12 +332,14 @@ impl AnonymousQuotaVoucher {
         voucher_nonce: &[u8; 32],
         max_bytes: u64,
         issuer_pubkey: &[u8; 32],
+        expires_at_ms: u64,
     ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(96);
-        buf.extend_from_slice(b"parvault-anon-voucher-v1:");
+        let mut buf = Vec::with_capacity(104);
+        buf.extend_from_slice(b"parvault-anon-voucher-v2:");
         buf.extend_from_slice(voucher_nonce);
         buf.extend_from_slice(&max_bytes.to_be_bytes());
         buf.extend_from_slice(issuer_pubkey);
+        buf.extend_from_slice(&expires_at_ms.to_be_bytes());
         buf
     }
 }
@@ -299,9 +352,8 @@ pub const MAX_VOUCHER_NULLIFIER_ENTRIES: usize = 65_536;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoucherNullifierLedger {
     trusted_issuer_pubkey: [u8; 32],
-    spent_nonces: HashSet<[u8; 32]>,
-    #[serde(default)]
-    spent_fifo: VecDeque<[u8; 32]>,
+    /// Spent nonce -> voucher expiry; kept until the voucher expires (F-35).
+    spent: HashMap<[u8; 32], u64>,
     #[serde(skip)]
     persistence_path: Option<std::path::PathBuf>,
 }
@@ -310,8 +362,7 @@ impl VoucherNullifierLedger {
     pub fn new(trusted_issuer_pubkey: [u8; 32]) -> Self {
         Self {
             trusted_issuer_pubkey,
-            spent_nonces: HashSet::new(),
-            spent_fifo: VecDeque::new(),
+            spent: HashMap::new(),
             persistence_path: None,
         }
     }
@@ -323,21 +374,23 @@ impl VoucherNullifierLedger {
         data_dir: &std::path::Path,
     ) -> Self {
         let path = data_dir.join("voucher_nullifiers.bin");
-        let spent_fifo: VecDeque<[u8; 32]> = if path.exists() {
+        // Format `Vec<([u8; 32], u64)>` since F-35; an older file (nonces only) does not decode
+        // and starts empty, which is safe because pre-F-35 vouchers no longer verify.
+        let spent: HashMap<[u8; 32], u64> = if path.exists() {
             std::fs::read(&path)
                 .ok()
                 .and_then(|raw| {
-                    deserialize_bounded::<VecDeque<[u8; 32]>>(&raw, MAX_NULLIFIER_LEDGER_BYTES).ok()
+                    deserialize_bounded::<Vec<([u8; 32], u64)>>(&raw, MAX_NULLIFIER_LEDGER_BYTES)
+                        .ok()
                 })
+                .map(|v| v.into_iter().collect())
                 .unwrap_or_default()
         } else {
-            VecDeque::new()
+            HashMap::new()
         };
-        let spent_nonces: HashSet<[u8; 32]> = spent_fifo.iter().copied().collect();
         Self {
             trusted_issuer_pubkey,
-            spent_nonces,
-            spent_fifo,
+            spent,
             persistence_path: Some(path),
         }
     }
@@ -373,27 +426,42 @@ impl VoucherNullifierLedger {
         voucher: &AnonymousQuotaVoucher,
         shard_size_bytes: u64,
     ) -> Result<(), StorageError> {
+        self.redeem_voucher_at(voucher, shard_size_bytes, now_unix_ms())
+    }
+
+    /// [`Self::redeem_voucher`] at an explicit time (tests and replay checks).
+    pub fn redeem_voucher_at(
+        &mut self,
+        voucher: &AnonymousQuotaVoucher,
+        shard_size_bytes: u64,
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
         if shard_size_bytes > voucher.max_bytes || !voucher.verify(&self.trusted_issuer_pubkey) {
             return Err(StorageError::QuotaExceeded(
                 "invalid_or_undersized_voucher".into(),
             ));
         }
-        if self.spent_nonces.contains(&voucher.voucher_nonce) {
+        if let Err(code) = voucher_freshness_decision(voucher.expires_at_ms, now_ms) {
+            tracing::warn!(code, "refused a voucher outside its lifetime");
+            return Err(StorageError::QuotaExceeded(code.into()));
+        }
+        // Drop nullifiers whose vouchers have expired: those vouchers can no longer verify as
+        // fresh, so forgetting them cannot re-enable a spend.
+        self.spent.retain(|_, exp| *exp > now_ms);
+        if self.spent.contains_key(&voucher.voucher_nonce) {
             return Err(StorageError::QuotaExceeded(
                 "double_spent_voucher_nullifier".into(),
             ));
         }
-        while self.spent_nonces.len() >= MAX_VOUCHER_NULLIFIER_ENTRIES {
-            if let Some(oldest) = self.spent_fifo.pop_front() {
-                self.spent_nonces.remove(&oldest);
-            } else {
-                break;
-            }
+        if let Err(code) = nullifier_cache_decision(self.spent.len()) {
+            tracing::warn!(code, "refused a voucher: the nullifier cache is full");
+            return Err(StorageError::QuotaExceeded(code.into()));
         }
-        self.spent_nonces.insert(voucher.voucher_nonce);
-        self.spent_fifo.push_back(voucher.voucher_nonce);
+        self.spent
+            .insert(voucher.voucher_nonce, voucher.expires_at_ms);
         if let Some(ref path) = self.persistence_path {
-            if let Ok(bytes) = bincode::serialize(&self.spent_fifo) {
+            let entries: Vec<([u8; 32], u64)> = self.spent.iter().map(|(n, e)| (*n, *e)).collect();
+            if let Ok(bytes) = bincode::serialize(&entries) {
                 let _ = crate::storage::BlockStore::atomic_write_file(path, &bytes);
             }
         }
@@ -401,7 +469,7 @@ impl VoucherNullifierLedger {
     }
 
     pub fn spent_count(&self) -> usize {
-        self.spent_nonces.len()
+        self.spent.len()
     }
 }
 
@@ -501,33 +569,58 @@ pub fn combinatorial_reconstruction_entropy_bits(
 mod tests {
     use super::*;
 
-    /// Voucher-rollover gap (plan 2c fact 5): once `MAX_VOUCHER_NULLIFIER_ENTRIES` other vouchers
-    /// are redeemed, the first spent voucher is accepted again (FIFO eviction, no expiry).
+    /// F-35 (plan 2c fact 5): a full ledger refuses a new voucher instead of evicting a live
+    /// nullifier, so a spent voucher is never redeemable again while it is fresh.
     #[test]
-    fn repro_spent_voucher_redeemable_after_rollover() {
+    fn spent_voucher_never_redeemable_again_while_fresh() {
         let issuer = NodeIdentity::from_seed([0x2C; 32]);
         let mut ledger = VoucherNullifierLedger::new(issuer.public_key_bytes());
+        let now = now_unix_ms();
         let first = AnonymousQuotaVoucher::mint(&issuer, 4096);
-        ledger.redeem_voucher(&first, 1024).unwrap();
+        ledger.redeem_voucher_at(&first, 1024, now).unwrap();
         assert!(
-            ledger.redeem_voucher(&first, 1024).is_err(),
+            ledger.redeem_voucher_at(&first, 1024, now).is_err(),
             "double spend refused"
         );
-        // Fill the ledger to capacity behind `first` (state setup only: distinct nonces, no
-        // signing), then redeem one real voucher: the ledger's own FIFO evicts `first`.
+        // Fill the ledger to capacity with live nullifiers (state setup only).
         for i in 1..MAX_VOUCHER_NULLIFIER_ENTRIES {
             let mut nonce = [0xEEu8; 32];
             nonce[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            ledger.spent_nonces.insert(nonce);
-            ledger.spent_fifo.push_back(nonce);
+            ledger.spent.insert(nonce, now + 60_000);
         }
-        assert_eq!(ledger.spent_nonces.len(), MAX_VOUCHER_NULLIFIER_ENTRIES);
         let next = AnonymousQuotaVoucher::mint(&issuer, 4096);
-        ledger.redeem_voucher(&next, 1024).unwrap();
         assert!(
-            ledger.redeem_voucher(&first, 1024).is_ok(),
-            "gap: the spent voucher is redeemable again after rollover"
+            matches!(ledger.redeem_voucher_at(&next, 1024, now), Err(StorageError::QuotaExceeded(c)) if c == "reject.voucher_cache_full")
         );
+        assert!(
+            ledger.redeem_voucher_at(&first, 1024, now).is_err(),
+            "still spent"
+        );
+        // Once the filler vouchers expire their nullifiers are dropped and new vouchers fit.
+        assert!(ledger.redeem_voucher_at(&next, 1024, now + 120_000).is_ok());
+        assert!(
+            ledger
+                .redeem_voucher_at(&first, 1024, now + 120_000)
+                .is_err(),
+            "first is still spent"
+        );
+    }
+
+    #[test]
+    fn voucher_lifetime_is_bounded_and_signed() {
+        let issuer = NodeIdentity::from_seed([0x2D; 32]);
+        let mut ledger = VoucherNullifierLedger::new(issuer.public_key_bytes());
+        let now = now_unix_ms();
+        let expired = AnonymousQuotaVoucher::mint_expiring(&issuer, 4096, now - 1);
+        assert!(ledger.redeem_voucher_at(&expired, 1024, now).is_err());
+        let too_far =
+            AnonymousQuotaVoucher::mint_expiring(&issuer, 4096, now + MAX_VOUCHER_TTL_MS + 1);
+        assert!(ledger.redeem_voucher_at(&too_far, 1024, now).is_err());
+        // The expiry is signed: extending it breaks the signature.
+        let mut stretched = AnonymousQuotaVoucher::mint(&issuer, 4096);
+        stretched.expires_at_ms += 1;
+        assert!(!stretched.verify(&issuer.public_key_bytes()));
+        assert_eq!(voucher_freshness_decision(now + 1, now), Ok(()));
     }
 
     #[test]

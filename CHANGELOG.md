@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Security
+- **Voucher expiry (F-35).** Blinded-shard vouchers carry a signed expiry (default 30 days, at most 90); a spent nullifier is kept until its voucher expires, and a full ledger refuses new vouchers instead of evicting old nullifiers, so a spent voucher can never be replayed. Older vouchers no longer verify.
 - **Voucher issuer policy (F-24).** A blinded-shard voucher is honoured only if its issuer is a ring member the node knows (or a seed's configured issuer); the node no longer trusts whichever issuer a voucher names. Ephemeral per-shard issuers are refused until v0.6.0.
 - **Rendezvous quotas (F-22).** `RegisterWanRendezvous` stays open before admission, but a signer may hold at most 8 slots and a subnet 32 live entries; only admitted signers are recorded in the admission-IP map.
 - **Onion relays need admission (F-33, L-38).** `RelayPqOnionEnvelope` is admitted like other storage requests: the originator presents its ring credential at the entry relay, and each relay at the next hop. A relay keeps at most 4 forwards in flight per sender and 64 in total, and refuses more (`relay busy; retry later`). Forwards no longer block the swarm task (F-18).
