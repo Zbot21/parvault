@@ -103,8 +103,8 @@ TLA2TOOLS_JAR=/root/tla2tools.jar cargo test --release
 # Run built-in self-tests for seed, zero-copy IPC gateway, lazy VFS, and zero-key folder sync
 cargo run --release --bin parvault-seed -- self-test
 cargo run --release --bin parvault -- gateway self-test
-cargo run --release --bin parvault-fuse -- self-test
-cargo run --release --bin parvault-sync -- self-test
+# Plugin self-tests are client-only: this starts a standalone gateway, mints a token, runs both
+cargo build --release --bins && bash scripts/plugin_self_test.sh target/release/parvault target/release/parvault-fuse target/release/parvault-sync
 
 # Run the empirical cryptography, Reed-Solomon, and /proc/self/status memory benchmark binary
 cargo run --release --bin parvault-bench -- run --payload-mib 64

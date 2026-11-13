@@ -218,3 +218,7 @@ impl ErasureTier {
         }
     }
 }
+
+/// Gateway IPC stripe size: the 1 MiB router-SoC profile (moved from `gateway::engine`; the
+/// client side of `gateway::shm` needs it without the engine).
+pub const GATEWAY_STRIPE_BYTES: usize = ROUTER_SOC_STRIPE_SIZE_BYTES;

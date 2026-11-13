@@ -23,8 +23,8 @@ Measured against a live `parvault` Unix Domain Socket listener (`/var/run/parvau
 | :--- | :--- | :---: | :---: |
 | **`parvault gateway ipc-roundtrip`** (`64 MiB`) | `1,280` shards via `memfd_create` + `SCM_RIGHTS` (`512 KiB` gateway stripes, `40`-lane `128 KiB`-stack pool) | **<!-- metric:gw.ipc.ttfb -->`12.13 ms`<!-- /metric --> TTFB** (`64 KiB` range)<br/><!-- metric:gw.ipc.upload -->`1,141.21 ms`<!-- /metric --> upload (<!-- metric:gw.ipc.upload_rate -->`56.08 MiB/s`<!-- /metric -->)<br/><!-- metric:gw.ipc.restore -->`736.03 ms`<!-- /metric --> restore (<!-- metric:gw.ipc.restore_rate -->`86.95 MiB/s`<!-- /metric -->) | Gateway `VmHWM`: **<!-- metric:gw.ipc.gateway_vmhwm -->`10.98 MiB`<!-- /metric -->** (<!-- metric:gw.ipc.gateway_vmhwm_kib -->`11,240 KiB`<!-- /metric -->)<br/>Client `VmRSS`: **<!-- metric:gw.ipc.client_rss -->`6.59 MiB`<!-- /metric -->** (<!-- metric:gw.ipc.client_rss_bytes -->`6,905,856 B`<!-- /metric -->) |
 | **`parvault gateway self-test`** (`static-musl`) | `2 MiB` zero-copy sealed `memfd` (`F_ADD_SEALS`) + `SCM_RIGHTS` + `SO_PEERCRED` round-trip | Bit-for-bit SHA-256 verified | **<!-- metric:gw.selftest.rss_musl -->`10.04 MiB`<!-- /metric -->** RSS (<!-- metric:gw.selftest.rss_glibc -->`13.14 MiB`<!-- /metric --> glibc) |
-| **`parvault-fuse self-test`** | Lazy byte-range hydration over UDS + `2 MiB` bounded LRU block cache (`1` eviction) | **<!-- metric:fuse.ttfb -->`12.33 ms`<!-- /metric --> TTFB** (<!-- metric:fuse.ttfb_musl -->`19.25 ms`<!-- /metric --> `musl`, `< 50 ms`) | Bounded `2,097,152 B` cache |
-| **`parvault-sync self-test`** | Zero-key sealed-`memfd` initial `push` + edit/add/delete `diff` + incremental `push` + attenuated `PARVAULT-MAC-V1:` `pull` + streaming SHA-256 verify | **<!-- metric:sync.selftest -->`94.58 ms`<!-- /metric -->** (<!-- metric:sync.selftest_musl -->`133.08 ms`<!-- /metric --> `musl`, `2` files, `catalog_v=2`) | **<!-- metric:sync.rss_musl -->`6.15 MiB`<!-- /metric -->** RSS `musl` (<!-- metric:sync.rss_glibc -->`9.21 MiB`<!-- /metric --> glibc) |
+| **`parvault-fuse self-test`** (client-only, vs `parvault gateway serve`; `scripts/plugin_self_test.sh`) | Lazy byte-range hydration over UDS + `2 MiB` bounded LRU block cache (`1` eviction) | **<!-- metric:fuse.ttfb -->`12.33 ms`<!-- /metric --> TTFB** (<!-- metric:fuse.ttfb_musl -->`19.25 ms`<!-- /metric --> `musl`, `< 50 ms`) | Bounded `2,097,152 B` cache |
+| **`parvault-sync self-test`** (client-only, as above) | Zero-key sealed-`memfd` initial `push` + edit/add/delete `diff` + incremental `push` + attenuated `PARVAULT-MAC-V1:` `pull` + streaming SHA-256 verify | **<!-- metric:sync.selftest -->`94.58 ms`<!-- /metric -->** (<!-- metric:sync.selftest_musl -->`133.08 ms`<!-- /metric --> `musl`, `2` files, `catalog_v=2`) | **<!-- metric:sync.rss_musl -->`6.15 MiB`<!-- /metric -->** RSS `musl` (<!-- metric:sync.rss_glibc -->`9.21 MiB`<!-- /metric --> glibc) |
 | **`parvault-seed start --no-fs`** | `--mode public-bootstrap --no-fs --in-memory-mb 16` | Live `Noise_XX + Yamux` TCP listener | **`0` files / `0` dirs** created on disk |
 
 ---
@@ -85,8 +85,8 @@ cargo run --release --bin parvault-bench -- run --payload-mib 64
 
 # 3. Run zero-copy UDS sealed memfd gateway, lazy VFS, and zero-key folder sync self-tests
 cargo run --release --bin parvault -- gateway self-test
-cargo run --release --bin parvault-fuse -- self-test
-cargo run --release --bin parvault-sync -- self-test
+# Plugin self-tests are client-only: this starts a standalone gateway, mints a token, runs both
+cargo build --release --bins && bash scripts/plugin_self_test.sh target/release/parvault target/release/parvault-fuse target/release/parvault-sync
 
 # 4. Run all Kani symbolic harnesses + all TLA+ TLC formal specifications
 bash scripts/verify_formal_proofs.sh

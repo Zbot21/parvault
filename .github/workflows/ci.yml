@@ -189,8 +189,7 @@ jobs:
         run: |
           ./target/release/parvault-seed self-test
           ./target/release/parvault gateway self-test
-          ./target/release/parvault-fuse self-test
-          ./target/release/parvault-sync self-test
+          bash scripts/plugin_self_test.sh ./target/release/parvault ./target/release/parvault-fuse ./target/release/parvault-sync
       - name: Run 13-Container Docker P2P Regression & Disaster Recovery Gate
         run: USE_GLIBC_IMAGE=1 bash scripts/docker_acceptance_gate.sh
 

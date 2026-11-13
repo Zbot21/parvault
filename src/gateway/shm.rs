@@ -4,7 +4,6 @@
 //! `recv_frame_with_fd`) and re-exports safe `pread`/`pwrite` + `memfd` helpers from [`crate::os_sys`].
 //! Contains **zero** `unsafe` blocks.
 
-use crate::gateway::engine::GATEWAY_STRIPE_BYTES as ENGINE_STRIPE_BYTES;
 use crate::gateway::ipc::{validate_ipc_frame_header, MAX_IPC_FRAME_BYTES as IPC_MAX_FRAME_BYTES};
 use crate::os_sys::{recvmsg_scm_rights, sendmsg_scm_rights};
 use std::io;
@@ -18,7 +17,7 @@ pub use crate::os_sys::{create_memfd, pread_full_or_eof, pwrite_all};
 pub const MAX_IPC_FRAME_BYTES: usize = IPC_MAX_FRAME_BYTES;
 
 /// Router-SoC zero-bloat streaming stripe size (`1 MiB`).
-pub const GATEWAY_STRIPE_BYTES: usize = ENGINE_STRIPE_BYTES;
+pub use crate::profile::GATEWAY_STRIPE_BYTES;
 
 /// Sends a length-prefixed frame (`[u32 BE len][payload]`) over asynchronous `stream`, optionally
 /// attaching a single `RawFd` via `SOL_SOCKET` / `SCM_RIGHTS` ancillary data on the 4-byte header.

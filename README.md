@@ -161,8 +161,8 @@ bash scripts/verify_formal_proofs.sh
 # Execute built-in end-to-end self-tests for seed, zero-copy IPC gateway, lazy VFS, and zero-key folder sync
 cargo run --release --bin parvault-seed -- self-test
 cargo run --release --bin parvault -- gateway self-test
-cargo run --release --bin parvault-fuse -- self-test
-cargo run --release --bin parvault-sync -- self-test
+# Plugin self-tests are client-only: this starts a standalone gateway, mints a token, runs both
+cargo build --release --bins && bash scripts/plugin_self_test.sh target/release/parvault target/release/parvault-fuse target/release/parvault-sync
 
 # Launch a zero-filesystem, RAM-capped seed node (zero directories or files created on disk)
 parvault-seed start --no-fs --in-memory-mb 256 --mode public-bootstrap --listen /ip4/0.0.0.0/tcp/4002

@@ -5,10 +5,10 @@
 //! bounded `PinnedRingBudget` admission/eviction, and 40-lane single-wave hedged parallel `libp2p`
 //! TCP + Noise XX shard distribution & reconstruction (`TTFB < 60 ms` under `15ms / 2% loss`).
 
-use crate::config::{ErasureTier, ROUTER_SOC_STRIPE_SIZE_BYTES};
+use crate::config::ErasureTier;
 
 /// Default Router-SoC zero-bloat streaming stripe size (`1 MiB`).
-pub const GATEWAY_STRIPE_BYTES: usize = ROUTER_SOC_STRIPE_SIZE_BYTES;
+pub use crate::profile::GATEWAY_STRIPE_BYTES;
 
 /// Dedicated persistent `libp2p` TCP + Noise XX worker pool concurrency (`40` independent lanes
 /// with `128 KiB` thread stacks so all `N <= 40` Reed-Solomon shards fire in a single wave at

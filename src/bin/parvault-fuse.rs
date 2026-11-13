@@ -71,7 +71,8 @@ enum FuseCommand {
         #[arg(long)]
         folder: PathBuf,
     },
-    /// Run an embedded self-test verifying `< 50 ms` TTFB lazy range streaming and LRU cache eviction.
+    /// Self-test against the daemon on `--socket` (presents `--macaroon`): `< 50 ms` TTFB lazy
+    /// range streaming and LRU cache eviction.
     SelfTest,
 }
 
@@ -106,10 +107,7 @@ fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use parvault::{
-            config::HardwareProfile,
-            crypto::MasterKey,
-            gateway::ipc::{create_memfd, GatewayIpcClient, GatewayIpcServer, RetentionPolicy},
-            storage::{BlockStore, QuotaManager},
+            gateway::ipc::{create_memfd, GatewayIpcClient, RetentionPolicy},
             vfs::VirtualVaultFs,
         };
         use std::io::{Seek, SeekFrom, Write};
@@ -171,6 +169,9 @@ fn main() -> anyhow::Result<()> {
                 );
             }
             FuseCommand::SelfTest => {
+                // Client-only (item 3): runs against the daemon on `--socket`, presenting
+                // `--macaroon` when the gateway has a root key. The in-process variant lives in
+                // tests/plugin_self_test.rs.
                 struct TempDirGuard(PathBuf);
                 impl Drop for TempDirGuard {
                     fn drop(&mut self) {
@@ -186,38 +187,39 @@ fn main() -> anyhow::Result<()> {
                 ));
                 std::fs::create_dir_all(&tmp_dir)?;
                 let _guard = TempDirGuard(tmp_dir.clone());
-                let sock = tmp_dir.join("vfs_selftest.sock");
-                let store = BlockStore::new(
-                    tmp_dir.join("store"),
-                    QuotaManager::new(512 * 1024 * 1024, 64 * 1024 * 1024),
-                )?;
-                let mut srv = GatewayIpcServer::new(&sock, store, MasterKey::generate())
-                    .with_profile(HardwareProfile::RouterSoc)
-                    .with_require_sealed_ingest_memfd(true)
-                    .spawn()?;
 
-                let client = GatewayIpcClient::new(&sock);
+                let client = GatewayIpcClient::new(&cli.socket);
                 let mfd = create_memfd("vfs-selftest")?;
                 let mut f = std::fs::File::from(mfd);
                 let payload: Vec<u8> = (0..(4 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
                 f.write_all(&payload)?;
                 f.seek(SeekFrom::Start(0))?;
-                let manifest = client.store_sealed_memfd(
-                    f.as_raw_fd(),
-                    payload.len() as u64,
-                    RetentionPolicy::Persistent,
-                )?;
+                let manifest = client
+                    .store_sealed_memfd(
+                        f.as_raw_fd(),
+                        payload.len() as u64,
+                        RetentionPolicy::Persistent,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "self-test needs a running daemon on {} (`parvault up --ipc-socket` or `parvault gateway serve`): {e}",
+                            cli.socket.display()
+                        )
+                    })?;
 
                 // Cap cache at 2 MiB and read 4 MiB across blocks to verify LRU eviction + <50ms TTFB.
-                let vfs = VirtualVaultFs::new(&sock, tmp_dir.join("cache"), 2 * 1024 * 1024)?;
+                let vfs = VirtualVaultFs::new(&cli.socket, tmp_dir.join("cache"), 2 * 1024 * 1024)?
+                    .with_default_macaroon(default_macaroon);
                 let ino = vfs.register_stub_file("/vault/test.bin", manifest, None)?;
                 let (slice, ttfb) =
                     vfs.read_range_with_ttfb(ino, 1024 * 1024 + 17, 2 * 1024 * 1024)?;
-                srv.shutdown();
-                assert_eq!(slice, payload[1024 * 1024 + 17..3 * 1024 * 1024 + 17]);
+                anyhow::ensure!(
+                    slice == payload[1024 * 1024 + 17..3 * 1024 * 1024 + 17],
+                    "range bytes differ"
+                );
                 let stats = vfs.cache_stats();
-                assert!(stats.used_bytes <= 2 * 1024 * 1024);
-                assert!(stats.evictions >= 1);
+                anyhow::ensure!(stats.used_bytes <= 2 * 1024 * 1024, "cache over its cap");
+                anyhow::ensure!(stats.evictions >= 1, "no LRU eviction");
                 println!(
                     "parvault-fuse self-test: PASS (TTFB={:.2} ms < 50 ms, cache_used={} B, evictions={})",
                     ttfb.as_secs_f64() * 1000.0,

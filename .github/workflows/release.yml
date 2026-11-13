@@ -83,8 +83,7 @@ jobs:
           ls -lh parvault-x86_64-* parvault-aarch64-* parvault-seed-* parvault-fuse-* parvault-sync-*
           ./parvault-seed-x86_64-unknown-linux-musl self-test
           ./parvault-x86_64-unknown-linux-musl gateway self-test
-          ./parvault-fuse-x86_64-unknown-linux-musl self-test
-          ./parvault-sync-x86_64-unknown-linux-musl self-test
+          bash ../scripts/plugin_self_test.sh ./parvault-x86_64-unknown-linux-musl ./parvault-fuse-x86_64-unknown-linux-musl ./parvault-sync-x86_64-unknown-linux-musl
           sha256sum \
             parvault-x86_64-unknown-linux-musl parvault-aarch64-unknown-linux-musl \
             parvault-seed-x86_64-unknown-linux-musl parvault-seed-aarch64-unknown-linux-musl \
