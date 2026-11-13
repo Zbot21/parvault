@@ -50,6 +50,8 @@ fn now_unix_ms() -> u64 {
 
 /// State borrowed by the daemon wire handler for one request.
 pub struct DaemonWireHandlerCtx<'a> {
+    /// B-SEED-SYND: the node's current lite syndication fan-out load (from `ServerSwarmEvents`).
+    pub syndication_load: crate::network::server_events::SyndicationLoad,
     pub cfg: &'a NodeConfig,
     pub node_identity: &'a NodeIdentity,
     pub genesis_pubkey: Option<[u8; 32]>,
@@ -67,6 +69,8 @@ pub struct DaemonWireHandlerCtx<'a> {
 
 /// State borrowed by the seed wire handler for one request.
 pub struct SeedWireHandlerCtx<'a> {
+    /// B-SEED-SYND: the node's current lite syndication fan-out load (from `ServerSwarmEvents`).
+    pub syndication_load: crate::network::server_events::SyndicationLoad,
     pub data_dir: &'a Path,
     pub node_identity: &'a NodeIdentity,
     pub advertised_admin_pk: Option<[u8; 32]>,
@@ -123,7 +127,7 @@ pub fn handle_daemon_wire_request(
         takedown_queue: ctx.takedown_queue,
     };
     handle_mesh_wire_reply(
-        &WirePeer::new(remote_peer_id, remote_addr),
+        &WirePeer::new(remote_peer_id, remote_addr).with_syndication_load(ctx.syndication_load),
         request,
         state,
         &policy,
@@ -162,7 +166,7 @@ pub fn handle_seed_wire_request(
         takedown_queue: ctx.takedown_queue,
     };
     handle_mesh_wire_reply(
-        &WirePeer::new(remote_peer_id, remote_addr),
+        &WirePeer::new(remote_peer_id, remote_addr).with_syndication_load(ctx.syndication_load),
         request,
         state,
         &policy,
@@ -179,6 +183,8 @@ pub struct WirePeer<'a> {
     pub addr: Option<&'a Multiaddr>,
     pub ip: Option<IpAddr>,
     pub pubkey: Option<[u8; 32]>,
+    /// B-SEED-SYND: lite syndication fan-outs in flight (total and for this peer).
+    pub syndication_load: crate::network::server_events::SyndicationLoad,
 }
 
 impl<'a> WirePeer<'a> {
@@ -188,7 +194,17 @@ impl<'a> WirePeer<'a> {
             addr,
             ip: addr.and_then(extract_ip_from_multiaddr),
             pubkey: NodeConfig::extract_ed25519_pubkey_from_peer_str(peer_id),
+            syndication_load: Default::default(),
         }
+    }
+
+    /// The same peer with the node's current lite syndication load.
+    pub fn with_syndication_load(
+        mut self,
+        load: crate::network::server_events::SyndicationLoad,
+    ) -> Self {
+        self.syndication_load = load;
+        self
     }
 }
 
@@ -735,7 +751,58 @@ pub fn handle_mesh_wire_reply<P: WireRolePolicy>(
 /// What a handler returns: a response now, or a relay forward to run off the swarm task.
 pub enum WireReply {
     Ready(Box<MeshWireResponse>),
-    Deferred(Box<RelayForward>),
+    Deferred(Box<DeferredJob>),
+}
+
+/// Work a handler hands off the swarm task: an onion relay forward (F-18) or a lite syndication
+/// fan-out (B-SEED-SYND, L-46). Each holds a slot in its own budget (`server_events`).
+pub enum DeferredJob {
+    Relay(Box<RelayForward>),
+    LiteFanOut(Box<crate::bootstrap::LiteFanOutPlan>),
+}
+
+impl DeferredJob {
+    /// Whether this job counts against the syndication budget (else the relay budget).
+    pub fn is_syndication(&self) -> bool {
+        matches!(self, DeferredJob::LiteFanOut(_))
+    }
+
+    /// Runs the job off the swarm task and returns the response to send.
+    pub async fn run(self) -> MeshWireResponse {
+        match self {
+            DeferredJob::Relay(job) => (*job).run().await,
+            DeferredJob::LiteFanOut(plan) => {
+                let t0 = std::time::Instant::now();
+                let done = tokio::task::spawn_blocking(move || {
+                    crate::bootstrap::run_lite_fan_out(
+                        *plan,
+                        crate::bootstrap::LITE_FANOUT_DEADLINE,
+                        crate::bootstrap::LITE_FANOUT_PARALLEL_PUTS,
+                    )
+                })
+                .await;
+                match done {
+                    Ok((receipt, syndicated_peers)) => {
+                        info!(
+                            job_ms = t0.elapsed().as_millis() as u64,
+                            mesh_peers_populated = receipt.mesh_peers_populated,
+                            "lite syndication fan-out finished"
+                        );
+                        MeshWireResponse::SyndicateLiteStripeAck {
+                            receipt: Some(receipt),
+                            syndicated_peers,
+                            error: None,
+                        }
+                    }
+                    Err(e) => MeshWireResponse::SyndicateLiteStripeAck {
+                        receipt: None,
+                        syndicated_peers: Vec::new(),
+                        error: Some(format!("syndication fan-out task failed: {e}")),
+                    },
+                }
+            }
+        }
+    }
 }
 
 impl WireReply {
@@ -826,7 +893,7 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
     request: MeshWireRequest,
     mut st: WireState<'_>,
     policy: &P,
-    deferred: &mut Option<RelayForward>,
+    deferred: &mut Option<DeferredJob>,
 ) -> MeshWireResponse {
     let class = admission_class(&request);
     if let Some(rejection) = admit(peer, &request, class, &mut st) {
@@ -1382,7 +1449,7 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
             }
             if let Some(next_hop) = target_peer_addr {
                 if let Some(client) = block_store.mesh_client() {
-                    *deferred = Some(RelayForward {
+                    *deferred = Some(DeferredJob::Relay(Box::new(RelayForward {
                         client: client.clone(),
                         delay_ms: 0,
                         hop: RelayHop::Final(Box::new(FinalHop {
@@ -1396,7 +1463,7 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                                 delete_verifier,
                             ),
                         })),
-                    });
+                    })));
                     relay_ack(Err("deferred".to_string()))
                 } else {
                     MeshWireResponse::RelayPqOnionAck {
@@ -1406,14 +1473,14 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                 }
             } else if let Ok(hop) = envelope.peel_relay_hop_pq(pq_kem) {
                 if let Some(client) = block_store.mesh_client() {
-                    *deferred = Some(RelayForward {
+                    *deferred = Some(DeferredJob::Relay(Box::new(RelayForward {
                         client: client.clone(),
                         delay_ms: envelope.jitter_delay_ms.min(250),
                         hop: RelayHop::Layered {
                             target: hop.target_peer_addr,
                             inner: hop.inner_envelope,
                         },
-                    });
+                    })));
                     relay_ack(Err("deferred".to_string()))
                 } else {
                     MeshWireResponse::RelayPqOnionAck {
@@ -1584,6 +1651,19 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                     error: Some(reason),
                 };
             }
+            // B-SEED-SYND (L-46): check the fan-out budget before any encode or write, so a busy
+            // refusal costs nothing; the enqueue check in `server_events` stays authoritative.
+            if let Err(code) = crate::network::server_events::syndication_fanout_decision(
+                peer.syndication_load.in_flight_total,
+                peer.syndication_load.in_flight_sender,
+            ) {
+                warn!(code, peer = %remote_peer_id, "refused a syndication: fan-out budget full");
+                return MeshWireResponse::SyndicateLiteStripeAck {
+                    receipt: None,
+                    syndicated_peers: Vec::new(),
+                    error: Some(crate::network::server_events::SYNDICATION_BUSY_TEXT.to_string()),
+                };
+            }
             let sender_device =
                 remote_pubkey.map(|pk| NodeIdentity::device_peer_id_for_pubkey(&pk));
             if let Err(code) = device_cert_decision(&cert.device_peer_id, sender_device.as_deref())
@@ -1644,27 +1724,42 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
             for id in &fresh {
                 por_verifier.clear_shard_binding(id);
             }
-            let grant_to_register = repair_grant.clone();
-            match server.ingest_and_syndicate_lite_stripe_with_grant(
-                &cert,
-                &bundle,
-                &[],
-                repair_grant,
-            ) {
-                Ok((receipt, syndicated_peers)) => {
-                    // F-02a: register only after the stripe was ingested, for that stripe.
-                    if let Some(grant) = grant_to_register {
-                        if let Err(code) = por_verifier.register_repair_grant_for_stored(
-                            grant,
-                            &syndicated_shard_ids(&bundle, receipt.stripe_merkle_root),
-                        ) {
+            // B-SEED-SYND: only the local ingest runs here, under the lock; the mesh fan-out is
+            // a deferred job without it.
+            let t0 = std::time::Instant::now();
+            match server.ingest_lite_stripe(&cert, &bundle) {
+                Ok(ingest) => {
+                    // F-02a: register only after the stripe was stored, for that stripe, and
+                    // before the fan-out.
+                    if let Some(grant) = repair_grant.clone() {
+                        if let Err(code) =
+                            por_verifier.register_repair_grant_for_stored(grant, &ingest.shard_ids)
+                        {
                             warn!(code, peer = %remote_peer_id, "repair grant not registered");
                         }
                     }
-                    MeshWireResponse::SyndicateLiteStripeAck {
-                        receipt: Some(receipt),
-                        syndicated_peers,
-                        error: None,
+                    info!(
+                        handler_ms = t0.elapsed().as_millis() as u64,
+                        shards = ingest.shard_ids.len(),
+                        "lite syndication ingested on the seed"
+                    );
+                    match server.lite_fan_out_plan(&ingest, repair_grant) {
+                        Ok(plan) => {
+                            *deferred = Some(DeferredJob::LiteFanOut(Box::new(plan)));
+                            // Not sent: the deferred job's response replaces it.
+                            MeshWireResponse::SyndicateLiteStripeAck {
+                                receipt: None,
+                                syndicated_peers: Vec::new(),
+                                error: None,
+                            }
+                        }
+                        Err((receipt, syndicated_peers)) => {
+                            MeshWireResponse::SyndicateLiteStripeAck {
+                                receipt: Some(receipt),
+                                syndicated_peers,
+                                error: None,
+                            }
+                        }
                     }
                 }
                 Err(e) => MeshWireResponse::SyndicateLiteStripeAck {

@@ -231,6 +231,8 @@ struct Fx {
     takedown: PublicTrackerTakedownQueue,
     admin_pk: [u8; 32],
     max_lease: u64,
+    /// B-SEED-SYND: the node's syndication load passed to the handler (zero by default).
+    syndication_load: parvault::network::server_events::SyndicationLoad,
     /// Owns `dir`; declared last so the fixture's state drops before the directory is removed.
     _root: TempDir,
 }
@@ -276,6 +278,7 @@ impl Fx {
             takedown: PublicTrackerTakedownQueue::load_or_init(&dir).unwrap(),
             admin_pk: keys.admin.public_key_bytes(),
             max_lease: SEED_DEFAULT_LEASE_LIMIT,
+            syndication_load: Default::default(),
             _root: root,
             store,
             server,
@@ -290,6 +293,7 @@ impl Fx {
                 Some(&peer.addr),
                 req,
                 DaemonWireHandlerCtx {
+                    syndication_load: self.syndication_load,
                     cfg: &self.cfg,
                     node_identity: &self.node,
                     genesis_pubkey: Some(self.genesis),
@@ -314,6 +318,7 @@ impl Fx {
                     Some(&peer.addr),
                     req,
                     SeedWireHandlerCtx {
+                        syndication_load: self.syndication_load,
                         data_dir: &self.dir,
                         node_identity: &self.node,
                         advertised_admin_pk: advertised,
@@ -1741,6 +1746,45 @@ fn syndicate_lite_stripe() {
     let o = t.run(&peer, &good);
     assert!(o[0].resp.contains("receipt: Some"), "{}", o[0].resp);
     assert_eq!(o[0], o[1]);
+
+    // B-SEED-SYND (L-46): at the fan-out budget every role refuses a new stripe identically,
+    // before any encode or write.
+    let ct3 = vec![0x3F; 32 * 1024];
+    let set3 = encode_ciphertext_stripe(0, &ct3, ErasureTier::Homelab).unwrap();
+    let busy_req = MeshWireRequest::SyndicateLiteStripe {
+        cert: cert2.clone(),
+        bundle: LiteStripeSyndicationBundle {
+            stripe_index: 0,
+            tier: ErasureTier::Homelab,
+            ciphertext_bytes: ct3,
+            expected_stripe_merkle_root: set3.stripe_merkle_root,
+            expected_shard_hashes: set3.shard_hashes.clone(),
+        },
+        repair_grant: None,
+    };
+    t.each(|fx, _| {
+        fx.syndication_load = parvault::network::server_events::SyndicationLoad {
+            in_flight_total: parvault::network::server_events::MAX_SYNDICATIONS_IN_FLIGHT,
+            in_flight_sender: 0,
+        }
+    });
+    let o = t.run(&peer, &busy_req);
+    for out in &o {
+        assert!(
+            out.resp
+                .contains(parvault::network::server_events::SYNDICATION_BUSY_TEXT),
+            "{}",
+            out.resp
+        );
+    }
+    assert_identical(&o);
+    let busy_id = ShardId {
+        stripe_merkle_root: set3.stripe_merkle_root,
+        shard_index: 0,
+        shard_hash: set3.shard_hashes[0],
+    };
+    assert!(t.fx.iter().all(|f| !f.store.has_shard(&busy_id)));
+    t.each(|fx, _| fx.syndication_load = Default::default());
 
     let root = set.stripe_merkle_root;
     t.each(|fx, k| fx.ban(k, EvictionTarget::StripeMerkleRoot(root)));

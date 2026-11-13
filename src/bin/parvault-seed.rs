@@ -1922,7 +1922,7 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
                 server_events.send_deferred(&mut swarm, done);
             }
             event = swarm.select_next_some() => {
-                let unhandled = server_events.handle(&mut swarm, event, |peer_str, remote_addr, request| {
+                let unhandled = server_events.handle(&mut swarm, event, |peer_str, remote_addr, request, syndication_load| {
                             let mut st = shared
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1942,6 +1942,7 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
                                 remote_addr,
                                 request,
                                 SeedWireHandlerCtx {
+                                    syndication_load,
                                     data_dir: &data_dir,
                                     node_identity: &node_identity,
                                     advertised_admin_pk,

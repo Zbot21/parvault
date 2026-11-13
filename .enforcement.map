@@ -30,6 +30,9 @@ no-blocking F-18     path=src/network/wire_handler.rs
 # handler modules instead (register: B-DISC).
 no-blocking B-DISC   path=src/network/server_events.rs
 no-blocking B-DISC   path=src/cli/daemon.rs
+# B-SEED-SYND (L-46): the seed's handler modules; the lite fan-out runs on the blocking pool.
+no-blocking B-SEED-SYND path=src/bootstrap.rs
+no-blocking B-SEED-SYND path=src/bin/parvault-seed.rs
 
 # --- ADR cross-references (existence only; F-16's keyword table is curated in its own item) --------
 xref       X-ADR     path=src/**.rs pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md
@@ -145,5 +148,9 @@ claim      G-SEAL    sym=src/gateway/engine.rs::gateway_memfd_seal_decision acce
 claim      G-UID     sym=src/gateway/engine.rs::gateway_peer_uid_decision accept=trust_enforcement::guid_allowed_peer_uid_served reject=trust_enforcement::guid_peer_uid_not_allowed_refused code=reject.gateway_peer_uid_not_allowed bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md
 kani       S-GUARD   sym=src/network/wot.rs::slash_target_decision harness=proof_slash_guard_protects_genesis_and_self cover=protected key not slashed
 kani       S-SANITIZE sym=src/sync.rs::sanitize_sync_relative_path_into harness=proof_sanitize_sync_relative_path_no_traversal cover=traversal segment rejected
+
+# --- B-SEED-SYND (2c): the seed's lite fan-out runs off the swarm task, within a budget (L-46) ---
+claim      B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision accept=trust_enforcement::bseed_second_sender_accepted_while_one_job_runs reject=trust_enforcement::bseed_third_job_refused_busy code=reject.syndication_busy bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe
+kani       B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision harness=proof_syndication_fanout_budget cover=syndication over budget
 
 ratchet    R         open=7 waive=11

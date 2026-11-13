@@ -41,7 +41,50 @@ pub fn relay_forward_decision(
 /// Refusal text for a forward over the relay budget.
 pub const RELAY_BUSY_TEXT: &str = "relay busy; retry later";
 
-type DeferredResponse = (ResponseChannel<MeshWireResponse>, String, MeshWireResponse);
+/// B-SEED-SYND (L-46): lite syndication fan-outs in flight on this node, across all senders.
+pub const MAX_SYNDICATIONS_IN_FLIGHT: usize = 2;
+/// B-SEED-SYND: lite syndication fan-outs in flight for one sender.
+pub const MAX_SYNDICATIONS_PER_SENDER: usize = 1;
+
+/// B-SEED-SYND: admits one more lite syndication only under both in-flight caps. Checked by the
+/// handler before the local ingest (so a refusal costs no encode and no write) and again,
+/// authoritatively, when the fan-out job is queued. Its own counter, separate from relays.
+pub fn syndication_fanout_decision(
+    in_flight_total: usize,
+    in_flight_sender: usize,
+) -> Result<(), &'static str> {
+    if in_flight_total >= MAX_SYNDICATIONS_IN_FLIGHT
+        || in_flight_sender >= MAX_SYNDICATIONS_PER_SENDER
+    {
+        Err("reject.syndication_busy")
+    } else {
+        Ok(())
+    }
+}
+
+/// Refusal text for a syndication over the fan-out budget; clients back off and retry on it.
+pub const SYNDICATION_BUSY_TEXT: &str = "seed syndication busy; retry later";
+
+/// Lite syndication load seen by one request: fan-outs in flight in total and for its sender.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyndicationLoad {
+    pub in_flight_total: usize,
+    pub in_flight_sender: usize,
+}
+
+/// Which budget a deferred job holds a slot in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredKind {
+    Relay,
+    Syndication,
+}
+
+pub type DeferredResponse = (
+    ResponseChannel<MeshWireResponse>,
+    String,
+    MeshWireResponse,
+    DeferredKind,
+);
 
 /// The routing-table rule (F-11): mDNS never feeds Kademlia; admission does. A peer enters the
 /// table only when its handshake or public-commons ticket was accepted.
@@ -130,6 +173,9 @@ pub struct ServerSwarmEvents {
     /// Deferred onion forwards; their responses go out from [`Self::next_deferred`].
     deferred: FuturesUnordered<BoxFuture<'static, DeferredResponse>>,
     relays_per_peer: HashMap<String, usize>,
+    /// B-SEED-SYND: lite syndication fan-outs in flight (total and per sender).
+    syndications_total: usize,
+    syndications_per_peer: HashMap<String, usize>,
 }
 
 impl ServerSwarmEvents {
@@ -141,6 +187,8 @@ impl ServerSwarmEvents {
             admitted_peers: std::collections::HashSet::new(),
             deferred: FuturesUnordered::new(),
             relays_per_peer: HashMap::new(),
+            syndications_total: 0,
+            syndications_per_peer: HashMap::new(),
         }
     }
 
@@ -160,11 +208,18 @@ impl ServerSwarmEvents {
         swarm: &mut Swarm<MeshNetworkBehaviour>,
         done: DeferredResponse,
     ) {
-        let (channel, peer, response) = done;
-        if let Some(n) = self.relays_per_peer.get_mut(&peer) {
+        let (channel, peer, response, kind) = done;
+        let per_peer = match kind {
+            DeferredKind::Relay => &mut self.relays_per_peer,
+            DeferredKind::Syndication => {
+                self.syndications_total = self.syndications_total.saturating_sub(1);
+                &mut self.syndications_per_peer
+            }
+        };
+        if let Some(n) = per_peer.get_mut(&peer) {
             *n = n.saturating_sub(1);
             if *n == 0 {
-                self.relays_per_peer.remove(&peer);
+                per_peer.remove(&peer);
             }
         }
         let _ = swarm
@@ -183,7 +238,7 @@ impl ServerSwarmEvents {
         on_request: F,
     ) -> Option<MeshSwarmEvent>
     where
-        F: FnOnce(&str, Option<&Multiaddr>, MeshWireRequest) -> WireReply,
+        F: FnOnce(&str, Option<&Multiaddr>, MeshWireRequest, SyndicationLoad) -> WireReply,
     {
         match event {
             SwarmEvent::ConnectionEstablished {
@@ -274,16 +329,57 @@ impl ServerSwarmEvents {
             )) => {
                 let peer_str = peer.to_string();
                 let remote_addr = self.peer_remote_addrs.get(&peer_str).cloned();
-                let response = match on_request(&peer_str, remote_addr.as_ref(), request) {
+                let load = SyndicationLoad {
+                    in_flight_total: self.syndications_total,
+                    in_flight_sender: self
+                        .syndications_per_peer
+                        .get(&peer_str)
+                        .copied()
+                        .unwrap_or(0),
+                };
+                let response = match on_request(&peer_str, remote_addr.as_ref(), request, load) {
                     WireReply::Ready(response) => *response,
+                    WireReply::Deferred(job) if job.is_syndication() => {
+                        // Authoritative enqueue check (the handler checked before ingest too).
+                        match syndication_fanout_decision(
+                            load.in_flight_total,
+                            load.in_flight_sender,
+                        ) {
+                            Ok(()) => {
+                                self.syndications_total += 1;
+                                *self
+                                    .syndications_per_peer
+                                    .entry(peer_str.clone())
+                                    .or_insert(0) += 1;
+                                self.deferred.push(Box::pin(async move {
+                                    (
+                                        channel,
+                                        peer_str,
+                                        job.run().await,
+                                        DeferredKind::Syndication,
+                                    )
+                                }));
+                                return None;
+                            }
+                            Err(code) => {
+                                warn!(code, peer = %peer_str, "refused a syndication fan-out");
+                                MeshWireResponse::SyndicateLiteStripeAck {
+                                    receipt: None,
+                                    syndicated_peers: Vec::new(),
+                                    error: Some(SYNDICATION_BUSY_TEXT.to_string()),
+                                }
+                            }
+                        }
+                    }
                     WireReply::Deferred(job) => {
                         let in_flight_peer =
                             self.relays_per_peer.get(&peer_str).copied().unwrap_or(0);
-                        match relay_forward_decision(self.deferred.len(), in_flight_peer) {
+                        let relays_total: usize = self.relays_per_peer.values().sum();
+                        match relay_forward_decision(relays_total, in_flight_peer) {
                             Ok(()) => {
                                 *self.relays_per_peer.entry(peer_str.clone()).or_insert(0) += 1;
                                 self.deferred.push(Box::pin(async move {
-                                    (channel, peer_str, job.run().await)
+                                    (channel, peer_str, job.run().await, DeferredKind::Relay)
                                 }));
                                 return None;
                             }
