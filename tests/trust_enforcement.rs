@@ -2376,6 +2376,7 @@ fn f37_ticket_only_node_refuses_zero_rooted_chain() {
         "{}",
         node.log_text()
     );
+    gate_ran("trust_enforcement::f37_ticket_only_node_refuses_zero_rooted_chain");
 }
 
 /// F-37: a ring node still admits a real chain.
@@ -2385,4 +2386,5 @@ fn f37_ring_node_admits_real_chain() {
     let member = NodeIdentity::generate();
     let resp = handshake(&member, &node, chain_for(&member));
     assert!(accepted(&resp), "{resp:?}");
+    gate_ran("trust_enforcement::f37_ring_node_admits_real_chain");
 }
