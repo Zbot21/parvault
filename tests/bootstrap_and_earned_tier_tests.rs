@@ -801,7 +801,7 @@ fn test_mechanism6_blockstore_physical_file_deletion_over_time_on_lease_expiry_a
     // The sweep removed the lease, so the read is refused before any file lookup (F-42: a
     // shard with no registered capability is unreadable).
     assert!(
-        matches!(read_deleted_x, Err(StorageError::QuotaExceeded(_))),
+        matches!(read_deleted_x, Err(StorageError::Unauthorized)),
         "Reading departed Node X's evicted shard must be refused: {read_deleted_x:?}"
     );
 
@@ -827,7 +827,7 @@ fn test_mechanism6_blockstore_physical_file_deletion_over_time_on_lease_expiry_a
     // Deleted with its lease, so the read is refused (F-42: no registered capability).
     assert!(matches!(
         store.get_blinded_shard_authorized(&bid_y, &cap_y, 1_000, &read_sig_y, 1_000),
-        Err(StorageError::QuotaExceeded(_))
+        Err(StorageError::Unauthorized)
     ));
 }
 

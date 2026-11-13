@@ -1269,7 +1269,9 @@ fn get_blinded_shard() {
             read_sig: vec![0; 10],
         },
     );
-    assert!(o[0].resp.contains("invalid 64-byte"));
+    // A wrong-length signature is an invalid one: the uniform refusal (QA 2c).
+    assert!(o[0].resp.contains("shard_bytes: None"), "{}", o[0].resp);
+    assert!(o[0].resp.contains("unauthorized"), "{}", o[0].resp);
     assert_identical(&o);
     let ts = now_ms();
     let sig = BlindedShardCapability::sign_read_token(&b.cap_ident, &b.id.locator, ts);

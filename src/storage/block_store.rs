@@ -35,6 +35,11 @@ pub enum StorageError {
     InvalidRange { offset: u64, length: u64, size: u64 },
     #[error("Storage quota or reciprocity limit exceeded for peer {0}")]
     QuotaExceeded(String),
+    /// A blinded-shard read, delete or re-put that its capability does not authorise. One
+    /// variant and one text for every cause (rebind, no capability, key mismatch, stale, bad
+    /// signature), so a refusal never tells a stranger whether a legacy entry exists (QA 2c).
+    #[error("unauthorized")]
+    Unauthorized,
     #[error("Shard integrity hash mismatch")]
     CorruptedShard,
     #[error("Rejected DHT manifest update: invalid owner Ed25519 signature or version rollback")]
@@ -1111,9 +1116,7 @@ impl BlockStore {
             capability.capability_pubkey,
         ) {
             tracing::warn!(code, "refused a blinded re-put with another capability");
-            return Err(StorageError::QuotaExceeded(
-                "blinded locator bound to another capability".into(),
-            ));
+            return Err(StorageError::Unauthorized);
         }
 
         if let Some(ref mem) = self.in_memory {
@@ -1365,7 +1368,7 @@ impl BlockStore {
         &self,
         blinded_id: &BlindedShardId,
         timestamp_ms: u64,
-        sig: &[u8; 64],
+        sig: &[u8],
         host_pubkey: &[u8; 32],
         now_ms: u64,
     ) -> Result<bool, StorageError> {
@@ -1381,6 +1384,9 @@ impl BlockStore {
             id_matches: stored_id == Some(*blinded_id),
             fresh: timestamp_ms.abs_diff(now_ms) <= crate::storage::MAX_CAPABILITY_CLOCK_SKEW_MS,
             sig_valid: registered.is_some_and(|pk| {
+                let Ok(sig) = <&[u8; 64]>::try_from(sig) else {
+                    return false;
+                };
                 BlindedShardCapability {
                     locator: blinded_id.locator,
                     capability_pubkey: pk,
@@ -1444,7 +1450,7 @@ impl BlockStore {
         blinded_id: &BlindedShardId,
         capability: &BlindedShardCapability,
         timestamp_ms: u64,
-        read_sig: &[u8; 64],
+        read_sig: &[u8],
         now_ms: u64,
     ) -> Result<Vec<u8>, StorageError> {
         // ADR-15: the capability key must be the one registered with the lease (no caller-supplied
@@ -1459,13 +1465,12 @@ impl BlockStore {
             capability_registered: registered == Some(capability.capability_pubkey),
             locator_matches: capability.locator == blinded_id.locator,
             fresh: timestamp_ms.abs_diff(now_ms) <= crate::storage::MAX_CAPABILITY_CLOCK_SKEW_MS,
-            sig_valid: capability.verify_read_token(timestamp_ms, read_sig),
+            sig_valid: <&[u8; 64]>::try_from(read_sig)
+                .is_ok_and(|sig| capability.verify_read_token(timestamp_ms, sig)),
         };
         if let Err(code) = crate::storage::anonymity::blinded_read_decision(&facts) {
             tracing::warn!(code, "refused a blinded shard read");
-            return Err(StorageError::QuotaExceeded(
-                "unauthorized_blinded_shard_capability".into(),
-            ));
+            return Err(StorageError::Unauthorized);
         }
         if let Some(ref mem) = self.in_memory {
             let bytes = mem

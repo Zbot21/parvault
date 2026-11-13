@@ -9,7 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Security
-- **Public status is coarse (F-44).** `QueryNodeStatus` reports capacity in power-of-two GiB buckets and SLA to one decimal, not exact values.
+- **Public status is coarse (F-44).** `QueryNodeStatus` reports free space rounded down to whole MiB, used space in power-of-two GiB buckets and SLA to one decimal, not exact values.
 - **Gateway identity statements are pinned (F-17).** `GatewayIdentityStatement::verify(now)` is replaced by `verify_pinned(expected_authority, now)`, which refuses another authority and a lifetime outside `(0, 30 days]`. **Breaking (library):** callers (the suite broker) must pin their authority.
 - **Post-quantum DHT manifests fail closed (PQ-DHT).** The DHT reader refuses `PostQuantumManifest` candidates (`reject.dht_owner_unbindable`) until an owner PQ key is bound to an identity.
 - **Reason codes on the remaining checks (2c D-ADR).** Oversized wire frames (`reject.wire_frame_oversized`), LAN beacons (`reject.beacon_*`), per-peer quotas (`reject.peer_quota_exceeded`, `reject.peer_write_amplification`), hybrid signatures (`reject.hybrid_sig_*`), PoR pre-screens (`reject.por_*`) and abuse reports (`reject.abuse_report_*`) now log a distinct code; each has a claim in `.enforcement.map`.

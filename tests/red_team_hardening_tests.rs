@@ -171,7 +171,7 @@ fn test_rt2_blinded_capability_pinning_clock_skew_and_tombstone_generation_repla
             &attacker_sig,
             1_000_000
         ),
-        Err(StorageError::QuotaExceeded(_))
+        Err(StorageError::Unauthorized)
     ));
 
     // Genuine owner capability succeeds

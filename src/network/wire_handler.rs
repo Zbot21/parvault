@@ -1221,19 +1221,12 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
             timestamp_ms,
             read_sig,
         } => {
-            if read_sig.len() != 64 {
-                return MeshWireResponse::BlindedShardResult {
-                    shard_bytes: None,
-                    error: Some("invalid 64-byte capability signature length".to_string()),
-                };
-            }
-            let mut sig64 = [0u8; 64];
-            sig64.copy_from_slice(&read_sig);
+            // A wrong-length signature is just an invalid one (QA 2c): the decision logs it.
             match block_store.get_blinded_shard_authorized(
                 &blinded_id,
                 &capability,
                 timestamp_ms,
-                &sig64,
+                &read_sig,
                 now_unix_ms(),
             ) {
                 Ok(bytes) => MeshWireResponse::BlindedShardResult {
@@ -1339,16 +1332,10 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
             timestamp_ms,
             sig,
         } => {
-            let Ok(sig64) = <[u8; 64]>::try_from(sig.as_slice()) else {
-                return MeshWireResponse::DeleteBlindedShardAck {
-                    deleted: false,
-                    error: Some("invalid 64-byte delete signature length".into()),
-                };
-            };
             match block_store.delete_blinded_shard_signed(
                 &blinded_id,
                 timestamp_ms,
-                &sig64,
+                &sig,
                 &node_identity.public_key_bytes(),
                 now_unix_ms(),
             ) {
@@ -1733,14 +1720,17 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
         MeshWireRequest::QueryNodeStatus => {
             let rep = server.status_report(1);
             let available_bytes = rep.max_storage_bytes.saturating_sub(rep.used_storage_bytes);
-            // F-44: status is public, so capacity and SLA are coarse (power-of-two GiB buckets,
-            // like the census beacon; SLA to one decimal), never a host fingerprint.
+            // F-44: status is public, so values are coarse, never a host fingerprint. Free space
+            // is rounded DOWN to whole MiB (never overstated, so placement does not pick a node
+            // that then refuses; small nodes stay visible); used space is a power-of-two GiB
+            // bucket like the census beacon; SLA to one decimal.
             let bucket = |b: u64| crate::telemetry::round_to_pow2_gib(b).saturating_mul(1 << 30);
+            let floor_mib = |b: u64| b - b % (1 << 20);
             MeshWireResponse::NodeStatusResult {
                 peer_id: server.server_peer_id().to_string(),
                 asn: 64512,
                 region: policy.status_region().to_string(),
-                available_bytes: bucket(available_bytes),
+                available_bytes: floor_mib(available_bytes),
                 used_bytes: bucket(rep.used_storage_bytes),
                 sla_score: (rep.sla_ratio * 10.0).round() / 10.0,
                 pq_kem_pubkey: Some(pq_kem.public_key()),
