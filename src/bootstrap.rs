@@ -1,4 +1,4 @@
-//! # Elastic Day-1-to-10,000-User Bootstrap & Earned Tier Progression Engine (`ADR-13`)
+//! # Elastic Day-1-to-10,000-User Bootstrap & Earned Tier Progression Engine (`ADR-15`)
 //!
 //! Solves the P2P Cold-Start problem and replaces manual `--tier homelab` selection with
 //! cryptographically and empirically **Earned Tier Progression**:
@@ -20,6 +20,8 @@
 //!    Rewards early adopters for committed standby capacity during bootstrap epochs while applying
 //!    $1 / \sqrt{M_{\text{subnet}}}$ inverse-square-root Sybil quota damping per `/24` subnet and
 //!    strictly bounding per-stripe fault domains to $\le N - K$ shards per `/24`.
+//!
+//! Formal model: `specs/ParVaultBootstrapAndEarnedTier.tla` (guard `tier-respects-slash`).
 
 use crate::crypto::pqc::{HybridPqPublicKey, HybridPqSignature, HybridPqSigningKeypair};
 use crate::crypto::CryptoError;
@@ -197,7 +199,7 @@ impl PersonalDeviceCert {
     }
 }
 
-/// Earned Redundancy Standing (`ADR-13`):
+/// Earned Redundancy Standing (`ADR-15`):
 /// Nodes CANNOT arbitrarily pick `--tier homelab` on the CLI to get cheap `1.25x` storage.
 /// Instead, a node's $(k, n)$ erasure profile and reciprocity expansion tax are **earned**
 /// via sustained Proof-of-Retrievability (`PoR`) uptime and scaled elastically with network size.
@@ -343,7 +345,7 @@ pub struct SeedAnchorDrainMigration {
     pub to_subnet_prefix: String,
 }
 
-/// Elastic Bootstrap, Placement & Pioneer Quota Engine (`ADR-13`).
+/// Elastic Bootstrap, Placement & Pioneer Quota Engine (`ADR-15`).
 pub struct ElasticBootstrapEngine;
 
 impl ElasticBootstrapEngine {
@@ -647,12 +649,12 @@ impl ElasticBootstrapEngine {
     }
 }
 
-/// Maximum lease duration or single-renewal extension (365 epochs) to prevent `u64::MAX` infinite pinning (`ADR-15`).
+/// Maximum lease duration or single-renewal extension (365 epochs) to prevent `u64::MAX` infinite pinning (`ADR-19`).
 pub const MAX_BLINDED_LEASE_EPOCHS: u64 = 365;
 
 /// Cryptographic capability tombstone (`BlindedShardTombstone`) allowing a departing node
 /// or file owner to delete a specific [`BlindedShardId`](crate::storage::anonymity::BlindedShardId)
-/// in $O(1)$ without revealing its `PeerId` or linking other shards (`ADR-13` / `ADR-15`).
+/// in $O(1)$ without revealing its `PeerId` or linking other shards (`ADR-11`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlindedShardTombstone {
     pub blinded_shard_id: [u8; 32],
@@ -680,7 +682,7 @@ impl BlindedShardTombstone {
         Self::create_for_generation(delete_verifier, blinded_shard_id, nonce, 0)
     }
 
-    /// Creates a generation-scoped `BlindedShardTombstone` (`ADR-15`) bound to `lease_generation`
+    /// Creates a generation-scoped `BlindedShardTombstone` (`ADR-19` signed delete) bound to `lease_generation`
     /// so old tombstones cannot be replayed after a shard is legitimately re-uploaded.
     pub fn create_for_generation(
         delete_verifier: &[u8; 32],
@@ -725,7 +727,7 @@ impl BlindedShardTombstone {
 }
 
 /// Metadata tracked per blinded shard on a storage node for **Identity-Free Lease Eviction**
-/// when an anonymous owner node permanently leaves the network (`ADR-13` / `ADR-15`).
+/// when an anonymous owner node permanently leaves the network (`ADR-11`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlindedShardLeaseEntry {
     pub blinded_shard_id: [u8; 32],
@@ -816,7 +818,7 @@ impl BlindedShardLeaseManager {
     }
 
     /// Stores a blinded shard while binding its `BlindedShardCapability` public key (`capability_pubkey`)
-    /// and incrementing its monotonic `lease_generation` (`ADR-15`).
+    /// and incrementing its monotonic `lease_generation` (`ADR-19` lease pinning).
     pub fn store_with_capability_and_lease(
         &mut self,
         blinded_shard_id: [u8; 32],
@@ -1027,7 +1029,7 @@ pub struct SeedServerStatusReport {
     pub holds_own_plaintext_files: bool,
 }
 
-/// Client operating mode for `parvault` (`ADR-17`):
+/// Client operating mode for `parvault` (`ADR-20`):
 /// - [`ClientOperatingMode::FullMeshNode`]: Full 24/7 P2P node that encodes and distributes `N`
 ///   Reed-Solomon shards directly to mesh peers and answers PoR challenges.
 /// - [`ClientOperatingMode::LiteSeedBacked`]: Laptop/roaming "Lite" client that runs the exact same
@@ -1043,7 +1045,7 @@ pub enum ClientOperatingMode {
 }
 
 /// A `1.0x` encrypted ciphertext stripe bundle sent by a `LiteSeedBacked` laptop to its paired
-/// `parvault-seed` server for zero-knowledge Reed-Solomon encoding and mesh syndication (`ADR-17`).
+/// `parvault-seed` server for zero-knowledge Reed-Solomon encoding and mesh syndication (`ADR-20`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiteStripeSyndicationBundle {
     pub stripe_index: u64,
@@ -1183,7 +1185,7 @@ pub fn run_lite_fan_out(
     (plan.ingest.receipt(populated), syndicated_peers)
 }
 
-/// Route used by a Lite Client when selectively restoring files or byte ranges (`ADR-17`).
+/// Route used by a Lite Client when selectively restoring files or byte ranges (`ADR-20`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LiteRestoreRoute {
     /// Fast 1-hop read from the paired `parvault-seed` server (local LAN or remote "Cloud-Away-From-Home").
@@ -1193,7 +1195,7 @@ pub enum LiteRestoreRoute {
     DirectFromMeshPeersFallback,
 }
 
-/// Standalone Zero-Trust Seed & Redundancy Server engine (`ADR-13`).
+/// Standalone Zero-Trust Seed & Redundancy Server engine (`ADR-16`).
 ///
 /// Holds **zero user plaintext or local folders of its own** and operates in either:
 /// - [`SeedServerMode::HomelabRedundancyVault`] (dedicated 24/7 personal device ring + uptime anchor), or
@@ -1340,7 +1342,7 @@ impl ZeroTrustSeedServer {
         Ok(self.block_store.get_shard(shard_id)?)
     }
 
-    /// Zero-Knowledge Lite-Client Stripe Ingestion & Mesh Syndication (`ADR-17`):
+    /// Zero-Knowledge Lite-Client Stripe Ingestion & Mesh Syndication (`ADR-20`):
     ///
     /// A laptop running in `ClientOperatingMode::LiteSeedBacked` encrypts its files locally
     /// (`AES-256-GCM` / `PqVaultMasterKey` — `K_user` never leaves the laptop) and sends a
@@ -1370,7 +1372,7 @@ impl ZeroTrustSeedServer {
     }
 
     /// Syndicates a Lite-Client `1.0x` encrypted stripe while forwarding the owner's `RepairGrant`
-    /// to each syndicated mesh peer (`ADR-17`) and returning the assigned peer addresses.
+    /// to each syndicated mesh peer (`ADR-20`) and returning the assigned peer addresses.
     pub fn ingest_and_syndicate_lite_stripe_with_grant(
         &mut self,
         cert: &PersonalDeviceCert,
@@ -1709,7 +1711,7 @@ pub fn normalize_subnet_prefix_key(raw_prefix: &str) -> String {
     raw_prefix.to_string()
 }
 
-/// Correlated ISP Outage Circuit-Breaker & Anti-Repair-Storm Controller (`ADR-13` / `ADR-14` / `ADR-15`).
+/// Correlated ISP Outage Circuit-Breaker & Anti-Repair-Storm Controller (`ADR-15`).
 pub struct CorrelatedOutageController;
 
 impl CorrelatedOutageController {

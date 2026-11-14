@@ -1,6 +1,7 @@
 # ADR-20: Lite-Client `1.0×` Seed Syndication, NAS-Death Mesh Failover & Selective Byte-Range Restore
 
 - **Status:** Accepted
+- **Formal model:** `specs/ParVaultLiteClientAndSeedFailover.tla`
 - **Subsystem:** `bootstrap` / `sync`
 - **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
 

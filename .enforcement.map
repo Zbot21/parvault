@@ -34,16 +34,73 @@ no-blocking B-DISC   path=src/cli/daemon.rs
 no-blocking B-SEED-SYND path=src/bootstrap.rs
 no-blocking B-SEED-SYND path=src/bin/parvault-seed.rs
 
-# --- ADR cross-references (existence only; F-16's keyword table is curated in its own item) --------
-xref       X-ADR     path=src/**.rs pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md
-xref       X-ADR-DOC path=docs/**.md pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md
+# --- ADR cross-references (F-16): every ADR-NN citation resolves and names a topic of that ADR on the
+# same line (docs/adr/xref-keywords.txt) ------------------------------------------------------------
+xref       X-ADR     path=src/**.rs pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md expect=docs/adr/xref-keywords.txt
+xref       X-ADR-DOC path=docs/**.md pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md expect=docs/adr/xref-keywords.txt
+# Root docs except CHANGELOG.md, whose released sections keep the ADR numbers of their release (history).
+xref       X-ADR-ROOT path=[!C]*.md pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md expect=docs/adr/xref-keywords.txt
+xref       X-ADR-CONTRIB path=CONTRIBUTING.md pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md expect=docs/adr/xref-keywords.txt
+# Prose citations in specs; the @traceability adr lists are resolved by tla-trace.
+xref       X-ADR-SPEC path=specs/*.tla pattern=[(`]ADR-(\d+) target=docs/adr/ADR-{}-*.md expect=docs/adr/xref-keywords.txt
 
 # --- Formal proofs (P-01 to P-05; mutants are authored by QA) --------------------------------------
 tla-spec   T-SPECS   path=specs/*.tla
-open       T-SPECS   expect=tla-lint by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
-open       T-SPECS   expect=completeness by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+# M5a: spec <-> ADR <-> Rust traceability; each @guard sym is reached from a production entry.
+tla-trace  T-TRACE   path=specs/*.tla
+reach      TR-NULLIFIER-FRESH sym=src/storage/anonymity.rs::redeem_voucher from=src/network/wire_handler.rs::handle_mesh_wire_request
+reach      TR-TIER-RESPECTS-SLASH sym=src/bootstrap.rs::evaluate from=src/cli/daemon.rs::run_daemon
+reach      TR-SLASHED-STICKY sym=src/storage/quota.rs::trust_level from=src/cli/daemon.rs::run_daemon
+reach      TR-HYBRID-SIG-BOTH sym=src/crypto/pqc.rs::hybrid_signature_decision from=src/network/wire_handler.rs::handle_mesh_wire_request
+reach      TR-READ-AUTH-OWNER sym=src/por/verifier.rs::grant_owner_decision from=src/network/wire_handler.rs::handle_mesh_wire_request
+reach      TR-READ-AUTH-REPAIR sym=src/por/verifier.rs::repair_read_decision from=src/network/wire_handler.rs::handle_mesh_wire_request
+reach      TR-WOT-ADMISSION sym=src/network/wot.rs::chain_admission_decision from=src/network/wire_handler.rs::handle_mesh_wire_request
+reach      TR-QUORUM-COUNT sym=src/storage/eviction.rs::tally_and_verify_quorum_raw from=src/network/wire_handler.rs::handle_mesh_wire_request
+reach      TR-NONCE-FRESH sym=src/admin_rpc.rs::validate_admin_rpc_slice_replay_and_auth_meta from=src/bin/parvault-seed.rs::main
+reach      TR-ORDER-ID-FRESH sym=src/storage/eviction.rs::replay_slot_check from=src/network/wire_handler.rs::handle_mesh_wire_request
+reach      TR-RING-SCOPE sym=src/storage/council.rs::council_from_manifest from=src/network/wire_handler.rs::handle_mesh_wire_request
+# L-47 guard-removal mutants (QA, independent); each @guard line names its Rust decision via sym=.
+tla-mutant TM-READ-OWNER    spec=specs/ParVaultProtocol.tla inv=DataSecrecyInvariant patch=specs/mutants/ParVaultProtocol-read-auth-owner.patch
+tla-mutant TM-READ-REPAIR   spec=specs/ParVaultProtocol.tla inv=DataSecrecyInvariant patch=specs/mutants/ParVaultProtocol-read-auth-repair.patch
+tla-mutant TM-WOT-ADMIT     spec=specs/ParVaultProtocol.tla inv=SybilResistanceInvariant patch=specs/mutants/ParVaultProtocol-wot-admission.patch
+tla-mutant TM-NULLIFIER     spec=specs/ParVaultAnonymity.tla inv=Safety_NoVoucherDoubleSpend patch=specs/mutants/ParVaultAnonymity-nullifier-fresh.patch
+tla-mutant TM-TIER-SLASH    spec=specs/ParVaultBootstrapAndEarnedTier.tla inv=Safety_TierStrictlyEarnedByUptime patch=specs/mutants/ParVaultBootstrapAndEarnedTier-tier-respects-slash.patch
+tla-mutant TM-QUORUM        spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_NoUnauthorizedOrSubQuorumEviction patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-quorum-count.patch
+tla-mutant TM-NONCE         spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_NoNonceOrOrderReplay patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-nonce-fresh.patch
+tla-mutant TM-ORDER-ID      spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_NoNonceOrOrderReplay patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-order-id-fresh.patch
+tla-mutant TM-RING-SCOPE    spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_PrivateRingImmuneToPublicCouncil patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-ring-scope.patch
+tla-mutant TM-SLASH-STICKY  spec=specs/ParVaultConfidentialityAndTrust.tla inv=Safety_SlashedNeverTrusted patch=specs/mutants/ParVaultConfidentialityAndTrust-slashed-sticky.patch
+tla-mutant TM-HYBRID-SIG    spec=specs/ParVaultPostQuantum.tla inv=Safety_QuantumSignatureUnforgeability patch=specs/mutants/ParVaultPostQuantum-hybrid-sig-both.patch
+# L-47 invariants with no guard to remove (structural or assumption; each reason names its tag).
+waive      TM-W-DURABILITY  inv=specs/ParVaultProtocol.tla::DurabilitySafetyInvariant reason=assume bounded-epoch-churn (threat model, no Rust check)
+waive      TM-W-SLASH-BOUND inv=specs/ParVaultProtocol.tla::SlashingBoundInvariant reason=assume leaf-quarantine-not-run: record_failure is cfg(test), nothing slashes in v0.5.0 (ADR-09, N-09)
+waive      TM-W-PROTECTED    inv=specs/ParVaultProtocol.tla::ProtectedKeysNeverSlashedInvariant reason=assume slash-target-not-run: slash_target_decision is called only from cfg(test) may_slash; nothing slashes in v0.5.0 (ADR-09, N-09)
+waive      TM-W-ORIGIN      inv=specs/ParVaultAnonymity.tla::Safety_ZeroOriginLeakage reason=observedSender conjunct structural (only RelayNode is ever recorded, L-38/L-39 scope); the ephemeralIssuerIds conjunct is also broken by TM-NULLIFIER, so nullifier-fresh covers it in part
+waive      TM-W-DRAIN       inv=specs/ParVaultBootstrapAndEarnedTier.tla::Safety_SeedAnchorsDrainAtOrganicThreshold reason=structural: seed shards = MaxOrganicPeers - organic by construction
+waive      TM-W-DAY1        inv=specs/ParVaultBootstrapAndEarnedTier.tla::Safety_Day1ToScaleDataAvailability reason=structural: recoverable = TierN(tier), TierK < TierN tables
+waive      TM-W-ZK-TYPE     inv=specs/ParVaultZeroKeyAdminAndQuorum.tla::TypeOK reason=type invariant, not a security property; TM-NONCE also violates it (without the nonce guard, nonce 0, meaning no challenge, is accepted and recorded)
+waive      TM-W-VPS-KEY     inv=specs/ParVaultZeroKeyAdminAndQuorum.tla::Safety_ZeroAdminPrivKeyOnVpsDisk reason=structural no-admin-key-persist + assume byzantine-below-quorum
+waive      TM-W-SUBNET-CAP  inv=specs/ParVaultConfidentialityAndTrust.tla::Safety_SubnetTrustCapsEnforced reason=assume placement-trust-cap: select_trust_weighted_peers has no production caller in v0.5.0
+waive      TM-W-LITE-TYPE   inv=specs/ParVaultLiteClientAndSeedFailover.tla::TypeOK reason=structural: type invariant
+waive      TM-W-NAS-DEATH   inv=specs/ParVaultLiteClientAndSeedFailover.tla::NasDeathSurvivableInvariant reason=assume mesh-churn-stops-at-k (MeshPeerChurn; threat model, no Rust check)
+waive      TM-W-SELECTIVE   inv=specs/ParVaultLiteClientAndSeedFailover.tla::SelectiveBandwidthSavingInvariant reason=structural: restore downloads exactly the selected stripes
+waive      TM-W-HNDL        inv=specs/ParVaultPostQuantum.tla::Safety_HNDLConfidentialityPreserved reason=assume one-break-per-class (AdversaryChooseCapability); onion exposes_* fields structural
+waive      TM-W-GROVER      inv=specs/ParVaultPostQuantum.tla::Safety_GroverBitSecurityFloor reason=assume grover-quadratic-only (ActivateGroverSearch) and one-break-per-class for the cipher cap
 module     P-01      path=src/network/wot.rs pattern=^(verify_and_admit_|is_peer_|apply_slashing_|slash_|record_failure) kani=required
-open       P-01      expect=completeness by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+reach      P-01      sym=src/network/wot.rs::is_peer_trusted from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
+reach      P-01      sym=src/network/wot.rs::is_peer_trust_decision from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
+reach      P-01      sym=src/network/wot.rs::is_peer_quarantined from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
+reach      P-01      sym=src/network/wot.rs::verify_and_admit_chain from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
+reach      P-01      sym=src/network/wot.rs::verify_and_admit_chain_shape_decision from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
+reach      P-01      sym=src/network/wot.rs::verify_and_admit_public_ticket_decision from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
+kani       P-01      sym=src/network/wot.rs::is_peer_trust_decision harness=proof_peer_trust_never_quarantined cover=quarantined peer refused
+kani       P-01      sym=src/network/wot.rs::verify_and_admit_chain_shape_decision harness=proof_chain_shape_bounded_and_rooted cover=too deep or empty refused
+kani       P-01      sym=src/network/wot.rs::verify_and_admit_public_ticket_decision harness=proof_public_ticket_admission cover=revoked ticket refused
+waive      P-01      sym=src/network/wot.rs::is_peer_trusted reason=stateful wrapper over is_peer_trust_decision (kani proof_peer_trust_never_quarantined); registry HashMaps are outside CBMC
+waive      P-01      sym=src/network/wot.rs::is_peer_quarantined reason=set lookup with no decision; its use in trust is proven by proof_peer_trust_never_quarantined
+waive      P-01      sym=src/network/wot.rs::verify_and_admit_chain reason=stateful wrapper over verify_and_admit_chain_shape_decision (kani proof_chain_shape_bounded_and_rooted) and chain_admission_decision; Ed25519 hop signatures are outside CBMC
+waive      P-01      sym=src/network/wot.rs::verify_and_admit_public_ticket reason=stateful wrapper over verify_and_admit_public_ticket_decision (kani proof_public_ticket_admission); PoW hashing is outside CBMC
+waive      P-01      sym=src/network/wot.rs::slash_target_decision reason=the slash guard (genesis and own keys never slashed), proven by kani S-GUARD; no production slasher in v0.5.0 (record_failure and slash_immediately are test-only since F-01)
 
 # --- Claims ----------------------------------------------------------------------------------------
 claim      F-02a     sym=src/por/verifier.rs::grant_registration_decision accept=trust_enforcement::f02a_owner_grant_update_registered reject=trust_enforcement::f02a_grant_for_other_stripe_not_registered code=reject.repair_grant_root_mismatch bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-04-repair-grant-ciphertext-reconstruction.md
@@ -153,4 +210,4 @@ kani       S-SANITIZE sym=src/sync.rs::sanitize_sync_relative_path_into harness=
 claim      B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision accept=trust_enforcement::bseed_second_sender_accepted_while_one_job_runs reject=trust_enforcement::bseed_third_job_refused_busy code=reject.syndication_busy bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe
 kani       B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision harness=proof_syndication_fanout_budget cover=syndication over budget
 
-ratchet    R         open=7 waive=11
+ratchet    R         open=4 waive=30

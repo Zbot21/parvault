@@ -79,10 +79,12 @@ Status values:
 
 | ID | Sev | Finding | Item | Status |
 | :--- | :--- | :--- | :--- | :--- |
-| P-01 | High | No Kani harness touches `src/network/*`. | 2d-β | Reported |
+| P-01 | High | No Kani harness touches `src/network/*`. | 2d-β | Fixed (QA pending; Kani not yet run): `wot.rs` decisions `is_peer_trust_decision`, `verify_and_admit_chain_shape_decision`, `verify_and_admit_public_ticket_decision` with Kani harnesses and reject covers, plus `slash_target_decision` (S-GUARD); reach lines from `handle_mesh_wire_request`; `record_failure` and `slash_immediately` are test-only (no production caller since F-01). Waive 11→16 approved by Lead: 4 stateful wire-path wrappers over Kani-proven decisions, plus the slash guard with no production caller. |
 | P-02 | High | Specs hardcode the properties they claim to check. | 2d-β | Reported |
 | P-03 | Medium | `ParVaultZeroKeyAdminAndQuorum`: tautological replay guard; Byzantine count fixed by `ASSUME`. | 2d-β | Reported |
+| P-03-COUNCIL | Low | `ParVaultZeroKeyAdminAndQuorum` models one council view: no council membership change (epoch rotation, F-08/F-09 in code). | v0.6.0 | Open by `v0.6.0` (L-47 item 8, minimum scope) |
 | P-04 | Medium | Earned-tier invariants are near-tautologies; no spec models pairing, rendezvous or PoW admission. | 2d-β | Reported |
+| P-04-SPECS | Medium | No TLA+ spec models SAS pairing, WAN rendezvous or PoW admission (part of P-04; the earned-tier lint findings are fixed in 2d-β). | v0.6.0 | Open by `v0.6.0` (BACKLOG B-3) |
 | P-05 | Low | Subtree slash limit is `3` in the spec cfg and `5` in Rust. | 2d-β | Reported |
 
 ## Completeness and artifact lines
@@ -131,6 +133,10 @@ Claim lines in `.enforcement.map` use the finding id, or the finding id with a s
 | F-43-PIN | Low | `parvault-fuse` cannot verify its own pinned `--macaroon` (no root key), so a wrong token surfaces only at the first uncached read; on a cache hit the WebDAV edge check is the only check. | post-v0.5.0 | Open (L-44) |
 | F-43-NOEXPIRY | Low | Expiry is not required: a non-expiring read-only token sent in clear stays valid until the root key rotates. | post-v0.5.0 | Open (L-44) |
 | F-43-CONNCAP | Low | Pre-auth WebDAV connections are capped at 64 overall and 8 per source IP (added in 2c, QA r1), and each request head has a 5 s absolute deadline. A client with 8 or more source IPs, or another process on the same host as a loopback user (both share `127.0.0.1`), can still keep the 64 global slots busy by reconnecting every few seconds; slots free within 5 s of each attempt. | post-v0.5.0 | Open (residual after the per-IP cap) |
+| F-48 | Medium | `PlacementEngine::select_trust_weighted_peers`' per-subnet trust cap (`TrustLevel::max_shards_per_subnet`: 1/2/4/0) has no production caller; no code stops one subnet holding `k` shards of a stripe. Confidentiality still rests on encrypt-then-shard (`K_user` never leaves the client). `ParVaultConfidentialityAndTrust`'s `Safety_SubnetTrustCapsEnforced` is therefore waived (`@assume placement-trust-cap`), not mutant-covered. | v0.6.0 | Open by `v0.6.0` (BACKLOG B-10) |
+| X-ADR-ROOT | Low | F-16 batch 3: the root `README.md`, `AGENTS.md`, `SECURITY.md`, `QUICKSTART.md` and `CHANGELOG.md` still cite pre-renumbering ADR numbers (about 77 citations, for example LAN discovery and crash safety under their old numbers), so the `X-ADR-ROOT` keyword check failed. | v0.5.0 | Fixed on `v0.5.0/item-2d-beta`: root docs renumbered; `CHANGELOG.md` excluded (released sections keep their release's numbers) |
+| F-49 | Low | The gateway socket is made `0600` by `set_permissions` after `bind` (`src/gateway/ipc.rs:295`), and the result is ignored. Between `bind` and `set_permissions` the socket has the umask's mode, and if `set_permissions` fails the socket keeps it. The UID allowlist (G-UID) still applies when configured; without one, any local UID the mode admits can connect. | v0.6.0 | Open by `v0.6.0` (candidate, plan-4 ruling) |
+| T-TRACE-LIMITS | Info | `tla-trace` checks that ADRs, Rust items, constants and guard `reach` paths exist and match by value; it catches renames and constant drift, not semantic drift. `var`/`action` lines (where present) are linked, not verified; caveat evaluation stays covered by Kani and G-MAC. The suite and control specs are not traced until their re-pin (B-12). | v0.6.0 | Registered (plan-4 ruling) |
 | G-MAC | Info | D-ADR claim for ADR-28: a gateway read frame whose attenuated macaroon is outside its caveat is refused, per frame (`gateway_macaroon_decision`). | 2c | Enforced (QA pending) |
 | G-SEAL | Info | D-ADR claim for ADR-32: under `--require-sealed-memfd` an unsealed ingest memfd is refused (`gateway_memfd_seal_decision`). | 2c | Enforced (QA pending) |
 | G-UID | Info | D-ADR claim for ADR-32: under `--allow-peer-uid` a client whose `SO_PEERCRED` UID is not listed is refused (`gateway_peer_uid_decision`). | 2c | Enforced (QA pending) |

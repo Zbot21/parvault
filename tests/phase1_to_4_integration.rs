@@ -1,9 +1,7 @@
 use parvault::{
     config::ErasureTier,
     crypto::{compute_sha256, MasterKey, NodeIdentity},
-    network::{
-        DelegationChain, InvitationHop, PeerTopologyMetrics, PlacementEngine, WebOfTrustRegistry,
-    },
+    network::{PeerTopologyMetrics, PlacementEngine},
     por::{
         compute_salted_commitment, generate_por_challenge, PorError, PorVerifierEngine,
         RepairGrant, WitnessFailureReceipt,
@@ -265,57 +263,6 @@ fn test_por_stateless_hmac_and_witness_repair_grant() {
     .expect("zero-knowledge ciphertext repair");
     assert_eq!(repaired[1], shard_set.shards[1]);
     assert_eq!(repaired[2], shard_set.shards[2]);
-}
-
-/// Verifies ADR-05: Web-of-Trust recursive delegation chains and subtree slashing within <= 3 failures.
-#[test]
-fn test_wot_delegation_and_subtree_slashing() {
-    let genesis = NodeIdentity::generate();
-    let inviter = NodeIdentity::generate();
-    let honest_leaf = NodeIdentity::generate();
-    let bad_leaf_1 = NodeIdentity::generate();
-    let bad_leaf_2 = NodeIdentity::generate();
-
-    let mut wot = WebOfTrustRegistry::new(genesis.public_key_bytes(), 2);
-
-    let hop0 = InvitationHop::issue(&genesis, inviter.public_key_bytes(), 1, 100);
-    let chain_honest = DelegationChain {
-        hops: vec![
-            hop0.clone(),
-            InvitationHop::issue(&inviter, honest_leaf.public_key_bytes(), 2, 101),
-        ],
-    };
-    let chain_bad1 = DelegationChain {
-        hops: vec![
-            hop0.clone(),
-            InvitationHop::issue(&inviter, bad_leaf_1.public_key_bytes(), 2, 102),
-        ],
-    };
-    let chain_bad2 = DelegationChain {
-        hops: vec![
-            hop0,
-            InvitationHop::issue(&inviter, bad_leaf_2.public_key_bytes(), 2, 103),
-        ],
-    };
-
-    wot.verify_and_admit_chain(&chain_honest).unwrap();
-    wot.verify_and_admit_chain(&chain_bad1).unwrap();
-    wot.verify_and_admit_chain(&chain_bad2).unwrap();
-
-    // 3 failures isolate bad_leaf_1.
-    assert!(!wot.record_failure(bad_leaf_1.public_key_bytes()));
-    assert!(!wot.record_failure(bad_leaf_1.public_key_bytes()));
-    assert!(wot.record_failure(bad_leaf_1.public_key_bytes()));
-    assert!(!wot.is_peer_trusted(&bad_leaf_1.public_key_bytes()));
-    // Honest sibling is still trusted after 1 slashed sibling (subtree limit = 2).
-    assert!(wot.is_peer_trusted(&honest_leaf.public_key_bytes()));
-
-    // 3 failures on bad_leaf_2 crosses inviter's subtree slash threshold (M=2), pruning the entire branch!
-    wot.record_failure(bad_leaf_2.public_key_bytes());
-    wot.record_failure(bad_leaf_2.public_key_bytes());
-    wot.record_failure(bad_leaf_2.public_key_bytes());
-    assert!(!wot.is_peer_trusted(&inviter.public_key_bytes()));
-    assert!(!wot.is_peer_trusted(&honest_leaf.public_key_bytes()));
 }
 
 /// Verifies ADR-06: 70% Intra-ASN / Low-RTT and 30% Cross-Region shard placement policy.

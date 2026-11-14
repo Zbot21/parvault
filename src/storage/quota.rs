@@ -1,3 +1,4 @@
+//! Formal model: `specs/ParVaultConfidentialityAndTrust.tla` (guard `slashed-sticky`).
 use crate::config::ErasureTier;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -57,7 +58,7 @@ pub struct PeerCreditAccount {
     pub por_failures: u64,
     /// Whether this peer has been slashed for Byzantine shard poisoning or egress withholding.
     pub is_slashed: bool,
-    /// Non-refundable cumulative bytes written during the current epoch (`ADR-15` anti-SSD-wear griefing).
+    /// Non-refundable cumulative bytes written during the current epoch (`ADR-19` anti-SSD-wear griefing).
     #[serde(default)]
     pub epoch_ingress_bytes_written: u64,
 }

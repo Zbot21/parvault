@@ -274,7 +274,7 @@ pub(crate) async fn report_abuse(env: CliEnv, command: Commands) -> anyhow::Resu
     }
     let verified_sha = ack_sha.unwrap_or(local_proof.verified_plaintext_sha256);
 
-    println!("=== ParVault Verifiable Abuse Report Submitted (ADR-19) ===");
+    println!("=== ParVault Verifiable Abuse Report Submitted (ADR-26) ===");
     println!("Public Tracker           : {}", target_tracker);
     println!("Report ID                : {}", hex::encode(ack_report_id));
     println!(

@@ -951,7 +951,7 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                     }
                 }
                 Err(e) => {
-                    // ADR-15 Red-Team Fix (RT3-03): Never penalize `chain.leaf_pubkey()` on an
+                    // ADR-05 Red-Team Fix (RT3-03): Never penalize `chain.leaf_pubkey()` on an
                     // unverified `HandshakeWoT` failure.
                     let code = handshake_refusal_code(&e);
                     warn!(code, error = %e, peer = %remote_peer_id, "refused a handshake");

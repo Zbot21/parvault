@@ -1077,7 +1077,7 @@ fn proof_fuse_header_parser_no_panic() {
 }
 
 /// Proves `sanitize_sync_relative_path_into` / `sanitize_sync_relative_path` (`src/sync.rs`,
-/// `ADR-33`) never panics across arbitrary symbolic `[u8; 10]` inputs of any length `0..=10`
+/// `ADR-33` path sanitization) never panics across arbitrary symbolic `[u8; 10]` inputs of any length `0..=10`
 /// (`0` heap `Vec` allocations) and strictly rejects empty outputs, NUL bytes, leading/trailing
 /// `/` or `\`, Windows drive colons (`:`), duplicate `//`, and `.` or `..` path-traversal
 /// segments, while preserving exact normalization idempotence on every accepted path.
@@ -1346,4 +1346,58 @@ fn proof_syndication_fanout_budget() {
         assert!(total + 1 <= MAX_SYNDICATIONS_IN_FLIGHT);
         assert!(sender + 1 <= MAX_SYNDICATIONS_PER_SENDER);
     }
+}
+
+/// P-01: a quarantined key is never trusted, the genesis included; an unquarantined key is
+/// trusted exactly when it is the genesis or a ring or public-commons member.
+#[kani::proof]
+fn proof_peer_trust_never_quarantined() {
+    let (g, q, pr, pu): (bool, bool, bool, bool) =
+        (kani::any(), kani::any(), kani::any(), kani::any());
+    let d = crate::network::wot::WebOfTrustRegistry::is_peer_trust_decision(g, q, pr, pu);
+    kani::cover!(d.is_err() && q, "quarantined peer refused");
+    kani::cover!(d.is_ok(), "member trusted");
+    // Only the outcome is checked (the &str code by the wire tests).
+    if q {
+        assert!(d.is_err());
+    } else {
+        assert_eq!(d.is_ok(), g || pr || pu);
+    }
+}
+
+/// P-01: a delegation chain is accepted only when non-empty, within `MAX_DELEGATION_DEPTH`
+/// hops and rooted at the genesis.
+#[kani::proof]
+fn proof_chain_shape_bounded_and_rooted() {
+    let len: usize = kani::any();
+    let root: bool = kani::any();
+    kani::assume(len <= 64);
+    let d =
+        crate::network::wot::WebOfTrustRegistry::verify_and_admit_chain_shape_decision(len, root);
+    kani::cover!(d.is_err() && len > 0 && root, "too deep or empty refused");
+    kani::cover!(d.is_ok(), "chain shape accepted");
+    // Only the outcome is checked (the &str code by the wire tests).
+    assert_eq!(
+        d.is_ok(),
+        len >= 1 && len as u64 <= crate::network::wot::MAX_DELEGATION_DEPTH as u64 && root
+    );
+}
+
+/// P-01: a public-commons ticket is admitted only outside private-ring mode, for an
+/// unquarantined key, with valid proof of work.
+#[kani::proof]
+fn proof_public_ticket_admission() {
+    let (private_ring, quarantined, pow_ok): (bool, bool, bool) =
+        (kani::any(), kani::any(), kani::any());
+    let d = crate::network::wot::WebOfTrustRegistry::verify_and_admit_public_ticket_decision(
+        private_ring,
+        quarantined,
+        pow_ok,
+    );
+    kani::cover!(
+        d.is_err() && quarantined && !private_ring,
+        "revoked ticket refused"
+    );
+    kani::cover!(d.is_ok(), "ticket admitted");
+    assert_eq!(d.is_ok(), !private_ring && !quarantined && pow_ok);
 }
