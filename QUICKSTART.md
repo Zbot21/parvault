@@ -3,7 +3,7 @@
 > **No CS or math degree required.** If you know how to run a command in a terminal (or spin up a Docker container / Raspberry Pi), this guide will get your files backed up with **zero monthly cloud bills** and **zero trust** in anyone else's computer.
 
 > [!WARNING]
-> **Pre-release.** `v0.5.0` is not released and has no installer or binary download. Build from source first (`cargo build --release`, then put `target/release/parvault` and `target/release/parvault-seed` on your `PATH`). Multi-machine setups have been tested only in Docker and on one host, not on real router hardware. The limits are listed in the [README](README.md#known-limits-v050).
+> **Pre-release.** `v0.5.0` is a GitHub pre-release, not marked Latest. Install the binaries first with the pinned-version installer (Linux `x86_64` or `aarch64`; it checks `SHA256SUMS` and installs to `/usr/local/bin`, or `PARVAULT_INSTALL_DIR`): `curl --proto '=https' --tlsv1.2 -fsSL https://github.com/Zbot21/parvault/releases/download/v0.5.0/install.sh | sh`. Or build from source (`cargo build --release`, then put `target/release/parvault` and `target/release/parvault-seed` on your `PATH`). Multi-machine setups have been tested only in Docker and on one host, not on real router hardware. The limits are listed in the [README](README.md#known-limits-v050).
 
 ---
 
