@@ -1,0 +1,12 @@
+diff --git a/specs/ParVaultGatewayPluginBus.tla b/specs/ParVaultGatewayPluginBus.tla
+--- a/specs/ParVaultGatewayPluginBus.tla
++++ b/specs/ParVaultGatewayPluginBus.tla
+@@ -101,7 +101,7 @@
+ \* status_auth_decision: a verifier (root key) and a snapshot, then a valid, ReadOnly,
+ \* unscoped token whose AllowedPeerUid (if any) is the caller's.
+ StatusAuthorized(t, u) ==
+-    /\ rootKeySet /\ snapshotPublished   \* @guard status-verifier sym=src/http_edge.rs::status_auth_decision
++    /\ TRUE
+     /\ t /= NoToken /\ t.key = "root" /\ t.scope = "any" /\ UidCaveatOk(t, u)   \* @guard status-auth sym=src/http_edge.rs::status_auth_decision
+ 
+ Init ==

@@ -5,7 +5,7 @@
 #   parvault-seed) whose `use` closure reaches it + runtime callers.
 # lib  = the module's own unit tests + those of every module that depends on
 #   it (transitive `use` edges in src/); no filter that matches 0 tests.
-# tla_formal_proofs_integration (all 7 TLC specs) is kept only for its own
+# tla_formal_proofs_integration (every specs/*.tla) is kept only for its own
 # file, bootstrap.rs and sync.rs: its lite-client failover test is the only
 # suite driving LiteRestoreRoute. Other modules map to their specific specs.
 
@@ -234,6 +234,7 @@ src/gateway/*                   test    zero_config_lan_and_router_soc_tests    
 src/gateway/*                   test    trust_enforcement
 src/gateway/engine.rs           kani    proof_pinned_ring_capacity_invariant
 src/gateway/ipc.rs              kani    proof_gateway_ipc_frame_header_bounds
+src/gateway/*                   tla     specs/ParVaultGatewayPluginBus.tla
 
 # --- capabilities.rs / vfs.rs / sync.rs --------------------------------------
 src/capabilities.rs             lib     admin_rpc::
@@ -258,10 +259,15 @@ src/capabilities.rs             test    zero_config_lan_and_router_soc_tests    
 src/capabilities.rs             test    trust_enforcement
 src/capabilities.rs             kani    proof_macaroon_peer_uid_and_compact_roundtrip
 src/capabilities.rs             kani    proof_macaroon_caveat_attenuation_monotonic_and_zero_key_rejected
+src/capabilities.rs             tla     specs/ParVaultGatewayPluginBus.tla
 src/vfs.rs                      test    gateway_bus_and_plugin_security
 src/vfs.rs                      test    m3_dual_mode_vfs_and_gateway_sync
 src/vfs.rs                      test    sync_daemon_usability_and_cli_regression_tests  # spawns main
 src/vfs.rs                      test    vfs_lazy_stream
+src/vfs.rs                      test    vfs_fuse_protocol
+src/vfs.rs                      test    vfs_mp4_seek_gate
+src/vfs.rs                      test    vfs_webdav_plain_get
+src/bin/parvault-fuse.rs        test    vfs_mp4_seek_gate
 src/vfs.rs                      test    zero_config_lan_and_router_soc_tests            # spawns main
 src/vfs.rs                      test    trust_enforcement
 src/vfs.rs                      kani    proof_vfs_block_window_power_of_two_and_zero_bounds
@@ -364,7 +370,7 @@ tests/post_quantum_security_proofs.rs                    test    post_quantum_se
 tests/red_team_hardening_tests.rs                        test    red_team_hardening_tests
 tests/seed_server_integration.rs                         test    seed_server_integration
 tests/sync_daemon_usability_and_cli_regression_tests.rs  test    sync_daemon_usability_and_cli_regression_tests
-tests/tla_formal_proofs_integration.rs                   test    tla_formal_proofs_integration   # runs all 7 specs
+tests/tla_formal_proofs_integration.rs                   test    tla_formal_proofs_integration   # runs every specs/*.tla
 tests/vfs_lazy_stream.rs                                 test    vfs_lazy_stream
 tests/wire_handler_equivalence.rs                        test    wire_handler_equivalence
 tests/zero_config_lan_and_router_soc_tests.rs            test    zero_config_lan_and_router_soc_tests
@@ -382,6 +388,7 @@ specs/ParVaultPostQuantum.*                 tla     specs/ParVaultPostQuantum.tl
 specs/ParVaultBootstrapAndEarnedTier.*      tla     specs/ParVaultBootstrapAndEarnedTier.tla
 specs/ParVaultLiteClientAndSeedFailover.*   tla     specs/ParVaultLiteClientAndSeedFailover.tla
 specs/ParVaultZeroKeyAdminAndQuorum.*       tla     specs/ParVaultZeroKeyAdminAndQuorum.tla
+specs/ParVaultGatewayPluginBus.*            tla     specs/ParVaultGatewayPluginBus.tla
 
 # --- Scripts, CI, deploy, misc -----------------------------------------------
 scripts/verify_formal_proofs.sh     full    # the formal gate itself (kani + all TLC)
@@ -391,6 +398,9 @@ scripts/VENDORED.md                none
 .github/workflows/*                 full    # CI defines the release gates; an edit can drop one
 scripts/docker_acceptance_gate.sh   none    # Docker gate, run by hand; not one of the 6 gates
 scripts/install.sh                  none
+scripts/test_install.sh             none    # run by the docs-commands CI job (plan-7)
+scripts/doc_commands.sh             none    # the docs-commands CI job (plan-7 L-34)
+scripts/doc_commands.py             none    # the docs-commands CI job (plan-7 L-34)
 scripts/check_no_runtime_deps.sh    test    static_build_checks   # L-48 no-runtime check (CI runs it too)
 scripts/check_claim_cfg.sh          test    static_build_checks   # ruling change 5 (CI runs it too)
 scripts/build_bins.sh               full    # builds every CI/release/metrics artifact; an edit can change a feature set

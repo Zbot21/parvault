@@ -6,6 +6,11 @@
 skips      K-1       path=tests/*.rs
 suite      S-DOCKER  test=docker_acceptance_gate::docker_acceptance_gate needs=docker
 suite      S-NOFS    test=gateway_ipc_benchmark::test_parvault_seed_no_fs_zero_disk_and_ram_cap_enforcement needs=cmd:sh
+suite      S-FUSE-PROTO test=vfs_fuse_protocol::no_reply_opcodes_get_no_reply_and_the_loop_keeps_serving needs=cmd:sh   # plan-5 D-1: FORGET/BATCH_FORGET/INTERRUPT take no reply
+suite      S-MP4-FUSE test=vfs_mp4_seek_gate::fuse_mount_mp4_probe_and_random_seek needs=cmd:ffmpeg,cmd:ffprobe,cmd:fusermount3   # plan-5 / ledger §7.2
+suite      S-MP4-DAV test=vfs_mp4_seek_gate::webdav_206_mp4_probe_and_random_seek needs=cmd:ffmpeg,cmd:ffprobe   # plan-5 / ledger §7.2
+suite      S-MP4-RSS test=vfs_mp4_seek_gate::parvault_fuse_plugin_mount_rss_under_16_mib needs=cmd:ffmpeg,cmd:ffprobe,cmd:fusermount3   # plan-5 / ledger §7.2
+suite      S-DAV-GET  test=vfs_webdav_plain_get::plain_get_still_streams_the_whole_file needs=cmd:sh   # plan-5: a plain GET streams the whole file (B-23 guard)
 
 # --- Artifact provenance (A-DOCKER: the gate copies from the build directory; convert before item 7)
 artifact   A-DOCKER  script=scripts/docker_acceptance_gate.sh bin=parvault suite=docker_acceptance_gate::docker_acceptance_gate
@@ -21,6 +26,8 @@ adr        D-ADR     path=docs/adr/*.md
 reach      F-03      sym=src/network/wire_handler.rs::admission_decision from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
 reach      F-05      sym=src/network/wot.rs::verify_and_admit_public_ticket from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
 reach      F-06      sym=src/por/verifier.rs::verify_audit_response from=src/cli/daemon.rs::run_daemon ref=docs/security/TRUST_FINDINGS.md
+reach      VFS-FUSE-1 sym=src/vfs.rs::serve_fuse_fd_blocking from=src/bin/parvault-fuse.rs::main   # plan-5: the FUSE loop is reached from the plugin and the daemon
+reach      VFS-FUSE-2 sym=src/vfs.rs::serve_fuse_fd_blocking from=src/cli/daemon.rs::run_daemon   # plan-5: the FUSE loop is reached from the plugin and the daemon
 open       F-06      expect=reach by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 
 # --- Blocking calls on handler paths --------------------------------------------------------------
@@ -47,7 +54,7 @@ xref       X-ADR-SPEC path=specs/*.tla pattern=[(`]ADR-(\d+) target=docs/adr/ADR
 # --- Formal proofs (P-01 to P-05; mutants are authored by QA) --------------------------------------
 tla-spec   T-SPECS   path=specs/*.tla
 # M5a: spec <-> ADR <-> Rust traceability; each @guard sym is reached from a production entry.
-tla-trace  T-TRACE   path=specs/*.tla
+tla-trace  T-TRACE   path=specs/*.tla complete=specs/ParVaultGatewayPluginBus.tla
 reach      TR-NULLIFIER-FRESH sym=src/storage/anonymity.rs::redeem_voucher from=src/network/wire_handler.rs::handle_mesh_wire_request
 reach      TR-TIER-RESPECTS-SLASH sym=src/bootstrap.rs::evaluate from=src/cli/daemon.rs::run_daemon
 reach      TR-SLASHED-STICKY sym=src/storage/quota.rs::trust_level from=src/cli/daemon.rs::run_daemon
@@ -88,6 +95,24 @@ waive      TM-W-NAS-DEATH   inv=specs/ParVaultLiteClientAndSeedFailover.tla::Nas
 waive      TM-W-SELECTIVE   inv=specs/ParVaultLiteClientAndSeedFailover.tla::SelectiveBandwidthSavingInvariant reason=structural: restore downloads exactly the selected stripes
 waive      TM-W-HNDL        inv=specs/ParVaultPostQuantum.tla::Safety_HNDLConfidentialityPreserved reason=assume one-break-per-class (AdversaryChooseCapability); onion exposes_* fields structural
 waive      TM-W-GROVER      inv=specs/ParVaultPostQuantum.tla::Safety_GroverBitSecurityFloor reason=assume grover-quadratic-only (ActivateGroverSearch) and one-break-per-class for the cipher cap
+# M5a phase C (item 4): the gateway plugin bus spec (complete tracing above), its IpcCommand enum, mutants and reach.
+enum       E-IPC     sym=src/gateway/ipc.rs::IpcCommand spec=specs/ParVaultGatewayPluginBus.tla
+# QA (qa-2c-council) guard-removal mutants for the gateway plugin bus spec.
+tla-mutant TM-GPB-UID      spec=specs/ParVaultGatewayPluginBus.tla inv=OnlyAllowedUidsServed patch=specs/mutants/ParVaultGatewayPluginBus-uid-allowlist.patch
+tla-mutant TM-GPB-MAC      spec=specs/ParVaultGatewayPluginBus.tla inv=NoReadWithoutCapability patch=specs/mutants/ParVaultGatewayPluginBus-macaroon-frame.patch
+tla-mutant TM-GPB-UIDCAV   spec=specs/ParVaultGatewayPluginBus.tla inv=NoReadWithoutCapability patch=specs/mutants/ParVaultGatewayPluginBus-macaroon-uid-caveat.patch
+tla-mutant TM-GPB-SEAL     spec=specs/ParVaultGatewayPluginBus.tla inv=StoredPayloadImmutable patch=specs/mutants/ParVaultGatewayPluginBus-memfd-seal.patch
+tla-mutant TM-GPB-STATUS   spec=specs/ParVaultGatewayPluginBus.tla inv=StatusOnlyWithIssuedToken patch=specs/mutants/ParVaultGatewayPluginBus-status-auth.patch
+tla-mutant TM-GPB-FETCHPAY spec=specs/ParVaultGatewayPluginBus.tla inv=NoReadWithoutCapability patch=specs/mutants/ParVaultGatewayPluginBus-fetch-payload-macaroon.patch
+tla-mutant TM-GPB-SCOPE    spec=specs/ParVaultGatewayPluginBus.tla inv=NoReadWithoutCapability patch=specs/mutants/ParVaultGatewayPluginBus-macaroon-scope.patch
+tla-mutant TM-GPB-STATUSVER spec=specs/ParVaultGatewayPluginBus.tla inv=StatusOnlyWithIssuedToken patch=specs/mutants/ParVaultGatewayPluginBus-status-verifier.patch
+waive TM-GPB-W-TYPE inv=specs/ParVaultGatewayPluginBus.tla::TypeOK reason=type invariant, not a security property, with no guard to remove; it types conns, lastRead and lastStatus and omits lastUnauth and stored, whose shapes are fixed by the actions that write them
+reach      TR-UID-ALLOWLIST sym=src/gateway/engine.rs::gateway_peer_uid_decision from=src/gateway/server.rs::spawn
+reach      TR-MACAROON-FRAME sym=src/gateway/engine.rs::gateway_macaroon_decision from=src/gateway/server.rs::execute_engine_command
+reach      TR-MACAROON-UID-CAVEAT sym=src/capabilities.rs::evaluate_caveats from=src/gateway/server.rs::execute_engine_command
+reach      TR-MEMFD-SEAL sym=src/gateway/engine.rs::gateway_memfd_seal_decision from=src/gateway/server.rs::execute_engine_command
+reach      TR-STATUS-AUTH sym=src/http_edge.rs::status_auth_decision from=src/gateway/server.rs::execute_engine_command
+reach      TR-FETCH-PAYLOAD-MACAROON sym=src/gateway/engine.rs::fetch_by_shard_ids_to_owned_fd_with_peer_uid from=src/gateway/server.rs::execute_engine_command
 module     P-01      path=src/network/wot.rs pattern=^(verify_and_admit_|is_peer_|apply_slashing_|slash_|record_failure) kani=required
 reach      P-01      sym=src/network/wot.rs::is_peer_trusted from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
 reach      P-01      sym=src/network/wot.rs::is_peer_trust_decision from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
@@ -222,4 +247,4 @@ kani       S-SANITIZE sym=src/sync/common.rs::sanitize_sync_relative_path_into h
 claim      B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision accept=trust_enforcement::bseed_second_sender_accepted_while_one_job_runs reject=trust_enforcement::bseed_third_job_refused_busy code=reject.syndication_busy bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe
 kani       B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision harness=proof_syndication_fanout_budget cover=syndication over budget
 
-ratchet    R         open=4 waive=29
+ratchet    R         open=4 waive=30

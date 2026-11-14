@@ -215,9 +215,9 @@ sequenceDiagram
 ```
 
 ### Key Technical Properties of WAN Peering:
-1. **Zero Knowledge on Rendezvous Anchors:** The rendezvous seed only ever observes an opaque 32-byte `slot_key` and an encrypted ciphertext payload. It cannot see the 4-word pairing code, the inner `WanPeerCard`, the node labels, or the folder manifests.
+1. **Rendezvous anchors can learn the pairing code ([F-54](security/TRUST_FINDINGS.md)):** The rendezvous seed sees a 32-byte `slot_key`, the encrypted `WanPeerCard` and the publisher's Ed25519 key (so its `PeerId`). The slot key is an unsalted hash of the 4-word code, so the seed can test codes offline, then read the card (node label, role, WAN addresses, PQ fingerprint) and hand a joiner a forged card. The code `parvault up` prints is not random: it is derived from the node's `PeerId` and PQ fingerprint with a fixed nonce, so it never changes, and anyone who knows both (public tracker cards and LAN beacons carry them) computes it without guessing. A forged card makes `parvault join` pin the attacker's address instead of the peer's; it does not admit the attacker to the ring. Until v0.6.0 replaces this with a PAKE, pair on the LAN or through a rendezvous seed you run. Folder manifests never pass through the rendezvous.
 2. **STUN-over-Noise Reflection:** No third-party STUN servers (like Google or Cloudflare STUN) are queried over plaintext UDP. Instead, `libp2p`'s authenticated Noise handshake metadata reflects the observed socket address directly inside the encrypted wire protocol.
-3. **ISP Dynamic-IP Resiliency:** When a home broadband ISP rotates an IPv4 or IPv6 address pool, nodes publish their updated signed `WanPeerCard` to their blinded DDNS slot. Remote peers detect the change and reconnect without dropped backup cycles.
+3. **ISP Dynamic-IP Resiliency:** When a home broadband ISP rotates an IPv4 or IPv6 address pool, nodes publish their updated signed `WanPeerCard` to their DDNS slot. The slot and its key derive from the node's PQ fingerprint, which is not secret, so anyone who knows it can read the node's current address (F-54). Remote peers detect the change and reconnect without dropped backup cycles.
 4. **Relay Seed Fallback:** If direct WAN TCP hole punching or incoming traffic is blocked by symmetric carrier-grade NAT (CGNAT), `WanPeerCard.relay_seed_addr` informs the peer of a trusted `parvault-seed` anchor that can relay traffic without seeing plaintext data.
 
 ---
@@ -249,11 +249,11 @@ parvault up \
 ## 7. OpenWrt `procd` Service Installation
 
 ### Binary Installation
-The command downloads the latest published release, <!-- metric:released_version_tag -->`v0.4.0`<!-- /metric -->.
+The command downloads the latest published release, <!-- metric:released_version_tag -->`v0.5.0`<!-- /metric -->.
 
 ```bash
 # 1. Download static aarch64 or x86_64 musl binary
-wget -O /usr/bin/parvault https://github.com/Zbot21/parvault/releases/download/v0.4.0/parvault-aarch64-unknown-linux-musl
+wget -O /usr/bin/parvault https://github.com/Zbot21/parvault/releases/download/v0.5.0/parvault-aarch64-unknown-linux-musl
 chmod +x /usr/bin/parvault
 
 # 2. Create runtime directories
@@ -446,7 +446,7 @@ Every request must present a read-only token (`parvault token mint --read-only`)
 - **`GET /api/v1/health`:** Returns health, RAM telemetry, storage quotas and uptime in JSON:
   ```bash
   ( umask 077; printf 'Authorization: Bearer %s\n' "$(parvault token mint --read-only)" > /etc/parvault/status.header )
-  curl -s -H @/etc/parvault/status.header http://127.0.0.1:4080/api/v1/health
+  curl -fsS -H @/etc/parvault/status.header http://127.0.0.1:4080/api/v1/health
   ```
   ```json
   {
@@ -488,7 +488,7 @@ case "$1" in
   list) echo '{ "status": {} }' ;;
   call)
     [ "$2" = status ] || exit 1
-    curl -s -m 5 -H @/etc/parvault/status.header http://127.0.0.1:4080/api/v1/health ;;
+    curl -fsS -m 5 -H @/etc/parvault/status.header http://127.0.0.1:4080/api/v1/health ;;
 esac
 ```
 

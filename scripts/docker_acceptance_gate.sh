@@ -695,6 +695,62 @@ SIDE_OOM="$(docker inspect -f '{{.State.OOMKilled}}' parvault-status-sidecar)"
 [ "$SIDE_OOM" = "false" ] || { echo "ERROR: sidecar container OOMKilled"; exit 1; }
 SIDE_BIN_BYTES="$(docker exec parvault-status-sidecar stat -c%s /usr/local/bin/parvault-status)"
 
+echo "=== [12c/12] Mounted MP4 probe and random seek: /dev/fuse and WebDAV 206, then netem 15ms/2% ==="
+# Plan-5 / design ledger 7.2. The release test binary tests/vfs_mp4_seek_gate.rs runs in a glibc
+# image with fuse3 and ffmpeg. FUSE leg: --device /dev/fuse + SYS_ADMIN. WebDAV leg: an
+# unprivileged container (no device, no caps), then the same leg with tc netem on its loopback,
+# which delays the HTTP hop between ffmpeg and the WebDAV edge (stripes stay local: a mesh-fetched
+# netem leg is deferred). A missing /dev/fuse is SKIPPED, and a FAIL under GATES_REQUIRE_REAL=1.
+VFS_CTX="/tmp/parvault-acceptance-vfs"
+rm -rf "$VFS_CTX"
+mkdir -p "$VFS_CTX"
+VFS_TEST_BIN="$(cargo test --release --test vfs_mp4_seek_gate --no-run --message-format=json 2>/dev/null \
+    | sed -n 's/.*"executable":"\([^"]*vfs_mp4_seek_gate[^"]*\)".*/\1/p' | tail -1)"
+[ -x "$VFS_TEST_BIN" ] || { echo "ERROR: stage 12c: no vfs_mp4_seek_gate test binary"; exit 1; }
+cargo build --release --bin parvault-fuse
+cp "$VFS_TEST_BIN" "$VFS_CTX/vfs_mp4_seek_gate"
+cp "$TDIR/release/parvault-fuse" "$VFS_CTX/parvault-fuse"
+cat > "$VFS_CTX/Dockerfile" <<'EOF'
+FROM ubuntu:24.04
+RUN apt-get update -o Acquire::Retries=3 \
+    && apt-get install -y --no-install-recommends fuse3 ffmpeg iproute2 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY vfs_mp4_seek_gate /usr/local/bin/vfs_mp4_seek_gate
+COPY parvault-fuse /usr/local/bin/parvault-fuse
+ENV PARVAULT_FUSE_BIN=/usr/local/bin/parvault-fuse TMPDIR=/var/tmp
+ENTRYPOINT ["/usr/local/bin/vfs_mp4_seek_gate", "--test-threads=1", "--nocapture"]
+EOF
+docker build -t parvault:acceptance-vfs "$VFS_CTX"
+
+VFS_FUSE_RESULT="SKIPPED (no /dev/fuse)"
+if [ -c /dev/fuse ] && docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
+        --security-opt apparmor:unconfined --entrypoint test parvault:acceptance-vfs -c /dev/fuse; then
+    docker run --rm --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined \
+        -e GATES_REQUIRE_REAL=1 parvault:acceptance-vfs \
+        fuse_mount_mp4_probe_and_random_seek parvault_fuse_plugin_mount_rss_under_16_mib \
+        || { echo "ERROR: stage 12c: the FUSE leg failed"; exit 1; }
+    VFS_FUSE_RESULT="PASS"
+elif [ "${GATES_REQUIRE_REAL:-0}" = "1" ]; then
+    echo "ERROR: stage 12c: /dev/fuse cannot be passed into a container (GATES_REQUIRE_REAL=1)"
+    exit 1
+else
+    echo "SKIPPED: stage 12c FUSE leg: /dev/fuse cannot be passed into a container"
+fi
+
+# Unprivileged WebDAV leg: no device, no capabilities.
+docker run --rm -e GATES_REQUIRE_REAL=1 parvault:acceptance-vfs webdav_206_mp4_probe_and_random_seek \
+    || { echo "ERROR: stage 12c: the unprivileged WebDAV leg failed"; exit 1; }
+
+# netem leg: NET_ADMIN only for tc; a 100 ms budget, and the cache cap. The per-block miss set is
+# logged, not asserted: under latency an abandoned `Range: bytes=N-` can hydrate up to about one
+# TCP window of extra blocks (B-23, v0.6.0).
+docker run --rm --cap-add NET_ADMIN -e GATES_REQUIRE_REAL=1 -e PARVAULT_VFS_TTFB_BUDGET_MS=100 \
+    -e PARVAULT_VFS_GATE_LATENCY=1 \
+    --entrypoint sh parvault:acceptance-vfs -c \
+    'tc qdisc add dev lo root netem delay 15ms loss 2% && exec /usr/local/bin/vfs_mp4_seek_gate --test-threads=1 --nocapture webdav_206_mp4_probe_and_random_seek' \
+    || { echo "ERROR: stage 12c: the WebDAV leg under netem 15ms/2% failed"; exit 1; }
+echo "Mounted MP4 gate verified: FUSE ${VFS_FUSE_RESULT}; WebDAV 206 PASS (plain and under netem)."
+
 echo "================================================================================"
 echo " PARVAULT v0.3.0 MULTI-CONTAINER & ROUTER-SOC DOCKER ACCEPTANCE SUMMARY"
 echo "================================================================================"
@@ -715,5 +771,6 @@ echo " Router-SoC Image       : ${ROUTER_SOC_IMAGE_SIZE} (FROM scratch)"
 echo " 48 MiB Cgroup SoC Gate : PASS (5 x 1 MiB stripes store+restore, 0 OOM kills)"
 echo " Status page (item 3)   : PASS (router-soc: no token 401, read-only token 200)"
 echo " parvault-status sidecar: PASS (200 / 401 / DNS Host 403 / ?token= 401; no files; ${SIDE_BIN_BYTES} B)"
+echo " Mounted MP4 (item 5)   : FUSE ${VFS_FUSE_RESULT}; WebDAV 206 PASS (plain + netem 15ms/2%, < 100 ms)"
 echo "================================================================================"
 echo "=== ACCEPTANCE GATE PASSED ==="

@@ -207,8 +207,39 @@ jobs:
       - name: Run 13-Container Docker P2P Regression & Disaster Recovery Gate
         run: USE_GLIBC_IMAGE=1 bash scripts/docker_acceptance_gate.sh
 
+  docs-commands:
+    # L-34 (plan-7 section 3): every command block in README.md and QUICKSTART.md runs against
+    # the release binaries in fresh ubuntu:24.04 containers (no Rust toolchain), or carries a
+    # reasoned skip counted by docs/doc-commands.ratchet. Also tests install.sh against these
+    # binaries served locally, and checks the claim labels.
+    name: L-34 Docs Commands (README & QUICKSTART run verbatim)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the merge base, for the skip ratchet
+      - name: docs/doc-commands.txt is current, fences are annotated, skips never increase
+        run: |
+          base_branch="${GITHUB_BASE_REF:-main}"
+          git fetch --no-tags origin "$base_branch"
+          if ! base="$(git merge-base HEAD "origin/$base_branch")" || [ -z "$base" ]; then
+            echo "::error::no merge base between HEAD and origin/$base_branch (needs fetch-depth: 0); cannot check that skips never increase" >&2
+            exit 1
+          fi
+          bash scripts/doc_commands.sh check --base "$base"
+      - name: Runner positive controls (stdin closed, failures fail, dead daemons are not ready)
+        run: bash scripts/doc_commands.sh selftest
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binaries (each with its own features)
+        run: bash scripts/build_bins.sh --profile release --out dist
+      - name: Run every documented command block
+        run: bash scripts/doc_commands.sh run dist
+      - name: install.sh installs its default version from release-style assets
+        run: bash scripts/test_install.sh dist
+
   kani-bounded-model-check:
-    name: Kani Rust Bounded Model Checking (17 Symbolic Harnesses)
+    name: Kani Rust Bounded Model Checking
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -233,7 +264,7 @@ jobs:
       - uses: model-checking/kani-github-action@v1
 
   tla-model-check:
-    name: TLA+ TLC Formal Model Checking (7 Specs)
+    name: TLA+ TLC Formal Model Checking
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -246,10 +277,25 @@ jobs:
           curl --proto '=https' --tlsv1.2 -fsSL \
             https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar \
             -o /tmp/tla2tools.jar
-      - name: Verify all 7 TLA+ Protocol Specifications
+      - name: Verify every TLA+ specification in specs/
         run: |
+          # Every specs/*.tla is model-checked with its own .cfg; the count lives in docs/metrics.txt.
           cd specs
-          for spec in ParVaultProtocol ParVaultConfidentialityAndTrust ParVaultAnonymity ParVaultPostQuantum ParVaultBootstrapAndEarnedTier ParVaultLiteClientAndSeedFailover ParVaultZeroKeyAdminAndQuorum; do
+          shopt -s nullglob
+          tla=(*.tla)
+          if [ "${#tla[@]}" -eq 0 ]; then
+            echo "::error::no specs/*.tla found" >&2
+            exit 1
+          fi
+          for file in "${tla[@]}"; do
+            spec="${file%.tla}"
+            if [ ! -f "${spec}.cfg" ]; then
+              echo "::error::specs/${spec}.tla has no specs/${spec}.cfg" >&2
+              exit 1
+            fi
+          done
+          for file in "${tla[@]}"; do
+            spec="${file%.tla}"
             echo "===> Model checking ${spec}.tla ..."
             java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -cleanup -config "${spec}.cfg" "${spec}.tla"
           done

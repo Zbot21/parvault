@@ -1,14 +1,8 @@
 //! TLA+ Formal Verification & Lite-Client Seed Failover Integration Suite (`ADR-17` / `ADR-19`):
 //!
-//! 1. Executes the TLC Model Checker (`tla2tools.jar`) across all 7 formal TLA+ specifications
-//!    in `specs/` as a first-class Rust integration test (`cargo test --release`):
-//!    - `ParVaultProtocol.tla`
-//!    - `ParVaultConfidentialityAndTrust.tla`
-//!    - `ParVaultAnonymity.tla`
-//!    - `ParVaultPostQuantum.tla`
-//!    - `ParVaultBootstrapAndEarnedTier.tla`
-//!    - `ParVaultLiteClientAndSeedFailover.tla`
-//!    - `ParVaultZeroKeyAdminAndQuorum.tla`
+//! 1. Executes the TLC Model Checker (`tla2tools.jar`) on every `specs/*.tla`, each with its
+//!    own `.cfg`, as a first-class Rust integration test (`cargo test --release`). The spec count
+//!    lives only in `docs/metrics.txt` (`tla_specs`).
 //! 2. Verifies end-to-end `ADR-17` Lite-Client (`LiteSeedBacked`) 1.0x encrypted stripe deposit
 //!    to `ZeroTrustSeedServer`, background 20-shard Reed-Solomon mesh syndication,
 //!    "Cloud-Away-From-Home" selective subset restore, and automatic failover to direct
@@ -63,7 +57,7 @@ fn locate_tla2tools_jar() -> Option<PathBuf> {
 }
 
 #[test]
-fn test_all_7_tla_plus_formal_specifications_via_tlc_model_checker() {
+fn test_every_tla_plus_spec_via_tlc_model_checker() {
     let Some(jar_path) = locate_tla2tools_jar() else {
         panic!(
             "tla2tools.jar not found in TLA2TOOLS_JAR, /tmp/tla2tools.jar, or /root/tla2tools.jar. \
@@ -75,17 +69,31 @@ fn test_all_7_tla_plus_formal_specifications_via_tlc_model_checker() {
     let specs_dir = manifest_dir.join("specs");
     let meta_base = unique_temp_dir("tlc-states");
 
-    let specs = [
-        "ParVaultProtocol",
-        "ParVaultConfidentialityAndTrust",
-        "ParVaultAnonymity",
-        "ParVaultPostQuantum",
-        "ParVaultBootstrapAndEarnedTier",
-        "ParVaultLiteClientAndSeedFailover",
-        "ParVaultZeroKeyAdminAndQuorum",
-    ];
+    let mut specs: Vec<String> = fs::read_dir(&specs_dir)
+        .expect("read specs/")
+        .map(|entry| entry.expect("read specs/ entry").path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "tla"))
+        .map(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("UTF-8 spec file name")
+                .to_owned()
+        })
+        .collect();
+    specs.sort();
+    assert!(
+        !specs.is_empty(),
+        "no specs/*.tla found in {}",
+        specs_dir.display()
+    );
+    for spec_name in &specs {
+        assert!(
+            specs_dir.join(format!("{spec_name}.cfg")).is_file(),
+            "specs/{spec_name}.tla has no specs/{spec_name}.cfg"
+        );
+    }
 
-    for spec_name in specs {
+    for spec_name in &specs {
         let spec_meta = meta_base.join(spec_name);
         let cfg_file = format!("{spec_name}.cfg");
         let tla_file = format!("{spec_name}.tla");

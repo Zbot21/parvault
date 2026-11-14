@@ -105,11 +105,13 @@ pub fn normalize_wan_code(code: &str) -> String {
         .join("-")
 }
 
-/// Derives a blinded 32-byte rendezvous slot key from a human-friendly code or passphrase:
-/// `slot_key = HKDF-SHA256(normalized_code, "parvault-wan-rendezvous-slot-v1")`.
+/// Derives the 32-byte rendezvous slot key from a human-friendly code or passphrase:
+/// `slot_key = HKDF-SHA256(normalized_code, "parvault-wan-rendezvous-slot-v1")`, with no salt.
 ///
-/// The rendezvous server (`parvault-seed` or Kademlia DHT) sees ONLY this blinded `slot_key`
-/// and NEVER learns the code or identity of the pairing peers.
+/// This hides the code only from someone who cannot guess it. The rendezvous server
+/// (`parvault-seed` or Kademlia DHT) sees `slot_key`, the wrapped card and the publisher's
+/// Ed25519 key, so it can test candidate codes offline, then decrypt the card or forge one
+/// (F-54 in `docs/security/TRUST_FINDINGS.md`; a PAKE is planned for v0.6.0).
 pub fn derive_slot_key_from_code(code: &str) -> [u8; 32] {
     let normalized = normalize_wan_code(code);
     let hk = Hkdf::<Sha256>::new(None, normalized.as_bytes());
@@ -291,8 +293,8 @@ impl WanPeerCard {
     }
 }
 
-/// Seals a `WanPeerCard` into a zero-knowledge `SignedWanRendezvousEntry` encrypted under
-/// the 4-word code wrapping key.
+/// Seals a `WanPeerCard` into a `SignedWanRendezvousEntry` encrypted under the 4-word code
+/// wrapping key (guessable offline by the rendezvous server, F-54).
 pub fn seal_wan_peer_card(
     code: &str,
     card: &WanPeerCard,

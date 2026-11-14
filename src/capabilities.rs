@@ -10,6 +10,8 @@
 //! 2. [`GatewayIdentityStatement`]: Composite Post-Quantum (`Ed25519 + NIST FIPS 204 ML-DSA-65`)
 //!    master gateway identity statement binding local Noise static keys (`Noise_IKpsk2_25519_...`)
 //!    and transport PeerIds to the household/CPE root of trust.
+//!
+//! Formal model: `specs/ParVaultGatewayPluginBus.tla` (guards `macaroon-uid-caveat`).
 
 use crate::crypto::{CryptoError, HybridPqPublicKey, HybridPqSignature, HybridPqSigningKeypair};
 use hmac::{Hmac, Mac};

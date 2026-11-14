@@ -27,7 +27,7 @@ $$
 $$
 
 2. **Layer 2 — Per-Shard PoR Capability Keys (`BlindedShardCapability`):** Derives an unlinkable per-shard Ed25519 capability keypair $V_i$ from `(blind_capability_subkey, Locator_i)` pinned at upload time (`±30 s` NTP skew window).
-3. **Layer 3 — Ephemeral-Issuer Bearer Quota Vouchers (`AnonymousQuotaVoucher`):** Mints single-use bearer tokens signed by fresh per-shard ephemeral Ed25519 keys (`mint_ephemeral`) redeemed into a disk-persisted `65,536`-entry `VoucherNullifierLedger` (`1-to-1` conservation with zero `PeerId` linkage).
+3. **Layer 3 — Ephemeral-Issuer Bearer Quota Vouchers (`AnonymousQuotaVoucher`):** Mints single-use bearer tokens signed by fresh per-shard ephemeral Ed25519 keys (`mint_ephemeral`) redeemed into a disk-persisted `65,536`-entry `VoucherNullifierLedger` (a failed write is ignored, so a spend can be lost at the next restart: F-55) (`1-to-1` conservation with zero `PeerId` linkage).
 4. **Layer 4 — 2-Layer Post-Quantum Onion Relay Dispatch (`PqRelayedShardEnvelope`):** Wraps `PqInnerStorageEnvelope` (sealed to destination storage peer's `HybridKemPublicKey`) inside an outer relay envelope (sealed to an intermediate relay peer's `HybridKemPublicKey` with `jitter_delay_ms`) so the relay never sees `Locator_i` or `voucher` and the storage peer never sees the uploader's IP/`PeerId`.
 
 ## `v0.5.0` Enforcement

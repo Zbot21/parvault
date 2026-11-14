@@ -5,12 +5,15 @@ use std::process::Command;
 
 fn run_script(script: &str) {
     let root = env!("CARGO_MANIFEST_DIR");
-    let out = Command::new("bash")
-        .arg(format!("{root}/scripts/{script}"))
-        .arg(root)
-        .env("CARGO", env!("CARGO"))
-        .output()
-        .expect("run bash");
+    let mut cmd = Command::new("bash");
+    cmd.arg(format!("{root}/scripts/{script}"));
+    // doc_commands.sh takes a mode; the others take the repository root.
+    if script == "doc_commands.sh" {
+        cmd.arg("selftest");
+    } else {
+        cmd.arg(root);
+    }
+    let out = cmd.env("CARGO", env!("CARGO")).output().expect("run bash");
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -30,4 +33,12 @@ fn plugin_feature_sets_link_no_async_runtime() {
 #[test]
 fn claimed_functions_carry_no_feature_cfg() {
     run_script("check_claim_cfg.sh");
+}
+
+/// L-34 runner positive controls (release QA): blocks run from a file with stdin closed, a failing
+/// command fails its block, unannotated non-allowlisted and indented shell fences fail the check,
+/// and a background block whose process dies is not reported ready. Runs locally (no Docker).
+#[test]
+fn doc_commands_runner_positive_controls() {
+    run_script("doc_commands.sh");
 }

@@ -631,3 +631,24 @@ async fn test_cli_mint_offline_attenuate_inspect_and_gateway_fetch_range_enforce
 
     srv.shutdown();
 }
+
+/// Plan-4 `@structural socket-mode` (`specs/ParVaultGatewayPluginBus.tla`): the gateway socket is
+/// owner-only (`0600`) once the server is bound.
+#[test]
+fn gateway_socket_is_mode_0600() {
+    let tmp = tempdir().unwrap();
+    let sock = tmp.path().join("mode.sock");
+    let cfg = GatewayConfig {
+        stripe_size_bytes: HardwareProfile::RouterSoc.stripe_size_bytes(),
+        tier: ErasureTier::Consumer,
+        peers: Vec::new(),
+        macaroon_root_key: None,
+        strict_allowed_peer_uids: None,
+        require_sealed_ingest_memfd: false,
+    };
+    let eng =
+        Arc::new(GatewayEngine::new(tmp.path().join("store"), MasterKey::generate(), cfg).unwrap());
+    let _srv = GatewayIpcServer::bind(&sock, eng).unwrap();
+    let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "gateway socket mode is {mode:o}");
+}

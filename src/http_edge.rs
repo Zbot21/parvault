@@ -2,6 +2,8 @@
 //! plan-3 ruling change 7): connection slots (a global cap per server and one per-IP cap),
 //! the request-head reader (8 KiB cap, one deadline), the fixed refusal responses, token
 //! extraction from `Authorization: Bearer` or `Basic` (L-45), and [`status_auth_decision`].
+//!
+//! Formal model: `specs/ParVaultGatewayPluginBus.tla` (guards `status-auth`).
 
 use crate::capabilities::{CapabilityMacaroon, Caveat};
 use std::collections::HashMap;

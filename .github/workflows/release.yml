@@ -73,6 +73,14 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      - name: install.sh defaults to this tag (plan-7; no Latest release to resolve)
+        run: |
+          stamped="$(sed -n 's/^VERSION="\${PARVAULT_VERSION:-\(v[^}]*\)}"$/\1/p' scripts/install.sh)"
+          if [ "$stamped" != "$GITHUB_REF_NAME" ]; then
+            echo "scripts/install.sh defaults to '$stamped' but the tag is '$GITHUB_REF_NAME'" >&2
+            exit 1
+          fi
+          cp scripts/install.sh artifacts/install.sh
       - name: Bundle Router-SoC configuration and generate checksums
         run: |
           tar -czvf artifacts/parvault-router-soc-bundle.tar.gz -C deploy/router-soc parvault-router.toml parvault-nas.procd -C ../ prplos-lxc-manifest.json
@@ -89,11 +97,15 @@ jobs:
             parvault-fuse-x86_64-unknown-linux-musl parvault-fuse-aarch64-unknown-linux-musl \
             parvault-sync-x86_64-unknown-linux-musl parvault-sync-aarch64-unknown-linux-musl \
             parvault-status-x86_64-unknown-linux-musl parvault-status-aarch64-unknown-linux-musl \
-            parvault-router-soc-bundle.tar.gz > SHA256SUMS
+            parvault-router-soc-bundle.tar.gz install.sh > SHA256SUMS
           cat SHA256SUMS
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          # Every ParVault release is a pre-release until the owner says otherwise (2026-11-11):
+          # never "Latest".
+          prerelease: true
+          make_latest: false
           files: |
             artifacts/parvault-x86_64-unknown-linux-musl
             artifacts/parvault-aarch64-unknown-linux-musl
@@ -103,4 +115,5 @@ jobs:
             artifacts/parvault-status-*
             artifacts/parvault-router-soc-bundle.tar.gz
             artifacts/SHA256SUMS
+            artifacts/install.sh
           generate_release_notes: true

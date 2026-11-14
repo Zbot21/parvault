@@ -1,0 +1,12 @@
+diff --git a/specs/ParVaultGatewayPluginBus.tla b/specs/ParVaultGatewayPluginBus.tla
+--- a/specs/ParVaultGatewayPluginBus.tla
++++ b/specs/ParVaultGatewayPluginBus.tla
+@@ -102,7 +102,7 @@
+ \* unscoped token whose AllowedPeerUid (if any) is the caller's.
+ StatusAuthorized(t, u) ==
+     /\ rootKeySet /\ snapshotPublished   \* @guard status-verifier sym=src/http_edge.rs::status_auth_decision
+-    /\ t /= NoToken /\ t.key = "root" /\ t.scope = "any" /\ UidCaveatOk(t, u)   \* @guard status-auth sym=src/http_edge.rs::status_auth_decision
++    /\ TRUE
+ 
+ Init ==
+     /\ allowlistSet \in BOOLEAN
