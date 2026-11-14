@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+---
+
+## [`0.5.0`] - 2026-11-14
+
 ### Fixed
 - **A dependent crate can run `cargo kani` on a plugin feature set.** Core's Kani harnesses now compile only with `daemon-runtime`, so a plugin built with `--no-default-features --features ipc-client` no longer fails to compile them (found by the suite's Kani CI).
 - **The FUSE mount no longer dies on the kernel's first FORGET.** The `/dev/fuse` loop replied ENOSYS to FORGET, BATCH_FORGET and INTERRUPT, which take no reply; the kernel refused the reply with ENOENT and the loop exited, leaving the mount `ENOTCONN`. Those three now get no reply, and an ENOENT on a reply is not fatal (plan-5 D-1).
