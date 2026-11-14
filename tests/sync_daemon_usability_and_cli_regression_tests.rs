@@ -5,6 +5,8 @@
 //! bounded FIFO nonce caches, PoR range limits, token-bucket bandwidth rate limiting,
 //! minimum free disk space guards, and PQ/Catalog `ZeroTrustDhtStore` enforcement.
 
+mod common;
+
 use parvault::{
     bootstrap::{
         normalize_subnet_prefix_key, ElasticBootstrapEngine, ElasticPeerCandidate,
@@ -19,8 +21,8 @@ use parvault::{
         MasterKey, NodeIdentity,
     },
     network::{
-        DelegationChain, InvitationHop, PeerTopologyMetrics, PlacementEngine, SlashingEvidence,
-        SlashingReason, TokenBucketRateLimiter, WebOfTrustRegistry,
+        DelegationChain, InvitationHop, PeerTopologyMetrics, PlacementEngine,
+        TokenBucketRateLimiter, WebOfTrustRegistry,
     },
     por::{
         compute_salted_commitment, generate_por_challenge, PorError, PorResponse,
@@ -362,26 +364,10 @@ fn test_bounded_por_and_slashing_replay_caches_and_range_cap() {
     })
     .unwrap();
 
-    let ev = SlashingEvidence::issue(
-        &reporter,
-        offender.public_key_bytes(),
-        SlashingReason::PorAuditTimeoutOrTamper,
-        42,
-    );
-    assert!(
-        !wot.apply_slashing_evidence(&ev),
-        "1st PoR timeout increments failure count to 1/3 (not yet quarantined)"
-    );
-    assert_eq!(wot.seen_slashing_nonces_count(), 1);
-    // Replaying the exact same SlashingEvidence (nonce=42) 5 times must be ignored and never quarantine offender
-    for _ in 0..5 {
-        assert!(!wot.apply_slashing_evidence(&ev));
-    }
-    assert!(
-        wot.is_peer_trusted(&offender.public_key_bytes()),
-        "Replayed SlashingEvidence with duplicate nonce must not quarantine honest/single-fault peer"
-    );
-    assert_eq!(wot.seen_slashing_nonces_count(), 1);
+    // Slashing evidence from peers is not applied in v0.5.0 (apply_slashing_evidence is
+    // test-only); its replay dedupe is covered by the network::wot unit tests.
+    assert!(wot.is_peer_trusted(&offender.public_key_bytes()));
+    assert!(wot.is_peer_trusted(&reporter.public_key_bytes()));
 
     let _ = fs::remove_dir_all(&base);
 }
@@ -659,7 +645,8 @@ fn test_cli_end_to_end_parvault_and_parvault_seed_subcommands() {
             "--catalog-out",
         ])
         .arg(&catalog_path)
-        .arg("--once")
+        // No peers: the stripes stay on this machine (R3-1); this test checks the catalog path.
+        .args(["--once", "--allow-local-only"])
         .output()
         .expect("run parvault watch-folder");
     assert!(
@@ -865,91 +852,58 @@ fn test_live_libp2p_tcp_multi_daemon_network_backup_prune_and_seed_recovery() {
         }
     }
 
-    fn reserve_free_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        listener.local_addr().unwrap().port()
-    }
-
     let base = unique_temp_dir("live-libp2p-multi-daemon");
     let parvault_bin = env!("CARGO_BIN_EXE_parvault");
     let seed_bin = env!("CARGO_BIN_EXE_parvault-seed");
 
-    let seed_port = reserve_free_port();
-    let node_ports = [
-        reserve_free_port(),
-        reserve_free_port(),
-        reserve_free_port(),
-        reserve_free_port(),
-    ];
-    let peers_csv = node_ports
-        .iter()
-        .map(|p| format!("/ip4/127.0.0.1/tcp/{p}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let seed_multiaddr = format!("/ip4/127.0.0.1/tcp/{seed_port}");
-
     let mut guards = ChildGuard(Vec::new());
 
-    // 1. Spawn parvault-seed + 4 parvault daemon processes on isolated data directories
-    let seed_dir = base.join("seed_node");
-    fs::create_dir_all(&seed_dir).unwrap();
-    let seed_child = std::process::Command::new(seed_bin)
-        .args([
-            "--peers",
-            &peers_csv,
-            "start",
-            "--mode",
-            "homelab-vault",
-            "--no-lan-discovery",
-            "--listen",
-            &seed_multiaddr,
-            "--data-dir",
-        ])
-        .arg(&seed_dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn parvault-seed");
-    guards.0.push(seed_child);
-
+    // 1. Spawn 4 parvault daemons, then parvault-seed (it syndicates to their addresses), each
+    // on an ephemeral port read back from its log (common::LOOPBACK_EPHEMERAL). `daemon start`
+    // does not use --peers or --seed-addr, so the daemons need no addresses up front.
     let mut node_dirs = Vec::new();
-    for (idx, port) in node_ports.iter().enumerate() {
+    let mut node_addrs = Vec::new();
+    for idx in 0..4 {
         let ndir = base.join(format!("daemon_{idx}"));
         fs::create_dir_all(&ndir).unwrap();
         node_dirs.push(ndir.clone());
-        let child = std::process::Command::new(parvault_bin)
-            .arg("--data-dir")
-            .arg(&ndir)
+        let (child, addr) = common::spawn_on_ephemeral_port(
+            std::process::Command::new(parvault_bin)
+                .arg("--data-dir")
+                .arg(&ndir)
+                .args([
+                    "--no-lan-discovery",
+                    "daemon",
+                    "start",
+                    "--listen",
+                    common::LOOPBACK_EPHEMERAL,
+                ]),
+            &base.join(format!("daemon_{idx}.log")),
+        );
+        guards.0.push(child);
+        node_addrs.push(addr);
+    }
+    let peers_csv = node_addrs.join(",");
+
+    let seed_dir = base.join("seed_node");
+    fs::create_dir_all(&seed_dir).unwrap();
+    let (seed_child, seed_multiaddr) = common::spawn_on_ephemeral_port(
+        std::process::Command::new(seed_bin)
             .args([
-                "--no-lan-discovery",
                 "--peers",
                 &peers_csv,
-                "--seed-addr",
-                &seed_multiaddr,
-                "daemon",
                 "start",
+                "--mode",
+                "homelab-vault",
+                "--no-lan-discovery",
                 "--listen",
-                &format!("/ip4/127.0.0.1/tcp/{port}"),
+                common::LOOPBACK_EPHEMERAL,
+                "--data-dir",
             ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn parvault daemon");
-        guards.0.push(child);
-    }
-
-    // Wait until all TCP listeners accept connections
-    for port in std::iter::once(seed_port).chain(node_ports.iter().copied()) {
-        let mut connected = false;
-        for _ in 0..50 {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                connected = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        assert!(connected, "Daemon on port {port} did not start listening");
-    }
+            .arg(&seed_dir),
+        &base.join("seed.log"),
+    );
+    guards.0.push(seed_child);
 
     // 2. From an isolated client directory, run watch-folder --once over libp2p
     let client_dir = base.join("client_data");

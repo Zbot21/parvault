@@ -389,7 +389,7 @@ impl ParvaultIgnore {
     }
 }
 
-/// Encrypted, Monotonically Signed Kademlia Root Superblock Catalog (`ADR-15` "House Fire" Disaster Recovery).
+/// Encrypted, Monotonically Signed Kademlia Root Superblock Catalog (`ADR-18` "House Fire" Disaster Recovery).
 /// Allows a user whose local disks were completely destroyed to recover their entire directory tree
 /// using ONLY their memorized recovery seed phrase and `vault_namespace` (zero local `.manifest.bin` files).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -482,8 +482,7 @@ impl EncryptedVaultCatalogEnvelope {
             &self.encrypted_catalog_bytes,
         )?;
         let raw_snapshot = decrypt_manifest(master_key, &inner_ct)?;
-        let snapshot: FolderSnapshotManifest = bincode::deserialize(&raw_snapshot)?;
-        Ok(snapshot)
+        FolderSnapshotManifest::decode_bytes(&raw_snapshot)
     }
 
     fn canonical_bytes(
@@ -546,6 +545,90 @@ pub struct FolderSnapshotManifest {
     pub signed_dht_envelope: Option<SignedDhtManifestEnvelope>,
     #[serde(default)]
     pub deleted_tombstones: BTreeMap<String, DeletedFileTombstone>,
+}
+
+impl FolderSnapshotManifest {
+    /// Decodes a bincode snapshot of either layout. The current layout embeds version-2 file
+    /// manifests (with chunk roots); snapshots written before that embed version-1 manifests
+    /// and decode through the frozen [`snapshot_v1`] structs with empty chunk roots.
+    ///
+    /// The snapshot has no layout tag of its own, so the current layout is tried first and
+    /// accepted only if every embedded manifest says version 2. A version-1 stream cannot pass
+    /// that check: the first embedded manifest's version is read before the layouts diverge.
+    pub fn decode_bytes(raw: &[u8]) -> Result<Self, StorageError> {
+        if let Ok(snap) = bincode::deserialize::<Self>(raw) {
+            let current = snap.files.values().all(|f| {
+                f.manifest.version == crate::storage::block_store::FILE_MANIFEST_VERSION
+                    && f.manifest.check_chunk_roots_aligned().is_ok()
+            });
+            if current {
+                return Ok(snap);
+            }
+        }
+        Ok(bincode::deserialize::<snapshot_v1::FolderSnapshotManifestV1>(raw)?.into())
+    }
+}
+
+/// Frozen snapshot layouts embedding version-1 file manifests. Never change these structs.
+pub mod snapshot_v1 {
+    use super::{DeletedFileTombstone, FolderSnapshotManifest, SyncedFileEntry};
+    use crate::config::ErasureTier;
+    use crate::sharding::merkle::Hash32;
+    use crate::storage::block_store::manifest_v1::FileManifestV1;
+    use crate::storage::SignedDhtManifestEnvelope;
+    use serde::{Deserialize, Serialize};
+    use std::collections::BTreeMap;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct SyncedFileEntryV1 {
+        pub relative_path: String,
+        pub size_bytes: u64,
+        pub modified_unix_ms: u64,
+        pub plaintext_sha256: Hash32,
+        pub file_merkle_root: Hash32,
+        pub manifest: FileManifestV1,
+        pub shard_pseudonyms: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct FolderSnapshotManifestV1 {
+        pub version: u64,
+        pub folder_merkle_root: Hash32,
+        pub tier: ErasureTier,
+        pub files: BTreeMap<String, SyncedFileEntryV1>,
+        pub signed_dht_envelope: Option<SignedDhtManifestEnvelope>,
+        pub deleted_tombstones: BTreeMap<String, DeletedFileTombstone>,
+    }
+
+    impl From<FolderSnapshotManifestV1> for FolderSnapshotManifest {
+        fn from(v1: FolderSnapshotManifestV1) -> Self {
+            FolderSnapshotManifest {
+                version: v1.version,
+                folder_merkle_root: v1.folder_merkle_root,
+                tier: v1.tier,
+                files: v1
+                    .files
+                    .into_iter()
+                    .map(|(k, f)| {
+                        (
+                            k,
+                            SyncedFileEntry {
+                                relative_path: f.relative_path,
+                                size_bytes: f.size_bytes,
+                                modified_unix_ms: f.modified_unix_ms,
+                                plaintext_sha256: f.plaintext_sha256,
+                                file_merkle_root: f.file_merkle_root,
+                                manifest: f.manifest.into(),
+                                shard_pseudonyms: f.shard_pseudonyms,
+                            },
+                        )
+                    })
+                    .collect(),
+                signed_dht_envelope: v1.signed_dht_envelope,
+                deleted_tombstones: v1.deleted_tombstones,
+            }
+        }
+    }
 }
 
 /// Lightweight file metadata entry returned by `FolderSyncEngine::list_snapshot_catalog` (`ADR-17`)
@@ -1421,7 +1504,7 @@ impl FolderSyncEngine {
         Ok((out_slice, route_used))
     }
 
-    /// Exports an encrypted, post-quantum-protected `EncryptedVaultCatalogEnvelope` (`ADR-15`)
+    /// Exports an encrypted, post-quantum-protected `EncryptedVaultCatalogEnvelope` (`ADR-18`)
     /// keyed at the deterministic `derive_vault_root_dht_key(vault_namespace)` so the entire
     /// folder snapshot can be discovered and recovered from a memorized seed phrase alone.
     /// Automatically persists to local `ZeroTrustDhtStore` and publishes to Kademlia DHT peers
@@ -1452,7 +1535,7 @@ impl FolderSyncEngine {
         Ok(env)
     }
 
-    /// Zero-Local-State "House Fire" Disaster Recovery (`ADR-15`):
+    /// Zero-Local-State "House Fire" Disaster Recovery (`ADR-18`):
     /// Reconstructs the user's `MasterKey`, `PqVaultMasterKey`, `NodeIdentity`, and deterministic
     /// `root_catalog_dht_key` strictly from `(seed_phrase, vault_namespace)`, verifies and decrypts
     /// `catalog_envelope`, and restores the entire directory tree into `target_dir` with zero prior local files.
@@ -2257,6 +2340,73 @@ pub use gateway_sync::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_roots_v1_snapshot_decodes_with_empty_roots() {
+        use crate::storage::block_store::manifest_v1::{FileManifestV1, StripeManifestEntryV1};
+        let fm = FileManifestV1 {
+            version: 1,
+            file_merkle_root: [0x11; 32],
+            file_salt: [0x22; 32],
+            original_file_size: 10,
+            stripe_size_bytes: 1024 * 1024,
+            tier: ErasureTier::Homelab,
+            stripes: vec![StripeManifestEntryV1 {
+                stripe_index: 0,
+                k_data: 16,
+                m_parity: 4,
+                original_ciphertext_len: 32,
+                shard_len: 2,
+                stripe_merkle_root: [0x33; 32],
+                shard_hashes: vec![[0x44; 32]; 20],
+                assigned_peers: vec![],
+            }],
+            witness_peers: vec![],
+        };
+        let mut files = BTreeMap::new();
+        for name in ["a", "b"] {
+            files.insert(
+                name.to_string(),
+                snapshot_v1::SyncedFileEntryV1 {
+                    relative_path: name.to_string(),
+                    size_bytes: 10,
+                    modified_unix_ms: 7,
+                    plaintext_sha256: [0x55; 32],
+                    file_merkle_root: [0x11; 32],
+                    manifest: fm.clone(),
+                    shard_pseudonyms: vec!["p".to_string()],
+                },
+            );
+        }
+        let v1 = snapshot_v1::FolderSnapshotManifestV1 {
+            version: 9,
+            folder_merkle_root: [0x66; 32],
+            tier: ErasureTier::Homelab,
+            files,
+            signed_dht_envelope: None,
+            deleted_tombstones: BTreeMap::new(),
+        };
+        let raw = bincode::serialize(&v1).unwrap();
+        let snap = FolderSnapshotManifest::decode_bytes(&raw).expect("v1 snapshot decodes");
+        assert_eq!(snap.version, 9);
+        assert_eq!(snap.files.len(), 2);
+        for f in snap.files.values() {
+            assert_eq!(f.manifest.version, crate::storage::FILE_MANIFEST_VERSION);
+            assert!(f.manifest.stripes[0].shard_chunk_roots.is_empty());
+            assert_eq!(f.modified_unix_ms, 7);
+        }
+
+        // A current snapshot round-trips unchanged, chunk roots included.
+        let mut current = snap.clone();
+        for f in current.files.values_mut() {
+            f.manifest.stripes[0].shard_chunk_roots = vec![[0x77; 32]; 20];
+        }
+        let raw2 = bincode::serialize(&current).unwrap();
+        let back = FolderSnapshotManifest::decode_bytes(&raw2).unwrap();
+        for (a, b) in back.files.values().zip(current.files.values()) {
+            assert_eq!(a, b);
+        }
+    }
     use crate::storage::QuotaManager;
 
     #[test]

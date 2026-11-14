@@ -215,11 +215,11 @@ fn test_layer3_anonymous_bearer_quota_vouchers_and_double_spend_prevention() {
     forged_sig[0] ^= 0xFF;
 
     assert!(store
-        .get_blinded_shard_authorized(&blinded_id, &capability, ts_ms, &forged_sig)
+        .get_blinded_shard_authorized(&blinded_id, &capability, ts_ms, &forged_sig, ts_ms)
         .is_err());
 
     let recovered = store
-        .get_blinded_shard_authorized(&blinded_id, &capability, ts_ms, &valid_sig)
+        .get_blinded_shard_authorized(&blinded_id, &capability, ts_ms, &valid_sig, ts_ms)
         .unwrap();
     assert_eq!(recovered, shard_bytes);
 }

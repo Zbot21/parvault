@@ -5,16 +5,17 @@
 # --- No silent skips ------------------------------------------------------------------------------
 skips      K-1       path=tests/*.rs
 suite      S-DOCKER  test=docker_acceptance_gate::docker_acceptance_gate needs=docker
+suite      S-NOFS    test=gateway_ipc_benchmark::test_parvault_seed_no_fs_zero_disk_and_ram_cap_enforcement needs=cmd:sh
 
 # --- Artifact provenance (A-DOCKER: the gate copies from the build directory; convert before item 7)
 artifact   A-DOCKER  script=scripts/docker_acceptance_gate.sh bin=parvault suite=docker_acceptance_gate::docker_acceptance_gate
 open       A-DOCKER  expect=artifact by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 
 # --- Completeness ---------------------------------------------------------------------------------
-enum       E-WIRE    sym=src/network/behaviour.rs::MeshWireRequest
-open       E-WIRE    expect=completeness by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+# QueryNodeStatus: public by design, bucketed values (F-44). LookupWanRendezvous: the slot code
+# authorises; registration is capped; public-slot enumeration is registered under F-22.
+enum       E-WIRE    sym=src/network/behaviour.rs::MeshWireRequest exclude=QueryNodeStatus,LookupWanRendezvous
 adr        D-ADR     path=docs/adr/*.md
-open       D-ADR     expect=completeness by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 
 # --- Reach: checks that exist but are not called on the wire path ----------------------------------
 reach      F-03      sym=src/network/wire_handler.rs::admission_decision from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
@@ -24,9 +25,14 @@ open       F-06      expect=reach by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 
 # --- Blocking calls on handler paths --------------------------------------------------------------
 no-blocking F-18     path=src/network/wire_handler.rs
-open       F-18      expect=no-blocking by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
-no-blocking B-DISC   path=src/network/discovery.rs
-open       B-DISC    expect=no-blocking by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+# B-DISC: discovery.rs blocks only on its dedicated beacon threads; the swarm reaches it only
+# through the onion forward, which runs on the blocking pool since F-18. The check covers the
+# handler modules instead (register: B-DISC).
+no-blocking B-DISC   path=src/network/server_events.rs
+no-blocking B-DISC   path=src/cli/daemon.rs
+# B-SEED-SYND (L-46): the seed's handler modules; the lite fan-out runs on the blocking pool.
+no-blocking B-SEED-SYND path=src/bootstrap.rs
+no-blocking B-SEED-SYND path=src/bin/parvault-seed.rs
 
 # --- ADR cross-references (existence only; F-16's keyword table is curated in its own item) --------
 xref       X-ADR     path=src/**.rs pattern=ADR-(\d+) target=docs/adr/ADR-{}-*.md
@@ -56,38 +62,95 @@ claim      F-21      sym=src/network/wot.rs::chain_leaf_decision accept=trust_en
 claim      F-24      sym=src/network/wire_handler.rs::admission_decision accept=trust_enforcement::f24_admitted_blinded_put_stored reject=trust_enforcement::f24_unadmitted_blinded_put_refused code=reject.peer_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-11-four-layer-shard-anonymization.md covers=MeshWireRequest::PutBlindedShard
 claim      F-24-ONION sym=src/network/wire_handler.rs::admission_decision accept=trust_enforcement::f24_admitted_onion_final_delivered reject=trust_enforcement::f24_unadmitted_onion_final_refused code=reject.peer_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::RelayPqOnionEnvelope
 claim      F-24-LAYERED sym=src/network/wire_handler.rs::admission_decision accept=trust_enforcement::f24_admitted_layered_final_delivered reject=trust_enforcement::f24_unadmitted_layered_final_refused code=reject.peer_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::RelayPqOnionEnvelope
-claim      F-25      sym=src/network/wire_handler.rs::device_cert_decision accept=trust_enforcement::f25_device_cert_of_sender_accepted reject=trust_enforcement::f25_device_cert_replayed_by_other_key_refused code=reject.device_cert_not_sender bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe
+claim      F-25      sym=src/network/wire_handler.rs::device_cert_decision accept=trust_enforcement::f25_device_cert_of_sender_accepted reject=trust_enforcement::f25_device_cert_replayed_by_other_key_refused code=reject.device_cert_not_sender bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-16-zero-trust-seed-server.md covers=MeshWireRequest::SyndicateLiteStripe
 claim      F-25-DHT  sym=src/network/wire_handler.rs::admission_decision accept=trust_enforcement::f25_admitted_dht_put_stored reject=trust_enforcement::f25_unadmitted_dht_put_refused code=reject.peer_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-02-dht-encrypted-manifests.md covers=MeshWireRequest::PutDhtEnvelope
 # Each 2b fix adds its claim line (a differential pair rewritten from its reproduction in
 # tests/trust_enforcement.rs) in the same commit. A claim cannot be declared before its check
 # function exists (an unknown sym is an error even under expect=claim-missing).
-# Findings with no line yet (no check function exists to name): F-07, F-08, F-09, F-12, F-17
-#   (2c); F-22, F-23, F-26 (2c); F-24 issuer policy (2c).
+# Findings with no line yet (no check function exists to name): F-07, F-12
+#   (2c); F-22, F-26 (2c); F-24 issuer policy (2c).
 
 claim      F-36      sym=src/por/verifier.rs::shard_delete_decision accept=trust_enforcement::f36_storer_deletes_its_shard reject=trust_enforcement::f36_other_key_cannot_delete_shard code=reject.delete_not_shard_owner bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::DeleteShard
 # --- Deferred to 2c: declared claims whose pairs do not exist yet (expect=claim-missing) ------------
-claim      F-22      sym=src/network/wan_rendezvous.rs::register accept=trust_enforcement::f22_rendezvous_within_quota_stored reject=trust_enforcement::f22_rendezvous_over_quota_refused code=reject.rendezvous_quota bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::RegisterWanRendezvous
-open       F-22      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
-claim      F-23      sym=src/storage/block_store.rs::renew_blinded_shard_lease accept=trust_enforcement::f23_capability_holder_renews reject=trust_enforcement::f23_stranger_renew_refused code=reject.renew_capability_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::RenewBlindedLease
-open       F-23      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
-claim      F-33      sym=src/network/wire_handler.rs::handle_mesh_wire_request accept=trust_enforcement::f33_admitted_originator_relayed reject=trust_enforcement::f33_relay_budget_exceeded_refused code=reject.onion_relay_budget bin=parvault ref=docs/security/TRUST_FINDINGS.md
-open       F-33      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+claim      F-22      sym=src/network/wan_rendezvous.rs::rendezvous_register_decision accept=trust_enforcement::f22_rendezvous_within_quota_stored reject=trust_enforcement::f22_rendezvous_over_quota_refused code=reject.rendezvous_quota bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-23-online-wan-rendezvous-and-stun-over-noise.md covers=MeshWireRequest::RegisterWanRendezvous
+claim      F-23      sym=src/network/wire_handler.rs::renew_decision accept=trust_enforcement::f23_capability_holder_renews reject=trust_enforcement::f23_stranger_renew_refused code=reject.renew_capability_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::RenewBlindedLease,MeshWireRequest::RenewBlindedLeaseSigned
+claim      F-33      sym=src/network/wire_handler.rs::admission_decision accept=trust_enforcement::f33_admitted_originator_relayed reject=trust_enforcement::f33_unadmitted_originator_refused code=reject.peer_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::RelayPqOnionEnvelope
+claim      F-33-BUDGET sym=src/network/server_events.rs::relay_forward_decision accept=trust_enforcement::f33_relay_within_budget_forwarded reject=trust_enforcement::f33_relay_over_budget_refused code=reject.relay_budget bin=parvault ref=docs/security/TRUST_FINDINGS.md
 
 # --- F-37 (2b) and 2c findings declared before their tests (architect 2b sign-off) ---
 claim      F-37      sym=src/network/wot.rs::ring_handshake_decision accept=trust_enforcement::f37_ring_node_admits_real_chain reject=trust_enforcement::f37_ticket_only_node_refuses_zero_rooted_chain code=reject.handshake_no_ring bin=parvault ref=docs/security/TRUST_FINDINGS.md
 claim      F-07      sym=src/bootstrap.rs::simulate_por_heartbeats accept=trust_enforcement::f07_peer_audit_pass_credited reject=trust_enforcement::f07_self_answered_audit_not_credited code=reject.por_self_credit bin=parvault ref=docs/security/TRUST_FINDINGS.md
 open       F-07      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
-claim      F-08      sym=src/storage/eviction.rs::apply_signed_eviction_order_with_quorum accept=trust_enforcement::f08_majority_council_order_applied reject=trust_enforcement::f08_below_majority_quorum_refused code=reject.council_quorum_below_majority bin=parvault ref=docs/security/TRUST_FINDINGS.md
-open       F-08      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
-claim      F-09      sym=src/storage/eviction.rs::apply_signed_eviction_order_with_quorum accept=trust_enforcement::f09_fresh_order_applied reject=trust_enforcement::f09_stale_or_replayed_order_refused code=reject.eviction_order_stale bin=parvault ref=docs/security/TRUST_FINDINGS.md
-open       F-09      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
-claim      F-17      sym=src/capabilities.rs::verify accept=trust_enforcement::f17_pinned_authority_statement_accepted reject=trust_enforcement::f17_unpinned_authority_statement_refused code=reject.gateway_statement_unpinned bin=parvault ref=docs/security/TRUST_FINDINGS.md
-open       F-17      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
-claim      F-24-ISSUER sym=src/storage/anonymity.rs::redeem_voucher accept=trust_enforcement::f24_ring_issuer_voucher_redeemed reject=trust_enforcement::f24_stranger_issuer_voucher_refused code=reject.voucher_issuer_untrusted bin=parvault ref=docs/security/TRUST_FINDINGS.md
-open       F-24-ISSUER expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+claim      F-08      sym=src/storage/council.rs::council_manifest_decision accept=trust_enforcement::f08_majority_council_order_applied reject=trust_enforcement::f08_below_majority_quorum_refused code=reject.council_quorum_below_majority bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-26-verifiable-abuse-and-council-quorum-governance.md
+claim      F-09      sym=src/storage/eviction.rs::order_admission_decision accept=trust_enforcement::f09_fresh_order_applied reject=trust_enforcement::f09_stale_or_replayed_order_refused code=reject.order_stale bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-25-hmac-blinded-shard-eviction-and-shredding.md covers=MeshWireRequest::BroadcastEvictionOrder
+# F-17 has no core wire or CLI consumer (only the suite broker verifies statements): a Kani
+# line on the decision, plus unit tests capabilities::tests::f17_* (accept and reject).
+kani       F-17      sym=src/capabilities.rs::gateway_statement_decision harness=proof_gateway_statement_pinned_and_bounded cover=statement unpinned or unbounded
+claim      F-24-ISSUER sym=src/network/wire_handler.rs::voucher_issuer_decision accept=trust_enforcement::f24_ring_issuer_voucher_redeemed reject=trust_enforcement::f24_stranger_issuer_voucher_refused code=reject.voucher_issuer_untrusted bin=parvault ref=docs/security/TRUST_FINDINGS.md
 claim      F-34      sym=src/por/verifier.rs::verify_audit_response accept=trust_enforcement::f34_chunk_proof_verified reject=trust_enforcement::f34_wrong_chunk_proof_refused code=reject.por_chunk_proof_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md
 open       F-34      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
-claim      F-35      sym=src/storage/anonymity.rs::redeem_voucher accept=trust_enforcement::f35_fresh_voucher_redeemed reject=trust_enforcement::f35_expired_voucher_refused code=reject.voucher_expired bin=parvault ref=docs/security/TRUST_FINDINGS.md
-open       F-35      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+claim      F-35      sym=src/storage/anonymity.rs::voucher_freshness_decision accept=trust_enforcement::f35_fresh_voucher_redeemed reject=trust_enforcement::f35_expired_voucher_refused code=reject.voucher_expired bin=parvault ref=docs/security/TRUST_FINDINGS.md
 
-ratchet    R         open=19 waive=0
+# --- F-38 (2e): a syndication repair grant must be owned by the sender (L-40) ---
+claim      F-38      sym=src/network/wire_handler.rs::syndication_grant_decision accept=trust_enforcement::f38_sender_owned_grant_accepted reject=trust_enforcement::f38_foreign_owner_grant_refused code=reject.syndication_grant_not_sender bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-20-lite-client-seed-syndication-and-failover.md
+kani       F-38      sym=src/network/wire_handler.rs::syndication_grant_decision harness=proof_syndication_grant_owned_by_sender cover=grant not owned by sender
+
+# --- E-WIRE (2c item 5): claims for the remaining wire variants ---
+claim      E-POR     sym=src/por/verifier.rs::por_prescreen_decision accept=trust_enforcement::ewire_por_audit_with_session_key_answered reject=trust_enforcement::ewire_por_audit_wrong_key_refused code=reject.por_hmac_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-03-stateless-witness-por-auditing.md covers=MeshWireRequest::PorAudit,MeshWireRequest::MultiSegmentPorAudit
+claim      E-ABUSE   sym=src/storage/eviction.rs::abuse_report_decision accept=trust_enforcement::ewire_signed_abuse_report_queued reject=trust_enforcement::ewire_forged_abuse_report_refused code=reject.abuse_report_sig_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-26-verifiable-abuse-and-council-quorum-governance.md covers=MeshWireRequest::SubmitAbuseTakedownReport
+claim      E-COUNCIL sym=src/network/wire_handler.rs::admission_decision accept=trust_enforcement::ewire_admitted_peer_gets_council_manifest reject=trust_enforcement::ewire_unadmitted_peer_council_manifest_refused code=reject.peer_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::GetCouncilManifest
+claim      E-BREAD   sym=src/storage/anonymity.rs::blinded_read_decision accept=trust_enforcement::ewire_blinded_read_by_capability_holder_served reject=trust_enforcement::ewire_blinded_read_by_other_key_refused code=reject.blinded_read_sig_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::GetBlindedShard
+
+# --- F-38-GRANT (2e): first writer wins while a shard is stored (L-41) ---
+claim      F-38-GRANT sym=src/por/verifier.rs::shard_rebind_decision accept=trust_enforcement::f38g_same_owner_reput_accepted reject=trust_enforcement::f38g_takeover_with_own_grant_refused code=reject.shard_bound_to_another_owner bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::PutShard
+claim      F-38-GRANT-SEED sym=src/por/verifier.rs::shard_rebind_decision accept=trust_enforcement::f38g_seed_vault_resyndication_accepted reject=trust_enforcement::f38g_seed_second_key_same_bundle_refused code=reject.shard_bound_to_another_owner bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe
+kani       F-38-GRANT sym=src/por/verifier.rs::shard_rebind_decision harness=proof_shard_rebind_first_writer_wins cover=rebind refused
+
+claim      F-42      sym=src/storage/anonymity.rs::blinded_read_decision accept=trust_enforcement::ewire_blinded_read_by_capability_holder_served reject=trust_enforcement::f42_unregistered_lease_read_refused code=reject.blinded_read_no_capability bin=parvault ref=docs/security/TRUST_FINDINGS.md
+
+# --- F-41 (L-42): blinded deletes signed by the capability key; capability first-writer-wins ---
+claim      F-41      sym=src/storage/anonymity.rs::blinded_delete_decision accept=trust_enforcement::f41_capability_holder_deletes_blinded_shard reject=trust_enforcement::f41_relay_holding_verifier_cannot_delete code=reject.blinded_delete_unsigned bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-11-four-layer-shard-anonymization.md covers=MeshWireRequest::DeleteBlindedShardTombstone,MeshWireRequest::DeleteBlindedShardSigned
+claim      F-41-SEED sym=src/storage/anonymity.rs::blinded_delete_decision accept=trust_enforcement::f41_seed_capability_holder_deletes_blinded_shard reject=trust_enforcement::f41_seed_mac_tombstone_refused code=reject.blinded_delete_unsigned bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md
+kani       F-41      sym=src/storage/anonymity.rs::blinded_delete_decision harness=proof_blinded_delete_needs_every_fact cover=blinded delete refused
+claim      F-41-REBIND sym=src/storage/anonymity.rs::blinded_rebind_decision accept=trust_enforcement::f41_same_capability_reput_accepted reject=trust_enforcement::f41_rebind_with_another_capability_refused code=reject.blinded_locator_bound_to_another_capability bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-19-crash-safe-atomic-storage-and-lease-pinning.md covers=MeshWireRequest::PutBlindedShard
+kani       F-41-REBIND sym=src/storage/anonymity.rs::blinded_rebind_decision harness=proof_blinded_rebind_first_writer_wins cover=blinded rebind refused
+
+claim      ADR-08    sym=src/network/behaviour.rs::wire_frame_decision accept=trust_enforcement::adr08_frame_within_limit_answered reject=trust_enforcement::adr08_oversized_frame_refused code=reject.wire_frame_oversized bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-08-noise-xx-transport-and-bounded-wire-framing.md
+
+claim      ADR-22    sym=src/network/discovery.rs::beacon_decision accept=trust_enforcement::adr22_signed_beacon_discovered reject=trust_enforcement::adr22_forged_beacon_ignored code=reject.beacon_sig_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-22-zero-ip-lan-discovery-and-sas-pairing.md
+
+claim      ADR-07    sym=src/storage/quota.rs::quota_decision accept=trust_enforcement::adr07_shard_within_peer_quota_stored reject=trust_enforcement::adr07_shard_over_peer_quota_refused code=reject.peer_quota_exceeded bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-07-tier-weighted-reciprocity-ledger.md covers=MeshWireRequest::PutShard
+
+claim      ADR-12    sym=src/crypto/pqc.rs::hybrid_signature_decision accept=trust_enforcement::f25_device_cert_of_sender_accepted reject=trust_enforcement::adr12_cert_with_bad_ml_dsa_half_refused code=reject.hybrid_sig_ml_dsa_invalid bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-12-asymmetric-post-quantum-hybrids.md
+
+# --- D-ADR (architect ruling on 2c-dadr-classification.md): ADRs with no runtime claim ---
+noenforce  N-01      adr=docs/adr/ADR-01-streaming-stripes-and-encrypt-before-shard.md reason=client pipeline order; no peer can violate it; unit and Kani in sharding and crypto::aes
+noenforce  N-06      adr=docs/adr/ADR-06-hybrid-locality-and-70-30-placement.md reason=client-side placement policy (performance); no peer-facing promise
+noenforce  N-09      adr=docs/adr/ADR-09-byzantine-merkle-quarantine-and-egress-slashing.md reason=no wire input can slash in v0.5.0 (slashing gossip unsubscribed, F-01; apply_slashing_evidence test-only); quarantine is local; egress slashing not implemented; guard proved by kani S-GUARD
+noenforce  N-13      adr=docs/adr/ADR-13-symmetric-pq-grover-baseline-and-cascaded-aead.md reason=cryptographic primitive; unit and Kani
+noenforce  N-14      adr=docs/adr/ADR-14-incremental-folder-sync-engine.md reason=client-side only
+noenforce  N-17      adr=docs/adr/ADR-17-anonymous-census-telemetry.md reason=client-side; the beacon is self-reported and labelled (F-07)
+noenforce  N-18      adr=docs/adr/ADR-18-seed-phrase-house-fire-disaster-recovery.md reason=client-side; catalogs read from untrusted peers are owner-bound by F-10a (dht_candidate_decision)
+noenforce  N-21      adr=docs/adr/ADR-21-router-soc-1mib-streaming-profile.md reason=performance profile
+noenforce  N-27      adr=docs/adr/ADR-27-zero-copy-uds-gateway-and-hedged-pool.md reason=the socket is a local trust boundary; its enforcement is the ADR-32 claim
+noenforce  N-30      adr=docs/adr/ADR-30-filesystem-free-in-memory-seed-mode.md reason=resource mode, no peer-facing promise; "0 files created" is checked by gateway_ipc_benchmark::test_parvault_seed_no_fs_zero_disk_and_ram_cap_enforcement
+noenforce  N-31      adr=docs/adr/ADR-31-unsafe-remediation-and-os-sys-ffi-boundary.md reason=enforced by audit_workspace_hardening.sh and crate attributes, not at runtime
+
+# --- F-43 (2c): every WebDAV request needs a read-only macaroon (L-43, L-44) ---
+claim      F-43      sym=src/vfs.rs::webdav_auth_decision accept=trust_enforcement::f43_valid_bearer_reads reject=trust_enforcement::f43_no_token_unauthorized code=reject.webdav_token_missing bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-29-pure-rust-fuse-and-webdav-lazy-vfs.md
+claim      F-43-ADR33 sym=src/vfs.rs::webdav_auth_decision accept=trust_enforcement::f43_valid_bearer_reads reject=trust_enforcement::f43_other_manifest_forbidden code=reject.webdav_scope_denied bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md
+claim      F-43-PLUGIN sym=src/vfs.rs::webdav_auth_decision accept=trust_enforcement::f43_plugin_attenuated_child_reads reject=trust_enforcement::f43_plugin_sibling_token_unauthorized code=reject.webdav_token_invalid bin=parvault-fuse ref=docs/security/TRUST_FINDINGS.md
+kani       F-43      sym=src/vfs.rs::webdav_auth_decision harness=proof_webdav_auth_decision cover=valid token out of scope
+
+# --- D-ADR (2c): gateway enforcement pairs ---
+claim      G-MAC     sym=src/gateway/engine.rs::gateway_macaroon_decision accept=trust_enforcement::gmac_frame_inside_caveat_served reject=trust_enforcement::gmac_frame_outside_caveat_refused code=reject.gateway_macaroon_caveat bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-28-stateless-macaroon-capability-attenuation.md
+claim      G-SEAL    sym=src/gateway/engine.rs::gateway_memfd_seal_decision accept=trust_enforcement::gseal_sealed_memfd_stored reject=trust_enforcement::gseal_unsealed_memfd_refused code=reject.gateway_memfd_unsealed bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md
+claim      G-UID     sym=src/gateway/engine.rs::gateway_peer_uid_decision accept=trust_enforcement::guid_allowed_peer_uid_served reject=trust_enforcement::guid_peer_uid_not_allowed_refused code=reject.gateway_peer_uid_not_allowed bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md
+kani       S-GUARD   sym=src/network/wot.rs::slash_target_decision harness=proof_slash_guard_protects_genesis_and_self cover=protected key not slashed
+kani       S-SANITIZE sym=src/sync.rs::sanitize_sync_relative_path_into harness=proof_sanitize_sync_relative_path_no_traversal cover=traversal segment rejected
+
+# --- B-SEED-SYND (2c): the seed's lite fan-out runs off the swarm task, within a budget (L-46) ---
+claim      B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision accept=trust_enforcement::bseed_second_sender_accepted_while_one_job_runs reject=trust_enforcement::bseed_third_job_refused_busy code=reject.syndication_busy bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe
+kani       B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision harness=proof_syndication_fanout_budget cover=syndication over budget
+
+ratchet    R         open=7 waive=11

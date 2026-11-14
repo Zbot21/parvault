@@ -53,6 +53,11 @@ enum SyncCommand {
         /// Store payloads with `RetentionPolicy::Ephemeral` instead of `Persistent`.
         #[arg(long, default_value_t = false)]
         ephemeral: bool,
+
+        /// Exit 0 even if some stripes stayed only on this machine (no ring peer accepted them).
+        /// Without it the command prints how many and exits with code 3: that data is NOT backed up.
+        #[arg(long, default_value_t = false)]
+        allow_local_only: bool,
     },
     /// Continuously poll `--folder` and push incremental changes at `--interval-secs`.
     Watch {
@@ -145,7 +150,11 @@ fn main() -> anyhow::Result<()> {
                     println!("  - {p}");
                 }
             }
-            SyncCommand::Push { folder, ephemeral } => {
+            SyncCommand::Push {
+                folder,
+                ephemeral,
+                allow_local_only,
+            } => {
                 let mut sync = load_sync_client(&cli.socket, &cli.catalog, default_macaroon)?;
                 let retention = if ephemeral {
                     RetentionPolicy::Ephemeral
@@ -153,7 +162,10 @@ fn main() -> anyhow::Result<()> {
                     RetentionPolicy::Persistent
                 };
                 let t0 = Instant::now();
-                let updated = sync.sync_folder_once(&folder, retention)?;
+                let (updated, local_only_stripes) = parvault::storage::local_only::track(|| {
+                    sync.sync_folder_once(&folder, retention)
+                });
+                let updated = updated?;
                 updated.save_to_file(&cli.catalog)?;
                 println!(
                     "[parvault-sync] pushed {} (v{}, files={}, tombstones={}, root={}, {:.2} ms)",
@@ -163,6 +175,10 @@ fn main() -> anyhow::Result<()> {
                     updated.deleted_tombstones.len(),
                     hex::encode(updated.folder_merkle_root),
                     t0.elapsed().as_secs_f64() * 1000.0
+                );
+                parvault::storage::local_only::finish_one_shot(
+                    local_only_stripes,
+                    allow_local_only,
                 );
             }
             SyncCommand::Watch {
@@ -184,8 +200,18 @@ fn main() -> anyhow::Result<()> {
                         || !diff.modified.is_empty()
                         || !diff.deleted.is_empty()
                     {
-                        let updated =
-                            sync.sync_folder_once(&folder, RetentionPolicy::Persistent)?;
+                        let updated = {
+                            let (r, n) = parvault::storage::local_only::track(|| {
+                                sync.sync_folder_once(&folder, RetentionPolicy::Persistent)
+                            });
+                            if n > 0 {
+                                eprintln!(
+                                    "[parvault-sync] ERROR: {}",
+                                    parvault::storage::local_only::summary_line(n)
+                                );
+                            }
+                            r?
+                        };
                         updated.save_to_file(&cli.catalog)?;
                         println!(
                             "[parvault-sync] synced v{} (+{} ~{} -{}, root={})",

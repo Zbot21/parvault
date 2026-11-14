@@ -39,7 +39,10 @@ BUILD_CTX="/tmp/parvault-acceptance-image"
 rm -rf "$BUILD_CTX"
 mkdir -p "$BUILD_CTX"
 
-if [ "${USE_GLIBC_IMAGE:-0}" != "1" ] && rustup target list --installed 2>/dev/null | grep -q "x86_64-unknown-linux-musl"; then
+# Capture before grepping: with pipefail, `cmd | grep -q` fails when grep exits early and cmd
+# gets SIGPIPE.
+INSTALLED_TARGETS="$(rustup target list --installed 2>/dev/null || true)"
+if [ "${USE_GLIBC_IMAGE:-0}" != "1" ] && grep -q "x86_64-unknown-linux-musl" <<<"$INSTALLED_TARGETS"; then
     cargo build --release --target x86_64-unknown-linux-musl --bin parvault --bin parvault-seed
     cp target/x86_64-unknown-linux-musl/release/parvault "$BUILD_CTX/parvault"
     cp target/x86_64-unknown-linux-musl/release/parvault-seed "$BUILD_CTX/parvault-seed"
@@ -153,12 +156,34 @@ docker run -d --name parvault-outsider \
     sleep 3600
 docker exec parvault-outsider /usr/local/bin/parvault --data-dir /var/lib/outsider --no-lan-discovery wot init
 docker exec parvault-outsider sh -c 'echo "outsider data" > /tmp/outsider.txt'
-if docker exec parvault-outsider /usr/local/bin/parvault --data-dir /var/lib/outsider --no-lan-discovery \
-    --peers /ip4/172.28.0.11/tcp/4001 file store --path /tmp/outsider.txt; then
+# The outsider is refused, keeps the stripe locally, says it is not backed up and exits 3.
+set +e
+OUTSIDER_OUT="$(docker exec parvault-outsider /usr/local/bin/parvault --data-dir /var/lib/outsider \
+    --no-lan-discovery --peers /ip4/172.28.0.11/tcp/4001 file store --path /tmp/outsider.txt 2>&1)"
+OUTSIDER_RC=$?
+set -e
+echo "$OUTSIDER_OUT"
+if [ "$OUTSIDER_RC" -ne 3 ] || ! grep -q "NOT backed up" <<<"$OUTSIDER_OUT"; then
+    echo "ERROR: the outsider's store did not report NOT backed up with exit 3 (exit $OUTSIDER_RC)"
+    exit 1
+fi
+OUTSIDER_ROOT="$(awk '/File Merkle Root/ {print $5}' <<<"$OUTSIDER_OUT")"
+if [ "${#OUTSIDER_ROOT}" -ne 64 ]; then
+    echo "ERROR: could not read the outsider's stripe root from its store output"
+    exit 1
+fi
+# The daemon creates its shards directory at start, so it must exist.
+if ! NODE1_SHARDS="$(docker exec parvault-node-1 ls /var/lib/parvault/.parvault-data/shards)"; then
+    echo "ERROR: node-1 has no shards directory to check"
+    exit 1
+fi
+if grep -q "^${OUTSIDER_ROOT:0:16}" <<<"$NODE1_SHARDS"; then
     echo "ERROR: a non-member stored data on a ring node"
     exit 1
 fi
-if ! docker logs parvault-node-1 2>&1 | grep -q "reject.peer_not_admitted"; then
+# Capture the log first: `docker logs | grep -q` fails under pipefail once the log is long.
+NODE1_LOG="$(docker logs parvault-node-1 2>&1)"
+if ! grep -q "reject.peer_not_admitted" <<<"$NODE1_LOG"; then
     echo "ERROR: the ring node did not log the refusal"
     exit 1
 fi
@@ -176,15 +201,16 @@ if [ "$DISCOVERED_COUNT" -lt 10 ]; then
     exit 1
 fi
 
-# Also prove zero-`--peers` file store & restore over Docker bridge auto-discovery
-docker exec parvault-client sh -cex '
+# Also prove zero-`--peers` file store & restore over Docker bridge auto-discovery.
+# The CLI never prints the master key (W-02): store and restore with one explicit key.
+ZKEY="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+docker exec -e ZKEY="$ZKEY" parvault-client sh -cex '
     mkdir -p /tmp/zero-ip-store /tmp/zero-ip-restore
     echo "Zero-IP LAN discovery file store/restore over 172.28.0.0/24 bridge" > /tmp/zero-ip-store/lan_zero_ip.txt
     sha256sum /tmp/zero-ip-store/lan_zero_ip.txt > /tmp/lan_zero_ip.sha256
-    ZOUT=$(/usr/local/bin/parvault --data-dir /tmp/zero-ip-store/data file store --path /tmp/zero-ip-store/lan_zero_ip.txt)
+    ZOUT=$(/usr/local/bin/parvault --data-dir /tmp/zero-ip-store/data file store --path /tmp/zero-ip-store/lan_zero_ip.txt --key-hex "$ZKEY")
     echo "$ZOUT"
     ZROOT=$(echo "$ZOUT" | awk "/File Merkle Root/ {print \$5}")
-    ZKEY=$(echo "$ZOUT" | awk "/Master Key/ {print \$5}")
     rm -rf /tmp/zero-ip-store
     /usr/local/bin/parvault --data-dir /tmp/zero-ip-restore/data file restore "$ZROOT" --output /tmp/zero-ip-store/lan_zero_ip.txt --key-hex "$ZKEY"
     sha256sum -c /tmp/lan_zero_ip.sha256
@@ -272,10 +298,20 @@ echo "=== [7/12] Lite-Client 1.0x Stripe Syndication via parvault-seed-0 & NAS-D
 docker exec parvault-client sh -cex '
     mkdir -p /tmp/lite-client-state /workspace/lite_source /workspace/lite_restored_after_nas_death
     echo "Lite-Client 1.0x stripe syndicated through parvault-seed-0 to 10 mesh peers" > /workspace/lite_source/laptop_note.txt
-    sha256sum /workspace/lite_source/laptop_note.txt > /tmp/expected_lite.sha256
+    sha256sum < /workspace/lite_source/laptop_note.txt | cut -d " " -f1 > /tmp/expected_lite.hash
 '
+# Every shard file in the client container before the lite run (other stages' vaults live here).
+LITE_SHARDS_BEFORE="$(docker exec parvault-client sh -c 'find / \( -path /proc -o -path /sys -o -path /dev \) -prune -o -name "*.shard" -type f -print 2>/dev/null | sort')"
 SEED_PUBKEY_HEX="$(docker exec parvault-seed-0 /usr/local/bin/parvault-seed identity --data-dir /var/lib/parvault-seed | awk '/Owner PQ Public Key Hex/ {print $7}')"
-DEVICE_CERT_TOKEN="$(docker exec parvault-seed-0 /usr/local/bin/parvault-seed issue-device-cert --data-dir /var/lib/parvault-seed --device-peer-id parvault-peer-lite-laptop --device-label laptop | awk '/Shareable Token/ {print $4}')"
+# The lite client syndicates as its vault identity, which also signs the repair grant (F-25,
+# F-38): the cert names the Vault Device Peer ID that `parvault identity --seed-phrase` prints.
+LITE_DEVICE_ID="$(docker exec -w /tmp/lite-client-state parvault-client /usr/local/bin/parvault identity \
+    --seed-phrase "$SEED_PHRASE" --vault-namespace "lite-failover-ns" 2>/dev/null | awk '/Vault Device Peer ID/ {print $6}')"
+if [ -z "$LITE_DEVICE_ID" ]; then
+    echo "ERROR: could not read the Vault Device Peer ID"
+    exit 1
+fi
+DEVICE_CERT_TOKEN="$(docker exec parvault-seed-0 /usr/local/bin/parvault-seed issue-device-cert --data-dir /var/lib/parvault-seed --device-peer-id "$LITE_DEVICE_ID" --device-label laptop | awk '/Shareable Token/ {print $4}')"
 
 docker exec -w /tmp/lite-client-state parvault-client /usr/local/bin/parvault \
     --peers "$PEERS_CSV" \
@@ -288,17 +324,51 @@ docker exec -w /tmp/lite-client-state parvault-client /usr/local/bin/parvault \
     --vault-namespace "lite-failover-ns" \
     --once
 
-# Simulate NAS / Seed Server death by stopping parvault-seed-0, then recover Lite-Client vault directly from mesh peers!
+# B-SEED-SYND (L-46): the seed logs its in-lock handler time and its off-task fan-out time.
+# The seed logs with ANSI colours (field "handler_ms<ESC>[0m<ESC>[2m=84"); strip them first.
+LITE_SYND_TIMES="$(docker logs parvault-seed-0 2>&1 | sed 's/\x1b\[[0-9;]*m//g' \
+    | grep -E 'lite syndication (ingested on the seed|fan-out finished)' || true)"
+echo "$LITE_SYND_TIMES"
+if ! echo "$LITE_SYND_TIMES" | grep -q 'handler_ms=' || ! echo "$LITE_SYND_TIMES" | grep -q 'job_ms='; then
+    echo "ERROR: stage 7: parvault-seed-0 logged no lite syndication handler/job durations"
+    exit 1
+fi
+
+# Simulate NAS / Seed Server death by stopping parvault-seed-0, then recover the Lite-Client vault
+# from mesh peers only. By design a successful lite syndication deletes the client's local shards
+# (src/cli/folder.rs, after syndication), so there is nothing to wipe: instead assert the lite run
+# left no shard file anywhere in the container, hide the source folder, and restore into a fresh
+# data dir and working dir, so the restore can read neither local shards nor the original file.
+LITE_SHARDS_AFTER="$(docker exec parvault-client sh -c 'find / \( -path /proc -o -path /sys -o -path /dev \) -prune -o -name "*.shard" -type f -print 2>/dev/null | sort')"
+LITE_NEW_SHARDS="$(comm -13 <(printf '%s\n' "$LITE_SHARDS_BEFORE") <(printf '%s\n' "$LITE_SHARDS_AFTER") | sed '/^$/d')"
+if [ -n "$LITE_NEW_SHARDS" ]; then
+    echo "ERROR: stage 7: the lite run kept local shards, so the restore could read them:"
+    echo "$LITE_NEW_SHARDS"
+    exit 1
+fi
+if ! docker exec parvault-client test -s /tmp/lite-client-state/lite.manifest.bin; then
+    echo "ERROR: stage 7: the lite run wrote no snapshot; nothing was synced"
+    exit 1
+fi
+docker exec parvault-client sh -cex '
+    mv /workspace/lite_source /workspace/lite_source.hidden-for-restore
+    mkdir -p /tmp/lite-restore-fresh/data /tmp/lite-restore-fresh/cwd
+    test -z "$(ls -A /tmp/lite-restore-fresh/data)"
+'
 docker stop parvault-seed-0
-docker exec -w /tmp/lite-client-state parvault-client /usr/local/bin/parvault \
+docker exec -w /tmp/lite-restore-fresh/cwd parvault-client /usr/local/bin/parvault \
+    --data-dir /tmp/lite-restore-fresh/data \
     --peers "$PEERS_CSV" \
     recover-from-seed \
     --seed-phrase "$SEED_PHRASE" \
     --vault-namespace "lite-failover-ns" \
     --out-dir /workspace/lite_restored_after_nas_death
+# Compare the restored file's content (not a path: a path-based check would re-hash the source).
 docker exec parvault-client sh -cex '
-    cd /workspace/lite_restored_after_nas_death
-    sha256sum -c /tmp/expected_lite.sha256
+    test ! -e /workspace/lite_source
+    RESTORED="$(find /workspace/lite_restored_after_nas_death -type f -name laptop_note.txt)"
+    test "$(printf "%s\n" "$RESTORED" | sed "/^$/d" | wc -l)" -eq 1
+    test "$(sha256sum < "$RESTORED" | cut -d " " -f1)" = "$(cat /tmp/expected_lite.hash)"
 '
 docker start parvault-seed-0
 for attempt in $(seq 1 30); do
@@ -307,6 +377,47 @@ for attempt in $(seq 1 30); do
     fi
     sleep 1
 done
+
+echo "=== [7b/12] Eviction council (F-08/F-09): signed manifest; member order applied; non-member refused ==="
+# node-1 holds the ring genesis and signs epoch 1 of a 1-of-1 council whose member is node-2;
+# nodes 2, 3 and 6 install that manifest. node-2 (a member) propagates a bounded, epoch-stamped
+# order that node-6 applies; node-3 (not a member) cannot propagate at all.
+NODE2_KEY="$(docker exec -w /var/lib/parvault parvault-node-2 /usr/local/bin/parvault --no-lan-discovery identity \
+    | awk -F': ' '/Ed25519 Public Key/ {print $2}')"
+COUNCIL_HEX="$(docker exec -w /var/lib/parvault parvault-node-1 /usr/local/bin/parvault --no-lan-discovery \
+    council init --member "$NODE2_KEY" --quorum 1 | tail -n 1)"
+for n in 2 3 6; do
+    docker exec -w /var/lib/parvault "parvault-node-$n" /usr/local/bin/parvault --no-lan-discovery \
+        council install --manifest "$COUNCIL_HEX"
+done
+if ! docker exec -w /var/lib/parvault parvault-node-6 /usr/local/bin/parvault --no-lan-discovery council show \
+    | grep -q '^Epoch *: 1$'; then
+    echo "ERROR: parvault-node-6 did not install council epoch 1"
+    exit 1
+fi
+docker exec -w /var/lib/parvault parvault-node-2 /usr/local/bin/parvault --peers "$PEERS_CSV" --no-lan-discovery \
+    evict --ip 203.0.113.77 --reason council-stage --propagate
+COUNCIL_APPLIED=0
+for _ in $(seq 1 20); do
+    if docker logs parvault-node-6 2>&1 | grep -q 'applied an eviction order'; then
+        COUNCIL_APPLIED=1
+        break
+    fi
+    sleep 0.5
+done
+if [ "$COUNCIL_APPLIED" -ne 1 ]; then
+    echo "ERROR: parvault-node-6 did not apply the council member's order"
+    exit 1
+fi
+if NONMEMBER_OUT="$(docker exec -w /var/lib/parvault parvault-node-3 /usr/local/bin/parvault --peers "$PEERS_CSV" \
+    --no-lan-discovery evict --ip 203.0.113.78 --propagate 2>&1)"; then
+    echo "ERROR: a non-member propagated an eviction order: $NONMEMBER_OUT"
+    exit 1
+fi
+case "$NONMEMBER_OUT" in
+    *"member of the installed council"*) ;;
+    *) echo "ERROR: unexpected non-member refusal: $NONMEMBER_OUT"; exit 1 ;;
+esac
 
 echo "=== [8/12] Graceful Node Decommission: parvault-node-5 -> parvault-node-11 ('parvault leave --handoff-to') ==="
 NODE11_BEFORE="$(docker exec parvault-node-11 sh -c 'ls -1 /var/lib/parvault/.parvault-data/shards/*.shard 2>/dev/null | wc -l')"
@@ -328,7 +439,7 @@ docker exec parvault-node-6 sh -cex '
 '
 SCRUB_OUT="$(docker exec -w /var/lib/parvault parvault-node-6 /usr/local/bin/parvault scrub)"
 echo "$SCRUB_OUT"
-echo "$SCRUB_OUT" | grep -q "corrupted_quarantined_shards : 1"
+grep -q "corrupted_quarantined_shards : 1" <<<"$SCRUB_OUT"
 
 # Restart parvault-node-6 and parvault-node-7 to prove persistent disk state across daemon restarts
 docker restart parvault-node-6 parvault-node-7
@@ -388,14 +499,14 @@ docker exec parvault-client sh -cex '
 '
 
 echo "=== [11/12] Cross-Machine 'parvault file store' -> 'parvault file restore --key-hex' with Wiped Local State ==="
-docker exec -e SURVIVING_PEERS="$SURVIVING_PEERS" parvault-client sh -cex '
+XKEY="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+docker exec -e SURVIVING_PEERS="$SURVIVING_PEERS" -e KEY="$XKEY" parvault-client sh -cex '
     mkdir -p /tmp/machine-a /tmp/machine-b
     echo "cross-machine file store and restore verified on v0.3.0" > /tmp/machine-a/secret.txt
     sha256sum /tmp/machine-a/secret.txt > /tmp/secret.sha256
-    OUT=$(/usr/local/bin/parvault --data-dir /tmp/machine-a/data --peers "$SURVIVING_PEERS" file store --path /tmp/machine-a/secret.txt)
+    OUT=$(/usr/local/bin/parvault --data-dir /tmp/machine-a/data --peers "$SURVIVING_PEERS" file store --path /tmp/machine-a/secret.txt --key-hex "$KEY")
     echo "$OUT"
     ROOT=$(echo "$OUT" | awk "/File Merkle Root/ {print \$5}")
-    KEY=$(echo "$OUT" | awk "/Master Key/ {print \$5}")
     rm -rf /tmp/machine-a
     /usr/local/bin/parvault --data-dir /tmp/machine-b/data --peers "$SURVIVING_PEERS" file restore "$ROOT" --output /tmp/machine-a/secret.txt --key-hex "$KEY"
     sha256sum -c /tmp/secret.sha256
@@ -451,6 +562,7 @@ SOC_EXPECTED_SHA256="$(docker run --rm -v "$SOC_VOL_NAME:/mnt/nas" parvault:acce
     sha256sum /mnt/nas/router_soc_5mib.bin | awk "{print \$1}"
 ')"
 
+SOC_KEY="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
 SOC_STORE_OUT="$(docker run --name parvault-soc-store \
     -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     --network parvault-acceptance-net \
@@ -459,7 +571,7 @@ SOC_STORE_OUT="$(docker run --name parvault-soc-store \
     parvault:router-soc \
     --profile router-soc \
     --data-dir /mnt/nas/store-data \
-    file store --path /mnt/nas/router_soc_5mib.bin)"
+    file store --path /mnt/nas/router_soc_5mib.bin --key-hex "$SOC_KEY")"
 echo "$SOC_STORE_OUT"
 
 SOC_STORE_OOM="$(docker inspect -f '{{.State.OOMKilled}}' parvault-soc-store)"
@@ -472,7 +584,6 @@ fi
 echo "$SOC_STORE_OUT" | grep -Eq "Total Stripes[[:space:]]*:[[:space:]]*5"
 
 SOC_ROOT="$(echo "$SOC_STORE_OUT" | awk '/File Merkle Root/ {print $5}')"
-SOC_KEY="$(echo "$SOC_STORE_OUT" | awk '/Master Key/ {print $5}')"
 
 # Wipe local store-data so restore pulls all 5 stripes over libp2p inside another 48 MiB cgroup container!
 docker run --rm -v "$SOC_VOL_NAME:/mnt/nas" parvault:acceptance rm -rf /mnt/nas/store-data
@@ -518,6 +629,7 @@ echo " Zero-IP LAN Discovery  : PASS (${DISCOVERED_COUNT} daemons auto-discovere
 echo " Initial Sync (v1)      : ${TOTAL_SHARDS_V1} shards across 10 nodes (${SYNC_V1_SECS}s)"
 echo " Continuous Watch (v2)  : PASS (live update + tombstone pruning over libp2p)"
 echo " Lite-Client Failover   : PASS (1.0x seed syndication + NAS-death mesh recovery)"
+echo " Eviction Council       : PASS (signed manifest epoch 1; member order applied; non-member refused)"
 echo " Graceful Node Leave    : PASS (parvault-node-5 -> parvault-node-11: ${NODE11_AFTER} shards)"
 echo " Bit-Rot Scrubbing      : PASS (1 corrupted shard detected & quarantined)"
 echo " Disaster Recovery      : PASS (4 killed + 1 left + 2 restarted, ${RECOVER_SECS}s)"

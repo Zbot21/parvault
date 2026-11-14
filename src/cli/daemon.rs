@@ -50,6 +50,17 @@ pub(crate) async fn run_daemon(
     );
     wot.set_trust_pool_mode(opts.trust_mode, DEFAULT_PUBLIC_WOT_POW_BITS);
     wot.protect_key(node_identity.public_key_bytes());
+    // The owner key (derived from the master key) is never slashed either, so a future audit
+    // loop's record_failure cannot quarantine the owner. Only an existing key is read here.
+    if cfg.data_dir.join("master_key.sealed").exists() {
+        if let Ok(mk) = resolve_master_key(
+            &cfg.data_dir,
+            None,
+            cfg.device_sealing_passphrase.as_deref(),
+        ) {
+            wot.protect_key(NodeIdentity::from_master_key(&mk).public_key_bytes());
+        }
+    }
 
     let mut por_verifier =
         PorVerifierEngine::with_persistence_dir(cfg.por_timeout_ms, &cfg.data_dir);
@@ -169,13 +180,41 @@ pub(crate) async fn run_daemon(
             cache_bytes,
         )?;
         if let Some(ref seed_dir) = opts.vfs_seed_dir {
-            let seeded = vfs.ingest_local_directory(seed_dir)?;
-            info!(
-                seed_dir = %seed_dir.display(),
-                seeded,
-                "Ingested built-in VFS seed directory"
-            );
+            // The seed directory is stored like any other data: on the node's pinned ring peers,
+            // or locally when it has none. If its peers are unreachable the ingest fails; the
+            // daemon keeps serving instead of exiting (W-04).
+            let (ingested, local_only_stripes) =
+                parvault::storage::local_only::track(|| vfs.ingest_local_directory(seed_dir));
+            if local_only_stripes > 0 {
+                tracing::error!(
+                    seed_dir = %seed_dir.display(),
+                    "{}",
+                    parvault::storage::local_only::summary_line(local_only_stripes)
+                );
+            }
+            match ingested {
+                Ok(seeded) => info!(
+                    seed_dir = %seed_dir.display(),
+                    seeded,
+                    "Ingested built-in VFS seed directory"
+                ),
+                Err(e) => {
+                    warn!(seed_dir = %seed_dir.display(), error = %e, "built-in VFS seed directory not ingested");
+                    eprintln!(
+                        "[parvault] warning: --vfs-seed-dir {} not ingested: {e}",
+                        seed_dir.display()
+                    );
+                }
+            }
         }
+        // F-43 (L-44, Addendum A ruling): with a root key, every in-process FetchRange needs a
+        // macaroon. The built-in VFS (WebDAV and FUSE) reads with a ReadOnly token minted here, in
+        // memory only: never written, logged or returned. Clients are gated at the WebDAV edge
+        // (`webdav_auth_decision`); their tokens never reach the gateway.
+        let vfs = match opts.macaroon_root_key {
+            Some(ref key) => vfs.with_default_macaroon(Some(builtin_vfs_read_token(key)?)),
+            None => vfs,
+        };
         if let Some(fuse_fd) = opts.vfs_fuse_fd {
             let fuse_dev = parvault::os_sys::adopt_fuse_dev_fd(fuse_fd)?;
             let vfs_fuse = vfs.clone();
@@ -193,7 +232,14 @@ pub(crate) async fn run_daemon(
             );
         }
         if let Some(ref webdav_addr) = opts.vfs_webdav_listen {
-            let handle = vfs.spawn_webdav_server(webdav_addr)?;
+            // F-43: fail closed without a root key (daemon_cmds loads or creates one).
+            let root_key = opts.macaroon_root_key.ok_or_else(|| {
+                anyhow::anyhow!("built-in WebDAV needs a macaroon root key (F-43)")
+            })?;
+            let handle = vfs.spawn_webdav_server(
+                webdav_addr,
+                parvault::vfs::WebdavVerifier::RootKey(root_key),
+            )?;
             println!(
                 "[parvault] Built-in VFS WebDAV listening on http://{} (in-process GatewayBus, socket={})",
                 handle.local_addr(),
@@ -267,13 +313,17 @@ pub(crate) async fn run_daemon(
 
     loop {
         tokio::select! {
+            Some(done) = server_events.next_deferred(), if server_events.has_deferred() => {
+                server_events.send_deferred(&mut swarm, done);
+            }
             event = swarm.select_next_some() => {
-                let unhandled = server_events.handle(&mut swarm, event, |peer_str, remote_addr, request| {
+                let unhandled = server_events.handle(&mut swarm, event, |peer_str, remote_addr, request, syndication_load| {
                     handle_daemon_wire_request(
                         peer_str,
                         remote_addr,
                         request,
                             DaemonWireHandlerCtx {
+                                    syndication_load,
                                 cfg: &cfg,
                                 node_identity: &node_identity,
                                 genesis_pubkey,
@@ -570,12 +620,23 @@ fn spawn_folder_sync(opts: &DaemonLaunchOptions, cfg: &NodeConfig, block_store: 
                     let mut engine = FolderSyncEngine::new(store_owner, mk, owner_id, sync_tier);
                     if snap_cl.exists() {
                         if let Ok(raw) = std::fs::read(&snap_cl) {
-                            if let Ok(prev) = bincode::deserialize::<FolderSnapshotManifest>(&raw) {
+                            if let Ok(prev) = FolderSnapshotManifest::decode_bytes(&raw) {
                                 engine.load_previous_snapshot(&prev);
                             }
                         }
                     }
-                    let updated = engine.sync_folder_once(&folder_cl)?;
+                    let (updated, local_only_stripes) =
+                        parvault::storage::local_only::track(|| {
+                            engine.sync_folder_once(&folder_cl)
+                        });
+                    if local_only_stripes > 0 {
+                        tracing::error!(
+                            folder = %folder_cl.display(),
+                            "{}",
+                            parvault::storage::local_only::summary_line(local_only_stripes)
+                        );
+                    }
+                    let updated = updated?;
                     if let Ok(bytes) = bincode::serialize(&updated) {
                         let _ = BlockStore::atomic_write_file(&snap_cl, &bytes);
                     }
@@ -667,4 +728,21 @@ pub(crate) fn spawn_wan_and_tracker_announce(task_cfg: WanAnnounceTaskConfig) {
             }
         }
     });
+}
+
+/// F-43: the in-memory ReadOnly macaroon the built-in VFS reads with (fresh random nonce).
+#[cfg(all(unix, feature = "vfs"))]
+fn builtin_vfs_read_token(
+    root_key: &[u8; 32],
+) -> anyhow::Result<parvault::capabilities::CapabilityMacaroon> {
+    use rand::RngCore;
+    let mut nonce = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    parvault::capabilities::CapabilityMacaroon::mint(
+        root_key,
+        nonce,
+        [0u8; 32],
+        vec![parvault::capabilities::Caveat::ReadOnly],
+    )
+    .map_err(|e| anyhow::anyhow!("built-in VFS read token: {e:?}"))
 }

@@ -25,3 +25,7 @@ Decentralized storage networks face two cold-start hazards: (1) a rigid 20-peer 
 
 - **Consequences:** Seamless progression from a single-user 2-device LAN ring on Day 1 to a 10,000-user organic mesh with zero self-selected tier gaming.
 - **Verification:** `specs/ParVaultBootstrapAndEarnedTier.tla` (`0` errors) and `tests/bootstrap_and_earned_tier_tests.rs`.
+
+## v0.5.0: blinded deletes (F-41)
+
+Blinded shards are deleted only by a delete signed with the lease's capability key (ADR-11, `DeleteBlindedShardSigned`); `BlindedShardTombstone` MACs are refused. Leases stored without a registered capability key (`capability_pubkey: None`, legacy) can be neither read nor deleted (F-42, D-2: fail closed) and expire by lease.

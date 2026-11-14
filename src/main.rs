@@ -128,10 +128,11 @@ fn command_needs_network_discovery(cmd: &Commands) -> bool {
     !matches!(
         cmd,
         Commands::Init { .. }
+            | Commands::NewSeedPhrase
             | Commands::Discover { .. }
             | Commands::Pair { .. }
             | Commands::Join { .. }
-            | Commands::Identity
+            | Commands::Identity { .. }
             | Commands::IssueDeviceCert { .. }
             | Commands::VerifyDeviceCert { .. }
             | Commands::DiffFolder { .. }
@@ -139,6 +140,7 @@ fn command_needs_network_discovery(cmd: &Commands) -> bool {
             | Commands::Scrub
             | Commands::Token { .. }
             | Commands::Wot { .. }
+            | Commands::Council { .. }
             | Commands::Gateway { .. }
     )
 }
@@ -255,6 +257,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // Stores nothing and needs no data directory or configuration.
+    if matches!(cli.command, Commands::NewSeedPhrase) {
+        println!("{}", generate_bip39_mnemonic(24)?);
+        return Ok(());
+    }
     let cfg = NodeConfig::load_for_cli(cli.config.as_ref(), cli.data_dir.as_deref(), cli.profile)?;
 
     let lan_port = cfg.effective_lan_discovery_port(cli.lan_discovery_port);
@@ -278,6 +285,10 @@ async fn main() -> anyhow::Result<()> {
 
     if let Commands::Token { action } = cli.command {
         return parvault::gateway::execute_token_cli(action, &cfg.data_dir);
+    }
+
+    if let Commands::Council { action } = cli.command {
+        return cli::council::run(action, &cfg, public_mode);
     }
 
     if let Commands::Gateway { opts, action } = cli.command {
@@ -318,7 +329,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mesh_client = MeshClient::new(node_identity.clone(), resolved_peers, effective_seed)
-        .with_data_dir_discovery(cfg.data_dir.clone(), lan_port);
+        .with_data_dir_discovery(cfg.data_dir.clone(), lan_port)
+        .with_lan_discovery(lan_enabled);
 
     if public_mode && command_needs_network_discovery(&cli.command) {
         for tracker in &public_trackers {
@@ -355,8 +367,10 @@ async fn main() -> anyhow::Result<()> {
     };
     match cli.command {
         Commands::Init { .. }
+        | Commands::NewSeedPhrase
         | Commands::Token { .. }
         | Commands::Wot { .. }
+        | Commands::Council { .. }
         | Commands::Gateway { .. } => {
             unreachable!("handled above")
         }
@@ -370,7 +384,7 @@ async fn main() -> anyhow::Result<()> {
         command @ Commands::Daemon { .. } => cli::daemon_cmds::daemon(env, command).await?,
         command @ Commands::File { .. } => cli::file::file(env, command).await?,
         command @ Commands::Status => cli::identity::status(env, command).await?,
-        command @ Commands::Identity => cli::identity::identity(env, command).await?,
+        command @ Commands::Identity { .. } => cli::identity::identity(env, command).await?,
         command @ Commands::IssueDeviceCert { .. } => {
             cli::identity::issue_device_cert(env, command).await?
         }
@@ -532,13 +546,13 @@ fn load_manifest_for_abuse_report(
         if let Ok(m) = FileManifest::from_encrypted_dht_record(disclosed_mk, &raw) {
             return Ok(m);
         }
-        if let Ok(m) = bincode::deserialize::<FileManifest>(&raw) {
+        if let Ok(m) = FileManifest::decode_bytes(&raw) {
             return Ok(m);
         }
         if let Ok(m) = serde_json::from_slice::<FileManifest>(&raw) {
             return Ok(m);
         }
-        if let Ok(snap) = bincode::deserialize::<FolderSnapshotManifest>(&raw) {
+        if let Ok(snap) = FolderSnapshotManifest::decode_bytes(&raw) {
             if let Some(first) = snap.files.values().next() {
                 return Ok(first.manifest.clone());
             }

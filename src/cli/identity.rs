@@ -50,6 +50,16 @@ pub(crate) async fn status(env: CliEnv, command: Commands) -> anyhow::Result<()>
         cfg.local_rtt_threshold_ms,
         (1.0 - cfg.intra_asn_ratio) * 100.0
     );
+    let local_only = block_store.local_only_stripe_count();
+    println!(
+        "Local-Only Stripes    : {}{}",
+        local_only,
+        if local_only > 0 {
+            " (kept only on this machine: NOT backed up)"
+        } else {
+            ""
+        }
+    );
     println!(
         "Local Storage Quota   : {} / {} bytes used ({} bytes bootstrap grace)",
         q_guard.used_storage_bytes(),
@@ -65,7 +75,7 @@ pub(crate) async fn status(env: CliEnv, command: Commands) -> anyhow::Result<()>
         "Bandwidth Rate Limits : upload={} Mbps, download={} Mbps (0 = unlimited)",
         cfg.max_upload_mbps, cfg.max_download_mbps
     );
-    println!("\nEarned Standing Progression Ladder (ADR-12):");
+    println!("\nStanding tiers (planned; standing is self-reported and does not change erasure coding yet):");
     println!(
         "  SoloPersonalVault -> PersonalDeviceRing -> BuddyMicroCluster -> ProbationaryConsumerPool -> EarnedVerifiedMixedPool -> EarnedHomelabAnchorPool"
     );
@@ -103,7 +113,11 @@ pub(crate) async fn status(env: CliEnv, command: Commands) -> anyhow::Result<()>
 
 pub(crate) async fn identity(env: CliEnv, command: Commands) -> anyhow::Result<()> {
     let CliEnv { cfg, .. } = env;
-    let Commands::Identity = command else {
+    let Commands::Identity {
+        seed_phrase,
+        vault_namespace,
+    } = command
+    else {
         unreachable!("identity() is only dispatched for Commands::Identity")
     };
     let node_id = NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?;
@@ -126,6 +140,19 @@ pub(crate) async fn identity(env: CliEnv, command: Commands) -> anyhow::Result<(
     println!("Owner PQ Public Key Hex : {}", pq_pk.to_hex()?);
     println!("Owner PQ Fingerprint    : {}", pq_pk.fingerprint_hex());
     println!("Master Key Fingerprint  : {}", mk_fp);
+    // F-38: the identity a lite-seed syndication sends as (and its device cert must name).
+    let phrase = crate::cli::folder::effective_seed_phrase(seed_phrase);
+    let (_, vault_id) =
+        crate::cli::folder::vault_keys(phrase.as_deref(), &vault_namespace, &cfg, None)?;
+    println!(
+        "Vault Device Peer ID    : {}{}",
+        vault_id.device_peer_id(),
+        if phrase.is_some() {
+            format!(" (recovery phrase, namespace {vault_namespace})")
+        } else {
+            " (local master key)".to_string()
+        }
+    );
     Ok(())
 }
 

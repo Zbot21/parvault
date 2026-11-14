@@ -20,3 +20,7 @@ Without symmetric storage accounting, rational users would upload terabytes of b
 
 - **Consequences:** Sustains fair cooperative storage ("Filecoin without the coin") with zero blockchain state and bounded flash wear.
 - **Verification:** `tests/phase1_to_4_integration.rs` and `tests/red_team_hardening_tests.rs`.
+
+## v0.5.0 status
+
+Items 1 and 3 (per-peer quota with bootstrap grace, the 4x per-epoch write-amplification cap) are enforced on every `PutShard` by `QuotaManager::quota_decision` (claim ADR-07). Item 2 (tier-weighted SLA multipliers) is not implemented: peers earn no credit in v0.5.0 (F-07), so every remote peer's allowance is its bootstrap grace.

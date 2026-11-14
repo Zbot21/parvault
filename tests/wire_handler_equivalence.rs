@@ -20,13 +20,11 @@
 //! Mutation record (each mutant is a one-line change, in `src/network/wire_handler.rs` unless
 //! the file is named; run with a dedicated `CARGO_TARGET_DIR` so a mutated library is never
 //! reused by another run). Each run covers `--lib`, this suite and `tests/trust_enforcement.rs`;
-//! `lib:` marks a library unit test. Last run: item 2b, 42 mutants, all detected.
+//! `lib:` marks a library unit test. Last run: item 2b, 42 mutants, all detected; item 2c removed the `on_por_pass` hook and its two rows (F-07).
 //!
 //! | Mutant | Kind | Failing test(s) |
 //! | :-- | :-- | :-- |
 //! | `record_put_shard_admission_ip`: seed returns `false` | hook | `put_shard` |
-//! | `on_por_pass`: seed does nothing | hook | `por_audit`, `multi_segment_por_audit` |
-//! | `on_por_pass`: daemon records a heartbeat | hook | `por_audit`, `multi_segment_por_audit` |
 //! | `max_probationary_lease_bytes`: seed returns `0` | hook | `put_blinded_shard`, `relay_pq_onion_over_seed_lease_limit` |
 //! | `tombstone_via_seed_server`: seed returns `false` | hook | `delete_blinded_tombstone` |
 //! | `status_region`: seed returns the daemon text | hook | `query_node_status` |
@@ -36,7 +34,7 @@
 //! | `eviction_council`: seed drops its local tracker admin | hook | `broadcast_eviction_order` |
 //! | `shard_owner` accepts a foreign claim | symmetric | `put_shard`, `refused_put_keeps_por_session_key`, `f04_invented_owner_claim_refused`, lib: `shard_owner_rule_binds_the_sender` |
 //! | `PutBlindedShard` drops `record_peer_admission_ip` | symmetric | `put_blinded_shard` |
-//! | `RenewBlindedLease` ignores `extension_epochs` | symmetric | `renew_blinded_lease` |
+//! | `RenewBlindedLease` ignores `extension_epochs` (now `RenewBlindedLeaseSigned`, F-23) | symmetric | `renew_blinded_lease` |
 //! | `PutShard` registers its grant for no shard | symmetric | `get_ciphertext_shard`, `f02a_grant_for_other_stripe_not_registered`, `f02a_owner_grant_update_registered`, `f02a_rejected_put_registers_nothing`, `f02b_registered_grant_repair_read`, `f26_owner_reads_after_root_squat` |
 //! | `admission_decision` admits strangers | decision | `put_shard`, `f03_unadmitted_put_shard_refused_daemon`, `f03_unadmitted_put_shard_refused_seed`, `f05_public_ticket_one_bit_short_refused`, `f24_unadmitted_blinded_put_refused`, `f24_unadmitted_layered_final_refused`, `f24_unadmitted_onion_final_refused`, `f25_unadmitted_dht_put_refused`, `invitee_serves_the_ring`, `refused_credential_is_not_presented_on_every_request`, lib: `admission_decision_rules` |
 //! | `chain_leaf_decision` ignores the sender (F-21, `wot.rs`) | decision | `f21_handshake_chain_leaf_not_sender_refused`, lib: `chain_leaf_decision_binds_the_sender` |
@@ -82,12 +80,13 @@ use parvault::crypto::pqc::{HybridPqSigningKeypair, PqOnionFinalBundle};
 use parvault::crypto::{HybridKemKeypair, MasterKey, NodeIdentity, PqRelayedShardEnvelope};
 use parvault::network::wire_handler::{
     handle_daemon_wire_request, handle_seed_wire_request, DaemonWireHandlerCtx, SeedWireHandlerCtx,
+    WireReply,
 };
 use parvault::network::{
     derive_slot_key_from_code, node_identity_libp2p_peer_id, seal_public_tracker_card,
     seal_wan_peer_card, DelegationChain, DhtEnvelopeKind, DhtWireEnvelope, InvitationHop,
-    KnownPeersStore, MeshWireRequest, MeshWireResponse, PublicCommonsTicket, TrustPoolMode,
-    WanPeerCard, WanRendezvousRegistry, WebOfTrustRegistry, DEFAULT_PUBLIC_WOT_POW_BITS,
+    MeshWireRequest, MeshWireResponse, PublicCommonsTicket, TrustPoolMode, WanPeerCard,
+    WanRendezvousRegistry, WebOfTrustRegistry, DEFAULT_PUBLIC_WOT_POW_BITS,
     PUBLIC_COMMONS_SWARM_SLOT,
 };
 use parvault::por::{
@@ -107,12 +106,9 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
-/// Serialises cases that read or set the eviction-council environment variables.
+/// Serialises cases that read or set process environment variables.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
-const ENV_VARS: [&str; 2] = [
-    "PARVAULT_EVICTION_AUTHORITIES",
-    "PARVAULT_TRACKER_EVICTION_QUORUM",
-];
+const ENV_VARS: [&str; 0] = [];
 const SEED_DEFAULT_LEASE_LIMIT: u64 = 64 * 1024 * 1024; // run_seed_listener_loop's value
 
 fn env_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -235,6 +231,8 @@ struct Fx {
     takedown: PublicTrackerTakedownQueue,
     admin_pk: [u8; 32],
     max_lease: u64,
+    /// B-SEED-SYND: the node's syndication load passed to the handler (zero by default).
+    syndication_load: parvault::network::server_events::SyndicationLoad,
     /// Owns `dir`; declared last so the fixture's state drops before the directory is removed.
     _root: TempDir,
 }
@@ -280,6 +278,7 @@ impl Fx {
             takedown: PublicTrackerTakedownQueue::load_or_init(&dir).unwrap(),
             admin_pk: keys.admin.public_key_bytes(),
             max_lease: SEED_DEFAULT_LEASE_LIMIT,
+            syndication_load: Default::default(),
             _root: root,
             store,
             server,
@@ -288,12 +287,13 @@ impl Fx {
     }
 
     fn call(&mut self, peer: &Peer, req: MeshWireRequest) -> MeshWireResponse {
-        match self.role {
+        let reply = match self.role {
             Role::Daemon => handle_daemon_wire_request(
                 &peer.id,
                 Some(&peer.addr),
                 req,
                 DaemonWireHandlerCtx {
+                    syndication_load: self.syndication_load,
                     cfg: &self.cfg,
                     node_identity: &self.node,
                     genesis_pubkey: Some(self.genesis),
@@ -318,12 +318,10 @@ impl Fx {
                     Some(&peer.addr),
                     req,
                     SeedWireHandlerCtx {
+                        syndication_load: self.syndication_load,
                         data_dir: &self.dir,
                         node_identity: &self.node,
                         advertised_admin_pk: advertised,
-                        local_tracker_admin_pk: Some(self.admin_pk),
-                        extra_council_pks: &[],
-                        council_quorum: None,
                         max_probationary_lease_bytes: self.max_lease,
                         genesis_pubkey: Some(self.genesis),
                         block_store: &self.store,
@@ -338,13 +336,28 @@ impl Fx {
                     },
                 )
             }
+        };
+        // Relay forwards are deferred off the swarm task (F-18); run them to completion here.
+        match reply {
+            WireReply::Ready(r) => *r,
+            WireReply::Deferred(job) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on((*job).run()),
         }
     }
 
     /// Bans `target` directly in the eviction engine (setup only; not a handler call).
     fn ban(&mut self, keys: &Keys, target: EvictionTarget) {
-        let order =
-            SignedBadActorEvictionOrder::issue(&keys.admin, target, "fixture-ban", now_ms(), 0);
+        let order = SignedBadActorEvictionOrder::issue(
+            &keys.admin,
+            target,
+            "fixture-ban",
+            now_ms(),
+            now_ms() + 3_600_000,
+            0,
+        );
         self.eviction
             .apply_signed_eviction_order(
                 &order,
@@ -482,10 +495,23 @@ impl Trio {
     fn new(label: &str) -> Self {
         let keys = Keys::new();
         let tpl = template(&keys);
-        let fx = ROLES
+        let mut fx: Vec<_> = ROLES
             .iter()
             .map(|r| Fx::new(*r, &keys, tpl.path(), label))
             .collect();
+        // F-24: vouchers are honoured only from issuers a node knows, so the fixtures' voucher
+        // issuer is a ring member (a genesis-issued chain), as a real issuer would be.
+        let issuer_chain = DelegationChain {
+            hops: vec![InvitationHop::issue(
+                &keys.genesis,
+                keys.voucher_issuer.public_key_bytes(),
+                1,
+                100,
+            )],
+        };
+        for f in &mut fx {
+            f.wot.verify_and_admit_chain(&issuer_chain).unwrap();
+        }
         Self { keys, fx }
     }
     /// Admits `peer` into every fixture's ring (a genesis-issued chain), as a v0.5.0 handshake
@@ -671,8 +697,10 @@ fn covering_case(req: &MeshWireRequest) -> &'static str {
         MeshWireRequest::GetCiphertextShard { .. } => "get_ciphertext_shard",
         MeshWireRequest::PutBlindedShard { .. } => "put_blinded_shard",
         MeshWireRequest::GetBlindedShard { .. } => "get_blinded_shard",
-        MeshWireRequest::RenewBlindedLease { .. } => "renew_blinded_lease",
-        MeshWireRequest::DeleteBlindedShardTombstone { .. } => "delete_blinded_tombstone",
+        MeshWireRequest::RenewBlindedLease { .. }
+        | MeshWireRequest::RenewBlindedLeaseSigned { .. } => "renew_blinded_lease",
+        MeshWireRequest::DeleteBlindedShardTombstone { .. }
+        | MeshWireRequest::DeleteBlindedShardSigned { .. } => "delete_blinded_tombstone",
         MeshWireRequest::MultiSegmentPorAudit(_) => "multi_segment_por_audit",
         MeshWireRequest::RelayPqOnionEnvelope { .. } => "relay_pq_onion",
         MeshWireRequest::SyndicateLiteStripe { .. } => "syndicate_lite_stripe",
@@ -683,7 +711,9 @@ fn covering_case(req: &MeshWireRequest) -> &'static str {
         MeshWireRequest::RegisterWanRendezvous { .. } => "register_wan_rendezvous",
         MeshWireRequest::LookupWanRendezvous { .. } => "lookup_wan_rendezvous",
         MeshWireRequest::SubmitAbuseTakedownReport(_) => "submit_abuse_takedown",
-        MeshWireRequest::BroadcastEvictionOrder(_) => "broadcast_eviction_order",
+        MeshWireRequest::BroadcastEvictionOrder(_) | MeshWireRequest::GetCouncilManifest { .. } => {
+            "broadcast_eviction_order"
+        }
         MeshWireRequest::AdmitPublicTicket(_) => "admit_public_ticket",
     }
 }
@@ -881,6 +911,27 @@ fn put_shard() {
         assert!(!fx.store.has_shard(&sid));
         assert_eq!(fx.hosted("alice-owner"), 0);
     }
+    // F-38-GRANT (L-41): first writer wins. Another admitted sender re-putting a stored shard
+    // (no grant on either side) is refused identically, and nothing changes: the shard stays
+    // charged to its first writer.
+    let (sid, bytes) = shard(29, 1024);
+    let o = t.run(&peer, &put_shard_req("", sid, bytes.clone(), [29; 32]));
+    assert!(o[0].resp.contains("stored: true"), "{}", o[0].resp);
+    let squatter = Peer::new(0x62, "198.51.100.3");
+    t.admit(&squatter);
+    let squatter_device = squatter.ident.device_peer_id();
+    let o = t.run(&squatter, &put_shard_req("", sid, bytes, [0x66; 32]));
+    assert!(
+        o[0].resp.contains("shard is bound to another owner"),
+        "{}",
+        o[0].resp
+    );
+    assert_identical(&o);
+    assert!(o[0].changed.is_empty() && o[0].quota_delta == 0);
+    for fx in &t.fx {
+        assert!(fx.store.has_shard(&sid));
+        assert_eq!(fx.hosted(&squatter_device), 0, "{:?}", fx.role);
+    }
     // Error path: shard hash mismatch.
     let (mut sid, bytes) = shard(3, 1024);
     sid.shard_hash = [0xEE; 32];
@@ -987,7 +1038,7 @@ fn delete_shard() {
     }
 }
 
-// --- 4 / 10. PoR audits (seed records a heartbeat on success) ------------------------------------
+// --- 4 / 10. PoR audits (identical: answering earns no credit, F-07) -----------------------------
 
 #[test]
 fn por_audit() {
@@ -1001,8 +1052,9 @@ fn por_audit() {
     let chal = generate_por_challenge(&session, sid, bytes.len() as u64, now_ms());
     let o = t.run(&peer, &MeshWireRequest::PorAudit(chal.clone()));
     assert!(o[0].resp.contains("PorAuditResult(Some"), "{}", o[0].resp);
-    // Hook on_por_pass: seed counts the pass, daemon does not.
-    assert_eq!((o[0].por_delta, o[1].por_delta, o[2].por_delta), (0, 1, 1));
+    // F-07: answering earns no credit on any role.
+    assert_eq!((o[0].por_delta, o[1].por_delta, o[2].por_delta), (0, 0, 0));
+    assert_identical(&o);
     // Replay: rejected in RAM, no heartbeat anywhere.
     let o = t.run(&peer, &MeshWireRequest::PorAudit(chal));
     assert!(o[0].resp.contains("PorAuditResult(None)"));
@@ -1026,7 +1078,8 @@ fn multi_segment_por_audit() {
         "{}",
         o[0].resp
     );
-    assert_eq!((o[0].por_delta, o[1].por_delta, o[2].por_delta), (0, 1, 1));
+    assert_eq!((o[0].por_delta, o[1].por_delta, o[2].por_delta), (0, 0, 0));
+    assert_identical(&o);
     let o = t.run(&peer, &MeshWireRequest::MultiSegmentPorAudit(chal));
     assert!(o[0].resp.contains("MultiSegmentPorAuditResult(None)"));
     assert_eq!((o[0].por_delta, o[1].por_delta, o[2].por_delta), (0, 0, 0));
@@ -1221,7 +1274,9 @@ fn get_blinded_shard() {
             read_sig: vec![0; 10],
         },
     );
-    assert!(o[0].resp.contains("invalid 64-byte"));
+    // A wrong-length signature is an invalid one: the uniform refusal (QA 2c).
+    assert!(o[0].resp.contains("shard_bytes: None"), "{}", o[0].resp);
+    assert!(o[0].resp.contains("unauthorized"), "{}", o[0].resp);
     assert_identical(&o);
     let ts = now_ms();
     let sig = BlindedShardCapability::sign_read_token(&b.cap_ident, &b.id.locator, ts);
@@ -1248,6 +1303,25 @@ fn get_blinded_shard() {
 
 // --- 8. RenewBlindedLease (same effect via the seed server's shared store) -----------------------
 
+/// A lease renewal signed by `b`'s capability key, timestamped now (F-23).
+fn signed_renew(b: &Blinded, current_epoch: u64, extension_epochs: u64) -> MeshWireRequest {
+    let ts = now_ms();
+    MeshWireRequest::RenewBlindedLeaseSigned {
+        blinded_id: b.id,
+        current_epoch,
+        extension_epochs,
+        timestamp_ms: ts,
+        sig: BlindedShardCapability::sign_lease_renewal(
+            &b.cap_ident,
+            &b.id.locator,
+            current_epoch,
+            extension_epochs,
+            ts,
+        )
+        .to_vec(),
+    }
+}
+
 #[test]
 fn renew_blinded_lease() {
     let _g = env_guard();
@@ -1260,23 +1334,21 @@ fn renew_blinded_lease() {
         &peer,
         &put_blinded(&b, AnonymousQuotaVoucher::mint(&issuer, 8192)),
     );
-    let req = MeshWireRequest::RenewBlindedLease {
+    // The unsigned variant carries no credential and is refused on every role (F-23).
+    let legacy = MeshWireRequest::RenewBlindedLease {
         blinded_id: b.id,
         current_epoch: 2,
         extension_epochs: 10,
     };
+    let o = t.run(&peer, &legacy);
+    assert!(o[0].resp.contains("renewed: false"), "{}", o[0].resp);
+    assert_identical(&o);
+    let req = signed_renew(&b, 2, 10);
     let o = t.run(&peer, &req);
     assert!(o[0].resp.contains("renewed: true"), "{}", o[0].resp);
     assert_identical(&o);
     let unknown = blinded(15, 16);
-    let o = t.run(
-        &peer,
-        &MeshWireRequest::RenewBlindedLease {
-            blinded_id: unknown.id,
-            current_epoch: 2,
-            extension_epochs: 10,
-        },
-    );
+    let o = t.run(&peer, &signed_renew(&unknown, 2, 10));
     assert!(o[0].resp.contains("renewed: false"));
     assert_identical(&o);
     let loc = b.id.locator;
@@ -1292,14 +1364,7 @@ fn renew_blinded_lease() {
         &peer,
         &put_blinded(&b2, AnonymousQuotaVoucher::mint(&issuer, 8192)),
     );
-    let o = t.run(
-        &peer,
-        &MeshWireRequest::RenewBlindedLease {
-            blinded_id: b2.id,
-            current_epoch: 2,
-            extension_epochs: 10,
-        },
-    );
+    let o = t.run(&peer, &signed_renew(&b2, 2, 10));
     assert!(o[0].resp.contains("renewed: true"), "{}", o[0].resp);
     for fx in &t.fx {
         let _ = fx.store.sweep_expired_blinded_shards(13);
@@ -1317,7 +1382,17 @@ fn renew_blinded_lease() {
     }
 }
 
-// --- 9. DeleteBlindedShardTombstone (seed error text carries a prefix) ---------------------------
+// --- 9. Blinded deletes (F-41: MAC tombstones refused; signed deletes; identical) ----------------
+
+/// A delete of `b` signed by its capability key for the fixtures' shared node key.
+fn signed_delete(b: &Blinded, ts: u64) -> MeshWireRequest {
+    let host = NodeIdentity::from_seed([0x11; 32]).public_key_bytes();
+    MeshWireRequest::DeleteBlindedShardSigned {
+        blinded_id: b.id,
+        timestamp_ms: ts,
+        sig: BlindedShardCapability::sign_delete(&b.cap_ident, &host, &b.id, ts).to_vec(),
+    }
+}
 
 #[test]
 fn delete_blinded_tombstone() {
@@ -1331,22 +1406,28 @@ fn delete_blinded_tombstone() {
         &peer,
         &put_blinded(&b, AnonymousQuotaVoucher::mint(&issuer, 8192)),
     );
-    // Forged tombstone (wrong verifier): Ok(false) everywhere.
-    let forged = BlindedShardTombstone::create(&[0xAB; 32], b.id.locator, [1; 16]);
+    // The old MAC tombstone, even from the real verifier, is refused everywhere (F-41).
+    let _ = b.delete_secret;
+    let mac = BlindedShardTombstone::create(&b.delete_verifier, b.id.locator, [1; 16]);
     let o = t.run(
         &peer,
         &MeshWireRequest::DeleteBlindedShardTombstone {
             blinded_id: b.id,
-            tombstone: forged,
+            tombstone: mac,
         },
     );
+    assert!(o[0].resp.contains("deleted: false"), "{}", o[0].resp);
+    assert_identical(&o);
+    // A stale signed delete: refused everywhere.
+    let o = t.run(&peer, &signed_delete(&b, now_ms() - 60_000));
     assert!(
         o[0].resp.contains("deleted: false, error: None"),
         "{}",
         o[0].resp
     );
     assert_identical(&o);
-    // Storage error: a directory where the .bshard file should be makes remove_file fail.
+    // Storage error: a directory where the .bshard file should be makes remove_file fail;
+    // since F-41 both roles use the same store path, so the error text is identical too.
     let b_err = blinded(23, 512);
     t.run(
         &peer,
@@ -1363,33 +1444,12 @@ fn delete_blinded_tombstone() {
         std::fs::remove_file(&f).unwrap();
         std::fs::create_dir(&f).unwrap();
     });
-    let tomb_err = BlindedShardTombstone::create(&b_err.delete_verifier, b_err.id.locator, [4; 16]);
-    let o = t.run(
-        &peer,
-        &MeshWireRequest::DeleteBlindedShardTombstone {
-            blinded_id: b_err.id,
-            tombstone: tomb_err,
-        },
-    );
+    let o = t.run(&peer, &signed_delete(&b_err, now_ms()));
     assert!(o[0].resp.contains("deleted: false"), "{}", o[0].resp);
-    // Hook tombstone_via_seed_server: identical state, seed error string gains a prefix.
-    assert_eq!(o[1], o[2]);
-    assert_eq!(o[0].changed, o[1].changed);
-    let prefixed = o[0].resp.replace(
-        "error: Some(\"",
-        "error: Some(\"Seed server storage error: ",
-    );
     assert!(o[0].resp.contains("error: Some(\""), "{}", o[0].resp);
-    assert_eq!(prefixed, o[1].resp);
-    let _ = b.delete_secret;
-    let good = BlindedShardTombstone::create(&b.delete_verifier, b.id.locator, [2; 16]);
-    let o = t.run(
-        &peer,
-        &MeshWireRequest::DeleteBlindedShardTombstone {
-            blinded_id: b.id,
-            tombstone: good,
-        },
-    );
+    assert_identical(&o);
+    // The capability holder's fresh delete: deleted everywhere.
+    let o = t.run(&peer, &signed_delete(&b, now_ms()));
     assert!(o[0].resp.contains("deleted: true"), "{}", o[0].resp);
     assert_identical(&o);
     assert_eq!(o[0].leases_delta, -1);
@@ -1643,6 +1703,89 @@ fn syndicate_lite_stripe() {
         "public bootstrapper has no owner: {}",
         o[2].resp
     );
+    // F-38 (L-40): a grant owned by another key is refused before ingest, identically in every
+    // role; a grant owned by the sender is accepted where the stripe is.
+    let ct2 = vec![0x3E; 32 * 1024];
+    let set2 = encode_ciphertext_stripe(0, &ct2, ErasureTier::Homelab).unwrap();
+    let cert2 = PersonalDeviceCert::issue(
+        &t.keys.owner_pq,
+        &laptop.device_peer_id(),
+        "laptop",
+        1_700_000_000,
+    )
+    .unwrap();
+    let synd2 = |owner: &NodeIdentity| MeshWireRequest::SyndicateLiteStripe {
+        cert: cert2.clone(),
+        bundle: LiteStripeSyndicationBundle {
+            stripe_index: 0,
+            tier: ErasureTier::Homelab,
+            ciphertext_bytes: ct2.clone(),
+            expected_stripe_merkle_root: set2.stripe_merkle_root,
+            expected_shard_hashes: set2.shard_hashes.clone(),
+        },
+        repair_grant: Some(parvault::por::RepairGrant::issue(
+            owner,
+            set2.stripe_merkle_root,
+            Vec::new(),
+            ErasureTier::Homelab,
+        )),
+    };
+    let foreign = NodeIdentity::from_seed([0x6C; 32]);
+    let bad = synd2(&foreign);
+    let o = t.run(&peer, &bad);
+    for out in &o {
+        assert!(
+            out.resp
+                .contains("repair grant must be owned by the sender"),
+            "{}",
+            out.resp
+        );
+    }
+    assert_identical(&o);
+    let good = synd2(&laptop);
+    let o = t.run(&peer, &good);
+    assert!(o[0].resp.contains("receipt: Some"), "{}", o[0].resp);
+    assert_eq!(o[0], o[1]);
+
+    // B-SEED-SYND (L-46): at the fan-out budget every role refuses a new stripe identically,
+    // before any encode or write.
+    let ct3 = vec![0x3F; 32 * 1024];
+    let set3 = encode_ciphertext_stripe(0, &ct3, ErasureTier::Homelab).unwrap();
+    let busy_req = MeshWireRequest::SyndicateLiteStripe {
+        cert: cert2.clone(),
+        bundle: LiteStripeSyndicationBundle {
+            stripe_index: 0,
+            tier: ErasureTier::Homelab,
+            ciphertext_bytes: ct3,
+            expected_stripe_merkle_root: set3.stripe_merkle_root,
+            expected_shard_hashes: set3.shard_hashes.clone(),
+        },
+        repair_grant: None,
+    };
+    t.each(|fx, _| {
+        fx.syndication_load = parvault::network::server_events::SyndicationLoad {
+            in_flight_total: parvault::network::server_events::MAX_SYNDICATIONS_IN_FLIGHT,
+            in_flight_sender: 0,
+        }
+    });
+    let o = t.run(&peer, &busy_req);
+    for out in &o {
+        assert!(
+            out.resp
+                .contains(parvault::network::server_events::SYNDICATION_BUSY_TEXT),
+            "{}",
+            out.resp
+        );
+    }
+    assert_identical(&o);
+    let busy_id = ShardId {
+        stripe_merkle_root: set3.stripe_merkle_root,
+        shard_index: 0,
+        shard_hash: set3.shard_hashes[0],
+    };
+    assert!(t.fx.iter().all(|f| !f.store.has_shard(&busy_id)));
+    t.each(|fx, _| fx.syndication_load = Default::default());
+
     let root = set.stripe_merkle_root;
     t.each(|fx, k| fx.ban(k, EvictionTarget::StripeMerkleRoot(root)));
     let o = t.run(&peer, &req);
@@ -1665,7 +1808,7 @@ fn dht_envelopes() {
     let owner = NodeIdentity::from_seed([0x6E; 32]);
     let mk = MasterKey::from_bytes([0x6F; 32]);
     let manifest = FileManifest {
-        version: 1,
+        version: 2,
         file_merkle_root: [0x11; 32],
         file_salt: [0x22; 32],
         original_file_size: 1024,
@@ -1680,6 +1823,7 @@ fn dht_envelopes() {
             stripe_merkle_root: [0x33; 32],
             shard_hashes: vec![[0x44; 32]; 20],
             assigned_peers: vec!["peer".to_string(); 20],
+            shard_chunk_roots: Vec::new(),
         }],
         witness_peers: vec!["w1".to_string()],
     };
@@ -1818,7 +1962,8 @@ fn register_wan_rendezvous() {
         )
     );
     assert_eq!(o[2].changed, o[0].changed);
-    // Absolute: the entry is retrievable and the signer is admitted at the sender's IP.
+    // Absolute: the entry is retrievable, but an unadmitted signer is not written to the
+    // admission-IP map (F-22).
     let pk_priv = peer.ident.public_key_bytes();
     for fx in &mut t.fx {
         assert_eq!(
@@ -1828,8 +1973,34 @@ fn register_wan_rendezvous() {
             fx.role
         );
         assert!(
-            fx.admitted_at(peer.ip).contains(&pk_priv),
-            "{:?}: signer admitted",
+            !fx.admitted_at(peer.ip).contains(&pk_priv),
+            "{:?}: unadmitted signer not recorded",
+            fx.role
+        );
+    }
+    // F-22: an admitted signer's registration is recorded at the sender's IP.
+    let member = Peer::new(0x72, "198.51.100.16");
+    t.admit(&member);
+    let member_code = "elm-fig-grape-hazel";
+    let member_entry = seal_wan_peer_card(
+        member_code,
+        &wan_card(&member.ident, &["/ip4/203.0.113.6/tcp/4001"]),
+        &member.ident,
+    )
+    .unwrap();
+    let o = t.run(
+        &member,
+        &MeshWireRequest::RegisterWanRendezvous {
+            slot_key: derive_slot_key_from_code(member_code),
+            entry: member_entry,
+        },
+    );
+    assert!(o[0].resp.contains("stored: true"), "{}", o[0].resp);
+    for fx in &mut t.fx {
+        assert!(
+            fx.admitted_at(member.ip)
+                .contains(&member.ident.public_key_bytes()),
+            "{:?}: admitted signer recorded",
             fx.role
         );
     }
@@ -1986,7 +2157,7 @@ fn submit_abuse_takedown() {
     let mut t = Trio::new("abuse");
     let peer = Peer::new(0x74, "198.51.100.18");
     let manifest = FileManifest {
-        version: 1,
+        version: 2,
         file_merkle_root: [0x11; 32],
         file_salt: [0x22; 32],
         original_file_size: 16,
@@ -2039,8 +2210,14 @@ fn broadcast_eviction_order() {
 
     // Local owner (the node's own key) is accepted by every role.
     let mut t = Trio::new("evict-local");
-    let order =
-        SignedBadActorEvictionOrder::issue(&t.keys.node, target(), "local-owner", now_ms(), 0);
+    let order = SignedBadActorEvictionOrder::issue(
+        &t.keys.node,
+        target(),
+        "local-owner",
+        now_ms(),
+        now_ms() + 3_600_000,
+        0,
+    );
     let o = t.run(
         &peer,
         &MeshWireRequest::BroadcastEvictionOrder(order.clone()),
@@ -2058,112 +2235,99 @@ fn broadcast_eviction_order() {
     assert!(!o.iter().any(accepted));
     assert_identical(&o);
 
-    // Tracker admin key: only the public seed trusts its local tracker admin.
-    let mut t = Trio::new("evict-admin");
-    let order =
-        SignedBadActorEvictionOrder::issue(&t.keys.admin, target(), "tracker-admin", now_ms(), 0);
-    let o = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(order));
-    assert_eq!(
-        o.iter().map(accepted).collect::<Vec<_>>(),
-        vec![false, false, true],
-        "{o:?}"
-    );
-    let target_ip: std::net::IpAddr = "192.0.2.200".parse().unwrap();
-    assert_eq!(
-        t.fx.iter()
-            .map(|f| f.blocked(target_ip))
-            .collect::<Vec<_>>(),
-        vec![false, false, true],
-        "only an accepted order blocks"
-    );
-
-    // Genesis key: trusted by the homelab seed (and by the daemon's own council resolver).
-    let mut t = Trio::new("evict-genesis");
-    let order =
-        SignedBadActorEvictionOrder::issue(&t.keys.genesis, target(), "genesis", now_ms(), 0);
-    let o = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(order));
-    let genesis_pattern: Vec<bool> = o.iter().map(accepted).collect();
-    assert!(genesis_pattern[1], "homelab seed trusts genesis: {o:?}");
-    assert!(
-        !genesis_pattern[2],
-        "public seed does not trust genesis: {o:?}"
-    );
-    let daemon_trusts_genesis = genesis_pattern[0];
-
-    // Authority from the environment (read per request by both resolvers).
-    let env_auth = NodeIdentity::from_seed([0x76; 32]);
-    let mut t = Trio::new("evict-env");
-    std::env::set_var(
-        "PARVAULT_EVICTION_AUTHORITIES",
-        hex::encode(env_auth.public_key_bytes()),
-    );
-    std::env::set_var("PARVAULT_TRACKER_EVICTION_QUORUM", "1");
-    let order = SignedBadActorEvictionOrder::issue(&env_auth, target(), "env", now_ms(), 0);
-    let o = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(order));
-    for v in ENV_VARS {
-        std::env::remove_var(v);
+    // F-08: one resolver (the signed council manifest), so every row is identical across roles.
+    // No manifest: neither the genesis nor the tracker admin alone is a council.
+    for (label, signer) in [("evict-genesis", 0u8), ("evict-admin", 1u8)] {
+        let mut t = Trio::new(label);
+        let key = if signer == 0 {
+            t.keys.genesis.clone()
+        } else {
+            t.keys.admin.clone()
+        };
+        let order = SignedBadActorEvictionOrder::issue(
+            &key,
+            target(),
+            label,
+            now_ms(),
+            now_ms() + 3_600_000,
+            1,
+        );
+        let o = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(order));
+        assert!(!o.iter().any(accepted), "{label}: {o:?}");
+        assert_identical(&o);
     }
-    let env_pattern: Vec<bool> = o.iter().map(accepted).collect();
 
-    // Pinned tracker admin in known_peers.json: the public daemon trusts it alone; the public seed
-    // adds it to its local admin (council of 2, default quorum 2), so one signature is not enough.
-    let pinned = NodeIdentity::from_seed([0x77; 32]);
-    let mut t = Trio::new("evict-pinned");
-    t.each(|fx, _| {
-        let mut kp = KnownPeersStore::load(&fx.dir);
-        kp.pin_tracker_admin_pubkey("tracker.example:4001", pinned.public_key_bytes());
-        kp.save(&fx.dir).unwrap();
-    });
-    let order = SignedBadActorEvictionOrder::issue(&pinned, target(), "pinned", now_ms(), 0);
-    let o = t.run(
-        &peer,
-        &MeshWireRequest::BroadcastEvictionOrder(order.clone()),
-    );
-    let pinned_private: Vec<bool> = o.iter().map(accepted).collect();
-    t.each(|fx, _| fx.public_mode = true);
-    let o2 = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(order));
-    let daemon_public_pinned = accepted(&o2[0]);
-
-    // pinned_tracker_admins.json: read only by the daemon resolver, and only in public mode.
-    let file_admin = NodeIdentity::from_seed([0x79; 32]);
-    let mut t = Trio::new("evict-pinned-file");
-    t.each(|fx, _| {
-        let list = vec![hex::encode(file_admin.public_key_bytes())];
-        std::fs::write(
-            fx.dir.join("pinned_tracker_admins.json"),
-            serde_json::to_string(&list).unwrap(),
+    // A genesis-signed 2-of-3 manifest: two members' signatures pass, one does not.
+    let members: Vec<NodeIdentity> = (0x81..=0x83u8)
+        .map(|b| NodeIdentity::from_seed([b; 32]))
+        .collect();
+    let mut t = Trio::new("evict-council");
+    t.each(|fx, keys| {
+        let mut m = parvault::storage::council::CouncilManifest::new(
+            keys.genesis.public_key_bytes(),
+            1,
+            members.iter().map(|m| m.public_key_bytes()).collect(),
+            2,
+            1,
+        );
+        m.sign(&keys.genesis);
+        parvault::storage::council::install_council_manifest(
+            &fx.dir,
+            &m,
+            keys.genesis.public_key_bytes(),
         )
         .unwrap();
-        fx.public_mode = true;
     });
-    let order =
-        SignedBadActorEvictionOrder::issue(&file_admin, target(), "pinned-file", now_ms(), 0);
-    let o = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(order));
-    let pinned_file: Vec<bool> = o.iter().map(accepted).collect();
-
-    // Pinned characterisation of today's council resolution, per role
-    // (hook eviction_council): [daemon, seed homelab, seed public].
+    // GetCouncilManifest: an unadmitted peer gets nothing; an admitted one gets the manifest of
+    // the scope it names, from every role that holds it.
+    let genesis_root = t.keys.genesis.public_key_bytes();
+    let ask = MeshWireRequest::GetCouncilManifest {
+        scope_root: genesis_root,
+        from_epoch: 0,
+    };
+    let o = t.run(&peer, &ask);
+    assert!(o.iter().all(|x| x.resp.contains("manifests: []")), "{o:?}");
+    t.admit(&peer);
+    let o = t.run(&peer, &ask);
+    assert!(o.iter().all(|x| x.resp.contains("epoch: 1")), "{o:?}");
+    assert_identical(&o);
+    let one = SignedBadActorEvictionOrder::issue(
+        &members[0],
+        target(),
+        "one",
+        now_ms(),
+        now_ms() + 3_600_000,
+        1,
+    );
+    let o = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(one));
+    assert!(!o.iter().any(accepted), "{o:?}");
+    // Daemon and homelab seed hold this council (refused for quorum); the public seed's scope
+    // is its own admin key, so it has no council here (refused as no council).
+    assert_eq!(o[0], o[1]);
+    assert!(
+        o[2].resp.contains("reject.order_no_council"),
+        "{}",
+        o[2].resp
+    );
+    let mut two = SignedBadActorEvictionOrder::issue(
+        &members[0],
+        target(),
+        "two",
+        now_ms(),
+        now_ms() + 3_600_000,
+        1,
+    );
+    assert!(two.add_cosignature(&members[1]));
+    let o = t.run(&peer, &MeshWireRequest::BroadcastEvictionOrder(two));
+    // [daemon, seed homelab, seed public]: the scope root follows the mode, not the role. The
+    // private daemon and the homelab seed are rooted at the genesis; a public seed at its own
+    // tracker admin key, so a genesis-rooted council is not its council.
     assert_eq!(
-        (
-            daemon_trusts_genesis,
-            env_pattern,
-            pinned_private,
-            daemon_public_pinned,
-            pinned_file
-        ),
-        (
-            DAEMON_TRUSTS_GENESIS,
-            vec![true, true, true],
-            vec![false, false, false],
-            true,
-            vec![true, false, false]
-        ),
-        "council resolution changed"
+        o.iter().map(accepted).collect::<Vec<_>>(),
+        vec![true, true, false],
+        "{o:?}"
     );
 }
-
-/// Today's daemon resolver trusts the genesis key in private mode.
-const DAEMON_TRUSTS_GENESIS: bool = true;
 
 // --- the seed's shared-store assumption --------------------------------------------------------
 
@@ -2197,8 +2361,13 @@ fn seed_server_shares_the_handler_store() {
         "server must see the handler store's lease"
     );
     assert_eq!(server.status_report(1).active_blinded_leases, 1);
-    let tomb = BlindedShardTombstone::create(&b.delete_verifier, b.id.locator, [3; 16]);
-    assert!(server.execute_blinded_tombstone(&b.id, &tomb).unwrap());
+    let host = [0x33u8; 32];
+    let ts = now_ms();
+    let sig = BlindedShardCapability::sign_delete(&b.cap_ident, &host, &b.id, ts);
+    assert!(server
+        .block_store()
+        .delete_blinded_shard_signed(&b.id, ts, &sig, &host, ts)
+        .unwrap());
     assert!(
         !store.renew_blinded_shard_lease(&b.id, 3, 1),
         "deletion via the server is visible in the store"

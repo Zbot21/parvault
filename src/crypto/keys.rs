@@ -14,7 +14,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub const KEY_LEN: usize = 32;
 pub type KeyError = CryptoError;
 
-/// Production Argon2id memory cost: 64 MiB (`65,536 KiB`) per `ADR-15` / `SECURITY_AND_CRYPTOGRAPHY.md §2`.
+/// Production Argon2id memory cost: 64 MiB (`65,536 KiB`) per `ADR-18` / `SECURITY_AND_CRYPTOGRAPHY.md §2`.
 pub const ARGON2_M_COST_KIB: u32 = 65_536;
 /// Production Argon2id time cost: 3 iterations.
 pub const ARGON2_T_COST: u32 = 3;
@@ -214,7 +214,7 @@ impl MasterKey {
     }
 
     /// Deterministically derives the 256-bit `MasterKey` from a memorized recovery seed phrase /
-    /// 24-word mnemonic and `vault_namespace` ("House Fire" zero-local-state disaster recovery, ADR-15).
+    /// 24-word mnemonic and `vault_namespace` ("House Fire" zero-local-state disaster recovery, ADR-18).
     /// Applies Unicode NFKD normalization and whitespace canonicalization (`B6`), followed by
     /// memory-hard `Argon2id` (`m = 64 MiB`, `t = 3`, `p = 4`) and `HKDF-SHA256` expansion (`A1`, `B7`).
     pub fn from_recovery_seed_phrase(seed_phrase: &str, vault_namespace: &str) -> Self {
@@ -255,7 +255,7 @@ impl MasterKey {
     }
 
     /// Deterministically derives the Kademlia DHT lookup key for the user's encrypted root
-    /// `FolderSnapshotManifest` superblock catalog (`ADR-15`), enabling full directory-tree
+    /// `FolderSnapshotManifest` superblock catalog (`ADR-18`), enabling full directory-tree
     /// discovery after total local disk loss. Uses the domain-separated `dht_routing_subkey` (`B1`).
     pub fn derive_vault_root_dht_key(&self, vault_namespace: &str) -> [u8; 32] {
         let mut routing_subkey = self.dht_routing_subkey();
@@ -413,16 +413,14 @@ impl NodeIdentity {
             ));
         }
         let Some(&(_, first)) = found.first() else {
-            return Err(CryptoError::InvalidKeyMaterial(
-                NOT_IN_RING_MESSAGE.to_string(),
-            ));
+            return Err(CryptoError::RingMembership(NOT_IN_RING_MESSAGE.to_string()));
         };
         if found.iter().any(|(_, pk)| *pk != first) {
             let list: Vec<String> = found
                 .iter()
                 .map(|(src, pk)| format!("{src}={}", hex::encode(pk)))
                 .collect();
-            return Err(CryptoError::InvalidKeyMaterial(format!(
+            return Err(CryptoError::RingMembership(format!(
                 "conflicting ring genesis sources: {}",
                 list.join(", ")
             )));
@@ -542,7 +540,7 @@ impl NodeIdentity {
     }
 
     /// Deterministically derives the owner's `NodeIdentity` from a recovery seed phrase and
-    /// `vault_namespace` (`ADR-15`) so the user can authenticate DHT catalog envelopes and
+    /// `vault_namespace` (`ADR-18`) so the user can authenticate DHT catalog envelopes and
     /// owner shard reads on a replacement machine after a house fire.
     pub fn from_recovery_seed_phrase(seed_phrase: &str, vault_namespace: &str) -> Self {
         let mk = MasterKey::from_recovery_seed_phrase(seed_phrase, vault_namespace);

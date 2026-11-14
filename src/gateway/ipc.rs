@@ -155,6 +155,13 @@ pub enum IpcResponse {
     Error {
         message: String,
     },
+    /// Appended (R3-1): stored, but `local_only_stripes` stripes are only on the daemon's machine
+    /// (no ring peer accepted them), so they are not backed up. Clients count them on the
+    /// calling thread (`storage::local_only`).
+    StoreSuccessLocalOnly {
+        manifest: EphemeralShardManifest,
+        local_only_stripes: u64,
+    },
 }
 
 /// Domain-separated SHA-256 digest of a vector of 32-byte shard/stripe identifiers used to index
@@ -417,7 +424,8 @@ mod unix_impl {
                         let peer_uid = crate::os_sys::peer_socket_ucred(stream.as_fd())
                             .ok()
                             .map(|u| u.uid);
-                        if !engine.is_peer_uid_allowed(peer_uid) {
+                        if let Err(code) = engine.peer_uid_decision(peer_uid) {
+                            tracing::warn!(code, ?peer_uid, "refused a gateway client by peer UID");
                             drop(stream);
                             continue;
                         }
@@ -460,7 +468,8 @@ mod unix_impl {
                         let peer_uid = crate::os_sys::peer_socket_ucred(stream.as_fd())
                             .ok()
                             .map(|u| u.uid);
-                        if !self.engine.is_peer_uid_allowed(peer_uid) {
+                        if let Err(code) = self.engine.peer_uid_decision(peer_uid) {
+                            tracing::warn!(code, ?peer_uid, "refused a gateway client by peer UID");
                             drop(stream);
                             continue;
                         }
@@ -493,14 +502,20 @@ mod unix_impl {
                         message: "StorePayload missing SCM_RIGHTS payload_fd".into(),
                     };
                 };
-                if engine.require_sealed_ingest_memfd()
-                    && !crate::os_sys::has_immutable_memfd_seals(owned_fd.as_fd()).unwrap_or(false)
-                {
+                if let Err(code) = engine.ingest_seal_decision(owned_fd.as_fd()) {
+                    tracing::warn!(code, "refused an unsealed ingest memfd");
                     return IpcResponse::Error {
-                        message: "unsealed ingest memfd rejected (F_SEAL_WRITE|F_SEAL_SHRINK|F_SEAL_GROW required)".into(),
+                        message: format!("unsealed ingest memfd rejected (F_SEAL_WRITE|F_SEAL_SHRINK|F_SEAL_GROW required): {code}"),
                     };
                 }
-                match engine.store_from_owned_fd(owned_fd, bytes_len, retention_policy) {
+                let (stored, local_only_stripes) = crate::storage::local_only::track(|| {
+                    engine.store_from_owned_fd(owned_fd, bytes_len, retention_policy)
+                });
+                match stored {
+                    Ok(manifest) if local_only_stripes > 0 => IpcResponse::StoreSuccessLocalOnly {
+                        manifest,
+                        local_only_stripes,
+                    },
                     Ok(manifest) => IpcResponse::StoreSuccess { manifest },
                     Err(e) => IpcResponse::Error {
                         message: format!("StorePayload failed: {e}"),
@@ -685,13 +700,33 @@ mod unix_impl {
             bytes_len: u64,
             retention_policy: RetentionPolicy,
         ) -> anyhow::Result<EphemeralShardManifest> {
+            let (manifest, local_only_stripes) = self
+                .store_payload_fd_counted(payload_fd, bytes_len, retention_policy)
+                .await?;
+            crate::storage::local_only::note(local_only_stripes);
+            Ok(manifest)
+        }
+
+        /// Like [`Self::store_payload_fd`], returning how many stripes stayed only on the
+        /// daemon's machine (not backed up, R3-1). Async callers that need the count use this:
+        /// the thread-local count does not follow a task across `.await`.
+        pub async fn store_payload_fd_counted(
+            &self,
+            payload_fd: RawFd,
+            bytes_len: u64,
+            retention_policy: RetentionPolicy,
+        ) -> anyhow::Result<(EphemeralShardManifest, u64)> {
             let cmd = IpcCommand::StorePayload {
                 payload_fd,
                 bytes_len,
                 retention_policy,
             };
             match self.send_command(&cmd, Some(payload_fd)).await? {
-                IpcResponse::StoreSuccess { manifest } => Ok(manifest),
+                IpcResponse::StoreSuccessLocalOnly {
+                    manifest,
+                    local_only_stripes,
+                } => Ok((manifest, local_only_stripes)),
+                IpcResponse::StoreSuccess { manifest } => Ok((manifest, 0)),
                 IpcResponse::Error { message } => {
                     anyhow::bail!("gateway StorePayload error: {message}")
                 }
@@ -707,12 +742,27 @@ mod unix_impl {
             bytes_len: u64,
             retention: RetentionPolicy,
         ) -> anyhow::Result<EphemeralShardManifest> {
+            let (manifest, local_only_stripes) = self
+                .store_sealed_payload_fd_counted(fd, bytes_len, retention)
+                .await?;
+            crate::storage::local_only::note(local_only_stripes);
+            Ok(manifest)
+        }
+
+        /// Like [`Self::store_sealed_payload_fd`], returning the local-only stripe count.
+        pub async fn store_sealed_payload_fd_counted(
+            &self,
+            fd: RawFd,
+            bytes_len: u64,
+            retention: RetentionPolicy,
+        ) -> anyhow::Result<(EphemeralShardManifest, u64)> {
             let dup = crate::os_sys::dup_fd_cloexec(fd)?;
             if !crate::os_sys::has_immutable_memfd_seals(dup.as_fd())? {
                 crate::os_sys::seal_memfd_immutable(dup.as_fd())?;
             }
             drop(dup);
-            self.store_payload_fd(fd, bytes_len, retention).await
+            self.store_payload_fd_counted(fd, bytes_len, retention)
+                .await
         }
 
         /// Reconstructs the full payload identified by `ephemeral_shard_ids` directly into `output_fd` via `SCM_RIGHTS`.
@@ -767,11 +817,23 @@ mod unix_impl {
             bytes: &[u8],
             retention_policy: RetentionPolicy,
         ) -> anyhow::Result<EphemeralShardManifest> {
+            let (manifest, local_only_stripes) =
+                self.store_bytes_counted(bytes, retention_policy).await?;
+            crate::storage::local_only::note(local_only_stripes);
+            Ok(manifest)
+        }
+
+        /// Like [`Self::store_bytes`], returning the local-only stripe count.
+        pub async fn store_bytes_counted(
+            &self,
+            bytes: &[u8],
+            retention_policy: RetentionPolicy,
+        ) -> anyhow::Result<(EphemeralShardManifest, u64)> {
             let mfd = create_memfd_sized("parvault-store", bytes.len() as u64)?;
             let file = File::from(mfd);
             pwrite_all(&file, 0, bytes)?;
             let _ = crate::os_sys::seal_memfd_immutable(file.as_fd());
-            self.store_payload_fd(file.as_raw_fd(), bytes.len() as u64, retention_policy)
+            self.store_payload_fd_counted(file.as_raw_fd(), bytes.len() as u64, retention_policy)
                 .await
         }
 
@@ -838,6 +900,13 @@ mod unix_impl {
                 retention_policy,
             };
             match self.send_request_sync(&cmd, Some(payload_fd))? {
+                IpcResponse::StoreSuccessLocalOnly {
+                    manifest,
+                    local_only_stripes,
+                } => {
+                    crate::storage::local_only::note(local_only_stripes);
+                    Ok(manifest)
+                }
                 IpcResponse::StoreSuccess { manifest } => Ok(manifest),
                 IpcResponse::Error { message } => Err(io::Error::other(message)),
                 other => Err(io::Error::other(format!(
@@ -993,20 +1062,39 @@ mod unix_impl {
             bytes_len: u64,
             retention: RetentionPolicy,
         ) -> anyhow::Result<EphemeralShardManifest> {
+            let (manifest, local_only_stripes) = self
+                .store_payload_fd_counted(payload_fd, bytes_len, retention)
+                .await?;
+            crate::storage::local_only::note(local_only_stripes);
+            Ok(manifest)
+        }
+
+        /// Like [`Self::store_payload_fd`], returning how many stripes stayed only on this
+        /// machine (not backed up, R3-1). The in-process store runs on the blocking pool, so the
+        /// count is taken there and returned rather than left in a thread-local.
+        pub async fn store_payload_fd_counted(
+            &self,
+            payload_fd: RawFd,
+            bytes_len: u64,
+            retention: RetentionPolicy,
+        ) -> anyhow::Result<(EphemeralShardManifest, u64)> {
             match self {
                 Self::InProcess(engine) => {
                     Self::ensure_in_process_peer_uid(engine)?;
                     let dup = crate::os_sys::dup_fd_cloexec(payload_fd)?;
                     let eng = Arc::clone(engine);
-                    tokio::task::spawn_blocking(move || {
-                        eng.store_from_owned_fd(dup, bytes_len, retention)
+                    let (stored, local_only_stripes) = tokio::task::spawn_blocking(move || {
+                        crate::storage::local_only::track(|| {
+                            eng.store_from_owned_fd(dup, bytes_len, retention)
+                        })
                     })
                     .await
-                    .map_err(|e| anyhow::anyhow!("in-process StorePayload join error: {e}"))?
+                    .map_err(|e| anyhow::anyhow!("in-process StorePayload join error: {e}"))?;
+                    Ok((stored?, local_only_stripes))
                 }
                 Self::UnixSocket(client) => {
                     client
-                        .store_payload_fd(payload_fd, bytes_len, retention)
+                        .store_payload_fd_counted(payload_fd, bytes_len, retention)
                         .await
                 }
             }
@@ -1020,6 +1108,20 @@ mod unix_impl {
             bytes_len: u64,
             retention: RetentionPolicy,
         ) -> anyhow::Result<EphemeralShardManifest> {
+            let (manifest, local_only_stripes) = self
+                .store_sealed_payload_fd_counted(fd, bytes_len, retention)
+                .await?;
+            crate::storage::local_only::note(local_only_stripes);
+            Ok(manifest)
+        }
+
+        /// Like [`Self::store_sealed_payload_fd`], returning the local-only stripe count.
+        pub async fn store_sealed_payload_fd_counted(
+            &self,
+            fd: RawFd,
+            bytes_len: u64,
+            retention: RetentionPolicy,
+        ) -> anyhow::Result<(EphemeralShardManifest, u64)> {
             match self {
                 Self::InProcess(engine) => {
                     Self::ensure_in_process_peer_uid(engine)?;
@@ -1027,16 +1129,13 @@ mod unix_impl {
                     if !crate::os_sys::has_immutable_memfd_seals(dup.as_fd())? {
                         crate::os_sys::seal_memfd_immutable(dup.as_fd())?;
                     }
-                    let eng = Arc::clone(engine);
-                    tokio::task::spawn_blocking(move || {
-                        eng.store_from_owned_fd(dup, bytes_len, retention)
-                    })
-                    .await
-                    .map_err(|e| anyhow::anyhow!("in-process StorePayload join error: {e}"))?
+                    drop(dup);
+                    self.store_payload_fd_counted(fd, bytes_len, retention)
+                        .await
                 }
                 Self::UnixSocket(client) => {
                     client
-                        .store_sealed_payload_fd(fd, bytes_len, retention)
+                        .store_sealed_payload_fd_counted(fd, bytes_len, retention)
                         .await
                 }
             }
@@ -1125,10 +1224,10 @@ mod unix_impl {
 
         fn ensure_in_process_peer_uid(engine: &GatewayEngine) -> io::Result<()> {
             let uid = Some(crate::os_sys::geteuid());
-            if !engine.is_peer_uid_allowed(uid) {
+            if let Err(code) = engine.peer_uid_decision(uid) {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    format!("peer UID {uid:?} rejected by strict_allowed_peer_uids policy"),
+                    format!("peer UID {uid:?} rejected by strict_allowed_peer_uids policy: {code}"),
                 ));
             }
             Ok(())
@@ -1146,12 +1245,11 @@ mod unix_impl {
                 Self::InProcess(engine) => {
                     Self::ensure_in_process_peer_uid(engine)?;
                     let dup = crate::os_sys::dup_fd_cloexec(payload_fd)?;
-                    if engine.require_sealed_ingest_memfd()
-                        && !crate::os_sys::has_immutable_memfd_seals(dup.as_fd()).unwrap_or(false)
-                    {
+                    if let Err(code) = engine.ingest_seal_decision(dup.as_fd()) {
+                        tracing::warn!(code, "refused an unsealed ingest memfd");
                         return Err(io::Error::new(
                             io::ErrorKind::PermissionDenied,
-                            "unsealed ingest memfd rejected (F_SEAL_WRITE|F_SEAL_SHRINK|F_SEAL_GROW required)",
+                            format!("unsealed ingest memfd rejected (F_SEAL_WRITE|F_SEAL_SHRINK|F_SEAL_GROW required): {code}"),
                         ));
                     }
                     engine

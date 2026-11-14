@@ -17,5 +17,5 @@ If a user's home burns down destroying every laptop, phone, and local `.manifest
 
 ## Consequences & Verification
 
-- **Consequences:** Total physical loss of all local hardware is survivable from a memorized 12/24-word phrase alone, backed by `64 MiB` memory-hard key stretching.
+- **Consequences:** Total physical loss of all local hardware is survivable from a memorized 12/24-word phrase alone, backed by `64 MiB` memory-hard key stretching. This covers only folders backed up with `parvault watch-folder --seed-phrase <P> --vault-namespace <NS>` (or `PARVAULT_SEED_PHRASE`) while peers holding the shards are reachable; `parvault init` prints no phrase (`parvault new-seed-phrase` generates one and stores nothing), and `parvault up --folder` vaults have no phrase recovery. Node, PQ, ring and enclave keys are never derived from the phrase.
 - **Verification:** `tests/red_team_hardening_tests.rs` and Stage 9 of `scripts/docker_acceptance_gate.sh`.

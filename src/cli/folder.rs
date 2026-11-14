@@ -26,13 +26,90 @@ pub(crate) async fn diff_folder(env: CliEnv, command: Commands) -> anyhow::Resul
     if let Some(snap_path) = &snapshot {
         if snap_path.exists() {
             let raw = std::fs::read(snap_path)?;
-            let prev_snap: FolderSnapshotManifest = bincode::deserialize(&raw)?;
+            let prev_snap = FolderSnapshotManifest::decode_bytes(&raw)?;
             engine.load_previous_snapshot(&prev_snap);
         }
     }
     let diff = engine.diff_folder(&folder)?;
     print_folder_sync_diff(&folder, &diff);
     Ok(())
+}
+
+/// How long a lite client waits for a seed to ack one `SyndicateLiteStripe`. The seed
+/// erasure-encodes, checks (F-38-GRANT, every shard) and stores the whole stripe before it acks,
+/// so the client default (1.2 s) times out on a slow or loaded seed and the stripe is then
+/// reported NOT backed up.
+pub(crate) const LITE_SYNDICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// B-SEED-SYND (L-46): waits before each retry of a stripe the seed refused as busy
+/// (`reject.syndication_busy`); after the last one the stripe stays "not backed up" for the next
+/// pass.
+pub(crate) const SYNDICATION_BUSY_BACKOFF: [std::time::Duration; 3] = [
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(10),
+];
+
+/// Runs `attempt`, retrying after each `SYNDICATION_BUSY_BACKOFF` wait while the seed answers
+/// busy; any other result (success or another error) returns at once.
+pub(crate) fn with_busy_backoff<T>(
+    mut attempt: impl FnMut() -> anyhow::Result<T>,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> anyhow::Result<T> {
+    let mut waits = SYNDICATION_BUSY_BACKOFF.iter();
+    loop {
+        match attempt() {
+            Err(e)
+                if e.to_string()
+                    .contains(parvault::network::server_events::SYNDICATION_BUSY_TEXT) =>
+            {
+                match waits.next() {
+                    Some(wait) => sleep(*wait),
+                    None => return Err(e),
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
+/// The client for `SyndicateLiteStripe` to the seed only: `base` with
+/// `LITE_SYNDICATION_TIMEOUT`. The timeout is per request, so `base` (used for the manifest and
+/// snapshot DHT puts to every mesh endpoint) keeps the default.
+pub(crate) fn lite_syndication_client(base: &MeshClient) -> MeshClient {
+    base.clone().with_timeout(LITE_SYNDICATION_TIMEOUT)
+}
+
+/// The recovery phrase from `--seed-phrase` or `PARVAULT_SEED_PHRASE`, if any.
+pub(crate) fn effective_seed_phrase(arg: Option<String>) -> Option<String> {
+    arg.or_else(|| std::env::var("PARVAULT_SEED_PHRASE").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The vault keys: derived from the recovery phrase and namespace when one is given (ADR-18),
+/// otherwise the node's sealed master key (or `--key-hex`).
+pub(crate) fn vault_keys(
+    phrase: Option<&str>,
+    vault_namespace: &str,
+    cfg: &NodeConfig,
+    key_hex: Option<&str>,
+) -> anyhow::Result<(MasterKey, NodeIdentity)> {
+    if let Some(phrase) = phrase {
+        let canonical = parvault::crypto::validate_recovery_seed_phrase_or_passphrase(phrase)?;
+        Ok((
+            MasterKey::from_recovery_seed_phrase(&canonical, vault_namespace),
+            NodeIdentity::from_recovery_seed_phrase(&canonical, vault_namespace),
+        ))
+    } else {
+        let mk = resolve_master_key(
+            &cfg.data_dir,
+            key_hex,
+            cfg.device_sealing_passphrase.as_deref(),
+        )?;
+        let id = NodeIdentity::from_master_key(&mk);
+        Ok((mk, id))
+    }
 }
 
 pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Result<()> {
@@ -50,6 +127,7 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
         tier,
         interval_secs,
         once,
+        allow_local_only,
         key_hex,
         dry_run,
         prune_deleted,
@@ -70,26 +148,23 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
     } else {
         tier
     };
-    let effective_seed_phrase = seed_phrase
-        .or_else(|| std::env::var("PARVAULT_SEED_PHRASE").ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let effective_seed_phrase = effective_seed_phrase(seed_phrase);
+    anyhow::ensure!(
+        catalog_out.is_none() || effective_seed_phrase.is_some(),
+        "--catalog-out needs --seed-phrase (or PARVAULT_SEED_PHRASE): the catalog is sealed under the recovery phrase"
+    );
+    anyhow::ensure!(
+        folder.is_dir(),
+        "watched folder {} does not exist or is not a directory",
+        folder.display()
+    );
 
-    let (master_key, owner_identity) = if let Some(phrase) = effective_seed_phrase.as_deref() {
-        let canonical = parvault::crypto::validate_recovery_seed_phrase_or_passphrase(phrase)?;
-        (
-            MasterKey::from_recovery_seed_phrase(&canonical, &vault_namespace),
-            NodeIdentity::from_recovery_seed_phrase(&canonical, &vault_namespace),
-        )
-    } else {
-        let mk = resolve_master_key(
-            &cfg.data_dir,
-            key_hex.as_deref(),
-            cfg.device_sealing_passphrase.as_deref(),
-        )?;
-        let id = NodeIdentity::from_master_key(&mk);
-        (mk, id)
-    };
+    let (master_key, owner_identity) = vault_keys(
+        effective_seed_phrase.as_deref(),
+        &vault_namespace,
+        &cfg,
+        key_hex.as_deref(),
+    )?;
 
     let mut store_for_sync = block_store
         .clone()
@@ -111,7 +186,7 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
 
     if snapshot_out.exists() {
         if let Ok(raw_prev) = std::fs::read(&snapshot_out) {
-            if let Ok(prev_snapshot) = bincode::deserialize::<FolderSnapshotManifest>(&raw_prev) {
+            if let Ok(prev_snapshot) = FolderSnapshotManifest::decode_bytes(&raw_prev) {
                 engine.load_previous_snapshot(&prev_snapshot);
             }
         }
@@ -124,6 +199,7 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
     }
 
     loop {
+        let mut pass_local_only = 0u64;
         let (snapshot, lite_receipts_count) = if let Some(seed_dir) = &lite_seed_dir {
             let pq_kp = HybridPqSigningKeypair::load_or_generate_in_dir(&cfg.data_dir)?;
             let cert = if let Some(cert_arg) = &device_cert {
@@ -135,14 +211,14 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                 PersonalDeviceCert::from_shareable_token(&raw_cert)
                     .or_else(|_| PersonalDeviceCert::from_json_str(&raw_cert))?
             } else {
-                let node_id = NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?;
+                // F-38: the cert must name the identity this client sends as (the vault owner).
                 let issued_at = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
                 PersonalDeviceCert::issue(
                     &pq_kp,
-                    &node_id.device_peer_id(),
+                    &owner_identity.device_peer_id(),
                     "lite-client",
                     issued_at,
                 )?
@@ -150,21 +226,33 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
 
             let seed_str = seed_dir.to_string_lossy().to_string();
             if is_network_peer_addr(&seed_str) {
+                // Stored locally first; counted after syndication below.
                 let mut snap = engine.sync_folder_once(&folder)?;
+                // F-38 (L-40): the seed requires the repair grant's owner to be the sender and the
+                // device cert to name the sender, so send as the vault owner identity that signs
+                // the grant. Its id is the Vault Device Peer ID `parvault identity --seed-phrase`
+                // prints. Only the seed is contacted for syndication. `net_client` (default
+                // timeout) also carries the manifest and snapshot DHT puts to every mesh endpoint;
+                // only `syndication_client` waits LITE_SYNDICATION_TIMEOUT.
                 let net_client = MeshClient::new(
                     owner_identity.clone(),
                     mesh_client.all_network_endpoints(),
                     Some(seed_str.clone()),
                 )
                 .with_data_dir_discovery(cfg.data_dir.clone(), lan_port);
+                let syndication_client = lite_syndication_client(&net_client);
                 let store_with_net = block_store.clone().with_mesh_client(net_client.clone());
                 let mut receipt_count = 0usize;
                 for entry in snap.files.values_mut() {
-                    let needs_syndication = entry
-                        .manifest
-                        .stripes
-                        .iter()
-                        .any(|s| !s.assigned_peers.iter().any(|p| is_network_peer_addr(p)));
+                    // A stripe with fewer than k shards on peers is not backed up (QA 2e M2-1).
+                    let backed_up = |s: &parvault::storage::StripeManifestEntry| {
+                        s.assigned_peers
+                            .iter()
+                            .filter(|p| is_network_peer_addr(p))
+                            .count()
+                            >= s.k_data
+                    };
+                    let needs_syndication = entry.manifest.stripes.iter().any(|s| !backed_up(s));
                     if !needs_syndication {
                         continue;
                     }
@@ -173,11 +261,7 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                         use std::io::{Read, Seek, SeekFrom};
                         let stripe_cap = entry.manifest.stripe_size_bytes.max(1024);
                         for stripe_meta in &mut entry.manifest.stripes {
-                            if stripe_meta
-                                .assigned_peers
-                                .iter()
-                                .any(|p| is_network_peer_addr(p))
-                            {
+                            if backed_up(stripe_meta) {
                                 continue;
                             }
                             let start = stripe_meta.stripe_index * (stripe_cap as u64);
@@ -206,33 +290,66 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                                     Vec::new(),
                                     snap.tier,
                                 );
-                                if let Ok((_receipt, syndicated_peers)) = net_client
-                                    .syndicate_lite_stripe_with_grant(
-                                        &seed_str,
-                                        cert.clone(),
-                                        bundle,
-                                        Some(grant),
-                                    )
-                                {
-                                    receipt_count += 1;
-                                    let has_net =
-                                        syndicated_peers.iter().any(|p| is_network_peer_addr(p));
-                                    stripe_meta.assigned_peers = if has_net {
-                                        syndicated_peers
-                                    } else {
-                                        vec![seed_str.clone(); stripe_meta.shard_hashes.len()]
-                                    };
-                                    for (idx, &sh_hash) in
-                                        stripe_meta.shard_hashes.iter().enumerate()
-                                    {
-                                        let sid = ShardId {
-                                            stripe_merkle_root: stripe_meta.stripe_merkle_root,
-                                            shard_index: idx as u32,
-                                            shard_hash: sh_hash,
+                                // B-SEED-SYND (L-46): a busy seed is retried after 2, 5
+                                // and 10 s, then the stripe is left for the next pass.
+                                match with_busy_backoff(
+                                    || {
+                                        syndication_client.syndicate_lite_stripe_with_grant(
+                                            &seed_str,
+                                            cert.clone(),
+                                            bundle.clone(),
+                                            Some(grant.clone()),
+                                        )
+                                    },
+                                    std::thread::sleep,
+                                ) {
+                                    Err(e) => tracing::error!(
+                                        code = "error.lite_syndication_failed",
+                                        stripe_index = stripe_meta.stripe_index,
+                                        seed = %seed_str,
+                                        error = %e,
+                                        "lite seed refused or failed to syndicate the stripe; it stays only on this machine (the seed log has its reject code)"
+                                    ),
+                                    Ok((_receipt, syndicated_peers)) => {
+                                        receipt_count += 1;
+                                        let has_net = syndicated_peers
+                                            .iter()
+                                            .any(|p| is_network_peer_addr(p));
+                                        // Shards the seed kept itself are labelled with its server id,
+                                        // not an address: record them as the seed's multiaddr, as the
+                                        // all-on-seed branch does, so they count as off this machine.
+                                        stripe_meta.assigned_peers = if has_net {
+                                            syndicated_peers
+                                                .into_iter()
+                                                .map(|p| {
+                                                    if is_network_peer_addr(&p) {
+                                                        p
+                                                    } else {
+                                                        seed_str.clone()
+                                                    }
+                                                })
+                                                .collect()
+                                        } else {
+                                            vec![seed_str.clone(); stripe_meta.shard_hashes.len()]
                                         };
-                                        let _ = block_store
-                                            .delete_shard(&owner_identity.device_peer_id(), &sid);
-                                        let _ = block_store.delete_shard("local", &sid);
+                                        // Every shard is now on the seed or its peers (QA 2e M2).
+                                        store_with_net.forget_local_only_stripe(
+                                            &stripe_meta.stripe_merkle_root,
+                                        );
+                                        for (idx, &sh_hash) in
+                                            stripe_meta.shard_hashes.iter().enumerate()
+                                        {
+                                            let sid = ShardId {
+                                                stripe_merkle_root: stripe_meta.stripe_merkle_root,
+                                                shard_index: idx as u32,
+                                                shard_hash: sh_hash,
+                                            };
+                                            let _ = block_store.delete_shard(
+                                                &owner_identity.device_peer_id(),
+                                                &sid,
+                                            );
+                                            let _ = block_store.delete_shard("local", &sid);
+                                        }
                                     }
                                 }
                             }
@@ -240,6 +357,20 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                         let _ = store_with_net.save_manifest(&master_key, &entry.manifest);
                     }
                 }
+                // The first local pass counted every new stripe as local-only; after
+                // syndication, report only the stripes still below k shards on peers (R3-1).
+                pass_local_only = snap
+                    .files
+                    .values()
+                    .flat_map(|f| f.manifest.stripes.iter())
+                    .filter(|s| {
+                        s.assigned_peers
+                            .iter()
+                            .filter(|p| is_network_peer_addr(p))
+                            .count()
+                            < s.k_data
+                    })
+                    .count() as u64;
                 if let Some(ref env) = snap.signed_dht_envelope {
                     let _ = net_client
                         .put_dht_envelope(DhtWireEnvelope::ClassicalManifest(env.clone()));
@@ -262,7 +393,10 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                 (snap, receipts.len())
             }
         } else {
-            (engine.sync_folder_once(&folder)?, 0)
+            let (snap, n) =
+                parvault::storage::local_only::track(|| engine.sync_folder_once(&folder));
+            pass_local_only += n;
+            (snap?, 0)
         };
         let raw_snapshot = bincode::serialize(&snapshot)?;
         BlockStore::atomic_write_file(&snapshot_out, &raw_snapshot)?;
@@ -300,6 +434,12 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
             hex::encode(snapshot.folder_merkle_root)
         );
         println!("Files Synced       : {}", snapshot.files.len());
+        if pass_local_only > 0 {
+            println!(
+                "Not Backed Up      : {}",
+                parvault::storage::local_only::summary_line(pass_local_only)
+            );
+        }
         println!("Deleted Tombstones : {}", snapshot.deleted_tombstones.len());
         if lite_receipts_count > 0 {
             println!(
@@ -311,12 +451,11 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
             println!("Pruned Shards      : {}", pruned_shards);
         }
         println!("Snapshot Saved To  : {}", snapshot_out.display());
-        println!("Master Key (hex)   : {}", master_key.to_hex());
 
         if let Some(cat_path) = &catalog_out {
             let phrase = effective_seed_phrase
                 .as_deref()
-                .unwrap_or("parvault-default-local-catalog-seed");
+                .expect("checked above: --catalog-out needs a seed phrase");
             let envelope =
                 engine.export_encrypted_vault_catalog(phrase, &vault_namespace, &snapshot)?;
             if is_lite_net_seed {
@@ -358,7 +497,14 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
         }
 
         if once {
+            parvault::storage::local_only::finish_one_shot(pass_local_only, allow_local_only);
             break;
+        }
+        if pass_local_only > 0 {
+            tracing::error!(
+                "{}",
+                parvault::storage::local_only::summary_line(pass_local_only)
+            );
         }
         tokio::time::sleep(Duration::from_secs(interval_secs.max(1))).await;
     }
@@ -371,7 +517,7 @@ pub(crate) async fn list_snapshot(env: CliEnv, command: Commands) -> anyhow::Res
         unreachable!("list_snapshot() is only dispatched for Commands::ListSnapshot")
     };
     let raw_snapshot = std::fs::read(&snapshot)?;
-    let snapshot_manifest: FolderSnapshotManifest = bincode::deserialize(&raw_snapshot)?;
+    let snapshot_manifest = FolderSnapshotManifest::decode_bytes(&raw_snapshot)?;
     let entries = FolderSyncEngine::list_snapshot_catalog(&snapshot_manifest);
     println!("=== ParVault Vault Snapshot Catalog (Zero-Shard-Download Browse, ADR-17) ===");
     println!("Snapshot File      : {}", snapshot.display());
@@ -389,6 +535,16 @@ pub(crate) async fn list_snapshot(env: CliEnv, command: Commands) -> anyhow::Res
             item.stripe_count,
             &hex::encode(item.file_merkle_root)[..16]
         );
+        // Full stripe roots: the value `evict --merkle-root` takes (R3-2).
+        if let Some(entry) = snapshot_manifest.files.get(&item.relative_path) {
+            for stripe in &entry.manifest.stripes {
+                println!(
+                    "      stripe {} root={}",
+                    stripe.stripe_index,
+                    hex::encode(stripe.stripe_merkle_root)
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -404,20 +560,22 @@ pub(crate) async fn restore_folder(env: CliEnv, command: Commands) -> anyhow::Re
         snapshot,
         out_dir,
         key_hex,
+        seed_phrase,
+        vault_namespace,
         file,
         filter,
     } = command
     else {
         unreachable!("restore_folder() is only dispatched for Commands::RestoreFolder")
     };
-    let master_key = resolve_master_key(
-        &cfg.data_dir,
+    let (master_key, owner_identity) = vault_keys(
+        effective_seed_phrase(seed_phrase).as_deref(),
+        &vault_namespace,
+        &cfg,
         key_hex.as_deref(),
-        cfg.device_sealing_passphrase.as_deref(),
     )?;
     let raw_snapshot = std::fs::read(&snapshot)?;
-    let snapshot_manifest: FolderSnapshotManifest = bincode::deserialize(&raw_snapshot)?;
-    let owner_identity = NodeIdentity::from_master_key(&master_key);
+    let snapshot_manifest = FolderSnapshotManifest::decode_bytes(&raw_snapshot)?;
     let store_with_owner = block_store
         .clone()
         .with_mesh_client(mesh_client.with_identity(owner_identity.clone()));
@@ -486,6 +644,9 @@ pub(crate) async fn recover_from_seed(env: CliEnv, command: Commands) -> anyhow:
     else {
         unreachable!("recover_from_seed() is only dispatched for Commands::RecoverFromSeed")
     };
+    let seed_phrase = effective_seed_phrase(seed_phrase).ok_or_else(|| {
+        anyhow::anyhow!("recover-from-seed needs --seed-phrase or PARVAULT_SEED_PHRASE")
+    })?;
     let canonical_seed =
         parvault::crypto::validate_recovery_seed_phrase_or_passphrase(&seed_phrase)?;
     let master_key = MasterKey::from_recovery_seed_phrase(&canonical_seed, &vault_namespace);
@@ -554,7 +715,7 @@ pub(crate) async fn recover_from_seed(env: CliEnv, command: Commands) -> anyhow:
             &envelope,
             &out_dir,
         )?;
-        println!("=== ParVault Disaster Recovery From Seed Phrase Complete (ADR-15) ===");
+        println!("=== ParVault Disaster Recovery From Seed Phrase Complete (ADR-18) ===");
         println!("Vault Namespace    : {}", vault_namespace);
         println!("Catalog Version    : {}", envelope.monotonic_version);
         println!("DHT Root Key (hex) : {}", hex::encode(envelope.dht_key));
@@ -562,4 +723,71 @@ pub(crate) async fn recover_from_seed(env: CliEnv, command: Commands) -> anyhow:
         println!("Files Restored     : {}", recovered_count);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn busy() -> anyhow::Error {
+        anyhow::anyhow!(
+            "SyndicateLiteStripe rejected: Some({:?})",
+            parvault::network::server_events::SYNDICATION_BUSY_TEXT
+        )
+    }
+
+    /// B-SEED-SYND: a busy seed is retried after 2, 5 and 10 s, then given up; other errors and
+    /// success return at once.
+    #[test]
+    fn busy_seed_backoff_schedule() {
+        use std::time::Duration;
+        // Busy three times, then accepted: three waits, 2/5/10 s, then Ok.
+        let mut calls = 0;
+        let mut slept = Vec::new();
+        let r = with_busy_backoff(
+            || {
+                calls += 1;
+                if calls <= 3 {
+                    Err(busy())
+                } else {
+                    Ok(calls)
+                }
+            },
+            |d| slept.push(d),
+        );
+        assert_eq!(r.unwrap(), 4);
+        assert_eq!(slept, [2, 5, 10].map(Duration::from_secs).to_vec());
+        // Busy every time: three waits, then the busy error.
+        let mut slept = Vec::new();
+        let r: anyhow::Result<()> = with_busy_backoff(|| Err(busy()), |d| slept.push(d));
+        assert!(r.is_err() && slept.len() == 3);
+        // Another error: no retry.
+        let mut slept = Vec::new();
+        let mut calls = 0;
+        let r: anyhow::Result<()> = with_busy_backoff(
+            || {
+                calls += 1;
+                Err(anyhow::anyhow!("device cert does not name the sender"))
+            },
+            |d| slept.push(d),
+        );
+        assert!(r.is_err() && slept.is_empty() && calls == 1);
+    }
+
+    /// Only the seed-syndication client waits `LITE_SYNDICATION_TIMEOUT`; the base client that
+    /// carries the DHT puts keeps the default (QA 2e r3).
+    #[test]
+    fn lite_syndication_client_uses_the_long_timeout() {
+        let default = MeshClient::new(NodeIdentity::from_seed([0x32; 32]), Vec::new(), None)
+            .request_timeout();
+        let dht_client = MeshClient::new(
+            NodeIdentity::from_seed([0x31; 32]),
+            vec!["/ip4/127.0.0.1/tcp/2".to_string()],
+            Some("/ip4/127.0.0.1/tcp/1".to_string()),
+        );
+        let syndication = lite_syndication_client(&dht_client);
+        assert_eq!(syndication.request_timeout(), LITE_SYNDICATION_TIMEOUT);
+        assert_eq!(dht_client.request_timeout(), default);
+        assert!(LITE_SYNDICATION_TIMEOUT > default);
+    }
 }

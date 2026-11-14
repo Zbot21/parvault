@@ -190,6 +190,7 @@ fn proof_eviction_quorum_sub_threshold_and_duplicate_signer_rejected() {
             sig_r: &sig_r,
             sig_s: &sig_s,
             cosignatures: &cosigs,
+            council_epoch: 0,
         },
         &council,
         min_quorum,
@@ -246,11 +247,12 @@ fn proof_eviction_quorum_authorized_distinct_signers_and_expiry() {
         issued_at_ms,
         expires_at_ms,
         &issuer_pubkey,
+        0,
     )
     .expect("fits in 256-byte stack preimage");
 
     let ufcma_verify = |pk: &[u8; 32], msg: &[u8], sig: &[u8; 64]| -> bool {
-        if !slice_eq_bounded::<132>(msg, &signed_buf[..signed_len]) {
+        if !slice_eq_bounded::<140>(msg, &signed_buf[..signed_len]) {
             return false;
         }
         if *pk == council[0] {
@@ -275,6 +277,7 @@ fn proof_eviction_quorum_authorized_distinct_signers_and_expiry() {
             sig_r: &sig_r,
             sig_s: &sig_s,
             cosignatures: &cosigs,
+            council_epoch: 0,
         },
         &council,
         min_quorum,
@@ -297,6 +300,7 @@ fn proof_eviction_quorum_authorized_distinct_signers_and_expiry() {
             sig_r: &sig_r,
             sig_s: &sig_s,
             cosignatures: &cosigs,
+            council_epoch: 0,
         },
         &council,
         min_quorum,
@@ -320,7 +324,8 @@ fn symbolic_eviction_target_32b() -> EvictionTarget {
 /// Proves `SignedBadActorEvictionOrder::encode_signing_payload_stack` (backing
 /// `canonical_sign_bytes` and `tally_and_verify_quorum_raw`) is strictly collision-free across
 /// ALL symbolic mutations to `order_id`, `target` (IPv4, IPv6, Pubkey, MerkleRoot, BlindedLocator),
-/// `reason` (content & length), `issued_at_ms`, `expires_at_ms`, and `issuer_pubkey`.
+/// `reason` (content & length), `issued_at_ms`, `expires_at_ms`, `issuer_pubkey` and
+/// `council_epoch` (F-09, `-v2:`).
 #[kani::proof]
 fn proof_eviction_signing_payload_collision_free_across_all_fields() {
     let order_id: [u8; 32] = kani::any();
@@ -335,7 +340,7 @@ fn proof_eviction_signing_payload_collision_free_across_all_fields() {
     let mut_expires: u64 = kani::any();
     let mut_issuer: [u8; 32] = kani::any();
 
-    // 1. Disjoint preimage lengths across V4 (131B), V6 (143B), and 32-byte digest targets (158B),
+    // 1. Disjoint preimage lengths across V4 (139B), V6 (151B), and 32-byte digest targets (166B),
     //    plus variable `reason` length (`3B` vs `4B`), prevent all cross-length-class collisions:
     let t_v4 = EvictionTarget::IpAddress(IpAddr::V4(Ipv4Addr::from(kani::any::<[u8; 4]>())));
     let t_v6 = EvictionTarget::IpAddress(IpAddr::V6(Ipv6Addr::from(kani::any::<[u8; 16]>())));
@@ -348,6 +353,7 @@ fn proof_eviction_signing_payload_collision_free_across_all_fields() {
         issued_at_ms,
         expires_at_ms,
         &issuer_pubkey,
+        0,
     )
     .expect("fits in 256B");
     let (_, len_v6) = SignedBadActorEvictionOrder::encode_signing_payload_stack(
@@ -357,8 +363,11 @@ fn proof_eviction_signing_payload_collision_free_across_all_fields() {
         mut_issued,
         mut_expires,
         &mut_issuer,
+        0,
     )
     .expect("fits in 256B");
+    let epoch_a: u64 = kani::any();
+    let mut_epoch: u64 = kani::any();
     let (buf_32_a, len_32_a) = SignedBadActorEvictionOrder::encode_signing_payload_stack(
         &order_id,
         &t_32,
@@ -366,6 +375,7 @@ fn proof_eviction_signing_payload_collision_free_across_all_fields() {
         issued_at_ms,
         expires_at_ms,
         &issuer_pubkey,
+        epoch_a,
     )
     .expect("fits in 256B");
     assert!(len_v4 != len_v6 && len_v4 != len_32_a && len_v6 != len_32_a);
@@ -377,6 +387,7 @@ fn proof_eviction_signing_payload_collision_free_across_all_fields() {
         issued_at_ms,
         expires_at_ms,
         &issuer_pubkey,
+        0,
     )
     .expect("fits in 256B");
     assert_ne!(short_len, len_32_a);
@@ -391,18 +402,20 @@ fn proof_eviction_signing_payload_collision_free_across_all_fields() {
         mut_issued,
         mut_expires,
         &mut_issuer,
+        mut_epoch,
     )
     .expect("fits in 256B");
-    assert_eq!(len_32_a, 158);
-    assert_eq!(len_32_b, 158);
+    assert_eq!(len_32_a, 166);
+    assert_eq!(len_32_b, 166);
     assert_eq!(
-        slice_eq_bounded::<158>(&buf_32_a[..158], &buf_32_b[..158]),
+        slice_eq_bounded::<166>(&buf_32_a[..166], &buf_32_b[..166]),
         mut_order_id == order_id
             && eviction_target_eq_fixed(&mut_t32, &t_32)
             && mut_reason == reason_a
             && mut_issued == issued_at_ms
             && mut_expires == expires_at_ms
             && mut_issuer == issuer_pubkey
+            && mut_epoch == epoch_a
     );
 }
 
@@ -1078,6 +1091,15 @@ fn proof_sanitize_sync_relative_path_no_traversal() {
     let mut out_buf = [0u8; 10];
     let result =
         sanitize_sync_relative_path_into(&raw_bytes[..slice_len], &mut out_buf[..slice_len]);
+    // Non-vacuity (ADR-33): a `..` traversal segment is rejected, and a nested path is accepted.
+    kani::cover!(
+        result.is_none() && slice_len == 2 && raw_bytes[0] == b'.' && raw_bytes[1] == b'.',
+        "traversal segment rejected"
+    );
+    kani::cover!(
+        result.is_some_and(|n| out_buf[..n].contains(&b'/')),
+        "nested relative path accepted"
+    );
 
     if slice_len == 0 || raw_bytes[0] == b'/' || raw_bytes[0] == b'\\' {
         assert!(result.is_none());
@@ -1128,4 +1150,200 @@ fn proof_sanitize_sync_relative_path_no_traversal() {
     assert!(sanitize_sync_relative_path("/etc/passwd").is_none());
     assert!(sanitize_sync_relative_path("../escape").is_none());
     assert!(sanitize_sync_relative_path("C:\\win").is_none());
+}
+
+/// F-38 (L-40): a syndication repair grant is accepted only when absent or owned by exactly the
+/// authenticated sender's 32-byte key; any other owner, or an unknown sender, is refused.
+#[kani::proof]
+#[kani::unwind(34)]
+fn proof_syndication_grant_owned_by_sender() {
+    let owner: [u8; 32] = kani::any();
+    let sender: [u8; 32] = kani::any();
+    let has_grant: bool = kani::any();
+    let sender_known: bool = kani::any();
+    let grant = has_grant.then_some(owner);
+    let sender_opt = sender_known.then_some(sender);
+    let decision = crate::network::wire_handler::syndication_grant_decision(grant, sender_opt);
+    kani::cover!(decision.is_err(), "grant not owned by sender");
+    let expected_ok = !has_grant || (sender_known && owner == sender);
+    // Only the outcome is checked: comparing the &str reason code makes CBMC unwind memcmp
+    // without a bound; the code itself is checked by the claim's wire test.
+    assert_eq!(decision.is_ok(), expected_ok);
+}
+
+/// F-17: a gateway statement is accepted only from the pinned authority, with a lifetime in
+/// `(0, 30 days]`, issued at most 5 minutes ahead, and not expired. Each condition is checked
+/// on its own as an implication, plus the all-good case (QA 2c D4: not a restatement).
+#[kani::proof]
+fn proof_gateway_statement_pinned_and_bounded() {
+    let pinned: bool = kani::any();
+    let issued: u64 = kani::any();
+    let expires: u64 = kani::any();
+    let now: u64 = kani::any();
+    let decision = crate::capabilities::gateway_statement_decision(pinned, issued, expires, now);
+    kani::cover!(decision.is_err(), "statement unpinned or unbounded");
+    if !pinned {
+        assert!(decision.is_err());
+    }
+    if expires <= issued {
+        assert!(decision.is_err());
+    }
+    if expires > issued && expires - issued > crate::capabilities::MAX_GATEWAY_STATEMENT_LIFETIME_MS
+    {
+        assert!(decision.is_err());
+    }
+    if now < issued && issued - now > crate::capabilities::GATEWAY_STATEMENT_FUTURE_SKEW_MS {
+        assert!(decision.is_err());
+    }
+    if now > expires {
+        assert!(decision.is_err());
+    }
+    // A concrete good statement: pinned, one-day lifetime, issued now.
+    if pinned && issued == now && expires == now.wrapping_add(86_400_000) && now < u64::MAX / 2 {
+        assert!(decision.is_ok());
+    }
+}
+
+/// F-38-GRANT (L-41): while a shard is stored, a permitted put never changes its grant owner
+/// or accounted owner. `Bind` of a stored shard happens only for its accounted owner with an
+/// unchanged (or first) grant owner; `Keep` only for the same 32-byte grant owner; an unstored
+/// shard always binds.
+#[kani::proof]
+#[kani::unwind(34)]
+fn proof_shard_rebind_first_writer_wins() {
+    use crate::por::{shard_rebind_decision, ShardBinding, ShardRebindFacts};
+    let existing: [u8; 32] = kani::any();
+    let incoming: [u8; 32] = kani::any();
+    let has_existing: bool = kani::any();
+    let has_incoming: bool = kani::any();
+    let facts = ShardRebindFacts {
+        stored: kani::any(),
+        existing_grant_owner: has_existing.then_some(existing),
+        incoming_grant_owner: has_incoming.then_some(incoming),
+        sender_is_accounted_owner: kani::any(),
+    };
+    let decision = shard_rebind_decision(&facts);
+    kani::cover!(decision.is_err(), "rebind refused");
+    kani::cover!(
+        matches!(decision, Ok(ShardBinding::Keep)),
+        "kept for the same grant owner"
+    );
+    if !facts.stored {
+        assert!(matches!(decision, Ok(ShardBinding::Bind)));
+        return;
+    }
+    match decision {
+        Ok(ShardBinding::Bind) => {
+            // Accounted owner unchanged: only that owner rebinds.
+            assert!(facts.sender_is_accounted_owner);
+            // Grant owner unchanged when both are present.
+            assert!(!(has_existing && has_incoming) || existing == incoming);
+        }
+        Ok(ShardBinding::Keep) => {
+            assert!(!facts.sender_is_accounted_owner);
+            assert!(has_existing && has_incoming && existing == incoming);
+        }
+        // Only the outcome is checked (the &str code is checked by the claim's wire test).
+        Err(_) => {}
+    }
+}
+
+/// F-41: a blinded delete passes only if all five facts hold.
+#[kani::proof]
+fn proof_blinded_delete_needs_every_fact() {
+    let f = crate::storage::anonymity::BlindedDeleteFacts {
+        signed: kani::any(),
+        capability_registered: kani::any(),
+        id_matches: kani::any(),
+        fresh: kani::any(),
+        sig_valid: kani::any(),
+    };
+    let decision = crate::storage::anonymity::blinded_delete_decision(&f);
+    kani::cover!(decision.is_err(), "blinded delete refused");
+    let all = f.signed && f.capability_registered && f.id_matches && f.fresh && f.sig_valid;
+    assert_eq!(decision.is_ok(), all);
+}
+
+/// F-41: a locator's capability is first-writer-wins while its lease exists.
+#[kani::proof]
+#[kani::unwind(34)]
+fn proof_blinded_rebind_first_writer_wins() {
+    let has: bool = kani::any();
+    let registered: [u8; 32] = kani::any();
+    let incoming: [u8; 32] = kani::any();
+    let decision =
+        crate::storage::anonymity::blinded_rebind_decision(has.then_some(registered), incoming);
+    kani::cover!(decision.is_err(), "blinded rebind refused");
+    assert_eq!(decision.is_ok(), !has || registered == incoming);
+}
+
+/// F-43 (L-43, L-44): a WebDAV request is served only with a present, well-formed, valid,
+/// unexpired, read-only, in-scope token without a peer-UID caveat. Every token-validity failure
+/// is a 401 (`Unauthorized`), every other refusal a 403 (`Forbidden`).
+#[kani::proof]
+fn proof_webdav_auth_decision() {
+    use crate::vfs::{webdav_auth_decision, WebdavAuthFacts, WebdavAuthRefusal};
+    let facts = WebdavAuthFacts {
+        token_present: kani::any(),
+        token_parses: kani::any(),
+        tag_valid: kani::any(),
+        expired: kani::any(),
+        read_only: kani::any(),
+        peer_uid_bound: kani::any(),
+        in_scope: kani::any(),
+    };
+    let decision = webdav_auth_decision(&facts);
+    kani::cover!(decision.is_ok(), "request served");
+    kani::cover!(
+        matches!(decision, Err(WebdavAuthRefusal::Forbidden(_))),
+        "valid token out of scope"
+    );
+    let token_valid =
+        facts.token_present && facts.token_parses && facts.tag_valid && !facts.expired;
+    let allowed = token_valid && facts.read_only && !facts.peer_uid_bound && facts.in_scope;
+    // Only the outcome is checked (the &str code is checked by the claims' wire tests).
+    assert_eq!(decision.is_ok(), allowed);
+    assert_eq!(
+        matches!(decision, Err(WebdavAuthRefusal::Unauthorized(_))),
+        !token_valid
+    );
+    assert_eq!(
+        matches!(decision, Err(WebdavAuthRefusal::Forbidden(_))),
+        token_valid && !allowed
+    );
+}
+
+/// ADR-09 / F-01: the slash guard never lets the genesis or the node's own keys be slashed.
+#[kani::proof]
+fn proof_slash_guard_protects_genesis_and_self() {
+    let facts = crate::network::wot::SlashTargetFacts {
+        is_genesis: kani::any(),
+        is_protected: kani::any(),
+    };
+    let decision = crate::network::wot::WebOfTrustRegistry::slash_target_decision(&facts);
+    kani::cover!(decision.is_err(), "protected key not slashed");
+    assert_eq!(decision.is_ok(), !facts.is_genesis && !facts.is_protected);
+}
+
+/// B-SEED-SYND (L-46): a lite syndication is admitted only while both counters are under their
+/// caps (2 in flight per node, 1 per sender), and admitting one more from any admitted state
+/// never exceeds either cap.
+#[kani::proof]
+fn proof_syndication_fanout_budget() {
+    use crate::network::server_events::{
+        syndication_fanout_decision, MAX_SYNDICATIONS_IN_FLIGHT, MAX_SYNDICATIONS_PER_SENDER,
+    };
+    let total: usize = kani::any();
+    let sender: usize = kani::any();
+    kani::assume(total < 1 << 16 && sender <= total);
+    let decision = syndication_fanout_decision(total, sender);
+    kani::cover!(decision.is_err(), "syndication over budget");
+    kani::cover!(decision.is_ok(), "syndication admitted");
+    let under = total < MAX_SYNDICATIONS_IN_FLIGHT && sender < MAX_SYNDICATIONS_PER_SENDER;
+    // Only the outcome is checked (the &str code is checked by the claim's wire test).
+    assert_eq!(decision.is_ok(), under);
+    if decision.is_ok() {
+        assert!(total + 1 <= MAX_SYNDICATIONS_IN_FLIGHT);
+        assert!(sender + 1 <= MAX_SYNDICATIONS_PER_SENDER);
+    }
 }

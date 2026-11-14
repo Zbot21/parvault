@@ -2,6 +2,9 @@
 
 > **No CS or math degree required.** If you know how to run a command in a terminal (or spin up a Docker container / Raspberry Pi), this guide will get your files backed up with **zero monthly cloud bills** and **zero trust** in anyone else's computer.
 
+> [!WARNING]
+> **Pre-release.** `v0.5.0` is not released and has no installer or binary download. Build from source first (`cargo build --release`, then put `target/release/parvault` and `target/release/parvault-seed` on your `PATH`). Multi-machine setups have been tested only in Docker and on one host, not on real router hardware. The limits are listed in the [README](README.md#known-limits-v050).
+
 ---
 
 ## 1. What Is This? (The 60-Second Plain-English Version)
@@ -15,20 +18,20 @@ Every homelabber and self-hoster eventually hits the same painful choice:
 Neighborhood Cloud lets your computers, your home server, and your friends' or neighbors' home servers team up to back each other up automatically—**without anyone ever being able to see anyone else's files:**
 
 1. **Step 1 — Locked in a Quantum-Safe Vault Before It Leaves Your Machine:**
-   Before a photo or document ever touches your network card, `parvault` pads its size (so nobody can even guess what kind of file it is) and locks it inside a **dual-layer, post-quantum encrypted vault** (`AES-256-GCM` + NIST post-quantum `ML-KEM-768` / `ML-DSA-65`). Your secret **Master Key** never leaves your computer.
+   Before a photo or document ever touches your network card, `parvault` pads its size and encrypts it with **`AES-256-GCM`**. The list of your files (the folder catalog and manifest) is also sealed with a post-quantum cascade. Your secret **Master Key** never leaves your computer.
 2. **Step 2 — Chopped into 20 "Space-Probe" Puzzle Pieces ("Shards"):**
-   Using **Reed-Solomon erasure coding** (the exact same math NASA uses to talk to deep-space probes across the solar system), that locked vault is split into **20 puzzle pieces** and spread across different machines.
+   Using **Reed-Solomon erasure coding** (the exact same math NASA uses to talk to deep-space probes across the solar system), that locked vault is split into **20 puzzle pieces** and spread across the ring members you store on.
    - **Here's the magic:** You **don't** need all 20 pieces to get your file back!
-   - In standard **Consumer Mode (`10-of-20`)**, **any 10 pieces** out of 20 reconstruct your entire file—meaning **half the network (10 computers!) can explode at the same time** and you lose **zero bytes**.
-   - Once your 24/7 home server proves it stays online, it automatically unlocks **Homelab Mode (`16-of-20`)**, where **any 16 pieces** reconstruct your file using only **1.25x** total storage space (`80%` efficiency) instead of making 2x or 3x full copies!
-3. **Step 3 — Completely Anonymized ("Blinded") Puzzle Pieces:**
-   Every puzzle piece is given a random disguise ("blinded locator") and passed through a neighbor relay. The computers holding your puzzle pieces have **zero idea** what the file is, whose computer sent it, or which other puzzle pieces belong to the same file.
+   - By default (**`--tier homelab`, `16-of-20`**), **any 16 pieces** reconstruct your file using only **1.25x** storage, so 4 pieces can be lost. `--tier consumer` (`10-of-20`) survives losing 10 pieces at 2x storage. You choose the tier; it does not change on its own yet.
+   - **With one paired router, all 20 pieces sit on that router.** That protects against bit rot on its disk, not against losing the router. Spread pieces by adding more ring members.
+3. **Step 3 — What the Machines Holding Your Pieces Can See:**
+   Only encrypted bytes: they cannot read your files. They do see which ring member sent each piece, and the piece file names show which pieces belong to the same stripe. Hiding that (blinded names and relaying uploads through a neighbor) is planned for the CLI.
 
 ```mermaid
 flowchart LR
     subgraph YourPC["1. Your Laptop or PC (Has Your Secret Key)"]
         File["Family Photos / Docs"] --> Vault["Lock in Quantum-Safe Vault\n(Only You Have the Key)"]
-        Vault --> Chop["Chop Encrypted Vault into\n20 Anonymized Puzzle Pieces"]
+        Vault --> Chop["Chop Encrypted Vault into\n20 Encrypted Puzzle Pieces"]
     end
 
     subgraph Mesh["2. Your Homelab & Neighborhood Mesh (Zero Knowledge)"]
@@ -38,8 +41,8 @@ flowchart LR
         Chop --> N4["17 Other Peers...\n(Can't Read Anything!)"]
     end
 
-    subgraph Restore["3. Instant Recovery (Even if 4–10 Machines Die!)"]
-        N1 & N2 & N3 --> Rebuild["Collect Any 10 (or 16) Pieces\n+ Unlock with Your Key = Exact File!"]
+    subgraph Restore["3. Recovery (4 of 20 Pieces Can Be Lost by Default)"]
+        N1 & N2 & N3 --> Rebuild["Collect Any 16 Pieces (default tier)\n+ Unlock with Your Key = Exact File!"]
     end
 ```
 
@@ -47,7 +50,7 @@ flowchart LR
 
 ## 2. Which Binary Should I Run? (`parvault` vs. `parvault-seed`)
 
-Neighborhood Cloud builds **two small, self-contained binaries** so you never have to install heavy software on a headless server:
+Neighborhood Cloud builds five binaries; this guide uses these two:
 
 | Binary | Who Should Run It? | What Does It Do? | Can It Read My Files? |
 | :--- | :--- | :--- | :---: |
@@ -58,7 +61,7 @@ Neighborhood Cloud builds **two small, self-contained binaries** so you never ha
 
 ## 3. Zero-IP Home Network Quickstart (No IP Addresses Needed!)
 
-In `v0.3.0`, you **never have to look up or type IP addresses**. Nodes auto-discover each other on your home network via cryptographically signed beacons, pair in seconds with a 4-word code, and auto-heal if your router assigns a new DHCP address.
+In `v0.5.0`, you **never have to look up or type IP addresses** on one home LAN. Nodes auto-discover each other on your home network via cryptographically signed beacons, pair in seconds with a 4-word code, and auto-heal if your router assigns a new DHCP address.
 
 ```mermaid
 flowchart LR
@@ -68,22 +71,11 @@ flowchart LR
 ```
 
 ### Step 1: Initialize Your Vault (`parvault init`)
-On your computer, home server, or router, generate cryptographic keys and a 24-word recovery phrase:
+On your computer, home server, or router, generate cryptographic keys and a `config.toml`:
 ```bash
 parvault init --profile router-soc --watch /mnt/usb-nas/shared --label "Home-NAS"
 ```
-Output:
-```text
-[parvault] Initialized node identity in .parvault-data
-[parvault] Persistent Device Peer ID: parvault-peer-8f3a9c12e4b07d11
-[parvault] ----------------------------------------------------------------------
-[parvault] 24-Word Recovery Mnemonic (Write this down!):
-[parvault] velvet orbit oak anchor matrix copper alpine shield
-[parvault] beacon crystal meadow timber galaxy canyon breeze horizon
-[parvault] river summit forest harbor ripple valley shadow summit
-[parvault] ----------------------------------------------------------------------
-[parvault] Created configuration file at .parvault-data/config.toml
-```
+It prints the data directory, the node's peer ids and its owner fingerprint. It prints no recovery phrase: see Recipe A for how recovery works.
 
 ---
 
@@ -97,7 +89,7 @@ parvault up \
   --pair
 ```
 This automatically starts:
-1. The **P2P storage daemon** (using 1 MiB stripes so RAM stays `< 16 MiB`),
+1. The **P2P storage daemon** (1 MiB stripes; <!-- metric:docker.live_rss -->`8.63 MiB`<!-- /metric --> resident in the Docker gate's 48 MiB container),
 2. The **Signed LAN Beacon Responder** on UDP `4009`,
 3. The **Embedded Status Dashboard** on `http://localhost:4080`,
 4. An active **4-word pairing code** (e.g. `shield-copper-alpine-matrix`).
@@ -113,12 +105,13 @@ parvault discover
 ```
 Output:
 ```text
-DISCOVERED HOME LAN PEERS (Zero-IP Configuration)
-------------------------------------------------------------------------------------------------------
-Label           Role        Multiaddr (Pinned Peer ID)                           Available    Status
-------------------------------------------------------------------------------------------------------
-Home-NAS        router-nas  /ip4/192.168.1.1/tcp/4001/p2p/12D3KooWSDu...        476.2 GiB    Online
-------------------------------------------------------------------------------------------------------
+DISCOVERED PARVAULT PEERS (Zero-IP Configuration)
+----------------------------------------------------------------------------------------------------------
+Label              | Role         | Multiaddr (Pinned PeerId)                              | Free Space
+----------------------------------------------------------------------------------------------------------
+Home-NAS           | router-nas   | /ip4/192.168.1.1/tcp/4001/p2p/12D3KooWBPqPNYp6...      | 32.0 GiB
+----------------------------------------------------------------------------------------------------------
+Discovered 1 verified peer(s). Pinned in .parvault-data/known_peers.json.
 ```
 
 ```bash
@@ -127,8 +120,8 @@ parvault join --code shield-copper-alpine-matrix
 ```
 Output:
 ```text
-[parvault] Verified signed beacon from 'Home-NAS' (12D3KooWSDu...)!
-[parvault] Successfully paired and pinned in known_peers.json! Zero-IP config ready.
+Paired with Home-NAS (12D3KooWBPqPNYp6...) — zero IP config ready!
+Pinned Multiaddr: /ip4/192.168.1.1/tcp/4001/p2p/12D3KooWBPqPNYp6...
 ```
 
 ---
@@ -151,16 +144,27 @@ A device outside the ring is refused with `peer not admitted; v0.5.0 requires ri
 Backup and restore commands find your paired storage nodes automatically; storing on them needs ring membership (Step 3b):
 
 ```bash
+# Optional: a recovery phrase makes this folder recoverable on a new machine (Recipe A).
+# Write the phrase down offline; parvault stores it nowhere.
+export PARVAULT_SEED_PHRASE="$(parvault new-seed-phrase)"; echo "$PARVAULT_SEED_PHRASE"
+
 # Back up personal documents incrementally (filters .git, node_modules automatically)
 parvault watch-folder \
   --folder ~/Documents \
+  --vault-namespace documents \
   --snapshot-out ./documents.manifest.bin \
   --prune-deleted \
   --once
+# If no ring peer takes the data, this prints "N stripe(s) kept only on this machine: NOT backed up"
+# and exits with code 3: nothing left this machine. Pass --allow-local-only to accept that.
+# "Backed up" means at least k shards are off this machine; with a lite seed they may all be on
+# the seed itself (one other machine).
 
-# Restore a single file or the whole directory tree on another machine
+# Restore a single file or the whole directory tree (keep PARVAULT_SEED_PHRASE set and pass the
+# same namespace if you backed up with a phrase; without one, omit --vault-namespace)
 parvault restore-folder \
   --snapshot ./documents.manifest.bin \
+  --vault-namespace documents \
   --out-dir ./restored-docs \
   --file "tax-return.pdf"
 ```
@@ -168,55 +172,64 @@ parvault restore-folder \
 ---
 
 ### Step 5: Zero-Pairing Public Commons Quickstart (`--public`)
-Want to back up files without pairing with anyone? You can connect to the open Public Commons swarm (analogous to a public BitTorrent tracker):
+Public Commons mode connects to a public swarm (analogous to a public BitTorrent tracker). **No public tracker is hosted today**: run your own `parvault-seed start --mode public-bootstrap` and use its address.
 
 ```bash
 parvault watch-folder \
   --folder ~/Documents \
   --public \
-  --tracker /dns4/tracker.neighborhoodcloud.org/tcp/4002/p2p/12D3KooW... \
+  --tracker /ip4/<YOUR_SEED_IP>/tcp/4002/p2p/<SEED_PEER_ID> \
   --once
 ```
-- **Zero pairing or join codes:** Anyone can join immediately with a lightweight Hashcash Proof-of-Work ticket.
-- **Client-Side Quantum-Safe Encryption:** Your files are locked with `AES-256-GCM` + Post-Quantum keys *before* leaving your machine. Stranger nodes only ever see encrypted shards.
+- **Zero pairing or join codes:** Anyone can join with a lightweight Hashcash Proof-of-Work ticket.
+- **Client-Side Encryption:** Your files are encrypted with `AES-256-GCM` *before* leaving your machine. Stranger nodes only ever see encrypted shards.
 - **10-of-20 Reed-Solomon:** Reconstructs your files even if 10 out of 20 stranger machines abruptly power off!
 
 ---
 
 ## 4. Advanced Homelab Recipes
 
-### Recipe A: Zero-Local-State "House Fire" Recovery (24-Word Recovery Phrase)
-What if your house burns down, destroying your laptop, your router, and all local files?
-When running `parvault init` or `watch-folder`, you received a 24-word recovery phrase. On a brand-new machine anywhere in the world:
+### Recipe A: "House Fire" Recovery from a Recovery Phrase (Opt-In)
+What if your laptop is lost or destroyed? A folder can be recovered on a new machine **only if you backed it up with a recovery phrase**, and only while ring members holding its pieces are still reachable. `parvault init` prints no phrase, and folders served by `parvault up --folder` have no phrase recovery.
 
+1. Before anything goes wrong, make a phrase and back up with it (write the phrase down offline; it is never stored):
 ```bash
-parvault recover-from-seed \
-  --seed-phrase "velvet orbit oak anchor matrix copper alpine shield beacon crystal meadow timber galaxy canyon breeze horizon river summit forest harbor ripple valley shadow summit" \
-  --vault-namespace "default" \
-  --out-dir ./recovered-after-fire
+export PARVAULT_SEED_PHRASE="$(parvault new-seed-phrase)"; echo "$PARVAULT_SEED_PHRASE"
+parvault watch-folder --folder ~/Documents --vault-namespace documents --once
 ```
-`parvault` deterministically re-derives your root Master Key, locates your encrypted vault catalog on the network DHT, downloads the surviving puzzle pieces, and reconstructs every file!
+2. On the new machine, which must reach the ring's nodes, recover with the same phrase and namespace. Ring membership gates storing and publishing, not reading. Anyone holding the owner's recovery key can restore from any reachable member without an invitation; it cannot store until invited. Members serve only ciphertext.
+```bash
+export PARVAULT_SEED_PHRASE="<your 24 words>"
+parvault recover-from-seed --vault-namespace documents --out-dir ./recovered-after-fire
+```
+For example, the BIP-39 test vector `legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth title` is a valid phrase; never use a published phrase for real data. Prefer `PARVAULT_SEED_PHRASE` over `--seed-phrase`, which other users can see in the process list.
+
+`parvault` re-derives the vault keys from the phrase, finds the encrypted folder catalog on the ring's DHT, downloads the surviving pieces, and rebuilds every file. A wrong phrase or namespace fails and writes nothing.
 
 ---
 
 ### Recipe B: Link Personal Devices with Zero Reciprocity Tax (`issue-device-cert`)
-To link machines into a private Day-1 Personal Ring with **zero storage quota tax (`0.00x`)**:
+To link machines into a private Day-1 Personal Ring (the planned zero storage quota tax for linked devices is not applied yet):
 ```bash
-# 1. On your laptop, issue a certificate for your desktop or NAS:
+# 1. On your laptop, issue a certificate for your desktop or NAS. For a lite seed
+#    (watch-folder --lite-seed-dir), certify the "Vault Device Peer ID" that
+#    `parvault identity --seed-phrase ... --vault-namespace ...` prints instead.
 parvault issue-device-cert \
   --device-peer-id "parvault-peer-8f3a9c12e4b07d11" \
   --device-label "Work-Laptop"
 
-# 2. Verify and pin on the destination machine:
-parvault-seed verify-device-cert \
-  --cert "PARVAULT-CERT-V1:<hex>"
+# 2. Verify it on the destination machine against the issuer's owner key
+#    ("Owner PQ Public Key Hex" in `parvault identity` on the issuing laptop):
+parvault-seed verify-device-cert --data-dir /mnt/nas/parvault-seed \
+  --cert "PARVAULT-CERT-V1:<hex>" \
+  --owner-pq-pubkey-hex <ISSUER_OWNER_PQ_PUBLIC_KEY_HEX>
 ```
 
 ---
 
 ### Recipe C: Scrub for Silent Disk Bit-Rot & Check Uptime Status
 ```bash
-# Check node storage quota, resident RAM, and Earned Standing ladder:
+# Check node storage quota and the standing tiers:
 parvault status
 
 # Verify every local shard against silent disk corruption:
@@ -233,25 +246,28 @@ If a spammer or illegal content is detected, administrators can purge matching s
 parvault evict --ip 203.0.113.42 --reason "Spam flood"
 
 # Purge and permanently block an illegal content stripe across mesh peers:
-parvault evict --merkle-root <MERKLE_ROOT_HEX> --propagate
+# --merkle-root takes a full 64-hex stripe Merkle root. `parvault list-snapshot --snapshot <file>`
+# prints each file's stripe roots (`stripe N root=...`); an abuse report names the stripe too.
+# File and folder roots are not stripe roots (they only coincide for a one-stripe file).
+parvault evict --merkle-root <STRIPE_MERKLE_ROOT_HEX> --propagate
 ```
 
 ---
 
 ### Recipe E: Report Abusive Content & Public Tracker Administration (`ADR-19`)
-On Public Commons swarms (`--public`), random users cannot grief or evict honest users. To report illegal content, submit a cryptographic burden-of-proof report (`parvault report-abuse`). The Public Tracker Operator reviews cryptographic proofs and issues official eviction orders:
+This needs a public tracker you run yourself (none is hosted today). On Public Commons swarms (`--public`), random users cannot grief or evict honest users. To report illegal content, submit a cryptographic burden-of-proof report (`parvault report-abuse`). The Public Tracker Operator reviews cryptographic proofs and issues official eviction orders:
 
 ```bash
 # 1. Reporter: submit leaked manifest and key proving illegal content distribution:
 parvault report-abuse \
-  --tracker /dns4/tracker.neighborhoodcloud.org/tcp/4002/p2p/... \
+  --tracker /ip4/<YOUR_SEED_IP>/tcp/4002/p2p/<SEED_PEER_ID> \
   --manifest ./contraband.manifest.bin \
   --disclosed-key-hex <DISCLOSED_KEY_HEX> \
   --allegation "CSAM / DMCA takedown violation"
 
 # 2. Tracker Operator: review queue and approve mesh-wide shredding:
 parvault-seed admin list-takedowns --data-dir /mnt/nas/parvault-seed
-parvault-seed admin approve-takedown --report-id <REPORT_ID> --note "Confirmed violation" --propagate
+parvault-seed admin approve-takedown --data-dir /mnt/nas/parvault-seed --report-id <REPORT_ID> --note "Confirmed violation" --propagate
 
 # 3. Tracker Operator: emergency unilateral eviction on formal legal/police warrant:
 parvault-seed admin emergency-evict --data-dir /mnt/nas/parvault-seed --ip 203.0.113.66 --warrant-ref "WARRANT-1234" --propagate
@@ -259,9 +275,25 @@ parvault-seed admin emergency-evict --data-dir /mnt/nas/parvault-seed --ip 203.0
 
 ---
 
-## 5. How the Automatic "Trust & Storage Ladder" Works
+### Recipe F: Browse Your Vault over WebDAV (Token Required)
 
-Your node automatically climbs the **Earned Uptime Ladder** based on how many peers are around and how reliably your machine stays online:
+`parvault up --no-socket --vfs-seed-dir <DIR> --vfs-webdav-listen 127.0.0.1:8088` serves your vault as a WebDAV drive. Every request needs a read-only token from the same data directory:
+
+```bash
+TOKEN="$(parvault token mint --read-only --ttl-secs 86400)"
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
+```
+
+Clients that cannot send a Bearer token (Finder, davfs2, Windows) use any user name and the token as the password.
+
+> [!WARNING]
+> There is no TLS in `v0.5.0`. On loopback (`127.0.0.1`) nothing leaves the machine, but over a LAN the token travels **in clear** and anyone who sees it can read your vault until it expires. Keep `--ttl-secs` short. Built-in TLS is planned for `v0.6.0`.
+
+**Windows:** its WebDAV client sends Basic auth over plain HTTP only after you allow it. In an administrator prompt run `reg add HKLM\SYSTEM\CurrentControlSet\Services\WebClient\Parameters /v BasicAuthLevel /t REG_DWORD /d 2 /f`, then restart the `WebClient` service (`net stop webclient && net start webclient`).
+
+## 5. Planned: The Automatic "Trust & Storage Ladder"
+
+**Not active yet.** Today `watch-folder` and `up` use the tier you pass with `--tier`: `consumer` (10-of-20), `homelab` (16-of-20, the default), `mixed` (16-of-24) or `relay` (20-of-24). The ladder below is the design: a node would climb it based on how many peers are around and how reliably it stays online.
 
 | Stage | Who Is Connected? | Puzzle Pieces (`K-of-N`) | How Many Machines Can Die at Once? | Storage Space Needed per `100 GB` Backed Up |
 | :--- | :--- | :---: | :---: | :---: |

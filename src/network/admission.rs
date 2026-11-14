@@ -190,6 +190,11 @@ impl AdmissionSource {
         }
     }
 
+    /// The PoW bits of tickets this source mints by default, if it mints tickets.
+    pub fn public_ticket_bits(&self) -> Option<u8> {
+        self.public_ticket_bits
+    }
+
     /// Falls back to a public-commons ticket of `pow_bits` when no chain is available.
     pub fn with_public_tickets(mut self, pow_bits: u8) -> Self {
         self.public_ticket_bits = Some(pow_bits);
@@ -331,13 +336,11 @@ pub fn decode_chain(bytes: &[u8]) -> anyhow::Result<DelegationChain> {
 /// Requests whose sender must be admitted (v0.5.0). Mirrors the server's admission classes;
 /// an onion relay request may be a final delivery, which the receiver checks.
 pub const fn requires_admitted_sender(request: &MeshWireRequest) -> bool {
+    // Derived from the server's classification so the two never drift (a request the server
+    // admits only from admitted peers must make the client handshake first).
     matches!(
-        request,
-        MeshWireRequest::PutShard { .. }
-            | MeshWireRequest::SyndicateLiteStripe { .. }
-            | MeshWireRequest::PutDhtEnvelope(_)
-            | MeshWireRequest::PutBlindedShard { .. }
-            | MeshWireRequest::RelayPqOnionEnvelope { .. }
+        crate::network::wire_handler::admission_class(request),
+        crate::network::wire_handler::AdmissionClass::AdmittedPeer
     )
 }
 
@@ -371,5 +374,35 @@ mod tests {
         chain.hops[0].invitee_pubkey = [2; 32];
         let holder = AdmissionSource::from_chain_dir(dir.path().to_path_buf());
         assert!(holder.store_chain(&chain).is_err());
+    }
+
+    /// F-38 (QA r3): a member holding no genesis extends its installed chain one hop for its
+    /// vault key (genesis -> member -> vault), and the chain checks out.
+    #[test]
+    fn member_extends_its_chain_for_the_vault_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let genesis = NodeIdentity::from_seed([0x47; 32]);
+        let member = NodeIdentity::from_seed([0xCD; 32]);
+        let vault = NodeIdentity::from_seed([0xCE; 32]);
+        let source = AdmissionSource {
+            chain_dir: Some(dir.path().to_path_buf()),
+            genesis: None,
+            node: Some(member.clone()),
+            public_ticket_bits: None,
+        };
+        source
+            .store_chain(&issue_invitation(&genesis, member.public_key_bytes()))
+            .unwrap();
+        assert!(source
+            .credential_for(&member)
+            .is_some_and(|c| c.hops.len() == 1));
+        let chain = source.credential_for(&vault).expect("one-hop extension");
+        assert_eq!(chain.hops.len(), 2);
+        assert_eq!(chain.hops[1].inviter_pubkey, member.public_key_bytes());
+        assert_eq!(chain.leaf_pubkey(), Some(vault.public_key_bytes()));
+        assert_eq!(
+            source.check_chain(&chain).unwrap(),
+            vault.public_key_bytes()
+        );
     }
 }

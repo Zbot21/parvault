@@ -49,7 +49,8 @@ Global options (available on all subcommands):
 ### 2.1 Zero-IP Onboarding, Auto-Discovery & Turnkey Appliance Mode (`v0.3.0`)
 | Command | Flags & Arguments | Description |
 | :--- | :--- | :--- |
-| `parvault init` | `--profile <PROFILE>` *(default: `desktop`)*<br>`--watch <DIR>` *(optional)*<br>`--label <NAME>` *(optional)*<br>`--max-storage-gib <GIB>` *(optional)* | Initializes fresh node identity keys (`0600`), generates and prints a 24-word BIP-39 recovery mnemonic, creates `<data_dir>/config.toml`, and creates `<watch>` directory. |
+| `parvault init` | `--profile <PROFILE>` *(default: `desktop`)*<br>`--watch <DIR>` *(optional)*<br>`--label <NAME>` *(optional)*<br>`--max-storage-gib <GIB>` *(optional)* | Initializes fresh node identity keys (`0600`), creates `<data_dir>/config.toml`, and creates `<watch>` directory. |
+| `parvault new-seed-phrase` | *(none)* | Prints a fresh 24-word BIP-39 recovery phrase and stores nothing. Use it with `watch-folder --seed-phrase` (or `PARVAULT_SEED_PHRASE`) to make a folder recoverable with `recover-from-seed` (§4.5). |
 | `parvault discover` | `--timeout-ms <MS>` *(default: `500`)*<br>`--port <PORT>` *(default: `4009`)*<br>`--json` *(optional)* | Scans the local network over UDP port `4009` and multicast `239.255.80.86`, verifies signed `LanBeaconPacket`s, upserts verified multiaddrs in `<data_dir>/known_peers.json`, and prints a human-readable table or structured JSON — **zero IP addresses required!** |
 | `parvault pair` | `--port <PORT>` *(default: `4009`)*<br>`--duration-secs <SECS>` *(default: `120`)*<br>`--once` *(optional)*<br>`--wan` *(optional)* | Derives a human-friendly 4-word BIP-39 SAS pairing code (e.g. `shield-copper-alpine-matrix`), broadcasts the commitment via `LanBeaconResponder` (or registers an encrypted WAN rendezvous slot on `--seed-addr`), and stays active for joining peers. |
 | `parvault join` | `--code <CODE_OR_TOKEN>` *(required)*<br>`--timeout-ms <MS>` *(default: `1500`)*<br>`--port <PORT>` *(default: `4009`)*<br>`--wan` *(optional)* | Probes the LAN (or looks up WAN rendezvous) for the peer broadcasting the matching 4-word code, verifies signature and SAS commitment, and pins `/p2p/<PeerId>` in `known_peers.json`. |
@@ -61,9 +62,14 @@ Global options (available on all subcommands):
 | `parvault identity` | *(none)* | Initializes (if absent) and displays your persistent `Device Peer ID`, `Ed25519 Public Key`, `Owner PQ Public Key Hex` (`Ed25519 + ML-DSA-65`), and `Master Key Fingerprint`. |
 | `parvault issue-device-cert` | `--device-peer-id <ID>` *(required)*<br>`--device-label <LABEL>` *(default: `"personal-device"`)*<br>`--cert-out <PATH>` *(optional)* | Signs a post-quantum composite `PersonalDeviceCert` (`Ed25519 + NIST FIPS 204 ML-DSA-65`) authorizing `<device-peer-id>` to store shards on your Personal Device Ring at `0.0x` quota cost. Outputs both JSON and a compact `PARVAULT-CERT-V1:<hex>` token. |
 | `parvault verify-device-cert` | `--cert <PATH_OR_JSON_OR_TOKEN>` *(required)*<br>`--owner-pq-pubkey-hex <HEX>` *(optional)* | Cryptographically verifies a `PersonalDeviceCert` from a `.json` file, raw JSON string, or `PARVAULT-CERT-V1:<hex>` token against the expected Owner PQ Public Key. |
+| `parvault council init` | `--member <PUBKEY_HEX>` *(repeat)*, `--quorum <N>` *(required)* | Signs and installs epoch 1 of this ring's eviction council with the ring genesis held here. The quorum must be a strict majority. Prints the manifest hex for `council install` on other nodes. |
+| `parvault council install` | `--manifest <HEX>` *(required)* | Installs a council manifest: epoch 1 signed by the scope root (ring genesis; in `--public` mode the pinned tracker admin key), or the next epoch signed by a quorum of the installed one. No shipped tool signs a public-mode or later-epoch manifest yet: those come with `parvault-control` (item 6). |
+| `parvault council show` | *(none)* | Prints the installed council (scope root, epoch, quorum, members) and its hex manifest. A node with none accepts no council eviction orders. |
 | `parvault wot init` | *(none)* | Starts a new ring on this node: creates the ring genesis secret (`<data_dir>/ring_genesis.seed`, `0600`). The only way a genesis is created; refused if the node is already in a ring. |
 | `parvault wot invite` | `--peer <PUBKEY_HEX>` *(required)* | Prints a ring invitation token (the chain and the ring's genesis key) admitting that key. Needs the ring secret from `parvault wot init` (or `PARVAULT_GENESIS_SEED_HEX`). |
 | `parvault wot install-chain` | `--token <HEX>` *(required)* | Verifies the invitation against its ring key, pins that key (`ring_genesis.pub`) and installs the chain; the node then serves the ring and presents the chain before storing on ring peers. |
+
+> **Council re-pin (public mode):** after re-pinning to another tracker key, delete `<data_dir>/council_manifest.bin` and run `parvault council install` with the new tracker's manifest; until then the node has no council and accepts no council orders.
 
 ### 2.3 Continuous Folder Sync, Diff & Disaster Recovery
 | Command | Flags & Arguments | Description |
@@ -71,8 +77,8 @@ Global options (available on all subcommands):
 | `parvault diff-folder` | `--folder <PATH>` *(required)*<br>`--snapshot <PATH>` *(optional)*<br>`--key-hex <HEX>` *(optional)* | Performs a read-only dry-run scan of `<folder>` (respecting `.parvaultignore`), compares streaming 64 KiB SHA-256 digests against `<snapshot>`, and prints added, modified, unchanged, deleted, and ignored file counts without writing shards. |
 | `parvault watch-folder` | `--folder <PATH>` *(required)*<br>`--snapshot-out <PATH>` *(default: `./folder_snapshot.manifest.bin`)*<br>`--tier <consumer\|mixed\|homelab\|relay>` *(default: `homelab`)*<br>`--interval-secs <SECS>` *(default: `5`)*<br>`--once` *(run 1 pass and exit)*<br>`--dry-run` *(preview changes without writing shards)*<br>`--prune-deleted` *(delete orphaned local & remote shards for removed files)*<br>`--key-hex <HEX>` *(optional)*<br>`--seed-phrase <PHRASE>` *(optional)*<br>`--vault-namespace <NS>` *(default: `"default"`)*<br>`--catalog-out <PATH>` *(optional `.catalog.bin`)*<br>`--lite-seed-dir <MULTIADDR_OR_PATH>` *(alias: `--lite-seed-addr`)*<br>`--device-cert <PATH_OR_TOKEN>` *(optional)* | Incrementally backs up new and modified files in `<folder>` using constant-memory 64 KiB streaming SHA-256 checks and 16 MiB `AES-256-GCM` + Reed-Solomon stripes distributed across `--peers` over `libp2p`. When `--seed-phrase` is provided, also seals and publishes a post-quantum `EncryptedVaultCatalogEnvelope` to the Kademlia DHT for zero-local-state disaster recovery. |
 | `parvault list-snapshot` | `--snapshot <PATH>` *(required)* | Lists all file paths, byte sizes, stripe counts, and Merkle root prefixes inside `<snapshot>` with zero shard downloads (`ADR-17`). |
-| `parvault restore-folder` | `--snapshot <PATH>` *(required)*<br>`--out-dir <PATH>` *(alias: `--target-dir`, required)*<br>`--key-hex <HEX>` *(optional)*<br>`--file <REL_PATH>` *(optional single-file restore)*<br>`--filter <CSV>` *(optional glob/prefix subset restore)* | Reconstructs Reed-Solomon shards in $GF(2^8)$ across `--peers`, verifies `AES-256-GCM` tags and end-to-end file SHA-256 on a staging file, blocks path/symlink traversal (`resolve_safe_restore_path`), and atomically writes the restored directory tree into `<out-dir>`. |
-| `parvault recover-from-seed` | `--seed-phrase <PHRASE>` *(required)*<br>`--vault-namespace <NS>` *(default: `"default"`)*<br>`--catalog-envelope <PATH>` *(optional; if omitted, queries Kademlia DHT via `--peers`)*<br>`--out-dir <PATH>` *(default: `./recovered_vault`)*<br>`--filter <CSV>` *(optional glob/prefix subset recovery)* | **Zero-Local-State "House Fire" Recovery (`ADR-15` / `ADR-17`):** Deterministically re-derives `MasterKey`, 512-bit `PqVaultMasterKey`, `NodeIdentity`, and `dht_key` from `(seed_phrase, vault_namespace)` using memory-hard `Argon2id` (`64 MiB`, `t=3`, `p=4`) + `HKDF-SHA256`, fetches and opens the highest-version `EncryptedVaultCatalogEnvelope`, and restores the directory tree into `<out-dir>`. |
+| `parvault restore-folder` | `--snapshot <PATH>` *(required)*<br>`--out-dir <PATH>` *(alias: `--target-dir`, required)*<br>`--key-hex <HEX>` *(optional)*<br>`--seed-phrase <PHRASE>` *(or `PARVAULT_SEED_PHRASE`; for folders backed up with a phrase)*<br>`--vault-namespace <NS>` *(default: `"default"`)*<br>`--file <REL_PATH>` *(optional single-file restore)*<br>`--filter <CSV>` *(optional glob/prefix subset restore)* | Reconstructs Reed-Solomon shards in $GF(2^8)$ across `--peers`, verifies `AES-256-GCM` tags and end-to-end file SHA-256 on a staging file, blocks path/symlink traversal (`resolve_safe_restore_path`), and atomically writes the restored directory tree into `<out-dir>`. |
+| `parvault recover-from-seed` | `--seed-phrase <PHRASE>` *(or `PARVAULT_SEED_PHRASE`)*<br>`--vault-namespace <NS>` *(default: `"default"`)*<br>`--catalog-envelope <PATH>` *(optional; if omitted, queries Kademlia DHT via `--peers`)*<br>`--out-dir <PATH>` *(default: `./recovered_vault`)*<br>`--filter <CSV>` *(optional glob/prefix subset recovery)* | **Zero-Local-State "House Fire" Recovery (`ADR-15` / `ADR-17`):** Deterministically re-derives `MasterKey`, 512-bit `PqVaultMasterKey`, `NodeIdentity`, and `dht_key` from `(seed_phrase, vault_namespace)` using memory-hard `Argon2id` (`64 MiB`, `t=3`, `p=4`) + `HKDF-SHA256`, fetches and opens the highest-version `EncryptedVaultCatalogEnvelope`, and restores the directory tree into `<out-dir>`. |
 
 ### 2.4 Single-File Vault Operations, Scrubbing, Graceful Leave & Daemon
 | Command | Flags & Arguments | Description |
@@ -94,7 +100,7 @@ Global option: `--peers <CSV>` (`PARVAULT_PEERS`) configures mesh peer `Multiadd
 
 | Command | Flags & Arguments | Description |
 | :--- | :--- | :--- |
-| `parvault-seed start` | `--mode <homelab-vault\|public-bootstrap>` *(default: `public-bootstrap`)*<br>`--listen <MULTIADDR>` *(default: `/ip4/0.0.0.0/tcp/4002`)*<br>`--data-dir <PATH>` *(default: `./.parvault-seed-data`)*<br>`--max-gb <GIB>` *(default: `500`)*<br>`--lan-discovery-port <PORT>` *(default: `4009`)*<br>`--no-lan-discovery` *(optional)*<br>`--owner-pq-pubkey-hex <HEX>` *(optional, for `homelab-vault`)*<br>`--grace-epochs <EPOCHS>` *(default: `2`)*<br>`--admin-rpc-listen <SOCKET_ADDR>` *(optional)*<br>`--admin-rpc-pubkey <HEX>` *(optional, repeatable/CSV)*<br>`--council-pubkeys <CSV>` *(optional)*<br>`--council-quorum <N>` *(default: `1`)*<br>`--once` *(print status report and exit)* | Starts the standalone Zero-Trust Seed & Redundancy Server over `TCP + Noise XX + Yamux`. In `--mode public-bootstrap`, also acts as a Zero-Pairing BitTorrent-Style Public Swarm Tracker (`ADR-18`), indexing active public peers and answering WAN rendezvous lookups. Supports opt-in authenticated admin RPC (`--admin-rpc-listen` + `--admin-rpc-pubkey`) for fleet management via `parvault-control` with forward-secret X25519 + ChaCha20-Poly1305 + Ed25519 framing and zero private keys required on the seed server. |
+| `parvault-seed start` | `--mode <homelab-vault\|public-bootstrap>` *(default: `public-bootstrap`)*<br>`--listen <MULTIADDR>` *(default: `/ip4/0.0.0.0/tcp/4002`)*<br>`--data-dir <PATH>` *(default: `./.parvault-seed-data`)*<br>`--max-gb <GIB>` *(default: `500`)*<br>`--lan-discovery-port <PORT>` *(default: `4009`)*<br>`--no-lan-discovery` *(optional)*<br>`--owner-pq-pubkey-hex <HEX>` *(optional, for `homelab-vault`)*<br>`--grace-epochs <EPOCHS>` *(default: `2`)*<br>`--admin-rpc-listen <SOCKET_ADDR>` *(optional)*<br>`--admin-rpc-pubkey <HEX>` *(optional, repeatable/CSV)*<br>`--once` *(print status report and exit)* | Starts the standalone Zero-Trust Seed & Redundancy Server over `TCP + Noise XX + Yamux`. In `--mode public-bootstrap`, also acts as a Zero-Pairing BitTorrent-Style Public Swarm Tracker (`ADR-18`), indexing active public peers and answering WAN rendezvous lookups. Supports opt-in authenticated admin RPC (`--admin-rpc-listen` + `--admin-rpc-pubkey`) for fleet management via `parvault-control` with forward-secret X25519 + ChaCha20-Poly1305 + Ed25519 framing and zero private keys required on the seed server. |
 | `parvault-seed identity` | `--data-dir <PATH>` *(default: `./.parvault-seed-data`)* | Displays or initializes the seed server's persistent `Device Peer ID` and `Owner PQ Public Key Hex` (`HybridPqPublicKey`). |
 | `parvault-seed issue-device-cert` | `--device-peer-id <ID>` *(required)*<br>`--device-label <LABEL>` *(default: `"personal-device"`)*<br>`--data-dir <PATH>` *(default: `./.parvault-seed-data`)*<br>`--cert-out <PATH>` *(optional)* | Issues a post-quantum `PersonalDeviceCert` signed by the seed server's persistent owner PQ keypair and prints both JSON and the `PARVAULT-CERT-V1:<hex>` token. |
 | `parvault-seed verify-device-cert` | `--cert <PATH_OR_JSON_OR_TOKEN>` *(required)*<br>`--data-dir <PATH>` *(default: `./.parvault-seed-data`)*<br>`--owner-pq-pubkey-hex <HEX>` *(optional)* | Verifies a `PersonalDeviceCert` against the seed server's configured `owner-pq-pubkey-hex`. |
@@ -116,7 +122,7 @@ Global option: `--peers <CSV>` (`PARVAULT_PEERS`) configures mesh peer `Multiadd
 With `v0.3.0`, you never need to look up or type IP addresses on your home network or across residential ISPs:
 
 #### 1. Quick Initialization (`parvault init`)
-Initialize keys, generate a 24-word BIP-39 recovery mnemonic, and create a ready-to-run `config.toml`:
+Initialize keys and create a ready-to-run `config.toml` (no recovery phrase is printed; see §4.5):
 ```bash
 parvault init --profile router-soc --watch /mnt/usb-nas/shared --label "Router-NAS"
 ```
@@ -175,6 +181,7 @@ Run `parvault identity` on your laptop:
 ```bash
 parvault identity
 ```
+For a lite seed (`watch-folder --lite-seed-dir`), the device cert must name the **Vault Device Peer ID** instead: syndication is sent and the repair grant signed by the vault identity derived from your recovery phrase and namespace (F-38). Print it with `parvault identity --seed-phrase "<phrase>" --vault-namespace <ns>` (or `PARVAULT_SEED_PHRASE`); without a phrase it is derived from the local master key. Every device holding the same phrase shares this id.
 Example output:
 ```text
 === ParVault Node & Post-Quantum Identity ===
@@ -187,7 +194,7 @@ Master Key Fingerprint  : sha256:4b19e8f021a7c6d4
 
 ### 4.2 Issuing & Sharing a Post-Quantum `PersonalDeviceCert` (`.json` or `PARVAULT-CERT-V1:` Token)
 
-To link your laptop (`parvault`) and your closet NAS (`parvault-seed --mode homelab-vault`) into a **Day-1 Personal Device Ring** with **zero reciprocity quota tax (`0.00x`)**:
+To link your laptop (`parvault`) and your closet NAS (`parvault-seed --mode homelab-vault`) into a **Day-1 Personal Device Ring** (the zero reciprocity quota tax for linked devices is planned, not applied yet):
 
 1. **On your laptop (`parvault`), get your `Device Peer ID` and `Owner PQ Public Key Hex`:**
    ```bash
@@ -270,6 +277,8 @@ parvault restore-folder \
 
 What if a house fire, flood, or theft destroys your laptop **and** your local `.manifest.bin` / `master_key.sealed` files?
 
+Recovery is opt-in: it covers only folders backed up with `watch-folder` and a phrase (`--seed-phrase` or `PARVAULT_SEED_PHRASE`, which keeps it out of the process list) and the same `--vault-namespace`, while ring members holding the shards are reachable. `parvault init` prints no phrase; `parvault new-seed-phrase` makes one. Folders served by `parvault up --folder` have no phrase recovery. `--catalog-out` needs a phrase. If the `.catalog.bin` file was lost too, omit `--catalog-envelope`: the catalog is fetched from ring peers.
+
 1. **During normal backups, pass `--seed-phrase` and `--catalog-out`** so `parvault` derives deterministic keys from your 12-word (128-bit) or 24-word (256-bit) checksummed BIP-39 recovery phrase (validated against the 2,048-word English wordlist, SHA-256 checksum, and Unicode NFKD whitespace normalization) and seals a post-quantum `EncryptedVaultCatalogEnvelope`:
    ```bash
    parvault watch-folder \
@@ -342,7 +351,7 @@ All evicted shards are overwritten with `0x00` zero bytes across their entire fi
 ### 4.7 Public Tracker Abuse Reporting & Admin Takedown Workflow (`parvault report-abuse`, `parvault-seed admin`, `ADR-19`)
 
 In `--public` (\"Public Commons / Public Tracker\") swarms, storage nodes store encrypted ciphertext shards without knowing what data they contain. To prevent griefing and vigilantism:
-1. **Anti-Griefing Governance:** Random public peers cannot issue eviction orders. Public storage nodes reject eviction broadcasts from arbitrary peers (`accepted: false`). They accept eviction orders **only** when signed by pinned/configured `eviction_authorities` (specifically the Public Tracker Operator's `tracker_admin.seed` authority, advertised in tracker discovery responses, or local node identity).
+1. **Anti-Griefing Governance:** Random public peers cannot issue eviction orders. Public storage nodes reject eviction broadcasts from arbitrary peers (`accepted: false`). They accept eviction orders **only** with a quorum of the installed council manifest (`parvault council show`; epoch 1 signed by the pinned tracker admin key in public mode), or an order signed by the node's own key, which applies on that node only. Until `parvault-control` (item 6) ships, a public tracker cannot sign that manifest with a shipped tool.
 2. **Reporter Burden-of-Proof:** Because the network is zero-knowledge, the burden of proof rests entirely on the reporting entity. If illegal content is being publicly shared via ParVault, the distributor had to publish a `(FileManifest, MasterKey)` bundle so recipients could download and view it. The reporter submits this bundle to the Public Tracker Operator.
 3. **Cryptographic Proof Pipeline:** The tracker verifies:
    - Sample shard leaf hashes match `stripe.shard_hashes` and `stripe.stripe_merkle_root` in the manifest.
@@ -409,8 +418,8 @@ parvault-seed admin cosign-eviction \
 > [!IMPORTANT]
 > **Strict Mode Isolation & M-of-N Quorum Invariants:**
 > - In `TrustPoolMode::PrivateRing` (family or homelab rings), nodes **unconditionally ignore and reject** external `tracker_admin_pubkey` eviction orders. Unilateral tracker admin actions can never affect private rings.
-> - In `TrustPoolMode::PublicCommons` / `Hybrid` (`--public`), nodes trust their pinned `tracker_admin_pubkey` council for swarm-wide protection while rejecting arbitrary non-admin public peers.
-> - If multiple tracker council operators exist ($N \ge 2$), a single rogue tracker operator cannot unilaterally wipe shards without reaching $M$-of-$N$ threshold co-signatures (`default_tracker_quorum_threshold(N) = \lfloor N/2 \rfloor + 1`).
+> - In `TrustPoolMode::PublicCommons` / `Hybrid` (`--public`), the council is the manifest signed by the pinned `tracker_admin_pubkey` (`parvault council install`; signing it comes with `parvault-control`, item 6); arbitrary public peers are rejected.
+> - The council manifest's quorum must be a strict majority (`2·quorum > members`), so a single rogue council member cannot evict alone; orders carry the council epoch, expire within 365 days and are refused when stale (F-08, F-09).
 
 ---
 
@@ -434,12 +443,10 @@ default_tier = "Consumer"
 lan_discovery_enabled = true
 lan_discovery_port = 4009
 
-# Eviction Authorities (trusted Ed25519 pubkeys for SignedBadActorEvictionOrder)
-eviction_authorities = [
-  "8f3a9c12e4b07d11c3a8...",
-]
-# Minimum M-of-N threshold quorum required for federated tracker council eviction (default: strict majority)
-# tracker_eviction_quorum = 2
+# The eviction council is not configured here: it is a signed manifest installed with
+# `parvault council init --member <HEX> ... --quorum <N>` (ring genesis holder) or
+# `parvault council install --manifest <HEX>` (v0.5.0; `eviction_authorities` and
+# `tracker_eviction_quorum` were removed and are ignored).
 
 # Maximum storage space committed to mesh shards (100 GiB) & initial bootstrap grace (10 GiB)
 max_storage_bytes = 107374182400

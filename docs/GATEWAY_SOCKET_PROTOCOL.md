@@ -79,6 +79,7 @@ Every request (`IpcCommand`) and response (`IpcResponse`) over `/var/run/parvaul
 - `1 = FetchSuccess { bytes_streamed: u64 }`
 - `2 = HealthStatus { iops: u64, peer_count: u64, por_sla_score: f32 }`
 - `3 = Error { message: String }`
+- `4 = StoreSuccessLocalOnly { manifest: EphemeralShardManifest, local_only_stripes: u64 }` (appended): stored, but that many stripes stayed only on the daemon's machine because no ring peer accepted them, so they are **not backed up**. A client that does not know this variant fails to decode it rather than reporting success.
 
 > [!NOTE]
 > The `payload_fd: i32` and `output_fd: i32` integers inside `IpcCommand` carry the sender's local descriptor number for diagnostic logging only. The gateway server **never** trusts that integer; it consumes exclusively the kernel-remapped `OwnedFd` delivered via `SCM_RIGHTS` (`MSG_CMSG_CLOEXEC`). Any surplus descriptors attached to a single `cmsg` are wrapped in `OwnedFd` and closed immediately on `recvmsg(2)` return so descriptors can never leak.
@@ -170,6 +171,8 @@ parvault --data-dir /var/lib/parvault up \
   --allow-peer-uid 1042 \
   --require-sealed-memfd
 
+# WebDAV clients must present ${PLUGIN_TOK} or an offline attenuation of it on every request
+# (F-43); a token with a peer-UID caveat is refused over TCP.
 parvault-fuse --socket /var/run/parvault.sock --macaroon "${PLUGIN_TOK}" webdav --listen 127.0.0.1:4918
 
 # 5. Zero-key incremental folder push & macaroon-attenuated selective pull via parvault-sync (=m)
@@ -183,6 +186,8 @@ parvault --data-dir /var/lib/parvault up \
   --vfs-seed-dir /srv/media \
   --vfs-cache-mib 64 \
   --vfs-webdav-listen 127.0.0.1:4918
+# Every request needs a read-only token minted on this data dir (F-43):
+#   curl -H "Authorization: Bearer $(parvault --data-dir /var/lib/parvault token mint --read-only --ttl-secs 3600)" http://127.0.0.1:4918/
 ```
 
 ---

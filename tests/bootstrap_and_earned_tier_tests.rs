@@ -653,17 +653,16 @@ fn test_mechanism5_departing_node_blinded_lease_expiry_and_tombstone_eviction() 
     assert_eq!(lease_mgr.active_shard_count(), 3);
     assert_eq!(lease_mgr.used_bytes(), 3 * shard_size);
 
-    // 1. Graceful Departure / Deletion: Peer Z sends a signed BlindedShardTombstone for shard_c
-    let forged_tombstone = BlindedShardTombstone::create(&verifier_a, shard_c, [0x01u8; 16]);
+    // 1. Graceful Departure / Deletion: Peer Z deletes shard_c. Authorisation (a signature by
+    //    the capability key, F-41) is `BlockStore::delete_blinded_shard_signed`; the lease
+    //    manager only removes the lease.
     assert!(
-        !lease_mgr.execute_tombstone(&forged_tombstone),
-        "Forged tombstone with wrong capability secret must be rejected"
+        lease_mgr.remove_lease(&shard_c),
+        "removing shard_c's lease must purge it immediately"
     );
-
-    let valid_tombstone = BlindedShardTombstone::create(&verifier_c, shard_c, [0x01u8; 16]);
     assert!(
-        lease_mgr.execute_tombstone(&valid_tombstone),
-        "Valid BlindedShardTombstone must immediately purge shard_c without revealing owner identity"
+        !lease_mgr.remove_lease(&shard_c),
+        "a second removal finds nothing"
     );
     assert_eq!(lease_mgr.active_shard_count(), 2);
     assert_eq!(lease_mgr.used_bytes(), 2 * shard_size);
@@ -797,32 +796,38 @@ fn test_mechanism6_blockstore_physical_file_deletion_over_time_on_lease_expiry_a
         "Departed Node X's .bshard file MUST be physically deleted from disk at epoch 8"
     );
     assert!(!store.has_blinded_shard_on_disk(&bid_x));
-    let read_deleted_x = store.get_blinded_shard_authorized(&bid_x, &cap_x, 1_000, &read_sig_x);
+    let read_deleted_x =
+        store.get_blinded_shard_authorized(&bid_x, &cap_x, 1_000, &read_sig_x, 1_000);
+    // The sweep removed the lease, so the read is refused before any file lookup (F-42: a
+    // shard with no registered capability is unreadable).
     assert!(
-        matches!(read_deleted_x, Err(StorageError::ShardNotFound(_))),
-        "Reading departed Node X's evicted shard must return Err(StorageError::ShardNotFound)"
+        matches!(read_deleted_x, Err(StorageError::Unauthorized)),
+        "Reading departed Node X's evicted shard must be refused: {read_deleted_x:?}"
     );
 
     // Meanwhile, Active Node Y's renewed shard_y is still intact on disk and readable!
     assert!(path_y.exists());
     let read_y = store
-        .get_blinded_shard_authorized(&bid_y, &cap_y, 1_000, &read_sig_y)
+        .get_blinded_shard_authorized(&bid_y, &cap_y, 1_000, &read_sig_y, 1_000)
         .expect("Active Node Y shard remains readable");
     assert_eq!(read_y, bytes_y);
 
-    // 5. Graceful Tombstone Deletion on Disk: Node Y sends a BlindedShardTombstone for shard_y
-    let tombstone_y = BlindedShardTombstone::create(&verifier_y, bid_y.locator, [0x99u8; 16]);
+    // 5. Graceful deletion on disk (F-41): Node Y signs a delete with shard_y's capability key
+    //    for this host.
+    let host = [0x5Au8; 32];
+    let del_sig = BlindedShardCapability::sign_delete(&cap_id_y, &host, &bid_y, 1_000);
     let deleted_y = store
-        .delete_blinded_shard_with_tombstone(&bid_y, &tombstone_y)
-        .expect("tombstone delete shard_y");
+        .delete_blinded_shard_signed(&bid_y, 1_000, &del_sig, &host, 1_000)
+        .expect("signed delete shard_y");
     assert!(deleted_y);
     assert!(
         !path_y.exists(),
         "Tombstoned .bshard file must be physically unlinked from the filesystem immediately"
     );
+    // Deleted with its lease, so the read is refused (F-42: no registered capability).
     assert!(matches!(
-        store.get_blinded_shard_authorized(&bid_y, &cap_y, 1_000, &read_sig_y),
-        Err(StorageError::ShardNotFound(_))
+        store.get_blinded_shard_authorized(&bid_y, &cap_y, 1_000, &read_sig_y, 1_000),
+        Err(StorageError::Unauthorized)
     ));
 }
 

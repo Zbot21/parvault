@@ -37,6 +37,93 @@ pub fn grant_registration_decision(facts: &GrantRegFacts) -> Result<(), &'static
     Ok(())
 }
 
+/// What the PoR pre-screen knows about a challenge, all from RAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PorPrescreenFacts {
+    pub range_ok: bool,
+    pub session_known: bool,
+    pub fresh: bool,
+    pub nonce_unseen: bool,
+    pub hmac_valid: bool,
+}
+
+/// ADR-03 / E-WIRE: a host answers a PoR challenge (and reads disk) only if the challenge names a
+/// bounded range of a shard it holds a session key for, is fresh and unseen, and carries that
+/// key's HMAC. Only the key holder can make the host read disk.
+pub fn por_prescreen_decision(f: &PorPrescreenFacts) -> Result<(), &'static str> {
+    if !f.range_ok {
+        return Err("reject.por_range_invalid");
+    }
+    if !f.session_known {
+        return Err("reject.por_session_unknown");
+    }
+    if !f.fresh || !f.nonce_unseen {
+        return Err("reject.por_stale_or_replayed");
+    }
+    if !f.hmac_valid {
+        return Err("reject.por_hmac_invalid");
+    }
+    Ok(())
+}
+
+/// What the shard-rebind decision needs to know (F-38-GRANT, L-41).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardRebindFacts {
+    /// The shard is in the block store now (not merely remembered by the verifier).
+    pub stored: bool,
+    /// The owner of the grant the stored shard is bound to, if any.
+    pub existing_grant_owner: Option<[u8; 32]>,
+    /// The owner of the grant this put carries, if any.
+    pub incoming_grant_owner: Option<[u8; 32]>,
+    /// The sender is the key the stored shard is accounted to.
+    pub sender_is_accounted_owner: bool,
+}
+
+/// How a permitted put treats the shard's binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardBinding {
+    /// Store and (re)register: the shard is new, or its owner re-puts it.
+    Bind,
+    /// Already stored for the same grant owner by another sender (repair, handoff, seed
+    /// re-forward, replay): ack as stored and change nothing.
+    Keep,
+}
+
+/// First writer wins (F-38-GRANT, L-41): while a shard is stored, its accounted owner, grant
+/// owner and PoR session commit never change hands. Grant owners compare on all 32 bytes.
+pub fn shard_rebind_decision(facts: &ShardRebindFacts) -> Result<ShardBinding, &'static str> {
+    if !facts.stored {
+        return Ok(ShardBinding::Bind);
+    }
+    let grant_unchanged = match (facts.existing_grant_owner, facts.incoming_grant_owner) {
+        (Some(existing), Some(incoming)) => existing == incoming,
+        _ => true,
+    };
+    if facts.sender_is_accounted_owner && grant_unchanged {
+        return Ok(ShardBinding::Bind);
+    }
+    match (facts.existing_grant_owner, facts.incoming_grant_owner) {
+        (Some(existing), Some(incoming))
+            if !facts.sender_is_accounted_owner && existing == incoming =>
+        {
+            Ok(ShardBinding::Keep)
+        }
+        _ => Err("reject.shard_bound_to_another_owner"),
+    }
+}
+
+/// The refusal code of `shard_rebind_decision`, taken from the decision itself so the code has
+/// one source (a grant naming another owner for a stored shard).
+pub fn shard_bound_to_another_owner_code() -> &'static str {
+    let facts = ShardRebindFacts {
+        stored: true,
+        existing_grant_owner: Some([0; 32]),
+        incoming_grant_owner: Some([1; 32]),
+        sender_is_accounted_owner: false,
+    };
+    shard_rebind_decision(&facts).err().unwrap_or_default()
+}
+
 /// A read or delete authorised by a grant owner applies only to shards that were stored with
 /// that owner's grant (F-26): an owner who registered a grant for the same stripe root first
 /// gains nothing over another owner's shards.
@@ -448,6 +535,14 @@ impl PorVerifierEngine {
                 && stored.iter().all(|s| s.stripe_merkle_root == *stored_root),
         };
         grant_registration_decision(&facts)?;
+        // F-38-GRANT: never replace a different owner a shard is already bound to.
+        if stored.iter().any(|shard| {
+            self.shard_grant_owners
+                .get(&shard.file_key())
+                .is_some_and(|o| *o != grant.owner_pubkey)
+        }) {
+            return Err(shard_bound_to_another_owner_code());
+        }
         for shard in stored {
             self.shard_grant_owners
                 .insert(shard.file_key(), grant.owner_pubkey);
@@ -456,6 +551,22 @@ impl PorVerifierEngine {
             .insert((grant.stripe_merkle_root, grant.owner_pubkey), grant);
         self.persist_state_if_configured();
         Ok(())
+    }
+
+    /// The owner of the grant `shard_id` is bound to, if any (F-38-GRANT).
+    pub fn shard_grant_owner(&self, shard_id: &ShardId) -> Option<[u8; 32]> {
+        self.shard_grant_owners.get(&shard_id.file_key()).copied()
+    }
+
+    /// Forgets `shard_id`'s binding (session commit and grant owner): on delete, and before a
+    /// fresh `Bind` of a shard no longer stored (e.g. LRU-evicted), so a stale owner keeps
+    /// nothing over the new owner's shard (F-38-GRANT).
+    pub fn clear_shard_binding(&mut self, shard_id: &ShardId) {
+        let key = shard_id.file_key();
+        let had_session = self.session_keys_ram.remove(&key).is_some();
+        if self.shard_grant_owners.remove(&key).is_some() || had_session {
+            self.persist_state_if_configured();
+        }
     }
 
     /// The grant `shard_id` was stored with, if any.
@@ -531,10 +642,42 @@ impl PorVerifierEngine {
             }
         };
         if authorized {
-            self.session_keys_ram.remove(&shard_id.file_key());
-            self.persist_state_if_configured();
+            self.clear_shard_binding(shard_id);
         }
         authorized
+    }
+
+    /// Runs [`por_prescreen_decision`] for one challenge; a refusal is logged with its code,
+    /// counted, and mapped to the existing `PorError`.
+    #[allow(clippy::too_many_arguments)]
+    fn prescreen(
+        &mut self,
+        range_ok: bool,
+        session_known: bool,
+        issued_at_unix_ms: u64,
+        nonce: &[u8; 32],
+        hmac_valid: bool,
+        now_unix_ms: u64,
+        shard_id: &ShardId,
+    ) -> Result<(), PorError> {
+        let facts = PorPrescreenFacts {
+            range_ok,
+            session_known,
+            fresh: now_unix_ms.abs_diff(issued_at_unix_ms) <= CHALLENGE_FRESHNESS_WINDOW_MS,
+            nonce_unseen: !self.seen_nonces_ram.contains(nonce),
+            hmac_valid,
+        };
+        por_prescreen_decision(&facts).map_err(|code| {
+            self.blocked_ddos_challenges += 1;
+            tracing::warn!(code, "refused a PoR challenge before any disk read");
+            if facts.range_ok && !facts.session_known {
+                PorError::UnknownSessionKey(shard_id.file_key())
+            } else if facts.range_ok && (!facts.fresh || !facts.nonce_unseen) {
+                PorError::StaleOrReplayedNonce
+            } else {
+                PorError::InvalidHmacToken
+            }
+        })
     }
 
     /// Handles an incoming `PorChallenge` on the storage host node (`P_x`):
@@ -546,37 +689,31 @@ impl PorVerifierEngine {
         now_unix_ms: u64,
         block_store: &BlockStore,
     ) -> Result<PorResponse, PorError> {
-        if challenge.length == 0 || challenge.length > MAX_POR_RANGE_BYTES {
-            self.blocked_ddos_challenges += 1;
-            return Err(PorError::InvalidHmacToken);
-        }
-        let key_id = challenge.shard_id.file_key();
-        let Some(&session_key) = self.session_keys_ram.get(&key_id) else {
-            self.blocked_ddos_challenges += 1;
-            return Err(PorError::UnknownSessionKey(key_id));
-        };
-
-        // 1a. Verify timestamp freshness & nonce uniqueness in RAM (0 disk I/O).
-        if now_unix_ms.abs_diff(challenge.issued_at_unix_ms) > CHALLENGE_FRESHNESS_WINDOW_MS
-            || self.seen_nonces_ram.contains(&challenge.nonce)
-        {
-            self.blocked_ddos_challenges += 1;
-            return Err(PorError::StaleOrReplayedNonce);
-        }
-
-        // 1b. Constant-time HMAC verification in RAM (0 disk I/O).
-        let expected_hmac = compute_challenge_hmac(
-            &session_key,
-            &challenge.shard_id,
-            &challenge.nonce,
-            challenge.offset,
-            challenge.length,
+        let range_ok = challenge.length != 0 && challenge.length <= MAX_POR_RANGE_BYTES;
+        let session_key = self
+            .session_keys_ram
+            .get(&challenge.shard_id.file_key())
+            .copied();
+        // 1. Range, session key, freshness, nonce and HMAC, all in RAM (0 disk I/O).
+        let hmac_valid = session_key.is_some_and(|k| {
+            compute_challenge_hmac(
+                &k,
+                &challenge.shard_id,
+                &challenge.nonce,
+                challenge.offset,
+                challenge.length,
+                challenge.issued_at_unix_ms,
+            ) == challenge.hmac_token
+        });
+        self.prescreen(
+            range_ok,
+            session_key.is_some(),
             challenge.issued_at_unix_ms,
-        );
-        if expected_hmac != challenge.hmac_token {
-            self.blocked_ddos_challenges += 1;
-            return Err(PorError::InvalidHmacToken);
-        }
+            &challenge.nonce,
+            hmac_valid,
+            now_unix_ms,
+            &challenge.shard_id,
+        )?;
 
         // Record nonce in bounded RAM replay filter.
         self.record_seen_nonce(challenge.nonce);
@@ -766,41 +903,35 @@ impl PorVerifierEngine {
         now_unix_ms: u64,
         block_store: &BlockStore,
     ) -> Result<PorResponse, PorError> {
-        if challenge.segments.is_empty()
-            || challenge.segments.len() > 64
-            || challenge
+        let range_ok = !challenge.segments.is_empty()
+            && challenge.segments.len() <= 64
+            && challenge
                 .segments
                 .iter()
-                .any(|seg| seg.length == 0 || seg.length > MAX_POR_RANGE_BYTES)
-        {
-            self.blocked_ddos_challenges += 1;
-            return Err(PorError::InvalidHmacToken);
-        }
-        let key_id = challenge.shard_id.file_key();
-        let Some(&session_key) = self.session_keys_ram.get(&key_id) else {
-            self.blocked_ddos_challenges += 1;
-            return Err(PorError::UnknownSessionKey(key_id));
-        };
-
-        if now_unix_ms.abs_diff(challenge.issued_at_unix_ms) > CHALLENGE_FRESHNESS_WINDOW_MS
-            || self.seen_nonces_ram.contains(&challenge.nonce)
-        {
-            self.blocked_ddos_challenges += 1;
-            return Err(PorError::StaleOrReplayedNonce);
-        }
-
-        let expected_hmac = compute_multi_challenge_hmac(
-            &session_key,
-            &challenge.shard_id,
-            &challenge.nonce,
-            &challenge.segments,
-            challenge.max_rtt_ms,
+                .all(|seg| seg.length != 0 && seg.length <= MAX_POR_RANGE_BYTES);
+        let session_key = self
+            .session_keys_ram
+            .get(&challenge.shard_id.file_key())
+            .copied();
+        let hmac_valid = session_key.is_some_and(|k| {
+            compute_multi_challenge_hmac(
+                &k,
+                &challenge.shard_id,
+                &challenge.nonce,
+                &challenge.segments,
+                challenge.max_rtt_ms,
+                challenge.issued_at_unix_ms,
+            ) == challenge.hmac_token
+        });
+        self.prescreen(
+            range_ok,
+            session_key.is_some(),
             challenge.issued_at_unix_ms,
-        );
-        if expected_hmac != challenge.hmac_token {
-            self.blocked_ddos_challenges += 1;
-            return Err(PorError::InvalidHmacToken);
-        }
+            &challenge.nonce,
+            hmac_valid,
+            now_unix_ms,
+            &challenge.shard_id,
+        )?;
 
         self.record_seen_nonce(challenge.nonce);
 
@@ -988,6 +1119,44 @@ impl EgressWithholdingEvidence {
 #[cfg(test)]
 mod decision_tests {
     use super::*;
+
+    /// E-WIRE PorAudit / MultiSegmentPorAudit: range, session, freshness, then the HMAC.
+    #[test]
+    fn por_prescreen_decision_rules() {
+        let ok = PorPrescreenFacts {
+            range_ok: true,
+            session_known: true,
+            fresh: true,
+            nonce_unseen: true,
+            hmac_valid: true,
+        };
+        assert_eq!(por_prescreen_decision(&ok), Ok(()));
+        let with = |f: &dyn Fn(&mut PorPrescreenFacts)| {
+            let mut x = ok;
+            f(&mut x);
+            por_prescreen_decision(&x)
+        };
+        assert_eq!(
+            with(&|f| f.range_ok = false),
+            Err("reject.por_range_invalid")
+        );
+        assert_eq!(
+            with(&|f| f.session_known = false),
+            Err("reject.por_session_unknown")
+        );
+        assert_eq!(
+            with(&|f| f.fresh = false),
+            Err("reject.por_stale_or_replayed")
+        );
+        assert_eq!(
+            with(&|f| f.nonce_unseen = false),
+            Err("reject.por_stale_or_replayed")
+        );
+        assert_eq!(
+            with(&|f| f.hmac_valid = false),
+            Err("reject.por_hmac_invalid")
+        );
+    }
 
     #[test]
     fn grant_and_repair_read_decisions() {
