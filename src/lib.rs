@@ -30,5 +30,7 @@ pub mod vfs;
 
 pub use gateway::ipc;
 
-#[cfg(kani)]
+// The harnesses prove daemon decisions; a dependent that runs `cargo kani` on a plugin feature set
+// (no `daemon-runtime`) must still compile this crate.
+#[cfg(all(kani, feature = "daemon-runtime"))]
 mod kani_proofs;
