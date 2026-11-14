@@ -30,6 +30,34 @@ pub const MAX_PUBLIC_SWARM_ENTRIES: usize = 64;
 /// Maximum byte size of the encrypted payload in a rendezvous entry (4 KiB anti-OOM cap).
 pub const MAX_ENTRY_BYTES: usize = 4096;
 
+/// Slots one signer key may hold at a time (F-22).
+pub const MAX_RENDEZVOUS_SLOTS_PER_SIGNER: usize = 8;
+/// Entries registered from one Sybil subnet (`canonical_sybil_subnet_key`) at a time (F-22).
+pub const MAX_RENDEZVOUS_SLOTS_PER_SUBNET: usize = 32;
+
+/// What the rendezvous quota decision needs to know about one registration (F-22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RendezvousFacts {
+    /// The signer already has an entry in this slot (a refresh, not a new slot).
+    pub is_update: bool,
+    /// Slots the signer holds now.
+    pub signer_slots: usize,
+    /// Live entries registered from the sender's subnet now.
+    pub subnet_slots: usize,
+}
+
+/// Registration stays pre-admission (pairing needs it), but a new entry is refused once its
+/// signer holds 8 slots or its subnet 32 entries (F-22). Refreshing an existing entry is allowed.
+pub fn rendezvous_register_decision(facts: &RendezvousFacts) -> Result<(), &'static str> {
+    if !facts.is_update
+        && (facts.signer_slots >= MAX_RENDEZVOUS_SLOTS_PER_SIGNER
+            || facts.subnet_slots >= MAX_RENDEZVOUS_SLOTS_PER_SUBNET)
+    {
+        return Err("reject.rendezvous_quota");
+    }
+    Ok(())
+}
+
 /// Default time-to-live for a WAN rendezvous entry in seconds (1 hour).
 pub const DEFAULT_WAN_TTL_SECS: u64 = 3600;
 
@@ -487,6 +515,9 @@ pub struct WanRendezvousRegistry {
     slots: HashMap<[u8; 32], Vec<SignedWanRendezvousEntry>>,
     #[serde(skip)]
     disk_path: Option<PathBuf>,
+    /// Subnet each live entry was registered from, keyed by (slot, signer). In memory only.
+    #[serde(skip)]
+    registrant_subnet: HashMap<([u8; 32], [u8; 32]), String>,
 }
 
 impl Default for WanRendezvousRegistry {
@@ -501,6 +532,7 @@ impl WanRendezvousRegistry {
         Self {
             slots: HashMap::new(),
             disk_path: None,
+            registrant_subnet: HashMap::new(),
         }
     }
 
@@ -509,6 +541,7 @@ impl WanRendezvousRegistry {
         Self {
             slots: HashMap::new(),
             disk_path: Some(path.into()),
+            registrant_subnet: HashMap::new(),
         }
     }
 
@@ -552,6 +585,17 @@ impl WanRendezvousRegistry {
         entry: SignedWanRendezvousEntry,
         current_time_ms: u64,
     ) -> Result<bool, String> {
+        self.register_from(slot_key, entry, current_time_ms, None)
+    }
+
+    /// [`Self::register`] with the sender's Sybil subnet, which the F-22 caps count against.
+    pub fn register_from(
+        &mut self,
+        slot_key: [u8; 32],
+        entry: SignedWanRendezvousEntry,
+        current_time_ms: u64,
+        source_subnet: Option<String>,
+    ) -> Result<bool, String> {
         if entry.slot_key != slot_key {
             return Err("slot_key mismatch".into());
         }
@@ -580,6 +624,35 @@ impl WanRendezvousRegistry {
         }
 
         self.prune_expired(current_time_ms);
+
+        let signer = entry.ed25519_pubkey;
+        let slots = &self.slots;
+        self.registrant_subnet.retain(|(slot, signer), _| {
+            slots
+                .get(slot)
+                .is_some_and(|es| es.iter().any(|e| e.ed25519_pubkey == *signer))
+        });
+        let facts = RendezvousFacts {
+            is_update: self
+                .slots
+                .get(&slot_key)
+                .is_some_and(|es| es.iter().any(|e| e.ed25519_pubkey == signer)),
+            signer_slots: self
+                .slots
+                .values()
+                .filter(|es| es.iter().any(|e| e.ed25519_pubkey == signer))
+                .count(),
+            subnet_slots: source_subnet.as_ref().map_or(0, |sn| {
+                self.registrant_subnet.values().filter(|v| *v == sn).count()
+            }),
+        };
+        if let Err(code) = rendezvous_register_decision(&facts) {
+            tracing::warn!(code, "refused a rendezvous registration over quota");
+            return Err("rendezvous quota exceeded".into());
+        }
+        if let Some(sn) = source_subnet {
+            self.registrant_subnet.insert((slot_key, signer), sn);
+        }
 
         if !self.slots.contains_key(&slot_key) && self.slots.len() >= MAX_WAN_RENDEZVOUS_SLOTS {
             self.evict_oldest_slot();
@@ -736,6 +809,26 @@ pub fn sample_diverse_public_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendezvous_quota_caps_signer_and_subnet() {
+        let f = |is_update, signer_slots, subnet_slots| RendezvousFacts {
+            is_update,
+            signer_slots,
+            subnet_slots,
+        };
+        assert_eq!(rendezvous_register_decision(&f(false, 7, 31)), Ok(()));
+        assert_eq!(
+            rendezvous_register_decision(&f(false, 8, 0)),
+            Err("reject.rendezvous_quota")
+        );
+        assert_eq!(
+            rendezvous_register_decision(&f(false, 0, 32)),
+            Err("reject.rendezvous_quota")
+        );
+        // A refresh of an existing entry is never refused.
+        assert_eq!(rendezvous_register_decision(&f(true, 8, 32)), Ok(()));
+    }
     use crate::crypto::compute_sha256;
 
     #[test]

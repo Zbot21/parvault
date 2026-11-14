@@ -50,6 +50,38 @@ fn now_unix_ms() -> u64 {
 /// zero-pairing admission (~0.5–2 ms on tiny router SoCs).
 pub const DEFAULT_PUBLIC_WOT_POW_BITS: u8 = 12;
 
+/// Most PoW bits a node may require of tickets (QA 2c R2): what a default client still re-mints
+/// (`DEFAULT_PUBLIC_WOT_POW_BITS + 4`, see `ticket_pow_demand_decision`).
+pub const MAX_REQUIRED_PUBLIC_POW_BITS: u8 = DEFAULT_PUBLIC_WOT_POW_BITS + 4;
+
+/// QA 2c R2: an operator may not require more ticket PoW than clients will mint, or every new
+/// public client is locked out.
+pub fn required_pow_bits_decision(bits: u8) -> Result<(), &'static str> {
+    if bits > MAX_REQUIRED_PUBLIC_POW_BITS {
+        Err("reject.required_pow_bits_excessive")
+    } else {
+        Ok(())
+    }
+}
+
+/// Hard ceiling on ticket PoW a client will mint (QA 2c D1): about a million hashes.
+pub const MAX_TICKET_POW_BITS: u8 = 20;
+
+/// QA 2c D1: a client re-mints at a peer's stated `required_pow_bits` only if the demand is at
+/// most 4 bits above its own (or the default) level and never above `MAX_TICKET_POW_BITS`; a
+/// larger demand would hang the client minting.
+pub fn ticket_pow_demand_decision(demanded: u8, own_bits: u8) -> Result<(), &'static str> {
+    let limit = own_bits
+        .max(DEFAULT_PUBLIC_WOT_POW_BITS)
+        .saturating_add(4)
+        .min(MAX_TICKET_POW_BITS);
+    if demanded > limit {
+        Err("reject.ticket_pow_demand_excessive")
+    } else {
+        Ok(())
+    }
+}
+
 /// Domain separator for `PublicCommonsTicket` Hashcash PoW and Ed25519 self-attestation.
 pub const PUBLIC_COMMONS_POW_DOMAIN: &[u8] = b"parvault-public-wot-pow-v1:";
 
@@ -227,7 +259,9 @@ impl PublicCommonsTicket {
         min_pow_bits: u8,
     ) -> Self {
         let peer_pubkey = identity.public_key_bytes();
-        let target_bits = u32::from(min_pow_bits);
+        // Defence in depth (QA 2c D1): the search never runs past MAX_TICKET_POW_BITS; a ticket
+        // declaring more is then simply invalid, never an endless loop.
+        let target_bits = u32::from(min_pow_bits.min(MAX_TICKET_POW_BITS));
 
         let mut prefix_hasher = Sha256::new();
         prefix_hasher.update(PUBLIC_COMMONS_POW_DOMAIN);
@@ -697,7 +731,8 @@ impl WebOfTrustRegistry {
     /// Updates the pool's `TrustPoolMode` and minimum required `PublicCommonsTicket` PoW difficulty.
     pub fn set_trust_pool_mode(&mut self, mode: TrustPoolMode, min_pow_bits: u8) {
         self.trust_pool_mode = mode;
-        self.min_public_pow_bits = min_pow_bits;
+        // Backstop for R2: never require more than clients will mint.
+        self.min_public_pow_bits = min_pow_bits.min(MAX_REQUIRED_PUBLIC_POW_BITS);
         self.persist();
     }
 
@@ -1145,7 +1180,9 @@ impl WebOfTrustRegistry {
 
     /// Processes a signed `SlashingEvidence` message received via Gossipsub.
     /// Deduplicates `(reporter_pubkey, offender_pubkey, nonce)` so replayed evidence cannot
-    /// repeatedly increment `record_failure` (`ADR-15`).
+    /// repeatedly increment `record_failure` (`ADR-15`). Test-only: nothing applies peer evidence
+    /// in `v0.5.0` (slashing is local; architect 2b sign-off).
+    #[cfg(test)]
     pub fn apply_slashing_evidence(&mut self, evidence: &SlashingEvidence) -> bool {
         if !evidence.verify() {
             return false;
@@ -1217,6 +1254,46 @@ impl WebOfTrustRegistry {
 
 #[cfg(test)]
 mod tests {
+    /// QA 2c R2: a node may require at most what a default client re-mints (16 bits).
+    #[test]
+    fn required_pow_bits_are_capped() {
+        use super::*;
+        assert_eq!(required_pow_bits_decision(16), Ok(()));
+        assert_eq!(
+            required_pow_bits_decision(17),
+            Err("reject.required_pow_bits_excessive")
+        );
+        assert_eq!(
+            ticket_pow_demand_decision(MAX_REQUIRED_PUBLIC_POW_BITS, DEFAULT_PUBLIC_WOT_POW_BITS),
+            Ok(()),
+            "every requirement a node may set is one a default client accepts"
+        );
+        let mut wot = WebOfTrustRegistry::new([1; 32], 3);
+        wot.set_trust_pool_mode(TrustPoolMode::PublicCommons, 30);
+        assert_eq!(wot.min_public_pow_bits(), MAX_REQUIRED_PUBLIC_POW_BITS);
+    }
+
+    /// QA 2c D1: a peer's PoW demand is capped, and mint never searches past the ceiling.
+    #[test]
+    fn ticket_pow_demand_is_bounded() {
+        use super::*;
+        assert_eq!(ticket_pow_demand_decision(12, 12), Ok(()));
+        assert_eq!(ticket_pow_demand_decision(16, 12), Ok(()));
+        assert_eq!(
+            ticket_pow_demand_decision(17, 12),
+            Err("reject.ticket_pow_demand_excessive")
+        );
+        assert_eq!(
+            ticket_pow_demand_decision(255, 30),
+            Err("reject.ticket_pow_demand_excessive")
+        );
+        assert_eq!(ticket_pow_demand_decision(20, 18), Ok(()));
+        let started = std::time::Instant::now();
+        let t = PublicCommonsTicket::mint(&NodeIdentity::from_seed([3; 32]), [4; 32], 1, 255);
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        assert!(!t.verify(255), "a ticket declaring 255 bits never verifies");
+    }
+
     #[test]
     fn f32_subinvites_and_chain_store_are_bounded() {
         let genesis = NodeIdentity::from_seed([0x47; 32]);

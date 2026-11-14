@@ -254,32 +254,40 @@ impl QuotaManager {
     /// Checks whether `peer_id` is within both the node's physical disk ceiling and its
     /// tier-weighted reciprocity allowance (`bootstrap_grace_bytes + contributed / factor`).
     pub fn can_accept_shard(&self, peer_id: &str, shard_bytes: u64) -> bool {
+        self.quota_decision(peer_id, shard_bytes).is_ok()
+    }
+
+    /// ADR-07: a shard is accepted only within the disk reserve and node capacity and, for a
+    /// remote peer, within its quota (bootstrap grace plus earned allowance) and its per-epoch
+    /// write ceiling (4x the quota, so put/delete loops cannot wear out flash).
+    pub fn quota_decision(&self, peer_id: &str, shard_bytes: u64) -> Result<(), &'static str> {
         if let Some(free_bytes) = self.observed_free_disk_bytes {
             if free_bytes.saturating_sub(shard_bytes) < self.min_free_disk_bytes {
-                return false;
+                return Err("reject.disk_reserve");
             }
         }
         if self.used_storage_bytes.saturating_add(shard_bytes) > self.max_storage_bytes {
-            return false;
+            return Err("reject.node_capacity");
         }
         if peer_id == "local" || peer_id == "self" {
-            return true;
+            return Ok(());
         }
-
         let acct = self.peer_accounts.get(peer_id).cloned().unwrap_or_default();
         if acct.is_slashed {
-            return false;
+            return Err("reject.peer_slashed");
         }
         let factor = acct.required_reciprocity_factor();
         let earned_allowance = (acct.bytes_contributed_by_peer as f64 / factor) as u64;
         let max_allowed_for_peer = self.bootstrap_grace_bytes.saturating_add(earned_allowance);
-
-        // Enforce both active hosted ceiling AND per-epoch cumulative ingress write ceiling (4x allowance)
-        // so an attacker cannot loop `put_shard -> delete_shard` to wear out NVMe flash at 0 net storage.
+        if acct.bytes_hosted_for_peer.saturating_add(shard_bytes) > max_allowed_for_peer {
+            return Err("reject.peer_quota_exceeded");
+        }
         let max_epoch_write_allowance = max_allowed_for_peer.saturating_mul(4);
-        acct.bytes_hosted_for_peer.saturating_add(shard_bytes) <= max_allowed_for_peer
-            && acct.epoch_ingress_bytes_written.saturating_add(shard_bytes)
-                <= max_epoch_write_allowance
+        if acct.epoch_ingress_bytes_written.saturating_add(shard_bytes) > max_epoch_write_allowance
+        {
+            return Err("reject.peer_write_amplification");
+        }
+        Ok(())
     }
 
     /// Resets per-epoch ingress write counters at the start of a new epoch.

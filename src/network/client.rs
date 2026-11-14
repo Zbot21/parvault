@@ -1,6 +1,4 @@
-use crate::bootstrap::{
-    BlindedShardTombstone, LiteStripeSyndicationBundle, LiteSyndicationReceipt, PersonalDeviceCert,
-};
+use crate::bootstrap::{LiteStripeSyndicationBundle, LiteSyndicationReceipt, PersonalDeviceCert};
 use crate::config::ErasureTier;
 use crate::crypto::{compute_sha256, HybridKemPublicKey, NodeIdentity, PqRelayedShardEnvelope};
 use crate::network::behaviour::{
@@ -942,15 +940,16 @@ fn spawn_swarm_worker(
 /// backed by a persistent background `Swarm` actor that reuses encrypted connections, enforces
 /// TOFU / explicit `PeerId` pinning, and records live RTT & topology telemetry.
 /// The DHT reader's owner binding (F-10a): a candidate counts only if the reading identity
-/// sealed it.
+/// sealed it. A candidate whose owner cannot be bound to an identity (`None`: a post-quantum
+/// manifest, signed by a hybrid key no identity is bound to yet) is refused: fail closed.
 pub fn dht_candidate_decision(
-    candidate_owner: [u8; 32],
+    candidate_owner: Option<[u8; 32]>,
     expected_owner: [u8; 32],
 ) -> Result<(), &'static str> {
-    if candidate_owner == expected_owner {
-        Ok(())
-    } else {
-        Err("reject.dht_owner_mismatch")
+    match candidate_owner {
+        None => Err("reject.dht_owner_unbindable"),
+        Some(owner) if owner == expected_owner => Ok(()),
+        Some(_) => Err("reject.dht_owner_mismatch"),
     }
 }
 
@@ -963,9 +962,8 @@ struct OnionSend {
     lease: crate::storage::BlindedLeaseSpec,
 }
 
-/// Originates onion uploads (ADR-11). It wraps a private client that never presents an
-/// admission credential, but it dials with the node's ring transport key, so the entry relay
-/// learns the originator's IP and ring identity. Onion routing hides the originator only from
+/// Originates onion uploads (ADR-11). It presents its ring credential at the entry relay,
+/// which admits it (F-33, L-38) and so learns the originator's IP and ring identity. Onion routing hides the originator only from
 /// the final target and the storage host. The relay's forward to the final target presents the
 /// relay's own chain. Unlinkable entry (an ephemeral key) is planned for v0.6.0.
 pub struct OnionOriginator {
@@ -998,7 +996,7 @@ impl OnionOriginator {
                 voucher,
                 lease,
             },
-            false,
+            true,
         )
     }
 
@@ -1009,7 +1007,7 @@ impl OnionOriginator {
         outer_envelope: PqRelayedShardEnvelope,
     ) -> anyhow::Result<()> {
         self.client
-            .send_layered_onion(entry_relay, outer_envelope, false)
+            .send_layered_onion(entry_relay, outer_envelope, true)
     }
 }
 
@@ -1164,6 +1162,22 @@ impl MeshClient {
                     && (verifier_pubkey != verifier
                         || required_bits != Some(required_pow_bits)) =>
                 {
+                    let own = self
+                        .admission
+                        .as_deref()
+                        .and_then(|s| s.public_ticket_bits())
+                        .unwrap_or(crate::network::wot::DEFAULT_PUBLIC_WOT_POW_BITS);
+                    if let Err(code) =
+                        crate::network::wot::ticket_pow_demand_decision(required_pow_bits, own)
+                    {
+                        warn!(
+                            code,
+                            peer = peer_addr,
+                            demanded = required_pow_bits,
+                            "refused a peer's ticket PoW demand"
+                        );
+                        break;
+                    }
                     verifier = verifier_pubkey;
                     required_bits = Some(required_pow_bits);
                 }
@@ -2343,31 +2357,33 @@ impl MeshClient {
         }
     }
 
-    pub fn delete_blinded_shard_tombstone(
+    /// Deletes a blinded shard on `peer_addr` with a delete signed by its capability key for
+    /// that host (F-41). `peer_addr` must carry `/p2p/<PeerId>` (the host binding).
+    pub fn delete_blinded_shard_signed(
         &self,
         peer_addr: &str,
+        cap_identity: &NodeIdentity,
         blinded_id: BlindedShardId,
-        tombstone: BlindedShardTombstone,
     ) -> anyhow::Result<bool> {
+        let host = crate::config::NodeConfig::extract_ed25519_pubkey_from_peer_str(peer_addr)
+            .ok_or_else(|| anyhow::anyhow!("a blinded delete needs a /p2p/ host address"))?;
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let sig =
+            BlindedShardCapability::sign_delete(cap_identity, &host, &blinded_id, timestamp_ms);
         match self.send_request(
             peer_addr,
-            MeshWireRequest::DeleteBlindedShardTombstone {
+            MeshWireRequest::DeleteBlindedShardSigned {
                 blinded_id,
-                tombstone,
+                timestamp_ms,
+                sig: sig.to_vec(),
             },
         )? {
-            MeshWireResponse::DeleteBlindedShardAck { deleted, error } => {
-                if !deleted {
-                    return Err(MeshClientError::RemoteRejected {
-                        peer: peer_addr.to_string(),
-                        reason: format!("DeleteBlindedShardTombstone failed: {error:?}"),
-                    }
-                    .into());
-                }
-                Ok(true)
-            }
+            MeshWireResponse::DeleteBlindedShardAck { deleted, .. } => Ok(deleted),
             other => Err(MeshClientError::ProtocolError(format!(
-                "unexpected response to DeleteBlindedShardTombstone: {other:?}"
+                "unexpected response to DeleteBlindedShardSigned: {other:?}"
             ))
             .into()),
         }
@@ -2546,6 +2562,7 @@ impl MeshClient {
             issuer_pubkey: [0u8; 32],
             sig_r: [0u8; 32],
             sig_s: [0u8; 32],
+            expires_at_ms: 0,
         };
         self.send_onion(
             relay_peer_addr,
@@ -2667,17 +2684,20 @@ impl MeshClient {
     ) -> Option<u64> {
         let version = Self::self_consistent_version(dht_key, kind, env)?;
         // F-10a: classical manifests and vault catalogs are sealed by the identity that reads
-        // them back; a self-consistent envelope signed by anyone else is a squat.
+        // them back; a self-consistent envelope signed by anyone else is a squat. A post-quantum
+        // manifest has no owner binding yet, so it is refused (PQ-DHT, fail closed).
         let owner = match env {
             DhtWireEnvelope::ClassicalManifest(m) => Some(m.owner_pubkey),
             DhtWireEnvelope::VaultCatalog(m) => Some(m.owner_pubkey),
             DhtWireEnvelope::PostQuantumManifest(_) => None,
         };
-        if let Some(owner) = owner {
-            if let Err(code) = dht_candidate_decision(owner, self.identity.public_key_bytes()) {
-                warn!(code, owner = %hex::encode(owner), "ignored a DHT envelope from another owner");
-                return None;
-            }
+        if let Err(code) = dht_candidate_decision(owner, self.identity.public_key_bytes()) {
+            warn!(
+                code,
+                owner = %owner.map(hex::encode).unwrap_or_default(),
+                "ignored a DHT envelope not bound to this owner"
+            );
+            return None;
         }
         Some(version)
     }
@@ -3186,6 +3206,21 @@ impl IpLocalityExt for IpAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PQ-DHT: an owner that cannot be bound is refused; the F-10a binding is unchanged.
+    #[test]
+    fn dht_candidate_decision_fails_closed_on_unbindable_owner() {
+        let me = [7u8; 32];
+        assert_eq!(dht_candidate_decision(Some(me), me), Ok(()));
+        assert_eq!(
+            dht_candidate_decision(Some([8u8; 32]), me),
+            Err("reject.dht_owner_mismatch")
+        );
+        assert_eq!(
+            dht_candidate_decision(None, me),
+            Err("reject.dht_owner_unbindable")
+        );
+    }
 
     #[test]
     fn test_parse_peer_multiaddr_preserves_p2p_peer_id() {

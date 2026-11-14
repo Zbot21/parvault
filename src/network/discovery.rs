@@ -144,6 +144,36 @@ pub struct LanBeaconOptions<'a> {
     pub pairing_sas_commitment: Option<[u8; 32]>,
 }
 
+/// What a LAN beacon check knows (ADR-22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeaconFacts {
+    /// Non-zero port, bounded label and role, a specified explicit IP if any.
+    pub well_formed: bool,
+    /// `libp2p_peer_id` and `device_peer_id` are derived from the signing key.
+    pub identity_bound: bool,
+    /// Signed within `MAX_LAN_BEACON_AGE_MS` (the replay window).
+    pub fresh: bool,
+    pub sig_valid: bool,
+}
+
+/// ADR-22: a LAN beacon is recorded only if it is well formed, names the identity of its own
+/// key (no spoofed peer id), is fresh, and is signed by that key.
+pub fn beacon_decision(f: &BeaconFacts) -> Result<(), &'static str> {
+    if !f.well_formed {
+        return Err("reject.beacon_malformed");
+    }
+    if !f.identity_bound {
+        return Err("reject.beacon_spoofed");
+    }
+    if !f.fresh {
+        return Err("reject.beacon_stale");
+    }
+    if !f.sig_valid {
+        return Err("reject.beacon_sig_invalid");
+    }
+    Ok(())
+}
+
 impl LanBeaconPacket {
     pub fn sign_new(
         identity: &NodeIdentity,
@@ -220,64 +250,43 @@ impl LanBeaconPacket {
     /// 3. Timestamp freshness within `max_age_ms` (`<= 15s` replay window),
     /// 4. Domain-separated `Ed25519` signature validity over all beacon fields.
     pub fn verify(&self, now_ms: u64, max_age_ms: u64) -> anyhow::Result<PeerId> {
-        if self.tcp_listen_port == 0 {
-            anyhow::bail!("LAN beacon rejected: tcp_listen_port cannot be 0");
-        }
-        if self.node_label.len() > 128 || self.role.len() > 64 {
-            anyhow::bail!("LAN beacon rejected: oversized label or role");
-        }
-        let expected_peer_id = derive_libp2p_peer_id_from_ed25519_pubkey(&self.ed25519_pubkey)?;
-        let claimed_peer_id: PeerId = self
-            .libp2p_peer_id
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid libp2p_peer_id in beacon: {e}"))?;
-        if claimed_peer_id != expected_peer_id
-            || self.libp2p_peer_id != expected_peer_id.to_string()
-        {
-            anyhow::bail!(
-                "LAN beacon PeerId spoofing rejected: claimed {} != pubkey-derived {}",
-                self.libp2p_peer_id,
-                expected_peer_id
-            );
-        }
-
+        let well_formed = self.tcp_listen_port != 0
+            && self.node_label.len() <= 128
+            && self.role.len() <= 64
+            && self.explicit_listen_ip.as_deref().is_none_or(|ip| {
+                ip.parse::<IpAddr>()
+                    .is_ok_and(|parsed| !parsed.is_unspecified())
+            });
+        let expected_peer_id = derive_libp2p_peer_id_from_ed25519_pubkey(&self.ed25519_pubkey).ok();
         let expected_device_id =
             format!("parvault-peer-{}", &hex::encode(self.ed25519_pubkey)[..16]);
-        if self.device_peer_id != expected_device_id {
-            anyhow::bail!(
-                "LAN beacon device_peer_id mismatch: claimed {} != expected {}",
-                self.device_peer_id,
-                expected_device_id
-            );
-        }
-
-        if let Some(ref explicit_ip) = self.explicit_listen_ip {
-            let parsed: IpAddr = explicit_ip
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid explicit_listen_ip '{explicit_ip}': {e}"))?;
-            if parsed.is_unspecified() {
-                anyhow::bail!("explicit_listen_ip must not be unspecified");
-            }
-        }
-
-        if now_ms.abs_diff(self.timestamp_ms) > max_age_ms {
-            anyhow::bail!(
-                "stale or future-skewed LAN beacon timestamp_ms={} (now_ms={}, max_age_ms={})",
-                self.timestamp_ms,
-                now_ms,
-                max_age_ms
-            );
-        }
-
+        let identity_bound = expected_peer_id.is_some_and(|pid| {
+            self.libp2p_peer_id
+                .parse::<PeerId>()
+                .is_ok_and(|claimed| claimed == pid)
+                && self.libp2p_peer_id == pid.to_string()
+        }) && self.device_peer_id == expected_device_id;
         let mut sig64 = [0u8; 64];
         sig64[..32].copy_from_slice(&self.sig_r);
         sig64[32..64].copy_from_slice(&self.sig_s);
-        let preimage = self.canonical_signing_bytes();
-        if !NodeIdentity::verify_with_pubkey(&self.ed25519_pubkey, &preimage, &sig64) {
-            anyhow::bail!("invalid Ed25519 signature on LanBeaconPacket");
+        let facts = BeaconFacts {
+            well_formed,
+            identity_bound,
+            fresh: now_ms.abs_diff(self.timestamp_ms) <= max_age_ms,
+            sig_valid: NodeIdentity::verify_with_pubkey(
+                &self.ed25519_pubkey,
+                &self.canonical_signing_bytes(),
+                &sig64,
+            ),
+        };
+        match (beacon_decision(&facts), expected_peer_id) {
+            (Ok(()), Some(pid)) => Ok(pid),
+            (Err(code), _) => {
+                tracing::warn!(code, peer = %self.libp2p_peer_id, "ignored a LAN beacon");
+                anyhow::bail!("LAN beacon rejected: {code}")
+            }
+            (Ok(()), None) => anyhow::bail!("LAN beacon rejected: no peer id"),
         }
-
-        Ok(expected_peer_id)
     }
 
     /// Verifies the packet against the current wall-clock time using `MAX_LAN_BEACON_AGE_MS` (`15s`).

@@ -3,9 +3,7 @@ use parvault::crypto::{
     decrypt_stripe, derive_unlinkable_shard_pseudonym, encrypt_stripe, generate_file_salt,
     pad_plaintext_iso_bucket, unpad_plaintext_iso_bucket, MasterKey, NodeIdentity,
 };
-use parvault::network::wot::{
-    DelegationChain, InvitationHop, SlashingEvidence, SlashingReason, WebOfTrustRegistry,
-};
+use parvault::network::wot::{DelegationChain, InvitationHop, WebOfTrustRegistry};
 use parvault::por::{
     compute_multi_salted_commitment, generate_multi_segment_por_challenge,
     EgressWithholdingEvidence, PorError, PorVerifierEngine, RepairGrant,
@@ -82,15 +80,9 @@ fn test_defense1_byzantine_shard_poisoning_quarantine_and_slashing() {
     assert_eq!(poisoned_indices, vec![4, 9]);
 
     // Immediately slash the Byzantine peers that served poisoned shards.
-    let reporter = &peer_identities[2];
     for &bad_idx in &poisoned_indices {
-        let evidence = SlashingEvidence::issue(
-            reporter,
-            peer_identities[bad_idx].public_key_bytes(),
-            SlashingReason::ByzantineShardPoisoning,
-            bad_idx as u64 + 1,
-        );
-        assert!(wot.apply_slashing_evidence(&evidence));
+        // The receiver slashes locally (peer evidence is not applied in v0.5.0).
+        assert!(wot.slash_immediately(peer_identities[bad_idx].public_key_bytes()));
         assert!(
             !wot.is_peer_trusted(&peer_identities[bad_idx].public_key_bytes()),
             "Byzantine shard poisoner must be quarantined on first offense"
@@ -237,7 +229,7 @@ fn test_defense3_zero_knowledge_signed_dht_manifest_anti_poisoning_and_rollback(
     let attacker_id = NodeIdentity::generate();
 
     let manifest_v1 = FileManifest {
-        version: 1,
+        version: 2,
         file_merkle_root: [0x11; 32],
         file_salt: [0x22; 32],
         original_file_size: 1024,
@@ -252,6 +244,7 @@ fn test_defense3_zero_knowledge_signed_dht_manifest_anti_poisoning_and_rollback(
             stripe_merkle_root: [0x33; 32],
             shard_hashes: vec![[0x44; 32]; 20],
             assigned_peers: vec!["peer".to_string(); 20],
+            shard_chunk_roots: Vec::new(),
         }],
         witness_peers: vec!["w1".to_string(), "w2".to_string()],
     };

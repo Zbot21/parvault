@@ -62,9 +62,14 @@ Global options (available on all subcommands):
 | `parvault identity` | *(none)* | Initializes (if absent) and displays your persistent `Device Peer ID`, `Ed25519 Public Key`, `Owner PQ Public Key Hex` (`Ed25519 + ML-DSA-65`), and `Master Key Fingerprint`. |
 | `parvault issue-device-cert` | `--device-peer-id <ID>` *(required)*<br>`--device-label <LABEL>` *(default: `"personal-device"`)*<br>`--cert-out <PATH>` *(optional)* | Signs a post-quantum composite `PersonalDeviceCert` (`Ed25519 + NIST FIPS 204 ML-DSA-65`) authorizing `<device-peer-id>` to store shards on your Personal Device Ring at `0.0x` quota cost. Outputs both JSON and a compact `PARVAULT-CERT-V1:<hex>` token. |
 | `parvault verify-device-cert` | `--cert <PATH_OR_JSON_OR_TOKEN>` *(required)*<br>`--owner-pq-pubkey-hex <HEX>` *(optional)* | Cryptographically verifies a `PersonalDeviceCert` from a `.json` file, raw JSON string, or `PARVAULT-CERT-V1:<hex>` token against the expected Owner PQ Public Key. |
+| `parvault council init` | `--member <PUBKEY_HEX>` *(repeat)*, `--quorum <N>` *(required)* | Signs and installs epoch 1 of this ring's eviction council with the ring genesis held here. The quorum must be a strict majority. Prints the manifest hex for `council install` on other nodes. |
+| `parvault council install` | `--manifest <HEX>` *(required)* | Installs a council manifest: epoch 1 signed by the scope root (ring genesis; in `--public` mode the pinned tracker admin key), or the next epoch signed by a quorum of the installed one. No shipped tool signs a public-mode or later-epoch manifest yet: those come with `parvault-control` (item 6). |
+| `parvault council show` | *(none)* | Prints the installed council (scope root, epoch, quorum, members) and its hex manifest. A node with none accepts no council eviction orders. |
 | `parvault wot init` | *(none)* | Starts a new ring on this node: creates the ring genesis secret (`<data_dir>/ring_genesis.seed`, `0600`). The only way a genesis is created; refused if the node is already in a ring. |
 | `parvault wot invite` | `--peer <PUBKEY_HEX>` *(required)* | Prints a ring invitation token (the chain and the ring's genesis key) admitting that key. Needs the ring secret from `parvault wot init` (or `PARVAULT_GENESIS_SEED_HEX`). |
 | `parvault wot install-chain` | `--token <HEX>` *(required)* | Verifies the invitation against its ring key, pins that key (`ring_genesis.pub`) and installs the chain; the node then serves the ring and presents the chain before storing on ring peers. |
+
+> **Council re-pin (public mode):** after re-pinning to another tracker key, delete `<data_dir>/council_manifest.bin` and run `parvault council install` with the new tracker's manifest; until then the node has no council and accepts no council orders.
 
 ### 2.3 Continuous Folder Sync, Diff & Disaster Recovery
 | Command | Flags & Arguments | Description |
@@ -95,7 +100,7 @@ Global option: `--peers <CSV>` (`PARVAULT_PEERS`) configures mesh peer `Multiadd
 
 | Command | Flags & Arguments | Description |
 | :--- | :--- | :--- |
-| `parvault-seed start` | `--mode <homelab-vault\|public-bootstrap>` *(default: `public-bootstrap`)*<br>`--listen <MULTIADDR>` *(default: `/ip4/0.0.0.0/tcp/4002`)*<br>`--data-dir <PATH>` *(default: `./.parvault-seed-data`)*<br>`--max-gb <GIB>` *(default: `500`)*<br>`--lan-discovery-port <PORT>` *(default: `4009`)*<br>`--no-lan-discovery` *(optional)*<br>`--owner-pq-pubkey-hex <HEX>` *(optional, for `homelab-vault`)*<br>`--grace-epochs <EPOCHS>` *(default: `2`)*<br>`--admin-rpc-listen <SOCKET_ADDR>` *(optional)*<br>`--admin-rpc-pubkey <HEX>` *(optional, repeatable/CSV)*<br>`--council-pubkeys <CSV>` *(optional)*<br>`--council-quorum <N>` *(default: `1`)*<br>`--once` *(print status report and exit)* | Starts the standalone Zero-Trust Seed & Redundancy Server over `TCP + Noise XX + Yamux`. In `--mode public-bootstrap`, also acts as a Zero-Pairing BitTorrent-Style Public Swarm Tracker (`ADR-18`), indexing active public peers and answering WAN rendezvous lookups. Supports opt-in authenticated admin RPC (`--admin-rpc-listen` + `--admin-rpc-pubkey`) for fleet management via `parvault-control` with forward-secret X25519 + ChaCha20-Poly1305 + Ed25519 framing and zero private keys required on the seed server. |
+| `parvault-seed start` | `--mode <homelab-vault\|public-bootstrap>` *(default: `public-bootstrap`)*<br>`--listen <MULTIADDR>` *(default: `/ip4/0.0.0.0/tcp/4002`)*<br>`--data-dir <PATH>` *(default: `./.parvault-seed-data`)*<br>`--max-gb <GIB>` *(default: `500`)*<br>`--lan-discovery-port <PORT>` *(default: `4009`)*<br>`--no-lan-discovery` *(optional)*<br>`--owner-pq-pubkey-hex <HEX>` *(optional, for `homelab-vault`)*<br>`--grace-epochs <EPOCHS>` *(default: `2`)*<br>`--admin-rpc-listen <SOCKET_ADDR>` *(optional)*<br>`--admin-rpc-pubkey <HEX>` *(optional, repeatable/CSV)*<br>`--once` *(print status report and exit)* | Starts the standalone Zero-Trust Seed & Redundancy Server over `TCP + Noise XX + Yamux`. In `--mode public-bootstrap`, also acts as a Zero-Pairing BitTorrent-Style Public Swarm Tracker (`ADR-18`), indexing active public peers and answering WAN rendezvous lookups. Supports opt-in authenticated admin RPC (`--admin-rpc-listen` + `--admin-rpc-pubkey`) for fleet management via `parvault-control` with forward-secret X25519 + ChaCha20-Poly1305 + Ed25519 framing and zero private keys required on the seed server. |
 | `parvault-seed identity` | `--data-dir <PATH>` *(default: `./.parvault-seed-data`)* | Displays or initializes the seed server's persistent `Device Peer ID` and `Owner PQ Public Key Hex` (`HybridPqPublicKey`). |
 | `parvault-seed issue-device-cert` | `--device-peer-id <ID>` *(required)*<br>`--device-label <LABEL>` *(default: `"personal-device"`)*<br>`--data-dir <PATH>` *(default: `./.parvault-seed-data`)*<br>`--cert-out <PATH>` *(optional)* | Issues a post-quantum `PersonalDeviceCert` signed by the seed server's persistent owner PQ keypair and prints both JSON and the `PARVAULT-CERT-V1:<hex>` token. |
 | `parvault-seed verify-device-cert` | `--cert <PATH_OR_JSON_OR_TOKEN>` *(required)*<br>`--data-dir <PATH>` *(default: `./.parvault-seed-data`)*<br>`--owner-pq-pubkey-hex <HEX>` *(optional)* | Verifies a `PersonalDeviceCert` against the seed server's configured `owner-pq-pubkey-hex`. |
@@ -346,7 +351,7 @@ All evicted shards are overwritten with `0x00` zero bytes across their entire fi
 ### 4.7 Public Tracker Abuse Reporting & Admin Takedown Workflow (`parvault report-abuse`, `parvault-seed admin`, `ADR-19`)
 
 In `--public` (\"Public Commons / Public Tracker\") swarms, storage nodes store encrypted ciphertext shards without knowing what data they contain. To prevent griefing and vigilantism:
-1. **Anti-Griefing Governance:** Random public peers cannot issue eviction orders. Public storage nodes reject eviction broadcasts from arbitrary peers (`accepted: false`). They accept eviction orders **only** when signed by pinned/configured `eviction_authorities` (specifically the Public Tracker Operator's `tracker_admin.seed` authority, advertised in tracker discovery responses, or local node identity).
+1. **Anti-Griefing Governance:** Random public peers cannot issue eviction orders. Public storage nodes reject eviction broadcasts from arbitrary peers (`accepted: false`). They accept eviction orders **only** with a quorum of the installed council manifest (`parvault council show`; epoch 1 signed by the pinned tracker admin key in public mode), or an order signed by the node's own key, which applies on that node only. Until `parvault-control` (item 6) ships, a public tracker cannot sign that manifest with a shipped tool.
 2. **Reporter Burden-of-Proof:** Because the network is zero-knowledge, the burden of proof rests entirely on the reporting entity. If illegal content is being publicly shared via ParVault, the distributor had to publish a `(FileManifest, MasterKey)` bundle so recipients could download and view it. The reporter submits this bundle to the Public Tracker Operator.
 3. **Cryptographic Proof Pipeline:** The tracker verifies:
    - Sample shard leaf hashes match `stripe.shard_hashes` and `stripe.stripe_merkle_root` in the manifest.
@@ -413,8 +418,8 @@ parvault-seed admin cosign-eviction \
 > [!IMPORTANT]
 > **Strict Mode Isolation & M-of-N Quorum Invariants:**
 > - In `TrustPoolMode::PrivateRing` (family or homelab rings), nodes **unconditionally ignore and reject** external `tracker_admin_pubkey` eviction orders. Unilateral tracker admin actions can never affect private rings.
-> - In `TrustPoolMode::PublicCommons` / `Hybrid` (`--public`), nodes trust their pinned `tracker_admin_pubkey` council for swarm-wide protection while rejecting arbitrary non-admin public peers.
-> - If multiple tracker council operators exist ($N \ge 2$), a single rogue tracker operator cannot unilaterally wipe shards without reaching $M$-of-$N$ threshold co-signatures (`default_tracker_quorum_threshold(N) = \lfloor N/2 \rfloor + 1`).
+> - In `TrustPoolMode::PublicCommons` / `Hybrid` (`--public`), the council is the manifest signed by the pinned `tracker_admin_pubkey` (`parvault council install`; signing it comes with `parvault-control`, item 6); arbitrary public peers are rejected.
+> - The council manifest's quorum must be a strict majority (`2·quorum > members`), so a single rogue council member cannot evict alone; orders carry the council epoch, expire within 365 days and are refused when stale (F-08, F-09).
 
 ---
 
@@ -438,12 +443,10 @@ default_tier = "Consumer"
 lan_discovery_enabled = true
 lan_discovery_port = 4009
 
-# Eviction Authorities (trusted Ed25519 pubkeys for SignedBadActorEvictionOrder)
-eviction_authorities = [
-  "8f3a9c12e4b07d11c3a8...",
-]
-# Minimum M-of-N threshold quorum required for federated tracker council eviction (default: strict majority)
-# tracker_eviction_quorum = 2
+# The eviction council is not configured here: it is a signed manifest installed with
+# `parvault council init --member <HEX> ... --quorum <N>` (ring genesis holder) or
+# `parvault council install --manifest <HEX>` (v0.5.0; `eviction_authorities` and
+# `tracker_eviction_quorum` were removed and are ignored).
 
 # Maximum storage space committed to mesh shards (100 GiB) & initial bootstrap grace (10 GiB)
 max_storage_bytes = 107374182400

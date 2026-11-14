@@ -10,7 +10,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashMap;
 use x25519_dalek::PublicKey as X25519Public;
 use zeroize::Zeroize;
 
@@ -94,6 +94,12 @@ pub struct BlindedShardCapability {
 /// Maximum bidirectional NTP clock-skew tolerance (30 seconds) for `BlindedShardCapability` read tokens (`ADR-15`).
 pub const MAX_CAPABILITY_CLOCK_SKEW_MS: u64 = 30_000;
 
+/// Domain tag of a signed lease renewal (F-23).
+pub const RENEW_LEASE_DOMAIN: &[u8] = b"parvault-renew-blinded-lease-v1";
+
+/// The most epochs one renewal may extend a lease by (F-23).
+pub const MAX_LEASE_EXTENSION_EPOCHS: u64 = 365;
+
 /// Maximum single bearer `AnonymousQuotaVoucher` credit ceiling (1 GiB) to prevent `u64::MAX` overflow exploits.
 pub const MAX_SINGLE_VOUCHER_BYTES: u64 = 1024 * 1024 * 1024;
 
@@ -127,6 +133,90 @@ impl BlindedShardCapability {
         cap_identity.sign(&msg)
     }
 
+    /// Signs a delete of `blinded_id` on the host whose Ed25519 key is `host_pubkey` (F-41):
+    /// `"parvault-delete-blinded-v1" || host || locator || content_sha256 || timestamp_ms`. The
+    /// host binding stops one host replaying the delete to other replicas.
+    pub fn sign_delete(
+        cap_identity: &NodeIdentity,
+        host_pubkey: &[u8; 32],
+        blinded_id: &BlindedShardId,
+        timestamp_ms: u64,
+    ) -> [u8; 64] {
+        cap_identity.sign(&Self::delete_bytes(host_pubkey, blinded_id, timestamp_ms))
+    }
+
+    /// Verifies a delete signature by this capability key (F-41).
+    pub fn verify_delete(
+        &self,
+        host_pubkey: &[u8; 32],
+        blinded_id: &BlindedShardId,
+        timestamp_ms: u64,
+        signature: &[u8; 64],
+    ) -> bool {
+        let msg = Self::delete_bytes(host_pubkey, blinded_id, timestamp_ms);
+        NodeIdentity::verify_with_pubkey(&self.capability_pubkey, &msg, signature)
+    }
+
+    fn delete_bytes(
+        host_pubkey: &[u8; 32],
+        blinded_id: &BlindedShardId,
+        timestamp_ms: u64,
+    ) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(26 + 32 + 32 + 32 + 8);
+        msg.extend_from_slice(b"parvault-delete-blinded-v1");
+        msg.extend_from_slice(host_pubkey);
+        msg.extend_from_slice(&blinded_id.locator);
+        msg.extend_from_slice(&blinded_id.content_sha256);
+        msg.extend_from_slice(&timestamp_ms.to_be_bytes());
+        msg
+    }
+
+    /// Signs a lease renewal (F-23) with the shard's capability key.
+    pub fn sign_lease_renewal(
+        cap_identity: &NodeIdentity,
+        locator: &[u8; 32],
+        current_epoch: u64,
+        extension_epochs: u64,
+        timestamp_ms: u64,
+    ) -> [u8; 64] {
+        cap_identity.sign(&Self::renewal_bytes(
+            locator,
+            current_epoch,
+            extension_epochs,
+            timestamp_ms,
+        ))
+    }
+
+    /// Verifies a lease renewal signed by `self.capability_pubkey` (F-23).
+    pub fn verify_lease_renewal(
+        &self,
+        current_epoch: u64,
+        extension_epochs: u64,
+        timestamp_ms: u64,
+        signature: &[u8],
+    ) -> bool {
+        let Ok(sig) = <[u8; 64]>::try_from(signature) else {
+            return false;
+        };
+        let msg = Self::renewal_bytes(&self.locator, current_epoch, extension_epochs, timestamp_ms);
+        NodeIdentity::verify_with_pubkey(&self.capability_pubkey, &msg, &sig)
+    }
+
+    fn renewal_bytes(
+        locator: &[u8; 32],
+        current_epoch: u64,
+        extension_epochs: u64,
+        timestamp_ms: u64,
+    ) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(RENEW_LEASE_DOMAIN.len() + 56);
+        msg.extend_from_slice(RENEW_LEASE_DOMAIN);
+        msg.extend_from_slice(locator);
+        msg.extend_from_slice(&current_epoch.to_le_bytes());
+        msg.extend_from_slice(&extension_epochs.to_le_bytes());
+        msg.extend_from_slice(&timestamp_ms.to_le_bytes());
+        msg
+    }
+
     /// Verifies a read/repair token against `self.capability_pubkey` without learning `owner_pubkey`
     /// or `stripe_merkle_root`.
     pub fn verify_read_token(&self, timestamp_ms: u64, signature: &[u8; 64]) -> bool {
@@ -158,6 +248,85 @@ impl BlindedShardCapability {
     }
 }
 
+/// What a blinded-shard read knows about its capability and token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlindedReadFacts {
+    /// The lease has a registered capability key (F-42: a lease without one is unreadable).
+    pub capability_known: bool,
+    /// The presented capability key is the registered one.
+    pub capability_registered: bool,
+    pub locator_matches: bool,
+    /// The read token was signed within `MAX_CAPABILITY_CLOCK_SKEW_MS` of now.
+    pub fresh: bool,
+    pub sig_valid: bool,
+}
+
+/// ADR-11 / ADR-15 / E-WIRE GetBlindedShard: bytes are served only to the holder of the lease's
+/// capability key, for this locator, with a fresh signature (a captured token expires in 30 s).
+pub fn blinded_read_decision(f: &BlindedReadFacts) -> Result<(), &'static str> {
+    if !f.capability_known {
+        return Err("reject.blinded_read_no_capability");
+    }
+    if !f.capability_registered || !f.locator_matches {
+        return Err("reject.blinded_read_capability_mismatch");
+    }
+    if !f.fresh {
+        return Err("reject.blinded_read_stale");
+    }
+    if !f.sig_valid {
+        return Err("reject.blinded_read_sig_invalid");
+    }
+    Ok(())
+}
+
+/// What a blinded delete knows (F-41, L-42).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlindedDeleteFacts {
+    /// A signed delete (`DeleteBlindedShardSigned`); the MAC tombstone is never signed.
+    pub signed: bool,
+    /// The lease exists and has a registered capability key.
+    pub capability_registered: bool,
+    /// The request's id equals the stored `BlindedShardId` (locator and content hash).
+    pub id_matches: bool,
+    /// Signed within `MAX_CAPABILITY_CLOCK_SKEW_MS` of now.
+    pub fresh: bool,
+    /// Valid signature by the registered capability key, bound to this host.
+    pub sig_valid: bool,
+}
+
+/// F-41: a blinded shard is deleted before lease expiry only on a fresh signature by the
+/// lease's registered capability key, bound to this host and to the stored id.
+pub fn blinded_delete_decision(f: &BlindedDeleteFacts) -> Result<(), &'static str> {
+    if !f.signed {
+        return Err("reject.blinded_delete_unsigned");
+    }
+    if !f.capability_registered {
+        return Err("reject.blinded_delete_no_capability");
+    }
+    if !f.id_matches {
+        return Err("reject.blinded_delete_id_mismatch");
+    }
+    if !f.fresh {
+        return Err("reject.blinded_delete_stale");
+    }
+    if !f.sig_valid {
+        return Err("reject.blinded_delete_sig_invalid");
+    }
+    Ok(())
+}
+
+/// F-41: the capability bound to a locator is immutable while its lease exists (first writer
+/// wins; a same-key re-put by the owner or a handoff passes).
+pub fn blinded_rebind_decision(
+    registered: Option<[u8; 32]>,
+    incoming: [u8; 32],
+) -> Result<(), &'static str> {
+    match registered {
+        Some(pk) if pk != incoming => Err("reject.blinded_locator_bound_to_another_capability"),
+        _ => Ok(()),
+    }
+}
+
 /// Layer 3 (ADR-11): Unlinkable Bearer Storage Quota Voucher.
 /// Decouples storage reciprocity accounting from static `peer_id` identities so storage nodes
 /// cannot link multiple shards to the same user account.
@@ -168,15 +337,60 @@ pub struct AnonymousQuotaVoucher {
     pub issuer_pubkey: [u8; 32],
     pub sig_r: [u8; 32],
     pub sig_s: [u8; 32],
+    /// Appended (F-35): the voucher is redeemable until this time (signed). A spent nonce is
+    /// remembered until then, so a voucher cannot be replayed once its nullifier is dropped.
+    pub expires_at_ms: u64,
+}
+
+/// Default voucher lifetime when minting (F-35).
+pub const DEFAULT_VOUCHER_TTL_MS: u64 = 30 * 24 * 3600 * 1000;
+/// Longest lifetime a receiver accepts (F-35).
+pub const MAX_VOUCHER_TTL_MS: u64 = 90 * 24 * 3600 * 1000;
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// A voucher is redeemable only before its expiry and at most 90 days ahead (F-35).
+pub fn voucher_freshness_decision(expires_at_ms: u64, now_ms: u64) -> Result<(), &'static str> {
+    if expires_at_ms <= now_ms {
+        return Err("reject.voucher_expired");
+    }
+    if expires_at_ms > now_ms.saturating_add(MAX_VOUCHER_TTL_MS) {
+        return Err("reject.voucher_expiry_unbounded");
+    }
+    Ok(())
+}
+
+/// A new nullifier is recorded only while the ledger, after dropping expired entries, has room;
+/// when full the voucher is refused rather than evicting a live nullifier (F-35).
+pub fn nullifier_cache_decision(live_entries: usize) -> Result<(), &'static str> {
+    if live_entries >= MAX_VOUCHER_NULLIFIER_ENTRIES {
+        Err("reject.voucher_cache_full")
+    } else {
+        Ok(())
+    }
 }
 
 impl AnonymousQuotaVoucher {
     /// Mints a fresh single-use bearer storage voucher for up to `max_bytes` using `OsRng` (`E4`).
     pub fn mint(issuer: &NodeIdentity, max_bytes: u64) -> Self {
+        Self::mint_expiring(
+            issuer,
+            max_bytes,
+            now_unix_ms().saturating_add(DEFAULT_VOUCHER_TTL_MS),
+        )
+    }
+
+    /// Mints a voucher that expires at `expires_at_ms` (F-35).
+    pub fn mint_expiring(issuer: &NodeIdentity, max_bytes: u64, expires_at_ms: u64) -> Self {
         let mut voucher_nonce = [0u8; 32];
         OsRng.fill_bytes(&mut voucher_nonce);
         let issuer_pubkey = issuer.public_key_bytes();
-        let msg = Self::canonical_bytes(&voucher_nonce, max_bytes, &issuer_pubkey);
+        let msg = Self::canonical_bytes(&voucher_nonce, max_bytes, &issuer_pubkey, expires_at_ms);
         let sig = issuer.sign(&msg);
         let mut sig_r = [0u8; 32];
         let mut sig_s = [0u8; 32];
@@ -189,6 +403,7 @@ impl AnonymousQuotaVoucher {
             issuer_pubkey,
             sig_r,
             sig_s,
+            expires_at_ms,
         }
     }
 
@@ -218,7 +433,12 @@ impl AnonymousQuotaVoucher {
         {
             return false;
         }
-        let msg = Self::canonical_bytes(&self.voucher_nonce, self.max_bytes, &self.issuer_pubkey);
+        let msg = Self::canonical_bytes(
+            &self.voucher_nonce,
+            self.max_bytes,
+            &self.issuer_pubkey,
+            self.expires_at_ms,
+        );
         let mut sig = [0u8; 64];
         sig[..32].copy_from_slice(&self.sig_r);
         sig[32..].copy_from_slice(&self.sig_s);
@@ -229,12 +449,14 @@ impl AnonymousQuotaVoucher {
         voucher_nonce: &[u8; 32],
         max_bytes: u64,
         issuer_pubkey: &[u8; 32],
+        expires_at_ms: u64,
     ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(96);
-        buf.extend_from_slice(b"parvault-anon-voucher-v1:");
+        let mut buf = Vec::with_capacity(104);
+        buf.extend_from_slice(b"parvault-anon-voucher-v2:");
         buf.extend_from_slice(voucher_nonce);
         buf.extend_from_slice(&max_bytes.to_be_bytes());
         buf.extend_from_slice(issuer_pubkey);
+        buf.extend_from_slice(&expires_at_ms.to_be_bytes());
         buf
     }
 }
@@ -247,9 +469,8 @@ pub const MAX_VOUCHER_NULLIFIER_ENTRIES: usize = 65_536;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoucherNullifierLedger {
     trusted_issuer_pubkey: [u8; 32],
-    spent_nonces: HashSet<[u8; 32]>,
-    #[serde(default)]
-    spent_fifo: VecDeque<[u8; 32]>,
+    /// Spent nonce -> voucher expiry; kept until the voucher expires (F-35).
+    spent: HashMap<[u8; 32], u64>,
     #[serde(skip)]
     persistence_path: Option<std::path::PathBuf>,
 }
@@ -258,8 +479,7 @@ impl VoucherNullifierLedger {
     pub fn new(trusted_issuer_pubkey: [u8; 32]) -> Self {
         Self {
             trusted_issuer_pubkey,
-            spent_nonces: HashSet::new(),
-            spent_fifo: VecDeque::new(),
+            spent: HashMap::new(),
             persistence_path: None,
         }
     }
@@ -271,21 +491,23 @@ impl VoucherNullifierLedger {
         data_dir: &std::path::Path,
     ) -> Self {
         let path = data_dir.join("voucher_nullifiers.bin");
-        let spent_fifo: VecDeque<[u8; 32]> = if path.exists() {
+        // Format `Vec<([u8; 32], u64)>` since F-35; an older file (nonces only) does not decode
+        // and starts empty, which is safe because pre-F-35 vouchers no longer verify.
+        let spent: HashMap<[u8; 32], u64> = if path.exists() {
             std::fs::read(&path)
                 .ok()
                 .and_then(|raw| {
-                    deserialize_bounded::<VecDeque<[u8; 32]>>(&raw, MAX_NULLIFIER_LEDGER_BYTES).ok()
+                    deserialize_bounded::<Vec<([u8; 32], u64)>>(&raw, MAX_NULLIFIER_LEDGER_BYTES)
+                        .ok()
                 })
+                .map(|v| v.into_iter().collect())
                 .unwrap_or_default()
         } else {
-            VecDeque::new()
+            HashMap::new()
         };
-        let spent_nonces: HashSet<[u8; 32]> = spent_fifo.iter().copied().collect();
         Self {
             trusted_issuer_pubkey,
-            spent_nonces,
-            spent_fifo,
+            spent,
             persistence_path: Some(path),
         }
     }
@@ -294,6 +516,21 @@ impl VoucherNullifierLedger {
         self.trusted_issuer_pubkey
     }
 
+    /// Runs `f` with `issuer` as the trusted voucher issuer, then restores the configured one.
+    /// The caller decides first whether `issuer` may be trusted (F-24 issuer policy); before this,
+    /// the receiver permanently adopted whatever issuer a voucher named.
+    pub fn with_trusted_issuer<T>(
+        &mut self,
+        issuer: [u8; 32],
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let configured = std::mem::replace(&mut self.trusted_issuer_pubkey, issuer);
+        let out = f(self);
+        self.trusted_issuer_pubkey = configured;
+        out
+    }
+
+    #[cfg(test)]
     pub fn set_trusted_issuer_pubkey(&mut self, pubkey: [u8; 32]) {
         self.trusted_issuer_pubkey = pubkey;
     }
@@ -306,27 +543,42 @@ impl VoucherNullifierLedger {
         voucher: &AnonymousQuotaVoucher,
         shard_size_bytes: u64,
     ) -> Result<(), StorageError> {
+        self.redeem_voucher_at(voucher, shard_size_bytes, now_unix_ms())
+    }
+
+    /// [`Self::redeem_voucher`] at an explicit time (tests and replay checks).
+    pub fn redeem_voucher_at(
+        &mut self,
+        voucher: &AnonymousQuotaVoucher,
+        shard_size_bytes: u64,
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
         if shard_size_bytes > voucher.max_bytes || !voucher.verify(&self.trusted_issuer_pubkey) {
             return Err(StorageError::QuotaExceeded(
                 "invalid_or_undersized_voucher".into(),
             ));
         }
-        if self.spent_nonces.contains(&voucher.voucher_nonce) {
+        if let Err(code) = voucher_freshness_decision(voucher.expires_at_ms, now_ms) {
+            tracing::warn!(code, "refused a voucher outside its lifetime");
+            return Err(StorageError::QuotaExceeded(code.into()));
+        }
+        // Drop nullifiers whose vouchers have expired: those vouchers can no longer verify as
+        // fresh, so forgetting them cannot re-enable a spend.
+        self.spent.retain(|_, exp| *exp > now_ms);
+        if self.spent.contains_key(&voucher.voucher_nonce) {
             return Err(StorageError::QuotaExceeded(
                 "double_spent_voucher_nullifier".into(),
             ));
         }
-        while self.spent_nonces.len() >= MAX_VOUCHER_NULLIFIER_ENTRIES {
-            if let Some(oldest) = self.spent_fifo.pop_front() {
-                self.spent_nonces.remove(&oldest);
-            } else {
-                break;
-            }
+        if let Err(code) = nullifier_cache_decision(self.spent.len()) {
+            tracing::warn!(code, "refused a voucher: the nullifier cache is full");
+            return Err(StorageError::QuotaExceeded(code.into()));
         }
-        self.spent_nonces.insert(voucher.voucher_nonce);
-        self.spent_fifo.push_back(voucher.voucher_nonce);
+        self.spent
+            .insert(voucher.voucher_nonce, voucher.expires_at_ms);
         if let Some(ref path) = self.persistence_path {
-            if let Ok(bytes) = bincode::serialize(&self.spent_fifo) {
+            let entries: Vec<([u8; 32], u64)> = self.spent.iter().map(|(n, e)| (*n, *e)).collect();
+            if let Ok(bytes) = bincode::serialize(&entries) {
                 let _ = crate::storage::BlockStore::atomic_write_file(path, &bytes);
             }
         }
@@ -334,7 +586,7 @@ impl VoucherNullifierLedger {
     }
 
     pub fn spent_count(&self) -> usize {
-        self.spent_nonces.len()
+        self.spent.len()
     }
 }
 
@@ -434,6 +686,60 @@ pub fn combinatorial_reconstruction_entropy_bits(
 mod tests {
     use super::*;
 
+    /// F-35 (plan 2c fact 5): a full ledger refuses a new voucher instead of evicting a live
+    /// nullifier, so a spent voucher is never redeemable again while it is fresh.
+    #[test]
+    fn spent_voucher_never_redeemable_again_while_fresh() {
+        let issuer = NodeIdentity::from_seed([0x2C; 32]);
+        let mut ledger = VoucherNullifierLedger::new(issuer.public_key_bytes());
+        let now = now_unix_ms();
+        let first = AnonymousQuotaVoucher::mint(&issuer, 4096);
+        ledger.redeem_voucher_at(&first, 1024, now).unwrap();
+        assert!(
+            ledger.redeem_voucher_at(&first, 1024, now).is_err(),
+            "double spend refused"
+        );
+        // Fill the ledger to capacity with live nullifiers (state setup only).
+        for i in 1..MAX_VOUCHER_NULLIFIER_ENTRIES {
+            let mut nonce = [0xEEu8; 32];
+            nonce[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            ledger.spent.insert(nonce, now + 60_000);
+        }
+        let next = AnonymousQuotaVoucher::mint(&issuer, 4096);
+        assert!(
+            matches!(ledger.redeem_voucher_at(&next, 1024, now), Err(StorageError::QuotaExceeded(c)) if c == "reject.voucher_cache_full")
+        );
+        assert!(
+            ledger.redeem_voucher_at(&first, 1024, now).is_err(),
+            "still spent"
+        );
+        // Once the filler vouchers expire their nullifiers are dropped and new vouchers fit.
+        assert!(ledger.redeem_voucher_at(&next, 1024, now + 120_000).is_ok());
+        assert!(
+            ledger
+                .redeem_voucher_at(&first, 1024, now + 120_000)
+                .is_err(),
+            "first is still spent"
+        );
+    }
+
+    #[test]
+    fn voucher_lifetime_is_bounded_and_signed() {
+        let issuer = NodeIdentity::from_seed([0x2D; 32]);
+        let mut ledger = VoucherNullifierLedger::new(issuer.public_key_bytes());
+        let now = now_unix_ms();
+        let expired = AnonymousQuotaVoucher::mint_expiring(&issuer, 4096, now - 1);
+        assert!(ledger.redeem_voucher_at(&expired, 1024, now).is_err());
+        let too_far =
+            AnonymousQuotaVoucher::mint_expiring(&issuer, 4096, now + MAX_VOUCHER_TTL_MS + 1);
+        assert!(ledger.redeem_voucher_at(&too_far, 1024, now).is_err());
+        // The expiry is signed: extending it breaks the signature.
+        let mut stretched = AnonymousQuotaVoucher::mint(&issuer, 4096);
+        stretched.expires_at_ms += 1;
+        assert!(!stretched.verify(&issuer.public_key_bytes()));
+        assert_eq!(voucher_freshness_decision(now + 1, now), Ok(()));
+    }
+
     #[test]
     fn test_ephemeral_blinded_vouchers_and_uniform_shard_bucket_padding() {
         let epoch_seed = [0x77u8; 32];
@@ -456,5 +762,89 @@ mod tests {
         assert_eq!(padded.len(), 4096);
         let unpadded = unpad_shard_uniform_bucket(&padded).expect("unpad");
         assert_eq!(unpadded, raw_shard);
+    }
+}
+
+#[cfg(test)]
+mod blinded_read_decision_tests {
+    use super::*;
+
+    /// F-41: every fact must hold, in order; the rebind is first-writer-wins.
+    #[test]
+    fn blinded_delete_and_rebind_rules() {
+        let ok = BlindedDeleteFacts {
+            signed: true,
+            capability_registered: true,
+            id_matches: true,
+            fresh: true,
+            sig_valid: true,
+        };
+        assert_eq!(blinded_delete_decision(&ok), Ok(()));
+        let with = |f: &dyn Fn(&mut BlindedDeleteFacts)| {
+            let mut x = ok;
+            f(&mut x);
+            blinded_delete_decision(&x)
+        };
+        assert_eq!(
+            with(&|f| f.signed = false),
+            Err("reject.blinded_delete_unsigned")
+        );
+        assert_eq!(
+            with(&|f| f.capability_registered = false),
+            Err("reject.blinded_delete_no_capability")
+        );
+        assert_eq!(
+            with(&|f| f.id_matches = false),
+            Err("reject.blinded_delete_id_mismatch")
+        );
+        assert_eq!(
+            with(&|f| f.fresh = false),
+            Err("reject.blinded_delete_stale")
+        );
+        assert_eq!(
+            with(&|f| f.sig_valid = false),
+            Err("reject.blinded_delete_sig_invalid")
+        );
+        assert_eq!(blinded_rebind_decision(None, [1; 32]), Ok(()));
+        assert_eq!(blinded_rebind_decision(Some([1; 32]), [1; 32]), Ok(()));
+        assert_eq!(
+            blinded_rebind_decision(Some([1; 32]), [2; 32]),
+            Err("reject.blinded_locator_bound_to_another_capability")
+        );
+    }
+
+    /// E-WIRE GetBlindedShard: registered capability for this locator, fresh, then the signature.
+    #[test]
+    fn blinded_read_decision_rules() {
+        let ok = BlindedReadFacts {
+            capability_known: true,
+            capability_registered: true,
+            locator_matches: true,
+            fresh: true,
+            sig_valid: true,
+        };
+        assert_eq!(blinded_read_decision(&ok), Ok(()));
+        let with = |f: &dyn Fn(&mut BlindedReadFacts)| {
+            let mut x = ok;
+            f(&mut x);
+            blinded_read_decision(&x)
+        };
+        assert_eq!(
+            with(&|f| f.capability_known = false),
+            Err("reject.blinded_read_no_capability")
+        );
+        assert_eq!(
+            with(&|f| f.capability_registered = false),
+            Err("reject.blinded_read_capability_mismatch")
+        );
+        assert_eq!(
+            with(&|f| f.locator_matches = false),
+            Err("reject.blinded_read_capability_mismatch")
+        );
+        assert_eq!(with(&|f| f.fresh = false), Err("reject.blinded_read_stale"));
+        assert_eq!(
+            with(&|f| f.sig_valid = false),
+            Err("reject.blinded_read_sig_invalid")
+        );
     }
 }

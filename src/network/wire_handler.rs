@@ -11,7 +11,6 @@ use crate::crypto::{HybridKemKeypair, NodeIdentity};
 use crate::network::behaviour::{
     DhtEnvelopeKind, DhtWireEnvelope, MeshWireRequest, MeshWireResponse,
 };
-use crate::network::discovery::KnownPeersStore;
 use crate::network::wan_rendezvous::{
     open_public_tracker_card, reflect_observed_wan_multiaddr, WanRendezvousRegistry,
     PUBLIC_COMMONS_SWARM_SLOT,
@@ -22,14 +21,13 @@ use crate::por::{
     ShardRebindFacts,
 };
 use crate::storage::{
-    BlockStore, PrivacyPreservingEvictionEngine, PublicTrackerTakedownQueue,
-    SignedBadActorEvictionOrder, VoucherNullifierLedger,
+    BlockStore, PrivacyPreservingEvictionEngine, PublicTrackerTakedownQueue, VoucherNullifierLedger,
 };
 use libp2p::Multiaddr;
 use std::net::IpAddr;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Returns the first IPv4 / IPv6 address in a multiaddr.
 pub fn extract_ip_from_multiaddr(addr: &Multiaddr) -> Option<std::net::IpAddr> {
@@ -50,69 +48,10 @@ fn now_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Resolves the eviction council and quorum for a `parvault-seed` node.
-pub fn resolve_seed_council_and_quorum(
-    data_dir: &Path,
-    mode: SeedServerMode,
-    local_tracker_admin_pubkey: Option<[u8; 32]>,
-    extra_council_pubkeys: &[[u8; 32]],
-    cli_quorum_override: Option<usize>,
-    genesis_pubkey: Option<[u8; 32]>,
-) -> (Vec<[u8; 32]>, usize) {
-    let mut council = Vec::new();
-    let mut push_pk = |pk: [u8; 32]| {
-        if pk != [0u8; 32] && !council.contains(&pk) {
-            council.push(pk);
-        }
-    };
-    if let Ok(env_auth) = std::env::var("PARVAULT_EVICTION_AUTHORITIES") {
-        for part in env_auth.split(',') {
-            if let Ok(bytes) = hex::decode(part.trim()) {
-                if bytes.len() == 32 {
-                    let mut pk = [0u8; 32];
-                    pk.copy_from_slice(&bytes);
-                    push_pk(pk);
-                }
-            }
-        }
-    }
-    let env_quorum = std::env::var("PARVAULT_TRACKER_EVICTION_QUORUM")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok());
-    let quorum_override = cli_quorum_override.or(env_quorum);
-
-    match mode {
-        SeedServerMode::PublicNetworkBootstrapper => {
-            if let Some(pk) = local_tracker_admin_pubkey {
-                push_pk(pk);
-            }
-            for pk in extra_council_pubkeys {
-                push_pk(*pk);
-            }
-            if !data_dir.as_os_str().is_empty() {
-                for pk in KnownPeersStore::load(data_dir).pinned_tracker_admin_pubkeys() {
-                    push_pk(pk);
-                }
-            }
-            let min_quorum = quorum_override
-                .unwrap_or_else(|| {
-                    SignedBadActorEvictionOrder::default_tracker_quorum_threshold(council.len())
-                })
-                .max(1);
-            (council, min_quorum)
-        }
-        SeedServerMode::HomelabRedundancyVault => {
-            if let Some(pk) = genesis_pubkey {
-                push_pk(pk);
-            }
-            let min_quorum = quorum_override.unwrap_or(1).max(1);
-            (council, min_quorum)
-        }
-    }
-}
-
 /// State borrowed by the daemon wire handler for one request.
 pub struct DaemonWireHandlerCtx<'a> {
+    /// B-SEED-SYND: the node's current lite syndication fan-out load (from `ServerSwarmEvents`).
+    pub syndication_load: crate::network::server_events::SyndicationLoad,
     pub cfg: &'a NodeConfig,
     pub node_identity: &'a NodeIdentity,
     pub genesis_pubkey: Option<[u8; 32]>,
@@ -130,12 +69,11 @@ pub struct DaemonWireHandlerCtx<'a> {
 
 /// State borrowed by the seed wire handler for one request.
 pub struct SeedWireHandlerCtx<'a> {
+    /// B-SEED-SYND: the node's current lite syndication fan-out load (from `ServerSwarmEvents`).
+    pub syndication_load: crate::network::server_events::SyndicationLoad,
     pub data_dir: &'a Path,
     pub node_identity: &'a NodeIdentity,
     pub advertised_admin_pk: Option<[u8; 32]>,
-    pub local_tracker_admin_pk: Option<[u8; 32]>,
-    pub extra_council_pks: &'a [[u8; 32]],
-    pub council_quorum: Option<usize>,
     pub max_probationary_lease_bytes: u64,
     pub genesis_pubkey: Option<[u8; 32]>,
     pub block_store: &'a BlockStore,
@@ -160,12 +98,22 @@ pub fn handle_daemon_wire_request(
     remote_addr: Option<&Multiaddr>,
     request: MeshWireRequest,
     ctx: DaemonWireHandlerCtx<'_>,
-) -> MeshWireResponse {
+) -> WireReply {
     let policy = DaemonWirePolicy {
         cfg: ctx.cfg,
         public_mode: ctx.public_mode,
     };
     let state = WireState {
+        data_dir: &ctx.cfg.data_dir,
+        council_root: crate::storage::council::council_scope_root(
+            &ctx.cfg.data_dir,
+            ctx.genesis_pubkey,
+            ctx.public_mode,
+            &ctx.block_store
+                .mesh_client()
+                .map(|mc| mc.pinned_tracker_admin_pubkeys())
+                .unwrap_or_default(),
+        ),
         node_identity: ctx.node_identity,
         genesis_pubkey: ctx.genesis_pubkey,
         block_store: ctx.block_store,
@@ -178,8 +126,8 @@ pub fn handle_daemon_wire_request(
         eviction: ctx.eviction,
         takedown_queue: ctx.takedown_queue,
     };
-    handle_mesh_wire_request(
-        &WirePeer::new(remote_peer_id, remote_addr),
+    handle_mesh_wire_reply(
+        &WirePeer::new(remote_peer_id, remote_addr).with_syndication_load(ctx.syndication_load),
         request,
         state,
         &policy,
@@ -192,16 +140,19 @@ pub fn handle_seed_wire_request(
     remote_addr: Option<&Multiaddr>,
     request: MeshWireRequest,
     ctx: SeedWireHandlerCtx<'_>,
-) -> MeshWireResponse {
+) -> WireReply {
     let policy = SeedWirePolicy {
-        data_dir: ctx.data_dir,
         advertised_admin_pk: ctx.advertised_admin_pk,
-        local_tracker_admin_pk: ctx.local_tracker_admin_pk,
-        extra_council_pks: ctx.extra_council_pks,
-        council_quorum: ctx.council_quorum,
         max_probationary_lease_bytes: ctx.max_probationary_lease_bytes,
     };
     let state = WireState {
+        data_dir: ctx.data_dir,
+        // A public seed's council is rooted at its own tracker admin key; a homelab seed's at
+        // its ring genesis.
+        council_root: match ctx.server.mode() {
+            SeedServerMode::PublicNetworkBootstrapper => ctx.advertised_admin_pk,
+            SeedServerMode::HomelabRedundancyVault => ctx.genesis_pubkey,
+        },
         node_identity: ctx.node_identity,
         genesis_pubkey: ctx.genesis_pubkey,
         block_store: ctx.block_store,
@@ -214,8 +165,8 @@ pub fn handle_seed_wire_request(
         eviction: ctx.eviction,
         takedown_queue: ctx.takedown_queue,
     };
-    handle_mesh_wire_request(
-        &WirePeer::new(remote_peer_id, remote_addr),
+    handle_mesh_wire_reply(
+        &WirePeer::new(remote_peer_id, remote_addr).with_syndication_load(ctx.syndication_load),
         request,
         state,
         &policy,
@@ -232,6 +183,8 @@ pub struct WirePeer<'a> {
     pub addr: Option<&'a Multiaddr>,
     pub ip: Option<IpAddr>,
     pub pubkey: Option<[u8; 32]>,
+    /// B-SEED-SYND: lite syndication fan-outs in flight (total and for this peer).
+    pub syndication_load: crate::network::server_events::SyndicationLoad,
 }
 
 impl<'a> WirePeer<'a> {
@@ -241,12 +194,26 @@ impl<'a> WirePeer<'a> {
             addr,
             ip: addr.and_then(extract_ip_from_multiaddr),
             pubkey: NodeConfig::extract_ed25519_pubkey_from_peer_str(peer_id),
+            syndication_load: Default::default(),
         }
+    }
+
+    /// The same peer with the node's current lite syndication load.
+    pub fn with_syndication_load(
+        mut self,
+        load: crate::network::server_events::SyndicationLoad,
+    ) -> Self {
+        self.syndication_load = load;
+        self
     }
 }
 
 /// Node state the handler reads and mutates for one request.
 pub struct WireState<'a> {
+    /// Where the council manifest lives (`council_from_manifest`).
+    pub data_dir: &'a Path,
+    /// This role's council scope root (`council_scope_root`), resolved at the entry point.
+    pub council_root: Option<[u8; 32]>,
     pub node_identity: &'a NodeIdentity,
     pub genesis_pubkey: Option<[u8; 32]>,
     pub block_store: &'a BlockStore,
@@ -267,23 +234,18 @@ pub struct WireState<'a> {
 /// | Row | Variant | Daemon | Seed |
 /// | :-- | :-- | :-- | :-- |
 /// | 2 | `PutShard` | no extra record | also `record_peer_admission_ip(ip, pubkey)` |
-/// | 4, 10 | `PorAudit`, `MultiSegmentPorAudit` | no heartbeat | `record_por_heartbeat(true)` on success |
 /// | 6, 11 | `PutBlindedShard`, onion final delivery | no size limit | `max_probationary_lease_bytes` (0 = off) |
 /// | 9 | `DeleteBlindedShardTombstone` | `BlockStore` error text | via the seed server: "Seed server storage error: " prefix |
 /// | 15 | `QueryNodeStatus` | region `local-neighborhood` | region `seed-anchor` |
 /// | 16, 17 | Register / Lookup rendezvous | `tracker_admin_pubkey: None` | advertised admin key |
 /// | 16 | Register on the public slot | no extra record | records every advertised card IP |
 /// | 18 | `SubmitAbuseTakedownReport` | always queued | refused unless public bootstrapper |
-/// | 19 | `BroadcastEvictionOrder` | `NodeConfig` council resolver | `resolve_seed_council_and_quorum` |
+/// | 19 | `BroadcastEvictionOrder` | identical since F-08: `council_from_manifest` | identical |
 pub trait WireRolePolicy {
     /// Row 2.
     fn record_put_shard_admission_ip(&self) -> bool;
-    /// Rows 4 and 10: called after a PoR challenge passes.
-    fn on_por_pass(&self, server: &mut ZeroTrustSeedServer);
     /// Rows 6 and 11: blinded shards longer than this are refused; 0 disables the check.
     fn max_probationary_lease_bytes(&self) -> u64;
-    /// Row 9: route tombstones through the seed server (changes only the error text).
-    fn tombstone_via_seed_server(&self) -> bool;
     /// Row 15.
     fn status_region(&self) -> &'static str;
     /// Rows 16 and 17.
@@ -292,13 +254,6 @@ pub trait WireRolePolicy {
     fn record_public_card_ips(&self) -> bool;
     /// Row 18: `Err(reason)` refuses the report before it reaches the queue.
     fn takedown_gate(&self, mode: SeedServerMode) -> Result<(), String>;
-    /// Row 19: the eviction council and minimum quorum.
-    fn eviction_council(
-        &self,
-        block_store: &BlockStore,
-        mode: SeedServerMode,
-        genesis_pubkey: Option<[u8; 32]>,
-    ) -> (Vec<[u8; 32]>, usize);
 }
 
 /// Policy of the `parvault` daemon.
@@ -308,12 +263,8 @@ pub struct DaemonWirePolicy<'a> {
 }
 
 /// Policy of `parvault-seed`. Built per request from live seed state.
-pub struct SeedWirePolicy<'a> {
-    pub data_dir: &'a Path,
+pub struct SeedWirePolicy {
     pub advertised_admin_pk: Option<[u8; 32]>,
-    pub local_tracker_admin_pk: Option<[u8; 32]>,
-    pub extra_council_pks: &'a [[u8; 32]],
-    pub council_quorum: Option<usize>,
     pub max_probationary_lease_bytes: u64,
 }
 
@@ -321,12 +272,8 @@ impl WireRolePolicy for DaemonWirePolicy<'_> {
     fn record_put_shard_admission_ip(&self) -> bool {
         false
     }
-    fn on_por_pass(&self, _server: &mut ZeroTrustSeedServer) {}
     fn max_probationary_lease_bytes(&self) -> u64 {
         0
-    }
-    fn tombstone_via_seed_server(&self) -> bool {
-        false
     }
     fn status_region(&self) -> &'static str {
         "local-neighborhood"
@@ -340,41 +287,14 @@ impl WireRolePolicy for DaemonWirePolicy<'_> {
     fn takedown_gate(&self, _mode: SeedServerMode) -> Result<(), String> {
         Ok(())
     }
-    fn eviction_council(
-        &self,
-        block_store: &BlockStore,
-        _mode: SeedServerMode,
-        genesis_pubkey: Option<[u8; 32]>,
-    ) -> (Vec<[u8; 32]>, usize) {
-        let mut pinned_admins =
-            KnownPeersStore::load(&self.cfg.data_dir).pinned_tracker_admin_pubkeys();
-        if let Some(mc) = block_store.mesh_client() {
-            for pk in mc.pinned_tracker_admin_pubkeys() {
-                if !pinned_admins.contains(&pk) {
-                    pinned_admins.push(pk);
-                }
-            }
-        }
-        self.cfg.resolve_eviction_council_and_quorum(
-            genesis_pubkey,
-            &pinned_admins,
-            self.public_mode,
-        )
-    }
 }
 
-impl WireRolePolicy for SeedWirePolicy<'_> {
+impl WireRolePolicy for SeedWirePolicy {
     fn record_put_shard_admission_ip(&self) -> bool {
         true
     }
-    fn on_por_pass(&self, server: &mut ZeroTrustSeedServer) {
-        server.record_por_heartbeat(true);
-    }
     fn max_probationary_lease_bytes(&self) -> u64 {
         self.max_probationary_lease_bytes
-    }
-    fn tombstone_via_seed_server(&self) -> bool {
-        true
     }
     fn status_region(&self) -> &'static str {
         "seed-anchor"
@@ -391,21 +311,6 @@ impl WireRolePolicy for SeedWirePolicy<'_> {
         }
         Ok(())
     }
-    fn eviction_council(
-        &self,
-        _block_store: &BlockStore,
-        mode: SeedServerMode,
-        genesis_pubkey: Option<[u8; 32]>,
-    ) -> (Vec<[u8; 32]>, usize) {
-        resolve_seed_council_and_quorum(
-            self.data_dir,
-            mode,
-            self.local_tracker_admin_pk,
-            self.extra_council_pks,
-            self.council_quorum,
-            genesis_pubkey,
-        )
-    }
 }
 
 /// How a request may be authorised. Inert in 2a; the admission check (`admit`) will use it.
@@ -419,11 +324,9 @@ pub enum AdmissionClass {
     SelfAuthorised,
     /// Authorised by a council or reporter signature checked inside the arm.
     CouncilSigned,
-    /// Requires an admitted peer.
+    /// Requires an admitted peer. Onion relays are in this class (F-33, L-38): the originator
+    /// is admitted at the entry relay, and each relay's forward is admitted at the next hop.
     AdmittedPeer,
-    /// An onion relay: forwarding needs no admission (the originator stays hidden); a final
-    /// delivery requires the last hop's sender to be admitted, checked inside the arm.
-    RelayCarried,
 }
 
 /// The refusal text sent to a sender that is not admitted (the reason code stays in the log).
@@ -488,13 +391,16 @@ pub const fn admission_class(request: &MeshWireRequest) -> AdmissionClass {
         | MeshWireRequest::LookupWanRendezvous { .. } => AdmissionClass::PreAdmission,
         MeshWireRequest::GetBlindedShard { .. }
         | MeshWireRequest::RenewBlindedLease { .. }
+        | MeshWireRequest::RenewBlindedLeaseSigned { .. }
         | MeshWireRequest::DeleteBlindedShardTombstone { .. }
+        | MeshWireRequest::DeleteBlindedShardSigned { .. }
         | MeshWireRequest::GetCiphertextShard { .. }
         | MeshWireRequest::DeleteShard { .. }
         | MeshWireRequest::PorAudit(_)
         | MeshWireRequest::MultiSegmentPorAudit(_)
         | MeshWireRequest::GetDhtEnvelope { .. } => AdmissionClass::SelfAuthorised,
-        MeshWireRequest::RelayPqOnionEnvelope { .. } => AdmissionClass::RelayCarried,
+        MeshWireRequest::RelayPqOnionEnvelope { .. }
+        | MeshWireRequest::GetCouncilManifest { .. } => AdmissionClass::AdmittedPeer,
         MeshWireRequest::SubmitAbuseTakedownReport(_)
         | MeshWireRequest::BroadcastEvictionOrder(_) => AdmissionClass::CouncilSigned,
         // v0.5.0: blinded-shard vouchers are self-certifying (F-24), so a blinded put needs an
@@ -582,6 +488,30 @@ pub fn device_cert_decision(
     }
 }
 
+/// What the lease-renewal decision needs to know (F-23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenewFacts {
+    /// The shard has a registered capability key and the request is signed by it.
+    pub signed_by_capability: bool,
+    /// The signature's timestamp is within the capability clock-skew window.
+    pub fresh: bool,
+    pub extension_epochs: u64,
+}
+
+/// A blinded shard's lease may be renewed only by its capability holder, recently, and by at
+/// most `MAX_LEASE_EXTENSION_EPOCHS` (F-23).
+pub fn renew_decision(facts: &RenewFacts) -> Result<(), &'static str> {
+    if !facts.signed_by_capability || !facts.fresh {
+        return Err("reject.renew_capability_invalid");
+    }
+    if facts.extension_epochs == 0
+        || facts.extension_epochs > crate::storage::MAX_LEASE_EXTENSION_EPOCHS
+    {
+        return Err("reject.renew_extension_unbounded");
+    }
+    Ok(())
+}
+
 /// A syndicated stripe's repair grant must be owned by the authenticated sender, compared on
 /// the full 32-byte key (never the 64-bit device id). With F-25 (the cert names the sender) this
 /// chains the grant owner to the owner root, so a certified device cannot attach a grant
@@ -599,6 +529,50 @@ pub fn syndication_grant_decision(
 
 /// The one refusal text for every failed handshake (F-30): the reason stays in the local log.
 pub const HANDSHAKE_REFUSED_TEXT: &str = "handshake refused";
+
+/// What the voucher issuer decision needs to know (F-24 issuer policy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoucherIssuerFacts {
+    /// The issuer is the ring genesis or holds an admitted ring chain on this node.
+    pub issuer_is_ring_member: bool,
+    /// The issuer is this node's configured voucher issuer (a seed's own issuer).
+    pub issuer_is_configured: bool,
+}
+
+/// A blinded-shard voucher is honoured only if its issuer is a ring member this node knows or
+/// its configured issuer; a voucher no longer certifies its own issuer (F-24). Ephemeral
+/// per-shard issuers (ADR-11) are therefore refused until anonymous credentials (v0.6.0).
+pub fn voucher_issuer_decision(facts: &VoucherIssuerFacts) -> Result<(), &'static str> {
+    if facts.issuer_is_ring_member || facts.issuer_is_configured {
+        Ok(())
+    } else {
+        Err("reject.voucher_issuer_untrusted")
+    }
+}
+
+/// Text sent to a sender whose voucher issuer is not trusted (the reason code stays in the log).
+pub const VOUCHER_ISSUER_UNTRUSTED_TEXT: &str = "voucher issuer not trusted by this node";
+
+fn voucher_issuer_allowed(
+    wot: &WebOfTrustRegistry,
+    ledger: &VoucherNullifierLedger,
+    issuer: &[u8; 32],
+    peer: &str,
+) -> bool {
+    let facts = VoucherIssuerFacts {
+        issuer_is_ring_member: (wot.genesis_pubkey() == Some(*issuer)
+            || wot.is_private_ring_peer(issuer))
+            && !wot.is_peer_quarantined(issuer),
+        issuer_is_configured: *issuer == ledger.issuer_pubkey(),
+    };
+    match voucher_issuer_decision(&facts) {
+        Ok(()) => true,
+        Err(code) => {
+            warn!(code, peer, "refused a voucher from an untrusted issuer");
+            false
+        }
+    }
+}
 
 /// The local reason code for a failed handshake (never sent on the wire).
 pub fn handshake_refusal_code(err: &crate::network::wot::WebOfTrustError) -> &'static str {
@@ -656,6 +630,9 @@ pub fn reject_response(request: &MeshWireRequest, reason: String) -> MeshWireRes
             verifier_pubkey: [0u8; 32],
             required_pow_bits: 0,
         },
+        MeshWireRequest::GetCouncilManifest { .. } => MeshWireResponse::CouncilManifestResult {
+            manifests: Vec::new(),
+        },
         MeshWireRequest::PutShard { .. } => MeshWireResponse::PutShardAck {
             stored: false,
             error: Some(reason),
@@ -673,10 +650,12 @@ pub fn reject_response(request: &MeshWireRequest, reason: String) -> MeshWireRes
             shard_bytes: None,
             error: Some(reason),
         },
-        MeshWireRequest::RenewBlindedLease { .. } => {
+        MeshWireRequest::RenewBlindedLease { .. }
+        | MeshWireRequest::RenewBlindedLeaseSigned { .. } => {
             MeshWireResponse::RenewBlindedLeaseAck { renewed: false }
         }
-        MeshWireRequest::DeleteBlindedShardTombstone { .. } => {
+        MeshWireRequest::DeleteBlindedShardTombstone { .. }
+        | MeshWireRequest::DeleteBlindedShardSigned { .. } => {
             MeshWireResponse::DeleteBlindedShardAck {
                 deleted: false,
                 error: Some(reason),
@@ -753,18 +732,176 @@ fn lease_limit_error(len: usize, limit: u64) -> Option<String> {
         .then(|| format!("shard length {len} exceeds max_probationary_lease_bytes {limit}"))
 }
 
-/// Handles one inbound `MeshWireRequest` for either role.
-pub fn handle_mesh_wire_request<P: WireRolePolicy>(
+/// Handles one inbound `MeshWireRequest` for either role. Onion relay forwards come back as
+/// [`WireReply::Deferred`] so the swarm task never waits on the jitter or the next hop (F-18).
+pub fn handle_mesh_wire_reply<P: WireRolePolicy>(
+    peer: &WirePeer<'_>,
+    request: MeshWireRequest,
+    st: WireState<'_>,
+    policy: &P,
+) -> WireReply {
+    let mut deferred = None;
+    let response = handle_mesh_wire_request(peer, request, st, policy, &mut deferred);
+    match deferred {
+        Some(job) => WireReply::Deferred(Box::new(job)),
+        None => WireReply::Ready(Box::new(response)),
+    }
+}
+
+/// What a handler returns: a response now, or a relay forward to run off the swarm task.
+pub enum WireReply {
+    Ready(Box<MeshWireResponse>),
+    Deferred(Box<DeferredJob>),
+}
+
+/// Work a handler hands off the swarm task: an onion relay forward (F-18) or a lite syndication
+/// fan-out (B-SEED-SYND, L-46). Each holds a slot in its own budget (`server_events`).
+pub enum DeferredJob {
+    Relay(Box<RelayForward>),
+    LiteFanOut(Box<crate::bootstrap::LiteFanOutPlan>),
+}
+
+impl DeferredJob {
+    /// Whether this job counts against the syndication budget (else the relay budget).
+    pub fn is_syndication(&self) -> bool {
+        matches!(self, DeferredJob::LiteFanOut(_))
+    }
+
+    /// Runs the job off the swarm task and returns the response to send.
+    pub async fn run(self) -> MeshWireResponse {
+        match self {
+            DeferredJob::Relay(job) => (*job).run().await,
+            DeferredJob::LiteFanOut(plan) => {
+                let t0 = std::time::Instant::now();
+                let done = tokio::task::spawn_blocking(move || {
+                    crate::bootstrap::run_lite_fan_out(
+                        *plan,
+                        crate::bootstrap::LITE_FANOUT_DEADLINE,
+                        crate::bootstrap::LITE_FANOUT_PARALLEL_PUTS,
+                    )
+                })
+                .await;
+                match done {
+                    Ok((receipt, syndicated_peers)) => {
+                        info!(
+                            job_ms = t0.elapsed().as_millis() as u64,
+                            mesh_peers_populated = receipt.mesh_peers_populated,
+                            "lite syndication fan-out finished"
+                        );
+                        MeshWireResponse::SyndicateLiteStripeAck {
+                            receipt: Some(receipt),
+                            syndicated_peers,
+                            error: None,
+                        }
+                    }
+                    Err(e) => MeshWireResponse::SyndicateLiteStripeAck {
+                        receipt: None,
+                        syndicated_peers: Vec::new(),
+                        error: Some(format!("syndication fan-out task failed: {e}")),
+                    },
+                }
+            }
+        }
+    }
+}
+
+impl WireReply {
+    /// The immediate response, or `None` for a deferred relay forward.
+    pub fn ready(self) -> Option<MeshWireResponse> {
+        match self {
+            WireReply::Ready(r) => Some(*r),
+            WireReply::Deferred(_) => None,
+        }
+    }
+}
+
+/// Last relay: forward the envelope to the final target with its lease.
+struct FinalHop {
+    next_hop: String,
+    envelope: crate::crypto::pqc::PqRelayedShardEnvelope,
+    capability: crate::storage::BlindedShardCapability,
+    voucher: crate::storage::AnonymousQuotaVoucher,
+    lease: crate::storage::BlindedLeaseSpec,
+}
+
+enum RelayHop {
+    Final(Box<FinalHop>),
+    /// Middle relay: forward the peeled inner layer after the envelope's jitter.
+    Layered {
+        target: String,
+        inner: crate::crypto::pqc::PqRelayedShardEnvelope,
+    },
+}
+
+/// An onion relay forward taken off the swarm task (F-18): the jitter is a tokio sleep and the
+/// blocking forward runs on the blocking pool, outside any handler lock. The relay still delays
+/// each forward by the envelope's jitter, so the next hop sees the same timing as before.
+pub struct RelayForward {
+    client: crate::network::MeshClient,
+    delay_ms: u64,
+    hop: RelayHop,
+}
+
+impl RelayForward {
+    /// Waits out the jitter, then forwards on the blocking pool and returns the ack to send.
+    pub async fn run(self) -> MeshWireResponse {
+        if self.delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+        }
+        match tokio::task::spawn_blocking(move || self.forward()).await {
+            Ok(r) => r,
+            Err(e) => relay_ack(Err(format!("relay forward task failed: {e}"))),
+        }
+    }
+
+    fn forward(self) -> MeshWireResponse {
+        let result = match self.hop {
+            RelayHop::Final(hop) => {
+                let FinalHop {
+                    next_hop,
+                    envelope,
+                    capability,
+                    voucher,
+                    lease,
+                } = *hop;
+                self.client
+                    .relay_pq_onion_envelope(&next_hop, None, envelope, capability, voucher, lease)
+            }
+            RelayHop::Layered { target, inner } => {
+                self.client.relay_layered_pq_onion_envelope(&target, inner)
+            }
+        };
+        relay_ack(result.map_err(|e| e.to_string()))
+    }
+}
+
+fn relay_ack(result: Result<(), String>) -> MeshWireResponse {
+    match result {
+        Ok(()) => MeshWireResponse::RelayPqOnionAck {
+            delivered: true,
+            error: None,
+        },
+        Err(e) => MeshWireResponse::RelayPqOnionAck {
+            delivered: false,
+            error: Some(e),
+        },
+    }
+}
+
+fn handle_mesh_wire_request<P: WireRolePolicy>(
     peer: &WirePeer<'_>,
     request: MeshWireRequest,
     mut st: WireState<'_>,
     policy: &P,
+    deferred: &mut Option<DeferredJob>,
 ) -> MeshWireResponse {
     let class = admission_class(&request);
     if let Some(rejection) = admit(peer, &request, class, &mut st) {
         return rejection;
     }
     let WireState {
+        data_dir,
+        council_root,
         node_identity,
         genesis_pubkey,
         block_store,
@@ -1015,10 +1152,9 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
         MeshWireRequest::PorAudit(challenge) => {
             let now_ms = now_unix_ms();
             match por_verifier.handle_incoming_challenge(&challenge, now_ms, block_store) {
-                Ok(resp) => {
-                    policy.on_por_pass(server);
-                    MeshWireResponse::PorAuditResult(Some(resp))
-                }
+                // Answering a challenge earns the prover nothing (F-07): only a verifier's
+                // own checks may credit a host.
+                Ok(resp) => MeshWireResponse::PorAuditResult(Some(resp)),
                 Err(e) => {
                     warn!(peer = remote_peer_id, error = %e, "Dropped PoR challenge in RAM pre-check");
                     MeshWireResponse::PorAuditResult(None)
@@ -1099,19 +1235,32 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                     error: Some(err),
                 };
             }
-            nullifier_ledger.set_trusted_issuer_pubkey(voucher.issuer_pubkey);
-            match block_store.put_blinded_shard_with_lease(
-                &blinded_id,
-                &shard_bytes,
-                capability,
-                &voucher,
+            if !voucher_issuer_allowed(
+                wot,
                 nullifier_ledger,
-                crate::storage::BlindedLeaseSpec::new(
-                    current_epoch,
-                    lease_duration_epochs,
-                    delete_verifier,
-                ),
+                &voucher.issuer_pubkey,
+                remote_peer_id,
             ) {
+                return MeshWireResponse::PutBlindedShardAck {
+                    stored: false,
+                    error: Some(VOUCHER_ISSUER_UNTRUSTED_TEXT.to_string()),
+                };
+            }
+            let issuer = voucher.issuer_pubkey;
+            match nullifier_ledger.with_trusted_issuer(issuer, |ledger| {
+                block_store.put_blinded_shard_with_lease(
+                    &blinded_id,
+                    &shard_bytes,
+                    capability,
+                    &voucher,
+                    ledger,
+                    crate::storage::BlindedLeaseSpec::new(
+                        current_epoch,
+                        lease_duration_epochs,
+                        delete_verifier,
+                    ),
+                )
+            }) {
                 Ok(_) => {
                     let _ = eviction.record_blinded_shard_ingress(
                         remote_ip,
@@ -1139,19 +1288,13 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
             timestamp_ms,
             read_sig,
         } => {
-            if read_sig.len() != 64 {
-                return MeshWireResponse::BlindedShardResult {
-                    shard_bytes: None,
-                    error: Some("invalid 64-byte capability signature length".to_string()),
-                };
-            }
-            let mut sig64 = [0u8; 64];
-            sig64.copy_from_slice(&read_sig);
+            // A wrong-length signature is just an invalid one (QA 2c): the decision logs it.
             match block_store.get_blinded_shard_authorized(
                 &blinded_id,
                 &capability,
                 timestamp_ms,
-                &sig64,
+                &read_sig,
+                now_unix_ms(),
             ) {
                 Ok(bytes) => MeshWireResponse::BlindedShardResult {
                     shard_bytes: Some(bytes),
@@ -1163,11 +1306,53 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                 },
             }
         }
-        MeshWireRequest::RenewBlindedLease {
+        MeshWireRequest::RenewBlindedLease { .. } => {
+            // Carries no credential (F-23): refused; use `RenewBlindedLeaseSigned`.
+            let unsigned = RenewFacts {
+                signed_by_capability: false,
+                fresh: false,
+                extension_epochs: 0,
+            };
+            if let Err(code) = renew_decision(&unsigned) {
+                warn!(
+                    code,
+                    peer = remote_peer_id,
+                    "refused an unsigned lease renewal"
+                );
+            }
+            MeshWireResponse::RenewBlindedLeaseAck { renewed: false }
+        }
+        MeshWireRequest::RenewBlindedLeaseSigned {
             blinded_id,
             current_epoch,
             extension_epochs,
+            timestamp_ms,
+            sig,
         } => {
+            let signed_by_capability = block_store
+                .blinded_capability_pubkey(&blinded_id)
+                .is_some_and(|pk| {
+                    crate::storage::BlindedShardCapability {
+                        locator: blinded_id.locator,
+                        capability_pubkey: pk,
+                    }
+                    .verify_lease_renewal(
+                        current_epoch,
+                        extension_epochs,
+                        timestamp_ms,
+                        &sig,
+                    )
+                });
+            let facts = RenewFacts {
+                signed_by_capability,
+                fresh: timestamp_ms.abs_diff(now_unix_ms())
+                    <= crate::storage::MAX_CAPABILITY_CLOCK_SKEW_MS,
+                extension_epochs,
+            };
+            if let Err(code) = renew_decision(&facts) {
+                warn!(code, peer = remote_peer_id, "refused a lease renewal");
+                return MeshWireResponse::RenewBlindedLeaseAck { renewed: false };
+            }
             if eviction
                 .is_ingress_blocked(
                     remote_ip,
@@ -1186,37 +1371,55 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                 block_store.renew_blinded_shard_lease(&blinded_id, current_epoch, extension_epochs);
             MeshWireResponse::RenewBlindedLeaseAck { renewed }
         }
-        MeshWireRequest::DeleteBlindedShardTombstone {
-            blinded_id,
-            tombstone,
-        } => {
-            let result = if policy.tombstone_via_seed_server() {
-                server
-                    .execute_blinded_tombstone(&blinded_id, &tombstone)
-                    .map_err(|e| e.to_string())
-            } else {
-                block_store
-                    .delete_blinded_shard_with_tombstone(&blinded_id, &tombstone)
-                    .map_err(|e| e.to_string())
+        MeshWireRequest::DeleteBlindedShardTombstone { .. } => {
+            // F-41: a MAC tombstone is keyed by the delete verifier, which relays and hosts
+            // see; it is never authority to delete. Refused like the unsigned renew.
+            let unsigned = crate::storage::anonymity::BlindedDeleteFacts {
+                signed: false,
+                capability_registered: false,
+                id_matches: false,
+                fresh: false,
+                sig_valid: false,
             };
-            match result {
+            let code = crate::storage::anonymity::blinded_delete_decision(&unsigned)
+                .err()
+                .unwrap_or_default();
+            warn!(
+                code,
+                peer = remote_peer_id,
+                "refused an unsigned blinded tombstone"
+            );
+            MeshWireResponse::DeleteBlindedShardAck {
+                deleted: false,
+                error: Some("unsigned tombstones are refused; use DeleteBlindedShardSigned".into()),
+            }
+        }
+        MeshWireRequest::DeleteBlindedShardSigned {
+            blinded_id,
+            timestamp_ms,
+            sig,
+        } => {
+            match block_store.delete_blinded_shard_signed(
+                &blinded_id,
+                timestamp_ms,
+                &sig,
+                &node_identity.public_key_bytes(),
+                now_unix_ms(),
+            ) {
                 Ok(deleted) => MeshWireResponse::DeleteBlindedShardAck {
                     deleted,
                     error: None,
                 },
                 Err(e) => MeshWireResponse::DeleteBlindedShardAck {
                     deleted: false,
-                    error: Some(e),
+                    error: Some(e.to_string()),
                 },
             }
         }
         MeshWireRequest::MultiSegmentPorAudit(challenge) => {
             let now_ms = now_unix_ms();
             match por_verifier.handle_multi_segment_challenge(&challenge, now_ms, block_store) {
-                Ok(resp) => {
-                    policy.on_por_pass(server);
-                    MeshWireResponse::MultiSegmentPorAuditResult(Some(resp))
-                }
+                Ok(resp) => MeshWireResponse::MultiSegmentPorAuditResult(Some(resp)),
                 Err(e) => {
                     warn!(peer = remote_peer_id, error = %e, "Dropped MultiSegmentPorAudit in RAM pre-check");
                     MeshWireResponse::MultiSegmentPorAuditResult(None)
@@ -1246,27 +1449,22 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
             }
             if let Some(next_hop) = target_peer_addr {
                 if let Some(client) = block_store.mesh_client() {
-                    match client.relay_pq_onion_envelope(
-                        &next_hop,
-                        None,
-                        envelope,
-                        capability,
-                        voucher,
-                        crate::storage::BlindedLeaseSpec::new(
-                            current_epoch,
-                            lease_duration_epochs,
-                            delete_verifier,
-                        ),
-                    ) {
-                        Ok(()) => MeshWireResponse::RelayPqOnionAck {
-                            delivered: true,
-                            error: None,
-                        },
-                        Err(e) => MeshWireResponse::RelayPqOnionAck {
-                            delivered: false,
-                            error: Some(e.to_string()),
-                        },
-                    }
+                    *deferred = Some(DeferredJob::Relay(Box::new(RelayForward {
+                        client: client.clone(),
+                        delay_ms: 0,
+                        hop: RelayHop::Final(Box::new(FinalHop {
+                            next_hop,
+                            envelope,
+                            capability,
+                            voucher,
+                            lease: crate::storage::BlindedLeaseSpec::new(
+                                current_epoch,
+                                lease_duration_epochs,
+                                delete_verifier,
+                            ),
+                        })),
+                    })));
+                    relay_ack(Err("deferred".to_string()))
                 } else {
                     MeshWireResponse::RelayPqOnionAck {
                         delivered: false,
@@ -1274,22 +1472,16 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                     }
                 }
             } else if let Ok(hop) = envelope.peel_relay_hop_pq(pq_kem) {
-                if envelope.jitter_delay_ms > 0 {
-                    std::thread::sleep(Duration::from_millis(envelope.jitter_delay_ms.min(250)));
-                }
                 if let Some(client) = block_store.mesh_client() {
-                    match client
-                        .relay_layered_pq_onion_envelope(&hop.target_peer_addr, hop.inner_envelope)
-                    {
-                        Ok(()) => MeshWireResponse::RelayPqOnionAck {
-                            delivered: true,
-                            error: None,
+                    *deferred = Some(DeferredJob::Relay(Box::new(RelayForward {
+                        client: client.clone(),
+                        delay_ms: envelope.jitter_delay_ms.min(250),
+                        hop: RelayHop::Layered {
+                            target: hop.target_peer_addr,
+                            inner: hop.inner_envelope,
                         },
-                        Err(e) => MeshWireResponse::RelayPqOnionAck {
-                            delivered: false,
-                            error: Some(e.to_string()),
-                        },
-                    }
+                    })));
+                    relay_ack(Err("deferred".to_string()))
                 } else {
                     MeshWireResponse::RelayPqOnionAck {
                         delivered: false,
@@ -1299,12 +1491,6 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                     }
                 }
             } else if let Ok(bundle) = envelope.open_final_target_pq(pq_kem) {
-                if !admitted(peer, AdmissionClass::AdmittedPeer, wot) {
-                    return MeshWireResponse::RelayPqOnionAck {
-                        delivered: false,
-                        error: Some(NOT_ADMITTED_TEXT.to_string()),
-                    };
-                }
                 if let Some(reason) = eviction.is_ingress_blocked(
                     remote_ip,
                     Some(remote_peer_id),
@@ -1326,21 +1512,34 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                         error: Some(err),
                     };
                 }
-                nullifier_ledger.set_trusted_issuer_pubkey(bundle.voucher.issuer_pubkey);
+                if !voucher_issuer_allowed(
+                    wot,
+                    nullifier_ledger,
+                    &bundle.voucher.issuer_pubkey,
+                    remote_peer_id,
+                ) {
+                    return MeshWireResponse::RelayPqOnionAck {
+                        delivered: false,
+                        error: Some(VOUCHER_ISSUER_UNTRUSTED_TEXT.to_string()),
+                    };
+                }
+                let issuer = bundle.voucher.issuer_pubkey;
                 let voucher_pk = bundle.voucher.issuer_pubkey;
                 let bid = bundle.blinded_id;
-                match block_store.put_blinded_shard_with_lease(
-                    &bundle.blinded_id,
-                    &bundle.shard_bytes,
-                    bundle.capability,
-                    &bundle.voucher,
-                    nullifier_ledger,
-                    crate::storage::BlindedLeaseSpec::new(
-                        bundle.current_epoch,
-                        bundle.lease_duration_epochs,
-                        bundle.delete_verifier,
-                    ),
-                ) {
+                match nullifier_ledger.with_trusted_issuer(issuer, |ledger| {
+                    block_store.put_blinded_shard_with_lease(
+                        &bundle.blinded_id,
+                        &bundle.shard_bytes,
+                        bundle.capability,
+                        &bundle.voucher,
+                        ledger,
+                        crate::storage::BlindedLeaseSpec::new(
+                            bundle.current_epoch,
+                            bundle.lease_duration_epochs,
+                            bundle.delete_verifier,
+                        ),
+                    )
+                }) {
                     Ok(_) => {
                         let _ = eviction.record_blinded_shard_ingress(
                             remote_ip,
@@ -1361,12 +1560,6 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
             } else {
                 match envelope.open_pq(pq_kem) {
                     Ok((blinded_id, shard_bytes)) => {
-                        if !admitted(peer, AdmissionClass::AdmittedPeer, wot) {
-                            return MeshWireResponse::RelayPqOnionAck {
-                                delivered: false,
-                                error: Some(NOT_ADMITTED_TEXT.to_string()),
-                            };
-                        }
                         if let Some(reason) = eviction.is_ingress_blocked(
                             remote_ip,
                             Some(remote_peer_id),
@@ -1388,20 +1581,33 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                                 error: Some(err),
                             };
                         }
-                        nullifier_ledger.set_trusted_issuer_pubkey(voucher.issuer_pubkey);
-                        let voucher_pk = voucher.issuer_pubkey;
-                        match block_store.put_blinded_shard_with_lease(
-                            &blinded_id,
-                            &shard_bytes,
-                            capability,
-                            &voucher,
+                        if !voucher_issuer_allowed(
+                            wot,
                             nullifier_ledger,
-                            crate::storage::BlindedLeaseSpec::new(
-                                current_epoch,
-                                lease_duration_epochs,
-                                delete_verifier,
-                            ),
+                            &voucher.issuer_pubkey,
+                            remote_peer_id,
                         ) {
+                            return MeshWireResponse::RelayPqOnionAck {
+                                delivered: false,
+                                error: Some(VOUCHER_ISSUER_UNTRUSTED_TEXT.to_string()),
+                            };
+                        }
+                        let issuer = voucher.issuer_pubkey;
+                        let voucher_pk = voucher.issuer_pubkey;
+                        match nullifier_ledger.with_trusted_issuer(issuer, |ledger| {
+                            block_store.put_blinded_shard_with_lease(
+                                &blinded_id,
+                                &shard_bytes,
+                                capability,
+                                &voucher,
+                                ledger,
+                                crate::storage::BlindedLeaseSpec::new(
+                                    current_epoch,
+                                    lease_duration_epochs,
+                                    delete_verifier,
+                                ),
+                            )
+                        }) {
                             Ok(_) => {
                                 let _ = eviction.record_blinded_shard_ingress(
                                     remote_ip,
@@ -1443,6 +1649,19 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                     receipt: None,
                     syndicated_peers: Vec::new(),
                     error: Some(reason),
+                };
+            }
+            // B-SEED-SYND (L-46): check the fan-out budget before any encode or write, so a busy
+            // refusal costs nothing; the enqueue check in `server_events` stays authoritative.
+            if let Err(code) = crate::network::server_events::syndication_fanout_decision(
+                peer.syndication_load.in_flight_total,
+                peer.syndication_load.in_flight_sender,
+            ) {
+                warn!(code, peer = %remote_peer_id, "refused a syndication: fan-out budget full");
+                return MeshWireResponse::SyndicateLiteStripeAck {
+                    receipt: None,
+                    syndicated_peers: Vec::new(),
+                    error: Some(crate::network::server_events::SYNDICATION_BUSY_TEXT.to_string()),
                 };
             }
             let sender_device =
@@ -1505,27 +1724,42 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
             for id in &fresh {
                 por_verifier.clear_shard_binding(id);
             }
-            let grant_to_register = repair_grant.clone();
-            match server.ingest_and_syndicate_lite_stripe_with_grant(
-                &cert,
-                &bundle,
-                &[],
-                repair_grant,
-            ) {
-                Ok((receipt, syndicated_peers)) => {
-                    // F-02a: register only after the stripe was ingested, for that stripe.
-                    if let Some(grant) = grant_to_register {
-                        if let Err(code) = por_verifier.register_repair_grant_for_stored(
-                            grant,
-                            &syndicated_shard_ids(&bundle, receipt.stripe_merkle_root),
-                        ) {
+            // B-SEED-SYND: only the local ingest runs here, under the lock; the mesh fan-out is
+            // a deferred job without it.
+            let t0 = std::time::Instant::now();
+            match server.ingest_lite_stripe(&cert, &bundle) {
+                Ok(ingest) => {
+                    // F-02a: register only after the stripe was stored, for that stripe, and
+                    // before the fan-out.
+                    if let Some(grant) = repair_grant.clone() {
+                        if let Err(code) =
+                            por_verifier.register_repair_grant_for_stored(grant, &ingest.shard_ids)
+                        {
                             warn!(code, peer = %remote_peer_id, "repair grant not registered");
                         }
                     }
-                    MeshWireResponse::SyndicateLiteStripeAck {
-                        receipt: Some(receipt),
-                        syndicated_peers,
-                        error: None,
+                    info!(
+                        handler_ms = t0.elapsed().as_millis() as u64,
+                        shards = ingest.shard_ids.len(),
+                        "lite syndication ingested on the seed"
+                    );
+                    match server.lite_fan_out_plan(&ingest, repair_grant) {
+                        Ok(plan) => {
+                            *deferred = Some(DeferredJob::LiteFanOut(Box::new(plan)));
+                            // Not sent: the deferred job's response replaces it.
+                            MeshWireResponse::SyndicateLiteStripeAck {
+                                receipt: None,
+                                syndicated_peers: Vec::new(),
+                                error: None,
+                            }
+                        }
+                        Err((receipt, syndicated_peers)) => {
+                            MeshWireResponse::SyndicateLiteStripeAck {
+                                receipt: Some(receipt),
+                                syndicated_peers,
+                                error: None,
+                            }
+                        }
                     }
                 }
                 Err(e) => MeshWireResponse::SyndicateLiteStripeAck {
@@ -1581,13 +1815,19 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
         MeshWireRequest::QueryNodeStatus => {
             let rep = server.status_report(1);
             let available_bytes = rep.max_storage_bytes.saturating_sub(rep.used_storage_bytes);
+            // F-44: status is public, so values are coarse, never a host fingerprint. Free space
+            // is rounded DOWN to whole MiB (never overstated, so placement does not pick a node
+            // that then refuses; small nodes stay visible); used space is a power-of-two GiB
+            // bucket like the census beacon; SLA to one decimal.
+            let bucket = |b: u64| crate::telemetry::round_to_pow2_gib(b).saturating_mul(1 << 30);
+            let floor_mib = |b: u64| b - b % (1 << 20);
             MeshWireResponse::NodeStatusResult {
                 peer_id: server.server_peer_id().to_string(),
                 asn: 64512,
                 region: policy.status_region().to_string(),
-                available_bytes,
-                used_bytes: rep.used_storage_bytes,
-                sla_score: rep.sla_ratio,
+                available_bytes: floor_mib(available_bytes),
+                used_bytes: bucket(rep.used_storage_bytes),
+                sla_score: (rep.sla_ratio * 10.0).round() / 10.0,
                 pq_kem_pubkey: Some(pq_kem.public_key()),
             }
         }
@@ -1630,9 +1870,13 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                 } else {
                     Vec::new()
                 };
-            match wan_registry.register(slot_key, entry, now_unix_ms()) {
+            let source_subnet =
+                remote_ip.map(|ip| crate::bootstrap::canonical_sybil_subnet_key(ip, None));
+            // F-22: the admission-IP map is written only for admitted signers.
+            let signer_admitted = wot.is_peer_trusted(&signer_pk);
+            match wan_registry.register_from(slot_key, entry, now_unix_ms(), source_subnet) {
                 Ok(stored) => {
-                    if stored {
+                    if stored && signer_admitted {
                         if let Some(ip) = remote_ip {
                             let _ = eviction.record_peer_admission_ip(ip, signer_pk);
                         }
@@ -1695,25 +1939,74 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                 },
             }
         }
+        MeshWireRequest::GetCouncilManifest {
+            scope_root,
+            from_epoch,
+        } => MeshWireResponse::CouncilManifestResult {
+            manifests: crate::storage::council::council_chain_after(
+                data_dir, scope_root, from_epoch,
+            ),
+        },
         MeshWireRequest::BroadcastEvictionOrder(order) => {
-            let (council, min_quorum) =
-                policy.eviction_council(block_store, server.mode(), genesis_pubkey);
+            // One resolver for both roles (F-08): the installed, signed council manifest.
+            let council = crate::storage::council::council_from_manifest(data_dir, council_root);
+            // An order from a newer council epoch: refused below, and the newer manifest is
+            // fetched in the background from peers this node admitted (bounded).
+            // With no manifest yet, epoch 1 is fetched only when the scope root is the ring
+            // genesis (private mode, QA 2c D6). A public node's root is a TOFU-pinned tracker
+            // key, so its epoch 1 is an operator `council install`, never automatic (R1).
+            let may_fetch =
+                council.is_some() || (council_root.is_some() && council_root == genesis_pubkey);
+            if !may_fetch && order.council_epoch > 0 {
+                info!(
+                    code = "reject.council_first_epoch_needs_install",
+                    "no council installed and none fetched automatically (its scope root is not this node's ring genesis); install one with `parvault council install`"
+                );
+            }
+            if let (Some(root), Some(mc), true) =
+                (council_root, block_store.mesh_client(), may_fetch)
+            {
+                if order.council_epoch > council.as_ref().map_or(0, |c| c.epoch) {
+                    let admitted: Vec<String> = mc
+                        .all_network_endpoints()
+                        .into_iter()
+                        .filter(|ep| {
+                            crate::config::NodeConfig::extract_ed25519_pubkey_from_peer_str(ep)
+                                .is_some_and(|pk| wot.is_peer_trusted(&pk))
+                        })
+                        .collect();
+                    if let Err(code) = crate::network::council_fetch::spawn_council_fetch(
+                        mc.clone(),
+                        admitted,
+                        data_dir.to_path_buf(),
+                        root,
+                    ) {
+                        info!(code, "no council manifest fetch started");
+                    }
+                }
+            }
             let local_pk = node_identity.public_key_bytes();
             match eviction.apply_signed_eviction_order_with_quorum(
                 &order,
                 Some(&local_pk),
-                &council,
-                min_quorum,
+                council.as_ref(),
                 now_unix_ms(),
                 block_store,
             ) {
-                Ok(rep) => MeshWireResponse::EvictionOrderAck {
-                    accepted: true,
-                    purged_regular_shards: rep.purged_regular_shards,
-                    purged_blinded_shards: rep.purged_blinded_shards,
-                    zero_wiped_bytes: rep.zero_wiped_bytes,
-                    error: None,
-                },
+                Ok(rep) => {
+                    info!(
+                        order = %hex::encode(order.order_id),
+                        epoch = order.council_epoch,
+                        "applied an eviction order"
+                    );
+                    MeshWireResponse::EvictionOrderAck {
+                        accepted: true,
+                        purged_regular_shards: rep.purged_regular_shards,
+                        purged_blinded_shards: rep.purged_blinded_shards,
+                        zero_wiped_bytes: rep.zero_wiped_bytes,
+                        error: None,
+                    }
+                }
                 Err(err) => MeshWireResponse::EvictionOrderAck {
                     accepted: false,
                     purged_regular_shards: 0,
@@ -1743,7 +2036,7 @@ mod tests {
         FileManifest, ShardId, SignedDhtManifestEnvelope, VerifiableAbuseReport,
     };
 
-    /// One request per variant (19), each paired with the response variant name it must
+    /// One request per variant, each paired with the response variant name it must
     /// produce on rejection and whether that response carries the reason string.
     fn all_requests() -> Vec<(MeshWireRequest, &'static str, bool)> {
         let id = NodeIdentity::from_seed([7; 32]);
@@ -1759,7 +2052,7 @@ mod tests {
         let kem = HybridKemKeypair::generate().unwrap();
         let owner_pq = HybridPqSigningKeypair::generate().unwrap();
         let manifest = FileManifest {
-            version: 1,
+            version: 2,
             file_merkle_root: [5; 32],
             file_salt: [6; 32],
             original_file_size: 1,
@@ -1939,13 +2232,16 @@ mod tests {
                 true,
             ),
             (
-                MeshWireRequest::BroadcastEvictionOrder(SignedBadActorEvictionOrder::issue(
-                    &id,
-                    EvictionTarget::BlindedLocator([9; 32]),
-                    "t",
-                    1,
-                    0,
-                )),
+                MeshWireRequest::BroadcastEvictionOrder(
+                    crate::storage::SignedBadActorEvictionOrder::issue(
+                        &id,
+                        EvictionTarget::BlindedLocator([9; 32]),
+                        "t",
+                        1,
+                        0,
+                        0,
+                    ),
+                ),
                 "EvictionOrderAck",
                 true,
             ),
@@ -1956,13 +2252,21 @@ mod tests {
                 "AdmitPublicTicketAck",
                 true,
             ),
+            (
+                MeshWireRequest::GetCouncilManifest {
+                    scope_root: [3; 32],
+                    from_epoch: 0,
+                },
+                "CouncilManifestResult",
+                false,
+            ),
         ]
     }
 
     #[test]
     fn reject_response_matches_each_variant() {
         let reqs = all_requests();
-        assert_eq!(reqs.len(), 20);
+        assert_eq!(reqs.len(), 21);
         for (req, expected, carries_reason) in &reqs {
             let resp = format!("{:?}", reject_response(req, "admission-denied".into()));
             assert!(resp.starts_with(expected), "{expected}: {resp}");
@@ -2004,7 +2308,6 @@ mod tests {
             AdmissionClass::PreAdmission,
             AdmissionClass::SelfAuthorised,
             AdmissionClass::CouncilSigned,
-            AdmissionClass::RelayCarried,
         ] {
             assert_eq!(admission_decision(&facts(class, None, false)), Ok(()));
         }
@@ -2031,8 +2334,8 @@ mod tests {
             .collect();
         assert_eq!(
             admitted.len(),
-            4,
-            "PutShard, SyndicateLiteStripe, PutDhtEnvelope, PutBlindedShard: {admitted:?}"
+            6,
+            "PutShard, SyndicateLiteStripe, PutDhtEnvelope, PutBlindedShard, RelayPqOnionEnvelope (F-33), GetCouncilManifest: {admitted:?}"
         );
         assert_eq!(
             admission_class(&MeshWireRequest::QueryNodeStatus),

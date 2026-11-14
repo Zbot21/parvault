@@ -31,8 +31,8 @@ $$
 
 ## `v0.5.0` Enforcement
 
-- Vouchers are self-certifying in `v0.5.0` (the receiver trusts the issuer the voucher names; issuer policy is item 2c, F-24). Until then an onion final delivery needs an admitted sender: the last hop.
-- Onion routing hides the originator from the final target and the storage host, assuming the entry relay and the target do not collude. The entry relay always learns the originator's IP address and transport key, which in `v0.5.0` is its ring identity. The relay forwards to the final target under its own identity and presents its own chain.
+- A voucher is honoured only if its issuer is a ring member the receiver knows or the receiver's configured issuer (F-24). Ephemeral per-shard issuers (`mint_blinded_ephemeral`) are therefore refused in `v0.5.0`; unlinkable vouchers need the anonymous credentials planned for `v0.6.0`. Because the final target only honours an issuer it trusts, an onion voucher identifies its issuer to the target: originator anonymity toward the target holds only if the issuer is not the originator (for example a relay-issued voucher) (L-39). Every hop needs an admitted sender: the originator at the entry relay, and each relay at the next hop.
+- Onion routing hides the originator from the final target and the storage host, assuming the entry relay and the target do not collude. The entry relay always learns the originator's IP address and transport key, which in `v0.5.0` is its ring identity. The originator presents its ring credential at the entry relay and must be admitted there (F-33); each relay forwards under its own identity, is admitted at the next hop, and keeps at most 4 forwards in flight per sender and 64 in total (`reject.relay_budget`).
 - A single-layer envelope sent straight to the target is not anonymous.
 - No shipped command originates onions in `v0.5.0` (`OnionOriginator` has no production caller). Unlinkable entry (an ephemeral transport key plus an anonymous credential, or a PoW ticket in public mode) is planned for `v0.6.0`.
 - A direct `PutBlindedShard` is a hand-off between ring members (graceful leave), not anonymous origination, and needs an admitted sender.
@@ -41,3 +41,7 @@ $$
 
 - **Consequences:** Eliminates static disk grouping, PoR key correlation, quota ledger linkage, and single-hop IP exposure; paired with hedged parallel $N$-shard reads across degraded WANs.
 - **Verification:** `specs/ParVaultAnonymity.tla` (<!-- metric:tlc.distinct.ParVaultAnonymity -->`861`<!-- /metric --> distinct states, `0` errors) and `tests/anonymity_and_degraded_net_tests.rs` (`8/8` degraded network profiles).
+
+## v0.5.0: deletes (F-41)
+
+A blinded shard is deleted before lease expiry only on a fresh Ed25519 signature by the lease's registered capability key over `"parvault-delete-blinded-v1" || host_pubkey || locator || content_sha256 || timestamp_ms` (`DeleteBlindedShardSigned`, `blinded_delete_decision`). The host binding stops one host replaying a delete to other replicas. The capability bound to a locator is immutable while its lease exists (`blinded_rebind_decision`). The MAC tombstone keyed by `delete_verifier` is refused: the verifier is visible to hosts and relays. Leases stored without a capability key cannot be deleted and expire by lease. Read, renew and delete share the capability key; it is Ed25519 only in v0.5.0.

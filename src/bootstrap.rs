@@ -128,8 +128,13 @@ impl PersonalDeviceCert {
             &self.device_label,
             self.issued_unix_secs,
         );
-        if !HybridPqSigningKeypair::verify(&self.owner_root_pubkey, &digest, &self.owner_signature)
-        {
+        let halves = HybridPqSigningKeypair::verify_halves(
+            &self.owner_root_pubkey,
+            &digest,
+            &self.owner_signature,
+        );
+        if let Err(code) = crate::crypto::pqc::hybrid_signature_decision(&halves) {
+            tracing::warn!(code, device = %self.device_peer_id, "refused a personal device cert");
             return Err(BootstrapError::InvalidPersonalDeviceCert);
         }
         Ok(())
@@ -870,39 +875,18 @@ impl BlindedShardLeaseManager {
         }
     }
 
-    /// Immediately purges a blinded shard when the owner presents a valid `BlindedShardTombstone`
-    /// (graceful departure or file deletion). Blocks cross-generation tombstone replay (`ADR-15`).
-    pub fn execute_tombstone(&mut self, tombstone: &BlindedShardTombstone) -> bool {
-        if let Some(seen_macs) = self
-            .consumed_tombstone_macs
-            .get(&tombstone.blinded_shard_id)
-        {
-            if seen_macs.contains(&tombstone.delete_proof_mac) {
-                return false;
-            }
-        }
-        let Some(entry) = self.leases.get(&tombstone.blinded_shard_id) else {
+    /// Removes the lease of `blinded_shard_id` (after a signed delete, F-41). Its next
+    /// generation is recorded so a stale grant cannot reuse it.
+    pub fn remove_lease(&mut self, blinded_shard_id: &[u8; 32]) -> bool {
+        let Some(removed) = self.leases.remove(blinded_shard_id) else {
             return false;
         };
-        if tombstone.lease_generation > 0 && tombstone.lease_generation < entry.lease_generation {
-            return false;
-        }
-        if !tombstone.verify(&entry.delete_verifier) {
-            return false;
-        }
-        let next_gen = entry.lease_generation.saturating_add(1);
-        if let Some(removed) = self.leases.remove(&tombstone.blinded_shard_id) {
-            self.used_bytes = self.used_bytes.saturating_sub(removed.size_bytes);
-            self.next_generation_by_locator
-                .insert(tombstone.blinded_shard_id, next_gen);
-            self.consumed_tombstone_macs
-                .entry(tombstone.blinded_shard_id)
-                .or_default()
-                .push(tombstone.delete_proof_mac);
-            true
-        } else {
-            false
-        }
+        self.used_bytes = self.used_bytes.saturating_sub(removed.size_bytes);
+        self.next_generation_by_locator.insert(
+            *blinded_shard_id,
+            removed.lease_generation.saturating_add(1),
+        );
+        true
     }
 
     /// Evicts shards whose `lease_expires_epoch + grace_epochs <= current_epoch` (oldest first)
@@ -1080,6 +1064,125 @@ pub struct LiteSyndicationReceipt {
     pub mesh_peers_populated: usize,
 }
 
+/// B-SEED-SYND (L-46): a syndication job stops issuing puts after this, and answers with what
+/// landed (shorter than the client's 30 s `LITE_SYNDICATION_TIMEOUT`).
+pub const LITE_FANOUT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+/// B-SEED-SYND: puts in flight at once within one syndication job.
+pub const LITE_FANOUT_PARALLEL_PUTS: usize = 4;
+
+/// The result of the locked half of a lite syndication: the stripe and its shard ids, all stored
+/// on the seed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiteIngest {
+    pub stripe_index: u64,
+    pub stripe_merkle_root: Hash32,
+    pub shard_ids: Vec<ShardId>,
+}
+
+impl LiteIngest {
+    pub fn receipt(&self, mesh_peers_populated: usize) -> LiteSyndicationReceipt {
+        LiteSyndicationReceipt {
+            stripe_index: self.stripe_index,
+            stripe_merkle_root: self.stripe_merkle_root,
+            total_shards_syndicated: self.shard_ids.len(),
+            cached_on_seed_server: true,
+            mesh_peers_populated,
+        }
+    }
+}
+
+/// The lock-free half of a lite syndication: owns shard ids (not bytes; each shard is read back
+/// from the block store when sent), the peers and a mesh client.
+pub struct LiteFanOutPlan {
+    ingest: LiteIngest,
+    peers: Vec<String>,
+    server_peer_id: String,
+    client: crate::network::MeshClient,
+    block_store: BlockStore,
+    repair_grant: Option<crate::por::RepairGrant>,
+    session_key: [u8; 32],
+}
+
+/// Runs a lite fan-out (blocking; call off the swarm task, without the seed's lock). Shards go
+/// out `parallel` at a time, keeping the replica rule (3 replicas when peers < shards, else 1);
+/// a peer whose put fails once gets no further puts in this job (dead set); no new put starts
+/// after `deadline`. The receipt names only peers that acknowledged.
+pub fn run_lite_fan_out(
+    plan: LiteFanOutPlan,
+    deadline: std::time::Duration,
+    parallel: usize,
+) -> (LiteSyndicationReceipt, Vec<String>) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    let stop_at = std::time::Instant::now() + deadline;
+    let shard_count = plan.ingest.shard_ids.len();
+    let num_peers = plan.peers.len();
+    let replica_shifts = if num_peers < shard_count {
+        3usize.min(num_peers)
+    } else {
+        1
+    };
+    // Per-peer gate: puts to one peer are serialized and the gate holds "dead", so a peer that
+    // fails once (e.g. silent until the timeout) gets exactly one put per job, even with
+    // `parallel` workers; different peers still run in parallel.
+    let unique: HashSet<&str> = plan.peers.iter().map(String::as_str).collect();
+    let gates: std::collections::HashMap<&str, Mutex<bool>> =
+        unique.into_iter().map(|p| (p, Mutex::new(false))).collect();
+    let primary: Mutex<Vec<Option<String>>> = Mutex::new(vec![None; shard_count]);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..parallel.max(1) {
+            scope.spawn(|| loop {
+                let idx = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if idx >= shard_count || std::time::Instant::now() >= stop_at {
+                    break;
+                }
+                let shard_id = plan.ingest.shard_ids[idx];
+                let Ok(bytes) = plan.block_store.get_shard(&shard_id) else {
+                    continue;
+                };
+                for shift in 0..replica_shifts {
+                    if std::time::Instant::now() >= stop_at {
+                        break;
+                    }
+                    let target = &plan.peers[(idx + shift) % num_peers];
+                    let Some(gate) = gates.get(target.as_str()) else {
+                        continue;
+                    };
+                    let mut dead = gate.lock().unwrap_or_else(|p| p.into_inner());
+                    if *dead || std::time::Instant::now() >= stop_at {
+                        continue;
+                    }
+                    // Accounted to the sender (v0.5.0 owner rule).
+                    let put = plan.client.put_shard(
+                        target,
+                        "",
+                        shard_id,
+                        bytes.clone(),
+                        plan.session_key,
+                        plan.repair_grant.clone(),
+                    );
+                    if put.is_ok() {
+                        let mut p = primary.lock().unwrap_or_else(|p| p.into_inner());
+                        if p[idx].is_none() {
+                            p[idx] = Some(target.clone());
+                        }
+                    } else {
+                        *dead = true;
+                    }
+                }
+            });
+        }
+    });
+    let primary = primary.into_inner().unwrap_or_else(|p| p.into_inner());
+    let populated = primary.iter().filter(|p| p.is_some()).count();
+    let syndicated_peers = primary
+        .into_iter()
+        .map(|p| p.unwrap_or_else(|| plan.server_peer_id.clone()))
+        .collect();
+    (plan.ingest.receipt(populated), syndicated_peers)
+}
+
 /// Route used by a Lite Client when selectively restoring files or byte ranges (`ADR-17`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LiteRestoreRoute {
@@ -1169,6 +1272,11 @@ impl ZeroTrustSeedServer {
 
     pub const fn mode(&self) -> SeedServerMode {
         self.mode
+    }
+
+    /// The homelab owner's root public key, if this seed has one.
+    pub fn owner_root_pubkey(&self) -> Option<&HybridPqPublicKey> {
+        self.owner_root_pubkey.as_ref()
     }
 
     pub fn block_store(&self) -> &BlockStore {
@@ -1270,96 +1378,94 @@ impl ZeroTrustSeedServer {
         mesh_peer_stores: &[&BlockStore],
         repair_grant: Option<crate::por::RepairGrant>,
     ) -> Result<(LiteSyndicationReceipt, Vec<String>), BootstrapError> {
-        self.authorize_personal_device(cert)?;
+        let ingest = self.ingest_lite_stripe(cert, bundle)?;
+        if !mesh_peer_stores.is_empty() {
+            // In-process mesh stores (tests and embedded callers): no network RPC.
+            let mut syndicated_peers = Vec::with_capacity(ingest.shard_ids.len());
+            for (idx, shard_id) in ingest.shard_ids.iter().enumerate() {
+                let bytes = self.block_store.get_shard(shard_id)?;
+                let target = mesh_peer_stores[idx % mesh_peer_stores.len()];
+                target.put_shard(&self.server_peer_id, shard_id, &bytes)?;
+                syndicated_peers.push(self.server_peer_id.clone());
+            }
+            let n = syndicated_peers.len();
+            return Ok((ingest.receipt(n), syndicated_peers));
+        }
+        Ok(match self.lite_fan_out_plan(&ingest, repair_grant) {
+            Ok(plan) => run_lite_fan_out(plan, LITE_FANOUT_DEADLINE, LITE_FANOUT_PARALLEL_PUTS),
+            Err(done) => done,
+        })
+    }
 
+    /// B-SEED-SYND (L-46), the part under the seed's lock: device cert, encode, integrity check
+    /// and the hot copy of every shard in the seed's own ring. No outbound RPC.
+    pub fn ingest_lite_stripe(
+        &mut self,
+        cert: &PersonalDeviceCert,
+        bundle: &LiteStripeSyndicationBundle,
+    ) -> Result<LiteIngest, BootstrapError> {
+        self.authorize_personal_device(cert)?;
         let shard_set = crate::sharding::encode_ciphertext_stripe(
             bundle.stripe_index,
             &bundle.ciphertext_bytes,
             bundle.tier,
         )
         .map_err(|e| BootstrapError::ReedSolomon(e.to_string()))?;
-
         if shard_set.stripe_merkle_root != bundle.expected_stripe_merkle_root
             || shard_set.shard_hashes != bundle.expected_shard_hashes
         {
             return Err(BootstrapError::CiphertextIntegrityMismatch);
         }
-
-        let total_shards = shard_set.shards.len();
-        let mut mesh_peers_populated = 0usize;
-        let mut syndicated_peers = Vec::with_capacity(total_shards);
-
+        let mut shard_ids = Vec::with_capacity(shard_set.shards.len());
         for (idx, shard_bytes) in shard_set.shards.iter().enumerate() {
             let shard_id = ShardId {
                 stripe_merkle_root: shard_set.stripe_merkle_root,
                 shard_index: idx as u32,
                 shard_hash: shard_set.shard_hashes[idx],
             };
-            // 1. Store hot copy in the seed server's own zero-quota personal ring
             self.block_store.put_shard("self", &shard_id, shard_bytes)?;
-
-            // 2. Syndicate out to external Neighborhood Cloud mesh peers
-            if !mesh_peer_stores.is_empty() {
-                let target_peer_store = mesh_peer_stores[idx % mesh_peer_stores.len()];
-                target_peer_store.put_shard(&self.server_peer_id, &shard_id, shard_bytes)?;
-                mesh_peers_populated += 1;
-                syndicated_peers.push(self.server_peer_id.clone());
-            } else if let Some(client) = self.block_store.mesh_client() {
-                let peers = client.peers();
-                if !peers.is_empty() {
-                    let num_peers = peers.len();
-                    let replica_shifts = if num_peers < total_shards {
-                        3usize.min(num_peers)
-                    } else {
-                        1usize
-                    };
-                    let session_key = client
-                        .identity()
-                        .derive_stripe_por_session_key(&shard_set.stripe_merkle_root);
-                    let mut primary_target = None;
-                    for shift in 0..replica_shifts {
-                        let target_addr = &peers[(idx + shift) % num_peers];
-                        if client
-                            .put_shard(
-                                target_addr,
-                                // Accounted to the sender (v0.5.0 owner rule); the server id
-                                // is a label such as "parvault-seed-homelab-vault", not a key.
-                                "",
-                                shard_id,
-                                shard_bytes.clone(),
-                                session_key,
-                                repair_grant.clone(),
-                            )
-                            .is_ok()
-                            && primary_target.is_none()
-                        {
-                            primary_target = Some(target_addr.clone());
-                        }
-                    }
-                    if let Some(chosen) = primary_target {
-                        mesh_peers_populated += 1;
-                        syndicated_peers.push(chosen);
-                    } else {
-                        syndicated_peers.push(self.server_peer_id.clone());
-                    }
-                } else {
-                    syndicated_peers.push(self.server_peer_id.clone());
-                }
-            } else {
-                syndicated_peers.push(self.server_peer_id.clone());
-            }
+            shard_ids.push(shard_id);
         }
+        Ok(LiteIngest {
+            stripe_index: bundle.stripe_index,
+            stripe_merkle_root: shard_set.stripe_merkle_root,
+            shard_ids,
+        })
+    }
 
-        Ok((
-            LiteSyndicationReceipt {
-                stripe_index: bundle.stripe_index,
-                stripe_merkle_root: shard_set.stripe_merkle_root,
-                total_shards_syndicated: total_shards,
-                cached_on_seed_server: true,
-                mesh_peers_populated,
-            },
-            syndicated_peers,
-        ))
+    /// B-SEED-SYND: what the fan-out needs, owned, so it runs without the seed's lock. `Err`
+    /// carries the finished result when the seed has no mesh client or no peers (the receipt then
+    /// names only the seed).
+    pub fn lite_fan_out_plan(
+        &self,
+        ingest: &LiteIngest,
+        repair_grant: Option<crate::por::RepairGrant>,
+    ) -> Result<LiteFanOutPlan, (LiteSyndicationReceipt, Vec<String>)> {
+        let seed_only = || {
+            (
+                ingest.receipt(0),
+                vec![self.server_peer_id.clone(); ingest.shard_ids.len()],
+            )
+        };
+        let Some(client) = self.block_store.mesh_client() else {
+            return Err(seed_only());
+        };
+        let peers = client.peers();
+        if peers.is_empty() {
+            return Err(seed_only());
+        }
+        let session_key = client
+            .identity()
+            .derive_stripe_por_session_key(&ingest.stripe_merkle_root);
+        Ok(LiteFanOutPlan {
+            ingest: ingest.clone(),
+            peers: peers.to_vec(),
+            server_peer_id: self.server_peer_id.clone(),
+            client: client.clone(),
+            block_store: self.block_store.clone(),
+            repair_grant,
+            session_key,
+        })
     }
 
     /// Returns the reciprocity quota tax charged against `device_peer_id` (always `0` for authorized
@@ -1379,8 +1485,9 @@ impl ZeroTrustSeedServer {
         self.reachable_seed_anchors = seed_anchors;
     }
 
-    /// Records a Proof-of-Retrievability (`PoR`) heartbeat outcome on this dedicated server,
-    /// advancing its earned `TrustLevel` toward `HighUptimeAnchor` (`16-of-20`).
+    /// Records a Proof-of-Retrievability (`PoR`) outcome in this server's own ledger. No network
+    /// path calls it: a node never credits itself for answering a challenge (F-07), so earned
+    /// standing is self-reported. Used by `simulate_por_heartbeats` for self-tests.
     pub fn record_por_heartbeat(&mut self, passed: bool) {
         if passed {
             self.server_credit_account.por_passes =
@@ -1389,15 +1496,13 @@ impl ZeroTrustSeedServer {
             self.server_credit_account.por_failures =
                 self.server_credit_account.por_failures.saturating_add(1);
         }
-        if self.reachable_organic_peers == 0 {
-            self.reachable_organic_peers = 20;
-        }
         if let Ok(mut q) = self.block_store.quota().lock() {
             q.record_por_outcome(&self.server_peer_id, passed);
         }
     }
 
     /// Simulates `count` consecutive passed PoR heartbeats with `reachable_organic_peers` neighbors.
+    /// Self-test and test fixture only: no network path calls it (F-07).
     pub fn simulate_por_heartbeats(&mut self, count: u64, reachable_organic_peers: usize) {
         self.reachable_organic_peers = reachable_organic_peers;
         for _ in 0..count {
@@ -1434,14 +1539,16 @@ impl ZeroTrustSeedServer {
         timestamp_ms: u64,
         read_sig: &[u8; 64],
         challenge_nonce: &[u8; 32],
+        now_ms: u64,
     ) -> Result<[u8; 32], BootstrapError> {
         let bytes = self.block_store.get_blinded_shard_authorized(
             blinded_id,
             capability,
             timestamp_ms,
             read_sig,
+            now_ms,
         )?;
-        self.record_por_heartbeat(true);
+        // No self-credit for answering (F-07).
         Ok(compute_salted_commitment(challenge_nonce, &bytes))
     }
 
@@ -1465,18 +1572,6 @@ impl ZeroTrustSeedServer {
         Ok(self
             .block_store
             .sweep_expired_blinded_shards(current_epoch)?)
-    }
-
-    /// Executes an immediate `BlindedShardTombstone` deletion (used when a shard is drained to an
-    /// organic peer or explicitly deleted by its owner) and unlinks `{locator}.bshard` from disk.
-    pub fn execute_blinded_tombstone(
-        &mut self,
-        blinded_id: &BlindedShardId,
-        tombstone: &BlindedShardTombstone,
-    ) -> Result<bool, BootstrapError> {
-        Ok(self
-            .block_store
-            .delete_blinded_shard_with_tombstone(blinded_id, tombstone)?)
     }
 
     /// Computes drain migration steps (`ElasticBootstrapEngine::plan_seed_anchor_drain`) to hand

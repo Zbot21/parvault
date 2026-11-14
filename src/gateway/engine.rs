@@ -122,6 +122,57 @@ impl Default for GatewayConfig {
     }
 }
 
+/// ADR-28 (D-ADR): what the per-frame macaroon decision needs to know about one gateway read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatewayMacaroonFacts {
+    /// The gateway holds a macaroon root key (every read must then carry a valid token).
+    pub root_key_set: bool,
+    /// The frame carries a macaroon.
+    pub token_present: bool,
+    /// Its HMAC chain is valid under the root key (only meaningful with a root key).
+    pub tag_valid: bool,
+    /// Every caveat allows this frame's manifest, offset, length, time and peer UID.
+    pub caveats_allow: bool,
+}
+
+/// ADR-28: a gateway read frame is served only if, with a root key, it carries a valid token, and
+/// any token it carries allows this frame (attenuation is enforced per frame).
+pub fn gateway_macaroon_decision(facts: &GatewayMacaroonFacts) -> Result<(), &'static str> {
+    if facts.root_key_set && !facts.token_present {
+        return Err("reject.gateway_macaroon_missing");
+    }
+    if facts.root_key_set && !facts.tag_valid {
+        return Err("reject.gateway_macaroon_invalid");
+    }
+    if facts.token_present && !facts.caveats_allow {
+        return Err("reject.gateway_macaroon_caveat");
+    }
+    Ok(())
+}
+
+/// ADR-32: under `--require-sealed-memfd`, an ingest memfd must carry
+/// `F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW`.
+pub fn gateway_memfd_seal_decision(require_sealed: bool, sealed: bool) -> Result<(), &'static str> {
+    if require_sealed && !sealed {
+        return Err("reject.gateway_memfd_unsealed");
+    }
+    Ok(())
+}
+
+/// ADR-32: under `--allow-peer-uid`, a client's kernel-reported (`SO_PEERCRED`) UID must be on
+/// the allowlist; an unknown UID is refused.
+pub fn gateway_peer_uid_decision(
+    allowlist: Option<&[u32]>,
+    peer_uid: Option<u32>,
+) -> Result<(), &'static str> {
+    match allowlist {
+        Some(allowed) if !peer_uid.is_some_and(|uid| allowed.contains(&uid)) => {
+            Err("reject.gateway_peer_uid_not_allowed")
+        }
+        _ => Ok(()),
+    }
+}
+
 #[cfg(unix)]
 mod unix_engine {
     use super::*;
@@ -437,15 +488,30 @@ mod unix_engine {
                 .and_then(|g| g.clone())
         }
 
+        /// ADR-32: whether `peer_uid` satisfies any active `strict_allowed_peer_uids` policy
+        /// (`gateway_peer_uid_decision`).
+        pub fn peer_uid_decision(&self, peer_uid: Option<u32>) -> Result<(), &'static str> {
+            let Ok(guard) = self.strict_allowed_peer_uids.read() else {
+                return gateway_peer_uid_decision(Some(&[]), peer_uid);
+            };
+            gateway_peer_uid_decision(guard.as_deref(), peer_uid)
+        }
+
         /// Evaluates whether `peer_uid` satisfies any active `strict_allowed_peer_uids` policy.
         pub fn is_peer_uid_allowed(&self, peer_uid: Option<u32>) -> bool {
-            let Ok(guard) = self.strict_allowed_peer_uids.read() else {
-                return false;
-            };
-            match guard.as_ref() {
-                None => true,
-                Some(allowed) => peer_uid.map(|uid| allowed.contains(&uid)).unwrap_or(false),
-            }
+            self.peer_uid_decision(peer_uid).is_ok()
+        }
+
+        /// ADR-32: whether an ingest memfd passes `require_sealed_ingest_memfd`
+        /// (`gateway_memfd_seal_decision`).
+        pub fn ingest_seal_decision(
+            &self,
+            fd: std::os::fd::BorrowedFd<'_>,
+        ) -> Result<(), &'static str> {
+            gateway_memfd_seal_decision(
+                self.require_sealed_ingest_memfd(),
+                crate::os_sys::has_immutable_memfd_seals(fd).unwrap_or(false),
+            )
         }
 
         /// Builder-style configuration requiring immutable Linux `memfd` seals (`F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW`)
@@ -533,11 +599,10 @@ mod unix_engine {
             bytes_len: u64,
             retention: RetentionPolicy,
         ) -> anyhow::Result<EphemeralShardManifest> {
-            if self.require_sealed_ingest_memfd()
-                && !crate::os_sys::has_immutable_memfd_seals(payload_fd.as_fd()).unwrap_or(false)
-            {
+            if let Err(code) = self.ingest_seal_decision(payload_fd.as_fd()) {
+                tracing::warn!(code, "refused an unsealed ingest memfd");
                 anyhow::bail!(
-                    "unsealed ingest memfd rejected (F_SEAL_WRITE|F_SEAL_SHRINK|F_SEAL_GROW required)"
+                    "unsealed ingest memfd rejected (F_SEAL_WRITE|F_SEAL_SHRINK|F_SEAL_GROW required): {code}"
                 );
             }
             let mut file = File::from(payload_fd);
@@ -627,16 +692,10 @@ mod unix_engine {
                     vec![(*self.owner_peer_id).clone(); n_total]
                 };
 
-                stripes.push(StripeManifestEntry {
-                    stripe_index,
-                    k_data: shard_set.k_data,
-                    m_parity: shard_set.m_parity,
-                    original_ciphertext_len: shard_set.original_ciphertext_len,
-                    shard_len: shard_set.shard_len,
-                    stripe_merkle_root: shard_set.stripe_merkle_root,
-                    shard_hashes: shard_set.shard_hashes,
+                stripes.push(StripeManifestEntry::from_shard_set(
+                    shard_set,
                     assigned_peers,
-                });
+                ));
 
                 self.ops_counter.fetch_add(1, Ordering::Relaxed);
                 self.bytes_ingested
@@ -655,7 +714,7 @@ mod unix_engine {
 
             let file_merkle_root = compute_file_merkle_root(&stripe_roots);
             let fm = FileManifest {
-                version: 1,
+                version: crate::storage::block_store::FILE_MANIFEST_VERSION,
                 file_merkle_root,
                 file_salt,
                 original_file_size: total_size,
@@ -738,9 +797,10 @@ mod unix_engine {
             peer_uid: Option<u32>,
             output_fd: OwnedFd,
         ) -> anyhow::Result<u64> {
-            if !self.is_peer_uid_allowed(peer_uid) {
+            if let Err(code) = self.peer_uid_decision(peer_uid) {
+                tracing::warn!(code, ?peer_uid, "refused a gateway read from a peer UID");
                 anyhow::bail!(
-                    "peer UID {:?} rejected by strict_allowed_peer_uids policy",
+                    "peer UID {:?} rejected by strict_allowed_peer_uids policy: {code}",
                     peer_uid
                 );
             }
@@ -758,19 +818,19 @@ mod unix_engine {
                 peer_uid,
             };
 
-            if let Some(root_key) = required_key {
-                let token = macaroon.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Macaroon capability rejected: missing CapabilityMacaroon for protected gateway read"
-                    )
-                })?;
-                token
-                    .verify_in_ram(&root_key, &ctx)
-                    .map_err(|e| anyhow::anyhow!("Macaroon capability rejected: {e}"))?;
-            } else if let Some(token) = macaroon {
-                if !token.evaluate_caveats(&ctx) {
-                    anyhow::bail!("Macaroon capability rejected: caveat rejected");
-                }
+            // ADR-28: checked per frame, before any manifest or block-store lookup.
+            let facts = crate::gateway::engine::GatewayMacaroonFacts {
+                root_key_set: required_key.is_some(),
+                token_present: macaroon.is_some(),
+                tag_valid: match (required_key.as_ref(), macaroon) {
+                    (Some(key), Some(token)) => token.tag_valid(key),
+                    _ => false,
+                },
+                caveats_allow: macaroon.is_some_and(|t| t.evaluate_caveats(&ctx)),
+            };
+            if let Err(code) = crate::gateway::engine::gateway_macaroon_decision(&facts) {
+                tracing::warn!(code, "refused a gateway read frame");
+                anyhow::bail!("Macaroon capability rejected: {code}");
             }
 
             let fm = self.resolve_manifest(manifest)?;

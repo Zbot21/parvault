@@ -21,6 +21,8 @@ Commitment = SHA-256(ChallengeNonce || ShardBytes[Offset .. Offset + Length])
 
 2. **Delegated Witness Auditing:** Cohort witness nodes hold only the per-stripe challenge key (or per-shard `BlindedShardCapability` public key in anonymized mode per [ADR-11](ADR-11-four-layer-shard-anonymization.md)) so routine PoR challenges continue while the owner device sleeps, without granting witnesses decryption capability.
 
+3. **Per-shard chunk roots (manifest version 2):** every new `StripeManifestEntry` records `shard_chunk_roots`, one root per shard over its `4 KiB` chunks (`por::chunk_merkle`): `leaf = SHA-256(0x00 || u32_le(i) || u32_le(n) || chunk)`, `node = SHA-256(0x01 || l || r)` with the last odd node promoted, `root = SHA-256(0x02 || u32_le(n) || tree_root)`. Index and count are bound into each leaf. The audit loop that challenges chunks against these roots does not issue challenges yet (`F-06`). Manifests written before version 2 decode with no roots and cannot be chunk-audited.
+
 ## Consequences & Verification
 
 - **Consequences:** Invalid or replayed audit packets are dropped in nanoseconds with zero disk seeks, while honest storage peers prove physical byte retention in bounded RAM.

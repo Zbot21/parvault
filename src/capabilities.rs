@@ -35,6 +35,38 @@ pub const MACAROON_CAVEAT_DOMAIN: &[u8] = b"parvault-macaroon-caveat-v1:";
 /// Domain separator for composite `Ed25519 + ML-DSA-65` [`GatewayIdentityStatement`] signatures.
 pub const GATEWAY_STATEMENT_DOMAIN: &[u8] = b"parvault-gateway-identity-statement-v1:";
 
+/// Longest lifetime of a [`GatewayIdentityStatement`] (`expires - issued`): 30 days (F-17).
+pub const MAX_GATEWAY_STATEMENT_LIFETIME_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+/// Largest clock skew allowed for a statement's issue time (5 minutes, as eviction orders).
+pub const GATEWAY_STATEMENT_FUTURE_SKEW_MS: u64 = 5 * 60 * 1000;
+
+/// F-17: a gateway statement counts only if its authority is the one the verifier pinned and its
+/// expiry is bounded (`issued < expires <= issued + 30 days`) and not yet passed.
+pub fn gateway_statement_decision(
+    authority_pinned: bool,
+    issued_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+    now_unix_ms: u64,
+) -> Result<(), &'static str> {
+    if !authority_pinned {
+        return Err("reject.gateway_authority_unpinned");
+    }
+    if expires_at_unix_ms <= issued_at_unix_ms
+        || expires_at_unix_ms - issued_at_unix_ms > MAX_GATEWAY_STATEMENT_LIFETIME_MS
+    {
+        return Err("reject.gateway_statement_unbounded");
+    }
+    // QA 2c D4: issued at most 5 minutes in the future (the eviction-order clock skew).
+    if issued_at_unix_ms > now_unix_ms.saturating_add(GATEWAY_STATEMENT_FUTURE_SKEW_MS) {
+        return Err("reject.gateway_statement_future");
+    }
+    if now_unix_ms > expires_at_unix_ms {
+        return Err("reject.gateway_statement_expired");
+    }
+    Ok(())
+}
+
 /// Compact shareable ASCII prefix for `CapabilityMacaroon` tokens (`ADR-28` / `ADR-32`).
 pub const COMPACT_MACAROON_PREFIX: &str = "PARVAULT-MAC-V1:";
 
@@ -283,6 +315,50 @@ fn chain_caveat_tag(prev_tag: &[u8; 32], caveat: &Caveat) -> [u8; 32] {
     out
 }
 
+impl std::fmt::Debug for CapabilityMacaroon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapabilityMacaroon")
+            .field("nonce_id_prefix", &hex::encode(&self.nonce_id[..4]))
+            .field("caveats", &self.caveats)
+            .field("tag", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for MacaroonSliceView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MacaroonSliceView")
+            .field("nonce_id_prefix", &hex::encode(&self.nonce_id[..4]))
+            .field("caveats", &self.caveats)
+            .field("tag", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+/// F-43 (L-44 item 4): whether `child` is `parent` itself or an offline attenuation of it,
+/// checked without the root key. Same `nonce_id` and `issuer_fingerprint`; `child`'s caveats begin
+/// with exactly `parent`'s; at most `MAX_MACAROON_CAVEATS` in total; `child`'s tag equals the chain
+/// recomputed from `parent`'s tag over the extra caveats (zero extras: equal tags), compared in
+/// constant time. Caveats are not evaluated here.
+///
+/// For `parvault-fuse webdav`, a block-cache hit never reaches the gateway, so this check (with
+/// the WebDAV edge's caveat evaluation) is the only check on that read (L-44 item 4).
+pub fn is_attenuation_of(parent: &CapabilityMacaroon, child: &CapabilityMacaroon) -> bool {
+    if !ct_eq_32(&parent.nonce_id, &child.nonce_id)
+        || !ct_eq_32(&parent.issuer_fingerprint, &child.issuer_fingerprint)
+        || child.caveats.len() > MAX_MACAROON_CAVEATS
+        || child.caveats.len() < parent.caveats.len()
+        || child.caveats[..parent.caveats.len()] != parent.caveats[..]
+    {
+        return false;
+    }
+    let mut tag = parent.tag;
+    for caveat in &child.caveats[parent.caveats.len()..] {
+        tag = chain_caveat_tag(&tag, caveat);
+    }
+    ct_eq_32(&tag, &child.tag)
+}
+
 /// Constant-time 32-byte tag equality check (zero early-exit timing side channels).
 #[inline]
 pub const fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
@@ -318,7 +394,8 @@ pub const fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
 
 /// Borrowed zero-allocation view over a [`CapabilityMacaroon`] used by in-RAM slice verifiers
 /// and Kani formal proof harnesses.
-#[derive(Debug, Clone, Copy)]
+/// `Debug` is manual and redacts the tag, as for [`CapabilityMacaroon`].
+#[derive(Clone, Copy)]
 pub struct MacaroonSliceView<'a> {
     pub nonce_id: &'a [u8; 32],
     pub issuer_fingerprint: &'a [u8; 32],
@@ -333,7 +410,9 @@ pub type DecodedCompactMacaroon<const MAX_C: usize> =
 
 /// HMAC-SHA256 chained capability token enabling zero-knowledge, `< 1 ms` RAM-only authorization
 /// of constrained manifest and byte-range reads without sharing `MasterKey` or `root_key`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `Debug` is manual and redacts the tag (the bearer secret) so a stray `{:?}` cannot leak a
+/// usable token (F-43, L-44 item 8).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityMacaroon {
     pub nonce_id: [u8; 32],
     pub issuer_fingerprint: [u8; 32],
@@ -416,6 +495,20 @@ impl CapabilityMacaroon {
             compute_root_macaroon_tag,
             chain_caveat_tag,
         )
+    }
+
+    /// Whether this token's HMAC chain is valid under `root_key`, in constant time. Caveats are
+    /// not evaluated: callers check them against the request separately (F-43 WebDAV edge).
+    pub fn tag_valid(&self, root_key: &[u8; 32]) -> bool {
+        Self::mint_slice_tag_with(
+            root_key,
+            &self.nonce_id,
+            &self.issuer_fingerprint,
+            &self.caveats,
+            compute_root_macaroon_tag,
+            chain_caveat_tag,
+        )
+        .is_ok_and(|expected| ct_eq_32(&expected, &self.tag))
     }
 
     /// Publicly attenuates this Macaroon parameterized by `chain_prf` (`attenuate` instantiates
@@ -733,17 +826,34 @@ impl GatewayIdentityStatement {
         })
     }
 
-    /// Verifies structural bounds, expiration (`expires_at_unix_ms == 0 || now_unix_ms <= expires_at_unix_ms`),
-    /// AND both legs of the composite `Ed25519 + NIST FIPS 204 ML-DSA-65` signature.
-    pub fn verify(&self, now_unix_ms: u64) -> bool {
+    /// Verifies the statement against the authority the caller pinned (F-17): the decision
+    /// ([`gateway_statement_decision`]: pinned authority, bounded and unexpired lifetime), the
+    /// structural bounds, and both legs of the composite `Ed25519 + ML-DSA-65` signature. There is
+    /// no unpinned verify: a statement signed by any other authority is refused.
+    pub fn verify_pinned(
+        &self,
+        expected_authority: &HybridPqPublicKey,
+        now_unix_ms: u64,
+    ) -> Result<(), &'static str> {
+        gateway_statement_decision(
+            self.authority_pq_pubkey == *expected_authority,
+            self.issued_at_unix_ms,
+            self.expires_at_unix_ms,
+            now_unix_ms,
+        )?;
+        if self.verify_signature() {
+            Ok(())
+        } else {
+            Err("reject.gateway_statement_invalid")
+        }
+    }
+
+    fn verify_signature(&self) -> bool {
         if self.gateway_id.is_empty()
             || self.gateway_id.len() > MAX_GATEWAY_ID_BYTES
             || self.ed25519_transport_pubkey == [0u8; 32]
             || self.noise_static_x25519_pubkey == [0u8; 32]
         {
-            return false;
-        }
-        if self.expires_at_unix_ms != 0 && now_unix_ms > self.expires_at_unix_ms {
             return false;
         }
         let payload = Self::canonical_sign_bytes(
@@ -785,6 +895,52 @@ impl GatewayIdentityStatement {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// F-17 accept: a statement from the pinned authority with a bounded lifetime verifies.
+    #[test]
+    fn f17_pinned_authority_statement_accepted() {
+        let authority = HybridPqSigningKeypair::generate().unwrap();
+        let stmt =
+            GatewayIdentityStatement::issue(&authority, "gw-1", [0x11; 32], [0x22; 32], 1, 60_000)
+                .unwrap();
+        assert_eq!(stmt.verify_pinned(&authority.public_key(), 30_000), Ok(()));
+    }
+
+    /// F-17 reject: a validly signed statement from another authority is refused, and so is a
+    /// pinned one that never expires or outlives 30 days.
+    #[test]
+    fn f17_unpinned_authority_statement_refused() {
+        let pinned = HybridPqSigningKeypair::generate().unwrap();
+        let rogue = HybridPqSigningKeypair::generate().unwrap();
+        let stmt =
+            GatewayIdentityStatement::issue(&rogue, "gw-1", [0x11; 32], [0x22; 32], 1, 60_000)
+                .unwrap();
+        assert_eq!(
+            stmt.verify_pinned(&pinned.public_key(), 30_000),
+            Err("reject.gateway_authority_unpinned")
+        );
+        let future = GatewayIdentityStatement::issue(
+            &pinned, "gw-1", [0x11; 32], [0x22; 32], 10_000_000, 10_060_000,
+        )
+        .unwrap();
+        assert_eq!(
+            future.verify_pinned(
+                &pinned.public_key(),
+                10_000_000 - GATEWAY_STATEMENT_FUTURE_SKEW_MS - 1
+            ),
+            Err("reject.gateway_statement_future")
+        );
+        for expires in [0, 1 + MAX_GATEWAY_STATEMENT_LIFETIME_MS + 1] {
+            let stmt = GatewayIdentityStatement::issue(
+                &pinned, "gw-1", [0x11; 32], [0x22; 32], 1, expires,
+            )
+            .unwrap();
+            assert_eq!(
+                stmt.verify_pinned(&pinned.public_key(), 2),
+                Err("reject.gateway_statement_unbounded")
+            );
+        }
+    }
 
     #[test]
     fn test_macaroon_sub_millisecond_ram_verification_and_attenuation() {
@@ -905,12 +1061,19 @@ mod tests {
         )
         .expect("issue statement");
 
-        assert!(stmt.verify(25_000));
-        assert!(!stmt.verify(60_001)); // Expired
+        let pinned = authority.public_key();
+        assert_eq!(stmt.verify_pinned(&pinned, 25_000), Ok(()));
+        assert_eq!(
+            stmt.verify_pinned(&pinned, 60_001),
+            Err("reject.gateway_statement_expired")
+        );
 
         let mut tampered = stmt.clone();
         tampered.noise_static_x25519_pubkey[0] ^= 0xFF;
-        assert!(!tampered.verify(25_000));
+        assert_eq!(
+            tampered.verify_pinned(&pinned, 25_000),
+            Err("reject.gateway_statement_invalid")
+        );
     }
 
     #[test]
@@ -1269,5 +1432,80 @@ mod kani_proofs {
             CapabilityMacaroon::decode_compact_into::<2>(&wire_two[..used_two]).err(),
             Some(CapabilityError::TooManyCaveats(over as usize))
         );
+    }
+}
+
+#[cfg(test)]
+mod f43_attenuation_tests {
+    use super::*;
+
+    const K: [u8; 32] = [0x43; 32];
+
+    fn parent() -> CapabilityMacaroon {
+        CapabilityMacaroon::mint(&K, [1; 32], [2; 32], vec![Caveat::ReadOnly]).unwrap()
+    }
+
+    #[test]
+    fn pinned_token_and_its_attenuation_accepted() {
+        let p = parent();
+        assert!(is_attenuation_of(&p, &p));
+        let child = p.attenuate(Caveat::ExpiresAtUnixMs(u64::MAX)).unwrap();
+        assert!(is_attenuation_of(&p, &child));
+        let grandchild = child
+            .attenuate(Caveat::ByteRange {
+                offset: 0,
+                length: 9,
+            })
+            .unwrap();
+        assert!(is_attenuation_of(&p, &grandchild));
+        assert!(p.tag_valid(&K) && grandchild.tag_valid(&K));
+        assert!(!p.tag_valid(&[0x44; 32]));
+    }
+
+    /// L-44 item 8: `{:?}` of a token never prints its tag (or its full nonce).
+    #[test]
+    fn debug_redacts_the_tag() {
+        let p = parent();
+        let text = format!("{p:?} {:?}", p.attenuate(Caveat::ReadOnly).unwrap());
+        assert!(!text.contains(&hex::encode(p.tag)), "{text}");
+        assert!(!text.contains(&hex::encode(p.nonce_id)), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+    }
+
+    #[test]
+    fn sibling_and_prefix_violations_refused() {
+        let p = parent();
+        // A sibling under the same root key (other nonce) is not an attenuation.
+        let sibling =
+            CapabilityMacaroon::mint(&K, [9; 32], [2; 32], vec![Caveat::ReadOnly]).unwrap();
+        assert!(!is_attenuation_of(&p, &sibling));
+        // Same nonce and issuer but missing the parent's caveat (minted from the root).
+        let p2 = CapabilityMacaroon::mint(
+            &K,
+            [1; 32],
+            [2; 32],
+            vec![Caveat::ReadOnly, Caveat::ExpiresAtUnixMs(5)],
+        )
+        .unwrap();
+        let missing = CapabilityMacaroon::mint(
+            &K,
+            [1; 32],
+            [2; 32],
+            vec![
+                Caveat::ReadOnly,
+                Caveat::ByteRange {
+                    offset: 0,
+                    length: 1,
+                },
+            ],
+        )
+        .unwrap();
+        assert!(!is_attenuation_of(&p2, &missing));
+        // A forged tag on a correct caveat list.
+        let mut forged = p.attenuate(Caveat::ExpiresAtUnixMs(7)).unwrap();
+        forged.tag[0] ^= 1;
+        assert!(!is_attenuation_of(&p, &forged));
+        // A child shorter than the parent.
+        assert!(!is_attenuation_of(&p2, &p));
     }
 }

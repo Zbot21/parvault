@@ -324,6 +324,16 @@ docker exec -w /tmp/lite-client-state parvault-client /usr/local/bin/parvault \
     --vault-namespace "lite-failover-ns" \
     --once
 
+# B-SEED-SYND (L-46): the seed logs its in-lock handler time and its off-task fan-out time.
+# The seed logs with ANSI colours (field "handler_ms<ESC>[0m<ESC>[2m=84"); strip them first.
+LITE_SYND_TIMES="$(docker logs parvault-seed-0 2>&1 | sed 's/\x1b\[[0-9;]*m//g' \
+    | grep -E 'lite syndication (ingested on the seed|fan-out finished)' || true)"
+echo "$LITE_SYND_TIMES"
+if ! echo "$LITE_SYND_TIMES" | grep -q 'handler_ms=' || ! echo "$LITE_SYND_TIMES" | grep -q 'job_ms='; then
+    echo "ERROR: stage 7: parvault-seed-0 logged no lite syndication handler/job durations"
+    exit 1
+fi
+
 # Simulate NAS / Seed Server death by stopping parvault-seed-0, then recover the Lite-Client vault
 # from mesh peers only. By design a successful lite syndication deletes the client's local shards
 # (src/cli/folder.rs, after syndication), so there is nothing to wipe: instead assert the lite run
@@ -367,6 +377,47 @@ for attempt in $(seq 1 30); do
     fi
     sleep 1
 done
+
+echo "=== [7b/12] Eviction council (F-08/F-09): signed manifest; member order applied; non-member refused ==="
+# node-1 holds the ring genesis and signs epoch 1 of a 1-of-1 council whose member is node-2;
+# nodes 2, 3 and 6 install that manifest. node-2 (a member) propagates a bounded, epoch-stamped
+# order that node-6 applies; node-3 (not a member) cannot propagate at all.
+NODE2_KEY="$(docker exec -w /var/lib/parvault parvault-node-2 /usr/local/bin/parvault --no-lan-discovery identity \
+    | awk -F': ' '/Ed25519 Public Key/ {print $2}')"
+COUNCIL_HEX="$(docker exec -w /var/lib/parvault parvault-node-1 /usr/local/bin/parvault --no-lan-discovery \
+    council init --member "$NODE2_KEY" --quorum 1 | tail -n 1)"
+for n in 2 3 6; do
+    docker exec -w /var/lib/parvault "parvault-node-$n" /usr/local/bin/parvault --no-lan-discovery \
+        council install --manifest "$COUNCIL_HEX"
+done
+if ! docker exec -w /var/lib/parvault parvault-node-6 /usr/local/bin/parvault --no-lan-discovery council show \
+    | grep -q '^Epoch *: 1$'; then
+    echo "ERROR: parvault-node-6 did not install council epoch 1"
+    exit 1
+fi
+docker exec -w /var/lib/parvault parvault-node-2 /usr/local/bin/parvault --peers "$PEERS_CSV" --no-lan-discovery \
+    evict --ip 203.0.113.77 --reason council-stage --propagate
+COUNCIL_APPLIED=0
+for _ in $(seq 1 20); do
+    if docker logs parvault-node-6 2>&1 | grep -q 'applied an eviction order'; then
+        COUNCIL_APPLIED=1
+        break
+    fi
+    sleep 0.5
+done
+if [ "$COUNCIL_APPLIED" -ne 1 ]; then
+    echo "ERROR: parvault-node-6 did not apply the council member's order"
+    exit 1
+fi
+if NONMEMBER_OUT="$(docker exec -w /var/lib/parvault parvault-node-3 /usr/local/bin/parvault --peers "$PEERS_CSV" \
+    --no-lan-discovery evict --ip 203.0.113.78 --propagate 2>&1)"; then
+    echo "ERROR: a non-member propagated an eviction order: $NONMEMBER_OUT"
+    exit 1
+fi
+case "$NONMEMBER_OUT" in
+    *"member of the installed council"*) ;;
+    *) echo "ERROR: unexpected non-member refusal: $NONMEMBER_OUT"; exit 1 ;;
+esac
 
 echo "=== [8/12] Graceful Node Decommission: parvault-node-5 -> parvault-node-11 ('parvault leave --handoff-to') ==="
 NODE11_BEFORE="$(docker exec parvault-node-11 sh -c 'ls -1 /var/lib/parvault/.parvault-data/shards/*.shard 2>/dev/null | wc -l')"
@@ -578,6 +629,7 @@ echo " Zero-IP LAN Discovery  : PASS (${DISCOVERED_COUNT} daemons auto-discovere
 echo " Initial Sync (v1)      : ${TOTAL_SHARDS_V1} shards across 10 nodes (${SYNC_V1_SECS}s)"
 echo " Continuous Watch (v2)  : PASS (live update + tombstone pruning over libp2p)"
 echo " Lite-Client Failover   : PASS (1.0x seed syndication + NAS-death mesh recovery)"
+echo " Eviction Council       : PASS (signed manifest epoch 1; member order applied; non-member refused)"
 echo " Graceful Node Leave    : PASS (parvault-node-5 -> parvault-node-11: ${NODE11_AFTER} shards)"
 echo " Bit-Rot Scrubbing      : PASS (1 corrupted shard detected & quarantined)"
 echo " Disaster Recovery      : PASS (4 killed + 1 left + 2 restarted, ${RECOVER_SECS}s)"

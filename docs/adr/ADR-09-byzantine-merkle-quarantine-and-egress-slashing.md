@@ -18,6 +18,11 @@ Crash-fault erasure coding alone fails under active Byzantine adversaries who in
 2. **8-Stratum Scatter-Gather PoR & Anti-Proxy RTT Ceiling (`MultiSegmentPorChallenge`):** Samples non-overlapping byte strata across the entire shard under a strict `max_rtt_ms` bound (`≤ 300 ms`) so partial-retention and remote-proxy nodes fail audits with overwhelming probability.
 3. **Egress-Withholding Credit Burn (`EgressWithholdingEvidence`):** Storage peers that pass PoR challenges but refuse bulk `FetchShard` egress during restore have 100% of their accumulated `bytes_contributed_by_peer` reciprocity credits burned (`QuotaManager::slash_peer_for_withholding`).
 
+## v0.5.0 status
+
+- **Quarantine is local.** A node quarantines a peer only from its own checks (pre-decoding Merkle quarantine, item 1, and in a later release its own PoR audits, 2c-β). No wire input slashes a peer in v0.5.0: slashing gossip is not subscribed (F-01) and `apply_slashing_evidence` is test-only. The slash guard `slash_target_decision` (`reject.slash_protected_target`) keeps the genesis and the node's own keys unslashable (Kani `proof_slash_guard_protects_genesis_and_self`).
+- **Egress slashing (item 3) is not implemented.** `EgressWithholdingEvidence` is a reporter's claim, not transferable proof; publishing proof-carrying evidence is v0.6.0.
+
 ## Consequences & Verification
 
 - **Consequences:** Neutralizes poisoned-shard decoding corruption, partial-shard cheating, WAN proxy outsourcing, and hostage egress withholding.

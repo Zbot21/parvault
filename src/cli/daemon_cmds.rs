@@ -49,10 +49,19 @@ pub(crate) async fn up(env: CliEnv, command: Commands) -> anyhow::Result<()> {
         strict_plugins,
         &allow_peer_uid,
     )?;
-    let macaroon_root_key = parvault::gateway::resolve_optional_macaroon_root_key(
-        &cfg.data_dir,
-        macaroon_root_key_hex.as_deref(),
-    )?;
+    // F-43 (L-44): built-in WebDAV verifies every request against the root key, so one
+    // must exist when it is on (created like `parvault token mint` does).
+    let macaroon_root_key = if vfs_webdav_listen.is_some() {
+        Some(parvault::gateway::load_or_create_macaroon_root_key(
+            &cfg.data_dir,
+            macaroon_root_key_hex.as_deref(),
+        )?)
+    } else {
+        parvault::gateway::resolve_optional_macaroon_root_key(
+            &cfg.data_dir,
+            macaroon_root_key_hex.as_deref(),
+        )?
+    };
     if let Some(listen_override) = listen {
         cfg.listen_tcp = listen_override;
     }
@@ -133,10 +142,19 @@ pub(crate) async fn daemon(env: CliEnv, command: Commands) -> anyhow::Result<()>
                 strict_plugins,
                 &allow_peer_uid,
             )?;
-            let macaroon_root_key = parvault::gateway::resolve_optional_macaroon_root_key(
-                &cfg.data_dir,
-                macaroon_root_key_hex.as_deref(),
-            )?;
+            // F-43 (L-44): built-in WebDAV verifies every request against the root key, so one
+            // must exist when it is on (created like `parvault token mint` does).
+            let macaroon_root_key = if vfs_webdav_listen.is_some() {
+                Some(parvault::gateway::load_or_create_macaroon_root_key(
+                    &cfg.data_dir,
+                    macaroon_root_key_hex.as_deref(),
+                )?)
+            } else {
+                parvault::gateway::resolve_optional_macaroon_root_key(
+                    &cfg.data_dir,
+                    macaroon_root_key_hex.as_deref(),
+                )?
+            };
             cfg.listen_tcp = listen;
             cfg.enable_quic = enable_quic;
             let opts = DaemonLaunchOptions {

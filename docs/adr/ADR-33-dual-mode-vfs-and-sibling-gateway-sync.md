@@ -30,5 +30,7 @@
 
 ## Consequences & Verification
 
+- **F-43 (L-43, L-44):** both hosts require a read-only macaroon on every WebDAV request: the built-in host verifies it under the node's `macaroon_root.key` (created when `--vfs-webdav-listen` is set), and `parvault-fuse webdav` accepts only its pinned `--macaroon` or an offline attenuation of it. The edge check is the only client gate: the built-in VFS reads with an in-memory ReadOnly macaroon minted by the daemon, and the plugin reads with its pinned token.
+
 - **Consequences:** Operators can choose built-in `=y` zero-socket single-daemon VFS (`parvault up --no-socket --vfs-webdav-listen ...`) or unprivileged `=m` split plugins (`parvault-fuse`, `parvault-sync`) over `/var/run/parvault.sock` with zero `MasterKey` exposure in plugin memory and zero new `unsafe` blocks (`13` audited wrappers in `src/os_sys.rs`, `#![forbid(unsafe_code)]` across all `5` binaries).
 - **Verification:** Kani symbolic harness #17 (`proof_sanitize_sync_relative_path_no_traversal` in `src/kani_proofs.rs`), `parvault-sync self-test`, and integration suite `tests/m3_dual_mode_vfs_and_gateway_sync.rs`.

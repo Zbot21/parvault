@@ -5,9 +5,7 @@ use parvault::bootstrap::{
 use parvault::config::ErasureTier;
 use parvault::crypto::{MasterKey, NodeIdentity, PqVaultMasterKey};
 use parvault::network::behaviour::{is_routable_public_ip, BincodeWireCodec};
-use parvault::network::wot::{
-    DelegationChain, InvitationHop, SlashingEvidence, SlashingReason, WebOfTrustRegistry,
-};
+use parvault::network::wot::{DelegationChain, InvitationHop, WebOfTrustRegistry};
 use parvault::por::{PorError, PorVerifierEngine, RepairGrant};
 use parvault::sharding::encode_ciphertext_stripe;
 use parvault::storage::{
@@ -170,16 +168,17 @@ fn test_rt2_blinded_capability_pinning_clock_skew_and_tombstone_generation_repla
             &blinded_id,
             &attacker_forged_cap,
             1_000_000,
-            &attacker_sig
+            &attacker_sig,
+            1_000_000
         ),
-        Err(StorageError::QuotaExceeded(_))
+        Err(StorageError::Unauthorized)
     ));
 
     // Genuine owner capability succeeds
     let owner_sig =
         BlindedShardCapability::sign_read_token(&owner_cap_id, &blinded_id.locator, 1_000_000);
     let read_back = store
-        .get_blinded_shard_authorized(&blinded_id, &owner_cap, 1_000_000, &owner_sig)
+        .get_blinded_shard_authorized(&blinded_id, &owner_cap, 1_000_000, &owner_sig, 1_000_000)
         .expect("genuine owner read");
     assert_eq!(read_back, shard_bytes);
 
@@ -201,13 +200,14 @@ fn test_rt2_blinded_capability_pinning_clock_skew_and_tombstone_generation_repla
         "Far-future immortal capability timestamp must be rejected"
     );
 
-    // 4. [CRITICAL-CRYPTO-03] Tombstone Generation Replay Defense:
-    //    Owner deletes the shard with `tombstone_gen0`, then re-uploads the shard at epoch 15 (gen 1).
-    //    An attacker who captured `tombstone_gen0` replays it against the re-uploaded shard!
-    let tombstone_gen0 =
-        BlindedShardTombstone::create(&delete_verifier, blinded_id.locator, [0x11u8; 16]);
+    // 4. [CRITICAL-CRYPTO-03, F-41] Delete replay defense. The owner deletes with a signature by
+    //    the capability key bound to this host; after a re-upload, the captured delete is stale
+    //    (outside +/-30 s) and refused, as is a delete signed for another host.
+    let host = [0x48u8; 32];
+    let t0 = 1_000_000u64;
+    let del0 = BlindedShardCapability::sign_delete(&owner_cap_id, &host, &blinded_id, t0);
     assert!(store
-        .delete_blinded_shard_with_tombstone(&blinded_id, &tombstone_gen0)
+        .delete_blinded_shard_signed(&blinded_id, t0, &del0, &host, t0)
         .unwrap());
     assert!(!store.has_blinded_shard_on_disk(&blinded_id));
 
@@ -225,24 +225,27 @@ fn test_rt2_blinded_capability_pinning_clock_skew_and_tombstone_generation_repla
         .expect("re-upload blinded shard gen 1");
     assert!(store.has_blinded_shard_on_disk(&blinded_id));
 
-    // Attacker replays `tombstone_gen0` -> MUST BE REJECTED! Shard remains intact on disk!
+    // The captured delete replayed 31 s later -> refused (stale); the shard stays.
+    let later = t0 + 31_000;
     assert!(
         !store
-            .delete_blinded_shard_with_tombstone(&blinded_id, &tombstone_gen0)
+            .delete_blinded_shard_signed(&blinded_id, t0, &del0, &host, later)
             .unwrap(),
-        "Replayed tombstone from prior lease generation must be rejected"
+        "a captured delete outside the skew window must be refused"
     );
+    // A delete signed for another host -> refused.
+    let other_host = [0x49u8; 32];
+    let del_other =
+        BlindedShardCapability::sign_delete(&owner_cap_id, &other_host, &blinded_id, later);
+    assert!(!store
+        .delete_blinded_shard_signed(&blinded_id, later, &del_other, &host, later)
+        .unwrap());
     assert!(store.has_blinded_shard_on_disk(&blinded_id));
 
-    // Fresh generation-1 tombstone from owner succeeds
-    let tombstone_gen1 = BlindedShardTombstone::create_for_generation(
-        &delete_verifier,
-        blinded_id.locator,
-        [0x22u8; 16],
-        1,
-    );
+    // A fresh delete from the owner for this host succeeds.
+    let del1 = BlindedShardCapability::sign_delete(&owner_cap_id, &host, &blinded_id, later);
     assert!(store
-        .delete_blinded_shard_with_tombstone(&blinded_id, &tombstone_gen1)
+        .delete_blinded_shard_signed(&blinded_id, later, &del1, &host, later)
         .unwrap());
     assert!(!store.has_blinded_shard_on_disk(&blinded_id));
 }
@@ -412,20 +415,10 @@ fn test_rt4_wire_codec_oom_bomb_defense_por_cross_protocol_replay_and_telemetry_
     })
     .unwrap();
 
-    // A single PorAuditTimeoutOrTamper evidence (nonce = 777) replayed 5 times must only count ONCE
-    let ev = SlashingEvidence::issue(
-        &reporter,
-        offender.public_key_bytes(),
-        SlashingReason::PorAuditTimeoutOrTamper,
-        777,
-    );
-    for _ in 0..5 {
-        wot.apply_slashing_evidence(&ev);
-    }
-    assert!(
-        wot.is_peer_trusted(&offender.public_key_bytes()),
-        "Replaying the same SlashingEvidence nonce must not quarantine an honest node"
-    );
+    // Peer slashing evidence is not applied in v0.5.0 (apply_slashing_evidence is test-only);
+    // its replay dedupe is covered by the network::wot unit tests.
+    assert!(wot.is_peer_trusted(&offender.public_key_bytes()));
+    assert!(wot.is_peer_trusted(&reporter.public_key_bytes()));
 
     // 5. [RT3-01] AnonymousTelemetryBeacon Hashcash PoW, Bucket Bounds & IQR Outlier Trimming:
     let mut agg = NetworkCensusAggregator::with_min_pow_bits(500, 8);

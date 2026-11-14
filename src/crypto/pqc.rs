@@ -475,30 +475,47 @@ impl HybridPqSigningKeypair {
         message: &[u8],
         signature: &HybridPqSignature,
     ) -> bool {
-        let Ok(ed_sig): Result<[u8; 64], _> = signature.ed25519_sig.as_slice().try_into() else {
-            return false;
-        };
-        if !NodeIdentity::verify_with_pubkey(&pubkey.ed25519_pub, message, &ed_sig) {
-            return false;
-        }
-
-        let Ok(pk_arr): Result<[u8; ml_dsa_65::PK_LEN], _> =
-            pubkey.ml_dsa_65_pk.as_slice().try_into()
-        else {
-            return false;
-        };
-        let Ok(pk) = ml_dsa_65::PublicKey::try_from_bytes(pk_arr) else {
-            return false;
-        };
-
-        let Ok(sig_arr): Result<[u8; ml_dsa_65::SIG_LEN], _> =
-            signature.ml_dsa_65_sig.as_slice().try_into()
-        else {
-            return false;
-        };
-
-        pk.verify(message, &sig_arr, ML_DSA_65_CONTEXT)
+        hybrid_signature_decision(&Self::verify_halves(pubkey, message, signature)).is_ok()
     }
+
+    /// Checks each half of a composite signature separately (ADR-12): the facts of
+    /// [`hybrid_signature_decision`].
+    pub fn verify_halves(
+        pubkey: &HybridPqPublicKey,
+        message: &[u8],
+        signature: &HybridPqSignature,
+    ) -> HybridSignatureFacts {
+        let ed25519_valid = <[u8; 64]>::try_from(signature.ed25519_sig.as_slice())
+            .is_ok_and(|ed| NodeIdentity::verify_with_pubkey(&pubkey.ed25519_pub, message, &ed));
+        let ml_dsa_valid = <[u8; ml_dsa_65::PK_LEN]>::try_from(pubkey.ml_dsa_65_pk.as_slice())
+            .ok()
+            .and_then(|pk| ml_dsa_65::PublicKey::try_from_bytes(pk).ok())
+            .zip(<[u8; ml_dsa_65::SIG_LEN]>::try_from(signature.ml_dsa_65_sig.as_slice()).ok())
+            .is_some_and(|(pk, sig)| pk.verify(message, &sig, ML_DSA_65_CONTEXT));
+        HybridSignatureFacts {
+            ed25519_valid,
+            ml_dsa_valid,
+        }
+    }
+}
+
+/// The two halves of a composite `Ed25519 + ML-DSA-65` signature, checked separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HybridSignatureFacts {
+    pub ed25519_valid: bool,
+    pub ml_dsa_valid: bool,
+}
+
+/// ADR-12: a hybrid signature holds only if BOTH halves verify; a valid classical half never
+/// stands in for a bad post-quantum half (or the reverse).
+pub fn hybrid_signature_decision(f: &HybridSignatureFacts) -> Result<(), &'static str> {
+    if !f.ed25519_valid {
+        return Err("reject.hybrid_sig_ed25519_invalid");
+    }
+    if !f.ml_dsa_valid {
+        return Err("reject.hybrid_sig_ml_dsa_invalid");
+    }
+    Ok(())
 }
 
 /// 512-bit (64-byte) Dual-Cipher Cascaded Post-Quantum Vault Master Key (`ADR-12`, `B8`).

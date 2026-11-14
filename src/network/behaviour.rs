@@ -26,6 +26,16 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 /// stream natively with zero fragmentation.
 pub const MAX_WIRE_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
+/// ADR-08: a frame longer than the codec's limit (`MAX_WIRE_FRAME_BYTES`) is refused from its
+/// length prefix, before any buffer is reserved.
+pub fn wire_frame_decision(len: usize, max_frame_bytes: usize) -> Result<(), &'static str> {
+    if len > max_frame_bytes {
+        Err("reject.wire_frame_oversized")
+    } else {
+        Ok(())
+    }
+}
+
 /// High-speed zero-expansion `bincode` wire codec for `/parvault/wire/1.0.0`.
 #[derive(Debug, Clone)]
 pub struct BincodeWireCodec {
@@ -99,7 +109,8 @@ impl BincodeWireCodec {
                 "wire frame length overflows usize",
             )
         })?;
-        if len > self.max_frame_bytes {
+        if let Err(code) = wire_frame_decision(len, self.max_frame_bytes) {
+            tracing::warn!(code, len, "refused a wire frame before allocating it");
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -369,6 +380,30 @@ pub enum MeshWireRequest {
     /// node in public-commons or hybrid mode (ADR-24). Appended in v0.5.0; the ticket key must be
     /// the sender's transport key.
     AdmitPublicTicket(PublicCommonsTicket),
+    /// Renews a blinded shard's lease, signed by its capability key (F-23). Appended; the
+    /// unsigned `RenewBlindedLease` is refused.
+    RenewBlindedLeaseSigned {
+        blinded_id: BlindedShardId,
+        current_epoch: u64,
+        extension_epochs: u64,
+        timestamp_ms: u64,
+        sig: Vec<u8>,
+    },
+    /// Deletes a blinded shard on a signature by its lease's capability key over
+    /// `"parvault-delete-blinded-v1" || host || locator || content_sha256 || timestamp_ms`
+    /// (appended, F-41; replaces the forgeable `DeleteBlindedShardTombstone`, which is refused).
+    DeleteBlindedShardSigned {
+        blinded_id: BlindedShardId,
+        timestamp_ms: u64,
+        sig: Vec<u8>,
+    },
+    /// Asks an admitted peer for the council manifests of `scope_root` after `from_epoch` (the
+    /// requester's epoch), appended, F-08/F-09: a node that sees an order from a newer council
+    /// epoch fetches the chain up to it.
+    GetCouncilManifest {
+        scope_root: [u8; 32],
+        from_epoch: u64,
+    },
 }
 
 /// Wire-level response messages exchanged over `/parvault/wire/1.0.0`.
@@ -472,6 +507,11 @@ pub enum MeshWireResponse {
         verifier_pubkey: [u8; 32],
         /// The PoW bits this node requires.
         required_pow_bits: u8,
+    },
+    /// Result of `GetCouncilManifest` (appended): the manifests after `from_epoch`, oldest
+    /// first, at most 64 KiB in all (the oldest that fit; ask again from the new epoch).
+    CouncilManifestResult {
+        manifests: Vec<crate::storage::council::CouncilManifest>,
     },
 }
 

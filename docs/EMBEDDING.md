@@ -90,7 +90,7 @@ use parvault::{
     capabilities::{CapabilityMacaroon, Caveat},
     gateway::{GatewayBus, RetentionPolicy, DEFAULT_IPC_SOCKET_PATH},
     sync::{sanitize_sync_relative_path, GatewayFolderSync},
-    vfs::VirtualVaultFs,
+    vfs::{VirtualVaultFs, WebdavVerifier},
 };
 use std::path::Path;
 
@@ -116,7 +116,9 @@ fn plugin_sync_and_vfs(root_key: &[u8; 32]) -> anyhow::Result<()> {
     // 4. Spawn an RAII background HTTP Range / WebDAV lazy VFS server over the same GatewayBus
     let vfs = VirtualVaultFs::with_bus(bus, Path::new("/tmp/pv-vfs-cache"), 64 * 1024 * 1024)?
         .with_default_macaroon(Some(read_token));
-    let mut webdav = vfs.spawn_webdav_server("127.0.0.1:0")?;
+    // F-43: every WebDAV request must present a read-only token under this root key.
+    let mut webdav =
+        vfs.spawn_webdav_server("127.0.0.1:0", WebdavVerifier::RootKey(*root_key))?;
     println!("WebDAV listening on http://{}", webdav.local_addr());
     webdav.shutdown();
     Ok(())

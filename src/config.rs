@@ -1,5 +1,29 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
+/// `parvault council` subcommands: the signed, epoch-versioned eviction council (F-08, ADR-19).
+#[derive(Debug, Clone, Subcommand)]
+pub enum CouncilAction {
+    /// Sign and install epoch 1 of this ring's council with the ring genesis held here. The
+    /// quorum must be a strict majority of the members.
+    Init {
+        /// A member's 32-byte Ed25519 public key (64 hex); repeat for each member.
+        #[arg(long = "member", required = true)]
+        members: Vec<String>,
+        /// Signatures an order needs (strict majority: `2 * quorum > members`).
+        #[arg(long)]
+        quorum: u32,
+    },
+    /// Install a council manifest (hex, from `council show` or the public tracker admin): epoch 1
+    /// signed by the scope root, or the next epoch signed by a quorum of the installed one.
+    Install {
+        /// The hex-encoded manifest.
+        #[arg(long)]
+        manifest: String,
+    },
+    /// Print the installed council and its hex manifest.
+    Show,
+}
+
 /// `parvault wot` subcommands (ring admission, bootstrap option A).
 #[derive(Debug, Clone, Subcommand)]
 pub enum WotAction {
@@ -746,6 +770,12 @@ pub enum Commands {
         #[command(subcommand)]
         action: WotAction,
     },
+    /// The eviction council (`ADR-19`, F-08): `init` signs epoch 1 with the ring genesis,
+    /// `install` adds a signed manifest, `show` prints the installed one.
+    Council {
+        #[command(subcommand)]
+        action: CouncilAction,
+    },
     /// Mint, offline-attenuate, and inspect `PARVAULT-MAC-V1:` capability macaroons (`ADR-32`).
     Token {
         #[command(subcommand)]
@@ -913,12 +943,6 @@ pub struct NodeConfig {
     /// Trust admission mode (`"private"` default, `"public"`, or `"hybrid"` — `ADR-18`).
     #[serde(default)]
     pub trust_mode: crate::network::wot::TrustPoolMode,
-    /// Hex-encoded 32-byte Ed25519 public keys trusted to issue signed mesh eviction orders (`ADR-19`).
-    #[serde(default)]
-    pub eviction_authorities: Vec<String>,
-    /// Optional explicit `M-of-N` federated Public Tracker Operator quorum threshold (`None` = auto strict majority).
-    #[serde(default)]
-    pub tracker_eviction_quorum: Option<usize>,
     /// Optional explicitly advertised public WAN Multiaddrs (`--external-addr` / `PARVAULT_EXTERNAL_ADDRS`).
     #[serde(default)]
     pub external_addrs: Vec<String>,
@@ -977,8 +1001,6 @@ impl Default for NodeConfig {
             wan_rendezvous_seeds: Vec::new(),
             public_trackers: Vec::new(),
             trust_mode: crate::network::wot::TrustPoolMode::PrivateRing,
-            eviction_authorities: Vec::new(),
-            tracker_eviction_quorum: None,
             external_addrs: Vec::new(),
             lan_discovery_enabled: default_lan_discovery_enabled(),
             lan_discovery_port: default_lan_discovery_port(),
@@ -1274,165 +1296,6 @@ impl NodeConfig {
         None
     }
 
-    /// Builds the deduplicated list of trusted 32-byte Ed25519 authority public keys allowed to issue
-    /// `SignedBadActorEvictionOrder`s (`ADR-19` Strict Mode Isolation):
-    /// - Always trusts `local_pubkey` and explicit `eviction_authorities` (`PARVAULT_EVICTION_AUTHORITIES`).
-    /// - In `PrivateRing` mode (`!public_commons_active`): external `tracker_admin_pubkey`s are
-    ///   **strictly ignored/rejected** so no public tracker authority can ever affect a private ring;
-    ///   only `local_pubkey` and explicit `genesis_pubkey` (+ explicit `eviction_authorities`) are trusted.
-    /// - In `--public` (`PublicCommons` / `Hybrid`) mode: trusts `local_pubkey` + pinned
-    ///   `tracker_admin_pubkey`s (`extra_pinned_admin_pubkeys` + `<data_dir>/pinned_tracker_admins.json`)
-    ///   + explicit `eviction_authorities`, rejecting all non-admin random public peers!
-    pub fn resolve_eviction_authorities(
-        &self,
-        local_pubkey: [u8; 32],
-        genesis_pubkey: [u8; 32],
-        extra_pinned_admin_pubkeys: &[[u8; 32]],
-        public_commons_active: bool,
-    ) -> Vec<[u8; 32]> {
-        let mut out = Vec::new();
-        let mut push_pk = |pk: [u8; 32]| {
-            if !out.contains(&pk) {
-                out.push(pk);
-            }
-        };
-
-        push_pk(local_pubkey);
-
-        for hex_str in &self.eviction_authorities {
-            if let Ok(bytes) = hex::decode(hex_str.trim()) {
-                if bytes.len() == 32 {
-                    let mut pk = [0u8; 32];
-                    pk.copy_from_slice(&bytes);
-                    push_pk(pk);
-                }
-            }
-        }
-        if let Ok(env_auth) = std::env::var("PARVAULT_EVICTION_AUTHORITIES") {
-            for part in env_auth.split(',') {
-                if let Ok(bytes) = hex::decode(part.trim()) {
-                    if bytes.len() == 32 {
-                        let mut pk = [0u8; 32];
-                        pk.copy_from_slice(&bytes);
-                        push_pk(pk);
-                    }
-                }
-            }
-        }
-
-        if public_commons_active {
-            for &pk in extra_pinned_admin_pubkeys {
-                push_pk(pk);
-            }
-            let pinned_path = self.data_dir.join("pinned_tracker_admins.json");
-            if let Ok(raw) = std::fs::read_to_string(&pinned_path) {
-                if let Ok(hex_list) = serde_json::from_str::<Vec<String>>(&raw) {
-                    for hex_str in hex_list {
-                        if let Ok(bytes) = hex::decode(hex_str.trim()) {
-                            if bytes.len() == 32 {
-                                let mut pk = [0u8; 32];
-                                pk.copy_from_slice(&bytes);
-                                push_pk(pk);
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            push_pk(genesis_pubkey);
-        }
-        out
-    }
-
-    /// Resolves `(trusted_council_pubkeys, min_quorum)` for `apply_signed_eviction_order_with_quorum`
-    /// (`ADR-19` Strict Mode Isolation + `M-of-N` Federated Public Tracker Operator Council Quorum):
-    /// - `local_pubkey` is passed separately as `local_owner_pubkey` (`1-of-1` local device sovereignty),
-    ///   so it is not mixed into `trusted_council_pubkeys` when sizing the federated tracker council.
-    /// - In `PrivateRing` mode (`!public_commons_active`), external `tracker_admin_pubkey`s are
-    ///   strictly excluded; only `genesis_pubkey` + explicit `eviction_authorities` are trusted.
-    /// - In `--public` mode (`public_commons_active`), `trusted_council_pubkeys` consists of pinned
-    ///   `tracker_admin_pubkey`s + explicit `eviction_authorities`, and `min_quorum` defaults to
-    ///   `SignedBadActorEvictionOrder::default_tracker_quorum_threshold(trusted_council.len())`
-    ///   unless overridden via `tracker_eviction_quorum` or `PARVAULT_TRACKER_EVICTION_QUORUM`.
-    pub fn resolve_eviction_council_and_quorum(
-        &self,
-        genesis_pubkey: Option<[u8; 32]>,
-        extra_pinned_admin_pubkeys: &[[u8; 32]],
-        public_commons_active: bool,
-    ) -> (Vec<[u8; 32]>, usize) {
-        let mut council = Vec::new();
-        let mut push_pk = |pk: [u8; 32]| {
-            if pk != [0u8; 32] && !council.contains(&pk) {
-                council.push(pk);
-            }
-        };
-
-        for hex_str in &self.eviction_authorities {
-            if let Ok(bytes) = hex::decode(hex_str.trim()) {
-                if bytes.len() == 32 {
-                    let mut pk = [0u8; 32];
-                    pk.copy_from_slice(&bytes);
-                    push_pk(pk);
-                }
-            }
-        }
-        if let Ok(env_auth) = std::env::var("PARVAULT_EVICTION_AUTHORITIES") {
-            for part in env_auth.split(',') {
-                if let Ok(bytes) = hex::decode(part.trim()) {
-                    if bytes.len() == 32 {
-                        let mut pk = [0u8; 32];
-                        pk.copy_from_slice(&bytes);
-                        push_pk(pk);
-                    }
-                }
-            }
-        }
-
-        let env_quorum = std::env::var("PARVAULT_TRACKER_EVICTION_QUORUM")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok());
-
-        if public_commons_active {
-            for &pk in extra_pinned_admin_pubkeys {
-                push_pk(pk);
-            }
-            let pinned_path = self.data_dir.join("pinned_tracker_admins.json");
-            if let Ok(raw) = std::fs::read_to_string(&pinned_path) {
-                if let Ok(hex_list) = serde_json::from_str::<Vec<String>>(&raw) {
-                    for hex_str in hex_list {
-                        if let Ok(bytes) = hex::decode(hex_str.trim()) {
-                            if bytes.len() == 32 {
-                                let mut pk = [0u8; 32];
-                                pk.copy_from_slice(&bytes);
-                                push_pk(pk);
-                            }
-                        }
-                    }
-                }
-            }
-            let min_quorum = self
-                .tracker_eviction_quorum
-                .or(env_quorum)
-                .unwrap_or_else(|| {
-                    crate::storage::SignedBadActorEvictionOrder::default_tracker_quorum_threshold(
-                        council.len(),
-                    )
-                })
-                .max(1);
-            (council, min_quorum)
-        } else {
-            if let Some(pk) = genesis_pubkey {
-                push_pk(pk);
-            }
-            let min_quorum = self
-                .tracker_eviction_quorum
-                .or(env_quorum)
-                .unwrap_or(1)
-                .max(1);
-            (council, min_quorum)
-        }
-    }
-
     /// Persists a discovered Public Tracker Admin Ed25519 pubkey into `<data_dir>/pinned_tracker_admins.json`.
     pub fn persist_pinned_tracker_admin(&self, admin_pubkey: [u8; 32]) {
         let pinned_path = self.data_dir.join("pinned_tracker_admins.json");
@@ -1573,14 +1436,12 @@ mod tests {
         let public_toml = r#"
             trust_mode = "public"
             public_trackers = ["/dns4/tracker.example.org/tcp/4002"]
-            eviction_authorities = ["1111111111111111111111111111111111111111111111111111111111111111"]
         "#;
         let parsed_pub = NodeConfig::from_toml_str(public_toml).expect("parse public toml");
         assert_eq!(
             parsed_pub.trust_mode,
             crate::network::wot::TrustPoolMode::PublicCommons
         );
-        assert_eq!(parsed_pub.eviction_authorities.len(), 1);
 
         let id = crate::crypto::NodeIdentity::generate();
         let pid = crate::network::node_identity_libp2p_peer_id(&id).expect("peer id");

@@ -1,4 +1,5 @@
 pub mod challenger;
+pub mod chunk_merkle;
 pub mod verifier;
 
 pub use challenger::{

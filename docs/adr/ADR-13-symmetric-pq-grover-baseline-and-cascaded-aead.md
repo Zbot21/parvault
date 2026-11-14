@@ -28,3 +28,7 @@ Outer Pass : C_outer = ChaCha20-Poly1305_Encrypt(key = K_2, nonce = Nonce_2, pla
 
 - **Consequences:** Preserves `~500–589 MiB/s` single-pass `AES-256-GCM` streaming speed on constrained Router-SoC CPUs with full 128-bit post-quantum security while protecting crown-jewel catalog superblocks and cascaded vaults against single-cipher cryptanalytic breaks.
 - **Verification:** `specs/ParVaultPostQuantum.tla` (`Safety_GroverBitSecurityFloor`), `tests/post_quantum_security_proofs.rs`, and `parvault-bench`.
+
+## v0.5.0: blinded deletes (F-41)
+
+Blinded shards are deleted only by a delete signed with the lease's capability key (ADR-11, `DeleteBlindedShardSigned`); `BlindedShardTombstone` MACs are refused. Leases stored without a registered capability key (`capability_pubkey: None`, legacy) can be neither read nor deleted (F-42, D-2: fail closed) and expire by lease.

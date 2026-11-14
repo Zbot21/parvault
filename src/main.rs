@@ -140,6 +140,7 @@ fn command_needs_network_discovery(cmd: &Commands) -> bool {
             | Commands::Scrub
             | Commands::Token { .. }
             | Commands::Wot { .. }
+            | Commands::Council { .. }
             | Commands::Gateway { .. }
     )
 }
@@ -286,6 +287,10 @@ async fn main() -> anyhow::Result<()> {
         return parvault::gateway::execute_token_cli(action, &cfg.data_dir);
     }
 
+    if let Commands::Council { action } = cli.command {
+        return cli::council::run(action, &cfg, public_mode);
+    }
+
     if let Commands::Gateway { opts, action } = cli.command {
         return parvault::gateway::execute_gateway_cli(opts, action, &cfg, cli.profile, &cli.peers)
             .await;
@@ -365,6 +370,7 @@ async fn main() -> anyhow::Result<()> {
         | Commands::NewSeedPhrase
         | Commands::Token { .. }
         | Commands::Wot { .. }
+        | Commands::Council { .. }
         | Commands::Gateway { .. } => {
             unreachable!("handled above")
         }
@@ -540,13 +546,13 @@ fn load_manifest_for_abuse_report(
         if let Ok(m) = FileManifest::from_encrypted_dht_record(disclosed_mk, &raw) {
             return Ok(m);
         }
-        if let Ok(m) = bincode::deserialize::<FileManifest>(&raw) {
+        if let Ok(m) = FileManifest::decode_bytes(&raw) {
             return Ok(m);
         }
         if let Ok(m) = serde_json::from_slice::<FileManifest>(&raw) {
             return Ok(m);
         }
-        if let Ok(snap) = bincode::deserialize::<FolderSnapshotManifest>(&raw) {
+        if let Ok(snap) = FolderSnapshotManifest::decode_bytes(&raw) {
             if let Some(first) = snap.files.values().next() {
                 return Ok(first.manifest.clone());
             }
