@@ -1,6 +1,7 @@
 # ADR-04: Authenticated `RepairGrant` & Witness Threshold Ciphertext Reconstruction
 
 - **Status:** Accepted
+- **Formal model:** `specs/ParVaultProtocol.tla`
 - **Subsystem:** `por::verifier` / `sharding::reed_solomon`
 - **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
 

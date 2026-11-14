@@ -1,0 +1,13 @@
+diff --git a/specs/ParVaultZeroKeyAdminAndQuorum.tla b/specs/ParVaultZeroKeyAdminAndQuorum.tla
+index b423315..0407955 100644
+--- a/specs/ParVaultZeroKeyAdminAndQuorum.tla
++++ b/specs/ParVaultZeroKeyAdminAndQuorum.tla
+@@ -128,7 +128,7 @@ OrderIdFresh(id) == id \notin seenOrderIds   \* @guard order-id-fresh sym=src/st
+ \* A PrivateRing node resolves its order authority from the manifest whose scope root is its
+ \* genesis (owner) key (council_scope_root / council_from_manifest), never the public council.
+ OrderMeetsPrivateRingAuth(ord) ==
+-    Cardinality(ValidDistinctSigners(ord, {HomelabOwner})) >= 1   \* @guard ring-scope sym=src/storage/council.rs::council_from_manifest
++    TRUE
+ 
+ \* The owner's own eviction order for its ring (the honest accept path of ring-scope).
+ OwnerRingOrder ==

@@ -1,6 +1,7 @@
 # ADR-15: Day-1-to-Scale Elastic Bootstrap, Auto-Draining Seed Anchors & Earned Tier Progression
 
 - **Status:** Accepted
+- **Formal model:** `specs/ParVaultBootstrapAndEarnedTier.tla`
 - **Subsystem:** `bootstrap`
 - **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
 

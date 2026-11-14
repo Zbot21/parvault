@@ -1,6 +1,7 @@
 # ADR-12: Asymmetric Post-Quantum Hybrid KEM & Signatures (`X25519 + ML-KEM-768` & `Ed25519 + ML-DSA-65`)
 
 - **Status:** Accepted
+- **Formal model:** `specs/ParVaultPostQuantum.tla`
 - **Subsystem:** `crypto::pqc`
 - **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
 
@@ -27,4 +28,4 @@ K_hybrid = HKDF-SHA512(salt = salt, ikm = ikm, info = info)
 ## Consequences & Verification
 
 - **Consequences:** Immunizes asymmetric key encapsulation and long-lived identity/manifest certificates against Shor's algorithm on a CRQC while retaining classical `x25519-dalek` / `ed25519-dalek` security guarantees. (For symmetric encryption under Grover's bound, see [ADR-13](ADR-13-symmetric-pq-grover-baseline-and-cascaded-aead.md).)
-- **Verification:** `specs/ParVaultPostQuantum.tla` (`Safety_HNDLConfidentialityPreserved`, `Safety_QuantumSignatureUnforgeability`, <!-- metric:tlc.distinct.ParVaultPostQuantum -->`927`<!-- /metric --> distinct states, `0` errors) and `tests/post_quantum_security_proofs.rs`.
+- **Verification:** `specs/ParVaultPostQuantum.tla` (`Safety_HNDLConfidentialityPreserved`, `Safety_QuantumSignatureUnforgeability`, <!-- metric:tlc.distinct.ParVaultPostQuantum -->`1,656`<!-- /metric --> distinct states, `0` errors) and `tests/post_quantum_security_proofs.rs`.

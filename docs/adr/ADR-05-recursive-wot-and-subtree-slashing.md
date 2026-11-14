@@ -1,6 +1,7 @@
 # ADR-05: Recursive Ed25519 Web-of-Trust Delegation & Subtree Slashing
 
 - **Status:** Accepted — Extended by [ADR-12](ADR-12-asymmetric-post-quantum-hybrids.md) and [ADR-24](ADR-24-public-commons-pow-swarm-mode.md)
+- **Formal model:** `specs/ParVaultProtocol.tla`
 - **Subsystem:** `network::wot`
 - **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
 

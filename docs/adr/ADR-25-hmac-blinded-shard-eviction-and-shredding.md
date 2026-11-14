@@ -1,6 +1,7 @@
 # ADR-25: 4-Vector HMAC-Blinded Bad-Actor Shard Eviction & Multi-Pass `0x00` Forensic Shredding
 
 - **Status:** Accepted
+- **Formal model:** `specs/ParVaultZeroKeyAdminAndQuorum.tla`
 - **Subsystem:** `storage::eviction`
 - **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
 
