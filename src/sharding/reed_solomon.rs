@@ -1,4 +1,4 @@
-use crate::config::ErasureTier;
+use crate::profile::ErasureTier;
 use crate::sharding::merkle::{Hash32, MerkleProof, MerkleTree};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use serde::{Deserialize, Serialize};
@@ -56,7 +56,7 @@ pub fn compute_stripe_memory_footprint_bytes(
 ) -> Result<(usize, usize), ShardingError> {
     let (k_data, _m_parity, n_total) = tier.params();
     let Some(ciphertext_len) =
-        plaintext_stripe_bytes.checked_add(crate::config::AES_GCM_TAG_OVERHEAD_BYTES)
+        plaintext_stripe_bytes.checked_add(crate::profile::AES_GCM_TAG_OVERHEAD_BYTES)
     else {
         return Err(ShardingError::InvalidParameters(k_data, n_total));
     };
@@ -389,7 +389,7 @@ mod kani_proofs {
         // 3. Production `compute_reed_solomon_shard_len` boundary safety across all 4 SLA tiers
         assert!(compute_reed_solomon_shard_len(0, 0).is_err());
         let ciphertext_len: usize = kani::any();
-        kani::assume(ciphertext_len <= crate::config::DEFAULT_STRIPE_SIZE_BYTES + 16);
+        kani::assume(ciphertext_len <= crate::profile::DEFAULT_STRIPE_SIZE_BYTES + 16);
         for tier in [
             ErasureTier::Consumer,
             ErasureTier::Mixed,

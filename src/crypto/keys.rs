@@ -501,7 +501,7 @@ impl NodeIdentity {
         }
         std::fs::create_dir_all(data_dir)
             .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
-        crate::storage::BlockStore::atomic_write_file(&path, hex::encode(pubkey).as_bytes())
+        crate::storage::fsio::atomic_write_file(&path, hex::encode(pubkey).as_bytes())
             .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))
     }
 
@@ -527,6 +527,7 @@ impl NodeIdentity {
 
     /// Converts this node's persistent Ed25519 signing seed into a `libp2p::identity::Keypair`
     /// so `PeerId` and Noise XX static identity remain stable across daemon/seed restarts.
+    #[cfg(feature = "daemon-runtime")]
     pub fn to_libp2p_keypair(&self) -> Result<libp2p::identity::Keypair, KeyError> {
         let mut seed = self.signing_seed_bytes();
         let res = libp2p::identity::Keypair::ed25519_from_bytes(&mut seed)

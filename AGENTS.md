@@ -20,7 +20,7 @@ This document is the authoritative architectural, security, and verification man
 4. **Canonical Lazy-Streaming VFS Reference Plugin (`parvault-fuse` — `src/bin/parvault-fuse.rs`, `#![forbid(unsafe_code)]`):**
    Standalone out-of-process reference plugin (`--features vfs`, zero C `libfuse3`, zero `unsafe`) speaking [`docs/GATEWAY_SOCKET_PROTOCOL.md`](docs/GATEWAY_SOCKET_PROTOCOL.md) over `/var/run/parvault.sock` (`mount-fd` Linux `/dev/fuse` `ABI 7.31`, unprivileged HTTP `206` / WebDAV `PROPFIND`, and sealed-`memfd` folder `sync` with `--macaroon <PARVAULT-MAC-V1:...>` and bounded `LruBlockCache` `< 50 ms` TTFB).
 5. **Zero-Key Incremental Folder Sync Sibling Plugin (`parvault-sync` — `src/bin/parvault-sync.rs`, `#![forbid(unsafe_code)]`):**
-   Standalone out-of-process folder synchronization plugin (`diff`, `push`, `watch`, `pull`, `list`, `self-test`; compiles even with `--no-default-features`) backed by `GatewayFolderSync` (`src/sync.rs`). Holds **zero** `MasterKey` and **zero** `NodeIdentity` secrets in process memory or `GatewayFolderCatalog` state, seals ingested `memfd`s (`F_ADD_SEALS`), enforces `sanitize_sync_relative_path` path-traversal rejection, and verifies streaming `SHA-256` digests on `1 MiB` chunked `--macaroon` restores (`ADR-33`).
+   Standalone out-of-process folder synchronization plugin (`diff`, `push`, `watch`, `pull`, `list`, `self-test`; builds with `--no-default-features --features ipc-client`, no tokio or libp2p, from item 3) backed by `GatewayFolderSync` (`src/sync/gateway.rs`). Holds **zero** `MasterKey` and **zero** `NodeIdentity` secrets in process memory or `GatewayFolderCatalog` state, seals ingested `memfd`s (`F_ADD_SEALS`), enforces `sanitize_sync_relative_path` path-traversal rejection, and verifies streaming `SHA-256` digests on `1 MiB` chunked `--macaroon` restores (`ADR-33`).
 6. **Empirical Benchmark & Memory Telemetry Runner (`parvault-bench` — `src/bin/parvault-bench.rs`, `#![forbid(unsafe_code)]`):**
    Executes real wall-clock benchmarks (`Argon2id`, `AES-256-GCM`, `PqVaultMasterKey`, `X25519 + ML-KEM-768`, `Ed25519 + ML-DSA-65`, Reed-Solomon $GF(2^8)$) and Linux `/proc/self/status` (`VmRSS`, `VmHWM`) + `CLOCK_PROCESS_CPUTIME_ID` (`parvault::os_sys::process_cpu_time_ns`) streaming memory measurements.
 
@@ -59,7 +59,7 @@ This document is the authoritative architectural, security, and verification man
 | `src/capabilities.rs` | Stateless `HMAC-SHA256` `CapabilityMacaroon` minting, offline caveat attenuation (`AllowedManifest`, `ByteRange`, `ExpiresAtUnixMs`, `ReadOnly`, `AllowedPeerUid`), `PARVAULT-MAC-V1:` compact binary/hex encoding, `MacaroonSliceView`, and `< 1 ms` zero-DB RAM verification (`ct_eq_32`). | [`ADR-28`](docs/adr/ADR-28-stateless-macaroon-capability-attenuation.md), [`ADR-32`](docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md) |
 | `src/vfs.rs` | Pure-Rust Linux `/dev/fuse` (`ABI 7.31`, `0` `unsafe` `parse_fuse_in_header` / `parse_fuse_read_in`), dual-mode `VirtualVaultFs` (`with_bus` / `with_bus_and_block_size`, `.parvaultignore`-aware `ingest_local_directory`), `VfsStubNode`, `LruBlockCache`, `--macaroon` attenuation pass-through, and RAII `VfsWebdavServerHandle` (`spawn_webdav_server`) + blocking HTTP `206` / WebDAV `PROPFIND` server. | [`ADR-29`](docs/adr/ADR-29-pure-rust-fuse-and-webdav-lazy-vfs.md), [`ADR-32`](docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md), [`ADR-33`](docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md) |
 | `src/admin_rpc.rs` | Forward-secret `X25519 + ChaCha20-Poly1305` + `Ed25519` challenge-authenticated TCP control channel for zero-private-key-on-VPS seed administration (`MAX_ADMIN_RPC_FRAME_BYTES`, `±300 s` anti-replay window, `MAX_ADMIN_RPC_CLOCK_SKEW_MS`). | [`ADR-26`](docs/adr/ADR-26-verifiable-abuse-and-council-quorum-governance.md) |
-| `src/kani_proofs.rs` | <!-- metric:kani_harnesses_module -->`25`<!-- /metric --> Kani Rust Bounded Model Checking symbolic harnesses (`#[cfg(kani)]`; <!-- metric:kani_harnesses -->`28`<!-- /metric --> total across the crate including `capabilities`, `crypto::aes`, and `sharding::reed_solomon`). | [`ADR-01`–<!-- metric:adr_last -->`ADR-33`<!-- /metric -->](docs/ADR.md) |
+| `src/kani_proofs.rs` | <!-- metric:kani_harnesses_module -->`26`<!-- /metric --> Kani Rust Bounded Model Checking symbolic harnesses (`#[cfg(kani)]`; <!-- metric:kani_harnesses -->`29`<!-- /metric --> total across the crate including `capabilities`, `crypto::aes`, and `sharding::reed_solomon`). | [`ADR-01`–<!-- metric:adr_last -->`ADR-33`<!-- /metric -->](docs/ADR.md) |
 | `src/bootstrap.rs` | `EarnedStanding`, `ElasticBootstrapEngine`, `PersonalDeviceCert` (including compact `PARVAULT-CERT-V1:` token encoding), `BlindedShardTombstone` (generation-scoped), `ZeroTrustSeedServer`, `CorrelatedOutageController`, and `/32` IPv6 + RFC 6598 CGNAT Sybil subnet normalization. | `ADR-15`, `ADR-16` |
 | `src/sync.rs` | Key-bearing `FolderSyncEngine`, zero-key `GatewayFolderSync` & `GatewayFolderCatalog` (`ADR-33`), `sanitize_sync_relative_path` (`sanitize_sync_relative_path_into`), `FolderSnapshotManifest`, `EncryptedVaultCatalogEnvelope`, `.parvaultignore` matcher (`ParvaultIgnore`), `FolderSyncDiff` (`diff_folder`), `prune_deleted_file_shards` (local + remote `DeleteShard` GC), selective restore (`restore_single_file`, `restore_selective_subset`), and zero-local-state seed recovery (`recover_folder_from_seed_phrase`). | `ADR-14`, `ADR-18`, `ADR-16`, `ADR-20`, [`ADR-33`](docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md) |
 | `src/network/admission.rs` | Client-side ring admission (`v0.5.0`): `AdmissionSource` (self-issue from a held genesis, installed chains in `wot_chains/`, public-commons tickets), `requires_admitted_sender`. Server-side decisions live next to their checks (`wire_handler::admission_decision`, `shard_owner_decision`, `device_cert_decision`; `wot::chain_leaf_decision`, `public_ticket_decision`, `slash_target_decision`; `por::verifier::grant_registration_decision`, `repair_read_decision`; `server_events::kad_record_decision`, `kad_routing_decision`; `client::dht_candidate_decision`). Each logs a `reject.*` code; `.enforcement.map` holds the claims. |
@@ -90,12 +90,22 @@ Every code change or PR **must** preserve these 7 invariants:
 
 ## 4. Build, Test, Multi-Container Docker & Formal Verification Commands
 
+### Cargo features (v0.5.0, item 3)
+| Feature | Adds | Binaries |
+| :-- | :-- | :-- |
+| `ipc-client` | gateway socket client, IPC wire types, client-side crypto and decisions (`http_edge`); no tokio, no libp2p | `parvault-sync` |
+| `vfs` (`ipc-client`) | lazy VFS, pure-Rust FUSE, WebDAV | `parvault-fuse` |
+| `status-ui` (`ipc-client`) | status page (`router_nas`) on the shared HTTP edge | `parvault-status` |
+| `daemon-runtime` (`ipc-client`, `status-ui`, tokio, libp2p) | the daemon: ring, storage engine, gateway server | `parvault`, `parvault-seed`, `parvault-bench` |
+
+`default = ["daemon-runtime", "vfs", "status-ui"]`. Build release binaries with `scripts/build_bins.sh`, which gives each binary only its own features; `scripts/check_no_runtime_deps.sh` fails if tokio, libp2p, mio or quinn reach a plugin feature set. A local-only daemon without tokio is not offered: the storage engine needs the ring client.
+
 ### Rust Unit, Integration, Mathematical & Red-Team Suites
 ```bash
 # Check formatting, lints, and --no-default-features compilation
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo check --no-default-features --bin parvault --bin parvault-seed --bin parvault-sync
+cargo check --no-default-features --features daemon-runtime --bin parvault --bin parvault-seed --bin parvault-sync
 
 # Run all unit, integration, Stateright, TLA+ TLC, GatewayBus, VFS, GatewayFolderSync, and live localhost TCP P2P tests
 TLA2TOOLS_JAR=/root/tla2tools.jar cargo test --release
@@ -103,8 +113,8 @@ TLA2TOOLS_JAR=/root/tla2tools.jar cargo test --release
 # Run built-in self-tests for seed, zero-copy IPC gateway, lazy VFS, and zero-key folder sync
 cargo run --release --bin parvault-seed -- self-test
 cargo run --release --bin parvault -- gateway self-test
-cargo run --release --bin parvault-fuse -- self-test
-cargo run --release --bin parvault-sync -- self-test
+# Plugin self-tests are client-only: this starts a standalone gateway, mints a token, runs both
+bash scripts/build_bins.sh --profile release --out dist && bash scripts/plugin_self_test.sh dist/parvault dist/parvault-fuse dist/parvault-sync
 
 # Run the empirical cryptography, Reed-Solomon, and /proc/self/status memory benchmark binary
 cargo run --release --bin parvault-bench -- run --payload-mib 64
@@ -119,17 +129,16 @@ bash scripts/docker_acceptance_gate.sh
 ### Static `musl` Cross-Compilation (`x86_64` & `aarch64`, `--profile soc`)
 ```bash
 # x86_64 static musl build (stripped sizes: docs/BENCHMARKS.md section 4)
-cargo build --profile soc --target x86_64-unknown-linux-musl \
-  --bin parvault --bin parvault-seed --bin parvault-fuse --bin parvault-sync
+# (build_bins.sh builds each binary with its own features, so the plugins link no tokio or libp2p)
+bash scripts/build_bins.sh --profile soc --target x86_64-unknown-linux-musl --out dist
 
 # ARM64 static musl build (OpenWrt / prplOS LXC / RPi; sizes: docs/BENCHMARKS.md section 4)
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
-  cargo build --profile soc --target aarch64-unknown-linux-musl \
-  --bin parvault --bin parvault-seed --bin parvault-fuse --bin parvault-sync
+  bash scripts/build_bins.sh --profile soc --target aarch64-unknown-linux-musl --out dist
 ```
 
-### Kani Bounded Model Checking (<!-- metric:kani_harnesses -->`28`<!-- /metric --> Harnesses) & TLA+ TLC Formal Model Checking (<!-- metric:tla_specs -->`7`<!-- /metric --> Specs)
-All **<!-- metric:kani_harnesses -->28<!-- /metric -->** Kani symbolic harnesses (`cargo kani`) and all **<!-- metric:tla_specs -->7<!-- /metric -->** TLA+ specifications in `specs/` must complete with **0 errors** (see [`docs/SAFETY_AND_LINT_AUDIT.md`](docs/SAFETY_AND_LINT_AUDIT.md)):
+### Kani Bounded Model Checking (<!-- metric:kani_harnesses -->`29`<!-- /metric --> Harnesses) & TLA+ TLC Formal Model Checking (<!-- metric:tla_specs -->`7`<!-- /metric --> Specs)
+All **<!-- metric:kani_harnesses -->29<!-- /metric -->** Kani symbolic harnesses (`cargo kani`) and all **<!-- metric:tla_specs -->7<!-- /metric -->** TLA+ specifications in `specs/` must complete with **0 errors** (see [`docs/SAFETY_AND_LINT_AUDIT.md`](docs/SAFETY_AND_LINT_AUDIT.md)):
 ```bash
 bash scripts/verify_formal_proofs.sh
 

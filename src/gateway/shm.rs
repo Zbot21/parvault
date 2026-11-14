@@ -4,12 +4,18 @@
 //! `recv_frame_with_fd`) and re-exports safe `pread`/`pwrite` + `memfd` helpers from [`crate::os_sys`].
 //! Contains **zero** `unsafe` blocks.
 
-use crate::gateway::engine::GATEWAY_STRIPE_BYTES as ENGINE_STRIPE_BYTES;
-use crate::gateway::ipc::{validate_ipc_frame_header, MAX_IPC_FRAME_BYTES as IPC_MAX_FRAME_BYTES};
+#[cfg(feature = "daemon-runtime")]
+use crate::gateway::ipc::validate_ipc_frame_header;
+use crate::gateway::ipc::MAX_IPC_FRAME_BYTES as IPC_MAX_FRAME_BYTES;
+#[cfg(feature = "daemon-runtime")]
 use crate::os_sys::{recvmsg_scm_rights, sendmsg_scm_rights};
+#[cfg(feature = "daemon-runtime")]
 use std::io;
+#[cfg(feature = "daemon-runtime")]
 use std::os::fd::{AsFd, OwnedFd, RawFd};
+#[cfg(feature = "daemon-runtime")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "daemon-runtime")]
 use tokio::net::UnixStream;
 
 pub use crate::os_sys::{create_memfd, pread_full_or_eof, pwrite_all};
@@ -18,8 +24,9 @@ pub use crate::os_sys::{create_memfd, pread_full_or_eof, pwrite_all};
 pub const MAX_IPC_FRAME_BYTES: usize = IPC_MAX_FRAME_BYTES;
 
 /// Router-SoC zero-bloat streaming stripe size (`1 MiB`).
-pub const GATEWAY_STRIPE_BYTES: usize = ENGINE_STRIPE_BYTES;
+pub use crate::profile::GATEWAY_STRIPE_BYTES;
 
+#[cfg(feature = "daemon-runtime")]
 /// Sends a length-prefixed frame (`[u32 BE len][payload]`) over asynchronous `stream`, optionally
 /// attaching a single `RawFd` via `SOL_SOCKET` / `SCM_RIGHTS` ancillary data on the 4-byte header.
 pub async fn send_frame_with_fd(
@@ -74,6 +81,7 @@ pub async fn send_frame_with_fd(
     Ok(())
 }
 
+#[cfg(feature = "daemon-runtime")]
 /// Receives a length-prefixed frame (`[u32 BE len][payload]`) from asynchronous `stream`,
 /// extracting any kernel-duplicated file descriptor delivered via `SCM_RIGHTS` (`MSG_CMSG_CLOEXEC`).
 pub async fn recv_frame_with_fd(stream: &mut UnixStream) -> io::Result<(Vec<u8>, Option<OwnedFd>)> {

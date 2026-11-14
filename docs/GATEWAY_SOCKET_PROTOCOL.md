@@ -2,7 +2,7 @@
 
 - **Governing ADRs:** [`ADR-27`](adr/ADR-27-zero-copy-uds-gateway-and-hedged-pool.md), [`ADR-28`](adr/ADR-28-stateless-macaroon-capability-attenuation.md), [`ADR-29`](adr/ADR-29-pure-rust-fuse-and-webdav-lazy-vfs.md), [`ADR-31`](adr/ADR-31-unsafe-remediation-and-os-sys-ffi-boundary.md), [`ADR-32`](adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md), [`ADR-33`](adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md)
 - **Canonical Reference Plugins:** [`src/bin/parvault-fuse.rs`](../src/bin/parvault-fuse.rs) (`parvault-fuse`) & [`src/bin/parvault-sync.rs`](../src/bin/parvault-sync.rs) (`parvault-sync`)
-- **Core Implementation:** [`src/gateway/`](../src/gateway/), [`src/vfs.rs`](../src/vfs.rs), [`src/sync.rs`](../src/sync.rs), [`src/capabilities.rs`](../src/capabilities.rs), [`src/os_sys.rs`](../src/os_sys.rs)
+- **Core Implementation:** [`src/gateway/`](../src/gateway/), [`src/vfs.rs`](../src/vfs.rs), [`src/sync/`](../src/sync/), [`src/capabilities.rs`](../src/capabilities.rs), [`src/os_sys.rs`](../src/os_sys.rs)
 
 ---
 
@@ -19,7 +19,7 @@ No second `parvault-gateway` daemon binary is required (`parvault gateway serve`
 
 ### Why `parvault-fuse` and `parvault-sync` Ship as Canonical Sibling Plugin Binaries
 
-Even though [`src/vfs.rs`](../src/vfs.rs) and [`src/sync.rs`](../src/sync.rs) can run in-process inside `parvault`, [`src/bin/parvault-fuse.rs`](../src/bin/parvault-fuse.rs) (lazy `/dev/fuse` `ABI 7.31` + HTTP `Range` / WebDAV) and [`src/bin/parvault-sync.rs`](../src/bin/parvault-sync.rs) (`GatewayFolderSync` `diff`, `push`, `watch`, `pull`, `list`, `self-test` — compiled even under `--no-default-features`) ship as standalone `#![forbid(unsafe_code)]` sibling binaries for two reasons:
+Even though [`src/vfs.rs`](../src/vfs.rs) and [`src/sync/`](../src/sync/) can run in-process inside `parvault`, [`src/bin/parvault-fuse.rs`](../src/bin/parvault-fuse.rs) (lazy `/dev/fuse` `ABI 7.31` + HTTP `Range` / WebDAV) and [`src/bin/parvault-sync.rs`](../src/bin/parvault-sync.rs) (`GatewayFolderSync` `diff`, `push`, `watch`, `pull`, `list`, `self-test` — compiled even under `--no-default-features`) ship as standalone `#![forbid(unsafe_code)]` sibling binaries for two reasons:
 
 1. **Copy-Paste Developer Reference:** Third-party and companion plugins (`parvault-dvr`, `parvault-s3d`, `parvault-auth-broker`, `parvault-isp-agent`) can use `parvault-fuse` and `parvault-sync` as complete, minimal reference clients speaking sealed `memfd` `SCM_RIGHTS` + `PARVAULT-MAC-V1:` macaroons over `/var/run/parvault.sock`.
 2. **Process & UID Privilege Separation (`Zero-Key` Sync & VFS):** Frontends that mount `/dev/fuse` (`fusermount3`), expose LAN HTTP-Range / WebDAV ports, or crawl untrusted container directories (`parvault-sync`) run under a dedicated unprivileged POSIX user (for example UID `1042`) with **zero** `MasterKey` and **zero** `NodeIdentity` secrets in process memory or `GatewayFolderCatalog` state, gated by `parvault up --ipc-socket /var/run/parvault.sock --strict-plugins --allow-peer-uid 1042 --require-sealed-memfd`.
@@ -67,10 +67,11 @@ Every request (`IpcCommand`) and response (`IpcResponse`) over `/var/run/parvaul
 | Variant | Discriminant (`u32` LE) | `SCM_RIGHTS` FD | Purpose |
 | :--- | :--- | :--- | :--- |
 | `IpcCommand::StorePayload { payload_fd: i32, bytes_len: u64, retention_policy: RetentionPolicy }` | `0` | **Required** (readable `memfd`, sealed when `--require-sealed-memfd` is active) | Streams `bytes_len` plaintext bytes in `1 MiB` stripes (`pread`), encrypts (`AES-256-GCM`), and shards (`GF(2^8)`). |
-| `IpcCommand::FetchPayload { ephemeral_shard_ids: Vec<[u8; 32]>, output_fd: i32 }` | `1` | **Required** (writable `memfd` / file) | Reconstructs and decrypts the full file directly into `output_fd` (`pwrite`). |
+| `IpcCommand::FetchPayload { ephemeral_shard_ids: Vec<[u8; 32]>, output_fd: i32, macaroon: Option<CapabilityMacaroon> }` | `1` | **Required** (writable `memfd` / file) | Verifies `macaroon` against the whole file (manifest, range, expiry, peer UID) like `FetchRange`, then reconstructs and decrypts the full file into `output_fd` (`pwrite`). With a gateway root key set, a missing token is refused (F-47). The `macaroon` field is appended in v0.5.0. |
 | `IpcCommand::FetchRange { manifest: EphemeralShardManifest, offset: u64, len: u64, output_fd: i32, macaroon: Option<CapabilityMacaroon> }` | `2` | **Required** (writable `memfd` / file) | Verifies `macaroon` in `< 1 ms` RAM (including `SO_PEERCRED` UID) and streams `[offset .. offset + len]` into `output_fd`. |
 | `IpcCommand::RegisterManifest { file_manifest: FileManifest }` | `3` | None | Indexes an existing or virtual `FileManifest` in gateway RAM and returns its `EphemeralShardManifest`. |
 | `IpcCommand::QueryHealthStatus` | `4` | None | Returns live `(iops, peer_count, por_sla_score)` telemetry. |
+| `IpcCommand::QueryStatus { macaroon: Option<CapabilityMacaroon> }` (appended in v0.5.0) | `5` | None | Returns `IpcResponse::StatusSnapshot`. `status_auth_decision` (`src/http_edge.rs`) checks the token first: a gateway root key and a published snapshot must exist (`reject.status_unavailable`); the token must be present, verify, be unexpired, carry `ReadOnly`, and carry no `AllowedManifest` or `ByteRange`; any `AllowedPeerUid` must match the socket peer's `SO_PEERCRED` UID. A daemon older than v0.5.0 cannot decode it; the client reports that. |
 
 `RetentionPolicy` discriminants (`u32` LE): `0 = Ephemeral`, `1 = Persistent`, `2 = PinnedRing`.
 
@@ -80,6 +81,7 @@ Every request (`IpcCommand`) and response (`IpcResponse`) over `/var/run/parvaul
 - `2 = HealthStatus { iops: u64, peer_count: u64, por_sla_score: f32 }`
 - `3 = Error { message: String }`
 - `4 = StoreSuccessLocalOnly { manifest: EphemeralShardManifest, local_only_stripes: u64 }` (appended): stored, but that many stripes stayed only on the daemon's machine because no ring peer accepted them, so they are **not backed up**. A client that does not know this variant fails to decode it rather than reporting success.
+- `5 = StatusSnapshot(StatusSnapshot)` (appended in v0.5.0): the node status (version, label, profile, peer IDs, owner PQ fingerprint, stripe size, SLA tier, storage, RSS, uptime, up to `MAX_STATUS_PEERS` = 128 LAN peers). Every string is at most `MAX_STATUS_STRING_BYTES` = 256 bytes; clients reject a snapshot over the caps. It carries no pairing SAS code and no watched-folder path.
 
 > [!NOTE]
 > The `payload_fd: i32` and `output_fd: i32` integers inside `IpcCommand` carry the sender's local descriptor number for diagnostic logging only. The gateway server **never** trusts that integer; it consumes exclusively the kernel-remapped `OwnedFd` delivered via `SCM_RIGHTS` (`MSG_CMSG_CLOEXEC`). Any surplus descriptors attached to a single `cmsg` are wrapped in `OwnedFd` and closed immediately on `recvmsg(2)` return so descriptors can never leak.
@@ -156,6 +158,7 @@ PLUGIN_TOK="$(parvault token attenuate \
   --allow-peer-uid 1042)"
 
 # 3. Inspect caveats and optionally verify in < 1 ms RAM against a simulated request
+#    (the tag, the bearer secret, prints as <redacted> unless --show-tag is given)
 parvault token inspect \
   --token "${PLUGIN_TOK}" \
   --verify-key-hex "$(cat /var/lib/parvault/macaroon_root.key)" \
@@ -173,11 +176,13 @@ parvault --data-dir /var/lib/parvault up \
 
 # WebDAV clients must present ${PLUGIN_TOK} or an offline attenuation of it on every request
 # (F-43); a token with a peer-UID caveat is refused over TCP.
-parvault-fuse --socket /var/run/parvault.sock --macaroon "${PLUGIN_TOK}" webdav --listen 127.0.0.1:4918
+# Tokens go in a mode-600 file: --macaroon on argv is readable by any local user (/proc/<pid>/cmdline).
+( umask 077; printf '%s\n' "${PLUGIN_TOK}" > ./plugin.token )
+parvault-fuse --socket /var/run/parvault.sock --macaroon-file ./plugin.token webdav --listen 127.0.0.1:4918
 
 # 5. Zero-key incremental folder push & macaroon-attenuated selective pull via parvault-sync (=m)
 parvault-sync --socket /var/run/parvault.sock --catalog ./gw-catalog.bin push --folder /srv/project
-parvault-sync --socket /var/run/parvault.sock --catalog ./gw-catalog.bin --macaroon "${PLUGIN_TOK}" \
+parvault-sync --socket /var/run/parvault.sock --catalog ./gw-catalog.bin --macaroon-file ./plugin.token \
   pull --output /tmp/restored-docs --filter "docs/*"
 
 # 6. Or run built-in (=y) WebDAV VFS inside parvault with --no-socket (zero .sock file on disk!)
@@ -201,6 +206,6 @@ Operators and firmware integrators should consult the matrix below to understand
 | **`parvault up --ipc-socket /var/run/parvault.sock`** *(Canonical Single-Daemon Host)* | **Active** (`PutShard`, `GetShard`, PoR, 30s bit-rot scrub, LAN/WAN pairing) | **Active** (`MeshClient` + `BlockStore`) | **Optional** (`--folder` / `watched_folder`) | **Active** (`GatewayIpcServer`) | Recommended single-process deployment for homelabs, desktops, and CPE routers. Auto-loads `<data_dir>/macaroon_root.key` if present; also supports built-in `=y` `--vfs-webdav-listen` / `--vfs-fuse-fd` sharing the same `Arc<GatewayEngine>`. |
 | **`parvault up --no-socket [--vfs-webdav-listen <ADDR>]`** | **Active** | **Active** | **Optional** | **Disabled** (`0` socket files) | Eliminates local Unix socket attack surface entirely while still permitting built-in `=y` WebDAV / `/dev/fuse` VFS over `GatewayBus::InProcess`; passing both `--no-socket` and `--ipc-socket` fails fast at CLI startup. |
 | **`parvault gateway serve`** *(Standalone Outbound Benchmark / Bridge)* | **Inactive** *(Rough Edge 1)* | **Active** (`40`-lane hedged `MeshClient` pool) | **Inactive** *(Rough Edge 2)* | **Active** (unless `--no-socket`) | **Rough Edge 1:** Outbound mesh client + local socket server only; a cluster composed *solely* of `gateway serve` processes has no inbound storage peers to host shards. **Rough Edge 2:** `watched_folder` in `config.toml` is ignored and emits an explicit startup `WARN` log; push backups via `parvault-sync` over `/var/run/parvault.sock` or use `parvault up --watch`. |
-| **`cargo build --no-default-features --bin parvault --bin parvault-seed --bin parvault-sync`** | **Active** (`parvault up` / `parvault-seed`) | **Active** | **Active** (`parvault` + zero-key `parvault-sync`) | **Active** (`parvault`) | Excludes `vfs` (`src/vfs.rs` and `parvault-fuse`) from compilation for minimal core footprints while still compiling `parvault-sync`. Passing `--vfs-webdav-listen` or `--vfs-fuse-fd` to a `--no-default-features` `parvault` binary fails fast with an actionable error instructing the operator to run `parvault-fuse` over `--ipc-socket` or rebuild with `--features vfs`. |
+| **`cargo build --no-default-features --features daemon-runtime --bin parvault --bin parvault-seed --bin parvault-sync`** | **Active** (`parvault up` / `parvault-seed`) | **Active** | **Active** (`parvault` + zero-key `parvault-sync`) | **Active** (`parvault`) | Excludes `vfs` (`src/vfs.rs` and `parvault-fuse`) from compilation for minimal core footprints while still compiling `parvault-sync`. Passing `--vfs-webdav-listen` or `--vfs-fuse-fd` to a `--no-default-features` `parvault` binary fails fast with an actionable error instructing the operator to run `parvault-fuse` over `--ipc-socket` or rebuild with `--features vfs`. |
 | **`--strict-plugins --allow-peer-uid <UID,...>`** | *(Inherits host mode)* | *(Inherits host mode)* | *(Inherits host mode)* | **UID-Allowlisted (`SO_PEERCRED`)** | Calls `getsockopt(SOL_SOCKET, SO_PEERCRED)` immediately on `accept()` (both sync and async Tokio loops) and drops unauthorized UIDs **before reading 1 byte**. Passing `--strict-plugins` with an empty `--allow-peer-uid` list fails fast at CLI startup (`anyhow::bail!`). |
 | **`--require-sealed-memfd`** | *(Inherits host mode)* | *(Inherits host mode)* | *(Inherits host mode)* | **Sealed `memfd` Required** | Rejects any `StorePayload` descriptor lacking `F_SEAL_WRITE \| F_SEAL_SHRINK \| F_SEAL_GROW` before reading or encrypting any byte. Custom C/Go/Rust plugins **must** call `fcntl(F_ADD_SEALS)` prior to `sendmsg`. |

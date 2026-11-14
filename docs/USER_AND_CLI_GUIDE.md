@@ -138,6 +138,17 @@ parvault up \
 ```
 This prints a **4-word BIP-39 SAS pairing code** (e.g. `shield-copper-alpine-matrix`), launches the P2P daemon, responds to signed LAN discovery beacons on UDP `4009`, and serves the live web dashboard on port `4080`.
 
+The status page needs a read-only token on every request (v0.5.0): run `parvault token mint --read-only` on the node, open `http://<node-ip>:4080`, and enter the token as the password (any user name), or send `Authorization: Bearer <token>` to `/api/v1/health`. The token goes only in that header, never in the URL: `?token=` is ignored and refused. Use an IP address or `localhost`, not a host name: DNS names are refused (DNS rebinding). Without `--status-http` there is no status listener.
+
+#### Status page as a separate process (`parvault-status`)
+`parvault-status` serves the same status page from outside the daemon. It holds no key and links no tokio or libp2p. It pins one read-only token, and asks the daemon for the snapshot over the gateway socket:
+```bash
+( umask 077; parvault token mint --read-only > ~/.parvault-status.token )
+parvault-status --socket /var/run/parvault.sock --listen 127.0.0.1:4080 \
+  --macaroon-file ~/.parvault-status.token
+```
+Requests must present that token, or an offline attenuation of it, in the `Authorization` header (Bearer, or as the Basic password), never in the URL. `--macaroon <token>` still works, but any local user can read it in the process list (`/proc/<pid>/cmdline`); use `--macaroon-file`, which is refused if group or others can read it. `--listen` has no default. The socket is mode `0600`, so run it as the daemon's user or set up the socket for its user. Against a daemon older than v0.5.0 it exits with "predates v0.5.0".
+
 #### 3. Zero-IP Auto-Discovery & Pairing on Laptops (`parvault discover` & `join`)
 On any other computer on your Wi-Fi/LAN:
 ```bash

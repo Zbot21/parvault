@@ -7,8 +7,7 @@ use std::collections::{HashMap, VecDeque};
 /// Homelab / Prosumer pool (`16-of-20`, 1.25x expansion factor).
 pub const HOMELAB_SLA_THRESHOLD: f64 = 0.995;
 
-/// Default minimum free OS filesystem space (5 GiB) reserved as a safety guard against disk exhaustion.
-pub const DEFAULT_MIN_FREE_DISK_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+pub use crate::profile::DEFAULT_MIN_FREE_DISK_BYTES;
 
 /// Dynamic Uptime-Based Trust Levels (ADR-10):
 /// Governs how many shards of a single stripe an ASN/subnet is permitted to host and
@@ -186,7 +185,7 @@ impl QuotaManager {
     fn persist(&self) {
         if let Some(ref path) = self.persistence_path {
             if let Ok(bytes) = bincode::serialize(self) {
-                let _ = crate::storage::BlockStore::atomic_write_file(path, &bytes);
+                let _ = crate::storage::fsio::atomic_write_file(path, &bytes);
             }
         }
     }

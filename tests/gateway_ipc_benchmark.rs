@@ -116,7 +116,7 @@ fn test_gateway_zero_copy_ipc_streaming() {
     // 3. Reconstruct all 100 x 1 MiB Reed-Solomon stripes into an output memfd via SCM_RIGHTS.
     let out_memfd = create_memfd("parvault-gate1-100mb-out").expect("create output memfd");
     let streamed = client
-        .fetch_into_memfd(manifest.shard_hashes.clone(), out_memfd.as_raw_fd())
+        .fetch_into_memfd(manifest.shard_hashes.clone(), out_memfd.as_raw_fd(), None)
         .expect("fetch 100 MiB into output memfd over SCM_RIGHTS");
     assert_eq!(streamed, total_bytes);
 

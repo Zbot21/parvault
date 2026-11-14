@@ -14,7 +14,6 @@
 #![forbid(unsafe_code)]
 
 use clap::{Parser, Subcommand};
-use parvault::capabilities::CapabilityMacaroon;
 use parvault::gateway::ipc::DEFAULT_IPC_SOCKET_PATH;
 use std::path::PathBuf;
 
@@ -38,8 +37,13 @@ struct FuseCli {
     cache_mib: u64,
 
     /// Optional `PARVAULT-MAC-V1:` attenuated capability macaroon presented on lazy `FetchRange` reads.
+    /// Visible to every local user in the process list (`/proc/<pid>/cmdline`); prefer `--macaroon-file`.
     #[arg(long, global = true, value_name = "PARVAULT-MAC-V1:...")]
     macaroon: Option<String>,
+
+    /// File holding the token (mode 600; refused if group or others can read it).
+    #[arg(long, value_name = "PATH", global = true)]
+    macaroon_file: Option<PathBuf>,
 
     #[command(subcommand)]
     command: FuseCommand,
@@ -71,7 +75,8 @@ enum FuseCommand {
         #[arg(long)]
         folder: PathBuf,
     },
-    /// Run an embedded self-test verifying `< 50 ms` TTFB lazy range streaming and LRU cache eviction.
+    /// Self-test against the daemon on `--socket` (presents `--macaroon`): `< 50 ms` TTFB lazy
+    /// range streaming and LRU cache eviction.
     SelfTest,
 }
 
@@ -84,18 +89,11 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     let cli = FuseCli::parse();
-    let default_macaroon = match cli
-        .macaroon
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(raw) => Some(
-            CapabilityMacaroon::from_compact_token(raw)
-                .map_err(|e| anyhow::anyhow!("invalid --macaroon token: {e}"))?,
-        ),
-        None => None,
-    };
+    let default_macaroon = parvault::capabilities::token_from_args(
+        cli.macaroon.as_deref(),
+        cli.macaroon_file.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
 
     #[cfg(not(unix))]
     {
@@ -106,10 +104,7 @@ fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use parvault::{
-            config::HardwareProfile,
-            crypto::MasterKey,
-            gateway::ipc::{create_memfd, GatewayIpcClient, GatewayIpcServer, RetentionPolicy},
-            storage::{BlockStore, QuotaManager},
+            gateway::ipc::{create_memfd, GatewayIpcClient, RetentionPolicy},
             vfs::VirtualVaultFs,
         };
         use std::io::{Seek, SeekFrom, Write};
@@ -171,6 +166,9 @@ fn main() -> anyhow::Result<()> {
                 );
             }
             FuseCommand::SelfTest => {
+                // Client-only (item 3): runs against the daemon on `--socket`, presenting
+                // `--macaroon` when the gateway has a root key. The in-process variant lives in
+                // tests/plugin_self_test.rs.
                 struct TempDirGuard(PathBuf);
                 impl Drop for TempDirGuard {
                     fn drop(&mut self) {
@@ -186,38 +184,39 @@ fn main() -> anyhow::Result<()> {
                 ));
                 std::fs::create_dir_all(&tmp_dir)?;
                 let _guard = TempDirGuard(tmp_dir.clone());
-                let sock = tmp_dir.join("vfs_selftest.sock");
-                let store = BlockStore::new(
-                    tmp_dir.join("store"),
-                    QuotaManager::new(512 * 1024 * 1024, 64 * 1024 * 1024),
-                )?;
-                let mut srv = GatewayIpcServer::new(&sock, store, MasterKey::generate())
-                    .with_profile(HardwareProfile::RouterSoc)
-                    .with_require_sealed_ingest_memfd(true)
-                    .spawn()?;
 
-                let client = GatewayIpcClient::new(&sock);
+                let client = GatewayIpcClient::new(&cli.socket);
                 let mfd = create_memfd("vfs-selftest")?;
                 let mut f = std::fs::File::from(mfd);
                 let payload: Vec<u8> = (0..(4 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
                 f.write_all(&payload)?;
                 f.seek(SeekFrom::Start(0))?;
-                let manifest = client.store_sealed_memfd(
-                    f.as_raw_fd(),
-                    payload.len() as u64,
-                    RetentionPolicy::Persistent,
-                )?;
+                let manifest = client
+                    .store_sealed_memfd(
+                        f.as_raw_fd(),
+                        payload.len() as u64,
+                        RetentionPolicy::Persistent,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "self-test needs a running daemon on {} (`parvault up --ipc-socket` or `parvault gateway serve`): {e}",
+                            cli.socket.display()
+                        )
+                    })?;
 
                 // Cap cache at 2 MiB and read 4 MiB across blocks to verify LRU eviction + <50ms TTFB.
-                let vfs = VirtualVaultFs::new(&sock, tmp_dir.join("cache"), 2 * 1024 * 1024)?;
+                let vfs = VirtualVaultFs::new(&cli.socket, tmp_dir.join("cache"), 2 * 1024 * 1024)?
+                    .with_default_macaroon(default_macaroon);
                 let ino = vfs.register_stub_file("/vault/test.bin", manifest, None)?;
                 let (slice, ttfb) =
                     vfs.read_range_with_ttfb(ino, 1024 * 1024 + 17, 2 * 1024 * 1024)?;
-                srv.shutdown();
-                assert_eq!(slice, payload[1024 * 1024 + 17..3 * 1024 * 1024 + 17]);
+                anyhow::ensure!(
+                    slice == payload[1024 * 1024 + 17..3 * 1024 * 1024 + 17],
+                    "range bytes differ"
+                );
                 let stats = vfs.cache_stats();
-                assert!(stats.used_bytes <= 2 * 1024 * 1024);
-                assert!(stats.evictions >= 1);
+                anyhow::ensure!(stats.used_bytes <= 2 * 1024 * 1024, "cache over its cap");
+                anyhow::ensure!(stats.evictions >= 1, "no LRU eviction");
                 println!(
                     "parvault-fuse self-test: PASS (TTFB={:.2} ms < 50 ms, cache_used={} B, evictions={})",
                     ttfb.as_secs_f64() * 1000.0,

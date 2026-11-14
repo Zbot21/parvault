@@ -1,71 +1,32 @@
-//! ParVault v0.3.0 — Embedded Router Cloud-NAS Dashboard & Control HTTP API
+//! ParVault embedded status page (`status-ui`): the node's [`StatusSnapshot`] as JSON
+//! (`/api/v1/health`, `/api/v1/peers`) and a small HTML dashboard (`/`).
 //!
-//! Provides a zero-dependency, ultra-lightweight HTTP status server and embedded HTML dashboard
-//! for hardware routers (OpenWrt LuCI, prplOS, ARM64/MIPS SoC gateways) and home users.
+//! Item 3 (plan-3, L-48): a blocking `std::net::TcpListener` on the shared [`crate::http_edge`]
+//! (connection slots, 8 KiB heads, one deadline, fixed refusals). Every request presents a
+//! read-only token (`Authorization: Bearer`, or as the Basic password; never in the URL), and
+//! [`crate::http_edge::status_auth_decision`] runs before the snapshot is fetched over a
+//! [`GatewayBus`]: in-process in `parvault`, the gateway socket in `parvault-status`.
 //!
-//! Built strictly with `tokio::net::TcpListener`, `tokio::io`, and `serde_json` to eliminate
-//! heavy web framework dependencies (axum/hyper/actix) and maintain a tiny binary footprint (< 32 MiB RAM).
+//! [`StatusSnapshot`]: crate::gateway::ipc::StatusSnapshot
 
-use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use crate::capabilities::CapabilityMacaroon;
+use crate::gateway::ipc::GatewayBus;
+use crate::http_edge::{
+    presented_token, read_request_head, spawn_edge_conn, status_auth_decision, status_auth_facts,
+    status_host_allowed, EdgeSlots, EdgeVerifier, PresentedToken, StatusAuthFacts, StatusTransport,
+    RESP_403, RESP_502, RESP_503, STATUS_401,
+};
+use std::io::{self, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Peer entry discovered or registered on the local network.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RouterNasPeerEntry {
-    pub peer_id: String,
-    pub label: String,
-    pub role: String,
-    pub multiaddr: String,
-    pub available_bytes: u64,
-}
-
-/// Live snapshot of the ParVault Router Cloud-NAS appliance state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RouterNasLiveSnapshot {
-    pub version: String,
-    pub node_label: String,
-    pub hardware_profile: String,
-    pub device_peer_id: String,
-    pub libp2p_peer_id: String,
-    pub owner_pq_fingerprint: String,
-    pub stripe_size_bytes: usize,
-    pub watched_folder: Option<String>,
-    pub pairing_sas_code: Option<String>,
-    pub sla_tier: String,
-    pub used_storage_bytes: u64,
-    pub max_storage_bytes: u64,
-    pub rss_kib: u64,
-    pub hwm_kib: u64,
-    pub uptime_secs: u64,
-    pub lan_peers: Vec<RouterNasPeerEntry>,
-}
-
-impl Default for RouterNasLiveSnapshot {
-    fn default() -> Self {
-        Self {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            node_label: "parvault-router-nas".to_string(),
-            hardware_profile: "router-soc".to_string(),
-            device_peer_id: String::new(),
-            libp2p_peer_id: String::new(),
-            owner_pq_fingerprint: String::new(),
-            stripe_size_bytes: 1024 * 1024,
-            watched_folder: None,
-            pairing_sas_code: None,
-            sla_tier: "Community".to_string(),
-            used_storage_bytes: 0,
-            max_storage_bytes: 0,
-            rss_kib: 0,
-            hwm_kib: 0,
-            uptime_secs: 0,
-            lan_peers: Vec::new(),
-        }
-    }
-}
+/// Moved to `gateway::ipc` (item 3) so the sidecar and `QueryStatus` share it; the old names
+/// stay as aliases. `pairing_sas_code` and `watched_folder` are gone (plan-3 ruling change 3).
+pub use crate::gateway::ipc::{
+    StatusPeerEntry as RouterNasPeerEntry, StatusSnapshot as RouterNasLiveSnapshot,
+};
 
 impl RouterNasLiveSnapshot {
     /// Refreshes process memory telemetry and uptime.
@@ -101,248 +62,224 @@ fn parse_kib_field(s: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Handle controlling the background HTTP server task.
-#[derive(Debug)]
+/// Most status connections served at once (item 3: the 33rd is dropped unanswered).
+pub const STATUS_MAX_CONNECTIONS: usize = 32;
+
+/// RAII handle of a running status server; dropping it stops the accept loop.
 pub struct RouterNasServerHandle {
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
-    join_handle: Option<tokio::task::JoinHandle<()>>,
+    local_addr: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+    join_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl RouterNasServerHandle {
-    /// Signal the server to stop accepting connections and shut down cleanly.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Stops accepting connections (in-flight ones finish on their own threads).
     pub fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown.store(true, Ordering::SeqCst);
     }
 
-    /// Alias for `shutdown`.
-    pub fn stop(&self) {
-        self.shutdown();
-    }
-
-    /// Awaits completion of the background server task.
-    pub async fn wait(mut self) {
-        if let Some(handle) = self.join_handle.take() {
-            let _ = handle.await;
+    /// Blocks until the accept loop exits (a foreground server, e.g. `parvault-status`).
+    pub fn wait(mut self) {
+        if let Some(h) = self.join_handle.take() {
+            let _ = h.join();
         }
     }
 }
 
 impl Drop for RouterNasServerHandle {
     fn drop(&mut self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown.store(true, Ordering::SeqCst);
     }
 }
 
-/// Zero-dependency Router Cloud-NAS HTTP Server.
+/// The status page server. There is no constructor without a verifier (L-44).
 pub struct RouterNasStatusServer;
 
 impl RouterNasStatusServer {
-    /// Binds to `bind_addr` and spawns the background server loop.
-    ///
-    /// Supports ephemeral `:0` binding for automated tests.
-    pub async fn bind_and_spawn(
+    /// Binds `bind_addr` (`:0` for an ephemeral port) and serves the snapshot from `bus` to
+    /// requests whose token `verifier` accepts. No default address: no flag, no listener.
+    pub fn bind_and_spawn(
         bind_addr: SocketAddr,
-        state: Arc<RwLock<RouterNasLiveSnapshot>>,
-    ) -> anyhow::Result<(SocketAddr, RouterNasServerHandle)> {
-        let listener = TcpListener::bind(bind_addr).await?;
-        Self::spawn_on_listener(listener, state)
-    }
-
-    /// Binds synchronously using standard library `TcpListener` and spawns in the active Tokio runtime.
-    pub fn bind_and_spawn_std(
-        bind_addr: SocketAddr,
-        state: Arc<RwLock<RouterNasLiveSnapshot>>,
-    ) -> anyhow::Result<(SocketAddr, RouterNasServerHandle)> {
-        let std_listener = std::net::TcpListener::bind(bind_addr)?;
-        std_listener.set_nonblocking(true)?;
-        let listener = TcpListener::from_std(std_listener)?;
-        Self::spawn_on_listener(listener, state)
-    }
-
-    /// Spawns the background server loop on an existing Tokio `TcpListener`.
-    pub fn spawn_on_listener(
-        listener: TcpListener,
-        state: Arc<RwLock<RouterNasLiveSnapshot>>,
-    ) -> anyhow::Result<(SocketAddr, RouterNasServerHandle)> {
+        bus: GatewayBus,
+        verifier: EdgeVerifier,
+    ) -> io::Result<(SocketAddr, RouterNasServerHandle)> {
+        let listener = TcpListener::bind(bind_addr)?;
+        listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-        let start_time = std::time::Instant::now();
-        let server_state = Arc::clone(&state);
-
-        let join_handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    res = listener.accept() => {
-                        match res {
-                            Ok((stream, _peer_addr)) => {
-                                let st = Arc::clone(&server_state);
-                                tokio::spawn(async move {
-                                    let _ = handle_client(stream, st, start_time).await;
-                                });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&shutdown);
+        let slots = Arc::new(EdgeSlots::new(STATUS_MAX_CONNECTIONS));
+        let join_handle = std::thread::Builder::new()
+            .name("parvault-status-accept".into())
+            .spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            if stream.set_nonblocking(false).is_err() {
+                                continue;
                             }
-                            Err(e) => {
-                                tracing::debug!("Router NAS status server accept error: {e}");
-                            }
+                            let (bus, verifier) = (bus.clone(), verifier.clone());
+                            spawn_edge_conn(stream, &slots, "parvault-status-http", move |s| {
+                                let _ = handle_status_conn(s, &bus, &verifier, local_addr);
+                            });
                         }
-                    }
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
-                            break;
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(20));
                         }
+                        Err(_) => std::thread::sleep(Duration::from_millis(20)),
                     }
                 }
-            }
-        });
-
+            })?;
         Ok((
             local_addr,
             RouterNasServerHandle {
-                shutdown_tx,
+                local_addr,
+                shutdown,
                 join_handle: Some(join_handle),
             },
         ))
     }
 }
 
-async fn handle_client(
-    mut stream: tokio::net::TcpStream,
-    state: Arc<RwLock<RouterNasLiveSnapshot>>,
-    start_time: std::time::Instant,
-) -> anyhow::Result<()> {
-    // Strict 4 KiB request header cap
-    let mut buf = [0u8; 4096];
-    let mut total_read = 0;
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
-    while total_read < buf.len() {
-        let n = stream.read(&mut buf[total_read..]).await?;
-        if n == 0 {
-            break;
-        }
-        total_read += n;
-        if buf[..total_read].windows(4).any(|w| w == b"\r\n\r\n")
-            || buf[..total_read].windows(2).any(|w| w == b"\n\n")
-        {
-            break;
-        }
+/// The fixed response for a refusal, from the facts in the decision's order: 503 when the node
+/// cannot verify or has no snapshot, 403 for a scoped token or a bad Host, and the one
+/// byte-identical 401 otherwise. The reason code itself is only logged.
+fn status_refusal(f: &StatusAuthFacts) -> &'static [u8] {
+    if !f.verifier_present || !f.provider_present {
+        RESP_503
+    } else if !f.token_present || !f.token_valid || !f.read_only {
+        STATUS_401
+    } else if f.scoped {
+        RESP_403
+    } else if !f.peer_uid_ok {
+        STATUS_401
+    } else {
+        RESP_403
     }
+}
 
-    if total_read == 0 {
+fn handle_status_conn(
+    stream: &mut TcpStream,
+    bus: &GatewayBus,
+    verifier: &EdgeVerifier,
+    bound: SocketAddr,
+) -> io::Result<()> {
+    let Some(head) = read_request_head(stream)? else {
         return Ok(());
-    }
-
-    let req_str = match std::str::from_utf8(&buf[..total_read]) {
-        Ok(s) => s,
-        Err(_) => {
-            send_response(
-                &mut stream,
-                "400 Bad Request",
-                "application/json",
-                b"{\"error\":\"invalid utf-8\"}\n",
-            )
-            .await?;
-            return Ok(());
-        }
     };
-
-    let first_line = req_str.lines().next().unwrap_or("");
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
-    if parts.len() < 2 {
-        send_response(
-            &mut stream,
-            "400 Bad Request",
-            "application/json",
-            b"{\"error\":\"malformed request line\"}\n",
-        )
-        .await?;
-        return Ok(());
+    let text = String::from_utf8_lossy(&head);
+    let mut lines = text.split("\r\n");
+    let mut request = lines.next().unwrap_or("").split_whitespace();
+    let method = request.next().unwrap_or("").to_string();
+    let raw_path = request.next().unwrap_or("/");
+    let path = raw_path.split('?').next().unwrap_or("/").to_string();
+    let (mut host, mut authorization) = (None, None);
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.eq_ignore_ascii_case("host") {
+                host = Some(v.trim());
+            } else if k.eq_ignore_ascii_case("authorization") {
+                authorization = Some(v);
+            }
+        }
     }
 
-    let method = parts[0];
-    let raw_path = parts[1];
-    let path = raw_path.split('?').next().unwrap_or(raw_path);
-
+    // Item 3: the decision runs before the snapshot is fetched.
+    let presented = presented_token(authorization);
+    let token: Option<&CapabilityMacaroon> = match &presented {
+        PresentedToken::Token(t) => Some(t),
+        _ => None,
+    };
+    let verify = |t: &CapabilityMacaroon| verifier.chain_ok(t);
+    let mut facts = status_auth_facts(
+        token,
+        Some(&verify),
+        now_unix_ms(),
+        StatusTransport::Tcp,
+        status_host_allowed(host, bound),
+        true,
+    );
+    if matches!(presented, PresentedToken::Malformed) {
+        facts.token_present = true;
+        facts.token_valid = false;
+    }
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    if let Err(code) = status_auth_decision(&facts) {
+        tracing::warn!(code, peer = %peer, "refused a status request");
+        stream.write_all(status_refusal(&facts))?;
+        return stream.flush();
+    }
     if method != "GET" {
-        let err_json = format!(
-            "{{\"error\":\"method not allowed\",\"method\":\"{}\"}}\n",
-            method
-        );
-        send_response(
-            &mut stream,
+        return send_response(
+            stream,
             "405 Method Not Allowed",
             "application/json",
-            err_json.as_bytes(),
-        )
-        .await?;
-        return Ok(());
+            b"{\"error\":\"method not allowed\"}\n",
+        );
     }
-
-    match path {
+    let snap = match bus.query_status_sync(token.cloned()) {
+        Ok(s) => s,
+        Err(e) => {
+            // The daemon's own refusal (or no daemon): 503 when it has no verifier or snapshot,
+            // 502 otherwise. Its reason code is in its log, not repeated here.
+            let unavailable = e.to_string().contains("status_unavailable");
+            tracing::warn!(peer = %peer, unavailable, "status snapshot not served by the gateway");
+            stream.write_all(if unavailable { RESP_503 } else { RESP_502 })?;
+            return stream.flush();
+        }
+    };
+    match path.as_str() {
         "/api/v1/health" => {
-            {
-                let mut guard = state.write().await;
-                guard.update_telemetry(start_time);
-            }
-            let snap = state.read().await.clone();
-            let json = serde_json::to_vec_pretty(&snap)?;
-            send_response(&mut stream, "200 OK", "application/json", &json).await?;
+            let json = serde_json::to_vec_pretty(&snap).map_err(io::Error::other)?;
+            send_response(stream, "200 OK", "application/json", &json)
         }
         "/api/v1/peers" => {
-            let peers = state.read().await.lan_peers.clone();
-            let json = serde_json::to_vec_pretty(&peers)?;
-            send_response(&mut stream, "200 OK", "application/json", &json).await?;
+            let json = serde_json::to_vec_pretty(&snap.lan_peers).map_err(io::Error::other)?;
+            send_response(stream, "200 OK", "application/json", &json)
         }
         "/" | "/index.html" => {
-            {
-                let mut guard = state.write().await;
-                guard.update_telemetry(start_time);
-            }
-            let snap = state.read().await.clone();
             let html = render_dashboard_html(&snap);
             send_response(
-                &mut stream,
+                stream,
                 "200 OK",
                 "text/html; charset=utf-8",
                 html.as_bytes(),
             )
-            .await?;
         }
-        _ => {
-            let not_found = format!("{{\"error\":\"not found\",\"path\":\"{}\"}}\n", path);
-            send_response(
-                &mut stream,
-                "404 Not Found",
-                "application/json",
-                not_found.as_bytes(),
-            )
-            .await?;
-        }
+        _ => send_response(
+            stream,
+            "404 Not Found",
+            "application/json",
+            b"{\"error\":\"not found\"}\n",
+        ),
     }
-
-    Ok(())
 }
 
-async fn send_response(
-    stream: &mut tokio::net::TcpStream,
-    status: &str,
-    content_type: &str,
-    body: &[u8],
-) -> anyhow::Result<()> {
-    let header = format!(
-        "HTTP/1.1 {}\r\n\
-         Content-Type: {}\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         X-Content-Type-Options: nosniff\r\n\
-         Cache-Control: no-store\r\n\
-         \r\n",
-        status,
-        content_type,
+/// QA item 3: no scripts, no external loads, no framing; the dashboard's inline `<style>` only.
+const STATUS_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'";
+
+fn send_response(stream: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) -> io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: {STATUS_CSP}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    stream.write_all(header.as_bytes()).await?;
-    stream.write_all(body).await?;
-    stream.flush().await?;
-    Ok(())
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
 }
 
 fn html_escape(s: &str) -> String {
@@ -401,17 +338,6 @@ pub fn render_dashboard_html(snap: &RouterNasLiveSnapshot) -> String {
     let label = html_escape(&snap.node_label);
     let version = html_escape(&snap.version);
     let profile = html_escape(&snap.hardware_profile);
-    let watched_folder = snap
-        .watched_folder
-        .as_ref()
-        .map(|s| html_escape(s))
-        .unwrap_or_else(|| "<em>None</em>".to_string());
-
-    let pairing_badge = match &snap.pairing_sas_code {
-        Some(code) => format!("<span class=\"sas-code\">{}</span>", html_escape(code)),
-        None => "<span class=\"badge-muted\">Standby (Run <code>parvault pair</code>)</span>"
-            .to_string(),
-    };
 
     let rss_mib = snap.rss_kib as f64 / 1024.0;
     let hwm_mib = snap.hwm_kib as f64 / 1024.0;
@@ -490,7 +416,6 @@ h1{{font-size:1.35rem;font-weight:700;display:flex;align-items:center;gap:0.5rem
 .val{{font-size:1.4rem;font-weight:700;color:var(--cyan)}}
 .bar-box{{background:#0f172a;border-radius:4px;height:10px;overflow:hidden;margin:0.5rem 0}}
 .bar{{background:linear-gradient(90deg,var(--cyan),var(--green));height:100%}}
-.sas-code{{font-family:monospace;font-size:1.05rem;font-weight:700;color:#fde047;background:#422006;padding:0.25rem 0.6rem;border-radius:6px;border:1px solid var(--amber);letter-spacing:0.05em}}
 table{{width:100%;border-collapse:collapse;font-size:0.85rem}}
 th,td{{text-align:left;padding:0.6rem;border-bottom:1px solid var(--border)}}
 th{{color:var(--muted);font-weight:600}}
@@ -507,7 +432,6 @@ footer{{margin-top:1.25rem;font-size:0.75rem;color:var(--muted);display:flex;jus
 <h1>ParVault Cloud NAS <span class="badge badge-profile">{profile}</span></h1>
 <div class="sub">Node: <strong>{label}</strong> &bull; v{version} &bull; Uptime: {uptime} &bull; SLA: {sla}</div>
 </div>
-<div>{pairing}</div>
 </header>
 <div class="grid">
 <div class="card">
@@ -522,8 +446,7 @@ footer{{margin-top:1.25rem;font-size:0.75rem;color:var(--muted);display:flex;jus
 </div>
 <div class="card">
 <h2>NAS Sync &amp; Network</h2>
-<div style="font-size:0.85rem">Watched Folder: <strong>{watched}</strong></div>
-<div style="font-size:0.85rem;margin-top:0.3rem">Stripe Size: <strong>{stripe}</strong> &bull; Quota Limit: <strong>{max_fmt}</strong></div>
+<div style="font-size:0.85rem">Stripe Size: <strong>{stripe}</strong> &bull; Quota Limit: <strong>{max_fmt}</strong></div>
 <div style="font-size:0.75rem;margin-top:0.4rem;color:var(--muted);word-break:break-all">Libp2p: <code>{libp2p}</code></div>
 </div>
 </div>
@@ -549,7 +472,6 @@ footer{{margin-top:1.25rem;font-size:0.75rem;color:var(--muted);display:flex;jus
         version = version,
         uptime = uptime,
         sla = html_escape(&snap.sla_tier),
-        pairing = pairing_badge,
         rss_mib = rss_mib,
         hwm_mib = hwm_mib,
         mem_cls = mem_status_cls,
@@ -557,7 +479,6 @@ footer{{margin-top:1.25rem;font-size:0.75rem;color:var(--muted);display:flex;jus
         storage_pct = storage_pct,
         used_fmt = used_fmt,
         max_fmt = max_fmt,
-        watched = watched_folder,
         stripe = stripe_str,
         libp2p = libp2p_id,
         peer_count = snap.lan_peers.len(),
@@ -569,7 +490,6 @@ footer{{margin-top:1.25rem;font-size:0.75rem;color:var(--muted);display:flex;jus
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn test_read_linux_process_memory() {
@@ -590,8 +510,6 @@ mod tests {
     fn test_dashboard_html_rendering_size() {
         let snap = RouterNasLiveSnapshot {
             node_label: "openwrt-gateway".to_string(),
-            pairing_sas_code: Some("apple-banana-cherry-date".to_string()),
-            watched_folder: Some("/mnt/usb-nas/shared".to_string()),
             rss_kib: 14 * 1024,
             hwm_kib: 18 * 1024,
             used_storage_bytes: 5 * 1024 * 1024 * 1024,
@@ -608,7 +526,6 @@ mod tests {
 
         let html = render_dashboard_html(&snap);
         assert!(html.contains("ParVault Cloud NAS"));
-        assert!(html.contains("apple-banana-cherry-date"));
         assert!(html.contains("openwrt-gateway"));
         assert!(html.contains("12D3KooWTestPeer1"));
         assert!(
@@ -618,98 +535,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_router_nas_http_server_endpoints() -> anyhow::Result<()> {
-        let initial_snap = RouterNasLiveSnapshot {
-            node_label: "test-router-node".to_string(),
-            pairing_sas_code: Some("test-pair-word-code".to_string()),
-            lan_peers: vec![RouterNasPeerEntry {
-                peer_id: "12D3KooWPeer1".to_string(),
-                label: "laptop".to_string(),
-                role: "client".to_string(),
-                multiaddr: "/ip4/192.168.1.50/tcp/4001".to_string(),
-                available_bytes: 50_000_000,
-            }],
-            ..RouterNasLiveSnapshot::default()
-        };
-        let state = Arc::new(RwLock::new(initial_snap));
-
-        let (addr, handle) =
-            RouterNasStatusServer::bind_and_spawn("127.0.0.1:0".parse()?, Arc::clone(&state))
-                .await?;
-
-        // 1. Test GET /api/v1/health
-        {
-            let mut stream = tokio::net::TcpStream::connect(addr).await?;
-            stream
-                .write_all(b"GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-                .await?;
-            let mut resp = Vec::new();
-            stream.read_to_end(&mut resp).await?;
-            let resp_str = String::from_utf8(resp)?;
-            assert!(resp_str.starts_with("HTTP/1.1 200 OK"));
-            assert!(resp_str.contains("Content-Type: application/json"));
-            assert!(resp_str.contains("X-Content-Type-Options: nosniff"));
-            assert!(resp_str.contains("Cache-Control: no-store"));
-            assert!(resp_str.contains("Connection: close"));
-            let body = resp_str.split("\r\n\r\n").nth(1).unwrap();
-            let parsed: RouterNasLiveSnapshot = serde_json::from_str(body)?;
-            assert_eq!(parsed.node_label, "test-router-node");
-            assert_eq!(
-                parsed.pairing_sas_code.as_deref(),
-                Some("test-pair-word-code")
-            );
-        }
-
-        // 2. Test GET /api/v1/peers
-        {
-            let mut stream = tokio::net::TcpStream::connect(addr).await?;
-            stream
-                .write_all(b"GET /api/v1/peers HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-                .await?;
-            let mut resp = Vec::new();
-            stream.read_to_end(&mut resp).await?;
-            let resp_str = String::from_utf8(resp)?;
-            assert!(resp_str.starts_with("HTTP/1.1 200 OK"));
-            let body = resp_str.split("\r\n\r\n").nth(1).unwrap();
-            let peers: Vec<RouterNasPeerEntry> = serde_json::from_str(body)?;
-            assert_eq!(peers.len(), 1);
-            assert_eq!(peers[0].peer_id, "12D3KooWPeer1");
-            assert_eq!(peers[0].label, "laptop");
-        }
-
-        // 3. Test GET / (HTML Dashboard)
-        {
-            let mut stream = tokio::net::TcpStream::connect(addr).await?;
-            stream
-                .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-                .await?;
-            let mut resp = Vec::new();
-            stream.read_to_end(&mut resp).await?;
-            let resp_str = String::from_utf8(resp)?;
-            assert!(resp_str.starts_with("HTTP/1.1 200 OK"));
-            assert!(resp_str.contains("Content-Type: text/html; charset=utf-8"));
-            assert!(resp_str.contains("ParVault Cloud NAS"));
-            assert!(resp_str.contains("test-pair-word-code"));
-        }
-
-        // 4. Test 404 for unknown route
-        {
-            let mut stream = tokio::net::TcpStream::connect(addr).await?;
-            stream
-                .write_all(b"GET /unknown/path HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-                .await?;
-            let mut resp = Vec::new();
-            stream.read_to_end(&mut resp).await?;
-            let resp_str = String::from_utf8(resp)?;
-            assert!(resp_str.starts_with("HTTP/1.1 404 Not Found"));
-            assert!(resp_str.contains("\"error\":\"not found\""));
-        }
-
-        // 5. Shutdown
-        handle.shutdown();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        Ok(())
-    }
+    // The HTTP endpoints are covered end to end in tests/trust_enforcement.rs (status_http_*)
+    // and tests/zero_config_lan_and_router_soc_tests.rs (test_4).
 }

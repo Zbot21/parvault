@@ -124,6 +124,8 @@ pub enum IpcCommand {
     FetchPayload {
         ephemeral_shard_ids: Vec<[u8; 32]>,
         output_fd: RawFd,
+        /// Checked like `FetchRange`'s, against the whole file (F-47, item 3). Appended.
+        macaroon: Option<CapabilityMacaroon>,
     },
     FetchRange {
         manifest: EphemeralShardManifest,
@@ -136,6 +138,12 @@ pub enum IpcCommand {
         file_manifest: FileManifest,
     },
     QueryHealthStatus,
+    /// Appended (item 3): the node's [`StatusSnapshot`]. Always carries a token, checked by
+    /// [`crate::http_edge::status_auth_decision`]; refused without a root key or a published
+    /// snapshot.
+    QueryStatus {
+        macaroon: Option<CapabilityMacaroon>,
+    },
 }
 
 /// Control responses returned by [`GatewayIpcServer`] over `/var/run/parvault.sock`.
@@ -162,6 +170,128 @@ pub enum IpcResponse {
         manifest: EphemeralShardManifest,
         local_only_stripes: u64,
     },
+    /// Appended (item 3): the answer to `QueryStatus`.
+    StatusSnapshot(StatusSnapshot),
+}
+
+/// Most LAN peers a [`StatusSnapshot`] carries (item 3, ruling change 3).
+pub const MAX_STATUS_PEERS: usize = 128;
+/// Longest string field, in bytes, a [`StatusSnapshot`] carries.
+pub const MAX_STATUS_STRING_BYTES: usize = 256;
+// 10 top-level strings and 4 per peer, each with an 8-byte length prefix, plus 6 + 1 u64s per
+// snapshot and peer: far below one IPC frame.
+const _: () = assert!(
+    (10 + 4 * MAX_STATUS_PEERS) * (MAX_STATUS_STRING_BYTES + 8) + (7 + MAX_STATUS_PEERS) * 8 + 64
+        < MAX_IPC_FRAME_BYTES
+);
+
+/// One LAN peer in a [`StatusSnapshot`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusPeerEntry {
+    pub peer_id: String,
+    pub label: String,
+    pub role: String,
+    pub multiaddr: String,
+    pub available_bytes: u64,
+}
+
+/// The node status served to the status page and over `QueryStatus` (was
+/// `router_nas::RouterNasLiveSnapshot`, which is now an alias). Item 3 dropped
+/// `pairing_sas_code` and `watched_folder`; strings and the peer list are capped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusSnapshot {
+    pub version: String,
+    pub node_label: String,
+    pub hardware_profile: String,
+    pub device_peer_id: String,
+    pub libp2p_peer_id: String,
+    pub owner_pq_fingerprint: String,
+    pub stripe_size_bytes: u64,
+    pub sla_tier: String,
+    pub used_storage_bytes: u64,
+    pub max_storage_bytes: u64,
+    pub rss_kib: u64,
+    pub hwm_kib: u64,
+    pub uptime_secs: u64,
+    pub lan_peers: Vec<StatusPeerEntry>,
+}
+
+impl Default for StatusSnapshot {
+    fn default() -> Self {
+        Self {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            node_label: "parvault-router-nas".to_string(),
+            hardware_profile: "router-soc".to_string(),
+            device_peer_id: String::new(),
+            libp2p_peer_id: String::new(),
+            owner_pq_fingerprint: String::new(),
+            stripe_size_bytes: 1024 * 1024,
+            sla_tier: "Community".to_string(),
+            used_storage_bytes: 0,
+            max_storage_bytes: 0,
+            rss_kib: 0,
+            hwm_kib: 0,
+            uptime_secs: 0,
+            lan_peers: Vec::new(),
+        }
+    }
+}
+
+fn cap_string(s: &mut String) {
+    if s.len() > MAX_STATUS_STRING_BYTES {
+        let mut end = MAX_STATUS_STRING_BYTES;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+}
+
+impl StatusSnapshot {
+    /// Truncates strings and the peer list to the caps (the daemon publishes only capped
+    /// snapshots).
+    pub fn capped(mut self) -> Self {
+        for s in [
+            &mut self.version,
+            &mut self.node_label,
+            &mut self.hardware_profile,
+            &mut self.device_peer_id,
+            &mut self.libp2p_peer_id,
+            &mut self.owner_pq_fingerprint,
+            &mut self.sla_tier,
+        ] {
+            cap_string(s);
+        }
+        self.lan_peers.truncate(MAX_STATUS_PEERS);
+        for p in &mut self.lan_peers {
+            for s in [&mut p.peer_id, &mut p.label, &mut p.role, &mut p.multiaddr] {
+                cap_string(s);
+            }
+        }
+        self
+    }
+
+    /// True when every string and the peer list are within the caps (clients check a decoded
+    /// snapshot with this).
+    pub fn within_caps(&self) -> bool {
+        let ok = |s: &String| s.len() <= MAX_STATUS_STRING_BYTES;
+        [
+            &self.version,
+            &self.node_label,
+            &self.hardware_profile,
+            &self.device_peer_id,
+            &self.libp2p_peer_id,
+            &self.owner_pq_fingerprint,
+            &self.sla_tier,
+        ]
+        .into_iter()
+        .all(ok)
+            && self.lan_peers.len() <= MAX_STATUS_PEERS
+            && self
+                .lan_peers
+                .iter()
+                .all(|p| ok(&p.peer_id) && ok(&p.label) && ok(&p.role) && ok(&p.multiaddr))
+    }
 }
 
 /// Domain-separated SHA-256 digest of a vector of 32-byte shard/stripe identifiers used to index
@@ -189,21 +319,20 @@ pub(crate) fn ipc_bincode() -> impl Options {
 #[cfg(unix)]
 mod unix_impl {
     use super::*;
-    use crate::config::{ErasureTier, HardwareProfile};
-    use crate::crypto::MasterKey;
+    #[cfg(feature = "daemon-runtime")]
     use crate::gateway::engine::GatewayEngine;
+    #[cfg(feature = "daemon-runtime")]
     use crate::gateway::shm::{pwrite_all, recv_frame_with_fd, send_frame_with_fd};
     use crate::os_sys::{recvmsg_scm_rights, sendmsg_scm_rights};
-    use crate::storage::BlockStore;
     use std::fs::File;
     use std::io::{self, Read, Seek, SeekFrom, Write};
     use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-    use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
+    use std::os::unix::net::UnixStream as StdUnixStream;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    #[cfg(feature = "daemon-runtime")]
     use std::sync::Arc;
-    use tokio::net::{UnixListener as TokioUnixListener, UnixStream as TokioUnixStream};
-    use tokio::sync::watch;
+    #[cfg(feature = "daemon-runtime")]
+    use tokio::net::UnixStream as TokioUnixStream;
 
     pub use crate::os_sys::{read_self_anon_rss_bytes, read_self_rss_bytes};
 
@@ -280,381 +409,6 @@ mod unix_impl {
         Ok((payload, received_fd))
     }
 
-    fn bind_clean_std_listener(path: &Path) -> io::Result<StdUnixListener> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        if path.exists() {
-            let _ = std::fs::remove_file(path);
-        }
-        let listener = StdUnixListener::bind(path)?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(listener)
-    }
-
-    /// Handle controlling a background thread-spawned [`GatewayIpcServer`].
-    pub struct GatewayIpcServerHandle {
-        socket_path: PathBuf,
-        shutdown_flag: Arc<AtomicBool>,
-        join_handle: Option<std::thread::JoinHandle<()>>,
-    }
-
-    impl GatewayIpcServerHandle {
-        pub fn socket_path(&self) -> &Path {
-            &self.socket_path
-        }
-
-        pub fn shutdown(&mut self) {
-            self.shutdown_flag.store(true, Ordering::SeqCst);
-            let _ = StdUnixStream::connect(&self.socket_path);
-            if let Some(jh) = self.join_handle.take() {
-                let _ = jh.join();
-            }
-            let _ = std::fs::remove_file(&self.socket_path);
-        }
-    }
-
-    impl Drop for GatewayIpcServerHandle {
-        fn drop(&mut self) {
-            self.shutdown();
-        }
-    }
-
-    /// Canonical zero-copy Unix Domain Socket IPC Server (`/var/run/parvault.sock`) backed by
-    /// [`GatewayEngine`]. Supports both synchronous background thread spawning (`new(..).spawn()`)
-    /// and asynchronous Tokio accept loops (`bind(..).serve(shutdown_rx)`).
-    pub struct GatewayIpcServer {
-        socket_path: PathBuf,
-        bound_listener: Option<StdUnixListener>,
-        engine: Arc<GatewayEngine>,
-    }
-
-    impl GatewayIpcServer {
-        /// Constructs an embedded `GatewayIpcServer` wrapping `block_store` and `master_key`.
-        pub fn new(
-            socket_path: impl AsRef<Path>,
-            block_store: BlockStore,
-            master_key: MasterKey,
-        ) -> Self {
-            Self {
-                socket_path: socket_path.as_ref().to_path_buf(),
-                bound_listener: None,
-                engine: Arc::new(GatewayEngine::from_local_block_store(
-                    block_store,
-                    master_key,
-                )),
-            }
-        }
-
-        /// Binds `socket_path` immediately against an existing `Arc<GatewayEngine>` (ready for
-        /// [`Self::serve`] or [`Self::spawn`]).
-        pub fn bind(socket_path: impl AsRef<Path>, engine: Arc<GatewayEngine>) -> io::Result<Self> {
-            let path = socket_path.as_ref().to_path_buf();
-            let std_listener = bind_clean_std_listener(&path)?;
-            Ok(Self {
-                socket_path: path,
-                bound_listener: Some(std_listener),
-                engine,
-            })
-        }
-
-        pub fn socket_path(&self) -> &Path {
-            &self.socket_path
-        }
-
-        pub fn engine(&self) -> &Arc<GatewayEngine> {
-            &self.engine
-        }
-
-        pub fn with_profile(self, profile: HardwareProfile) -> Self {
-            self.engine
-                .set_stripe_size_bytes(profile.stripe_size_bytes());
-            self
-        }
-
-        pub fn with_tier(self, tier: ErasureTier) -> Self {
-            self.engine.set_tier(tier);
-            self
-        }
-
-        pub fn with_macaroon_root_key(self, root_key: [u8; 32]) -> Self {
-            self.engine.set_macaroon_root_key(Some(root_key));
-            self
-        }
-
-        pub fn with_strict_allowed_peer_uids(self, uids: Vec<u32>) -> Self {
-            self.engine.set_strict_allowed_peer_uids(Some(uids));
-            self
-        }
-
-        pub fn with_require_sealed_ingest_memfd(self, required: bool) -> Self {
-            self.engine.set_require_sealed_ingest_memfd(required);
-            self
-        }
-
-        /// Binds (if not already bound) and spawns a background worker accept loop, returning an
-        /// RAII [`GatewayIpcServerHandle`].
-        pub fn spawn(mut self) -> io::Result<GatewayIpcServerHandle> {
-            let listener = match self.bound_listener.take() {
-                Some(l) => l,
-                None => bind_clean_std_listener(&self.socket_path)?,
-            };
-            listener.set_nonblocking(false)?;
-
-            let shutdown_flag = Arc::new(AtomicBool::new(false));
-            let shutdown_cl = Arc::clone(&shutdown_flag);
-            let sock_path = self.socket_path.clone();
-            let engine = Arc::clone(&self.engine);
-
-            let join_handle = std::thread::Builder::new()
-                .name("parvault-ipc-accept".into())
-                .spawn(move || {
-                    for incoming in listener.incoming() {
-                        if shutdown_cl.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let Ok(stream) = incoming else {
-                            continue;
-                        };
-                        let peer_uid = crate::os_sys::peer_socket_ucred(stream.as_fd())
-                            .ok()
-                            .map(|u| u.uid);
-                        if let Err(code) = engine.peer_uid_decision(peer_uid) {
-                            tracing::warn!(code, ?peer_uid, "refused a gateway client by peer UID");
-                            drop(stream);
-                            continue;
-                        }
-                        let eng = Arc::clone(&engine);
-                        std::thread::Builder::new()
-                            .name("parvault-ipc-conn".into())
-                            .stack_size(256 * 1024)
-                            .spawn(move || {
-                                let _ = serve_client_stream_sync(stream, &eng, peer_uid);
-                            })
-                            .ok();
-                    }
-                })?;
-
-            Ok(GatewayIpcServerHandle {
-                socket_path: sock_path,
-                shutdown_flag,
-                join_handle: Some(join_handle),
-            })
-        }
-
-        /// Runs an asynchronous Tokio accept loop until `shutdown_rx` signals `true`.
-        pub async fn serve(mut self, mut shutdown_rx: watch::Receiver<bool>) -> io::Result<()> {
-            let std_listener = match self.bound_listener.take() {
-                Some(l) => l,
-                None => bind_clean_std_listener(&self.socket_path)?,
-            };
-            std_listener.set_nonblocking(true)?;
-            let listener = TokioUnixListener::from_std(std_listener)?;
-
-            loop {
-                tokio::select! {
-                    changed = shutdown_rx.changed() => {
-                        if changed.is_err() || *shutdown_rx.borrow() {
-                            break;
-                        }
-                    }
-                    accept_res = listener.accept() => {
-                        let (stream, _) = accept_res?;
-                        let peer_uid = crate::os_sys::peer_socket_ucred(stream.as_fd())
-                            .ok()
-                            .map(|u| u.uid);
-                        if let Err(code) = self.engine.peer_uid_decision(peer_uid) {
-                            tracing::warn!(code, ?peer_uid, "refused a gateway client by peer UID");
-                            drop(stream);
-                            continue;
-                        }
-                        let engine = Arc::clone(&self.engine);
-                        tokio::spawn(async move {
-                            let _ = serve_client_stream_async(stream, engine, peer_uid).await;
-                        });
-                    }
-                }
-            }
-            let _ = std::fs::remove_file(&self.socket_path);
-            Ok(())
-        }
-    }
-
-    fn execute_engine_command(
-        engine: &GatewayEngine,
-        cmd: IpcCommand,
-        maybe_fd: Option<OwnedFd>,
-        peer_uid: Option<u32>,
-    ) -> IpcResponse {
-        match cmd {
-            IpcCommand::StorePayload {
-                bytes_len,
-                retention_policy,
-                ..
-            } => {
-                let Some(owned_fd) = maybe_fd else {
-                    return IpcResponse::Error {
-                        message: "StorePayload missing SCM_RIGHTS payload_fd".into(),
-                    };
-                };
-                if let Err(code) = engine.ingest_seal_decision(owned_fd.as_fd()) {
-                    tracing::warn!(code, "refused an unsealed ingest memfd");
-                    return IpcResponse::Error {
-                        message: format!("unsealed ingest memfd rejected (F_SEAL_WRITE|F_SEAL_SHRINK|F_SEAL_GROW required): {code}"),
-                    };
-                }
-                let (stored, local_only_stripes) = crate::storage::local_only::track(|| {
-                    engine.store_from_owned_fd(owned_fd, bytes_len, retention_policy)
-                });
-                match stored {
-                    Ok(manifest) if local_only_stripes > 0 => IpcResponse::StoreSuccessLocalOnly {
-                        manifest,
-                        local_only_stripes,
-                    },
-                    Ok(manifest) => IpcResponse::StoreSuccess { manifest },
-                    Err(e) => IpcResponse::Error {
-                        message: format!("StorePayload failed: {e}"),
-                    },
-                }
-            }
-            IpcCommand::FetchPayload {
-                ephemeral_shard_ids,
-                ..
-            } => {
-                let Some(owned_fd) = maybe_fd else {
-                    return IpcResponse::Error {
-                        message: "FetchPayload missing SCM_RIGHTS output_fd".into(),
-                    };
-                };
-                match engine.fetch_by_shard_ids_to_owned_fd(&ephemeral_shard_ids, owned_fd) {
-                    Ok(bytes_streamed) => IpcResponse::FetchSuccess { bytes_streamed },
-                    Err(e) => IpcResponse::Error {
-                        message: format!("FetchPayload failed: {e}"),
-                    },
-                }
-            }
-            IpcCommand::FetchRange {
-                manifest,
-                offset,
-                len,
-                macaroon,
-                ..
-            } => {
-                let Some(owned_fd) = maybe_fd else {
-                    return IpcResponse::Error {
-                        message: "FetchRange missing SCM_RIGHTS output_fd".into(),
-                    };
-                };
-                match engine.fetch_range_to_owned_fd_with_peer_uid(
-                    &manifest,
-                    offset,
-                    len,
-                    macaroon.as_ref(),
-                    peer_uid,
-                    owned_fd,
-                ) {
-                    Ok(bytes_streamed) => IpcResponse::FetchSuccess { bytes_streamed },
-                    Err(e) => IpcResponse::Error {
-                        message: format!("FetchRange failed: {e}"),
-                    },
-                }
-            }
-            IpcCommand::RegisterManifest { file_manifest } => {
-                let manifest = engine.register_manifest(file_manifest);
-                IpcResponse::StoreSuccess { manifest }
-            }
-            IpcCommand::QueryHealthStatus => {
-                let (iops, peer_count, por_sla_score) = engine.health_snapshot();
-                IpcResponse::HealthStatus {
-                    iops,
-                    peer_count,
-                    por_sla_score,
-                }
-            }
-        }
-    }
-
-    fn serve_client_stream_sync(
-        mut stream: StdUnixStream,
-        engine: &GatewayEngine,
-        peer_uid: Option<u32>,
-    ) -> io::Result<()> {
-        loop {
-            let (raw_cmd, maybe_fd) = match recv_frame_with_optional_fd(&mut stream) {
-                Ok(pair) => pair,
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(e) => return Err(e),
-            };
-
-            let cmd: IpcCommand = match ipc_bincode().deserialize(&raw_cmd) {
-                Ok(c) => c,
-                Err(e) => {
-                    drop(maybe_fd);
-                    let resp = IpcResponse::Error {
-                        message: format!("invalid IPC command bincode: {e}"),
-                    };
-                    let bytes = ipc_bincode()
-                        .serialize(&resp)
-                        .map_err(|se| io::Error::other(se.to_string()))?;
-                    send_frame_with_optional_fd(&mut stream, &bytes, None)?;
-                    continue;
-                }
-            };
-
-            let resp = execute_engine_command(engine, cmd, maybe_fd, peer_uid);
-            let resp_bytes = ipc_bincode()
-                .serialize(&resp)
-                .map_err(|se| io::Error::other(se.to_string()))?;
-            send_frame_with_optional_fd(&mut stream, &resp_bytes, None)?;
-        }
-    }
-
-    async fn serve_client_stream_async(
-        mut stream: TokioUnixStream,
-        engine: Arc<GatewayEngine>,
-        peer_uid: Option<u32>,
-    ) -> anyhow::Result<()> {
-        loop {
-            let (frame_bytes, received_fd) = match recv_frame_with_fd(&mut stream).await {
-                Ok(pair) => pair,
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(e) => return Err(e.into()),
-            };
-
-            let cmd: IpcCommand = match ipc_bincode().deserialize(&frame_bytes) {
-                Ok(c) => c,
-                Err(e) => {
-                    drop(received_fd);
-                    let resp = IpcResponse::Error {
-                        message: format!("invalid IPC command frame: {e}"),
-                    };
-                    let enc = ipc_bincode().serialize(&resp)?;
-                    send_frame_with_fd(&mut stream, &enc, None).await?;
-                    continue;
-                }
-            };
-
-            let eng = Arc::clone(&engine);
-            let response = match tokio::task::spawn_blocking(move || {
-                execute_engine_command(&eng, cmd, received_fd, peer_uid)
-            })
-            .await
-            {
-                Ok(resp) => resp,
-                Err(e) => IpcResponse::Error {
-                    message: format!("gateway worker join error: {e}"),
-                },
-            };
-            let enc = ipc_bincode().serialize(&response)?;
-            send_frame_with_fd(&mut stream, &enc, None).await?;
-        }
-    }
-
     /// Zero-copy Unix Domain Socket IPC client connecting to `/var/run/parvault.sock`
     /// (`parvault-gateway`). Provides both asynchronous Tokio methods (`store_payload_fd`,
     /// `fetch_payload_to_fd`, `fetch_range_to_fd`, `store_bytes`, `query_health`, `send_command`)
@@ -675,7 +429,11 @@ mod unix_impl {
         pub fn socket_path(&self) -> &Path {
             &self.socket_path
         }
+    }
 
+    /// Asynchronous Tokio client surface (`daemon-runtime`).
+    #[cfg(feature = "daemon-runtime")]
+    impl GatewayIpcClient {
         // --- Asynchronous Tokio Client Surface ---
 
         /// Sends a raw [`IpcCommand`] with an optional `SCM_RIGHTS` file descriptor over Tokio `UnixStream`.
@@ -770,10 +528,12 @@ mod unix_impl {
             &self,
             ephemeral_shard_ids: Vec<[u8; 32]>,
             output_fd: RawFd,
+            macaroon: Option<CapabilityMacaroon>,
         ) -> anyhow::Result<u64> {
             let cmd = IpcCommand::FetchPayload {
                 ephemeral_shard_ids,
                 output_fd,
+                macaroon,
             };
             match self.send_command(&cmd, Some(output_fd)).await? {
                 IpcResponse::FetchSuccess { bytes_streamed } => Ok(bytes_streamed),
@@ -867,7 +627,9 @@ mod unix_impl {
                 other => anyhow::bail!("unexpected QueryHealthStatus response: {other:?}"),
             }
         }
+    }
 
+    impl GatewayIpcClient {
         // --- Synchronous Blocking Client Surface (FUSE / Sync CLI / Benchmarks) ---
 
         fn send_request_sync(
@@ -936,10 +698,12 @@ mod unix_impl {
             &self,
             ephemeral_shard_ids: Vec<[u8; 32]>,
             output_fd: RawFd,
+            macaroon: Option<CapabilityMacaroon>,
         ) -> io::Result<u64> {
             let cmd = IpcCommand::FetchPayload {
                 ephemeral_shard_ids,
                 output_fd,
+                macaroon,
             };
             match self.send_request_sync(&cmd, Some(output_fd))? {
                 IpcResponse::FetchSuccess { bytes_streamed } => Ok(bytes_streamed),
@@ -948,6 +712,21 @@ mod unix_impl {
                     "unexpected IPC response: {other:?}"
                 ))),
             }
+        }
+
+        /// Fetches a whole file (`FetchPayload`) into a fresh memfd and returns its bytes.
+        pub fn fetch_payload_bytes(
+            &self,
+            ephemeral_shard_ids: Vec<[u8; 32]>,
+            macaroon: Option<CapabilityMacaroon>,
+        ) -> io::Result<Vec<u8>> {
+            let mfd = create_memfd("parvault-payload")?;
+            let streamed = self.fetch_into_memfd(ephemeral_shard_ids, mfd.as_raw_fd(), macaroon)?;
+            let mut file = File::from(mfd);
+            file.seek(SeekFrom::Start(0))?;
+            let mut buf = vec![0u8; streamed as usize];
+            file.read_exact(&mut buf)?;
+            Ok(buf)
         }
 
         /// Fetches a targeted `[offset .. offset + len]` byte range into `output_fd` via `SCM_RIGHTS`.
@@ -1009,6 +788,42 @@ mod unix_impl {
             }
         }
 
+        /// `QueryStatus` (item 3): the node's [`StatusSnapshot`], presenting `macaroon`. A daemon
+        /// older than v0.5.0 does not know the command; that is reported as such.
+        pub fn query_status(
+            &self,
+            macaroon: Option<CapabilityMacaroon>,
+        ) -> io::Result<StatusSnapshot> {
+            let resp = self
+                .send_request_sync(&IpcCommand::QueryStatus { macaroon }, None)
+                .map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!(
+                            "QueryStatus failed ({e}); the daemon on {} may predate v0.5.0, which added it",
+                            self.socket_path.display()
+                        ),
+                    )
+                })?;
+            match resp {
+                IpcResponse::StatusSnapshot(snap) if snap.within_caps() => Ok(snap),
+                IpcResponse::StatusSnapshot(_) => {
+                    Err(io::Error::other("QueryStatus: snapshot over its size caps"))
+                }
+                // A pre-v0.5.0 daemon cannot decode command 5 and says so.
+                IpcResponse::Error { message } if message.starts_with("invalid IPC command") => {
+                    Err(io::Error::other(format!(
+                        "the daemon on {} predates v0.5.0 and has no QueryStatus; upgrade it ({message})",
+                        self.socket_path.display()
+                    )))
+                }
+                IpcResponse::Error { message } => Err(io::Error::other(message)),
+                other => Err(io::Error::other(format!(
+                    "unexpected QueryStatus response: {other:?}"
+                ))),
+            }
+        }
+
         /// Queries live gateway IOPS, peer count, and PoR SLA compliance score synchronously.
         pub fn query_health_sync(&self) -> io::Result<(u64, usize, f32)> {
             match self.send_request_sync(&IpcCommand::QueryHealthStatus, None)? {
@@ -1030,6 +845,8 @@ mod unix_impl {
     /// Socket IPC (`/var/run/parvault.sock`) with bit-for-bit identical semantics.
     #[derive(Clone)]
     pub enum GatewayBus {
+        /// In-process engine (`daemon-runtime` only; item 3).
+        #[cfg(feature = "daemon-runtime")]
         InProcess(Arc<GatewayEngine>),
         UnixSocket(GatewayIpcClient),
     }
@@ -1037,6 +854,7 @@ mod unix_impl {
     impl std::fmt::Debug for GatewayBus {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
+                #[cfg(feature = "daemon-runtime")]
                 Self::InProcess(_) => f.write_str("GatewayBus::InProcess(..)"),
                 Self::UnixSocket(client) => f
                     .debug_tuple("GatewayBus::UnixSocket")
@@ -1047,6 +865,7 @@ mod unix_impl {
     }
 
     impl GatewayBus {
+        #[cfg(feature = "daemon-runtime")]
         pub fn in_process(engine: Arc<GatewayEngine>) -> Self {
             Self::InProcess(engine)
         }
@@ -1054,7 +873,11 @@ mod unix_impl {
         pub fn unix_socket(socket_path: impl AsRef<Path>) -> Self {
             Self::UnixSocket(GatewayIpcClient::new(socket_path))
         }
+    }
 
+    /// Asynchronous surface (`daemon-runtime`).
+    #[cfg(feature = "daemon-runtime")]
+    impl GatewayBus {
         /// Streams `bytes_len` bytes from `payload_fd` into the gateway (`StorePayload`).
         pub async fn store_payload_fd(
             &self,
@@ -1079,6 +902,7 @@ mod unix_impl {
             retention: RetentionPolicy,
         ) -> anyhow::Result<(EphemeralShardManifest, u64)> {
             match self {
+                #[cfg(feature = "daemon-runtime")]
                 Self::InProcess(engine) => {
                     Self::ensure_in_process_peer_uid(engine)?;
                     let dup = crate::os_sys::dup_fd_cloexec(payload_fd)?;
@@ -1123,6 +947,7 @@ mod unix_impl {
             retention: RetentionPolicy,
         ) -> anyhow::Result<(EphemeralShardManifest, u64)> {
             match self {
+                #[cfg(feature = "daemon-runtime")]
                 Self::InProcess(engine) => {
                     Self::ensure_in_process_peer_uid(engine)?;
                     let dup = crate::os_sys::dup_fd_cloexec(fd)?;
@@ -1146,21 +971,28 @@ mod unix_impl {
             &self,
             ephemeral_shard_ids: Vec<[u8; 32]>,
             output_fd: RawFd,
+            macaroon: Option<CapabilityMacaroon>,
         ) -> anyhow::Result<u64> {
             match self {
+                #[cfg(feature = "daemon-runtime")]
                 Self::InProcess(engine) => {
                     Self::ensure_in_process_peer_uid(engine)?;
                     let dup = crate::os_sys::dup_fd_cloexec(output_fd)?;
                     let eng = Arc::clone(engine);
                     tokio::task::spawn_blocking(move || {
-                        eng.fetch_by_shard_ids_to_owned_fd(&ephemeral_shard_ids, dup)
+                        eng.fetch_by_shard_ids_to_owned_fd_with_peer_uid(
+                            &ephemeral_shard_ids,
+                            macaroon.as_ref(),
+                            Some(crate::os_sys::geteuid()),
+                            dup,
+                        )
                     })
                     .await
                     .map_err(|e| anyhow::anyhow!("in-process FetchPayload join error: {e}"))?
                 }
                 Self::UnixSocket(client) => {
                     client
-                        .fetch_payload_to_fd(ephemeral_shard_ids, output_fd)
+                        .fetch_payload_to_fd(ephemeral_shard_ids, output_fd, macaroon)
                         .await
                 }
             }
@@ -1177,6 +1009,7 @@ mod unix_impl {
             macaroon: Option<CapabilityMacaroon>,
         ) -> anyhow::Result<u64> {
             match self {
+                #[cfg(feature = "daemon-runtime")]
                 Self::InProcess(engine) => {
                     Self::ensure_in_process_peer_uid(engine)?;
                     let dup = crate::os_sys::dup_fd_cloexec(output_fd)?;
@@ -1201,6 +1034,7 @@ mod unix_impl {
             file_manifest: FileManifest,
         ) -> anyhow::Result<EphemeralShardManifest> {
             match self {
+                #[cfg(feature = "daemon-runtime")]
                 Self::InProcess(engine) => {
                     Self::ensure_in_process_peer_uid(engine)?;
                     Ok(engine.register_manifest(file_manifest))
@@ -1212,6 +1046,7 @@ mod unix_impl {
         /// Queries `(iops, peer_count, por_sla_score)` telemetry from the gateway.
         pub async fn query_health(&self) -> anyhow::Result<(u64, usize, f32)> {
             match self {
+                #[cfg(feature = "daemon-runtime")]
                 Self::InProcess(engine) => {
                     Self::ensure_in_process_peer_uid(engine)?;
                     Ok(engine.health_snapshot())
@@ -1219,9 +1054,12 @@ mod unix_impl {
                 Self::UnixSocket(client) => client.query_health().await,
             }
         }
+    }
 
+    impl GatewayBus {
         // --- Synchronous Blocking Surface (`FUSE`, `WebDAV`, `GatewayFolderSync`) ---
 
+        #[cfg(feature = "daemon-runtime")]
         fn ensure_in_process_peer_uid(engine: &GatewayEngine) -> io::Result<()> {
             let uid = Some(crate::os_sys::geteuid());
             if let Err(code) = engine.peer_uid_decision(uid) {
@@ -1242,6 +1080,7 @@ mod unix_impl {
             retention: RetentionPolicy,
         ) -> io::Result<EphemeralShardManifest> {
             match self {
+                #[cfg(feature = "daemon-runtime")]
                 Self::InProcess(engine) => {
                     Self::ensure_in_process_peer_uid(engine)?;
                     let dup = crate::os_sys::dup_fd_cloexec(payload_fd)?;
@@ -1269,6 +1108,7 @@ mod unix_impl {
             retention: RetentionPolicy,
         ) -> io::Result<EphemeralShardManifest> {
             match self {
+                #[cfg(feature = "daemon-runtime")]
                 Self::InProcess(engine) => {
                     Self::ensure_in_process_peer_uid(engine)?;
                     let dup = crate::os_sys::dup_fd_cloexec(payload_fd)?;
@@ -1290,16 +1130,25 @@ mod unix_impl {
             &self,
             ephemeral_shard_ids: Vec<[u8; 32]>,
             output_fd: RawFd,
+            macaroon: Option<CapabilityMacaroon>,
         ) -> io::Result<u64> {
             match self {
+                #[cfg(feature = "daemon-runtime")]
                 Self::InProcess(engine) => {
                     Self::ensure_in_process_peer_uid(engine)?;
                     let dup = crate::os_sys::dup_fd_cloexec(output_fd)?;
                     engine
-                        .fetch_by_shard_ids_to_owned_fd(&ephemeral_shard_ids, dup)
+                        .fetch_by_shard_ids_to_owned_fd_with_peer_uid(
+                            &ephemeral_shard_ids,
+                            macaroon.as_ref(),
+                            Some(crate::os_sys::geteuid()),
+                            dup,
+                        )
                         .map_err(|e| io::Error::other(format!("FetchPayload failed: {e}")))
                 }
-                Self::UnixSocket(client) => client.fetch_into_memfd(ephemeral_shard_ids, output_fd),
+                Self::UnixSocket(client) => {
+                    client.fetch_into_memfd(ephemeral_shard_ids, output_fd, macaroon)
+                }
             }
         }
 
@@ -1314,6 +1163,7 @@ mod unix_impl {
             macaroon: Option<CapabilityMacaroon>,
         ) -> io::Result<u64> {
             match self {
+                #[cfg(feature = "daemon-runtime")]
                 Self::InProcess(engine) => {
                     Self::ensure_in_process_peer_uid(engine)?;
                     let dup = crate::os_sys::dup_fd_cloexec(output_fd)?;
@@ -1337,6 +1187,7 @@ mod unix_impl {
             macaroon: Option<CapabilityMacaroon>,
         ) -> io::Result<Vec<u8>> {
             match self {
+                #[cfg(feature = "daemon-runtime")]
                 Self::InProcess(_) => {
                     let mfd = create_memfd("parvault-range")?;
                     let streamed = self.fetch_range_into_memfd_sync(
@@ -1358,12 +1209,60 @@ mod unix_impl {
             }
         }
 
+        /// Fetches a whole file (`FetchPayload`) synchronously and returns its bytes; the token is
+        /// checked against the whole file (F-47).
+        pub fn fetch_payload_bytes_sync(
+            &self,
+            ephemeral_shard_ids: Vec<[u8; 32]>,
+            macaroon: Option<CapabilityMacaroon>,
+        ) -> io::Result<Vec<u8>> {
+            match self {
+                #[cfg(feature = "daemon-runtime")]
+                Self::InProcess(engine) => {
+                    let mfd = create_memfd("parvault-payload")?;
+                    let dup = crate::os_sys::dup_fd_cloexec(mfd.as_raw_fd())?;
+                    let streamed = engine
+                        .fetch_by_shard_ids_to_owned_fd_with_peer_uid(
+                            &ephemeral_shard_ids,
+                            macaroon.as_ref(),
+                            Some(crate::os_sys::geteuid()),
+                            dup,
+                        )
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    let mut file = File::from(mfd);
+                    file.seek(SeekFrom::Start(0))?;
+                    let mut buf = vec![0u8; streamed as usize];
+                    file.read_exact(&mut buf)?;
+                    Ok(buf)
+                }
+                Self::UnixSocket(client) => {
+                    client.fetch_payload_bytes(ephemeral_shard_ids, macaroon)
+                }
+            }
+        }
+
+        /// `QueryStatus` (item 3) synchronously: in-process, the engine runs the same decision
+        /// with this process's UID; over the socket, the daemon does.
+        pub fn query_status_sync(
+            &self,
+            macaroon: Option<CapabilityMacaroon>,
+        ) -> io::Result<StatusSnapshot> {
+            match self {
+                #[cfg(feature = "daemon-runtime")]
+                Self::InProcess(engine) => engine
+                    .query_status(macaroon.as_ref(), Some(crate::os_sys::geteuid()))
+                    .map_err(|e| io::Error::other(e.to_string())),
+                Self::UnixSocket(client) => client.query_status(macaroon),
+            }
+        }
+
         /// Registers an existing or sparse virtual `FileManifest` synchronously.
         pub fn register_manifest_sync(
             &self,
             file_manifest: FileManifest,
         ) -> io::Result<EphemeralShardManifest> {
             match self {
+                #[cfg(feature = "daemon-runtime")]
                 Self::InProcess(engine) => {
                     Self::ensure_in_process_peer_uid(engine)?;
                     Ok(engine.register_manifest(file_manifest))
@@ -1375,6 +1274,7 @@ mod unix_impl {
         /// Queries `(iops, peer_count, por_sla_score)` synchronously.
         pub fn query_health_sync(&self) -> io::Result<(u64, usize, f32)> {
             match self {
+                #[cfg(feature = "daemon-runtime")]
                 Self::InProcess(engine) => {
                     Self::ensure_in_process_peer_uid(engine)?;
                     Ok(engine.health_snapshot())
@@ -1385,9 +1285,171 @@ mod unix_impl {
     }
 }
 
+/// The server half lives in `gateway::server` (`daemon-runtime`; item 3); re-exported here so the
+/// old paths stay valid.
+#[cfg(all(unix, feature = "daemon-runtime"))]
+pub use crate::gateway::server::{GatewayIpcServer, GatewayIpcServerHandle};
 #[cfg(unix)]
 pub use unix_impl::{
     create_memfd, create_memfd_sized, read_self_anon_rss_bytes, read_self_rss_bytes,
     recv_frame_with_optional_fd, send_frame_with_optional_fd, GatewayBus, GatewayIpcClient,
-    GatewayIpcServer, GatewayIpcServerHandle,
 };
+
+/// Golden wire bytes (item 3, plan-3 ruling): one fixed value per `IpcCommand` / `IpcResponse`
+/// variant, encoded with the frame codec. Each row pins the variant index and the SHA-256 of
+/// the bytes, so a renumbered, reordered or re-typed variant or field fails here. Run under the
+/// default features and under `--no-default-features --features ipc-client` (CI does both):
+/// the layout is the same in every feature set.
+#[cfg(test)]
+mod golden_wire {
+    use super::*;
+    use crate::capabilities::Caveat;
+    use crate::profile::ErasureTier;
+
+    fn tok() -> CapabilityMacaroon {
+        CapabilityMacaroon {
+            nonce_id: [0x11; 32],
+            issuer_fingerprint: [0x22; 32],
+            caveats: vec![Caveat::ReadOnly, Caveat::ExpiresAtUnixMs(7)],
+            tag: [0x33; 32],
+        }
+    }
+
+    fn eph() -> EphemeralShardManifest {
+        EphemeralShardManifest {
+            file_merkle_root: [0x44; 32],
+            shard_hashes: vec![[0x55; 32], [0x66; 32]],
+            total_size: 4096,
+            stripe_size_bytes: 1 << 20,
+        }
+    }
+
+    fn commands() -> Vec<IpcCommand> {
+        vec![
+            IpcCommand::StorePayload {
+                payload_fd: 3,
+                bytes_len: 4096,
+                retention_policy: RetentionPolicy::Persistent,
+            },
+            IpcCommand::FetchPayload {
+                ephemeral_shard_ids: vec![[0x77; 32]],
+                output_fd: 4,
+                macaroon: Some(tok()),
+            },
+            IpcCommand::FetchRange {
+                manifest: eph(),
+                offset: 1,
+                len: 2,
+                output_fd: 5,
+                macaroon: None,
+            },
+            IpcCommand::RegisterManifest {
+                file_manifest: FileManifest {
+                    version: 2,
+                    file_merkle_root: [0x88; 32],
+                    file_salt: [0x99; 32],
+                    original_file_size: 9,
+                    stripe_size_bytes: 1 << 20,
+                    tier: ErasureTier::Mixed,
+                    stripes: Vec::new(),
+                    witness_peers: vec!["w".into()],
+                },
+            },
+            IpcCommand::QueryHealthStatus,
+            IpcCommand::QueryStatus {
+                macaroon: Some(tok()),
+            },
+        ]
+    }
+
+    fn responses() -> Vec<IpcResponse> {
+        vec![
+            IpcResponse::StoreSuccess { manifest: eph() },
+            IpcResponse::FetchSuccess { bytes_streamed: 8 },
+            IpcResponse::HealthStatus {
+                iops: 1,
+                peer_count: 2,
+                por_sla_score: 0.5,
+            },
+            IpcResponse::Error {
+                message: "e".into(),
+            },
+            IpcResponse::StoreSuccessLocalOnly {
+                manifest: eph(),
+                local_only_stripes: 3,
+            },
+            IpcResponse::StatusSnapshot(StatusSnapshot {
+                version: "0.5.0".into(),
+                lan_peers: vec![StatusPeerEntry {
+                    peer_id: "p".into(),
+                    label: "l".into(),
+                    role: "r".into(),
+                    multiaddr: "/ip4/127.0.0.1/tcp/1".into(),
+                    available_bytes: 5,
+                }],
+                ..StatusSnapshot::default()
+            }),
+        ]
+    }
+
+    // Exhaustive (no wildcard): a new variant does not compile until it has a golden row.
+    fn cmd_name(c: &IpcCommand) -> &'static str {
+        match c {
+            IpcCommand::StorePayload { .. } => "StorePayload",
+            IpcCommand::FetchPayload { .. } => "FetchPayload",
+            IpcCommand::FetchRange { .. } => "FetchRange",
+            IpcCommand::RegisterManifest { .. } => "RegisterManifest",
+            IpcCommand::QueryHealthStatus => "QueryHealthStatus",
+            IpcCommand::QueryStatus { .. } => "QueryStatus",
+        }
+    }
+
+    fn resp_name(r: &IpcResponse) -> &'static str {
+        match r {
+            IpcResponse::StoreSuccess { .. } => "StoreSuccess",
+            IpcResponse::FetchSuccess { .. } => "FetchSuccess",
+            IpcResponse::HealthStatus { .. } => "HealthStatus",
+            IpcResponse::Error { .. } => "Error",
+            IpcResponse::StoreSuccessLocalOnly { .. } => "StoreSuccessLocalOnly",
+            IpcResponse::StatusSnapshot(_) => "StatusSnapshot",
+        }
+    }
+
+    fn row(name: &str, bytes: &[u8]) -> String {
+        let idx = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        format!("{name} {idx} {}", hex::encode(Sha256::digest(bytes)))
+    }
+
+    const GOLDEN: &[&str] = &[
+        "cmd StorePayload 0 7b0dbf38038f7d8066e4ba2c6b92391311224d8fdd74b9ca8e177582d1655144",
+        "cmd FetchPayload 1 cb9ee27d569a133d75be31d0bfd6262c40ce321ab590c9acf14d8652517a9a66",
+        "cmd FetchRange 2 0f48d64bf090dec6706c52c923f99c9ebb550605bad2a329329909fcfa23d61b",
+        "cmd RegisterManifest 3 bb9d2f5b2ef768d98e3f4b80ba0c63e4a4e74b14f71ac816610103854faad27e",
+        "cmd QueryHealthStatus 4 fb5e512425fc9449316ec95969ebe71e2d576dbab833d61e2a5b9330fd70ee02",
+        "cmd QueryStatus 5 90690e4aee4f4c975bb59f0b9edcc0b1603f1e3e871933889e314a4e5d768f64",
+        "resp StoreSuccess 0 d0cbeed4caa773256e6190330f1d22bc4a0bb707981381ea504318bb9dd22d28",
+        "resp FetchSuccess 1 3cf4c6d7d35690bf9cefc706492dccabc67d6e25ff145e0a681864bc0e3db0da",
+        "resp HealthStatus 2 42c3ccd517cfe720bf02dd2c56c9f606cc40fbd10ff238e4d9ef3215faeda5a1",
+        "resp Error 3 b7c04c4052c347008dfd50308f5eec48d49ea14b6799fbaf6766fd909f843bab",
+        "resp StoreSuccessLocalOnly 4 89d1aa480b45d25c240e8e575927ccf33ddb8bdef94edaa84e56a433b1e369ad",
+        "resp StatusSnapshot 5 91e96c3e3aa3aef402af076f2034354a657615f15706c1db41bc9c923896c556",
+    ];
+
+    #[test]
+    fn ipc_wire_layout_matches_golden() {
+        let mut got = Vec::new();
+        for c in commands() {
+            let b = ipc_bincode().serialize(&c).unwrap();
+            let back: IpcCommand = ipc_bincode().deserialize(&b).unwrap();
+            assert_eq!(ipc_bincode().serialize(&back).unwrap(), b);
+            got.push(format!("cmd {}", row(cmd_name(&c), &b)));
+        }
+        for r in responses() {
+            let b = ipc_bincode().serialize(&r).unwrap();
+            let back: IpcResponse = ipc_bincode().deserialize(&b).unwrap();
+            assert_eq!(back, r);
+            got.push(format!("resp {}", row(resp_name(&r), &b)));
+        }
+        assert_eq!(got, GOLDEN, "IPC wire layout changed:\n{}", got.join("\n"));
+    }
+}

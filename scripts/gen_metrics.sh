@@ -18,7 +18,7 @@
 #   measurement commands and prints fresh values for the STATIC measured keys.
 #   Review them, then copy them into the static section of docs/metrics.txt
 #   with a new provenance comment (command + date). It runs:
-#     - `cargo build --profile soc --target <t> --bin <b>` for both musl
+#     - `scripts/build_bins.sh --profile soc --target <t> <b>` (each bin with its own features) for both musl
 #       targets, then `stat` -> size.<bin>.<arch>.bytes
 #       (aarch64 needs CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER)
 #     - TLC on every specs/*.tla (needs TLA2TOOLS_JAR) ->
@@ -44,9 +44,9 @@ if [[ "${1:-}" == "--measured" ]]; then
     [[ -n "${CARGO_TARGET_DIR:-}" ]] || fail "--measured sizes needs CARGO_TARGET_DIR"
     for target in aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
       arch="${target%%-*}"
-      for bin in parvault parvault-seed parvault-fuse parvault-sync; do
-        cargo build -q --profile soc --target "$target" --bin "$bin" >&2
-        bytes="$(stat -c %s "$CARGO_TARGET_DIR/$target/soc/$bin")"
+      for bin in parvault parvault-seed parvault-fuse parvault-sync parvault-status; do
+        bash scripts/build_bins.sh --profile soc --target "$target" --out "$CARGO_TARGET_DIR/measured" "$bin" >&2
+        bytes="$(stat -c %s "$CARGO_TARGET_DIR/measured/$bin-$target")"
         [[ "$bytes" =~ ^[1-9][0-9]*$ ]] || fail "no size for $bin ($target)"
         out+="size.$bin.$arch.bytes = $(group "$bytes") B"$'\n'
       done
@@ -173,7 +173,7 @@ for k, v in static.items():
         mib = num(v) / 1048576
         sizes.setdefault(m.group(2), []).append(mib)
         out.append((f"size.{m.group(1)}.{m.group(2)}", f"{mib:.2f} MiB"))
-BINS = ("parvault", "parvault-seed", "parvault-fuse", "parvault-sync")
+BINS = ("parvault", "parvault-seed", "parvault-fuse", "parvault-sync", "parvault-status")
 missing = [f"size.{b}.{a}.bytes" for a in ("aarch64", "x86_64") for b in BINS
            if f"size.{b}.{a}.bytes" not in static]
 if missing:

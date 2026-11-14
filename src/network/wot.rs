@@ -1810,23 +1810,25 @@ mod tests {
         assert!(public_wot.is_peer_trusted(&stranger.public_key_bytes()));
         assert_eq!(public_wot.admitted_peer_count(), 4);
 
+        // Distinct per-run nonces, not literals (CodeQL alerts #4-6, L-50).
+        let nonce_base = u64::from(rand::random::<u32>());
         let ev1 = SlashingEvidence::issue(
             &reporter1,
             stranger.public_key_bytes(),
             SlashingReason::PorAuditTimeoutOrTamper,
-            101,
+            nonce_base + 1,
         );
         let ev2 = SlashingEvidence::issue(
             &reporter2,
             stranger.public_key_bytes(),
             SlashingReason::PorAuditTimeoutOrTamper,
-            102,
+            nonce_base + 2,
         );
         let ev3 = SlashingEvidence::issue(
             &reporter3,
             stranger.public_key_bytes(),
             SlashingReason::PorAuditTimeoutOrTamper,
-            103,
+            nonce_base + 3,
         );
 
         assert!(!public_wot.apply_slashing_evidence(&ev1));
