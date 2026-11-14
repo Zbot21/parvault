@@ -347,16 +347,14 @@ mod unix_engine {
             let mut lane_workers = Vec::new();
             if !normalized_peers.is_empty() {
                 lane_workers.reserve(MESH_POOL_CONCURRENCY);
-                for slot in 0..MESH_POOL_CONCURRENCY {
-                    // Distinct ephemeral transport identities give each lane an independent TCP +
-                    // Noise XX socket so a 2% packet-loss retransmission on one flow never
-                    // head-of-line blocks sibling Reed-Solomon shard lanes.
-                    let mut lane_seed = master_key.derive_purpose_subkey(b"parvault-gw-mesh-lane");
-                    lane_seed[0] ^= (slot & 0xFF) as u8;
-                    lane_seed[1] ^= ((slot >> 8) & 0xFF) as u8;
-                    let lane_id = NodeIdentity::from_seed(lane_seed);
-                    let client = MeshClient::new(lane_id, normalized_peers.clone(), None)
-                        .with_timeout(Duration::from_millis(2500));
+                for _slot in 0..MESH_POOL_CONCURRENCY {
+                    // Each lane has its own swarm (an independent TCP + Noise XX socket, so a
+                    // retransmission on one flow never head-of-line blocks sibling shard lanes),
+                    // and every lane sends as the owner identity: the owner is the accounted and
+                    // admitted sender (v0.5.0 owner rule), so storage peers see one PeerId.
+                    let client =
+                        MeshClient::new(owner_identity.clone(), normalized_peers.clone(), None)
+                            .with_timeout(Duration::from_millis(2500));
                     lane_workers.push(spawn_mesh_lane_worker(client, owner_identity.clone())?);
                 }
             }

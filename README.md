@@ -7,7 +7,7 @@
 
 > [!TIP]
 > **Built-In (`=y`) vs. Split-Plugin (`=m`) Architecture (<!-- metric:crate_version_tag -->`v0.5.0`<!-- /metric -->, [`ADR-32`](docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md), [`ADR-33`](docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md)):**
-> - **`parvault` (this repository, `AGPL-3.0-only`):** Unified single-daemon core (`parvault up` with `--no-socket` + built-in `=y` `--vfs-webdav-listen` / `--vfs-fuse-fd` `GatewayBus::InProcess` mode or `--ipc-socket /var/run/parvault.sock` plugin-host mode, `parvault token {mint,attenuate,inspect}`, `parvault-seed --no-fs`, and canonical open-source sibling plugins `parvault-fuse` & zero-key `parvault-sync`), post-quantum cryptography, $GF(2^8)$ Reed-Solomon sharding, and formal verification (<!-- metric:kani_harnesses -->`17`<!-- /metric --> `cargo kani` harnesses + <!-- metric:tla_specs -->`7`<!-- /metric --> TLA+ TLC specs + <!-- metric:tests_total -->`157`<!-- /metric --> release tests).
+> - **`parvault` (this repository, `AGPL-3.0-only`):** Unified single-daemon core (`parvault up` with `--no-socket` + built-in `=y` `--vfs-webdav-listen` / `--vfs-fuse-fd` `GatewayBus::InProcess` mode or `--ipc-socket /var/run/parvault.sock` plugin-host mode, `parvault token {mint,attenuate,inspect}`, `parvault-seed --no-fs`, and canonical open-source sibling plugins `parvault-fuse` & zero-key `parvault-sync`), post-quantum cryptography, $GF(2^8)$ Reed-Solomon sharding, and formal verification (<!-- metric:kani_harnesses -->`17`<!-- /metric --> `cargo kani` harnesses + <!-- metric:tla_specs -->`7`<!-- /metric --> TLA+ TLC specs + <!-- metric:tests_total -->`229`<!-- /metric --> release tests).
 > - **Hardened Out-of-Process Plugin Boundary ([`docs/GATEWAY_SOCKET_PROTOCOL.md`](docs/GATEWAY_SOCKET_PROTOCOL.md)):** `parvault-fuse`, zero-key `parvault-sync`, and downstream companion appliances (`parvault-suite`: `parvault-auth-broker`, `parvault-media-daemon`, `parvault-isp-agent`; and `parvault-control`) connect over `/var/run/parvault.sock` with kernel `SO_PEERCRED` UID allowlisting (`--strict-plugins --allow-peer-uid <UID>`), `F_ADD_SEALS` immutable `memfd` TOCTOU protection (`--require-sealed-memfd`), and offline-attenuated `PARVAULT-MAC-V1:` tokens without bloating or sharing `MasterKey` memory with the core daemon.
 
 Designed to run identically on multi-terabyte homelab NAS servers and memory-constrained residential gateways (`prplOS` / `OpenWrt` LXC containers with a strict **`< 32 MiB` active RAM ceiling**), `parvault` combines **16 MiB streaming `AES-256-GCM` + dual-cipher `PqVaultMasterKey` (`AES-256-GCM` + `ChaCha20-Poly1305`) cascaded encryption**, **Reed-Solomon erasure coding over $GF(2^8)$**, **4-layer shard anonymization ($\Omega_{\text{search}} \ge 2^{224}$)**, **Stateless Stratified Proof-of-Retrievability (PoR)**, and **Cryptographically Earned Uptime Tiers** so that **no storage peer, witness node, or DHT router is ever trusted with plaintext, metadata correlation, or unchecked shard concentration.**
@@ -15,7 +15,7 @@ Designed to run identically on multi-terabyte homelab NAS servers and memory-con
 > [!NOTE]
 > **Public Tracker Status:** We are **not** currently operating an official public tracker or public bootstrap swarm. **All `parvault` features work standalone without a public tracker** — including Zero-IP home LAN auto-discovery (`UDP 4009`), 4-word SAS pairing (`parvault pair` / `parvault join`), Router-SoC Cloud-NAS mode (`--profile router-soc`), personal multi-machine rings, and private self-hosted `parvault-seed` rendezvous/vault servers for friends, family, or organizations.
 >
-> **Public Swarm Readiness:** The codebase is engineered with multiple subsystems specifically designed to initialize and govern a public tracker (`parvault-seed --mode public-bootstrap`) when desired — including memory-hard Argon2id & Hashcash Sybil PoW (`PublicCommonsTicket`), Web-of-Trust (`WoT`) vouching & 1-strike Byzantine slashing, earned storage reciprocity tiers, 4-vector privacy-preserving keyed-HMAC eviction (`ADR-19`), $M$-of-$N$ federated council co-signing, and zero-private-key-on-VPS `admin_rpc` hooks.
+> **Public Swarm Readiness:** The codebase is engineered with multiple subsystems specifically designed to initialize and govern a public tracker (`parvault-seed --mode public-bootstrap`) when desired — including memory-hard Argon2id & Hashcash Sybil PoW (`PublicCommonsTicket`), Web-of-Trust (`WoT`) ring admission (slashing is applied locally only in `v0.5.0`), earned storage reciprocity tiers, 4-vector privacy-preserving keyed-HMAC eviction (`ADR-19`), $M$-of-$N$ federated council co-signing, and zero-private-key-on-VPS `admin_rpc` hooks.
 
 ---
 
@@ -42,26 +42,35 @@ Designed to run identically on multi-terabyte homelab NAS servers and memory-con
 # 1. Initialize your vault with a 24-word BIP-39 recovery mnemonic
 parvault init --profile router-soc --watch /mnt/usb-nas/shared --label "Router-NAS"
 
-# 2. Launch turnkey Cloud-NAS appliance mode on your router or home server
+# 2. Start your ring on the router (once). Only ring members can store data on each other.
+parvault wot init
+
+# 3. Launch turnkey Cloud-NAS appliance mode on your router or home server
 parvault up \
   --profile router-soc \
   --folder /mnt/usb-nas/shared \
   --status-http 0.0.0.0:4080 \
   --pair
 
-# 3. On your laptop: auto-discover home LAN storage (Zero IP addresses to type!)
+# 4. On your laptop: discover home LAN storage (no IP addresses to type) and pair with the code
 parvault discover
-
-# 4. Pair permanently with the 4-word code displayed on your router
 parvault join --code shield-copper-alpine-matrix
 
-# 5. Incrementally back up files (auto-finds paired router storage with zero --peers flags!)
+# 5. Invite the laptop into the ring: print its key on the laptop, invite it on the router,
+#    install the printed token on the laptop
+parvault identity                                   # laptop: note "Ed25519 Public Key"
+parvault wot invite --peer <LAPTOP_ED25519_KEY>     # router: prints a token
+parvault wot install-chain --token <TOKEN>          # laptop
+
+# 6. Incrementally back up files to the paired router
 parvault watch-folder --folder ~/Documents --once
 
-# 6. Optional: connect to a self-hosted or community-initialized public tracker (--public):
+# 7. Optional: connect to a self-hosted or community-initialized public tracker (--public):
 #    (No official public tracker is currently hosted; supply your own parvault-seed multiaddr)
 parvault watch-folder --folder ~/Documents --public --tracker /ip4/<YOUR_SEED_IP>/tcp/4002/p2p/<SEED_PEER_ID> --once
 ```
+
+Discovery and pairing find and pin peers; storing data needs ring membership. A node outside the ring is refused with `peer not admitted; v0.5.0 requires ring admission`, and a node with no ring prints how to start or join one (`parvault wot init` or `parvault wot install-chain`).
 
 ---
 
@@ -103,7 +112,7 @@ flowchart LR
 | **Zero-Filesystem Bounded RAM Mode (`parvault-seed --no-fs`)** | Pure in-memory seed/bootstrap execution (`--no-fs --in-memory-mb <MiB>`, `--identity-env` / `--identity-file`) with **zero persistent directories or files** created, hard RAM byte-cap enforcement, and `0x00` `zeroize()` memory wiping on eviction/drop | [`ADR-30`](docs/adr/ADR-30-filesystem-free-in-memory-seed-mode.md) |
 | **Transport-Agnostic `GatewayBus`, Sealed `memfd` & UID-Bound Macaroons** | Unified `GatewayBus` (`InProcess` `--no-socket` vs. `UnixSocket` `/var/run/parvault.sock`), `SCM_RIGHTS` zero-copy IPC with `F_ADD_SEALS` (`--require-sealed-memfd`) anti-TOCTOU protection, kernel `SO_PEERCRED` peer UID gating (`--strict-plugins --allow-peer-uid`), and offline `PARVAULT-MAC-V1:` caveats (`AllowedManifest`, `ByteRange`, `ExpiresAtUnixMs`, `ReadOnly`, `AllowedPeerUid`) | [`ADR-27`](docs/adr/ADR-27-zero-copy-uds-gateway-and-hedged-pool.md), [`ADR-28`](docs/adr/ADR-28-stateless-macaroon-capability-attenuation.md), [`ADR-32`](docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md) |
 | **Dual-Mode VFS (`=y` / `=m`) & Zero-Key Folder Sync (`parvault-fuse`, `parvault-sync`)** | Built-in `=y` (`parvault up --no-socket --vfs-webdav-listen`) or out-of-process `=m` (`parvault-fuse`) pure-Rust `/dev/fuse` (`ABI 7.31`, `0` C `libfuse3`, `0` `unsafe`, <!-- metric:fuse.ttfb -->`12.33 ms`<!-- /metric --> TTFB `< 50 ms`) + zero-key `parvault-sync` (`GatewayFolderSync` holding zero `MasterKey`/`NodeIdentity` secrets, `--macaroon` selective `pull`, Kani-verified path sanitizer) | [`ADR-29`](docs/adr/ADR-29-pure-rust-fuse-and-webdav-lazy-vfs.md), [`ADR-32`](docs/adr/ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md), [`ADR-33`](docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md) |
-| **Machine-Checked Formal Verification (`cargo kani` + <!-- metric:tla_specs -->`7`<!-- /metric --> TLA+ Specs)** | **<!-- metric:kani_harnesses -->17<!-- /metric --> Kani Rust Bounded Model Checking symbolic harnesses** (`src/kani_proofs.rs`, `capabilities.rs`, `aes.rs`, `reed_solomon.rs`) + **<!-- metric:tla_specs -->7<!-- /metric --> exhaustive TLA+ TLC specifications** (`specs/*.tla`, <!-- metric:tlc.distinct -->`4,467`<!-- /metric --> distinct states, `0` errors) + <!-- metric:tests_pass -->`157 / 157`<!-- /metric --> release tests + `#![deny(unsafe_code)]` / `#![forbid(unsafe_code)]` | [`ADR-31`](docs/adr/ADR-31-unsafe-remediation-and-os-sys-ffi-boundary.md), [`ADR-01`–<!-- metric:adr_last -->`ADR-33`<!-- /metric -->](docs/ADR.md) |
+| **Machine-Checked Formal Verification (`cargo kani` + <!-- metric:tla_specs -->`7`<!-- /metric --> TLA+ Specs)** | **<!-- metric:kani_harnesses -->17<!-- /metric --> Kani Rust Bounded Model Checking symbolic harnesses** (`src/kani_proofs.rs`, `capabilities.rs`, `aes.rs`, `reed_solomon.rs`) + **<!-- metric:tla_specs -->7<!-- /metric --> exhaustive TLA+ TLC specifications** (`specs/*.tla`, <!-- metric:tlc.distinct -->`4,467`<!-- /metric --> distinct states, `0` errors) + <!-- metric:tests_pass -->`229 / 229`<!-- /metric --> release tests + `#![deny(unsafe_code)]` / `#![forbid(unsafe_code)]` | [`ADR-31`](docs/adr/ADR-31-unsafe-remediation-and-os-sys-ffi-boundary.md), [`ADR-01`–<!-- metric:adr_last -->`ADR-33`<!-- /metric -->](docs/ADR.md) |
 
 ---
 

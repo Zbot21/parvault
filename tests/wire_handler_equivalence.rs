@@ -1,8 +1,11 @@
 //! Characterisation suite for the inbound wire handlers (`network::wire_handler`).
 //!
-//! Pins today's behaviour of the `parvault` daemon handler and the `parvault-seed` handler
-//! (homelab-vault and public-bootstrapper modes) for every `MeshWireRequest` variant and branch,
-//! so the handlers can be merged into one shared implementation without a behaviour change.
+//! Pins the behaviour of the shared handler for the `parvault` daemon and the `parvault-seed`
+//! handler (homelab-vault and public-bootstrapper modes) for every `MeshWireRequest` variant and
+//! branch. Item 2a used it to merge the two handlers without a behaviour change; since item 2b it
+//! also pins the v0.5.0 trust rules where they touch the handler (admission, owner rule, ticket
+//! binding, handshake refusal text), each change justified in its commit message. The wire-level
+//! claims for those rules live in `tests/trust_enforcement.rs`.
 //!
 //! Each case runs the same request on three fixtures built from one template directory (same
 //! keys and secrets) and compares the full response, the full data-directory tree (path, length,
@@ -14,8 +17,10 @@
 //! also asserts its absolute effect (response fields and the state change, read through the
 //! store, quota, eviction, rendezvous and takedown APIs).
 //!
-//! Mutation record (each mutant is a one-line change in `src/network/wire_handler.rs`; run with
-//! a dedicated `CARGO_TARGET_DIR` so a mutated library is never reused by another run):
+//! Mutation record (each mutant is a one-line change, in `src/network/wire_handler.rs` unless
+//! the file is named; run with a dedicated `CARGO_TARGET_DIR` so a mutated library is never
+//! reused by another run). Each run covers `--lib`, this suite and `tests/trust_enforcement.rs`;
+//! `lib:` marks a library unit test. Last run: item 2b, 42 mutants, all detected.
 //!
 //! | Mutant | Kind | Failing test(s) |
 //! | :-- | :-- | :-- |
@@ -29,12 +34,44 @@
 //! | `record_public_card_ips`: seed returns `false` | hook | `register_wan_rendezvous` |
 //! | `takedown_gate`: seed always open | hook | `submit_abuse_takedown` |
 //! | `eviction_council`: seed drops its local tracker admin | hook | `broadcast_eviction_order` |
-//! | `shard_owner` ignores the claimed owner | symmetric | `put_shard`, `delete_shard` |
+//! | `shard_owner` accepts a foreign claim | symmetric | `put_shard`, `refused_put_keeps_por_session_key`, `f04_invented_owner_claim_refused`, lib: `shard_owner_rule_binds_the_sender` |
 //! | `PutBlindedShard` drops `record_peer_admission_ip` | symmetric | `put_blinded_shard` |
 //! | `RenewBlindedLease` ignores `extension_epochs` | symmetric | `renew_blinded_lease` |
-//! | `PutShard` skips `register_repair_grant` | symmetric | `get_ciphertext_shard` |
+//! | `PutShard` registers its grant for no shard | symmetric | `get_ciphertext_shard`, `f02a_grant_for_other_stripe_not_registered`, `f02a_owner_grant_update_registered`, `f02a_rejected_put_registers_nothing`, `f02b_registered_grant_repair_read`, `f26_owner_reads_after_root_squat` |
+//! | `admission_decision` admits strangers | decision | `put_shard`, `f03_unadmitted_put_shard_refused_daemon`, `f03_unadmitted_put_shard_refused_seed`, `f05_public_ticket_one_bit_short_refused`, `f24_unadmitted_blinded_put_refused`, `f24_unadmitted_layered_final_refused`, `f24_unadmitted_onion_final_refused`, `f25_unadmitted_dht_put_refused`, `invitee_serves_the_ring`, `refused_credential_is_not_presented_on_every_request`, lib: `admission_decision_rules` |
+//! | `chain_leaf_decision` ignores the sender (F-21, `wot.rs`) | decision | `f21_handshake_chain_leaf_not_sender_refused`, lib: `chain_leaf_decision_binds_the_sender` |
+//! | Ticket PoW unchecked (F-05, `wot.rs`) | decision | `f05_public_ticket_one_bit_short_refused` |
+//! | Grant with a mismatched root registered (F-02a, `por/verifier.rs`) | decision | `f02a_grant_for_other_stripe_not_registered`, lib: `grant_and_repair_read_decisions` |
+//! | Repair read not bound to a registered grant (F-02b, `por/verifier.rs`) | decision | `f02b_foreign_grant_repair_read_refused`, lib: `grant_and_repair_read_decisions` |
+//! | Device cert not bound to the sender (F-25) | decision | `f25_device_cert_replayed_by_other_key_refused` |
+//! | Kademlia record validity unchecked (F-10b, `server_events.rs`) | decision | `f10b_unsigned_record_refused`, lib: `kad_record_decision_rules` |
+//! | DHT reader does not bind the owner (F-10a, `client.rs`) | decision | `f10a_squatted_catalog_ignored` |
+//! | Kademlia routing without admission (F-11, `server_events.rs`) | decision | `f11_unadmitted_peer_not_routed`, `ring_member_originator_stays_anonymous_at_the_relay`, lib: `kad_routing_requires_admission` |
+//! | Single-layer onion final delivery unchecked (F-24) | decision | `f24_unadmitted_onion_final_refused` |
+//! | Layered onion final delivery unchecked (QA B3) | decision | `f24_unadmitted_layered_final_refused` |
+//! | Grant owner not bound to the shard (F-26, `por/verifier.rs`) | rule | `f26_squatter_cannot_read_owner_shard`, lib: `grant_and_repair_read_decisions` |
+//! | Stale ticket accepted (F-29, `wot.rs`) | rule | `f29_stale_ticket_refused`, lib: `f29_ticket_rules` |
+//! | Ticket not bound to the verifier (F-29, `wot.rs`) | rule | lib: `f29_ticket_rules` |
+//! | No per-subnet ticket rate (F-29, `wot.rs`) | rule | lib: `f29_ticket_rules` |
+//! | Re-sent ticket rewrites the registry (F-29, `wot.rs`) | rule | lib: `f29_resent_ticket_is_a_no_op_that_writes_nothing` |
+//! | Full ticket registry still admits (F-29, `wot.rs`) | rule | lib: `f29_full_registry_refuses_and_never_evicts_a_live_admission` |
+//! | Raw handshake error sent on the wire (F-30) | rule | `handshake_wot` |
+//! | Kademlia record source unchecked (F-31, `server_events.rs`) | rule | `f31_unadmitted_source_record_refused`, lib: `kad_record_decision_rules` |
+//! | No sub-invite limit (F-32, `wot.rs`) | rule | lib: `f32_subinvites_and_chain_store_are_bounded` |
+//! | Any key deletes a grant-less shard (F-36, `por/verifier.rs`) | rule | `f36_other_key_cannot_delete_shard`, lib: `grant_and_repair_read_decisions` |
+//! | Slash guard off for the genesis and own keys (F-01, `wot.rs`) | rule | lib: `genesis_and_own_keys_are_never_slashed` |
+//! | Originator presents its credential to the relay (QA B1, `client.rs`) | rule | `ring_member_originator_stays_anonymous_at_the_relay` |
+//! | No backoff after a refused handshake (`client.rs`) | rule | `refused_credential_is_not_presented_on_every_request` |
+//! | No re-handshake after lost admission (`client.rs`) | rule | `client_rehandshakes_after_lost_admission` |
+//! | PoR session committed before the owner decision | rule | `refused_put_keeps_por_session_key` |
+//! | Private daemon without a ring starts ticket-only (QA B2, `admission.rs`) | rule | `daemon_without_ring_refuses_to_start` (hangs: the mutated daemon keeps running; detected once it was killed) |
+//! | `install-chain` does not pin the ring genesis (QA B2, `cli/wot.rs`) | rule | `invitee_serves_the_ring` |
 //!
-//! The four symmetric mutants passed the suite before the absolute assertions were added.
+//! The four symmetric mutants passed the suite before the absolute assertions were added. In the
+//! 2b run, `f04_gateway_lanes_send_as_owner`, `f04_graceful_leave_handoff_accepted` and
+//! `f04_seed_syndication_accounted_to_seed` also failed for three consecutive mutants (full
+//! ticket registry, raw handshake error, sub-invite limit) that do not touch their paths; they are
+//! not counted above.
 
 use libp2p::Multiaddr;
 use parvault::bootstrap::{
@@ -49,8 +86,9 @@ use parvault::network::wire_handler::{
 use parvault::network::{
     derive_slot_key_from_code, node_identity_libp2p_peer_id, seal_public_tracker_card,
     seal_wan_peer_card, DelegationChain, DhtEnvelopeKind, DhtWireEnvelope, InvitationHop,
-    KnownPeersStore, MeshWireRequest, MeshWireResponse, WanPeerCard, WanRendezvousRegistry,
-    WebOfTrustRegistry, PUBLIC_COMMONS_SWARM_SLOT,
+    KnownPeersStore, MeshWireRequest, MeshWireResponse, PublicCommonsTicket, TrustPoolMode,
+    WanPeerCard, WanRendezvousRegistry, WebOfTrustRegistry, DEFAULT_PUBLIC_WOT_POW_BITS,
+    PUBLIC_COMMONS_SWARM_SLOT,
 };
 use parvault::por::{
     generate_multi_segment_por_challenge, generate_por_challenge, PorVerifierEngine, RepairGrant,
@@ -170,7 +208,7 @@ fn template(keys: &Keys) -> TempDir {
     let dir = root.path().to_path_buf();
     let genesis = keys.genesis.public_key_bytes();
     let _ = BlockStore::new(&dir, QuotaManager::new(512 * 1024 * 1024, 64 * 1024 * 1024)).unwrap();
-    let _ = WebOfTrustRegistry::with_persistence_dir(genesis, 3, &dir);
+    let _ = WebOfTrustRegistry::with_persistence_dir(Some(genesis), 3, &dir);
     let _ = PorVerifierEngine::with_persistence_dir(300, &dir);
     let _ = VoucherNullifierLedger::with_persistence_dir(genesis, &dir);
     let _ = HybridKemKeypair::load_or_generate_in_dir(&dir).unwrap();
@@ -233,7 +271,7 @@ impl Fx {
             node: NodeIdentity::from_seed([0x11; 32]),
             genesis,
             public_mode: false,
-            wot: WebOfTrustRegistry::with_persistence_dir(genesis, 3, &dir),
+            wot: WebOfTrustRegistry::with_persistence_dir(Some(genesis), 3, &dir),
             por: PorVerifierEngine::with_persistence_dir(300, &dir),
             nullifiers: VoucherNullifierLedger::with_persistence_dir(genesis, &dir),
             kem: HybridKemKeypair::load_or_generate_in_dir(&dir).unwrap(),
@@ -258,7 +296,7 @@ impl Fx {
                 DaemonWireHandlerCtx {
                     cfg: &self.cfg,
                     node_identity: &self.node,
-                    genesis_pubkey: self.genesis,
+                    genesis_pubkey: Some(self.genesis),
                     public_mode: self.public_mode,
                     block_store: &self.store,
                     wot: &mut self.wot,
@@ -287,7 +325,7 @@ impl Fx {
                         extra_council_pks: &[],
                         council_quorum: None,
                         max_probationary_lease_bytes: self.max_lease,
-                        genesis_pubkey: self.genesis,
+                        genesis_pubkey: Some(self.genesis),
                         block_store: &self.store,
                         server: &mut self.server,
                         wot: &mut self.wot,
@@ -450,6 +488,21 @@ impl Trio {
             .collect();
         Self { keys, fx }
     }
+    /// Admits `peer` into every fixture's ring (a genesis-issued chain), as a v0.5.0 handshake
+    /// would. Requests that need an admitted sender are refused without it.
+    fn admit(&mut self, peer: &Peer) {
+        let chain = DelegationChain {
+            hops: vec![InvitationHop::issue(
+                &self.keys.genesis,
+                peer.ident.public_key_bytes(),
+                1,
+                100,
+            )],
+        };
+        for fx in &mut self.fx {
+            fx.wot.verify_and_admit_chain(&chain).unwrap();
+        }
+    }
     /// Applies `f` to every fixture (setup).
     fn each(&mut self, mut f: impl FnMut(&mut Fx, &Keys)) {
         for fx in &mut self.fx {
@@ -609,7 +662,7 @@ fn wan_card(id: &NodeIdentity, addrs: &[&str]) -> WanPeerCard {
 
 // --- the exhaustive variant guard ---------------------------------------------------------------
 
-/// Names the case that covers each variant. No wildcard: a 20th variant fails to compile here.
+/// Names the case that covers each variant. No wildcard: a new variant fails to compile here.
 fn covering_case(req: &MeshWireRequest) -> &'static str {
     match req {
         MeshWireRequest::HandshakeWoT { .. } => "handshake_wot",
@@ -631,6 +684,7 @@ fn covering_case(req: &MeshWireRequest) -> &'static str {
         MeshWireRequest::LookupWanRendezvous { .. } => "lookup_wan_rendezvous",
         MeshWireRequest::SubmitAbuseTakedownReport(_) => "submit_abuse_takedown",
         MeshWireRequest::BroadcastEvictionOrder(_) => "broadcast_eviction_order",
+        MeshWireRequest::AdmitPublicTicket(_) => "admit_public_ticket",
     }
 }
 
@@ -715,12 +769,40 @@ fn handshake_wot() {
     let pk = peer.ident.public_key_bytes();
     t.each(|fx, k| fx.ban(k, EvictionTarget::PeerOrIssuerPubkey(pk)));
     let o = t.run(&peer, &good);
+    // F-30: a blocked peer gets the same fixed text as any other refused handshake.
     assert!(
-        o[0].resp.contains("accepted: false") && o[0].resp.contains("blocked"),
+        o[0].resp.contains("accepted: false") && o[0].resp.contains("handshake refused"),
         "{}",
         o[0].resp
     );
     assert_identical(&o);
+    // F-30: the handshake is not a quarantine oracle. A forged hop (rogue inviter) for a
+    // quarantined key and for an ordinary key gets the same response on every role.
+    let quarantined = Peer::new(0x54, "198.51.100.32");
+    let ordinary = Peer::new(0x55, "198.51.100.33");
+    let qk = quarantined.ident.public_key_bytes();
+    t.each(|fx, _| {
+        fx.wot.slash_immediately(qk);
+    });
+    // The probe names the genesis as inviter but carries a rogue signature.
+    let genesis_pk = t.keys.genesis.public_key_bytes();
+    let forged = |p: &Peer| {
+        let mut hop = InvitationHop::issue(&rogue, p.ident.public_key_bytes(), 1, 100);
+        hop.inviter_pubkey = genesis_pk;
+        MeshWireRequest::HandshakeWoT {
+            chain: DelegationChain { hops: vec![hop] },
+            asn: None,
+            region: None,
+        }
+    };
+    let oq = t.run(&quarantined, &forged(&quarantined));
+    let oo = t.run(&ordinary, &forged(&ordinary));
+    assert_eq!(
+        oq[0].resp, oo[0].resp,
+        "quarantine state must not show on the wire"
+    );
+    assert!(oq[0].resp.contains("handshake refused"), "{}", oq[0].resp);
+    assert_identical(&oq);
 }
 
 // --- 2. PutShard (seed also records the admission IP) -------------------------------------------
@@ -730,34 +812,29 @@ fn put_shard() {
     let _g = env_guard();
     let mut t = Trio::new("put");
     let peer = Peer::new(0x61, "198.51.100.2");
-    for (owner, seed) in [("", 1u8), ("alice-owner", 2u8)] {
+    t.admit(&peer);
+    // v0.5.0 owner rule: an empty claim and the sender's own device id both account the shard to
+    // the sender's device id.
+    let device = peer.ident.device_peer_id();
+    for (owner, seed) in [("", 1u8), (device.as_str(), 2u8)] {
         let (sid, bytes) = shard(seed, 2048);
-        let before: Vec<(u64, u64)> =
-            t.fx.iter()
-                .map(|f| (f.hosted(&peer.id), f.hosted("alice-owner")))
-                .collect();
+        let before: Vec<u64> = t.fx.iter().map(|f| f.hosted(&device)).collect();
         let o = t.run(&peer, &put_shard_req(owner, sid, bytes, [seed; 32]));
         assert!(o[0].resp.contains("stored: true"), "{}", o[0].resp);
         assert!(o[0].quota_delta > 0);
-        // Absolute: the shard is stored and charged to the effective owner (empty claim -> the
-        // remote peer; explicit claim -> that owner), on every role.
-        for (fx, (peer_before, alice_before)) in t.fx.iter().zip(before) {
+        // Absolute: the shard is stored and charged to the sender's device id on every role.
+        for (fx, before) in t.fx.iter().zip(before) {
             assert!(fx.store.has_shard(&sid), "{:?}: shard stored", fx.role);
-            let (charged, other) = if owner.is_empty() {
-                (
-                    fx.hosted(&peer.id) - peer_before,
-                    fx.hosted("alice-owner") - alice_before,
-                )
-            } else {
-                (
-                    fx.hosted("alice-owner") - alice_before,
-                    fx.hosted(&peer.id) - peer_before,
-                )
-            };
             assert_eq!(
-                (charged, other),
-                (2048, 0),
-                "{:?}: quota charged to {owner:?}",
+                fx.hosted(&device) - before,
+                2048,
+                "{:?}: quota charged to the sender for claim {owner:?}",
+                fx.role
+            );
+            assert_eq!(
+                fx.hosted(&peer.id),
+                0,
+                "{:?}: nothing under the PeerId",
                 fx.role
             );
         }
@@ -791,6 +868,19 @@ fn put_shard() {
         );
         assert!(!eviction_files(&o[1].changed).is_empty());
     }
+    // A claim naming anyone else is refused identically, with nothing stored or charged.
+    let (sid, bytes) = shard(28, 1024);
+    let o = t.run(&peer, &put_shard_req("alice-owner", sid, bytes, [28; 32]));
+    assert!(
+        o[0].resp.contains("owner claim does not match the sender"),
+        "{}",
+        o[0].resp
+    );
+    assert_identical(&o);
+    for fx in &t.fx {
+        assert!(!fx.store.has_shard(&sid));
+        assert_eq!(fx.hosted("alice-owner"), 0);
+    }
     // Error path: shard hash mismatch.
     let (mut sid, bytes) = shard(3, 1024);
     sid.shard_hash = [0xEE; 32];
@@ -809,6 +899,19 @@ fn put_shard() {
     );
     assert_identical(&o);
     assert!(t.fx.iter().all(|f| !f.store.has_shard(&sid)));
+    // v0.5.0 admission: a sender without a ring chain is refused identically by every role,
+    // with no state change.
+    let stranger = Peer::new(0x60, "198.51.100.40");
+    let (sid, bytes) = shard(27, 1024);
+    let o = t.run(&stranger, &put_shard_req("", sid, bytes, [27; 32]));
+    assert!(
+        o[0].resp
+            .contains("peer not admitted; v0.5.0 requires ring admission"),
+        "{}",
+        o[0].resp
+    );
+    assert_identical(&o);
+    assert!(o[0].changed.is_empty() && o[0].quota_delta == 0);
 }
 
 // --- 3. DeleteShard (identical) -----------------------------------------------------------------
@@ -818,6 +921,8 @@ fn delete_shard() {
     let _g = env_guard();
     let mut t = Trio::new("del");
     let peer = Peer::new(0x62, "198.51.100.3");
+    t.admit(&peer);
+    let device = peer.ident.device_peer_id();
     let (sid, bytes) = shard(5, 1024);
     t.run(&peer, &put_shard_req("", sid, bytes, [5; 32]));
     let (pub_, payload, sig) =
@@ -840,7 +945,7 @@ fn delete_shard() {
     assert!(t
         .fx
         .iter()
-        .all(|f| f.store.has_shard(&sid) && f.hosted(&peer.id) == 1024));
+        .all(|f| f.store.has_shard(&sid) && f.hosted(&device) == 1024));
     let o = t.run(
         &peer,
         &MeshWireRequest::DeleteShard {
@@ -850,20 +955,17 @@ fn delete_shard() {
     );
     assert!(o[0].resp.contains("deleted: true"), "{}", o[0].resp);
     assert_identical(&o);
-    // Absolute: the shard is gone and its quota is released under the deleting peer.
+    // Absolute: the shard is gone and its quota is released under the sender's device id.
     for fx in &t.fx {
         assert!(!fx.store.has_shard(&sid), "{:?}: shard deleted", fx.role);
-        assert_eq!(fx.hosted(&peer.id), 0, "{:?}: quota released", fx.role);
+        assert_eq!(fx.hosted(&device), 0, "{:?}: quota released", fx.role);
     }
-    // Explicit claimed owner: PutShard charges the claim, DeleteShard releases under the remote
-    // peer (it sends no claim), so the claimed owner's account keeps the bytes. Pinned as today's
-    // behaviour; item 2b's owner rule (accounted owner = sender) removes the split.
+    // Explicit claim of the sender's own device id: put and delete account to the same key, so
+    // the release empties the account (2a pinned a split here: a claim of another owner kept
+    // that owner charged after the sender's delete; the v0.5.0 owner rule refuses such claims).
     let (sid2, bytes2) = shard(26, 1024);
-    t.run(&peer, &put_shard_req("alice-owner", sid2, bytes2, [26; 32]));
-    assert!(t
-        .fx
-        .iter()
-        .all(|f| f.hosted("alice-owner") == 1024 && f.hosted(&peer.id) == 0));
+    t.run(&peer, &put_shard_req(&device, sid2, bytes2, [26; 32]));
+    assert!(t.fx.iter().all(|f| f.hosted(&device) == 1024));
     let (pub2, payload2, sig2) =
         PorVerifierEngine::sign_owner_shard_delete_token(&peer.ident, &sid2, now_ms());
     let mut r2 = [0u8; 32];
@@ -881,12 +983,7 @@ fn delete_shard() {
     assert_identical(&o);
     for fx in &t.fx {
         assert!(!fx.store.has_shard(&sid2), "{:?}: shard deleted", fx.role);
-        assert_eq!(
-            (fx.hosted("alice-owner"), fx.hosted(&peer.id)),
-            (1024, 0),
-            "{:?}: release goes to the remote peer, not the claimed owner",
-            fx.role
-        );
+        assert_eq!(fx.hosted(&device), 0, "{:?}: released in full", fx.role);
     }
 }
 
@@ -897,6 +994,7 @@ fn por_audit() {
     let _g = env_guard();
     let mut t = Trio::new("por");
     let peer = Peer::new(0x63, "198.51.100.4");
+    t.admit(&peer);
     let (sid, bytes) = shard(6, 4096);
     let session = [0x99; 32];
     t.run(&peer, &put_shard_req("", sid, bytes.clone(), session));
@@ -916,6 +1014,7 @@ fn multi_segment_por_audit() {
     let _g = env_guard();
     let mut t = Trio::new("mpor");
     let peer = Peer::new(0x64, "198.51.100.5");
+    t.admit(&peer);
     let (sid, bytes) = shard(7, 64 * 1024);
     let session = [0x98; 32];
     t.run(&peer, &put_shard_req("", sid, bytes.clone(), session));
@@ -940,6 +1039,7 @@ fn get_ciphertext_shard() {
     let _g = env_guard();
     let mut t = Trio::new("getct");
     let peer = Peer::new(0x65, "198.51.100.6");
+    t.admit(&peer);
     let (sid, bytes) = shard(8, 1024);
     t.run(&peer, &put_shard_req("", sid, bytes, [8; 32]));
     let o = t.run(
@@ -1025,6 +1125,7 @@ fn put_blinded_shard() {
     let mut t = Trio::new("pb");
     let issuer = t.keys.voucher_issuer.clone();
     let peer = Peer::new(0x66, "198.51.100.7");
+    t.admit(&peer);
     let b = blinded(9, 4096);
     let v = AnonymousQuotaVoucher::mint(&issuer, 8192);
     let o = t.run(&peer, &put_blinded(&b, v.clone()));
@@ -1105,6 +1206,7 @@ fn get_blinded_shard() {
     let mut t = Trio::new("gb");
     let issuer = t.keys.voucher_issuer.clone();
     let peer = Peer::new(0x67, "198.51.100.8");
+    t.admit(&peer);
     let b = blinded(13, 2048);
     t.run(
         &peer,
@@ -1152,6 +1254,7 @@ fn renew_blinded_lease() {
     let mut t = Trio::new("renew");
     let issuer = t.keys.voucher_issuer.clone();
     let peer = Peer::new(0x68, "198.51.100.9");
+    t.admit(&peer);
     let b = blinded(14, 2048);
     t.run(
         &peer,
@@ -1222,6 +1325,7 @@ fn delete_blinded_tombstone() {
     let mut t = Trio::new("tomb");
     let issuer = t.keys.voucher_issuer.clone();
     let peer = Peer::new(0x69, "198.51.100.10");
+    t.admit(&peer);
     let b = blinded(16, 2048);
     t.run(
         &peer,
@@ -1332,6 +1436,7 @@ fn relay_pq_onion() {
     let mut t = Trio::new("onion");
     let issuer = t.keys.voucher_issuer.clone();
     let peer = Peer::new(0x6A, "198.51.100.11");
+    t.admit(&peer);
     let our_kem_pub = t.fx[0].kem.public_key();
     let v = || AnonymousQuotaVoucher::mint(&issuer, 8192);
 
@@ -1442,6 +1547,7 @@ fn relay_pq_onion_over_seed_lease_limit() {
     let peer = Peer::new(0x6B, "198.51.100.21");
     for layered_case in [false, true] {
         let mut t = Trio::new("onion-limit");
+        t.admit(&peer);
         let issuer = t.keys.voucher_issuer.clone();
         let our_kem_pub = t.fx[0].kem.public_key();
         t.each(|fx, _| fx.max_lease = 512);
@@ -1488,7 +1594,9 @@ fn syndicate_lite_stripe() {
     let _g = env_guard();
     let mut t = Trio::new("synd");
     let peer = Peer::new(0x6B, "198.51.100.12");
-    let laptop = NodeIdentity::from_seed([0x6C; 32]);
+    t.admit(&peer);
+    // v0.5.0: a cert authorises only the device it names, so the sender is that device.
+    let laptop = peer.ident.clone();
     let cert = PersonalDeviceCert::issue(
         &t.keys.owner_pq,
         &laptop.device_peer_id(),
@@ -1553,6 +1661,7 @@ fn dht_envelopes() {
     let _g = env_guard();
     let mut t = Trio::new("dht");
     let peer = Peer::new(0x6D, "198.51.100.13");
+    t.admit(&peer);
     let owner = NodeIdentity::from_seed([0x6E; 32]);
     let mk = MasterKey::from_bytes([0x6F; 32]);
     let manifest = FileManifest {
@@ -2094,4 +2203,71 @@ fn seed_server_shares_the_handler_store() {
         !store.renew_blinded_shard_lease(&b.id, 3, 1),
         "deletion via the server is visible in the store"
     );
+}
+
+// --- 20. AdmitPublicTicket (appended in v0.5.0; identical) ---------------------------------------
+
+#[test]
+fn admit_public_ticket() {
+    let _g = env_guard();
+    let mut t = Trio::new("ticket");
+    let peer = Peer::new(0x77, "198.51.100.22");
+    let ticket = PublicCommonsTicket::mint(
+        &peer.ident,
+        NodeIdentity::from_seed([0x11; 32]).public_key_bytes(),
+        now_ms(),
+        DEFAULT_PUBLIC_WOT_POW_BITS,
+    );
+    // Private ring (the fixtures' mode): refused by every role, no state change.
+    let o = t.run(&peer, &MeshWireRequest::AdmitPublicTicket(ticket.clone()));
+    assert!(o[0].resp.contains("admitted: false"), "{}", o[0].resp);
+    assert_identical(&o);
+    assert!(o[0].changed.is_empty());
+    // Public commons: admitted by every role.
+    t.each(|fx, _| {
+        fx.wot
+            .set_trust_pool_mode(TrustPoolMode::PublicCommons, DEFAULT_PUBLIC_WOT_POW_BITS)
+    });
+    let o = t.run(&peer, &MeshWireRequest::AdmitPublicTicket(ticket));
+    assert!(o[0].resp.contains("admitted: true"), "{}", o[0].resp);
+    assert_identical(&o);
+    let pk = peer.ident.public_key_bytes();
+    for fx in &t.fx {
+        assert!(
+            fx.wot.is_public_commons_peer(&pk),
+            "{:?}: admitted",
+            fx.role
+        );
+        assert!(
+            fx.admitted_at(peer.ip).contains(&pk),
+            "{:?}: admission IP",
+            fx.role
+        );
+    }
+    // A ticket for another key is refused even in public commons.
+    let other = Peer::new(0x78, "198.51.100.23");
+    let foreign = PublicCommonsTicket::mint(
+        &peer.ident,
+        NodeIdentity::from_seed([0x11; 32]).public_key_bytes(),
+        now_ms(),
+        DEFAULT_PUBLIC_WOT_POW_BITS,
+    );
+    let o = t.run(&other, &MeshWireRequest::AdmitPublicTicket(foreign));
+    assert!(o[0].resp.contains("admitted: false"), "{}", o[0].resp);
+    assert_identical(&o);
+    // State, not only text: the sender gains nothing and no admission IP is recorded for it.
+    let other_pk = other.ident.public_key_bytes();
+    assert!(o[0].changed.is_empty(), "{:?}", o[0].changed);
+    for fx in &t.fx {
+        assert!(
+            !fx.wot.is_peer_trusted(&other_pk),
+            "{:?}: sender not admitted",
+            fx.role
+        );
+        assert!(
+            fx.admitted_at(other.ip).is_empty(),
+            "{:?}: no admission IP",
+            fx.role
+        );
+    }
 }

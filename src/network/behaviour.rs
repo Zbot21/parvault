@@ -2,7 +2,7 @@ use crate::bootstrap::{
     BlindedShardTombstone, LiteStripeSyndicationBundle, LiteSyndicationReceipt, PersonalDeviceCert,
 };
 use crate::crypto::{NodeIdentity, PqRelayedShardEnvelope, PqSignedDhtManifestEnvelope};
-use crate::network::wot::{DelegationChain, SlashingEvidence};
+use crate::network::wot::{DelegationChain, PublicCommonsTicket, SlashingEvidence};
 use crate::por::{
     MultiSegmentPorChallenge, PorChallenge, PorResponse, RepairGrant, WitnessFailureReceipt,
 };
@@ -365,6 +365,10 @@ pub enum MeshWireRequest {
     SubmitAbuseTakedownReport(crate::storage::VerifiableAbuseReport),
     /// Broadcast a signed bad-actor or illegal-content eviction order across peers (ADR-19).
     BroadcastEvictionOrder(crate::storage::SignedBadActorEvictionOrder),
+    /// Present a self-signed Hashcash `PublicCommonsTicket` for probationary admission to a
+    /// node in public-commons or hybrid mode (ADR-24). Appended in v0.5.0; the ticket key must be
+    /// the sender's transport key.
+    AdmitPublicTicket(PublicCommonsTicket),
 }
 
 /// Wire-level response messages exchanged over `/parvault/wire/1.0.0`.
@@ -459,6 +463,15 @@ pub enum MeshWireResponse {
         purged_blinded_shards: usize,
         zero_wiped_bytes: u64,
         error: Option<String>,
+    },
+    /// Result of `AdmitPublicTicket` (appended in v0.5.0).
+    AdmitPublicTicketAck {
+        admitted: bool,
+        reason: Option<String>,
+        /// The node a ticket must be bound to (its Ed25519 key).
+        verifier_pubkey: [u8; 32],
+        /// The PoW bits this node requires.
+        required_pow_bits: u8,
     },
 }
 

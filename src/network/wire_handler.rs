@@ -54,7 +54,7 @@ pub fn resolve_seed_council_and_quorum(
     local_tracker_admin_pubkey: Option<[u8; 32]>,
     extra_council_pubkeys: &[[u8; 32]],
     cli_quorum_override: Option<usize>,
-    genesis_pubkey: [u8; 32],
+    genesis_pubkey: Option<[u8; 32]>,
 ) -> (Vec<[u8; 32]>, usize) {
     let mut council = Vec::new();
     let mut push_pk = |pk: [u8; 32]| {
@@ -99,7 +99,9 @@ pub fn resolve_seed_council_and_quorum(
             (council, min_quorum)
         }
         SeedServerMode::HomelabRedundancyVault => {
-            push_pk(genesis_pubkey);
+            if let Some(pk) = genesis_pubkey {
+                push_pk(pk);
+            }
             let min_quorum = quorum_override.unwrap_or(1).max(1);
             (council, min_quorum)
         }
@@ -110,7 +112,7 @@ pub fn resolve_seed_council_and_quorum(
 pub struct DaemonWireHandlerCtx<'a> {
     pub cfg: &'a NodeConfig,
     pub node_identity: &'a NodeIdentity,
-    pub genesis_pubkey: [u8; 32],
+    pub genesis_pubkey: Option<[u8; 32]>,
     pub public_mode: bool,
     pub block_store: &'a BlockStore,
     pub wot: &'a mut WebOfTrustRegistry,
@@ -132,7 +134,7 @@ pub struct SeedWireHandlerCtx<'a> {
     pub extra_council_pks: &'a [[u8; 32]],
     pub council_quorum: Option<usize>,
     pub max_probationary_lease_bytes: u64,
-    pub genesis_pubkey: [u8; 32],
+    pub genesis_pubkey: Option<[u8; 32]>,
     pub block_store: &'a BlockStore,
     pub server: &'a mut ZeroTrustSeedServer,
     pub wot: &'a mut WebOfTrustRegistry,
@@ -243,7 +245,7 @@ impl<'a> WirePeer<'a> {
 /// Node state the handler reads and mutates for one request.
 pub struct WireState<'a> {
     pub node_identity: &'a NodeIdentity,
-    pub genesis_pubkey: [u8; 32],
+    pub genesis_pubkey: Option<[u8; 32]>,
     pub block_store: &'a BlockStore,
     /// The daemon's embedded lite seed server, or the seed binary's server.
     pub server: &'a mut ZeroTrustSeedServer,
@@ -292,7 +294,7 @@ pub trait WireRolePolicy {
         &self,
         block_store: &BlockStore,
         mode: SeedServerMode,
-        genesis_pubkey: [u8; 32],
+        genesis_pubkey: Option<[u8; 32]>,
     ) -> (Vec<[u8; 32]>, usize);
 }
 
@@ -339,7 +341,7 @@ impl WireRolePolicy for DaemonWirePolicy<'_> {
         &self,
         block_store: &BlockStore,
         _mode: SeedServerMode,
-        genesis_pubkey: [u8; 32],
+        genesis_pubkey: Option<[u8; 32]>,
     ) -> (Vec<[u8; 32]>, usize) {
         let mut pinned_admins =
             KnownPeersStore::load(&self.cfg.data_dir).pinned_tracker_admin_pubkeys();
@@ -390,7 +392,7 @@ impl WireRolePolicy for SeedWirePolicy<'_> {
         &self,
         _block_store: &BlockStore,
         mode: SeedServerMode,
-        genesis_pubkey: [u8; 32],
+        genesis_pubkey: Option<[u8; 32]>,
     ) -> (Vec<[u8; 32]>, usize) {
         resolve_seed_council_and_quorum(
             self.data_dir,
@@ -416,54 +418,209 @@ pub enum AdmissionClass {
     CouncilSigned,
     /// Requires an admitted peer.
     AdmittedPeer,
+    /// An onion relay: forwarding needs no admission (the originator stays hidden); a final
+    /// delivery requires the last hop's sender to be admitted, checked inside the arm.
+    RelayCarried,
+}
+
+/// The refusal text sent to a sender that is not admitted (the reason code stays in the log).
+pub const NOT_ADMITTED_TEXT: &str = "peer not admitted; v0.5.0 requires ring admission";
+
+/// What the admission decision needs to know about one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionFacts {
+    pub class: AdmissionClass,
+    /// The sender's Ed25519 key from its transport identity, if it has one.
+    pub sender_pubkey: Option<[u8; 32]>,
+    /// The sender is admitted (genesis, an unquarantined ring chain, or a public ticket) and not
+    /// quarantined.
+    pub sender_trusted: bool,
+}
+
+/// The single admission decision (F-03). `Err` carries the reason code for the local log.
+pub fn admission_decision(facts: &AdmissionFacts) -> Result<(), &'static str> {
+    if facts.class != AdmissionClass::AdmittedPeer {
+        return Ok(());
+    }
+    if facts.sender_pubkey.is_none() {
+        return Err("reject.peer_key_unknown");
+    }
+    if !facts.sender_trusted {
+        return Err("reject.peer_not_admitted");
+    }
+    Ok(())
+}
+
+/// Facts for `class` about the sender of this request.
+fn admission_facts(
+    peer: &WirePeer<'_>,
+    class: AdmissionClass,
+    wot: &WebOfTrustRegistry,
+) -> AdmissionFacts {
+    AdmissionFacts {
+        class,
+        sender_pubkey: peer.pubkey,
+        sender_trusted: peer.pubkey.is_some_and(|pk| wot.is_peer_trusted(&pk)),
+    }
+}
+
+/// Runs the decision and logs a refusal; `true` admits.
+fn admitted(peer: &WirePeer<'_>, class: AdmissionClass, wot: &WebOfTrustRegistry) -> bool {
+    match admission_decision(&admission_facts(peer, class, wot)) {
+        Ok(()) => true,
+        Err(code) => {
+            warn!(code, peer = %peer.peer_id, "refused a request from a peer that is not admitted");
+            false
+        }
+    }
 }
 
 /// Classifies a request for admission.
 pub const fn admission_class(request: &MeshWireRequest) -> AdmissionClass {
     match request {
         MeshWireRequest::HandshakeWoT { .. }
+        | MeshWireRequest::AdmitPublicTicket(_)
         | MeshWireRequest::QueryNodeStatus
         | MeshWireRequest::RegisterWanRendezvous { .. }
         | MeshWireRequest::LookupWanRendezvous { .. } => AdmissionClass::PreAdmission,
-        MeshWireRequest::PutBlindedShard { .. }
-        | MeshWireRequest::GetBlindedShard { .. }
+        MeshWireRequest::GetBlindedShard { .. }
         | MeshWireRequest::RenewBlindedLease { .. }
         | MeshWireRequest::DeleteBlindedShardTombstone { .. }
-        | MeshWireRequest::RelayPqOnionEnvelope { .. }
         | MeshWireRequest::GetCiphertextShard { .. }
         | MeshWireRequest::DeleteShard { .. }
         | MeshWireRequest::PorAudit(_)
         | MeshWireRequest::MultiSegmentPorAudit(_)
-        | MeshWireRequest::PutDhtEnvelope(_)
         | MeshWireRequest::GetDhtEnvelope { .. } => AdmissionClass::SelfAuthorised,
+        MeshWireRequest::RelayPqOnionEnvelope { .. } => AdmissionClass::RelayCarried,
         MeshWireRequest::SubmitAbuseTakedownReport(_)
         | MeshWireRequest::BroadcastEvictionOrder(_) => AdmissionClass::CouncilSigned,
-        MeshWireRequest::PutShard { .. } | MeshWireRequest::SyndicateLiteStripe { .. } => {
-            AdmissionClass::AdmittedPeer
-        }
+        // v0.5.0: blinded-shard vouchers are self-certifying (F-24), so a blinded put needs an
+        // admitted sender as well as its voucher.
+        MeshWireRequest::PutShard { .. }
+        | MeshWireRequest::SyndicateLiteStripe { .. }
+        | MeshWireRequest::PutDhtEnvelope(_)
+        | MeshWireRequest::PutBlindedShard { .. } => AdmissionClass::AdmittedPeer,
     }
 }
 
 /// The single admission check: `Some(rejection)` refuses the request before dispatch.
-/// Always admits in 2a (today's behaviour).
 fn admit(
-    _peer: &WirePeer<'_>,
-    _request: &MeshWireRequest,
-    _class: AdmissionClass,
-    _st: &mut WireState<'_>,
+    peer: &WirePeer<'_>,
+    request: &MeshWireRequest,
+    class: AdmissionClass,
+    st: &mut WireState<'_>,
 ) -> Option<MeshWireResponse> {
-    None
+    (!admitted(peer, class, st.wot))
+        .then(|| reject_response(request, NOT_ADMITTED_TEXT.to_string()))
 }
 
-/// The single quota-identity decision for shard ownership. `claimed` is the owner named in the
-/// request (`PutShard`), or `None` where none is sent (`DeleteShard`). Today's rule: an empty,
-/// `local` or `self` claim, or no claim, means the remote peer.
-fn shard_owner<'r>(peer: &WirePeer<'r>, claimed: Option<&'r str>) -> &'r str {
-    match claimed {
-        Some(owner) if !(owner.is_empty() || owner == "local" || owner == "self") => owner,
-        _ => peer.peer_id,
+/// What the shard-owner decision needs to know about one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerFacts<'a> {
+    /// The owner named in the request (`PutShard`), or `None` where none is sent (`DeleteShard`).
+    pub claimed: Option<&'a str>,
+    /// The sender's device peer id, if its transport identity carries an Ed25519 key.
+    pub sender_device_id: Option<&'a str>,
+    /// The sender's libp2p `PeerId` string.
+    pub sender_peer_id: &'a str,
+}
+
+/// The single quota-identity decision (F-04): the accounted owner is always the sender's device
+/// id. A claim may only name the sender (empty, `local`, `self`, its device id or its `PeerId`).
+pub fn shard_owner_decision<'a>(facts: &OwnerFacts<'a>) -> Result<&'a str, &'static str> {
+    let Some(device) = facts.sender_device_id else {
+        return Err("reject.owner_not_sender");
+    };
+    match facts.claimed {
+        None => Ok(device),
+        Some(c)
+            if c.is_empty()
+                || c == "local"
+                || c == "self"
+                || c == device
+                || c == facts.sender_peer_id =>
+        {
+            Ok(device)
+        }
+        Some(_) => Err("reject.owner_not_sender"),
     }
 }
+
+/// The accounted owner for a request from `peer`, or `None` (logged) when the claim does not
+/// name the sender.
+fn shard_owner(peer: &WirePeer<'_>, claimed: Option<&str>) -> Option<String> {
+    let device = peer
+        .pubkey
+        .map(|pk| NodeIdentity::device_peer_id_for_pubkey(&pk));
+    let facts = OwnerFacts {
+        claimed,
+        sender_device_id: device.as_deref(),
+        sender_peer_id: peer.peer_id,
+    };
+    match shard_owner_decision(&facts) {
+        Ok(owner) => Some(owner.to_string()),
+        Err(code) => {
+            warn!(code, peer = %peer.peer_id, "refused an owner claim that does not name the sender");
+            None
+        }
+    }
+}
+
+/// The syndication binding (F-25): a personal-device cert authorises only the device it names,
+/// so it must name the sender. Fails closed when the sender has no Ed25519 key.
+pub fn device_cert_decision(
+    cert_device_id: &str,
+    sender_device_id: Option<&str>,
+) -> Result<(), &'static str> {
+    if sender_device_id == Some(cert_device_id) {
+        Ok(())
+    } else {
+        Err("reject.device_cert_not_sender")
+    }
+}
+
+/// The one refusal text for every failed handshake (F-30): the reason stays in the local log.
+pub const HANDSHAKE_REFUSED_TEXT: &str = "handshake refused";
+
+/// The local reason code for a failed handshake (never sent on the wire).
+pub fn handshake_refusal_code(err: &crate::network::wot::WebOfTrustError) -> &'static str {
+    match err {
+        crate::network::wot::WebOfTrustError::QuarantinedSubtree => "reject.handshake_quarantined",
+        // The code comes from its declared check, so it is built in one place (F-37).
+        crate::network::wot::WebOfTrustError::NoRing => {
+            crate::network::wot::WebOfTrustRegistry::ring_handshake_decision(None)
+                .expect_err("no genesis is always refused")
+        }
+        _ => "reject.handshake_chain_invalid",
+    }
+}
+
+fn handshake_refused() -> MeshWireResponse {
+    MeshWireResponse::HandshakeAck {
+        accepted: false,
+        reason: Some(HANDSHAKE_REFUSED_TEXT.to_string()),
+    }
+}
+
+/// The shard ids a syndicated stripe was stored as (its root and expected shard hashes).
+fn syndicated_shard_ids(
+    bundle: &crate::bootstrap::LiteStripeSyndicationBundle,
+    root: crate::sharding::merkle::Hash32,
+) -> Vec<crate::storage::ShardId> {
+    bundle
+        .expected_shard_hashes
+        .iter()
+        .enumerate()
+        .map(|(i, h)| crate::storage::ShardId {
+            stripe_merkle_root: root,
+            shard_index: i as u32,
+            shard_hash: *h,
+        })
+        .collect()
+}
+
+/// The refusal text for an owner claim that does not name the sender.
+const OWNER_NOT_SENDER_TEXT: &str = "owner claim does not match the sender";
 
 /// The negative acknowledgement for `request` carrying `reason` (for use by `admit`).
 pub fn reject_response(request: &MeshWireRequest, reason: String) -> MeshWireResponse {
@@ -471,6 +628,12 @@ pub fn reject_response(request: &MeshWireRequest, reason: String) -> MeshWireRes
         MeshWireRequest::HandshakeWoT { .. } => MeshWireResponse::HandshakeAck {
             accepted: false,
             reason: Some(reason),
+        },
+        MeshWireRequest::AdmitPublicTicket(_) => MeshWireResponse::AdmitPublicTicketAck {
+            admitted: false,
+            reason: Some(reason),
+            verifier_pubkey: [0u8; 32],
+            required_pow_bits: 0,
         },
         MeshWireRequest::PutShard { .. } => MeshWireResponse::PutShardAck {
             stored: false,
@@ -608,10 +771,16 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                 None,
                 None,
             ) {
-                return MeshWireResponse::HandshakeAck {
-                    accepted: false,
-                    reason: Some(reason),
-                };
+                warn!(%reason, peer = %remote_peer_id, "refused a handshake from a blocked peer");
+                return handshake_refused();
+            }
+            if let Err(code) = WebOfTrustRegistry::ring_handshake_decision(wot.genesis_pubkey()) {
+                warn!(code, peer = %remote_peer_id, "refused a handshake: this node is in no ring");
+                return handshake_refused();
+            }
+            if let Err(code) = WebOfTrustRegistry::chain_leaf_decision(leaf_pk, remote_pubkey) {
+                warn!(code, peer = %remote_peer_id, "refused a handshake for another key's chain");
+                return handshake_refused();
             }
             match wot.verify_and_admit_chain(&chain) {
                 Ok(_) => {
@@ -626,11 +795,56 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                 Err(e) => {
                     // ADR-15 Red-Team Fix (RT3-03): Never penalize `chain.leaf_pubkey()` on an
                     // unverified `HandshakeWoT` failure.
-                    MeshWireResponse::HandshakeAck {
-                        accepted: false,
-                        reason: Some(e.to_string()),
-                    }
+                    let code = handshake_refusal_code(&e);
+                    warn!(code, error = %e, peer = %remote_peer_id, "refused a handshake");
+                    handshake_refused()
                 }
+            }
+        }
+        MeshWireRequest::AdmitPublicTicket(ticket) => {
+            let verifier_pubkey = node_identity.public_key_bytes();
+            let required_pow_bits = wot.required_public_pow_bits();
+            let ack =
+                |admitted: bool, reason: Option<String>| MeshWireResponse::AdmitPublicTicketAck {
+                    admitted,
+                    reason,
+                    verifier_pubkey,
+                    required_pow_bits,
+                };
+            if let Some(reason) = eviction.is_ingress_blocked(
+                remote_ip,
+                Some(remote_peer_id),
+                Some(&ticket.peer_pubkey),
+                None,
+                None,
+            ) {
+                return ack(false, Some(reason));
+            }
+            let subnet = remote_ip
+                .map(PrivacyPreservingEvictionEngine::canonicalize_ip_subnet)
+                .unwrap_or_else(|| "unknown".to_string());
+            let facts = wot.ticket_facts(
+                &ticket,
+                remote_pubkey,
+                verifier_pubkey,
+                &subnet,
+                now_unix_ms(),
+            );
+            if let Err(code) = WebOfTrustRegistry::public_ticket_decision(&facts) {
+                warn!(code, peer = %remote_peer_id, "refused a public-commons ticket");
+                return ack(false, Some("public-commons ticket refused".to_string()));
+            }
+            if facts.already_admitted {
+                return ack(true, None);
+            }
+            match wot.verify_and_admit_public_ticket(&ticket) {
+                Ok(()) => {
+                    if let Some(ip) = remote_ip {
+                        let _ = eviction.record_peer_admission_ip(ip, ticket.peer_pubkey);
+                    }
+                    ack(true, None)
+                }
+                Err(e) => ack(false, Some(e.to_string())),
             }
         }
         MeshWireRequest::PutShard {
@@ -652,13 +866,26 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                     error: Some(reason),
                 };
             }
-            if let Some(grant) = repair_grant {
-                por_verifier.register_repair_grant(grant);
-            }
-            por_verifier.register_shard_session(&shard_id, session_key_commit);
-            let effective_owner = shard_owner(peer, Some(owner_peer_id.as_str()));
+            let Some(effective_owner) = shard_owner(peer, Some(owner_peer_id.as_str())) else {
+                return MeshWireResponse::PutShardAck {
+                    stored: false,
+                    error: Some(OWNER_NOT_SENDER_TEXT.to_string()),
+                };
+            };
+            let effective_owner = effective_owner.as_str();
             match block_store.put_shard(effective_owner, &shard_id, &shard_bytes) {
                 Ok(_) => {
+                    // The PoR session commit, like the grant, registers only after the owner
+                    // decision and a successful store (a refused put must not replace it).
+                    por_verifier.register_shard_session(&shard_id, session_key_commit);
+                    // F-02a: a grant registers only after the shard is stored, for its stripe.
+                    if let Some(grant) = repair_grant {
+                        if let Err(code) =
+                            por_verifier.register_repair_grant_for_stored(grant, &[shard_id])
+                        {
+                            warn!(code, peer = %remote_peer_id, "repair grant not registered");
+                        }
+                    }
                     let _ = eviction.record_regular_shard_ingress(
                         remote_ip,
                         Some(remote_peer_id),
@@ -689,18 +916,30 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
             let mut sig64 = [0u8; 64];
             sig64[..32].copy_from_slice(&r);
             sig64[32..].copy_from_slice(&s);
+            let accounted_owner = block_store
+                .quota()
+                .lock()
+                .ok()
+                .and_then(|q| q.shard_owner(&shard_id.file_key()).map(str::to_string));
             if !por_verifier.authorize_owner_shard_delete(
                 &shard_id,
                 &owner_pub,
                 payload.as_slice(),
                 &sig64,
+                accounted_owner.as_deref(),
             ) {
                 return MeshWireResponse::DeleteShardAck {
                     deleted: false,
                     error: Some("unauthorized owner shard delete signature".to_string()),
                 };
             }
-            match block_store.delete_shard(shard_owner(peer, None), &shard_id) {
+            let Some(owner) = shard_owner(peer, None) else {
+                return MeshWireResponse::DeleteShardAck {
+                    deleted: false,
+                    error: Some(OWNER_NOT_SENDER_TEXT.to_string()),
+                };
+            };
+            match block_store.delete_shard(&owner, &shard_id) {
                 Ok(deleted) => MeshWireResponse::DeleteShardAck {
                     deleted,
                     error: None,
@@ -998,6 +1237,12 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                     }
                 }
             } else if let Ok(bundle) = envelope.open_final_target_pq(pq_kem) {
+                if !admitted(peer, AdmissionClass::AdmittedPeer, wot) {
+                    return MeshWireResponse::RelayPqOnionAck {
+                        delivered: false,
+                        error: Some(NOT_ADMITTED_TEXT.to_string()),
+                    };
+                }
                 if let Some(reason) = eviction.is_ingress_blocked(
                     remote_ip,
                     Some(remote_peer_id),
@@ -1054,6 +1299,12 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
             } else {
                 match envelope.open_pq(pq_kem) {
                     Ok((blinded_id, shard_bytes)) => {
+                        if !admitted(peer, AdmissionClass::AdmittedPeer, wot) {
+                            return MeshWireResponse::RelayPqOnionAck {
+                                delivered: false,
+                                error: Some(NOT_ADMITTED_TEXT.to_string()),
+                            };
+                        }
                         if let Some(reason) = eviction.is_ingress_blocked(
                             remote_ip,
                             Some(remote_peer_id),
@@ -1132,20 +1383,40 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                     error: Some(reason),
                 };
             }
-            if let Some(ref grant) = repair_grant {
-                por_verifier.register_repair_grant(grant.clone());
+            let sender_device =
+                remote_pubkey.map(|pk| NodeIdentity::device_peer_id_for_pubkey(&pk));
+            if let Err(code) = device_cert_decision(&cert.device_peer_id, sender_device.as_deref())
+            {
+                warn!(code, peer = %remote_peer_id, "refused a device cert issued to another device");
+                return MeshWireResponse::SyndicateLiteStripeAck {
+                    receipt: None,
+                    syndicated_peers: Vec::new(),
+                    error: Some("device cert does not name the sender".to_string()),
+                };
             }
+            let grant_to_register = repair_grant.clone();
             match server.ingest_and_syndicate_lite_stripe_with_grant(
                 &cert,
                 &bundle,
                 &[],
                 repair_grant,
             ) {
-                Ok((receipt, syndicated_peers)) => MeshWireResponse::SyndicateLiteStripeAck {
-                    receipt: Some(receipt),
-                    syndicated_peers,
-                    error: None,
-                },
+                Ok((receipt, syndicated_peers)) => {
+                    // F-02a: register only after the stripe was ingested, for that stripe.
+                    if let Some(grant) = grant_to_register {
+                        if let Err(code) = por_verifier.register_repair_grant_for_stored(
+                            grant,
+                            &syndicated_shard_ids(&bundle, receipt.stripe_merkle_root),
+                        ) {
+                            warn!(code, peer = %remote_peer_id, "repair grant not registered");
+                        }
+                    }
+                    MeshWireResponse::SyndicateLiteStripeAck {
+                        receipt: Some(receipt),
+                        syndicated_peers,
+                        error: None,
+                    }
+                }
                 Err(e) => MeshWireResponse::SyndicateLiteStripeAck {
                     receipt: None,
                     syndicated_peers: Vec::new(),
@@ -1567,13 +1838,20 @@ mod tests {
                 "EvictionOrderAck",
                 true,
             ),
+            (
+                MeshWireRequest::AdmitPublicTicket(crate::network::wot::PublicCommonsTicket::mint(
+                    &id, [0; 32], 1, 1,
+                )),
+                "AdmitPublicTicketAck",
+                true,
+            ),
         ]
     }
 
     #[test]
     fn reject_response_matches_each_variant() {
         let reqs = all_requests();
-        assert_eq!(reqs.len(), 19);
+        assert_eq!(reqs.len(), 20);
         for (req, expected, carries_reason) in &reqs {
             let resp = format!("{:?}", reject_response(req, "admission-denied".into()));
             assert!(resp.starts_with(expected), "{expected}: {resp}");
@@ -1591,6 +1869,37 @@ mod tests {
     }
 
     #[test]
+    fn admission_decision_rules() {
+        let facts = |class, sender_pubkey, sender_trusted| AdmissionFacts {
+            class,
+            sender_pubkey,
+            sender_trusted,
+        };
+        let admitted = AdmissionClass::AdmittedPeer;
+        assert_eq!(
+            admission_decision(&facts(admitted, Some([1; 32]), true)),
+            Ok(())
+        );
+        assert_eq!(
+            admission_decision(&facts(admitted, Some([1; 32]), false)),
+            Err("reject.peer_not_admitted")
+        );
+        // Fail closed when the transport identity carries no Ed25519 key.
+        assert_eq!(
+            admission_decision(&facts(admitted, None, true)),
+            Err("reject.peer_key_unknown")
+        );
+        for class in [
+            AdmissionClass::PreAdmission,
+            AdmissionClass::SelfAuthorised,
+            AdmissionClass::CouncilSigned,
+            AdmissionClass::RelayCarried,
+        ] {
+            assert_eq!(admission_decision(&facts(class, None, false)), Ok(()));
+        }
+    }
+
+    #[test]
     fn admission_class_keeps_pre_admission_paths_open() {
         let classes: Vec<AdmissionClass> = all_requests()
             .iter()
@@ -1600,7 +1909,20 @@ mod tests {
             .iter()
             .filter(|c| **c == AdmissionClass::PreAdmission)
             .count();
-        assert_eq!(pre, 4, "handshake, status, rendezvous register and lookup");
+        assert_eq!(
+            pre, 5,
+            "handshake, public ticket, status, rendezvous register and lookup"
+        );
+        let admitted: Vec<&str> = all_requests()
+            .iter()
+            .filter(|(r, _, _)| admission_class(r) == AdmissionClass::AdmittedPeer)
+            .map(|(_, name, _)| *name)
+            .collect();
+        assert_eq!(
+            admitted.len(),
+            4,
+            "PutShard, SyndicateLiteStripe, PutDhtEnvelope, PutBlindedShard: {admitted:?}"
+        );
         assert_eq!(
             admission_class(&MeshWireRequest::QueryNodeStatus),
             AdmissionClass::PreAdmission
@@ -1608,11 +1930,39 @@ mod tests {
     }
 
     #[test]
-    fn shard_owner_rule_is_unchanged() {
-        let peer = WirePeer::new("remote-peer", None);
-        for claim in [None, Some(""), Some("local"), Some("self")] {
-            assert_eq!(shard_owner(&peer, claim), "remote-peer");
+    fn shard_owner_rule_binds_the_sender() {
+        let facts = |claimed| OwnerFacts {
+            claimed,
+            sender_device_id: Some("parvault-peer-0011223344556677"),
+            sender_peer_id: "12D3KooWsender",
+        };
+        for claim in [
+            None,
+            Some(""),
+            Some("local"),
+            Some("self"),
+            Some("parvault-peer-0011223344556677"),
+            Some("12D3KooWsender"),
+        ] {
+            assert_eq!(
+                shard_owner_decision(&facts(claim)),
+                Ok("parvault-peer-0011223344556677"),
+                "{claim:?}"
+            );
         }
-        assert_eq!(shard_owner(&peer, Some("alice")), "alice");
+        assert_eq!(
+            shard_owner_decision(&facts(Some("alice"))),
+            Err("reject.owner_not_sender")
+        );
+        let keyless = OwnerFacts {
+            claimed: None,
+            sender_device_id: None,
+            sender_peer_id: "remote-peer",
+        };
+        assert_eq!(
+            shard_owner_decision(&keyless),
+            Err("reject.owner_not_sender"),
+            "a sender without an Ed25519 key fails closed"
+        );
     }
 }

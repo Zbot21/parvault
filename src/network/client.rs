@@ -941,6 +941,97 @@ fn spawn_swarm_worker(
 /// Live `libp2p` Mesh Client (TCP + Noise XX + Yamux + Kademlia DHT + `/parvault/wire/1.0.0`)
 /// backed by a persistent background `Swarm` actor that reuses encrypted connections, enforces
 /// TOFU / explicit `PeerId` pinning, and records live RTT & topology telemetry.
+/// The DHT reader's owner binding (F-10a): a candidate counts only if the reading identity
+/// sealed it.
+pub fn dht_candidate_decision(
+    candidate_owner: [u8; 32],
+    expected_owner: [u8; 32],
+) -> Result<(), &'static str> {
+    if candidate_owner == expected_owner {
+        Ok(())
+    } else {
+        Err("reject.dht_owner_mismatch")
+    }
+}
+
+/// One onion send: the envelope, its capability and voucher, and the lease for final delivery.
+struct OnionSend {
+    target_peer_addr: Option<String>,
+    envelope: PqRelayedShardEnvelope,
+    capability: BlindedShardCapability,
+    voucher: AnonymousQuotaVoucher,
+    lease: crate::storage::BlindedLeaseSpec,
+}
+
+/// Originates onion uploads (ADR-11). It wraps a private client that never presents an
+/// admission credential, but it dials with the node's ring transport key, so the entry relay
+/// learns the originator's IP and ring identity. Onion routing hides the originator only from
+/// the final target and the storage host. The relay's forward to the final target presents the
+/// relay's own chain. Unlinkable entry (an ephemeral key) is planned for v0.6.0.
+pub struct OnionOriginator {
+    client: MeshClient,
+}
+
+impl OnionOriginator {
+    pub fn new(identity: NodeIdentity, peers: Vec<String>) -> Self {
+        Self {
+            client: MeshClient::new(identity, peers, None),
+        }
+    }
+
+    /// Sends a single-layer envelope to `entry_relay` (with `next_hop`, or for final delivery).
+    pub fn send_onion(
+        &self,
+        entry_relay: &str,
+        next_hop: Option<String>,
+        envelope: PqRelayedShardEnvelope,
+        capability: BlindedShardCapability,
+        voucher: AnonymousQuotaVoucher,
+        lease: crate::storage::BlindedLeaseSpec,
+    ) -> anyhow::Result<()> {
+        self.client.send_onion(
+            entry_relay,
+            OnionSend {
+                target_peer_addr: next_hop,
+                envelope,
+                capability,
+                voucher,
+                lease,
+            },
+            false,
+        )
+    }
+
+    /// Sends a 2-layer envelope to `entry_relay`, which peels it and forwards to the target.
+    pub fn send_layered_onion(
+        &self,
+        entry_relay: &str,
+        outer_envelope: PqRelayedShardEnvelope,
+    ) -> anyhow::Result<()> {
+        self.client
+            .send_layered_onion(entry_relay, outer_envelope, false)
+    }
+}
+
+/// How long a client waits after a refused handshake before presenting its credential again.
+pub const ADMISSION_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Whether `resp` is the server's "not admitted" refusal.
+fn is_not_admitted_refusal(resp: &MeshWireResponse) -> bool {
+    let text = crate::network::wire_handler::NOT_ADMITTED_TEXT;
+    match resp {
+        MeshWireResponse::PutShardAck { error, .. }
+        | MeshWireResponse::PutBlindedShardAck { error, .. }
+        | MeshWireResponse::RelayPqOnionAck { error, .. }
+        | MeshWireResponse::PutDhtEnvelopeAck { error, .. }
+        | MeshWireResponse::SyndicateLiteStripeAck { error, .. } => error.as_deref() == Some(text),
+        _ => false,
+    }
+}
+
+/// A (sender public key, peer address) pair that accepted this process's handshake.
+type AdmittedAt = ([u8; 32], String);
+
 #[derive(Clone, Debug)]
 pub struct MeshClient {
     identity: NodeIdentity,
@@ -958,6 +1049,12 @@ pub struct MeshClient {
     peer_status_cache: Arc<Mutex<HashMap<String, CachedNodeStatus>>>,
     discovered_peers: Arc<Mutex<HashSet<String>>>,
     worker: Arc<Mutex<Option<SwarmWorkerHandle>>>,
+    /// Explicit admission source; `None` falls back to the process-wide one.
+    admission: Option<Arc<crate::network::admission::AdmissionSource>>,
+    /// (sender pubkey, peer address) pairs that accepted this process's handshake.
+    admitted_at: Arc<Mutex<HashSet<AdmittedAt>>>,
+    /// When a handshake with (sender, peer) was last refused (backoff).
+    admission_refused_at: Arc<Mutex<HashMap<AdmittedAt, Instant>>>,
 }
 
 impl MeshClient {
@@ -998,7 +1095,110 @@ impl MeshClient {
             peer_status_cache: Arc::new(Mutex::new(HashMap::new())),
             discovered_peers: Arc::new(Mutex::new(HashSet::new())),
             worker: Arc::new(Mutex::new(None)),
+            admission: None,
+            admitted_at: Arc::new(Mutex::new(HashSet::new())),
+            admission_refused_at: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Uses `source` for ring admission instead of the process-wide source.
+    pub fn with_admission(mut self, source: crate::network::admission::AdmissionSource) -> Self {
+        self.admission = Some(Arc::new(source));
+        self
+    }
+
+    /// Presents this identity's chain to `peer_addr` once, before the first request that needs an
+    /// admitted sender. Without a credential nothing is sent and the peer decides.
+    fn ensure_admitted(&self, peer_addr: &str) {
+        let key = (self.identity.public_key_bytes(), peer_addr.to_string());
+        if self
+            .admitted_at
+            .lock()
+            .map(|s| s.contains(&key))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        // After a refused handshake, do not handshake again until the backoff has passed.
+        if self
+            .admission_refused_at
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&key).copied())
+            .is_some_and(|t| t.elapsed() < ADMISSION_RETRY_BACKOFF)
+        {
+            return;
+        }
+        // A ticket is bound to the peer's key: known from a `/p2p/<PeerId>` address, else learned
+        // from the peer's refusal, which states its key and required bits (one re-mint).
+        let mut verifier = parse_peer_multiaddr(peer_addr)
+            .ok()
+            .and_then(|m| extract_expected_peer_id(&m))
+            .and_then(|pid| {
+                crate::config::NodeConfig::extract_ed25519_pubkey_from_peer_str(&pid.to_string())
+            })
+            .unwrap_or([0u8; 32]);
+        let mut required_bits = None;
+        let mut admitted = false;
+        for _attempt in 0..2 {
+            let Some(request) = self.admission_request(verifier, required_bits) else {
+                return;
+            };
+            let is_ticket = matches!(request, MeshWireRequest::AdmitPublicTicket(_));
+            match self.send_request(peer_addr, request) {
+                Ok(MeshWireResponse::HandshakeAck { accepted: true, .. })
+                | Ok(MeshWireResponse::AdmitPublicTicketAck { admitted: true, .. }) => {
+                    admitted = true;
+                    break;
+                }
+                Ok(MeshWireResponse::AdmitPublicTicketAck {
+                    admitted: false,
+                    verifier_pubkey,
+                    required_pow_bits,
+                    ..
+                }) if is_ticket
+                    && verifier_pubkey != [0u8; 32]
+                    && (verifier_pubkey != verifier
+                        || required_bits != Some(required_pow_bits)) =>
+                {
+                    verifier = verifier_pubkey;
+                    required_bits = Some(required_pow_bits);
+                }
+                _ => break,
+            }
+        }
+        if admitted {
+            if let Ok(mut m) = self.admission_refused_at.lock() {
+                m.remove(&key);
+            }
+            if let Ok(mut s) = self.admitted_at.lock() {
+                s.insert(key);
+            }
+        } else if let Ok(mut m) = self.admission_refused_at.lock() {
+            m.insert(key, Instant::now());
+        }
+    }
+
+    /// The admission request this identity presents: a chain, or a ticket bound to `verifier`.
+    fn admission_request(
+        &self,
+        verifier: [u8; 32],
+        required_bits: Option<u8>,
+    ) -> Option<MeshWireRequest> {
+        use crate::network::admission::AdmissionCredential;
+        let credential = match self.admission.as_deref() {
+            Some(source) => source.credential(&self.identity, verifier, required_bits),
+            None => crate::network::admission::process_source()
+                .and_then(|source| source.credential(&self.identity, verifier, required_bits)),
+        };
+        Some(match credential? {
+            AdmissionCredential::Chain(chain) => MeshWireRequest::HandshakeWoT {
+                chain,
+                asn: None,
+                region: None,
+            },
+            AdmissionCredential::Ticket(ticket) => MeshWireRequest::AdmitPublicTicket(ticket),
+        })
     }
 
     /// Enables Zero-IP LAN auto-discovery and DHCP IP/port-change self-healing backed by
@@ -1353,16 +1553,64 @@ impl MeshClient {
     /// Sends a `MeshWireRequest` to `peer_addr` over the persistent background `libp2p` `Swarm`
     /// (reusing open TCP + Noise XX + Yamux connections across RPCs, and automatically healing
     /// stale DHCP IP/port endpoints when `with_data_dir_discovery` is active).
+    /// Sends `request` as this client's identity. Before a request that needs an admitted sender
+    /// it first presents this identity's admission credential (once per peer).
     pub fn send_request(
         &self,
         peer_addr: &str,
         request: MeshWireRequest,
     ) -> anyhow::Result<MeshWireResponse> {
+        self.send_request_inner(peer_addr, request, true)
+    }
+
+    fn send_request_inner(
+        &self,
+        peer_addr: &str,
+        request: MeshWireRequest,
+        present_credential: bool,
+    ) -> anyhow::Result<MeshWireResponse> {
         let trimmed = peer_addr.trim();
         if trimmed.is_empty() {
             return Err(MeshClientError::InvalidAddress("empty peer address".into()).into());
         }
+        let needs_admission =
+            present_credential && crate::network::admission::requires_admitted_sender(&request);
+        if !needs_admission {
+            return self.send_request_transport(trimmed, request);
+        }
+        self.ensure_admitted(trimmed);
+        let key = (self.identity.public_key_bytes(), trimmed.to_string());
+        let was_admitted = self
+            .admitted_at
+            .lock()
+            .map(|s| s.contains(&key))
+            .unwrap_or(false);
+        let resp = self.send_request_transport(trimmed, request.clone())?;
+        // A peer that admitted us before but now answers "not admitted" lost our admission (for
+        // example, a restart): forget it, handshake once more, and resend once.
+        if was_admitted && is_not_admitted_refusal(&resp) {
+            if let Ok(mut s) = self.admitted_at.lock() {
+                s.remove(&key);
+            }
+            self.ensure_admitted(trimmed);
+            let readmitted = self
+                .admitted_at
+                .lock()
+                .map(|s| s.contains(&key))
+                .unwrap_or(false);
+            if readmitted {
+                return self.send_request_transport(trimmed, request);
+            }
+        }
+        Ok(resp)
+    }
 
+    /// Sends one request over the transport, with dead-peer healing and LAN refresh.
+    fn send_request_transport(
+        &self,
+        trimmed: &str,
+        request: MeshWireRequest,
+    ) -> anyhow::Result<MeshWireResponse> {
         // If `trimmed` was already marked dead and we know a newer verified endpoint for the
         // exact same `/p2p/<PeerId>`, dial the healed endpoint directly.
         if self.is_peer_marked_dead(trimmed) {
@@ -2185,6 +2433,8 @@ impl MeshClient {
         }
     }
 
+    /// A relay's forward of an onion envelope to its next hop, sent as this node (admitted). Used
+    /// by the wire handler for the last hop; originators use [`OnionOriginator`].
     pub fn relay_pq_onion_envelope(
         &self,
         relay_peer_addr: &str,
@@ -2194,7 +2444,33 @@ impl MeshClient {
         voucher: AnonymousQuotaVoucher,
         lease: crate::storage::BlindedLeaseSpec,
     ) -> anyhow::Result<()> {
-        match self.send_request(
+        self.send_onion(
+            relay_peer_addr,
+            OnionSend {
+                target_peer_addr,
+                envelope,
+                capability,
+                voucher,
+                lease,
+            },
+            true,
+        )
+    }
+
+    fn send_onion(
+        &self,
+        relay_peer_addr: &str,
+        onion: OnionSend,
+        present_credential: bool,
+    ) -> anyhow::Result<()> {
+        let OnionSend {
+            target_peer_addr,
+            envelope,
+            capability,
+            voucher,
+            lease,
+        } = onion;
+        match self.send_request_inner(
             relay_peer_addr,
             MeshWireRequest::RelayPqOnionEnvelope {
                 target_peer_addr,
@@ -2205,6 +2481,7 @@ impl MeshClient {
                 lease_duration_epochs: lease.lease_duration_epochs,
                 delete_verifier: lease.delete_verifier,
             },
+            present_credential,
         )? {
             MeshWireResponse::RelayPqOnionAck { delivered, error } => {
                 if !delivered {
@@ -2233,6 +2510,15 @@ impl MeshClient {
         relay_peer_addr: &str,
         outer_envelope: PqRelayedShardEnvelope,
     ) -> anyhow::Result<()> {
+        self.send_layered_onion(relay_peer_addr, outer_envelope, true)
+    }
+
+    fn send_layered_onion(
+        &self,
+        relay_peer_addr: &str,
+        outer_envelope: PqRelayedShardEnvelope,
+        present_credential: bool,
+    ) -> anyhow::Result<()> {
         let dummy_capability = BlindedShardCapability {
             locator: [0u8; 32],
             capability_pubkey: [0u8; 32],
@@ -2244,13 +2530,16 @@ impl MeshClient {
             sig_r: [0u8; 32],
             sig_s: [0u8; 32],
         };
-        self.relay_pq_onion_envelope(
+        self.send_onion(
             relay_peer_addr,
-            None,
-            outer_envelope,
-            dummy_capability,
-            dummy_voucher,
-            crate::storage::BlindedLeaseSpec::new(0, 0, [0u8; 32]),
+            OnionSend {
+                target_peer_addr: None,
+                envelope: outer_envelope,
+                capability: dummy_capability,
+                voucher: dummy_voucher,
+                lease: crate::storage::BlindedLeaseSpec::new(0, 0, [0u8; 32]),
+            },
+            present_credential,
         )
     }
 
@@ -2354,6 +2643,31 @@ impl MeshClient {
     }
 
     fn validate_dht_candidate(
+        &self,
+        dht_key: &[u8; 32],
+        kind: DhtEnvelopeKind,
+        env: &DhtWireEnvelope,
+    ) -> Option<u64> {
+        let version = Self::self_consistent_version(dht_key, kind, env)?;
+        // F-10a: classical manifests and vault catalogs are sealed by the identity that reads
+        // them back; a self-consistent envelope signed by anyone else is a squat.
+        let owner = match env {
+            DhtWireEnvelope::ClassicalManifest(m) => Some(m.owner_pubkey),
+            DhtWireEnvelope::VaultCatalog(m) => Some(m.owner_pubkey),
+            DhtWireEnvelope::PostQuantumManifest(_) => None,
+        };
+        if let Some(owner) = owner {
+            if let Err(code) = dht_candidate_decision(owner, self.identity.public_key_bytes()) {
+                warn!(code, owner = %hex::encode(owner), "ignored a DHT envelope from another owner");
+                return None;
+            }
+        }
+        Some(version)
+    }
+
+    /// The monotonic version of `env` if it is a self-consistent envelope of `kind` at `dht_key`
+    /// (key match and owner signature), else `None`.
+    pub(crate) fn self_consistent_version(
         dht_key: &[u8; 32],
         kind: DhtEnvelopeKind,
         env: &DhtWireEnvelope,
@@ -2406,7 +2720,7 @@ impl MeshClient {
                 if let Ok(raw_records) = reply_rx.recv_timeout(kad_wait) {
                     for raw in raw_records {
                         if let Ok(env) = bincode::deserialize::<DhtWireEnvelope>(&raw) {
-                            if let Some(ver) = Self::validate_dht_candidate(dht_key, kind, &env) {
+                            if let Some(ver) = self.validate_dht_candidate(dht_key, kind, &env) {
                                 if best.as_ref().is_none_or(|(best_v, _)| ver > *best_v) {
                                     best = Some((ver, env));
                                 }
@@ -2432,7 +2746,7 @@ impl MeshClient {
                     kind,
                 },
             ) {
-                if let Some(ver) = Self::validate_dht_candidate(dht_key, kind, &env) {
+                if let Some(ver) = self.validate_dht_candidate(dht_key, kind, &env) {
                     if best.as_ref().is_none_or(|(best_v, _)| ver > *best_v) {
                         best = Some((ver, env));
                     }
@@ -2452,7 +2766,7 @@ impl MeshClient {
                         kind,
                     },
                 ) {
-                    if let Some(ver) = Self::validate_dht_candidate(dht_key, kind, &env) {
+                    if let Some(ver) = self.validate_dht_candidate(dht_key, kind, &env) {
                         if best.as_ref().is_none_or(|(best_v, _)| ver > *best_v) {
                             best = Some((ver, env));
                         }

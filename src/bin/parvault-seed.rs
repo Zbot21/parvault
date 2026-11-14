@@ -32,7 +32,7 @@ use parvault::{
         MasterKey, NodeIdentity,
     },
     network::{
-        build_mesh_swarm, derive_4word_pairing_sas, extract_listen_port_and_ip,
+        build_mesh_server_swarm, derive_4word_pairing_sas, extract_listen_port_and_ip,
         open_public_tracker_card, resolve_zero_config_peers, KnownPeersStore, LanBeaconConfig,
         LanBeaconResponder, MeshClient, TrustPoolMode, WanRendezvousRegistry, WebOfTrustRegistry,
         DEFAULT_LAN_DISCOVERY_PORT, DEFAULT_LAN_PAIRING_NONCE, DEFAULT_PUBLIC_WOT_POW_BITS,
@@ -485,6 +485,10 @@ async fn main() -> anyhow::Result<()> {
                 NodeIdentity::load_or_generate_in_dir(&data_dir)?
             };
 
+            parvault::network::admission::install_process_source(
+                &data_dir,
+                mode == CliSeedMode::PublicBootstrap,
+            );
             let seed_peers =
                 if effective_peers.is_empty() && lan_enabled && !once && !in_memory_mode {
                     resolve_zero_config_peers(
@@ -568,14 +572,16 @@ async fn main() -> anyhow::Result<()> {
                 }
                 CliSeedMode::PublicBootstrap => {
                     let genesis_pubkey = if in_memory_mode {
-                        if let Ok(env_hex) = std::env::var("PARVAULT_GENESIS_PUBKEY_HEX") {
-                            parse_hex_32(&env_hex, "PARVAULT_GENESIS_PUBKEY_HEX")
-                                .unwrap_or_else(|_| node_identity.public_key_bytes())
-                        } else {
-                            node_identity.public_key_bytes()
-                        }
+                        Some(
+                            if let Ok(env_hex) = std::env::var("PARVAULT_GENESIS_PUBKEY_HEX") {
+                                parse_hex_32(&env_hex, "PARVAULT_GENESIS_PUBKEY_HEX")
+                                    .unwrap_or_else(|_| node_identity.public_key_bytes())
+                            } else {
+                                node_identity.public_key_bytes()
+                            },
+                        )
                     } else {
-                        NodeIdentity::resolve_genesis_root_pubkey_in_dir(&data_dir, None)?
+                        parvault::network::admission::server_ring_genesis(&data_dir, None, true)?
                     };
                     info!(
                         lease_epochs,
@@ -586,7 +592,7 @@ async fn main() -> anyhow::Result<()> {
                     ZeroTrustSeedServer::new_public_bootstrapper(
                         "parvault-seed-public-bootstrapper",
                         block_store.clone(),
-                        genesis_pubkey,
+                        genesis_pubkey.unwrap_or(parvault::network::admission::NO_RING_ISSUER),
                         grace_epochs,
                     )
                 }
@@ -720,11 +726,11 @@ async fn main() -> anyhow::Result<()> {
                 ),
                 CliSeedMode::PublicBootstrap => {
                     let genesis_pubkey =
-                        NodeIdentity::resolve_genesis_root_pubkey_in_dir(&data_dir, None)?;
+                        parvault::network::admission::server_ring_genesis(&data_dir, None, true)?;
                     ZeroTrustSeedServer::new_public_bootstrapper(
                         "parvault-seed-public-bootstrapper",
                         block_store,
-                        genesis_pubkey,
+                        genesis_pubkey.unwrap_or(parvault::network::admission::NO_RING_ISSUER),
                         2,
                     )
                 }
@@ -743,11 +749,12 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let quota = QuotaManager::new(500 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
             let block_store = BlockStore::new(&data_dir, quota)?;
-            let genesis_pubkey = NodeIdentity::resolve_genesis_root_pubkey_in_dir(&data_dir, None)?;
+            let genesis_pubkey =
+                parvault::network::admission::server_ring_genesis(&data_dir, None, true)?;
             let server = ZeroTrustSeedServer::new_public_bootstrapper(
                 "parvault-seed-public-bootstrapper",
                 block_store,
-                genesis_pubkey,
+                genesis_pubkey.unwrap_or(parvault::network::admission::NO_RING_ISSUER),
                 2,
             );
 
@@ -1266,7 +1273,8 @@ async fn main() -> anyhow::Result<()> {
                 let quota = QuotaManager::new(500 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
                 let block_store = BlockStore::new(&data_dir, quota)?;
                 let mut eviction = PrivacyPreservingEvictionEngine::load_or_init(&data_dir)?;
-                let genesis_pk = NodeIdentity::resolve_genesis_root_pubkey_in_dir(&data_dir, None)?;
+                let genesis_pk =
+                    parvault::network::admission::server_ring_genesis(&data_dir, None, true)?;
                 let (council, min_quorum) = resolve_seed_council_and_quorum(
                     &data_dir,
                     SeedServerMode::PublicNetworkBootstrapper,
@@ -1747,18 +1755,27 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
     let keypair = node_identity.to_libp2p_keypair()?;
     let local_peer_id = keypair.public().to_peer_id();
     let genesis_pubkey = if in_memory_mode {
-        if let Ok(env_hex) = std::env::var("PARVAULT_GENESIS_PUBKEY_HEX") {
-            parse_hex_32(&env_hex, "PARVAULT_GENESIS_PUBKEY_HEX")
-                .unwrap_or_else(|_| node_identity.public_key_bytes())
-        } else {
-            node_identity.public_key_bytes()
-        }
+        Some(
+            if let Ok(env_hex) = std::env::var("PARVAULT_GENESIS_PUBKEY_HEX") {
+                parse_hex_32(&env_hex, "PARVAULT_GENESIS_PUBKEY_HEX")
+                    .unwrap_or_else(|_| node_identity.public_key_bytes())
+            } else {
+                node_identity.public_key_bytes()
+            },
+        )
     } else {
-        NodeIdentity::resolve_genesis_root_pubkey_in_dir(&data_dir, None)?
+        parvault::network::admission::server_ring_genesis(
+            &data_dir,
+            None,
+            server.mode() == SeedServerMode::PublicNetworkBootstrapper,
+        )?
     };
 
     let mut wot = if in_memory_mode {
-        WebOfTrustRegistry::new(genesis_pubkey, DEFAULT_SUBTREE_SLASH_LIMIT)
+        match genesis_pubkey {
+            Some(g) => WebOfTrustRegistry::new(g, DEFAULT_SUBTREE_SLASH_LIMIT),
+            None => WebOfTrustRegistry::without_ring(DEFAULT_SUBTREE_SLASH_LIMIT),
+        }
     } else {
         WebOfTrustRegistry::with_persistence_dir(
             genesis_pubkey,
@@ -1769,15 +1786,21 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
     if server.mode() == SeedServerMode::PublicNetworkBootstrapper {
         wot.set_trust_pool_mode(TrustPoolMode::Hybrid, DEFAULT_PUBLIC_WOT_POW_BITS);
     }
+    wot.protect_key(node_identity.public_key_bytes());
     let por_verifier = if in_memory_mode {
         PorVerifierEngine::new(300)
     } else {
         PorVerifierEngine::with_persistence_dir(300, &data_dir)
     };
     let nullifier_ledger = if in_memory_mode {
-        VoucherNullifierLedger::new(genesis_pubkey)
+        VoucherNullifierLedger::new(
+            genesis_pubkey.unwrap_or(parvault::network::admission::NO_RING_ISSUER),
+        )
     } else {
-        VoucherNullifierLedger::with_persistence_dir(genesis_pubkey, &data_dir)
+        VoucherNullifierLedger::with_persistence_dir(
+            genesis_pubkey.unwrap_or(parvault::network::admission::NO_RING_ISSUER),
+            &data_dir,
+        )
     };
     let pq_kem = if in_memory_mode {
         HybridKemKeypair::generate()?
@@ -1801,7 +1824,8 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
     };
     let mut server_events = ServerSwarmEvents::new(false);
 
-    let mut swarm = build_mesh_swarm(keypair, false)?;
+    let mut swarm =
+        build_mesh_server_swarm(keypair, false, resolve_seed_lan_enabled(no_lan_discovery))?;
     let tcp_addr: Multiaddr = listen.parse()?;
     swarm.listen_on(tcp_addr.clone())?;
 
@@ -2001,6 +2025,8 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     st.epoch_counter = st.epoch_counter.saturating_add(1);
                     let ep = st.epoch_counter;
+                    // Admissions are written in batches (F-29, F-32).
+                    st.wot.flush();
                     st.wan_registry.prune_expired(seed_now_ms());
                     if let Ok(purged) = st.server.sweep_expired_epoch(ep) {
                         if !purged.is_empty() {
@@ -2022,6 +2048,11 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received Ctrl-C, shutting down parvault-seed cleanly.");
+                shared
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .wot
+                    .flush();
                 break;
             }
         }
@@ -2040,7 +2071,7 @@ struct SeedAdminRpcCtx<'a> {
     local_tracker_admin_pk: Option<[u8; 32]>,
     extra_council_pks: &'a [[u8; 32]],
     council_quorum: Option<usize>,
-    genesis_pubkey: [u8; 32],
+    genesis_pubkey: Option<[u8; 32]>,
     effective_peers: &'a [String],
     start_instant: Instant,
 }

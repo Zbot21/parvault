@@ -19,7 +19,7 @@ Decentralized storage networks face two cold-start hazards: (1) a rigid 20-peer 
    - `EarnedVerifiedMixedPool` (`≥ 50` PoR passes at `≥ 98.0%` SLA, `≥ 24` peers): `16-of-24`, `1.50×` tax.
    - `EarnedHomelabAnchorPool` (`≥ 200` PoR passes at `≥ 99.8%` SLA, `≥ 20` peers): `16-of-20`, `1.25×` tax.
 2. **Auto-Draining Foundation Seed Anchors & `VerifiedNeighbor` Gate:** When organic peers are scarce (`P_organic < N`), `FoundationSeedAnchor` nodes hold blinded `.bshard` fallback slots and automatically drain (`plan_seed_anchor_drain`) to `0` shards strictly onto `VerifiedNeighbor` (`≥ 50` PoR passes) organic subnets.
-3. **Zero-Knowledge Ciphertext Re-Sharding & Sybil-Damped Standby Mining:** `reshard_ciphertext_stripe_elastic` transitions stripes across $(k, n)$ tiers purely over $GF(2^8)$ ciphertext without `MasterKey`. Pioneer standby credits divide by `/24` (and `/32` IPv6 / 4-slot RFC 6598 CGNAT) cohort counts (`M × (1/M) = 1.0×`), and `CorrelatedOutageController` freezes SLA demotions during regional ISP blackouts upon `≥ 3` anchor `SignedWeatherAttestation`s.
+3. **Zero-Knowledge Ciphertext Re-Sharding & Sybil-Damped Standby Mining:** `reshard_ciphertext_stripe_elastic` transitions stripes across $(k, n)$ tiers purely over $GF(2^8)$ ciphertext without `MasterKey`. Pioneer standby credits divide by `/24` (and `/32` IPv6 / 4-slot RFC 6598 CGNAT) cohort counts (`M × (1/M) = 1.0×`). (An anchor-signed weather quorum for freezing SLA demotions during regional outages was specified but never wired; it was removed in `v0.5.0`, finding F-15.)
 
 ## Consequences & Verification
 

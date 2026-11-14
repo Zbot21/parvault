@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod behaviour;
 pub mod client;
 pub mod discovery;
@@ -14,7 +15,7 @@ pub use behaviour::{
     is_routable_public_ip, DhtEnvelopeKind, DhtWireEnvelope, MeshNetworkBehaviour, MeshWireRequest,
     MeshWireResponse,
 };
-pub use client::{is_network_peer_addr, parse_peer_multiaddr, MeshClient};
+pub use client::{is_network_peer_addr, parse_peer_multiaddr, MeshClient, OnionOriginator};
 pub use discovery::{
     compute_pairing_sas_commitment, derive_4word_pairing_sas,
     derive_libp2p_peer_id_from_ed25519_pubkey, detect_primary_lan_ipv4, discover_lan_peers,
@@ -28,11 +29,12 @@ pub use discovery::{
 };
 pub use placement::{PeerTopologyMetrics, PlacementEngine, ShardPlacementPlan};
 pub use rate_limit::TokenBucketRateLimiter;
-pub use transport::{build_mesh_client_swarm, build_mesh_swarm};
+pub use transport::{build_mesh_client_swarm, build_mesh_server_swarm, build_mesh_swarm};
 pub use wan_rendezvous::*;
 pub use wot::{
     DelegationChain, InvitationHop, PublicCommonsTicket, SlashingEvidence, SlashingReason,
-    TrustPoolMode, WebOfTrustError, WebOfTrustRegistry, WotError, DEFAULT_PUBLIC_WOT_POW_BITS,
-    DEFAULT_SUBTREE_SLASH_LIMIT, MAX_LEAF_FAILURES, MAX_PUBLIC_COMMONS_PEERS,
-    MAX_SEEN_SLASHING_NONCES, PUBLIC_COMMONS_GENESIS_SEED_DOMAIN, PUBLIC_COMMONS_POW_DOMAIN,
+    TicketFacts, TrustPoolMode, WebOfTrustError, WebOfTrustRegistry, WotError,
+    DEFAULT_PUBLIC_WOT_POW_BITS, DEFAULT_SUBTREE_SLASH_LIMIT, MAX_LEAF_FAILURES,
+    MAX_PUBLIC_COMMONS_PEERS, MAX_SEEN_SLASHING_NONCES, PUBLIC_COMMONS_GENESIS_SEED_DOMAIN,
+    PUBLIC_COMMONS_POW_DOMAIN,
 };

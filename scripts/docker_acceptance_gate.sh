@@ -11,12 +11,18 @@ CONTAINERS=(
     parvault-soc-store
     parvault-soc-restore
     parvault-soc-extract
+    parvault-invitee
+    parvault-outsider
 )
 for i in $(seq 1 11); do
     CONTAINERS+=("parvault-node-$i")
 done
 
 SOC_VOL_NAME="parvault-soc-nas-vol"
+
+# v0.5.0 ring admission: every container shares one ring genesis (fresh per gate run), so the
+# nodes, the seed and the clients admit each other.
+RING_GENESIS_SEED_HEX="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
 
 cleanup() {
     if [ "${KEEP_CONTAINERS:-0}" != "1" ]; then
@@ -74,6 +80,7 @@ NODE11_MULTIADDR="/ip4/172.28.0.21/tcp/4001"
 
 echo "=== [3/12] Starting parvault-seed-0 + 11 parvault daemon containers + 1 isolated client container ==="
 docker run -d --name parvault-seed-0 \
+    -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     --network parvault-acceptance-net --ip 172.28.0.10 \
     parvault:acceptance \
     /usr/local/bin/parvault-seed \
@@ -86,6 +93,7 @@ docker run -d --name parvault-seed-0 \
 for i in $(seq 1 11); do
     IP="172.28.0.$((10 + i))"
     docker run -d --name "parvault-node-$i" \
+        -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
         --network parvault-acceptance-net --ip "$IP" \
         -w /var/lib/parvault \
         parvault:acceptance \
@@ -97,6 +105,7 @@ done
 
 # Start isolated client container with ZERO volume mounts
 docker run -d --name parvault-client \
+    -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     --network parvault-acceptance-net --ip 172.28.0.50 \
     parvault:acceptance \
     sleep 3600
@@ -110,6 +119,50 @@ if [ "$CLIENT_MOUNTS" != "[]" ] && [ "$CLIENT_MOUNTS" != "null" ]; then
     echo "ERROR: parvault-client has volume mounts: $CLIENT_MOUNTS"
     exit 1
 fi
+
+echo "=== [3b/12] Ring membership: an invited node serves the ring; a non-member is refused ==="
+# The invitee never holds the ring secret: it joins with 'wot invite' (on a ring member) and
+# 'wot install-chain', then runs a daemon that stores a ring member's file.
+docker run -d --name parvault-invitee \
+    --network parvault-acceptance-net --ip 172.28.0.40 \
+    parvault:acceptance \
+    sleep 3600
+INVITEE_KEY="$(docker exec parvault-invitee /usr/local/bin/parvault --data-dir /var/lib/invitee --no-lan-discovery identity \
+    | awk -F': ' '/Ed25519 Public Key/ {print $2}')"
+RING_TOKEN="$(docker exec parvault-node-1 /usr/local/bin/parvault --data-dir /tmp/ring-inviter --no-lan-discovery \
+    wot invite --peer "$INVITEE_KEY")"
+docker exec parvault-invitee /usr/local/bin/parvault --data-dir /var/lib/invitee --no-lan-discovery \
+    wot install-chain --token "$RING_TOKEN"
+if docker exec parvault-invitee test -e /var/lib/invitee/ring_genesis.seed; then
+    echo "ERROR: the invitee holds a ring genesis secret"
+    exit 1
+fi
+docker exec -d parvault-invitee /usr/local/bin/parvault --data-dir /var/lib/invitee --no-lan-discovery \
+    daemon start --listen /ip4/0.0.0.0/tcp/4001
+sleep 3
+docker exec parvault-client sh -cex '
+    mkdir -p /tmp/ring-check
+    echo "stored on an invited ring member" > /tmp/ring-check/doc.txt
+    /usr/local/bin/parvault --data-dir /tmp/ring-check/data --no-lan-discovery \
+        --peers /ip4/172.28.0.40/tcp/4001 file store --path /tmp/ring-check/doc.txt
+'
+# The outsider runs its own ring: its credential does not admit it to this ring.
+docker run -d --name parvault-outsider \
+    --network parvault-acceptance-net --ip 172.28.0.41 \
+    parvault:acceptance \
+    sleep 3600
+docker exec parvault-outsider /usr/local/bin/parvault --data-dir /var/lib/outsider --no-lan-discovery wot init
+docker exec parvault-outsider sh -c 'echo "outsider data" > /tmp/outsider.txt'
+if docker exec parvault-outsider /usr/local/bin/parvault --data-dir /var/lib/outsider --no-lan-discovery \
+    --peers /ip4/172.28.0.11/tcp/4001 file store --path /tmp/outsider.txt; then
+    echo "ERROR: a non-member stored data on a ring node"
+    exit 1
+fi
+if ! docker logs parvault-node-1 2>&1 | grep -q "reject.peer_not_admitted"; then
+    echo "ERROR: the ring node did not log the refusal"
+    exit 1
+fi
+echo "Ring membership verified: invitee served the ring, outsider refused."
 
 echo "=== [4/12] Zero-IP Home LAN Auto-Discovery ('parvault discover') over 172.28.0.0/24 Bridge ==="
 DISCOVER_TABLE="$(docker exec parvault-client /usr/local/bin/parvault --data-dir /tmp/zero-ip-discover discover --timeout-ms 1200)"
@@ -364,6 +417,7 @@ echo "Total parvault:router-soc (FROM scratch) image size : ${ROUTER_SOC_IMAGE_S
 
 # Start a live `parvault:router-soc` appliance container constrained to --memory=48m --memory-swap=48m
 docker run -d --name parvault-router-soc \
+    -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     --network parvault-acceptance-net --ip 172.28.0.60 \
     --memory=48m --memory-swap=48m \
     parvault:router-soc
@@ -398,6 +452,7 @@ SOC_EXPECTED_SHA256="$(docker run --rm -v "$SOC_VOL_NAME:/mnt/nas" parvault:acce
 ')"
 
 SOC_STORE_OUT="$(docker run --name parvault-soc-store \
+    -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     --network parvault-acceptance-net \
     --memory=48m --memory-swap=48m \
     -v "$SOC_VOL_NAME:/mnt/nas" \
@@ -423,6 +478,7 @@ SOC_KEY="$(echo "$SOC_STORE_OUT" | awk '/Master Key/ {print $5}')"
 docker run --rm -v "$SOC_VOL_NAME:/mnt/nas" parvault:acceptance rm -rf /mnt/nas/store-data
 
 SOC_RESTORE_OUT="$(docker run --name parvault-soc-restore \
+    -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     --network parvault-acceptance-net \
     --memory=48m --memory-swap=48m \
     -v "$SOC_VOL_NAME:/mnt/nas" \
@@ -456,7 +512,7 @@ echo "==========================================================================
 echo " PARVAULT v0.3.0 MULTI-CONTAINER & ROUTER-SOC DOCKER ACCEPTANCE SUMMARY"
 echo "================================================================================"
 echo " Base Image             : ${BASE_IMAGE}"
-echo " Containers Deployed    : 14 (1 parvault-seed + 11 daemon + 1 router-soc + 1 client)"
+echo " Containers Deployed    : 16 (1 parvault-seed + 11 daemon + 1 router-soc + 1 client + 1 invitee + 1 outsider)"
 echo " Client Shared Volumes  : ${CLIENT_MOUNTS} (strictly isolated)"
 echo " Zero-IP LAN Discovery  : PASS (${DISCOVERED_COUNT} daemons auto-discovered with 0 IPs)"
 echo " Initial Sync (v1)      : ${TOTAL_SHARDS_V1} shards across 10 nodes (${SYNC_V1_SECS}s)"

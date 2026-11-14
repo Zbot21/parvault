@@ -1505,13 +1505,16 @@ impl BlockStore {
             let target_str = target_root.to_string_lossy().to_string();
 
             if crate::network::is_network_peer_addr(&target_str) {
-                let client = self.mesh_client.clone().unwrap_or_else(|| {
-                    crate::network::MeshClient::new(
+                // Hand-off puts claim the departing identity, so they are sent as it (v0.5.0
+                // owner rule: the accounted owner is the sender).
+                let client = match self.mesh_client.clone() {
+                    Some(c) => c.with_identity(departing_identity.clone()),
+                    None => crate::network::MeshClient::new(
                         departing_identity.clone(),
                         vec![target_str.clone()],
                         None,
-                    )
-                });
+                    ),
+                };
                 if let Some(stem) = fname.strip_suffix(".shard") {
                     let shard_id = shard_idx_snapshot.get(stem).copied().unwrap_or(ShardId {
                         stripe_merkle_root: content_sha,

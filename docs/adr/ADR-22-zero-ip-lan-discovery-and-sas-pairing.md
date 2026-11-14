@@ -16,6 +16,11 @@ Typing 60-character `/ip4/.../tcp/.../p2p/<PeerId>` multiaddrs blocks non-techni
 2. **4-Word BIP-39 SAS Pairing (`parvault pair` / `parvault join`):** Derives a human-readable 4-word Short Authentication String (e.g., `shield-copper-alpine-matrix`) from `(libp2p_peer_id, owner_pq_fingerprint, pairing_nonce)` committed via SHA-256 in the beacon.
 3. **DHCP-Resilient Peer Store (`KnownPeersStore`):** Indexes `known_peers.json` by pinned `libp2p_peer_id`, dynamically updating socket IPs upon DHCP rotation and powering zero-flag peer resolution (`resolve_zero_config_peers`).
 
+## `v0.5.0` Enforcement
+
+- Discovery and SAS pairing find and pin endpoints; they do not admit. Storage needs ring admission (ADR-05): the first node runs `parvault wot init`, and every other node joins with `parvault wot invite` / `parvault wot install-chain`.
+- `--no-lan-discovery` now also turns libp2p mDNS off. mDNS never feeds the Kademlia routing table; a peer enters it when it is admitted (F-11).
+
 ## Consequences & Verification
 
 - **Consequences:** Zero IP addresses or port numbers required for home LAN pairing, with cryptographic anti-spoofing and automatic DHCP self-healing.

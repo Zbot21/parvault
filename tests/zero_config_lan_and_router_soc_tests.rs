@@ -39,6 +39,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// v0.5.0 requires ring admission for storage: every process these tests start (and every
+/// in-process `MeshClient`) shares one ring genesis, provisioned before the first spawn.
+fn provision_ring_genesis() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| std::env::set_var("PARVAULT_GENESIS_SEED_HEX", "47".repeat(32)));
+}
+
 struct ChildGuard(Vec<Child>);
 
 impl ChildGuard {
@@ -171,6 +178,7 @@ fn http_get_raw(port: u16, path: &str) -> (u16, String, String) {
 
 #[test]
 fn test_1_zero_ip_home_lan_auto_discovery_4word_pairing_and_cli_backup_restore() {
+    provision_ring_genesis();
     let base = unique_temp_dir("lan-zero-ip");
     let registry_dir = base.join("lan_registry");
     fs::create_dir_all(&registry_dir).unwrap();
@@ -520,6 +528,7 @@ fn test_1_zero_ip_home_lan_auto_discovery_4word_pairing_and_cli_backup_restore()
 
 #[test]
 fn test_2_dhcp_ip_port_change_self_healing() {
+    provision_ring_genesis();
     let base = unique_temp_dir("dhcp-self-heal");
     let registry_dir = base.join("lan_registry");
     fs::create_dir_all(&registry_dir).unwrap();
@@ -686,6 +695,7 @@ fn test_2_dhcp_ip_port_change_self_healing() {
 
 #[test]
 fn test_3_interoperable_router_soc_1mib_homelab_4mib_desktop_16mib_streaming_stripes() {
+    provision_ring_genesis();
     let base = unique_temp_dir("cross-profile-stripes");
     let registry_dir = base.join("lan_registry");
     fs::create_dir_all(&registry_dir).unwrap();
@@ -849,6 +859,7 @@ fn test_3_interoperable_router_soc_1mib_homelab_4mib_desktop_16mib_streaming_str
 
 #[test]
 fn test_4_embedded_router_nas_status_server_http_and_html_dashboard() {
+    provision_ring_genesis();
     let base = unique_temp_dir("router-nas-http");
     let registry_dir = base.join("lan_registry");
     let watched_usb = base.join("mnt_usb_nas");
@@ -1024,6 +1035,7 @@ fn test_4_embedded_router_nas_status_server_http_and_html_dashboard() {
 
 #[test]
 fn test_5_zero_ip_online_wan_rendezvous_stun_reflection_and_ddns_ip_rotation() {
+    provision_ring_genesis();
     let base = unique_temp_dir("wan-rendezvous");
     let empty_reg_alice = base.join("isolated_lan_alice");
     let empty_reg_bob = base.join("isolated_lan_bob");
@@ -1347,6 +1359,7 @@ fn test_5_zero_ip_online_wan_rendezvous_stun_reflection_and_ddns_ip_rotation() {
 
 #[test]
 fn test_6_zero_pairing_public_tracker_swarm() {
+    provision_ring_genesis();
     let base = unique_temp_dir("public-tracker-swarm");
     let empty_lan = base.join("no_lan");
     fs::create_dir_all(&empty_lan).unwrap();
@@ -1538,6 +1551,7 @@ fn test_6_zero_pairing_public_tracker_swarm() {
 
 #[test]
 fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quorum() {
+    provision_ring_genesis();
     let base = unique_temp_dir("adr19-eviction-governance");
     let empty_lan = base.join("no_lan");
     fs::create_dir_all(&empty_lan).unwrap();

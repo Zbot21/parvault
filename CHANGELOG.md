@@ -8,7 +8,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Security
+- **F-37 (critical, pre-release):** a public-commons node outside any ring used the all-zero key as a placeholder genesis, and signatures were checked non-strictly, so a stranger could forge a one-hop chain and be admitted as a ring member. A node with no ring now has no genesis and refuses every `HandshakeWoT`; all Ed25519 checks use strict verification.
+- **Ring admission is enforced (item 2b, `docs/security/TRUST_FINDINGS.md`).** Storage requests (`PutShard`, `SyndicateLiteStripe`, `PutDhtEnvelope`, `PutBlindedShard`, onion final delivery) need an admitted sender; others get `peer not admitted; v0.5.0 requires ring admission`. Start a ring with `parvault wot init` and add devices with `parvault wot invite` / `parvault wot install-chain`. No node creates a genesis on its own any more: a private-mode daemon outside any ring, or with conflicting genesis sources, refuses to start. `v0.4.0` peers are refused.
+- Onion originators (`OnionOriginator`) never present a ring credential to the entry relay; only the relay's forward to the final target is admitted.
+- Public-commons tickets are bound to the verifier and fresh for 10 minutes, rate-limited per subnet, and never evict a live admission; admissions are written in batches.
+- The handshake returns one fixed refusal text; members may sub-invite at most 64 keys; inbound Kademlia records need an admitted source; repair grants are keyed by owner and bound to the shards stored with them; only a shard's owner can delete it.
+- `HandshakeWoT` admits only the sender's own chain; the accounted shard owner is always the sender (foreign owner claims are refused); a syndication device cert must name the sender.
+- Repair grants register only after a stored shard, for its stripe, without replacing another owner's grant; witness repair reads need the registered grant.
+- The DHT reader ignores envelopes not sealed by the reading identity; inbound Kademlia records must be valid signed envelopes.
+- Slashing gossip is no longer applied (until proof-carrying evidence, 2c); the genesis and the node's own key are never slashed.
+- `--no-lan-discovery` turns mDNS off; mDNS never feeds Kademlia, admission does.
+
+### Added
+- `MeshWireRequest::AdmitPublicTicket` / `MeshWireResponse::AdmitPublicTicketAck` (appended; existing indices unchanged) and `parvault wot init` / `invite` / `install-chain`.
+
+### Removed
+- `CorrelatedOutageController::verify_weather_quorum` and `SignedWeatherAttestation` (never called; F-15).
+
 ### Changed
+- The gateway engine's 40 mesh lanes send as the owner identity (one `PeerId`).
+- The seed's syndication puts carry an empty owner claim (accounted to the seed).
 - **Shared wire handler (`#codehealth`):** the daemon and `parvault-seed` now serve every `MeshWireRequest` through one `handle_mesh_wire_request` in `src/network/wire_handler.rs`; the nine role differences are explicit `WireRolePolicy` hooks. Behaviour and wire format are unchanged (pinned by `tests/wire_handler_equivalence.rs`).
 - **Log targets:** the seed's wire-handler warnings now log under `parvault::network::wire_handler` instead of `parvault_seed`, and the daemon's mDNS discovery line under `parvault::network::server_events`. The default filters (`parvault=info`) still print them; a custom `RUST_LOG` that names `parvault_seed` will not.
 - `parvault` command implementations moved from `src/main.rs` into `src/cli/`; `PlacementEngine` and `TokenBucketRateLimiter` moved to `network::placement` / `network::rate_limit` (re-exported at their old paths).

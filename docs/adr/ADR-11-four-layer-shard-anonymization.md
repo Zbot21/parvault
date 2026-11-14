@@ -29,6 +29,14 @@ $$
 3. **Layer 3 — Ephemeral-Issuer Bearer Quota Vouchers (`AnonymousQuotaVoucher`):** Mints single-use bearer tokens signed by fresh per-shard ephemeral Ed25519 keys (`mint_ephemeral`) redeemed into a disk-persisted `65,536`-entry `VoucherNullifierLedger` (`1-to-1` conservation with zero `PeerId` linkage).
 4. **Layer 4 — 2-Layer Post-Quantum Onion Relay Dispatch (`PqRelayedShardEnvelope`):** Wraps `PqInnerStorageEnvelope` (sealed to destination storage peer's `HybridKemPublicKey`) inside an outer relay envelope (sealed to an intermediate relay peer's `HybridKemPublicKey` with `jitter_delay_ms`) so the relay never sees `Locator_i` or `voucher` and the storage peer never sees the uploader's IP/`PeerId`.
 
+## `v0.5.0` Enforcement
+
+- Vouchers are self-certifying in `v0.5.0` (the receiver trusts the issuer the voucher names; issuer policy is item 2c, F-24). Until then an onion final delivery needs an admitted sender: the last hop.
+- Onion routing hides the originator from the final target and the storage host, assuming the entry relay and the target do not collude. The entry relay always learns the originator's IP address and transport key, which in `v0.5.0` is its ring identity. The relay forwards to the final target under its own identity and presents its own chain.
+- A single-layer envelope sent straight to the target is not anonymous.
+- No shipped command originates onions in `v0.5.0` (`OnionOriginator` has no production caller). Unlinkable entry (an ephemeral transport key plus an anonymous credential, or a PoW ticket in public mode) is planned for `v0.6.0`.
+- A direct `PutBlindedShard` is a hand-off between ring members (graceful leave), not anonymous origination, and needs an admitted sender.
+
 ## Consequences & Verification
 
 - **Consequences:** Eliminates static disk grouping, PoR key correlation, quota ledger linkage, and single-hop IP exposure; paired with hedged parallel $N$-shard reads across degraded WANs.

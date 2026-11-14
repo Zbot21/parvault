@@ -1,4 +1,27 @@
 use clap::{Parser, Subcommand, ValueEnum};
+
+/// `parvault wot` subcommands (ring admission, bootstrap option A).
+#[derive(Debug, Clone, Subcommand)]
+pub enum WotAction {
+    /// Start a new ring on this node: creates the ring genesis secret
+    /// (`<data_dir>/ring_genesis.seed`, 0600). The only way a node creates a genesis; refused if
+    /// the node is already in a ring.
+    Init,
+    /// Print a ring invitation token admitting `--peer`. Needs the ring genesis secret (from
+    /// `parvault wot init` on this node, or `PARVAULT_GENESIS_SEED_HEX`).
+    Invite {
+        /// The invitee's 32-byte Ed25519 public key (64 hex characters, from `parvault identity`).
+        #[arg(long)]
+        peer: String,
+    },
+    /// Install a ring invitation token (from `parvault wot invite`): verifies the chain against the
+    /// ring's genesis key, pins that key (`<data_dir>/ring_genesis.pub`) and stores the chain.
+    InstallChain {
+        /// The hex chain token.
+        #[arg(long)]
+        token: String,
+    },
+}
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -686,6 +709,12 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         keep_local: bool,
     },
+    /// Ring admission (`ADR-05`): issue (`invite`) or install (`install-chain`) a Web-of-Trust
+    /// delegation chain. A node needs a chain for every key it stores data as.
+    Wot {
+        #[command(subcommand)]
+        action: WotAction,
+    },
     /// Mint, offline-attenuate, and inspect `PARVAULT-MAC-V1:` capability macaroons (`ADR-32`).
     Token {
         #[command(subcommand)]
@@ -1291,7 +1320,7 @@ impl NodeConfig {
     ///   unless overridden via `tracker_eviction_quorum` or `PARVAULT_TRACKER_EVICTION_QUORUM`.
     pub fn resolve_eviction_council_and_quorum(
         &self,
-        genesis_pubkey: [u8; 32],
+        genesis_pubkey: Option<[u8; 32]>,
         extra_pinned_admin_pubkeys: &[[u8; 32]],
         public_commons_active: bool,
     ) -> (Vec<[u8; 32]>, usize) {
@@ -1356,7 +1385,9 @@ impl NodeConfig {
                 .max(1);
             (council, min_quorum)
         } else {
-            push_pk(genesis_pubkey);
+            if let Some(pk) = genesis_pubkey {
+                push_pk(pk);
+            }
             let min_quorum = self
                 .tracker_eviction_quorum
                 .or(env_quorum)

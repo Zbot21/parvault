@@ -133,8 +133,22 @@ Output:
 
 ---
 
+### Step 3b: Join the Ring (Required to Store Data)
+Pairing finds and pins your router; storing data on it needs ring membership. Start the ring once on the router (before `parvault up`), then invite each device:
+
+```bash
+parvault wot init                                   # router, once
+parvault identity                                   # laptop: note "Ed25519 Public Key"
+parvault wot invite --peer <LAPTOP_ED25519_KEY>     # router: prints a token
+parvault wot install-chain --token <TOKEN>          # laptop
+```
+
+A device outside the ring is refused with `peer not admitted; v0.5.0 requires ring admission`.
+
+---
+
 ### Step 4: Back Up and Sync Folders (Zero IP Flags!)
-Now all backup and restore commands find your paired storage nodes automatically:
+Backup and restore commands find your paired storage nodes automatically; storing on them needs ring membership (Step 3b):
 
 ```bash
 # Back up personal documents incrementally (filters .git, node_modules automatically)

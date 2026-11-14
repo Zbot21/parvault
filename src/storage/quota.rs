@@ -339,6 +339,11 @@ impl QuotaManager {
     }
 
     /// Commits a newly stored shard to quota accounting and pushes it to the back of the LRU queue.
+    /// The id the shard `shard_key` is accounted to, if it is stored.
+    pub fn shard_owner(&self, shard_key: &str) -> Option<&str> {
+        self.shard_owners.get(shard_key).map(String::as_str)
+    }
+
     pub fn record_shard_stored(&mut self, peer_id: &str, shard_key: String, shard_bytes: u64) {
         self.record_shard_stored_deferred(peer_id, shard_key, shard_bytes);
         self.persist();

@@ -18,6 +18,14 @@ In private neighborhood and co-op rings, uninvited Sybil nodes must be rejected 
 2. **Gossipsub Slashing & Ancestor Propagation (`SlashingEvidence`):** Any cryptographic fault (poisoned shard Merkle proof or confirmed egress withholding) triggers immediate 1-strike leaf quarantine (`slash_immediately`), while `≥ 3` unexcused PoR audit failures quarantine the leaf and increment its parent inviter's fault counter—pruning compromised invitation branches in finite steps (`≤ M`) with anti-replay `(reporter_pubkey, offender_pubkey, nonce)` tracking.
 3. **Unauthenticated Framing Immunity:** Unverified wire handshakes never increment failure counters against a claimed `leaf_pubkey`, preventing attackers from framing honest peers with bit-flipped packets.
 
+## `v0.5.0` Enforcement
+
+- **Admission on the wire:** a `PutShard`, `SyndicateLiteStripe`, `PutDhtEnvelope` or `PutBlindedShard` from a sender that is not admitted (genesis, an unquarantined chain, or a public-commons ticket) is refused with `peer not admitted; v0.5.0 requires ring admission`. A sender without an Ed25519 transport key is refused.
+- **Handshake binding:** `HandshakeWoT` admits only the key at the chain's leaf, and that key must be the sender's transport key.
+- **A ring is one genesis**, created only by `parvault wot init` (`ring_genesis.seed`). The holder self-issues one-hop chains; other nodes join with `parvault wot invite --peer <pubkey>` / `parvault wot install-chain --token <hex>`, which verifies the chain against the ring key and pins it (`ring_genesis.pub`). No node creates a genesis on its own; conflicting sources stop the daemon.
+- **Decision 2 is suspended:** nodes do not subscribe to the slashing gossip topic, so `SlashingEvidence` is not applied from gossip until it is proof-carrying (item 2c). The genesis and the node's own key are never slashed.
+- Register: `docs/security/TRUST_FINDINGS.md` (F-01, F-03, F-20, F-21).
+
 ## Consequences & Verification
 
 - **Consequences:** Sybil branches are isolated within `≤ 3` faults without a central certificate authority, and honest nodes cannot be framed by spoofed handshakes.

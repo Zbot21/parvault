@@ -9,6 +9,7 @@ pub(crate) mod folder;
 pub(crate) mod identity;
 pub(crate) mod maintenance;
 pub(crate) mod onboarding;
+pub(crate) mod wot;
 
 use crate::*;
 

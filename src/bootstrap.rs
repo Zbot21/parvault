@@ -22,7 +22,7 @@
 //!    strictly bounding per-stripe fault domains to $\le N - K$ shards per `/24`.
 
 use crate::crypto::pqc::{HybridPqPublicKey, HybridPqSignature, HybridPqSigningKeypair};
-use crate::crypto::{CryptoError, NodeIdentity};
+use crate::crypto::CryptoError;
 use crate::por::compute_salted_commitment;
 use crate::sharding::merkle::{Hash32, MerkleTree};
 use crate::storage::anonymity::{
@@ -1322,7 +1322,9 @@ impl ZeroTrustSeedServer {
                         if client
                             .put_shard(
                                 target_addr,
-                                &self.server_peer_id,
+                                // Accounted to the sender (v0.5.0 owner rule); the server id
+                                // is a label such as "parvault-seed-homelab-vault", not a key.
+                                "",
                                 shard_id,
                                 shard_bytes.clone(),
                                 session_key,
@@ -1612,81 +1614,6 @@ pub fn normalize_subnet_prefix_key(raw_prefix: &str) -> String {
     raw_prefix.to_string()
 }
 
-/// Signed Multi-Anchor Weather Attestation (`ADR-15`) preventing a single lazy or malicious node
-/// from spoofing a `>= 15%` mass outage to freeze its own PoR SLA demotions.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SignedWeatherAttestation {
-    pub epoch: u64,
-    pub total_verified_subnets: usize,
-    pub offline_verified_subnets: usize,
-    pub anchor_pubkey: [u8; 32],
-    pub sig_r: [u8; 32],
-    pub sig_s: [u8; 32],
-}
-
-impl SignedWeatherAttestation {
-    pub fn issue(
-        anchor: &NodeIdentity,
-        epoch: u64,
-        total_verified_subnets: usize,
-        offline_verified_subnets: usize,
-    ) -> Self {
-        let anchor_pubkey = anchor.public_key_bytes();
-        let msg = Self::canonical_bytes(
-            epoch,
-            total_verified_subnets,
-            offline_verified_subnets,
-            &anchor_pubkey,
-        );
-        let sig = anchor.sign(&msg);
-        let mut sig_r = [0u8; 32];
-        let mut sig_s = [0u8; 32];
-        sig_r.copy_from_slice(&sig[..32]);
-        sig_s.copy_from_slice(&sig[32..]);
-        Self {
-            epoch,
-            total_verified_subnets,
-            offline_verified_subnets,
-            anchor_pubkey,
-            sig_r,
-            sig_s,
-        }
-    }
-
-    pub fn verify(&self) -> bool {
-        if self.total_verified_subnets == 0
-            || self.offline_verified_subnets > self.total_verified_subnets
-        {
-            return false;
-        }
-        let msg = Self::canonical_bytes(
-            self.epoch,
-            self.total_verified_subnets,
-            self.offline_verified_subnets,
-            &self.anchor_pubkey,
-        );
-        let mut sig = [0u8; 64];
-        sig[..32].copy_from_slice(&self.sig_r);
-        sig[32..].copy_from_slice(&self.sig_s);
-        NodeIdentity::verify_with_pubkey(&self.anchor_pubkey, &msg, &sig)
-    }
-
-    fn canonical_bytes(
-        epoch: u64,
-        total_verified_subnets: usize,
-        offline_verified_subnets: usize,
-        anchor_pubkey: &[u8; 32],
-    ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(80);
-        buf.extend_from_slice(b"parvault-weather-quorum-v1:");
-        buf.extend_from_slice(&epoch.to_be_bytes());
-        buf.extend_from_slice(&(total_verified_subnets as u64).to_be_bytes());
-        buf.extend_from_slice(&(offline_verified_subnets as u64).to_be_bytes());
-        buf.extend_from_slice(anchor_pubkey);
-        buf
-    }
-}
-
 /// Correlated ISP Outage Circuit-Breaker & Anti-Repair-Storm Controller (`ADR-13` / `ADR-14` / `ADR-15`).
 pub struct CorrelatedOutageController;
 
@@ -1694,33 +1621,6 @@ impl CorrelatedOutageController {
     /// Threshold of simultaneous mesh/ASN unreachability (`15.0%`) that trips the
     /// Correlated Outage Circuit-Breaker (freezing PoR SLA demotions and throttling non-critical repairs).
     pub const CIRCUIT_BREAKER_OFFLINE_THRESHOLD: f64 = 0.15;
-
-    /// Verifies that at least `min_quorum` distinct trusted anchor nodes (`HighUptimeAnchor` or
-    /// `FoundationSeedAnchor`) have signed a `SignedWeatherAttestation` for `epoch` reporting
-    /// $\ge 15\%$ offline verified subnets across at least `20` probed verified subnets (`ADR-15`).
-    pub fn verify_weather_quorum(
-        epoch: u64,
-        attestations: &[SignedWeatherAttestation],
-        trusted_anchor_pubkeys: &std::collections::HashSet<[u8; 32]>,
-        min_quorum: usize,
-    ) -> bool {
-        let required = min_quorum.max(3);
-        let mut valid_signers = std::collections::HashSet::new();
-        for att in attestations {
-            if att.epoch != epoch
-                || att.total_verified_subnets < 20
-                || !trusted_anchor_pubkeys.contains(&att.anchor_pubkey)
-                || !att.verify()
-            {
-                continue;
-            }
-            let ratio = att.offline_verified_subnets as f64 / att.total_verified_subnets as f64;
-            if ratio >= Self::CIRCUIT_BREAKER_OFFLINE_THRESHOLD {
-                valid_signers.insert(att.anchor_pubkey);
-            }
-        }
-        valid_signers.len() >= required
-    }
 
     /// Evaluates the health of a batch of stripes (each with `n_total` assigned node indices `0..total_nodes`)
     /// across a mass outage wave (`online_mask[node_idx] == true`), tracking how many shards

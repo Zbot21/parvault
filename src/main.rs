@@ -3,7 +3,7 @@
 mod cli;
 use clap::Parser;
 use cli::daemon::{run_daemon, DaemonLaunchOptions};
-use libp2p::{futures::StreamExt, gossipsub, swarm::SwarmEvent, Multiaddr};
+use libp2p::{futures::StreamExt, swarm::SwarmEvent, Multiaddr};
 use parvault::network::server_events::ServerSwarmEvents;
 use parvault::network::wire_handler::{handle_daemon_wire_request, DaemonWireHandlerCtx};
 use parvault::{
@@ -17,14 +17,15 @@ use parvault::{
         LocalFileKeystore, MasterKey, NodeIdentity,
     },
     network::{
-        behaviour::{DhtEnvelopeKind, DhtWireEnvelope, MeshNetworkBehaviourEvent},
-        build_mesh_swarm, derive_4word_pairing_sas, derive_slot_key_from_code, discover_lan_peers,
-        extract_listen_port_and_ip, is_network_peer_addr, node_identity_libp2p_peer_id,
-        reflect_observed_wan_multiaddr, resolve_zero_config_peers_with_wan,
-        verify_lan_pairing_code, DiscoveredLanPeer, KnownPeersStore, LanBeaconConfig,
-        LanBeaconResponder, MeshClient, TrustPoolMode, WanPeerCard, WanRendezvousRegistry,
-        WebOfTrustRegistry, DEFAULT_LAN_PAIRING_NONCE, DEFAULT_PUBLIC_WOT_POW_BITS,
-        DEFAULT_SUBTREE_SLASH_LIMIT, DEFAULT_WAN_TTL_SECS, PUBLIC_COMMONS_SWARM_SLOT,
+        behaviour::{DhtEnvelopeKind, DhtWireEnvelope},
+        build_mesh_server_swarm, derive_4word_pairing_sas, derive_slot_key_from_code,
+        discover_lan_peers, extract_listen_port_and_ip, is_network_peer_addr,
+        node_identity_libp2p_peer_id, reflect_observed_wan_multiaddr,
+        resolve_zero_config_peers_with_wan, verify_lan_pairing_code, DiscoveredLanPeer,
+        KnownPeersStore, LanBeaconConfig, LanBeaconResponder, MeshClient, TrustPoolMode,
+        WanPeerCard, WanRendezvousRegistry, WebOfTrustRegistry, DEFAULT_LAN_PAIRING_NONCE,
+        DEFAULT_PUBLIC_WOT_POW_BITS, DEFAULT_SUBTREE_SLASH_LIMIT, DEFAULT_WAN_TTL_SECS,
+        PUBLIC_COMMONS_SWARM_SLOT,
     },
     por::{PorVerifierEngine, RepairGrant},
     router_nas::{RouterNasLiveSnapshot, RouterNasPeerEntry, RouterNasStatusServer},
@@ -137,6 +138,7 @@ fn command_needs_network_discovery(cmd: &Commands) -> bool {
             | Commands::ListSnapshot { .. }
             | Commands::Scrub
             | Commands::Token { .. }
+            | Commands::Wot { .. }
             | Commands::Gateway { .. }
     )
 }
@@ -259,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
     let lan_enabled = cfg.effective_lan_discovery_enabled(cli.no_lan_discovery);
     let trust_mode = cfg.effective_trust_mode(cli.public, &cli.trackers);
     let public_mode = trust_mode.allows_public_commons();
+    parvault::network::admission::install_process_source(&cfg.data_dir, public_mode);
     let public_trackers =
         cfg.effective_public_trackers(&cli.trackers, cli.seed_addr.as_deref(), public_mode);
     let wan_seeds = cfg.effective_wan_rendezvous_seeds(cli.seed_addr.as_deref());
@@ -267,6 +270,10 @@ async fn main() -> anyhow::Result<()> {
     // Handle `parvault init` first before pre-creating default keys so we can print initialization cleanly
     if matches!(cli.command, Commands::Init { .. }) {
         return cli::early::init(cfg, cli, external_addrs);
+    }
+
+    if let Commands::Wot { action } = cli.command {
+        return cli::wot::run(action, &cfg.data_dir);
     }
 
     if let Commands::Token { action } = cli.command {
@@ -347,7 +354,10 @@ async fn main() -> anyhow::Result<()> {
         },
     };
     match cli.command {
-        Commands::Init { .. } | Commands::Token { .. } | Commands::Gateway { .. } => {
+        Commands::Init { .. }
+        | Commands::Token { .. }
+        | Commands::Wot { .. }
+        | Commands::Gateway { .. } => {
             unreachable!("handled above")
         }
 

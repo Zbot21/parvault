@@ -35,6 +35,13 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// v0.5.0 requires ring admission for storage: every process these tests start (and every
+/// in-process `MeshClient`) shares one ring genesis, provisioned before the first spawn.
+fn provision_ring_genesis() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| std::env::set_var("PARVAULT_GENESIS_SEED_HEX", "47".repeat(32)));
+}
+
 fn unique_temp_dir(label: &str) -> std::path::PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -52,6 +59,7 @@ fn unique_temp_dir(label: &str) -> std::path::PathBuf {
 
 #[test]
 fn test_streaming_sha256_and_parvaultignore_filtering() {
+    provision_ring_genesis();
     let base = unique_temp_dir("ignore-and-stream");
     let data_dir = base.join("store");
     let watched = base.join("watched_project");
@@ -128,6 +136,7 @@ fn test_streaming_sha256_and_parvaultignore_filtering() {
 
 #[test]
 fn test_incremental_mtime_fastpath_diff_folder_tombstones_and_single_file_restore() {
+    provision_ring_genesis();
     let base = unique_temp_dir("diff-tombstone-single");
     let data_dir = base.join("store");
     let watched = base.join("docs");
@@ -203,6 +212,7 @@ fn test_incremental_mtime_fastpath_diff_folder_tombstones_and_single_file_restor
 
 #[test]
 fn test_persistent_identity_and_shareable_personal_device_cert_tokens() {
+    provision_ring_genesis();
     let base = unique_temp_dir("identity-and-cert");
 
     // 1. NodeIdentity & HybridPqSigningKeypair persistence across restarts
@@ -275,6 +285,7 @@ fn test_persistent_identity_and_shareable_personal_device_cert_tokens() {
 
 #[test]
 fn test_bounded_por_and_slashing_replay_caches_and_range_cap() {
+    provision_ring_genesis();
     let base = unique_temp_dir("por-and-wot-bounds");
     let quota = QuotaManager::new(100 * 1024 * 1024, 10 * 1024 * 1024);
     let store = BlockStore::new(&base, quota).unwrap();
@@ -377,6 +388,7 @@ fn test_bounded_por_and_slashing_replay_caches_and_range_cap() {
 
 #[test]
 fn test_token_bucket_rate_limiter_free_disk_guard_and_pq_dht_catalog_store() {
+    provision_ring_genesis();
     let base = unique_temp_dir("ratelimit-disk-dht");
 
     // 1. TokenBucketRateLimiter enforces burst & refill rate
@@ -453,6 +465,7 @@ fn test_token_bucket_rate_limiter_free_disk_guard_and_pq_dht_catalog_store() {
 
 #[test]
 fn test_normalize_subnet_prefix_key_and_placement_ip_subnet_cap() {
+    provision_ring_genesis();
     // 1. Subnet normalization collapses IPv6 /64s under the same /32 and IPv4s under /24
     let k1 = normalize_subnet_prefix_key("2001:db8:abcd:0001::1/64");
     let k2 = normalize_subnet_prefix_key("2001:db8:abcd:ffff::99/64");
@@ -558,6 +571,7 @@ fn test_normalize_subnet_prefix_key_and_placement_ip_subnet_cap() {
 
 #[test]
 fn test_cli_end_to_end_parvault_and_parvault_seed_subcommands() {
+    provision_ring_genesis();
     let base = unique_temp_dir("cli-e2e");
     let watched = base.join("watched");
     let single_restore_dir = base.join("single_restore");
@@ -756,6 +770,7 @@ fn test_cli_end_to_end_parvault_and_parvault_seed_subcommands() {
 
 #[test]
 fn test_persistent_por_repair_grants_dht_store_and_libp2p_keypair_across_restarts() {
+    provision_ring_genesis();
     use parvault::{
         config::ErasureTier,
         crypto::{pqc::PqVaultMasterKey, LocalFileKeystore, LocalKeystoreSealer, NodeIdentity},
@@ -806,7 +821,10 @@ fn test_persistent_por_repair_grants_dht_store_and_libp2p_keypair_across_restart
     );
     {
         let mut por1 = PorVerifierEngine::with_persistence_dir(400, &base);
-        assert!(por1.register_repair_grant(grant));
+        // v0.5.0 (F-26): a grant authorises the shards stored with it.
+        assert!(por1
+            .register_repair_grant_for_stored(grant, &[shard_id])
+            .is_ok());
         por1.register_shard_session(&shard_id, [0x77; 32]);
     }
     {
@@ -836,6 +854,7 @@ fn test_persistent_por_repair_grants_dht_store_and_libp2p_keypair_across_restart
 
 #[test]
 fn test_live_libp2p_tcp_multi_daemon_network_backup_prune_and_seed_recovery() {
+    provision_ring_genesis();
     struct ChildGuard(Vec<std::process::Child>);
     impl Drop for ChildGuard {
         fn drop(&mut self) {

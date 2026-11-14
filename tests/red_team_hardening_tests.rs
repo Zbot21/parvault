@@ -1,6 +1,6 @@
 use parvault::bootstrap::{
-    canonical_sybil_subnet_key, BlindedShardTombstone, CorrelatedOutageController, EarnedStanding,
-    ElasticBootstrapEngine, ElasticPeerCandidate, PeerRole, SignedWeatherAttestation,
+    canonical_sybil_subnet_key, BlindedShardTombstone, EarnedStanding, ElasticBootstrapEngine,
+    ElasticPeerCandidate, PeerRole,
 };
 use parvault::config::ErasureTier;
 use parvault::crypto::{MasterKey, NodeIdentity, PqVaultMasterKey};
@@ -19,7 +19,6 @@ use parvault::telemetry::{
     AnonymousTelemetryBeacon, NetworkCensusAggregator, TelemetryError, BYTES_PER_GIB,
     MAX_SINGLE_NODE_BUCKET_GIB,
 };
-use std::collections::HashSet;
 use std::fs;
 use std::net::IpAddr;
 use tempfile::tempdir;
@@ -249,10 +248,10 @@ fn test_rt2_blinded_capability_pinning_clock_skew_and_tombstone_generation_repla
 }
 
 /// ============================================================================
-/// RED-TEAM TEST 3 (Domain 2 — Game Theory, Sybil Seed Drain, CGNAT & Weather Quorum):
+/// RED-TEAM TEST 3 (Domain 2 — Game Theory, Sybil Seed Drain & CGNAT):
 /// ============================================================================
 #[test]
-fn test_rt3_ephemeral_sybil_seed_drain_blocked_cgnat_fairness_and_weather_quorum() {
+fn test_rt3_ephemeral_sybil_seed_drain_blocked_and_cgnat_fairness() {
     let standing = EarnedStanding::ProbationaryConsumerPool; // 10-of-20
 
     // 1. Initial network has 20 Foundation Seed Anchors holding a user's 20 shards
@@ -313,37 +312,6 @@ fn test_rt3_ephemeral_sybil_seed_drain_blocked_cgnat_fairness_and_weather_quorum
         canonical_sybil_subnet_key(starlink_house_a, Some(0)),
         canonical_sybil_subnet_key(starlink_house_b, Some(4))
     );
-
-    // 4. [Finding 2 Report 2] Multi-Anchor Signed Weather Quorum (`SignedWeatherAttestation`):
-    let anchor1 = NodeIdentity::generate();
-    let anchor2 = NodeIdentity::generate();
-    let anchor3 = NodeIdentity::generate();
-    let untrusted = NodeIdentity::generate();
-
-    let mut trusted_anchors = HashSet::new();
-    trusted_anchors.insert(anchor1.public_key_bytes());
-    trusted_anchors.insert(anchor2.public_key_bytes());
-    trusted_anchors.insert(anchor3.public_key_bytes());
-
-    // Single anchor + untrusted node claiming outage -> rejected (< 3 trusted anchors)
-    let a1 = SignedWeatherAttestation::issue(&anchor1, 42, 100, 25);
-    let a_forged = SignedWeatherAttestation::issue(&untrusted, 42, 100, 50);
-    assert!(!CorrelatedOutageController::verify_weather_quorum(
-        42,
-        &[a1.clone(), a_forged],
-        &trusted_anchors,
-        3
-    ));
-
-    // 3 distinct trusted anchors co-signing >= 15% verified subnet unreachability -> quorum passes!
-    let a2 = SignedWeatherAttestation::issue(&anchor2, 42, 100, 20);
-    let a3 = SignedWeatherAttestation::issue(&anchor3, 42, 100, 18);
-    assert!(CorrelatedOutageController::verify_weather_quorum(
-        42,
-        &[a1, a2, a3],
-        &trusted_anchors,
-        3
-    ));
 }
 
 /// ============================================================================
@@ -401,7 +369,10 @@ fn test_rt4_wire_codec_oom_bomb_defense_por_cross_protocol_replay_and_telemetry_
         vec![witness1.public_key_bytes(), witness2.public_key_bytes()],
         ErasureTier::Homelab,
     );
-    assert!(por_verifier.register_repair_grant(grant.clone()));
+    // v0.5.0 (F-26): a grant authorises the shards stored with it.
+    assert!(por_verifier
+        .register_repair_grant_for_stored(grant.clone(), &[shard_id])
+        .is_ok());
 
     // Attacker tries to replay the owner's signature over an arbitrary non-read-token message
     let arbitrary_msg = b"parvault-repair-grant-v1:replay-attempt";
@@ -726,8 +697,8 @@ fn test_rt6_review_remediation_bip39_subkeys_0600_and_2layer_pq_onion() {
     // 4. [B4 / B5] Secret key files written with 0600 permissions + LocalFileKeystore sealing
     let key_dir = tempdir().expect("key tempdir");
     let _loaded_node = NodeIdentity::load_or_generate_in_dir(key_dir.path()).unwrap();
-    let _loaded_genesis =
-        NodeIdentity::resolve_genesis_root_pubkey_in_dir(key_dir.path(), None).unwrap();
+    // v0.5.0: a ring genesis exists only after the explicit `parvault wot init` action.
+    let _loaded_genesis = NodeIdentity::init_ring_genesis_in_dir(key_dir.path()).unwrap();
     let _loaded_kem = HybridKemKeypair::load_or_generate_in_dir(key_dir.path()).unwrap();
     let _loaded_pq = HybridPqSigningKeypair::load_or_generate_in_dir(key_dir.path()).unwrap();
     let keystore = LocalFileKeystore::from_passphrase_or_csprng_in_dir(
@@ -750,7 +721,7 @@ fn test_rt6_review_remediation_bip39_subkeys_0600_and_2layer_pq_onion() {
         use std::os::unix::fs::PermissionsExt;
         for secret_file in [
             "node_identity.seed",
-            "genesis_root.seed",
+            "ring_genesis.seed",
             "node_pq_kem.bin",
             "owner_pq_keypair.bin",
             "enclave_sealing.seed",
