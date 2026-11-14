@@ -2136,6 +2136,32 @@ fn handle_seed_admin_rpc_request(
             }
         }
 
+        SeedAdminRequest::InstallCouncilManifest { manifest_bytes } => {
+            use parvault::storage::council;
+            let root = match council::seed_council_install_decision(
+                seed_mode == SeedServerMode::PublicNetworkBootstrapper,
+                block_store.is_in_memory(),
+                council_root,
+            ) {
+                Ok(root) => root,
+                Err(code) => {
+                    tracing::warn!(code, "refused a council manifest install");
+                    return SeedAdminResponse::CouncilManifestResult {
+                        code: Some(code.to_string()),
+                        installed_epoch: council::installed_council_epoch(data_dir),
+                    };
+                }
+            };
+            let code = match council::CouncilManifest::from_bytes(&manifest_bytes) {
+                None => Some("reject.council_manifest_decode".to_string()),
+                Some(m) => council::install_council_manifest(data_dir, &m, root).err(),
+            };
+            SeedAdminResponse::CouncilManifestResult {
+                code,
+                installed_epoch: council::installed_council_epoch(data_dir),
+            }
+        }
+
         SeedAdminRequest::ExecuteSignedEvictionBatch {
             orders,
             propagate_to_swarm,

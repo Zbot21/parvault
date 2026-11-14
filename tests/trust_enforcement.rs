@@ -6371,6 +6371,135 @@ fn status_ipc_without_root_key_refused() {
     assert_logged(&node, "reject.status_unavailable");
 }
 
+// ---- Item 6 C1: InstallCouncilManifest over admin RPC (plan-6 ruling, L-53) -----------------
+
+/// A public-bootstrap seed given `--admin-rpc-pubkey admin` and no `tracker_admin.seed`, so its
+/// council scope root is `admin`.
+fn c1_public_seed(label: &str, admin: &NodeIdentity, extra: &[&str]) -> (Node, String) {
+    let (root, dir, reg, log) = prepare(label);
+    let admin_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let admin_addr = format!("127.0.0.1:{admin_port}");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault-seed"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .args([
+            "start",
+            "--mode",
+            "public-bootstrap",
+            "--no-lan-discovery",
+            "--listen",
+            common::LOOPBACK_EPHEMERAL,
+            "--admin-rpc-listen",
+            &admin_addr,
+            "--admin-rpc-pubkey",
+            &hex::encode(admin.public_key_bytes()),
+        ])
+        .args(extra)
+        .arg("--data-dir")
+        .arg(&dir);
+    (spawn(cmd, root, dir, log), admin_addr)
+}
+
+fn c1_manifest(
+    root: &NodeIdentity,
+    epoch: u64,
+    members: &[&NodeIdentity],
+    quorum: u32,
+    signers: &[&NodeIdentity],
+) -> parvault::storage::council::CouncilManifest {
+    let mut m = parvault::storage::council::CouncilManifest::new(
+        root.public_key_bytes(),
+        epoch,
+        members.iter().map(|k| k.public_key_bytes()).collect(),
+        quorum,
+        1_700_000_000_000,
+    );
+    for s in signers {
+        m.sign(s);
+    }
+    m
+}
+
+fn c1_install(
+    addr: &str,
+    admin: &NodeIdentity,
+    m: &parvault::storage::council::CouncilManifest,
+) -> parvault::admin_rpc::SeedAdminResponse {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(parvault::admin_rpc::send_admin_rpc_with_identity(
+        addr,
+        None,
+        admin,
+        &parvault::admin_rpc::SeedAdminRequest::InstallCouncilManifest {
+            manifest_bytes: m.to_bytes(),
+        },
+    ))
+    .expect("admin rpc round trip")
+    .0
+}
+
+fn c1_result(code: Option<&str>, epoch: Option<u64>) -> parvault::admin_rpc::SeedAdminResponse {
+    parvault::admin_rpc::SeedAdminResponse::CouncilManifestResult {
+        code: code.map(str::to_string),
+        installed_epoch: epoch,
+    }
+}
+
+#[test]
+fn c1_epoch1_installed_and_repush_is_idempotent() {
+    let admin = key(0xD1);
+    let (c1, c2, c3) = (key(0xD2), key(0xD3), key(0xD4));
+    let (_seed, addr) = c1_public_seed("c1-epoch1", &admin, &[]);
+    let m1 = c1_manifest(&admin, 1, &[&c1, &c2, &c3], 2, &[&admin]);
+    assert_eq!(c1_install(&addr, &admin, &m1), c1_result(None, Some(1)));
+    assert_eq!(c1_install(&addr, &admin, &m1), c1_result(None, Some(1)));
+    gate_ran("trust_enforcement::c1_epoch1_installed_and_repush_is_idempotent");
+}
+
+#[test]
+fn c1_next_epoch_needs_quorum_of_current() {
+    let admin = key(0xD5);
+    let (c1, c2, c3) = (key(0xD6), key(0xD7), key(0xD8));
+    let (_seed, addr) = c1_public_seed("c1-epoch2", &admin, &[]);
+    let m1 = c1_manifest(&admin, 1, &[&c1, &c2, &c3], 2, &[&admin]);
+    assert_eq!(c1_install(&addr, &admin, &m1), c1_result(None, Some(1)));
+    let below = c1_manifest(&admin, 2, &[&c1, &c2], 2, &[&c1]);
+    assert_eq!(
+        c1_install(&addr, &admin, &below),
+        c1_result(Some("reject.council_epoch_chain"), Some(1))
+    );
+    let quorum = c1_manifest(&admin, 2, &[&c1, &c2], 2, &[&c1, &c2]);
+    assert_eq!(c1_install(&addr, &admin, &quorum), c1_result(None, Some(2)));
+    gate_ran("trust_enforcement::c1_next_epoch_needs_quorum_of_current");
+}
+
+#[test]
+fn c1_in_memory_seed_refuses_install() {
+    let admin = key(0xD9);
+    let (_seed, addr) = c1_public_seed("c1-mem", &admin, &["--in-memory-mb", "64"]);
+    let m1 = c1_manifest(&admin, 1, &[&key(0xDA)], 1, &[&admin]);
+    assert_eq!(
+        c1_install(&addr, &admin, &m1),
+        c1_result(Some("reject.council_install_in_memory"), None)
+    );
+    gate_ran("trust_enforcement::c1_in_memory_seed_refuses_install");
+}
+
+#[test]
+fn c1_private_seed_refuses_install() {
+    let admin = key(0xDB);
+    let (_seed, addr) = bseed_seed("c1-private", &[], &admin);
+    let m1 = c1_manifest(&admin, 1, &[&key(0xDC)], 1, &[&admin]);
+    assert_eq!(
+        c1_install(&addr, &admin, &m1),
+        c1_result(Some("reject.council_install_not_public"), None)
+    );
+    gate_ran("trust_enforcement::c1_private_seed_refuses_install");
+}
+
 // --- Item 3: the status page over HTTP (status_auth_decision at the shared edge) ----------------
 
 /// Starts `parvault up` with the status page on an ephemeral loopback port.
