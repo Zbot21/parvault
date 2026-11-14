@@ -7,6 +7,8 @@
 //!
 //! Every test writes its sentinel (`gate_ran`) last, after its assertions.
 
+mod common;
+
 use libp2p::futures::StreamExt;
 use libp2p::{gossipsub, kad, swarm::SwarmEvent, Multiaddr, PeerId};
 use parvault::bootstrap::{LiteStripeSyndicationBundle, PersonalDeviceCert};
@@ -27,7 +29,6 @@ use parvault::sharding::encode_ciphertext_stripe;
 use parvault::storage::{AnonymousQuotaVoucher, BlindedShardCapability, BlindedShardId, ShardId};
 use parvault::sync::{EncryptedVaultCatalogEnvelope, FolderSnapshotManifest};
 use sha2::{Digest, Sha256};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -53,24 +54,6 @@ fn temp_root(label: &str) -> TempDir {
         .prefix(&format!("pv-trust-{label}-"))
         .tempdir()
         .expect("temp root")
-}
-
-/// Ports handed out in this process; parallel tests never get the same one.
-static USED_PORTS: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-
-fn free_port() -> u16 {
-    let mut used = USED_PORTS.lock().unwrap();
-    loop {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        if !used.contains(&port) {
-            used.push(port);
-            return port;
-        }
-    }
 }
 
 fn wait_for_port(port: u16) {
@@ -141,24 +124,20 @@ fn prepare(label: &str) -> (TempDir, PathBuf, PathBuf, PathBuf) {
     (root, dir, reg, log)
 }
 
-fn spawn(mut cmd: Command, root: TempDir, dir: PathBuf, log: PathBuf, port: u16) -> Node {
+fn spawn(mut cmd: Command, root: TempDir, dir: PathBuf, log: PathBuf) -> Node {
     cmd.env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED));
-    spawn_as_is(cmd, root, dir, log, port)
+    spawn_as_is(cmd, root, dir, log)
 }
 
 /// Like `spawn`, but the binary gets no ring genesis from the environment.
-fn spawn_without_ring_env(
-    mut cmd: Command,
-    root: TempDir,
-    dir: PathBuf,
-    log: PathBuf,
-    port: u16,
-) -> Node {
+fn spawn_without_ring_env(mut cmd: Command, root: TempDir, dir: PathBuf, log: PathBuf) -> Node {
     cmd.env_remove("PARVAULT_GENESIS_SEED_HEX");
-    spawn_as_is(cmd, root, dir, log, port)
+    spawn_as_is(cmd, root, dir, log)
 }
 
-fn spawn_as_is(mut cmd: Command, root: TempDir, dir: PathBuf, log: PathBuf, port: u16) -> Node {
+/// Spawns a daemon told to listen on `common::LOOPBACK_EPHEMERAL`; `addr` is the address it
+/// reports binding (never a port reserved and released first: see `common::LOOPBACK_EPHEMERAL`).
+fn spawn_as_is(mut cmd: Command, root: TempDir, dir: PathBuf, log: PathBuf) -> Node {
     let log_file = std::fs::File::create(&log).unwrap();
     let child = cmd
         .env("RUST_LOG", "info")
@@ -173,33 +152,21 @@ fn spawn_as_is(mut cmd: Command, root: TempDir, dir: PathBuf, log: PathBuf, port
         child,
         dir,
         log,
-        addr: format!("/ip4/127.0.0.1/tcp/{port}"),
+        addr: String::new(),
         _root: root,
     };
-    // Ready when the binary itself reports listening on its address (an open port alone may
-    // belong to another process).
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let log = node.log_text();
-        if log.contains("istening on") && log.contains(&node.addr) {
-            break;
-        }
-        if let Ok(Some(status)) = node.child.try_wait() {
-            panic!("binary exited ({status}) before listening:\n{log}");
-        }
-        assert!(
-            Instant::now() < deadline,
-            "binary not listening on {}:\n{log}",
-            node.addr
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    wait_for_port(port);
+    let log_path = node.log.clone();
+    node.addr = common::wait_for_listen_addr(
+        &mut node.child,
+        || std::fs::read_to_string(&log_path).unwrap_or_default(),
+        Duration::from_secs(20),
+    );
+    wait_for_port(common::tcp_port_of(&node.addr));
     node
 }
 
 /// `parvault daemon start` on loopback with LAN discovery off, provisioned with the ring genesis.
-fn daemon_command(dir: &Path, reg: &Path, port: u16) -> Command {
+fn daemon_command(dir: &Path, reg: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
     cmd.env("PARVAULT_LAN_REGISTRY_DIR", reg)
         .arg("--data-dir")
@@ -209,32 +176,32 @@ fn daemon_command(dir: &Path, reg: &Path, port: u16) -> Command {
             "daemon",
             "start",
             "--listen",
-            &format!("/ip4/127.0.0.1/tcp/{port}"),
+            common::LOOPBACK_EPHEMERAL,
         ]);
     cmd
 }
 
 fn spawn_daemon(label: &str) -> Node {
     let (root, dir, reg, log) = prepare(label);
-    let port = free_port();
-    let cmd = daemon_command(&dir, &reg, port);
-    spawn(cmd, root, dir, log, port)
+    let cmd = daemon_command(&dir, &reg);
+    spawn(cmd, root, dir, log)
 }
 
 impl Node {
-    /// Restarts this daemon on the same data directory and port, first deleting its persisted
-    /// Web-of-Trust state (as if its admissions were lost).
+    /// Restarts this daemon on the same data directory (on a new ephemeral port, which `addr`
+    /// then names), first deleting its persisted Web-of-Trust state (as if its admissions were
+    /// lost).
     fn restart_daemon_without_wot_state(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_file(self.dir.join("wot_state.bin"));
-        let port: u16 = self.addr.rsplit('/').next().unwrap().parse().unwrap();
         let reg = self.dir.parent().unwrap().join("lan-registry");
+        let offset = self.log_text().len();
         let log_file = std::fs::OpenOptions::new()
             .append(true)
             .open(&self.log)
             .unwrap();
-        self.child = daemon_command(&self.dir, &reg, port)
+        self.child = daemon_command(&self.dir, &reg)
             .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
             .env("RUST_LOG", "info")
             .env("NO_COLOR", "1")
@@ -242,11 +209,16 @@ impl Node {
             .stderr(Stdio::from(log_file))
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(Instant::now() < deadline, "daemon did not come back");
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        let log = self.log.clone();
+        self.addr = common::wait_for_listen_addr(
+            &mut self.child,
+            || {
+                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                text.get(offset..).unwrap_or_default().to_string()
+            },
+            Duration::from_secs(20),
+        );
+        wait_for_port(common::tcp_port_of(&self.addr));
         std::thread::sleep(Duration::from_millis(300));
     }
 }
@@ -254,7 +226,6 @@ impl Node {
 /// `parvault --public daemon start`: public-commons mode (tickets admit strangers).
 fn spawn_public_daemon(label: &str) -> Node {
     let (root, dir, reg, log) = prepare(label);
-    let port = free_port();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
     cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
         .arg("--data-dir")
@@ -265,9 +236,9 @@ fn spawn_public_daemon(label: &str) -> Node {
             "daemon",
             "start",
             "--listen",
-            &format!("/ip4/127.0.0.1/tcp/{port}"),
+            common::LOOPBACK_EPHEMERAL,
         ]);
-    spawn(cmd, root, dir, log, port)
+    spawn(cmd, root, dir, log)
 }
 
 /// `parvault-seed start --mode homelab-vault` on loopback, provisioned with the ring genesis. Its
@@ -279,7 +250,6 @@ fn spawn_seed(label: &str) -> Node {
 /// `spawn_seed` with `--peers` (the mesh peers it syndicates to).
 fn spawn_seed_with_peers(label: &str, peers: &[&str]) -> Node {
     let (root, dir, reg, log) = prepare(label);
-    let port = free_port();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault-seed"));
     if !peers.is_empty() {
         cmd.arg("--peers").arg(peers.join(","));
@@ -291,11 +261,11 @@ fn spawn_seed_with_peers(label: &str, peers: &[&str]) -> Node {
             "homelab-vault",
             "--no-lan-discovery",
             "--listen",
-            &format!("/ip4/127.0.0.1/tcp/{port}"),
+            common::LOOPBACK_EPHEMERAL,
             "--data-dir",
         ])
         .arg(&dir);
-    spawn(cmd, root, dir, log, port)
+    spawn(cmd, root, dir, log)
 }
 
 /// An in-process wire client speaking as `ident`, a ring member: it self-issues its chain from
@@ -753,7 +723,13 @@ fn f04_graceful_leave_handoff_accepted() {
             target.log_text()
         );
     };
-    run(&["file", "store", "--path", file.to_str().unwrap()]);
+    run(&[
+        "file",
+        "store",
+        "--allow-local-only",
+        "--path",
+        file.to_str().unwrap(),
+    ]);
     let local = shard_files(&dir);
     assert!(local > 0, "the departing node holds shards");
     run(&["leave", "--handoff-to", &target.addr]);
@@ -788,8 +764,10 @@ fn f04_seed_syndication_accounted_to_seed() {
         expected_stripe_merkle_root: set.stripe_merkle_root,
         expected_shard_hashes: set.shard_hashes.clone(),
     };
-    let resp = send(
-        &device,
+    // The seed re-uploads all n shards to its peer inside the request before it answers, which
+    // can exceed the client's default 1.2 s under a loaded gate run: allow 10 s.
+    let resp = send_with(
+        client(&device).with_timeout(Duration::from_secs(10)),
         &seed,
         MeshWireRequest::SyndicateLiteStripe {
             cert,
@@ -2138,32 +2116,6 @@ fn out_text(out: &std::process::Output) -> String {
     )
 }
 
-/// How long a daemon that must refuse to start may run before the test fails.
-const REFUSAL_DEADLINE: Duration = Duration::from_secs(30);
-
-/// Runs a `daemon start` that must refuse, and fails if it is still running at the deadline
-/// (a daemon that starts would otherwise keep the test waiting forever).
-fn refusal_output(cmd: &mut Command) -> std::process::Output {
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let start = Instant::now();
-    while child.try_wait().unwrap().is_none() {
-        if start.elapsed() >= REFUSAL_DEADLINE {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!(
-                "daemon did not refuse within {}s",
-                REFUSAL_DEADLINE.as_secs()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    child.wait_with_output().unwrap()
-}
-
 /// An invitee joins by `wot invite` / `wot install-chain` (it never holds the genesis secret),
 /// runs as a server, stores a ring member's shard and refuses a stranger's.
 #[test]
@@ -2192,14 +2144,7 @@ fn invitee_serves_the_ring() {
     assert!(install.status.success(), "{}", out_text(&install));
     assert!(inv_dir.join("ring_genesis.pub").exists());
     assert!(!inv_dir.join("ring_genesis.seed").exists());
-    let port = free_port();
-    let node = spawn_without_ring_env(
-        daemon_command(&inv_dir, &reg, port),
-        inv_root,
-        inv_dir,
-        log,
-        port,
-    );
+    let node = spawn_without_ring_env(daemon_command(&inv_dir, &reg), inv_root, inv_dir, log);
     let (sid, bytes) = shard(0x41, 512);
     let member = send(&key(0xD8), &node, put_shard("", sid, bytes, None));
     assert!(stored(&member), "{member:?}\n{}", node.log_text());
@@ -2221,7 +2166,7 @@ fn invitee_serves_the_ring() {
 #[test]
 fn daemon_without_ring_refuses_to_start() {
     let root = temp_root("b2-fresh-daemon");
-    let out = refusal_output(
+    let out = common::output_within_deadline(
         Command::new(env!("CARGO_BIN_EXE_parvault"))
             .env_remove("PARVAULT_GENESIS_SEED_HEX")
             .env_remove("PARVAULT_GENESIS_PUBKEY_HEX")
@@ -2229,7 +2174,7 @@ fn daemon_without_ring_refuses_to_start() {
             .arg("--data-dir")
             .arg(root.path().join("d"))
             .args(["--no-lan-discovery", "daemon", "start", "--listen"])
-            .arg(format!("/ip4/127.0.0.1/tcp/{}", free_port())),
+            .arg(common::LOOPBACK_EPHEMERAL),
     );
     let text = out_text(&out);
     assert!(!out.status.success(), "{text}");
@@ -2290,7 +2235,7 @@ fn conflicting_genesis_sources_refuse_to_start() {
     let root = temp_root("b2-conflict");
     let dir = root.path().join("n");
     assert!(parvault_cli(&dir, false, &["wot", "init"]).status.success());
-    let out = refusal_output(
+    let out = common::output_within_deadline(
         Command::new(env!("CARGO_BIN_EXE_parvault"))
             .env("PARVAULT_GENESIS_PUBKEY_HEX", hex::encode([0x11u8; 32]))
             .env_remove("PARVAULT_GENESIS_SEED_HEX")
@@ -2298,7 +2243,7 @@ fn conflicting_genesis_sources_refuse_to_start() {
             .arg("--data-dir")
             .arg(&dir)
             .args(["--no-lan-discovery", "daemon", "start", "--listen"])
-            .arg(format!("/ip4/127.0.0.1/tcp/{}", free_port())),
+            .arg(common::LOOPBACK_EPHEMERAL),
     );
     let text = out_text(&out);
     assert!(!out.status.success(), "{text}");
@@ -2306,10 +2251,457 @@ fn conflicting_genesis_sources_refuse_to_start() {
     gate_ran("trust_enforcement::conflicting_genesis_sources_refuse_to_start");
 }
 
+// --- W-01: the recovery phrase is opt-in at backup time ---------------------------------------
+
+/// A ring-member client on `dir` (working directory `cwd`) that reaches only `peers`.
+fn phrase_client(dir: &Path, cwd: &Path, peers: &str) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.current_dir(cwd)
+        .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+        .env_remove("PARVAULT_GENESIS_PUBKEY_HEX")
+        .env_remove("PARVAULT_SEED_PHRASE")
+        .env("PARVAULT_LAN_REGISTRY_DIR", cwd.join("lan-registry"))
+        .env_remove("PARVAULT_PEERS")
+        .arg("--data-dir")
+        .arg(dir)
+        .arg("--no-lan-discovery");
+    if !peers.is_empty() {
+        cmd.env("PARVAULT_PEERS", peers);
+    }
+    cmd
+}
+
+const W01_NS: &str = "laptop";
+
+fn w01_files() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        ("notes.txt", b"house fire drill".to_vec()),
+        (
+            "docs/plan.bin",
+            (0..70_000u32).map(|i| (i % 251) as u8).collect(),
+        ),
+    ]
+}
+
+/// Backs up a folder from a fresh client into `node`, with the phrase in `PARVAULT_SEED_PHRASE`
+/// if `phrase` is set (the documented commands). Returns the client's root directory.
+fn w01_backup(node: &Node, label: &str, phrase: Option<&str>) -> TempDir {
+    let root = temp_root(label);
+    let folder = root.path().join("Documents");
+    for (rel, bytes) in w01_files() {
+        let p = folder.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, bytes).unwrap();
+    }
+    let mut cmd = phrase_client(&root.path().join("data"), root.path(), &node.addr);
+    if let Some(p) = phrase {
+        cmd.env("PARVAULT_SEED_PHRASE", p);
+    }
+    let out = cmd
+        .arg("watch-folder")
+        .arg("--folder")
+        .arg(&folder)
+        .args(["--once", "--vault-namespace", W01_NS])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", out_text(&out));
+    root
+}
+
+/// Runs `recover-from-seed` from a fresh data directory into `<root>/Recovered`.
+fn w01_recover(
+    node: &Node,
+    label: &str,
+    phrase: &str,
+    ns: &str,
+) -> (TempDir, std::process::Output) {
+    let root = temp_root(label);
+    let out = phrase_client(&root.path().join("data"), root.path(), &node.addr)
+        .env("PARVAULT_SEED_PHRASE", phrase)
+        .args(["recover-from-seed", "--vault-namespace", ns, "--out-dir"])
+        .arg(root.path().join("Recovered"))
+        .output()
+        .unwrap();
+    (root, out)
+}
+
+fn assert_nothing_recovered(root: &TempDir) {
+    let out_dir = root.path().join("Recovered");
+    let empty = !out_dir.exists() || std::fs::read_dir(&out_dir).unwrap().next().is_none();
+    assert!(empty, "files were written to {}", out_dir.display());
+}
+
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            out.extend(files_under(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// W-01 test 1: `init` prints no phrase and no recovery line, and a second `init` leaves the
+/// sealed master key unchanged.
+#[test]
+fn w01_init_prints_no_phrase() {
+    let root = temp_root("w01-init");
+    let dir = root.path().join("n");
+    let first = parvault_cli(&dir, false, &["init"]);
+    assert!(first.status.success(), "{}", out_text(&first));
+    let sealed = std::fs::read(dir.join("master_key.sealed")).unwrap();
+    let second = parvault_cli(&dir, false, &["init"]);
+    assert!(second.status.success(), "{}", out_text(&second));
+    for out in [&first, &second] {
+        let text = out_text(out);
+        assert!(
+            !text.contains("Recovery") && !text.contains("Mnemonic"),
+            "{text}"
+        );
+        for line in text.lines() {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let phrase_like = words.len() >= 12
+                && words
+                    .iter()
+                    .all(|w| w.chars().all(|c| c.is_ascii_lowercase()));
+            assert!(!phrase_like, "init printed a phrase: {line}");
+        }
+    }
+    assert_eq!(
+        std::fs::read(dir.join("master_key.sealed")).unwrap(),
+        sealed
+    );
+}
+
+/// W-01 test 2: a folder backed up with the phrase is recovered byte for byte into a fresh
+/// data directory with the documented commands.
+#[test]
+fn w01_phrase_backup_recovers_byte_identical() {
+    let node = spawn_daemon("w01-rec");
+    let _backup = w01_backup(&node, "w01-rec-a", Some(PHRASE));
+    let (root, out) = w01_recover(&node, "w01-rec-b", PHRASE, W01_NS);
+    assert!(out.status.success(), "{}", out_text(&out));
+    for (rel, bytes) in w01_files() {
+        assert_eq!(
+            std::fs::read(root.path().join("Recovered").join(rel)).unwrap(),
+            bytes,
+            "{rel}"
+        );
+    }
+}
+
+/// W-01: a folder backed up with the phrase restores with `restore-folder` and the same phrase
+/// and namespace (the QUICKSTART step 4 commands).
+#[test]
+fn w01_restore_folder_with_phrase() {
+    let node = spawn_daemon("w01-restore");
+    let backup = w01_backup(&node, "w01-restore-a", Some(PHRASE));
+    let out = phrase_client(&backup.path().join("data"), backup.path(), &node.addr)
+        .env("PARVAULT_SEED_PHRASE", PHRASE)
+        .args([
+            "restore-folder",
+            "--snapshot",
+            "./folder_snapshot.manifest.bin",
+            "--vault-namespace",
+            W01_NS,
+            "--out-dir",
+            "./restored-docs",
+            "--file",
+            "notes.txt",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", out_text(&out));
+    assert_eq!(
+        std::fs::read(backup.path().join("restored-docs/notes.txt")).unwrap(),
+        b"house fire drill"
+    );
+}
+
+/// W-01 test 3: a wrong phrase or namespace fails and writes nothing.
+#[test]
+fn w01_wrong_phrase_or_namespace_recovers_nothing() {
+    let node = spawn_daemon("w01-wrong");
+    let _backup = w01_backup(&node, "w01-wrong-a", Some(PHRASE));
+    let other = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    for (label, phrase, ns) in [
+        ("w01-wrong-p", other, W01_NS),
+        ("w01-wrong-n", PHRASE, "desktop"),
+    ] {
+        let (root, out) = w01_recover(&node, label, phrase, ns);
+        assert!(!out.status.success(), "{label}: {}", out_text(&out));
+        assert_nothing_recovered(&root);
+    }
+}
+
+/// W-01 test 4: a vault backed up without a phrase cannot be recovered from one, and the
+/// command fails cleanly.
+#[test]
+fn w01_vault_without_phrase_is_not_recoverable() {
+    let node = spawn_daemon("w01-nophrase");
+    let _backup = w01_backup(&node, "w01-nophrase-a", None);
+    let (root, out) = w01_recover(&node, "w01-nophrase-b", PHRASE, W01_NS);
+    let text = out_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(!text.contains("panicked"), "{text}");
+    assert_nothing_recovered(&root);
+}
+
+/// W-01 test 5: the phrase is written nowhere: not in the data directory, the snapshot, the
+/// catalog or `config.toml`.
+#[test]
+fn w01_phrase_is_never_stored() {
+    let node = spawn_daemon("w01-store");
+    let backup = w01_backup(&node, "w01-store-a", Some(PHRASE));
+    let files = files_under(backup.path());
+    assert!(
+        files
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with(".manifest.bin")),
+        "{files:?}"
+    );
+    for p in files.iter().chain(files_under(&node.dir).iter()) {
+        let bytes = std::fs::read(p).unwrap();
+        let found = bytes.windows(PHRASE.len()).any(|w| w == PHRASE.as_bytes());
+        assert!(!found, "the phrase is stored in {}", p.display());
+    }
+}
+
+/// W-01 test 6 (W-02): `watch-folder` and `file store` never print the master key.
+#[test]
+fn w01_master_key_is_never_printed() {
+    let node = spawn_daemon("w01-mk");
+    let root = temp_root("w01-mk-a");
+    let key_hex = hex::encode([0x5Au8; 32]);
+    let folder = root.path().join("Documents");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.txt"), b"master key must stay secret").unwrap();
+    let dir = root.path().join("data");
+    let watch = phrase_client(&dir, root.path(), &node.addr)
+        .arg("watch-folder")
+        .arg("--folder")
+        .arg(&folder)
+        .args(["--once", "--key-hex", &key_hex])
+        .output()
+        .unwrap();
+    let store = phrase_client(&dir, root.path(), &node.addr)
+        .args(["file", "store", "--key-hex", &key_hex])
+        .arg(folder.join("a.txt"))
+        .output()
+        .unwrap();
+    for out in [&watch, &store] {
+        let text = out_text(out);
+        assert!(out.status.success(), "{text}");
+        assert!(!text.to_lowercase().contains(&key_hex), "{text}");
+        assert!(!text.contains("Master Key (hex)"), "{text}");
+    }
+}
+
+/// W-01: `--catalog-out` without a phrase is an error (it used to seal under a public constant).
+#[test]
+fn w01_catalog_out_needs_a_phrase() {
+    let root = temp_root("w01-cat");
+    let folder = root.path().join("Documents");
+    std::fs::create_dir_all(&folder).unwrap();
+    let out = phrase_client(&root.path().join("data"), root.path(), "")
+        .arg("watch-folder")
+        .arg("--folder")
+        .arg(&folder)
+        .arg("--once")
+        .arg("--catalog-out")
+        .arg(root.path().join("c.catalog.bin"))
+        .output()
+        .unwrap();
+    let text = out_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("--catalog-out needs --seed-phrase"), "{text}");
+    assert!(!root.path().join("c.catalog.bin").exists());
+}
+
+/// W-03: `watch-folder` on a missing folder exits non-zero.
+#[test]
+fn w03_missing_folder_fails() {
+    let root = temp_root("w03");
+    let out = phrase_client(&root.path().join("data"), root.path(), "")
+        .arg("watch-folder")
+        .arg("--folder")
+        .arg(root.path().join("no-such-folder"))
+        .arg("--once")
+        .output()
+        .unwrap();
+    let text = out_text(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("does not exist"), "{text}");
+}
+
+// --- D1 (2e round 2): gateway stores with a non-ring peer configured ------------------------------
+
+fn other_ring_daemon(label: &str) -> Node {
+    let (root, dir, reg, log) = prepare(label);
+    let mut cmd = daemon_command(&dir, &reg);
+    cmd.env("PARVAULT_GENESIS_SEED_HEX", hex::encode([0x99u8; 32]));
+    spawn_as_is(cmd, root, dir, log)
+}
+
+/// Runs a ring node's `up --no-socket --vfs-seed-dir` with `pins` pinned (in that order, as LAN
+/// discovery pins them) and waits until the seed folder is ingested.
+fn d1_up_with_pins(label: &str, pins: &[&Node]) -> Node {
+    let (root, dir, reg, log) = prepare(label);
+    let seed_dir = root.path().join("shared");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    std::fs::write(
+        seed_dir.join("a.txt"),
+        b"gateway store with a non-ring peer",
+    )
+    .unwrap();
+    let mut store = parvault::network::KnownPeersStore::load(&dir);
+    for n in pins {
+        let pid = n.peer_id().to_string();
+        store.upsert_pinned_multiaddr(&pid, &format!("{}/p2p/{pid}", n.addr), None, Some("daemon"));
+    }
+    store.save(&dir).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .arg("--data-dir")
+        .arg(&dir)
+        .args([
+            "--no-lan-discovery",
+            "up",
+            "--no-socket",
+            "--listen",
+            common::LOOPBACK_EPHEMERAL,
+            "--vfs-webdav-listen",
+            "127.0.0.1:0",
+            "--vfs-seed-dir",
+        ])
+        .arg(&seed_dir);
+    let node = spawn(cmd, root, dir, log);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let text = node.log_text();
+        if text.contains("Ingested built-in VFS seed directory") {
+            return node;
+        }
+        assert!(
+            !text.contains("not ingested") && Instant::now() < deadline,
+            "seed folder not stored:\n{text}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// D1: with one pinned non-ring peer (first) and one admitted ring peer, the gateway path stores
+/// on the ring peer: the refusal means "try the next peer".
+#[test]
+fn d1_gateway_store_skips_non_ring_peer() {
+    let ring_peer = spawn_daemon("d1-ring");
+    let other = other_ring_daemon("d1-other");
+    let _node = d1_up_with_pins("d1-node", &[&other, &ring_peer]);
+    assert!(
+        shard_files(&ring_peer.dir) > 0,
+        "shards on the admitted ring peer"
+    );
+    assert_eq!(shard_files(&other.dir), 0, "nothing on the non-ring peer");
+}
+
+/// D1: with only a non-ring peer pinned (a fresh ring node on a LAN with other rings), the
+/// gateway path keeps the stripe locally instead of failing.
+#[test]
+fn d1_gateway_store_with_only_non_ring_peers_stays_local() {
+    let other = other_ring_daemon("d1-only-other");
+    let node = d1_up_with_pins("d1-only-node", &[&other]);
+    assert!(shard_files(&node.dir) > 0, "stored locally");
+    assert_eq!(shard_files(&other.dir), 0, "nothing on the non-ring peer");
+    // R3-1: the long-running mode says the data is not backed up and records the stripes.
+    let log = node.log_text();
+    assert!(
+        log.contains("kept only on this machine: NOT backed up"),
+        "{log}"
+    );
+    let listed = std::fs::read_to_string(
+        node.dir
+            .join(parvault::storage::local_only::LOCAL_ONLY_STRIPES_FILE),
+    )
+    .unwrap_or_default();
+    assert!(
+        listed.lines().any(|l| l.len() == 64),
+        "local-only list: {listed:?}"
+    );
+}
+
+/// R3-1: runs `watch-folder --once` on a ring node whose only pinned peer belongs to another
+/// ring, so every stripe stays on this machine. Returns (exit code, stdout).
+fn r3_watch_once_with_only_non_ring_peer(label: &str, extra: &[&str]) -> (Option<i32>, String) {
+    let other = other_ring_daemon(&format!("{label}-other"));
+    let (root, dir, reg, _log) = prepare(label);
+    let folder = root.path().join("docs");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.txt"), b"never left this machine").unwrap();
+    let mut store = parvault::network::KnownPeersStore::load(&dir);
+    let pid = other.peer_id().to_string();
+    store.upsert_pinned_multiaddr(
+        &pid,
+        &format!("{}/p2p/{pid}", other.addr),
+        None,
+        Some("daemon"),
+    );
+    store.save(&dir).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+        .arg("--data-dir")
+        .arg(&dir)
+        .args(["--no-lan-discovery", "watch-folder", "--once", "--folder"])
+        .arg(&folder)
+        .arg("--snapshot-out")
+        .arg(root.path().join("snap.bin"))
+        .args(extra)
+        .output()
+        .expect("run watch-folder");
+    assert_eq!(shard_files(&other.dir), 0, "nothing on the non-ring peer");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// R3-1: a pass that backed nothing up says so and exits with the documented code.
+#[test]
+fn r3_watch_once_local_only_exits_with_code() {
+    let (code, stdout) = r3_watch_once_with_only_non_ring_peer("r3-local-only", &[]);
+    assert_eq!(
+        code,
+        Some(parvault::storage::local_only::EXIT_CODE_LOCAL_ONLY),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("stripe(s) kept only on this machine: NOT backed up"),
+        "{stdout}"
+    );
+}
+
+/// R3-1: `--allow-local-only` prints the same line and exits 0.
+#[test]
+fn r3_watch_once_allow_local_only_exits_zero() {
+    let (code, stdout) =
+        r3_watch_once_with_only_non_ring_peer("r3-allow-local-only", &["--allow-local-only"]);
+    assert_eq!(code, Some(0), "{stdout}");
+    assert!(
+        stdout.contains("Files Synced       : 1"),
+        "nothing was stored:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("kept only on this machine: NOT backed up"),
+        "{stdout}"
+    );
+}
+
 /// A public-commons daemon with no ring: no genesis from the environment or the data dir.
 fn spawn_ticket_only_daemon(label: &str) -> Node {
     let (root, dir, reg, log) = prepare(label);
-    let port = free_port();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
     cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
         .arg("--data-dir")
@@ -2320,9 +2712,9 @@ fn spawn_ticket_only_daemon(label: &str) -> Node {
             "daemon",
             "start",
             "--listen",
-            &format!("/ip4/127.0.0.1/tcp/{port}"),
+            common::LOOPBACK_EPHEMERAL,
         ]);
-    spawn_without_ring_env(cmd, root, dir, log, port)
+    spawn_without_ring_env(cmd, root, dir, log)
 }
 
 /// F-37: a one-hop chain "signed" by the all-zero key, a small-order Ed25519 point. With
@@ -2387,4 +2779,706 @@ fn f37_ring_node_admits_real_chain() {
     let resp = handshake(&member, &node, chain_for(&member));
     assert!(accepted(&resp), "{resp:?}");
     gate_ran("trust_enforcement::f37_ring_node_admits_real_chain");
+}
+
+/// R3-1: `file store` on a ring node whose only pinned peer belongs to another ring.
+#[test]
+fn r3_file_store_local_only_exits_with_code() {
+    let other = other_ring_daemon("r3-file-other");
+    let (root, dir, reg, _log) = prepare("r3-file");
+    let file = root.path().join("doc.txt");
+    std::fs::write(&file, b"never left this machine").unwrap();
+    let mut store = parvault::network::KnownPeersStore::load(&dir);
+    let pid = other.peer_id().to_string();
+    store.upsert_pinned_multiaddr(
+        &pid,
+        &format!("{}/p2p/{pid}", other.addr),
+        None,
+        Some("daemon"),
+    );
+    store.save(&dir).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+        .arg("--data-dir")
+        .arg(&dir)
+        .args(["--no-lan-discovery", "file", "store", "--path"])
+        .arg(&file);
+    let out = common::output_within_deadline(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(parvault::storage::local_only::EXIT_CODE_LOCAL_ONLY),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("kept only on this machine: NOT backed up"),
+        "{stdout}"
+    );
+    assert_eq!(shard_files(&other.dir), 0, "nothing on the non-ring peer");
+}
+
+/// R3-1: `parvault-sync push` through a gateway with no ring peer exits with the code, and the
+/// count crosses the socket (`IpcResponse::StoreSuccessLocalOnly`).
+#[test]
+fn r3_sync_push_local_only_exits_with_code() {
+    let (root, dir, reg, log) = prepare("r3-push");
+    let sock = root.path().join("gw.sock");
+    let folder = root.path().join("docs");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.txt"), b"pushed but not backed up").unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .arg("--data-dir")
+        .arg(&dir)
+        .args([
+            "--no-lan-discovery",
+            "up",
+            "--listen",
+            common::LOOPBACK_EPHEMERAL,
+            "--ipc-socket",
+        ])
+        .arg(&sock);
+    let _node = spawn(cmd, root, dir, log);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !sock.exists() {
+        assert!(Instant::now() < deadline, "gateway socket never appeared");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let push = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_parvault-sync"))
+            .arg("--socket")
+            .arg(&sock)
+            .arg("--catalog")
+            .arg(sock.with_file_name(format!("catalog{}.bin", extra.len())))
+            .args(["push", "--folder"])
+            .arg(&folder)
+            .args(extra)
+            .output()
+            .expect("run parvault-sync push")
+    };
+    let out = push(&[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(parvault::storage::local_only::EXIT_CODE_LOCAL_ONLY),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("kept only on this machine: NOT backed up"),
+        "{stdout}"
+    );
+    let out = push(&["--allow-local-only"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// QA 2e M2: a ring peer whose per-owner grace quota fits only a few shards. The store keeps the
+/// shards that reached the peer, writes only the rest locally, lists the stripe (fewer than k
+/// remote), exits 3, and restores byte-for-byte. A second store with a roomy peer pinned first
+/// places every shard remotely and adds no entry.
+#[test]
+fn r3_partial_placement_keeps_remote_shards() {
+    const TIER_K: usize = 10; // consumer: 10-of-20
+    const TIER_N: usize = 20;
+    let peer = {
+        let (root, dir, reg, log) = prepare("r3-partial-peer");
+        std::fs::write(
+            dir.join("config.toml"),
+            "max_storage_bytes = 1073741824\nbootstrap_grace_bytes = 20000\n",
+        )
+        .unwrap();
+        let cmd = daemon_command(&dir, &reg);
+        spawn(cmd, root, dir, log)
+    };
+    let (root, dir, reg, _log) = prepare("r3-partial-client");
+    let file = root.path().join("doc.bin");
+    let data: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&file, &data).unwrap();
+    let mut store = parvault::network::KnownPeersStore::load(&dir);
+    let pid = peer.peer_id().to_string();
+    store.upsert_pinned_multiaddr(
+        &pid,
+        &format!("{}/p2p/{pid}", peer.addr),
+        None,
+        Some("daemon"),
+    );
+    store.save(&dir).unwrap();
+    let key_hex = hex::encode([0x4Bu8; 32]);
+    let run = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+        cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+            .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+            .arg("--data-dir")
+            .arg(&dir)
+            .arg("--no-lan-discovery")
+            .args(args);
+        common::output_within_deadline(&mut cmd)
+    };
+    let out = run(&[
+        "file",
+        "store",
+        "--tier",
+        "consumer",
+        "--key-hex",
+        &key_hex,
+        "--path",
+        file.to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let remote = shard_files(&peer.dir);
+    let local = shard_files(&dir);
+    assert!(
+        remote > 0 && remote < TIER_K,
+        "remote={remote}\n{stdout}\npeer log:\n{}",
+        peer.log_text()
+    );
+    assert_eq!(local, TIER_N - remote, "only the missing shards are local");
+    assert_eq!(
+        out.status.code(),
+        Some(parvault::storage::local_only::EXIT_CODE_LOCAL_ONLY),
+        "{stdout}"
+    );
+    let listed =
+        std::fs::read_to_string(dir.join(parvault::storage::local_only::LOCAL_ONLY_STRIPES_FILE))
+            .unwrap_or_default();
+    assert_eq!(listed.lines().count(), 1, "{listed:?}");
+    let root_hex = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("File Merkle Root : "))
+        .expect("root printed")
+        .trim()
+        .to_string();
+    // The manifest names the peer for each remote shard and this node for each local one.
+    let mk = MasterKey::from_hex(&key_hex).unwrap();
+    let file_root: [u8; 32] = hex::decode(&root_hex).unwrap().try_into().unwrap();
+    let manifest = parvault::storage::BlockStore::new(
+        &dir,
+        parvault::storage::QuotaManager::new(1 << 30, 1 << 30),
+    )
+    .unwrap()
+    .load_manifest(&mk, &file_root)
+    .unwrap();
+    assert_eq!(manifest.stripes.len(), 1);
+    let assigned = &manifest.stripes[0].assigned_peers;
+    let on_peer = assigned.iter().filter(|p| p.contains(&pid)).count();
+    assert_eq!(on_peer, remote, "{assigned:?}");
+    // Leave fewer than k local shards, so the restore must fetch the remote ones.
+    let mut local_files: Vec<_> = std::fs::read_dir(dir.join("shards"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "shard"))
+        .collect();
+    local_files.sort();
+    while local_files.len() >= TIER_K {
+        std::fs::remove_file(local_files.pop().unwrap()).unwrap();
+    }
+    assert!(shard_files(&dir) < TIER_K);
+    let restored = root.path().join("restored.bin");
+    let out = run(&[
+        "file",
+        "restore",
+        &root_hex,
+        "--output",
+        restored.to_str().unwrap(),
+        "--key-hex",
+        &key_hex,
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&restored).unwrap(),
+        data,
+        "restore byte-for-byte"
+    );
+
+    // A roomy ring peer pinned first takes every shard: no new entry, exit 0.
+    let roomy = spawn_daemon("r3-partial-roomy");
+    let mut store = parvault::network::KnownPeersStore::load(&dir);
+    let rid = roomy.peer_id().to_string();
+    store.upsert_pinned_multiaddr(
+        &rid,
+        &format!("{}/p2p/{rid}", roomy.addr),
+        None,
+        Some("daemon"),
+    );
+    store.save(&dir).unwrap();
+    let out = run(&[
+        "file",
+        "store",
+        "--tier",
+        "consumer",
+        "--key-hex",
+        &key_hex,
+        "--path",
+        file.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let listed =
+        std::fs::read_to_string(dir.join(parvault::storage::local_only::LOCAL_ONLY_STRIPES_FILE))
+            .unwrap_or_default();
+    assert_eq!(listed.lines().count(), 1, "no new entry: {listed:?}");
+}
+
+/// A syndication of one stripe whose cert names `cert_device` and whose repair grant, if any, is
+/// self-signed by `grant_owner`. Returns the request and the stripe's shard 0.
+fn f38_syndicate(
+    seed: &Node,
+    cert_device: &NodeIdentity,
+    grant_owner: Option<&NodeIdentity>,
+) -> (MeshWireRequest, ShardId) {
+    let mut req = syndicate(seed, cert_device);
+    let MeshWireRequest::SyndicateLiteStripe {
+        bundle,
+        repair_grant,
+        ..
+    } = &mut req
+    else {
+        unreachable!()
+    };
+    let root = bundle.expected_stripe_merkle_root;
+    let sid = ShardId {
+        stripe_merkle_root: root,
+        shard_index: 0,
+        shard_hash: bundle.expected_shard_hashes[0],
+    };
+    *repair_grant = grant_owner
+        .map(|o| parvault::por::RepairGrant::issue(o, root, Vec::new(), ErasureTier::Homelab));
+    (req, sid)
+}
+
+fn synd_stored(resp: &MeshWireResponse) -> bool {
+    matches!(
+        resp,
+        MeshWireResponse::SyndicateLiteStripeAck {
+            receipt: Some(_),
+            ..
+        }
+    )
+}
+
+/// F-38 accept (L-40): the vault identity sends, the cert names it and it signs the grant; it
+/// then reads the shard as its owner.
+#[test]
+fn f38_sender_owned_grant_accepted() {
+    let node = spawn_seed("f38-a");
+    let vault = key(0xC9);
+    let (req, sid) = f38_syndicate(&node, &vault, Some(&vault));
+    let resp = send(&vault, &node, req);
+    assert!(synd_stored(&resp), "{resp:?}");
+    assert!(read_bytes(&send(&vault, &node, owner_read(&vault, sid))).is_some());
+    gate_ran("trust_enforcement::f38_sender_owned_grant_accepted");
+}
+
+/// F-38 reject (reproduced before the fix: the foreign key was registered and read the shard):
+/// a certified device attaching a grant self-signed by another key is refused outright; nothing
+/// is stored and the foreign key reads nothing.
+#[test]
+fn f38_foreign_owner_grant_refused() {
+    let node = spawn_seed("f38-r");
+    let device = key(0xC7);
+    let stranger = key(0xC8);
+    let (req, sid) = f38_syndicate(&node, &device, Some(&stranger));
+    let resp = send(&device, &node, req);
+    assert!(!synd_stored(&resp), "{resp:?}");
+    assert_logged(&node, "reject.syndication_grant_not_sender");
+    assert!(read_bytes(&send(&stranger, &node, owner_read(&stranger, sid))).is_none());
+    gate_ran("trust_enforcement::f38_foreign_owner_grant_refused");
+}
+
+/// F-38: the node identity sending a vault-signed grant (the 5f330a1 shape) is refused with the
+/// new code, even though its cert names it.
+#[test]
+fn f38_node_sending_vault_grant_refused() {
+    let node = spawn_seed("f38-n");
+    let device = key(0xCA);
+    let vault = key(0xCB);
+    let (req, _) = f38_syndicate(&node, &device, Some(&vault));
+    let resp = send(&device, &node, req);
+    assert!(!synd_stored(&resp), "{resp:?}");
+    assert_logged(&node, "reject.syndication_grant_not_sender");
+}
+
+/// F-38: a syndication without a repair grant is still accepted.
+#[test]
+fn f38_no_grant_still_accepted() {
+    let node = spawn_seed("f38-none");
+    let device = key(0xCC);
+    let (req, _) = f38_syndicate(&node, &device, None);
+    assert!(synd_stored(&send(&device, &node, req)));
+}
+
+/// F-38: an invited, non-genesis lite client syndicates as its vault key. The seed admits a
+/// genesis -> member -> vault chain and accepts the vault-owned grant. The chain is the shape
+/// `AdmissionSource::credential_for` extends for a member's vault key; that extension is
+/// unit-tested in `admission::tests::member_extends_its_chain_for_the_vault_key` (this process
+/// sets `PARVAULT_GENESIS_SEED_HEX`, so a data-dir source here would hold the genesis).
+#[test]
+fn f38_invited_client_syndicates_as_vault_key() {
+    let node = spawn_seed("f38-invited");
+    let member = key(0xCD);
+    let vault = key(0xCE);
+    let to_member = InvitationHop::issue(&genesis(), member.public_key_bytes(), 1, 100);
+    let to_vault = InvitationHop::issue(&member, vault.public_key_bytes(), 2, 100);
+    let chain = DelegationChain {
+        hops: vec![to_member, to_vault],
+    };
+    assert!(accepted(&handshake(&vault, &node, chain)));
+    let (req, sid) = f38_syndicate(&node, &vault, Some(&vault));
+    let resp = send_as_stranger(&vault, &node, req);
+    assert!(synd_stored(&resp), "{resp:?}");
+    assert!(read_bytes(&send_as_stranger(&vault, &node, owner_read(&vault, sid))).is_some());
+}
+
+/// F-38 (QA r3): with no `--device-cert`, `watch-folder` self-issues its cert for the identity
+/// it sends as, the vault key. The client holds the seed's owner key, so the seed accepts the
+/// stripe, and the vault key then reads its shard back as owner.
+#[test]
+fn f38_lite_client_without_device_cert_syndicates() {
+    let seed = spawn_seed("f38-nocert");
+    let root = temp_root("f38-nocert-client");
+    let client_dir = root.path().join("data");
+    let folder = root.path().join("folder");
+    std::fs::create_dir_all(&client_dir).unwrap();
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::copy(
+        seed.dir.join("owner_pq_keypair.bin"),
+        client_dir.join("owner_pq_keypair.bin"),
+    )
+    .unwrap();
+    std::fs::write(folder.join("a.txt"), vec![0x5A; 4096]).unwrap();
+    let snap = root.path().join("snap.bin");
+    let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+    let ns = "f38-nocert";
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+        .env("PARVAULT_LAN_REGISTRY_DIR", root.path().join("reg"))
+        .env_remove("PARVAULT_PEERS")
+        .env_remove("PARVAULT_SEED_PHRASE")
+        .arg("--data-dir")
+        .arg(&client_dir)
+        .args(["--no-lan-discovery", "watch-folder", "--folder"])
+        .arg(&folder)
+        .arg("--snapshot-out")
+        .arg(&snap)
+        .args([
+            "--tier",
+            "homelab",
+            "--seed-phrase",
+            phrase,
+            "--vault-namespace",
+            ns,
+        ])
+        .args(["--lite-seed-dir", &seed.addr, "--once"])
+        .output()
+        .unwrap();
+    let client_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{client_log}");
+    assert!(
+        !seed.log_text().contains("reject.device_cert_not_sender"),
+        "seed refused the self-issued cert:\n{}",
+        seed.log_text()
+    );
+    let snapshot: FolderSnapshotManifest =
+        bincode::deserialize(&std::fs::read(&snap).unwrap()).unwrap();
+    let stripe = &snapshot.files.values().next().unwrap().manifest.stripes[0];
+    let sid = ShardId {
+        stripe_merkle_root: stripe.stripe_merkle_root,
+        shard_index: 0,
+        shard_hash: stripe.shard_hashes[0],
+    };
+    let canonical = parvault::crypto::validate_recovery_seed_phrase_or_passphrase(phrase).unwrap();
+    let vault = NodeIdentity::from_recovery_seed_phrase(&canonical, ns);
+    assert!(
+        read_bytes(&send(&vault, &seed, owner_read(&vault, sid))).is_some(),
+        "owner read failed; client:\n{client_log}\nseed:\n{}",
+        seed.log_text()
+    );
+    gate_ran("trust_enforcement::f38_lite_client_without_device_cert_syndicates");
+}
+
+// --- F-38-GRANT (L-41): first-writer-wins shard binding -----------------------------------------
+
+fn put_with_commit(
+    sid: ShardId,
+    bytes: Vec<u8>,
+    commit: u8,
+    grant: Option<RepairGrant>,
+) -> MeshWireRequest {
+    MeshWireRequest::PutShard {
+        owner_peer_id: String::new(),
+        shard_id: sid,
+        shard_bytes: bytes,
+        session_key_commit: [commit; 32],
+        repair_grant: grant,
+    }
+}
+
+fn self_grant(owner: &NodeIdentity, sid: &ShardId) -> RepairGrant {
+    RepairGrant::issue(owner, sid.stripe_merkle_root, vec![], ErasureTier::Homelab)
+}
+
+/// The PoR audit under the session commit `put_shard` registers (`[0x5E; 32]`) is answered.
+fn audit_ok(asker: &NodeIdentity, node: &Node, sid: ShardId, len: usize) -> bool {
+    let chal = parvault::por::generate_por_challenge(&[0x5E; 32], sid, len as u64, now_ms());
+    matches!(
+        send(asker, node, MeshWireRequest::PorAudit(chal)),
+        MeshWireResponse::PorAuditResult(Some(_))
+    )
+}
+
+/// F-38-GRANT reject (reproduced before the fix: M became the grant and accounted owner): an
+/// admitted peer holding a shard's bytes re-puts it with its own grant. Refused; the victim
+/// keeps read, delete and its session commit; M can neither read nor delete.
+#[test]
+fn f38g_takeover_with_own_grant_refused() {
+    let node = spawn_daemon("f38g-grant");
+    let victim = key(0xD1);
+    let m = key(0xD2);
+    let (sid, bytes) = shard(0x61, 2048);
+    let ok = send(
+        &victim,
+        &node,
+        put_shard("", sid, bytes.clone(), Some(self_grant(&victim, &sid))),
+    );
+    assert!(stored(&ok), "{ok:?}");
+    let resp = send(
+        &m,
+        &node,
+        put_with_commit(sid, bytes.clone(), 0x66, Some(self_grant(&m, &sid))),
+    );
+    assert!(!stored(&resp), "{resp:?}");
+    assert_logged(&node, "reject.shard_bound_to_another_owner");
+    assert!(read_bytes(&send(&m, &node, owner_read(&m, sid))).is_none());
+    assert!(!deleted(&send(&m, &node, delete_req(&m, sid))));
+    assert!(
+        audit_ok(&victim, &node, sid, bytes.len()),
+        "session commit replaced"
+    );
+    assert_eq!(
+        read_bytes(&send(&victim, &node, owner_read(&victim, sid))),
+        Some(bytes)
+    );
+    assert!(deleted(&send(&victim, &node, delete_req(&victim, sid))));
+    gate_ran("trust_enforcement::f38g_takeover_with_own_grant_refused");
+}
+
+/// F-38-GRANT reject: a re-put with no grant onto an ungranted shard (accounted-owner takeover)
+/// is refused; M cannot delete, the storer still can.
+#[test]
+fn f38g_takeover_without_grant_refused() {
+    let node = spawn_daemon("f38g-nogrant");
+    let victim = key(0xD3);
+    let m = key(0xD4);
+    let (sid, bytes) = shard(0x62, 1024);
+    assert!(stored(&send(
+        &victim,
+        &node,
+        put_shard("", sid, bytes.clone(), None)
+    )));
+    let resp = send(&m, &node, put_with_commit(sid, bytes.clone(), 0x66, None));
+    assert!(!stored(&resp), "{resp:?}");
+    assert_logged(&node, "reject.shard_bound_to_another_owner");
+    assert!(!deleted(&send(&m, &node, delete_req(&m, sid))));
+    assert!(
+        audit_ok(&victim, &node, sid, bytes.len()),
+        "session commit replaced"
+    );
+    assert!(deleted(&send(&victim, &node, delete_req(&victim, sid))));
+}
+
+/// F-38-GRANT accept: the owner re-puts its own shard with its grant (idempotent `Bind`).
+#[test]
+fn f38g_same_owner_reput_accepted() {
+    let node = spawn_daemon("f38g-same");
+    let owner = key(0xD5);
+    let (sid, bytes) = shard(0x63, 1024);
+    for _ in 0..2 {
+        let r = send(
+            &owner,
+            &node,
+            put_shard("", sid, bytes.clone(), Some(self_grant(&owner, &sid))),
+        );
+        assert!(stored(&r), "{r:?}");
+    }
+    assert_eq!(
+        read_bytes(&send(&owner, &node, owner_read(&owner, sid))),
+        Some(bytes)
+    );
+    gate_ran("trust_enforcement::f38g_same_owner_reput_accepted");
+}
+
+/// F-38-GRANT accept (`Keep`): a third party re-puts with the owner's grant (repair, handoff,
+/// seed re-forward). Acked as stored; nothing changes: session commit, read and delete stay
+/// the owner's.
+#[test]
+fn f38g_third_party_with_owner_grant_kept() {
+    let node = spawn_daemon("f38g-keep");
+    let owner = key(0xD6);
+    let third = key(0xD7);
+    let (sid, bytes) = shard(0x64, 1024);
+    let grant = self_grant(&owner, &sid);
+    assert!(stored(&send(
+        &owner,
+        &node,
+        put_shard("", sid, bytes.clone(), Some(grant.clone()))
+    )));
+    let r = send(
+        &third,
+        &node,
+        put_with_commit(sid, bytes.clone(), 0x66, Some(grant)),
+    );
+    assert!(stored(&r), "{r:?}");
+    assert!(
+        audit_ok(&owner, &node, sid, bytes.len()),
+        "session commit replaced"
+    );
+    assert!(!deleted(&send(&third, &node, delete_req(&third, sid))));
+    assert!(deleted(&send(&owner, &node, delete_req(&owner, sid))));
+}
+
+/// F-38-GRANT accept: after the owner deletes its shard, a new owner may store it; the old
+/// owner's stale grant binding gives it nothing over the new owner's shard.
+#[test]
+fn f38g_delete_then_new_owner_rebinds() {
+    let node = spawn_daemon("f38g-rebind");
+    let old = key(0xD8);
+    let new = key(0xD9);
+    let (sid, bytes) = shard(0x65, 1024);
+    assert!(stored(&send(
+        &old,
+        &node,
+        put_shard("", sid, bytes.clone(), Some(self_grant(&old, &sid)))
+    )));
+    assert!(deleted(&send(&old, &node, delete_req(&old, sid))));
+    let r = send(
+        &new,
+        &node,
+        put_shard("", sid, bytes.clone(), Some(self_grant(&new, &sid))),
+    );
+    assert!(stored(&r), "{r:?}");
+    assert_eq!(
+        read_bytes(&send(&new, &node, owner_read(&new, sid))),
+        Some(bytes)
+    );
+    assert!(read_bytes(&send(&old, &node, owner_read(&old, sid))).is_none());
+    assert!(!deleted(&send(&old, &node, delete_req(&old, sid))));
+}
+
+/// F-38-GRANT seed accept: the vault key re-syndicates the same stripe (rule 2).
+#[test]
+fn f38g_seed_vault_resyndication_accepted() {
+    let node = spawn_seed("f38g-resynd");
+    let vault = key(0xDA);
+    for _ in 0..2 {
+        let (req, _) = f38_syndicate(&node, &vault, Some(&vault));
+        let resp = send(&vault, &node, req);
+        assert!(synd_stored(&resp), "{resp:?}");
+    }
+    gate_ran("trust_enforcement::f38g_seed_vault_resyndication_accepted");
+}
+
+/// F-38-GRANT seed reject: a second key syndicating the identical bundle under its own cert
+/// and grant is refused; nothing is re-registered, so it reads nothing.
+#[test]
+fn f38g_seed_second_key_same_bundle_refused() {
+    let node = spawn_seed("f38g-second");
+    let vault = key(0xDB);
+    let other = key(0xDC);
+    let (req, sid) = f38_syndicate(&node, &vault, Some(&vault));
+    assert!(synd_stored(&send(&vault, &node, req)));
+    let (req2, _) = f38_syndicate(&node, &other, Some(&other));
+    let resp = send(&other, &node, req2);
+    assert!(!synd_stored(&resp), "{resp:?}");
+    assert_logged(&node, "reject.shard_bound_to_another_owner");
+    assert!(read_bytes(&send(&other, &node, owner_read(&other, sid))).is_none());
+    assert!(read_bytes(&send(&vault, &node, owner_read(&vault, sid))).is_some());
+    gate_ran("trust_enforcement::f38g_seed_second_key_same_bundle_refused");
+}
+
+/// F-38-GRANT accept: after a shard is LRU-evicted (its file removed, as `put_shard`'s eviction
+/// does, with no verifier cleanup), a new owner may store it; the old owner's stale grant
+/// binding is dropped on that fresh bind, so the old owner can neither read nor delete it.
+#[test]
+fn f38g_evicted_then_new_owner_rebinds() {
+    let node = spawn_daemon("f38g-evict");
+    let old = key(0xDD);
+    let new = key(0xDE);
+    let (sid, bytes) = shard(0x66, 1024);
+    let r = send(
+        &old,
+        &node,
+        put_shard("", sid, bytes.clone(), Some(self_grant(&old, &sid))),
+    );
+    assert!(stored(&r), "{r:?}");
+    let file = node
+        .dir
+        .join("shards")
+        .join(format!("{}.shard", sid.file_key()));
+    assert!(file.exists(), "{}", file.display());
+    std::fs::remove_file(&file).unwrap();
+    let r = send(
+        &new,
+        &node,
+        put_shard("", sid, bytes.clone(), Some(self_grant(&new, &sid))),
+    );
+    assert!(stored(&r), "{r:?}");
+    assert_eq!(
+        read_bytes(&send(&new, &node, owner_read(&new, sid))),
+        Some(bytes)
+    );
+    assert!(read_bytes(&send(&old, &node, owner_read(&old, sid))).is_none());
+    assert!(!deleted(&send(&old, &node, delete_req(&old, sid))));
+    assert!(deleted(&send(&new, &node, delete_req(&new, sid))));
+}
+
+/// F-38-GRANT `Keep` with the wrong bytes: a third party carrying the owner's grant but bytes
+/// that do not match the shard hash is acked `stored: false`, and nothing changes: the owner
+/// still reads its original bytes and its session commit still answers audits.
+#[test]
+fn f38g_keep_with_mismatched_bytes_refused() {
+    let node = spawn_daemon("f38g-keep-bad");
+    let owner = key(0xDF);
+    let third = key(0xE0);
+    let (sid, bytes) = shard(0x67, 1024);
+    let grant = self_grant(&owner, &sid);
+    assert!(stored(&send(
+        &owner,
+        &node,
+        put_shard("", sid, bytes.clone(), Some(grant.clone()))
+    )));
+    let forged = vec![0x99; bytes.len()];
+    let r = send(
+        &third,
+        &node,
+        put_with_commit(sid, forged, 0x66, Some(grant)),
+    );
+    assert!(!stored(&r), "{r:?}");
+    assert_eq!(
+        read_bytes(&send(&owner, &node, owner_read(&owner, sid))),
+        Some(bytes.clone())
+    );
+    assert!(
+        audit_ok(&owner, &node, sid, bytes.len()),
+        "session commit replaced"
+    );
+    assert!(!deleted(&send(&third, &node, delete_req(&third, sid))));
 }

@@ -1041,6 +1041,8 @@ pub struct MeshClient {
     discovery_data_dir: Option<PathBuf>,
     lan_discovery_port: u16,
     last_lan_refresh: Arc<Mutex<Option<Instant>>>,
+    /// `false` with `--no-lan-discovery`: `refresh_lan_peers` neither scans nor pins.
+    lan_discovery_enabled: bool,
     healed_peer_addrs: Arc<Mutex<HashMap<PeerId, String>>>,
     tracker_admin_pubkeys: Arc<Mutex<HashMap<String, [u8; 32]>>>,
     dead_peers: Arc<Mutex<HashSet<String>>>,
@@ -1087,6 +1089,7 @@ impl MeshClient {
             discovery_data_dir: None,
             lan_discovery_port: DEFAULT_LAN_DISCOVERY_PORT,
             last_lan_refresh: Arc::new(Mutex::new(None)),
+            lan_discovery_enabled: true,
             healed_peer_addrs: Arc::new(Mutex::new(initial_healed)),
             tracker_admin_pubkeys: Arc::new(Mutex::new(HashMap::new())),
             dead_peers: Arc::new(Mutex::new(HashSet::new())),
@@ -1230,7 +1233,16 @@ impl MeshClient {
     /// Actively scans the local network via `discover_lan_peers`, persists updated endpoints to
     /// `<data_dir>/known_peers.json` (if configured), updates DHCP-healed `PeerId -> Multiaddr`
     /// mappings, and returns all active discovered peer Multiaddrs.
+    /// Turns LAN scanning and pinning off (`--no-lan-discovery`); pinned peers are still used.
+    pub fn with_lan_discovery(mut self, enabled: bool) -> Self {
+        self.lan_discovery_enabled = enabled;
+        self
+    }
+
     pub fn refresh_lan_peers(&self) -> Vec<String> {
+        if !self.lan_discovery_enabled {
+            return Vec::new();
+        }
         let found = discover_lan_peers(Duration::from_millis(220), self.lan_discovery_port);
         if let Ok(mut ts) = self.last_lan_refresh.lock() {
             *ts = Some(Instant::now());
@@ -1330,6 +1342,11 @@ impl MeshClient {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         self
+    }
+
+    /// The timeout this client applies to each request.
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
     }
 
     pub fn with_identity(&self, identity: NodeIdentity) -> Self {
@@ -2795,6 +2812,34 @@ impl MeshClient {
         tier: ErasureTier,
         session_key: [u8; 32],
     ) -> anyhow::Result<Vec<String>> {
+        let placed = self.distribute_stripe_shards_partial(
+            owner_identity,
+            owner_peer_id,
+            shard_set,
+            tier,
+            session_key,
+        )?;
+        placed
+            .into_iter()
+            .enumerate()
+            .map(|(idx, peer)| {
+                peer.ok_or_else(|| {
+                    anyhow::anyhow!("failed to store shard {idx} on any reachable mesh peer")
+                })
+            })
+            .collect()
+    }
+
+    /// Like [`Self::distribute_stripe_shards`], but a shard no peer accepted is `None` instead of
+    /// failing the stripe, so the caller keeps the shards already placed on peers (QA 2e M2).
+    pub fn distribute_stripe_shards_partial(
+        &self,
+        owner_identity: &NodeIdentity,
+        owner_peer_id: &str,
+        shard_set: &StripeShardSet,
+        tier: ErasureTier,
+        session_key: [u8; 32],
+    ) -> anyhow::Result<Vec<Option<String>>> {
         let raw_peers = if !self.peers.is_empty() && self.discovery_data_dir.is_none() {
             self.peers
                 .iter()
@@ -3024,10 +3069,7 @@ impl MeshClient {
                 }
             }
 
-            let chosen = primary_peer.ok_or_else(|| {
-                anyhow::anyhow!("failed to store shard {idx} on any reachable mesh peer")
-            })?;
-            assigned_peers.push(chosen);
+            assigned_peers.push(primary_peer);
         }
 
         Ok(assigned_peers)

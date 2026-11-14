@@ -932,6 +932,11 @@ fn send_lan_discovery_probes(
 /// and `127.0.0.1`) plus `PARVAULT_LAN_REGISTRY_DIR` (if set), returning cryptographically
 /// verified and deduplicated `DiscoveredLanPeer` records with `/p2p/<PeerId>` Multiaddrs.
 pub fn discover_lan_peers(timeout: Duration, discovery_port: u16) -> Vec<DiscoveredLanPeer> {
+    // A zero timeout means LAN discovery is off (`--no-lan-discovery`): no beacon registry
+    // read and no probe, so nothing new is pinned.
+    if timeout.is_zero() {
+        return Vec::new();
+    }
     let mut by_peer_id: BTreeMap<String, DiscoveredLanPeer> = BTreeMap::new();
     let local_lan_ip = detect_primary_lan_ipv4();
     let registry_dir = active_registry_dir();

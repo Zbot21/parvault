@@ -37,6 +37,64 @@ pub fn grant_registration_decision(facts: &GrantRegFacts) -> Result<(), &'static
     Ok(())
 }
 
+/// What the shard-rebind decision needs to know (F-38-GRANT, L-41).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardRebindFacts {
+    /// The shard is in the block store now (not merely remembered by the verifier).
+    pub stored: bool,
+    /// The owner of the grant the stored shard is bound to, if any.
+    pub existing_grant_owner: Option<[u8; 32]>,
+    /// The owner of the grant this put carries, if any.
+    pub incoming_grant_owner: Option<[u8; 32]>,
+    /// The sender is the key the stored shard is accounted to.
+    pub sender_is_accounted_owner: bool,
+}
+
+/// How a permitted put treats the shard's binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardBinding {
+    /// Store and (re)register: the shard is new, or its owner re-puts it.
+    Bind,
+    /// Already stored for the same grant owner by another sender (repair, handoff, seed
+    /// re-forward, replay): ack as stored and change nothing.
+    Keep,
+}
+
+/// First writer wins (F-38-GRANT, L-41): while a shard is stored, its accounted owner, grant
+/// owner and PoR session commit never change hands. Grant owners compare on all 32 bytes.
+pub fn shard_rebind_decision(facts: &ShardRebindFacts) -> Result<ShardBinding, &'static str> {
+    if !facts.stored {
+        return Ok(ShardBinding::Bind);
+    }
+    let grant_unchanged = match (facts.existing_grant_owner, facts.incoming_grant_owner) {
+        (Some(existing), Some(incoming)) => existing == incoming,
+        _ => true,
+    };
+    if facts.sender_is_accounted_owner && grant_unchanged {
+        return Ok(ShardBinding::Bind);
+    }
+    match (facts.existing_grant_owner, facts.incoming_grant_owner) {
+        (Some(existing), Some(incoming))
+            if !facts.sender_is_accounted_owner && existing == incoming =>
+        {
+            Ok(ShardBinding::Keep)
+        }
+        _ => Err("reject.shard_bound_to_another_owner"),
+    }
+}
+
+/// The refusal code of `shard_rebind_decision`, taken from the decision itself so the code has
+/// one source (a grant naming another owner for a stored shard).
+pub fn shard_bound_to_another_owner_code() -> &'static str {
+    let facts = ShardRebindFacts {
+        stored: true,
+        existing_grant_owner: Some([0; 32]),
+        incoming_grant_owner: Some([1; 32]),
+        sender_is_accounted_owner: false,
+    };
+    shard_rebind_decision(&facts).err().unwrap_or_default()
+}
+
 /// A read or delete authorised by a grant owner applies only to shards that were stored with
 /// that owner's grant (F-26): an owner who registered a grant for the same stripe root first
 /// gains nothing over another owner's shards.
@@ -448,6 +506,14 @@ impl PorVerifierEngine {
                 && stored.iter().all(|s| s.stripe_merkle_root == *stored_root),
         };
         grant_registration_decision(&facts)?;
+        // F-38-GRANT: never replace a different owner a shard is already bound to.
+        if stored.iter().any(|shard| {
+            self.shard_grant_owners
+                .get(&shard.file_key())
+                .is_some_and(|o| *o != grant.owner_pubkey)
+        }) {
+            return Err(shard_bound_to_another_owner_code());
+        }
         for shard in stored {
             self.shard_grant_owners
                 .insert(shard.file_key(), grant.owner_pubkey);
@@ -456,6 +522,22 @@ impl PorVerifierEngine {
             .insert((grant.stripe_merkle_root, grant.owner_pubkey), grant);
         self.persist_state_if_configured();
         Ok(())
+    }
+
+    /// The owner of the grant `shard_id` is bound to, if any (F-38-GRANT).
+    pub fn shard_grant_owner(&self, shard_id: &ShardId) -> Option<[u8; 32]> {
+        self.shard_grant_owners.get(&shard_id.file_key()).copied()
+    }
+
+    /// Forgets `shard_id`'s binding (session commit and grant owner): on delete, and before a
+    /// fresh `Bind` of a shard no longer stored (e.g. LRU-evicted), so a stale owner keeps
+    /// nothing over the new owner's shard (F-38-GRANT).
+    pub fn clear_shard_binding(&mut self, shard_id: &ShardId) {
+        let key = shard_id.file_key();
+        let had_session = self.session_keys_ram.remove(&key).is_some();
+        if self.shard_grant_owners.remove(&key).is_some() || had_session {
+            self.persist_state_if_configured();
+        }
     }
 
     /// The grant `shard_id` was stored with, if any.
@@ -531,8 +613,7 @@ impl PorVerifierEngine {
             }
         };
         if authorized {
-            self.session_keys_ram.remove(&shard_id.file_key());
-            self.persist_state_if_configured();
+            self.clear_shard_binding(shard_id);
         }
         authorized
     }

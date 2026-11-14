@@ -389,7 +389,7 @@ impl ParvaultIgnore {
     }
 }
 
-/// Encrypted, Monotonically Signed Kademlia Root Superblock Catalog (`ADR-15` "House Fire" Disaster Recovery).
+/// Encrypted, Monotonically Signed Kademlia Root Superblock Catalog (`ADR-18` "House Fire" Disaster Recovery).
 /// Allows a user whose local disks were completely destroyed to recover their entire directory tree
 /// using ONLY their memorized recovery seed phrase and `vault_namespace` (zero local `.manifest.bin` files).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1421,7 +1421,7 @@ impl FolderSyncEngine {
         Ok((out_slice, route_used))
     }
 
-    /// Exports an encrypted, post-quantum-protected `EncryptedVaultCatalogEnvelope` (`ADR-15`)
+    /// Exports an encrypted, post-quantum-protected `EncryptedVaultCatalogEnvelope` (`ADR-18`)
     /// keyed at the deterministic `derive_vault_root_dht_key(vault_namespace)` so the entire
     /// folder snapshot can be discovered and recovered from a memorized seed phrase alone.
     /// Automatically persists to local `ZeroTrustDhtStore` and publishes to Kademlia DHT peers
@@ -1452,7 +1452,7 @@ impl FolderSyncEngine {
         Ok(env)
     }
 
-    /// Zero-Local-State "House Fire" Disaster Recovery (`ADR-15`):
+    /// Zero-Local-State "House Fire" Disaster Recovery (`ADR-18`):
     /// Reconstructs the user's `MasterKey`, `PqVaultMasterKey`, `NodeIdentity`, and deterministic
     /// `root_catalog_dht_key` strictly from `(seed_phrase, vault_namespace)`, verifies and decrypts
     /// `catalog_envelope`, and restores the entire directory tree into `target_dir` with zero prior local files.

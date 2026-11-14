@@ -17,7 +17,10 @@ use crate::network::wan_rendezvous::{
     PUBLIC_COMMONS_SWARM_SLOT,
 };
 use crate::network::wot::WebOfTrustRegistry;
-use crate::por::PorVerifierEngine;
+use crate::por::{
+    shard_bound_to_another_owner_code, shard_rebind_decision, PorVerifierEngine, ShardBinding,
+    ShardRebindFacts,
+};
 use crate::storage::{
     BlockStore, PrivacyPreservingEvictionEngine, PublicTrackerTakedownQueue,
     SignedBadActorEvictionOrder, VoucherNullifierLedger,
@@ -579,6 +582,21 @@ pub fn device_cert_decision(
     }
 }
 
+/// A syndicated stripe's repair grant must be owned by the authenticated sender, compared on
+/// the full 32-byte key (never the 64-bit device id). With F-25 (the cert names the sender) this
+/// chains the grant owner to the owner root, so a certified device cannot attach a grant
+/// self-signed by another key (F-38, L-40). No grant is allowed.
+pub fn syndication_grant_decision(
+    grant_owner: Option<[u8; 32]>,
+    sender_pubkey: Option<[u8; 32]>,
+) -> Result<(), &'static str> {
+    match grant_owner {
+        None => Ok(()),
+        Some(owner) if sender_pubkey == Some(owner) => Ok(()),
+        Some(_) => Err("reject.syndication_grant_not_sender"),
+    }
+}
+
 /// The one refusal text for every failed handshake (F-30): the reason stays in the local log.
 pub const HANDSHAKE_REFUSED_TEXT: &str = "handshake refused";
 
@@ -603,6 +621,9 @@ fn handshake_refused() -> MeshWireResponse {
 }
 
 /// The shard ids a syndicated stripe was stored as (its root and expected shard hashes).
+/// Error text of a put refused by `shard_rebind_decision` (F-38-GRANT).
+const SHARD_BOUND_TO_ANOTHER_OWNER_TEXT: &str = "shard is bound to another owner";
+
 fn syndicated_shard_ids(
     bundle: &crate::bootstrap::LiteStripeSyndicationBundle,
     root: crate::sharding::merkle::Hash32,
@@ -873,6 +894,47 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                 };
             };
             let effective_owner = effective_owner.as_str();
+            // F-38-GRANT (L-41): first writer wins while the shard is stored.
+            let is_stored = block_store.has_shard(&shard_id);
+            let accounted_owner = block_store
+                .quota()
+                .lock()
+                .ok()
+                .and_then(|q| q.shard_owner(&shard_id.file_key()).map(str::to_string));
+            let facts = ShardRebindFacts {
+                stored: is_stored,
+                existing_grant_owner: is_stored
+                    .then(|| por_verifier.shard_grant_owner(&shard_id))
+                    .flatten(),
+                incoming_grant_owner: repair_grant.as_ref().map(|g| g.owner_pubkey),
+                sender_is_accounted_owner: accounted_owner.as_deref() == Some(effective_owner),
+            };
+            match shard_rebind_decision(&facts) {
+                Err(code) => {
+                    warn!(code, peer = %remote_peer_id, "refused a put of a shard bound to another owner");
+                    return MeshWireResponse::PutShardAck {
+                        stored: false,
+                        error: Some(SHARD_BOUND_TO_ANOTHER_OWNER_TEXT.to_string()),
+                    };
+                }
+                Ok(ShardBinding::Keep) => {
+                    // Already held for the same grant owner: verify the bytes, change nothing.
+                    let ok = crate::sharding::merkle::hash_shard_leaf(
+                        shard_id.shard_index,
+                        &shard_bytes,
+                    ) == shard_id.shard_hash;
+                    return MeshWireResponse::PutShardAck {
+                        stored: ok,
+                        error: (!ok).then(|| "shard bytes do not match the shard hash".to_string()),
+                    };
+                }
+                Ok(ShardBinding::Bind) => {
+                    if !is_stored {
+                        // Drop any stale binding of an evicted or deleted copy.
+                        por_verifier.clear_shard_binding(&shard_id);
+                    }
+                }
+            }
             match block_store.put_shard(effective_owner, &shard_id, &shard_bytes) {
                 Ok(_) => {
                     // The PoR session commit, like the grant, registers only after the owner
@@ -1393,6 +1455,55 @@ pub fn handle_mesh_wire_request<P: WireRolePolicy>(
                     syndicated_peers: Vec::new(),
                     error: Some("device cert does not name the sender".to_string()),
                 };
+            }
+            // F-38: refuse the whole request (never store while dropping the grant).
+            if let Err(code) = syndication_grant_decision(
+                repair_grant.as_ref().map(|g| g.owner_pubkey),
+                remote_pubkey,
+            ) {
+                warn!(code, peer = %remote_peer_id, "refused a repair grant not owned by the sender");
+                return MeshWireResponse::SyndicateLiteStripeAck {
+                    receipt: None,
+                    syndicated_peers: Vec::new(),
+                    error: Some("repair grant must be owned by the sender".to_string()),
+                };
+            }
+            // F-38-GRANT (L-41): every bundle shard must bind to the sender, all or nothing. The
+            // seed accounts to "self", so the sender owns a stored shard when its grant does.
+            let bundle_ids = syndicated_shard_ids(&bundle, bundle.expected_stripe_merkle_root);
+            let incoming_grant_owner = repair_grant.as_ref().map(|g| g.owner_pubkey);
+            let mut fresh = Vec::new();
+            for id in &bundle_ids {
+                let is_stored = block_store.has_shard(id);
+                let existing_grant_owner = is_stored
+                    .then(|| por_verifier.shard_grant_owner(id))
+                    .flatten();
+                let facts = ShardRebindFacts {
+                    stored: is_stored,
+                    existing_grant_owner,
+                    incoming_grant_owner,
+                    sender_is_accounted_owner: existing_grant_owner.is_some()
+                        && existing_grant_owner == remote_pubkey,
+                };
+                // `Keep` cannot arise here (the grant owner is the sender, F-38); refuse it too
+                // rather than re-ingest.
+                if let Err(code) = shard_rebind_decision(&facts).and_then(|b| match b {
+                    ShardBinding::Bind => Ok(()),
+                    ShardBinding::Keep => Err(shard_bound_to_another_owner_code()),
+                }) {
+                    warn!(code, peer = %remote_peer_id, "refused a syndication of a stripe bound to another owner");
+                    return MeshWireResponse::SyndicateLiteStripeAck {
+                        receipt: None,
+                        syndicated_peers: Vec::new(),
+                        error: Some(SHARD_BOUND_TO_ANOTHER_OWNER_TEXT.to_string()),
+                    };
+                }
+                if !is_stored {
+                    fresh.push(*id);
+                }
+            }
+            for id in &fresh {
+                por_verifier.clear_shard_binding(id);
             }
             let grant_to_register = repair_grant.clone();
             match server.ingest_and_syndicate_lite_stripe_with_grant(

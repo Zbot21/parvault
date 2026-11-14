@@ -3,6 +3,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use parvault::capabilities::{AccessRequestContext, CapabilityMacaroon, Caveat};
 use parvault::config::{ErasureTier, HardwareProfile};
 use parvault::crypto::MasterKey;
@@ -356,16 +358,13 @@ async fn test_cli_mint_offline_attenuate_inspect_and_gateway_fetch_range_enforce
         Some(vec![1000, 1001])
     );
 
-    let bad_strict = Command::new(parvault_bin)
-        .args([
-            "--data-dir",
-            data_dir.to_str().unwrap(),
-            "gateway",
-            "--strict-plugins",
-            "serve",
-        ])
-        .output()
-        .expect("spawn parvault gateway --strict-plugins");
+    let bad_strict = common::output_within_deadline(Command::new(parvault_bin).args([
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+        "gateway",
+        "--strict-plugins",
+        "serve",
+    ]));
     assert!(
         !bad_strict.status.success(),
         "`parvault gateway --strict-plugins serve` without --allow-peer-uid must fail fast"

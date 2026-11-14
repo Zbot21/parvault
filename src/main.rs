@@ -128,10 +128,11 @@ fn command_needs_network_discovery(cmd: &Commands) -> bool {
     !matches!(
         cmd,
         Commands::Init { .. }
+            | Commands::NewSeedPhrase
             | Commands::Discover { .. }
             | Commands::Pair { .. }
             | Commands::Join { .. }
-            | Commands::Identity
+            | Commands::Identity { .. }
             | Commands::IssueDeviceCert { .. }
             | Commands::VerifyDeviceCert { .. }
             | Commands::DiffFolder { .. }
@@ -255,6 +256,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // Stores nothing and needs no data directory or configuration.
+    if matches!(cli.command, Commands::NewSeedPhrase) {
+        println!("{}", generate_bip39_mnemonic(24)?);
+        return Ok(());
+    }
     let cfg = NodeConfig::load_for_cli(cli.config.as_ref(), cli.data_dir.as_deref(), cli.profile)?;
 
     let lan_port = cfg.effective_lan_discovery_port(cli.lan_discovery_port);
@@ -318,7 +324,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mesh_client = MeshClient::new(node_identity.clone(), resolved_peers, effective_seed)
-        .with_data_dir_discovery(cfg.data_dir.clone(), lan_port);
+        .with_data_dir_discovery(cfg.data_dir.clone(), lan_port)
+        .with_lan_discovery(lan_enabled);
 
     if public_mode && command_needs_network_discovery(&cli.command) {
         for tracker in &public_trackers {
@@ -355,6 +362,7 @@ async fn main() -> anyhow::Result<()> {
     };
     match cli.command {
         Commands::Init { .. }
+        | Commands::NewSeedPhrase
         | Commands::Token { .. }
         | Commands::Wot { .. }
         | Commands::Gateway { .. } => {
@@ -370,7 +378,7 @@ async fn main() -> anyhow::Result<()> {
         command @ Commands::Daemon { .. } => cli::daemon_cmds::daemon(env, command).await?,
         command @ Commands::File { .. } => cli::file::file(env, command).await?,
         command @ Commands::Status => cli::identity::status(env, command).await?,
-        command @ Commands::Identity => cli::identity::identity(env, command).await?,
+        command @ Commands::Identity { .. } => cli::identity::identity(env, command).await?,
         command @ Commands::IssueDeviceCert { .. } => {
             cli::identity::issue_device_cert(env, command).await?
         }

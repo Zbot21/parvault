@@ -881,6 +881,27 @@ fn put_shard() {
         assert!(!fx.store.has_shard(&sid));
         assert_eq!(fx.hosted("alice-owner"), 0);
     }
+    // F-38-GRANT (L-41): first writer wins. Another admitted sender re-putting a stored shard
+    // (no grant on either side) is refused identically, and nothing changes: the shard stays
+    // charged to its first writer.
+    let (sid, bytes) = shard(29, 1024);
+    let o = t.run(&peer, &put_shard_req("", sid, bytes.clone(), [29; 32]));
+    assert!(o[0].resp.contains("stored: true"), "{}", o[0].resp);
+    let squatter = Peer::new(0x62, "198.51.100.3");
+    t.admit(&squatter);
+    let squatter_device = squatter.ident.device_peer_id();
+    let o = t.run(&squatter, &put_shard_req("", sid, bytes, [0x66; 32]));
+    assert!(
+        o[0].resp.contains("shard is bound to another owner"),
+        "{}",
+        o[0].resp
+    );
+    assert_identical(&o);
+    assert!(o[0].changed.is_empty() && o[0].quota_delta == 0);
+    for fx in &t.fx {
+        assert!(fx.store.has_shard(&sid));
+        assert_eq!(fx.hosted(&squatter_device), 0, "{:?}", fx.role);
+    }
     // Error path: shard hash mismatch.
     let (mut sid, bytes) = shard(3, 1024);
     sid.shard_hash = [0xEE; 32];
@@ -1643,6 +1664,50 @@ fn syndicate_lite_stripe() {
         "public bootstrapper has no owner: {}",
         o[2].resp
     );
+    // F-38 (L-40): a grant owned by another key is refused before ingest, identically in every
+    // role; a grant owned by the sender is accepted where the stripe is.
+    let ct2 = vec![0x3E; 32 * 1024];
+    let set2 = encode_ciphertext_stripe(0, &ct2, ErasureTier::Homelab).unwrap();
+    let cert2 = PersonalDeviceCert::issue(
+        &t.keys.owner_pq,
+        &laptop.device_peer_id(),
+        "laptop",
+        1_700_000_000,
+    )
+    .unwrap();
+    let synd2 = |owner: &NodeIdentity| MeshWireRequest::SyndicateLiteStripe {
+        cert: cert2.clone(),
+        bundle: LiteStripeSyndicationBundle {
+            stripe_index: 0,
+            tier: ErasureTier::Homelab,
+            ciphertext_bytes: ct2.clone(),
+            expected_stripe_merkle_root: set2.stripe_merkle_root,
+            expected_shard_hashes: set2.shard_hashes.clone(),
+        },
+        repair_grant: Some(parvault::por::RepairGrant::issue(
+            owner,
+            set2.stripe_merkle_root,
+            Vec::new(),
+            ErasureTier::Homelab,
+        )),
+    };
+    let foreign = NodeIdentity::from_seed([0x6C; 32]);
+    let bad = synd2(&foreign);
+    let o = t.run(&peer, &bad);
+    for out in &o {
+        assert!(
+            out.resp
+                .contains("repair grant must be owned by the sender"),
+            "{}",
+            out.resp
+        );
+    }
+    assert_identical(&o);
+    let good = synd2(&laptop);
+    let o = t.run(&peer, &good);
+    assert!(o[0].resp.contains("receipt: Some"), "{}", o[0].resp);
+    assert_eq!(o[0], o[1]);
+
     let root = set.stripe_merkle_root;
     t.each(|fx, k| fx.ban(k, EvictionTarget::StripeMerkleRoot(root)));
     let o = t.run(&peer, &req);

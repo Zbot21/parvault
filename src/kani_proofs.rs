@@ -1129,3 +1129,66 @@ fn proof_sanitize_sync_relative_path_no_traversal() {
     assert!(sanitize_sync_relative_path("../escape").is_none());
     assert!(sanitize_sync_relative_path("C:\\win").is_none());
 }
+
+/// F-38 (L-40): a syndication repair grant is accepted only when absent or owned by exactly the
+/// authenticated sender's 32-byte key; any other owner, or an unknown sender, is refused.
+#[kani::proof]
+#[kani::unwind(34)]
+fn proof_syndication_grant_owned_by_sender() {
+    let owner: [u8; 32] = kani::any();
+    let sender: [u8; 32] = kani::any();
+    let has_grant: bool = kani::any();
+    let sender_known: bool = kani::any();
+    let grant = has_grant.then_some(owner);
+    let sender_opt = sender_known.then_some(sender);
+    let decision = crate::network::wire_handler::syndication_grant_decision(grant, sender_opt);
+    kani::cover!(decision.is_err(), "grant not owned by sender");
+    let expected_ok = !has_grant || (sender_known && owner == sender);
+    // Only the outcome is checked: comparing the &str reason code makes CBMC unwind memcmp
+    // without a bound; the code itself is checked by the claim's wire test.
+    assert_eq!(decision.is_ok(), expected_ok);
+}
+
+/// F-38-GRANT (L-41): while a shard is stored, a permitted put never changes its grant owner
+/// or accounted owner. `Bind` of a stored shard happens only for its accounted owner with an
+/// unchanged (or first) grant owner; `Keep` only for the same 32-byte grant owner; an unstored
+/// shard always binds.
+#[kani::proof]
+#[kani::unwind(34)]
+fn proof_shard_rebind_first_writer_wins() {
+    use crate::por::{shard_rebind_decision, ShardBinding, ShardRebindFacts};
+    let existing: [u8; 32] = kani::any();
+    let incoming: [u8; 32] = kani::any();
+    let has_existing: bool = kani::any();
+    let has_incoming: bool = kani::any();
+    let facts = ShardRebindFacts {
+        stored: kani::any(),
+        existing_grant_owner: has_existing.then_some(existing),
+        incoming_grant_owner: has_incoming.then_some(incoming),
+        sender_is_accounted_owner: kani::any(),
+    };
+    let decision = shard_rebind_decision(&facts);
+    kani::cover!(decision.is_err(), "rebind refused");
+    kani::cover!(
+        matches!(decision, Ok(ShardBinding::Keep)),
+        "kept for the same grant owner"
+    );
+    if !facts.stored {
+        assert!(matches!(decision, Ok(ShardBinding::Bind)));
+        return;
+    }
+    match decision {
+        Ok(ShardBinding::Bind) => {
+            // Accounted owner unchanged: only that owner rebinds.
+            assert!(facts.sender_is_accounted_owner);
+            // Grant owner unchanged when both are present.
+            assert!(!(has_existing && has_incoming) || existing == incoming);
+        }
+        Ok(ShardBinding::Keep) => {
+            assert!(!facts.sender_is_accounted_owner);
+            assert!(has_existing && has_incoming && existing == incoming);
+        }
+        // Only the outcome is checked (the &str code is checked by the claim's wire test).
+        Err(_) => {}
+    }
+}

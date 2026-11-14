@@ -372,4 +372,34 @@ mod tests {
         let holder = AdmissionSource::from_chain_dir(dir.path().to_path_buf());
         assert!(holder.store_chain(&chain).is_err());
     }
+
+    /// F-38 (QA r3): a member holding no genesis extends its installed chain one hop for its
+    /// vault key (genesis -> member -> vault), and the chain checks out.
+    #[test]
+    fn member_extends_its_chain_for_the_vault_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let genesis = NodeIdentity::from_seed([0x47; 32]);
+        let member = NodeIdentity::from_seed([0xCD; 32]);
+        let vault = NodeIdentity::from_seed([0xCE; 32]);
+        let source = AdmissionSource {
+            chain_dir: Some(dir.path().to_path_buf()),
+            genesis: None,
+            node: Some(member.clone()),
+            public_ticket_bits: None,
+        };
+        source
+            .store_chain(&issue_invitation(&genesis, member.public_key_bytes()))
+            .unwrap();
+        assert!(source
+            .credential_for(&member)
+            .is_some_and(|c| c.hops.len() == 1));
+        let chain = source.credential_for(&vault).expect("one-hop extension");
+        assert_eq!(chain.hops.len(), 2);
+        assert_eq!(chain.hops[1].inviter_pubkey, member.public_key_bytes());
+        assert_eq!(chain.leaf_pubkey(), Some(vault.public_key_bytes()));
+        assert_eq!(
+            source.check_chain(&chain).unwrap(),
+            vault.public_key_bytes()
+        );
+    }
 }

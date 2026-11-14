@@ -79,6 +79,7 @@ Every request (`IpcCommand`) and response (`IpcResponse`) over `/var/run/parvaul
 - `1 = FetchSuccess { bytes_streamed: u64 }`
 - `2 = HealthStatus { iops: u64, peer_count: u64, por_sla_score: f32 }`
 - `3 = Error { message: String }`
+- `4 = StoreSuccessLocalOnly { manifest: EphemeralShardManifest, local_only_stripes: u64 }` (appended): stored, but that many stripes stayed only on the daemon's machine because no ring peer accepted them, so they are **not backed up**. A client that does not know this variant fails to decode it rather than reporting success.
 
 > [!NOTE]
 > The `payload_fd: i32` and `output_fd: i32` integers inside `IpcCommand` carry the sender's local descriptor number for diagnostic logging only. The gateway server **never** trusts that integer; it consumes exclusively the kernel-remapped `OwnedFd` delivered via `SCM_RIGHTS` (`MSG_CMSG_CLOEXEC`). Any surplus descriptors attached to a single `cmsg` are wrapped in `OwnedFd` and closed immediately on `recvmsg(2)` return so descriptors can never leak.

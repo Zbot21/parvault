@@ -335,7 +335,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Initialize keys (`0600`), print a fresh 24-word BIP-39 recovery phrase, and write a turnkey `config.toml`.
+    /// Initialize keys (`0600`) and write a turnkey `config.toml`.
     Init {
         /// Optional folder to create and configure for automatic continuous backup.
         #[arg(long, value_name = "DIR", visible_alias = "folder")]
@@ -550,7 +550,19 @@ pub enum Commands {
     /// Inspect local daemon health, SLA cohort tier, WoT peers, and storage quota.
     Status,
     /// Display or initialize the persistent NodeIdentity, Post-Quantum Owner Key, and Master Key fingerprints.
-    Identity,
+    Identity {
+        /// Also print the Vault Device Peer ID of the vault this phrase and namespace derive
+        /// (the id a lite-seed device cert must name, F-38). Or set `PARVAULT_SEED_PHRASE`.
+        #[arg(long)]
+        seed_phrase: Option<String>,
+
+        /// Vault namespace used with `--seed-phrase`.
+        #[arg(long, default_value = "default")]
+        vault_namespace: String,
+    },
+    /// Print a fresh 24-word BIP-39 recovery phrase and store nothing. Back up with
+    /// `watch-folder --seed-phrase` to make a folder recoverable with `recover-from-seed` (ADR-18).
+    NewSeedPhrase,
     /// Issue a post-quantum PersonalDeviceCert (Ed25519 + ML-DSA-65) authorizing a personal device on the Homelab Ring.
     IssueDeviceCert {
         /// Device Peer ID to authorize (e.g. `parvault-peer-...`).
@@ -611,6 +623,11 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         once: bool,
 
+        /// Exit 0 even if some stripes stayed only on this machine (no ring peer accepted them).
+        /// Without it the command prints how many and exits with code 3: that data is NOT backed up.
+        #[arg(long, default_value_t = false)]
+        allow_local_only: bool,
+
         /// Optional hex-encoded 32-byte master key.
         #[arg(long)]
         key_hex: Option<String>,
@@ -623,15 +640,18 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         prune_deleted: bool,
 
-        /// Optional recovery seed phrase to derive deterministic keys and export an EncryptedVaultCatalogEnvelope.
+        /// Recovery seed phrase (or `PARVAULT_SEED_PHRASE`): derives the vault keys and publishes an
+        /// EncryptedVaultCatalogEnvelope, so `recover-from-seed` can restore this folder (ADR-18).
+        /// Without it the folder has no phrase recovery.
         #[arg(long)]
         seed_phrase: Option<String>,
 
-        /// Vault namespace used with `--seed-phrase` for deterministic disaster recovery (ADR-15).
+        /// Vault namespace used with `--seed-phrase` for disaster recovery (ADR-18).
         #[arg(long, default_value = "default")]
         vault_namespace: String,
 
         /// Optional output file path for the post-quantum EncryptedVaultCatalogEnvelope (`.catalog.bin`).
+        /// Needs `--seed-phrase` (or `PARVAULT_SEED_PHRASE`).
         #[arg(long)]
         catalog_out: Option<PathBuf>,
 
@@ -663,6 +683,15 @@ pub enum Commands {
         #[arg(long)]
         key_hex: Option<String>,
 
+        /// Recovery seed phrase the folder was backed up with (or `PARVAULT_SEED_PHRASE`). Without
+        /// it, the node's own master key is used.
+        #[arg(long)]
+        seed_phrase: Option<String>,
+
+        /// Vault namespace used with `--seed-phrase` (ADR-18).
+        #[arg(long, default_value = "default")]
+        vault_namespace: String,
+
         /// Optional relative file path inside the snapshot to selectively restore a single file.
         #[arg(long)]
         file: Option<String>,
@@ -671,11 +700,13 @@ pub enum Commands {
         #[arg(long)]
         filter: Option<String>,
     },
-    /// Zero-Local-State "House Fire" Disaster Recovery from a memorized seed phrase and network peers or EncryptedVaultCatalogEnvelope (ADR-15 / ADR-17).
+    /// Zero-Local-State "House Fire" Disaster Recovery from a memorized seed phrase and network peers or EncryptedVaultCatalogEnvelope (ADR-18). Recovers only folders backed up with
+    /// `watch-folder --seed-phrase` and the same `--vault-namespace`.
     RecoverFromSeed {
-        /// Memorized recovery seed phrase.
+        /// Memorized recovery seed phrase (default: `PARVAULT_SEED_PHRASE`, which keeps it out of
+        /// the process list).
         #[arg(long)]
-        seed_phrase: String,
+        seed_phrase: Option<String>,
 
         /// Vault namespace (default: "default").
         #[arg(long, default_value = "default")]
@@ -807,6 +838,11 @@ pub enum FileAction {
         /// Hex-encoded 32-byte master key (if omitted, uses or generates the local master key).
         #[arg(long)]
         key_hex: Option<String>,
+
+        /// Exit 0 even if some stripes stayed only on this machine (no ring peer accepted them).
+        /// Without it the command prints how many and exits with code 3: that data is NOT backed up.
+        #[arg(long, default_value_t = false)]
+        allow_local_only: bool,
     },
     /// Reconstruct and decrypt a file from its File Manifest or Merkle Root hex.
     Restore {
