@@ -8,10 +8,12 @@ description = "ParVault — Zero-knowledge post-quantum erasure-coded backup uti
 [[bin]]
 name = "parvault"
 path = "src/main.rs"
+required-features = ["daemon-runtime"]
 
 [[bin]]
 name = "parvault-seed"
 path = "src/bin/parvault-seed.rs"
+required-features = ["daemon-runtime"]
 
 [[bin]]
 name = "parvault-fuse"
@@ -21,26 +23,39 @@ required-features = ["vfs"]
 [[bin]]
 name = "parvault-sync"
 path = "src/bin/parvault-sync.rs"
+required-features = ["ipc-client"]
+
+[[bin]]
+name = "parvault-status"
+path = "src/bin/parvault-status.rs"
+required-features = ["status-ui"]
 
 [[bin]]
 name = "parvault-bench"
 path = "src/bin/parvault-bench.rs"
+required-features = ["daemon-runtime"]
 
 [lib]
 name = "parvault"
 path = "src/lib.rs"
 
 [features]
-default = ["vfs"]
-vfs = []
+default = ["daemon-runtime", "vfs", "status-ui"]
+# The full daemon: tokio, libp2p and everything that drives the ring (item 3, L-48).
+daemon-runtime = ["ipc-client", "status-ui", "dep:tokio", "dep:libp2p", "dep:async-trait"]
+# The gateway socket client, wire types and client-side crypto: what a plugin links. No tokio or libp2p.
+ipc-client = []
+vfs = ["ipc-client"]
+# The status page (router_nas) on the shared HTTP edge; the daemon and parvault-status link it.
+status-ui = ["ipc-client"]
 simd-accel = ["reed-solomon-erasure/simd-accel"]
 
 [package.metadata.kani]
 flags = { lib = true }
 
 [dependencies]
-tokio = { version = "1.40", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal"] }
-libp2p = { version = "0.54", features = [
+tokio = { version = "1.40", optional = true, features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal"] }
+libp2p = { version = "0.54", optional = true, features = [
     "tokio",
     "gossipsub",
     "mdns",
@@ -80,7 +95,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "1.0"
 anyhow = "1.0"
 hex = "0.4"
-async-trait = "0.1"
+async-trait = { version = "0.1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -29,8 +29,13 @@ struct SyncCli {
     catalog: PathBuf,
 
     /// Optional `PARVAULT-MAC-V1:` attenuated capability macaroon presented on `pull` range reads.
+    /// Visible to every local user in the process list (`/proc/<pid>/cmdline`); prefer `--macaroon-file`.
     #[arg(long, global = true, value_name = "PARVAULT-MAC-V1:...")]
     macaroon: Option<String>,
+
+    /// File holding the token (mode 600; refused if group or others can read it).
+    #[arg(long, value_name = "PATH", global = true)]
+    macaroon_file: Option<PathBuf>,
 
     #[command(subcommand)]
     command: SyncCommand,
@@ -81,24 +86,18 @@ enum SyncCommand {
     },
     /// List files and tombstones recorded in `--catalog` with zero shard traffic.
     List,
-    /// Run a self-contained sealed-`memfd` + attenuated-macaroon incremental push/diff/pull smoke test.
+    /// Self-test against the daemon on `--socket`: sealed-`memfd` incremental push/diff, then a
+    /// pull presenting `--macaroon` attenuated offline.
     SelfTest,
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = SyncCli::parse();
-    let default_macaroon = match cli
-        .macaroon
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(raw) => Some(
-            CapabilityMacaroon::from_compact_token(raw)
-                .map_err(|e| anyhow::anyhow!("invalid --macaroon token: {e}"))?,
-        ),
-        None => None,
-    };
+    let default_macaroon = parvault::capabilities::token_from_args(
+        cli.macaroon.as_deref(),
+        cli.macaroon_file.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
 
     #[cfg(not(unix))]
     {
@@ -269,21 +268,25 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             SyncCommand::SelfTest => {
-                run_self_test()?;
+                run_self_test(&cli.socket, default_macaroon.clone())?;
             }
         }
         Ok(())
     }
 }
 
+/// Client-only self-test (item 3) against the daemon on `socket`. The pull presents `macaroon`
+/// attenuated offline (ReadOnly, this UID, 60 s), showing the zero-key path; with no token the
+/// pull works only against a daemon without a root key. The in-process variant lives in
+/// tests/plugin_self_test.rs.
 #[cfg(unix)]
-fn run_self_test() -> anyhow::Result<()> {
+fn run_self_test(
+    socket: &std::path::Path,
+    macaroon: Option<parvault::capabilities::CapabilityMacaroon>,
+) -> anyhow::Result<()> {
     use parvault::{
-        capabilities::{CapabilityMacaroon, Caveat},
-        config::HardwareProfile,
-        crypto::MasterKey,
-        gateway::ipc::{read_self_rss_bytes, GatewayBus, GatewayIpcServer, RetentionPolicy},
-        storage::{BlockStore, QuotaManager},
+        capabilities::Caveat,
+        gateway::ipc::{read_self_rss_bytes, GatewayBus, RetentionPolicy},
         sync::{compute_file_sha256_streaming, GatewayFolderCatalog, GatewayFolderSync},
     };
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -306,26 +309,14 @@ fn run_self_test() -> anyhow::Result<()> {
     let _guard = TempDirGuard(tmp_dir.clone());
 
     let t0 = Instant::now();
-    let sock_path = tmp_dir.join("sync_selftest.sock");
+    let sock_path = socket.to_path_buf();
     let catalog_path = tmp_dir.join("sync_catalog.bin");
     let src_dir = tmp_dir.join("src_vault");
     let out_dir = tmp_dir.join("pulled_vault");
     std::fs::create_dir_all(src_dir.join("sub"))?;
     std::fs::create_dir_all(src_dir.join("nested"))?;
 
-    let root_key = [0x5Au8; 32];
     let local_uid = parvault::os_sys::geteuid();
-    let store = BlockStore::new(
-        tmp_dir.join("store"),
-        QuotaManager::new(512 * 1024 * 1024, 64 * 1024 * 1024),
-    )?;
-    let mut srv = GatewayIpcServer::new(&sock_path, store, MasterKey::generate())
-        .with_profile(HardwareProfile::RouterSoc)
-        .with_require_sealed_ingest_memfd(true)
-        .with_strict_allowed_peer_uids(vec![local_uid])
-        .with_macaroon_root_key(root_key)
-        .spawn()?;
-
     std::fs::write(src_dir.join(".parvaultignore"), b"*.ignored\n")?;
     std::fs::write(src_dir.join("alpha.txt"), b"initial alpha document")?;
     let initial_bravo: Vec<u8> = (0..(1536 * 1024)).map(|i| (i % 251) as u8).collect();
@@ -334,7 +325,14 @@ fn run_self_test() -> anyhow::Result<()> {
 
     // 1. Initial push
     let mut pusher = GatewayFolderSync::new(GatewayBus::unix_socket(&sock_path));
-    let cat1 = pusher.sync_folder_once(&src_dir, RetentionPolicy::Persistent)?;
+    let cat1 = pusher
+        .sync_folder_once(&src_dir, RetentionPolicy::Persistent)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "self-test needs a running daemon on {} (`parvault up --ipc-socket` or `parvault gateway serve`): {e}",
+                sock_path.display()
+            )
+        })?;
     cat1.save_to_file(&catalog_path)?;
     anyhow::ensure!(cat1.version == 1, "expected catalog v1");
     anyhow::ensure!(cat1.files.len() == 2, "expected 2 non-ignored files");
@@ -383,17 +381,20 @@ fn run_self_test() -> anyhow::Result<()> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let root_mac = CapabilityMacaroon::mint(&root_key, [0x11u8; 32], [0x22u8; 32], Vec::new())?;
-    let attenuated_mac = root_mac
-        .attenuate(Caveat::ReadOnly)?
-        .attenuate(Caveat::AllowedPeerUid(local_uid))?
-        .attenuate(Caveat::ExpiresAtUnixMs(now_ms + 60_000))?;
+    let attenuated_mac = match macaroon {
+        Some(token) => Some(
+            token
+                .attenuate(Caveat::ReadOnly)?
+                .attenuate(Caveat::AllowedPeerUid(local_uid))?
+                .attenuate(Caveat::ExpiresAtUnixMs(now_ms + 60_000))?,
+        ),
+        None => None,
+    };
 
     let pull_cat = GatewayFolderCatalog::load_from_file(&catalog_path)?;
     let puller = GatewayFolderSync::with_catalog(GatewayBus::unix_socket(&sock_path), pull_cat)
-        .with_default_macaroon(Some(attenuated_mac));
+        .with_default_macaroon(attenuated_mac);
     let restored_count = puller.restore_to_folder(&out_dir, &[])?;
-    srv.shutdown();
 
     anyhow::ensure!(restored_count == 2, "expected 2 restored files");
     anyhow::ensure!(

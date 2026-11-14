@@ -94,6 +94,8 @@ This automatically starts:
 3. The **Embedded Status Dashboard** on `http://localhost:4080`,
 4. An active **4-word pairing code** (e.g. `shield-copper-alpine-matrix`).
 
+The status page needs a read-only token on every request (v0.5.0): run `parvault token mint --read-only` on the node, open `http://<node-ip>:4080`, and enter the token as the password (any user name), or send `Authorization: Bearer <token>` to `/api/v1/health`. The token goes only in that header, never in the URL: `?token=` is ignored and refused. Use an IP address or `localhost`, not a host name: DNS names are refused (DNS rebinding). Without `--status-http` there is no status listener.
+
 ---
 
 ### Step 3: Auto-Discover & Pair with 4 Words (`parvault discover` & `join`)

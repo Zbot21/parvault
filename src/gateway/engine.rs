@@ -5,10 +5,10 @@
 //! bounded `PinnedRingBudget` admission/eviction, and 40-lane single-wave hedged parallel `libp2p`
 //! TCP + Noise XX shard distribution & reconstruction (`TTFB < 60 ms` under `15ms / 2% loss`).
 
-use crate::config::{ErasureTier, ROUTER_SOC_STRIPE_SIZE_BYTES};
+use crate::config::ErasureTier;
 
 /// Default Router-SoC zero-bloat streaming stripe size (`1 MiB`).
-pub const GATEWAY_STRIPE_BYTES: usize = ROUTER_SOC_STRIPE_SIZE_BYTES;
+pub use crate::profile::GATEWAY_STRIPE_BYTES;
 
 /// Dedicated persistent `libp2p` TCP + Noise XX worker pool concurrency (`40` independent lanes
 /// with `128 KiB` thread stacks so all `N <= 40` Reed-Solomon shards fire in a single wave at
@@ -325,6 +325,8 @@ mod unix_engine {
         ops_counter: AtomicU64,
         bytes_ingested: AtomicU64,
         bytes_served_lan: AtomicU64,
+        /// Last snapshot the daemon published for `QueryStatus` (item 3); `None` refuses it.
+        status_snapshot: RwLock<Option<crate::gateway::ipc::StatusSnapshot>>,
     }
 
     impl GatewayEngine {
@@ -365,6 +367,7 @@ mod unix_engine {
                 strict_allowed_peer_uids: RwLock::new(None),
                 require_sealed_ingest_memfd: AtomicBool::new(false),
                 by_merkle_root: RwLock::new(HashMap::new()),
+                status_snapshot: RwLock::new(None),
                 by_shard_vec_hash: RwLock::new(HashMap::new()),
                 pinned_ring: RwLock::new(PinnedRingBudget::new(DEFAULT_PINNED_RING_MAX_BYTES)),
                 ops_counter: AtomicU64::new(0),
@@ -423,6 +426,7 @@ mod unix_engine {
                 strict_allowed_peer_uids: RwLock::new(cfg.strict_allowed_peer_uids),
                 require_sealed_ingest_memfd: AtomicBool::new(cfg.require_sealed_ingest_memfd),
                 by_merkle_root: RwLock::new(HashMap::new()),
+                status_snapshot: RwLock::new(None),
                 by_shard_vec_hash: RwLock::new(HashMap::new()),
                 pinned_ring: RwLock::new(PinnedRingBudget::new(DEFAULT_PINNED_RING_MAX_BYTES)),
                 ops_counter: AtomicU64::new(0),
@@ -525,6 +529,45 @@ mod unix_engine {
         pub fn set_require_sealed_ingest_memfd(&self, required: bool) {
             self.require_sealed_ingest_memfd
                 .store(required, Ordering::Release);
+        }
+
+        /// Publishes the snapshot `QueryStatus` serves (capped first). The daemon calls this at
+        /// start and on each refresh.
+        pub fn publish_status_snapshot(&self, snap: crate::gateway::ipc::StatusSnapshot) {
+            if let Ok(mut g) = self.status_snapshot.write() {
+                *g = Some(snap.capped());
+            }
+        }
+
+        /// `QueryStatus` (item 3): [`crate::http_edge::status_auth_decision`] under the gateway
+        /// root key, with the socket peer's UID, before the snapshot is read.
+        pub fn query_status(
+            &self,
+            macaroon: Option<&CapabilityMacaroon>,
+            peer_uid: Option<u32>,
+        ) -> anyhow::Result<crate::gateway::ipc::StatusSnapshot> {
+            let snap = self.status_snapshot.read().ok().and_then(|g| g.clone());
+            let root_key = self.macaroon_root_key.read().ok().and_then(|g| *g);
+            let verify = root_key.map(|k| move |t: &CapabilityMacaroon| t.tag_valid(&k));
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let facts = crate::http_edge::status_auth_facts(
+                macaroon,
+                verify
+                    .as_ref()
+                    .map(|v| v as &dyn Fn(&CapabilityMacaroon) -> bool),
+                now_ms,
+                crate::http_edge::StatusTransport::Socket { peer_uid },
+                true,
+                snap.is_some(),
+            );
+            if let Err(code) = crate::http_edge::status_auth_decision(&facts) {
+                tracing::warn!(code, ?peer_uid, "refused a QueryStatus");
+                anyhow::bail!("QueryStatus refused: {code}");
+            }
+            snap.ok_or_else(|| anyhow::anyhow!("QueryStatus refused: reject.status_unavailable"))
         }
 
         /// Returns `true` iff `StorePayload` requires `F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW` seals.
@@ -760,7 +803,58 @@ mod unix_engine {
             ephemeral_shard_ids: &[[u8; 32]],
             output_fd: OwnedFd,
         ) -> anyhow::Result<u64> {
+            self.fetch_by_shard_ids_to_owned_fd_with_peer_uid(
+                ephemeral_shard_ids,
+                None,
+                Some(crate::os_sys::geteuid()),
+                output_fd,
+            )
+        }
+
+        /// `FetchPayload` (F-47, item 3): the peer UID and any macaroon are checked exactly as
+        /// for `FetchRange`, against the whole file, before any block-store read. The manifest
+        /// is resolved from the RAM index first, since its root and size are the caveat context.
+        pub fn fetch_by_shard_ids_to_owned_fd_with_peer_uid(
+            &self,
+            ephemeral_shard_ids: &[[u8; 32]],
+            macaroon: Option<&CapabilityMacaroon>,
+            peer_uid: Option<u32>,
+            output_fd: OwnedFd,
+        ) -> anyhow::Result<u64> {
+            if let Err(code) = self.peer_uid_decision(peer_uid) {
+                tracing::warn!(code, ?peer_uid, "refused a gateway read from a peer UID");
+                anyhow::bail!(
+                    "peer UID {:?} rejected by strict_allowed_peer_uids policy: {code}",
+                    peer_uid
+                );
+            }
             let fm = self.resolve_manifest_by_shard_ids(ephemeral_shard_ids)?;
+            let required_key = self.macaroon_root_key.read().ok().and_then(|guard| *guard);
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let ctx = AccessRequestContext {
+                manifest_root: fm.file_merkle_root,
+                offset: 0,
+                length: fm.original_file_size,
+                is_write: false,
+                now_unix_ms: now_ms,
+                peer_uid,
+            };
+            let facts = crate::gateway::engine::GatewayMacaroonFacts {
+                root_key_set: required_key.is_some(),
+                token_present: macaroon.is_some(),
+                tag_valid: match (required_key.as_ref(), macaroon) {
+                    (Some(key), Some(token)) => token.tag_valid(key),
+                    _ => false,
+                },
+                caveats_allow: macaroon.is_some_and(|t| t.evaluate_caveats(&ctx)),
+            };
+            if let Err(code) = crate::gateway::engine::gateway_macaroon_decision(&facts) {
+                tracing::warn!(code, "refused a gateway full-file fetch");
+                anyhow::bail!("Macaroon capability rejected: {code}");
+            }
             self.stream_manifest_range_to_fd(&fm, 0, fm.original_file_size, output_fd)
         }
 

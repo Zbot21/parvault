@@ -140,7 +140,15 @@ fn test_gateway_bus_sync_surface_parity_and_sealed_memfd_enforcement() {
         // 3. `fetch_into_memfd_sync` reconstructs full payload
         let out_mfd = File::from(create_memfd("fetch-full-m3").unwrap());
         let full_n = bus
-            .fetch_into_memfd_sync(man.shard_hashes.clone(), out_mfd.as_raw_fd())
+            .fetch_into_memfd_sync(
+                man.shard_hashes.clone(),
+                out_mfd.as_raw_fd(),
+                // F-47: a whole-file read carries a token under the root key.
+                Some(
+                    CapabilityMacaroon::mint(&root_key, [0xAA; 32], [0xBB; 32], Vec::new())
+                        .unwrap(),
+                ),
+            )
             .expect("fetch_into_memfd_sync");
         assert_eq!(full_n, payload.len() as u64);
         let mut full_vec = vec![0u8; full_n as usize];
@@ -242,7 +250,7 @@ fn test_gateway_bus_sync_surface_parity_and_sealed_memfd_enforcement() {
     );
     assert_eq!(
         denied_bus
-            .fetch_into_memfd_sync(Vec::new(), denied_mfd.as_raw_fd())
+            .fetch_into_memfd_sync(Vec::new(), denied_mfd.as_raw_fd(), None)
             .unwrap_err()
             .kind(),
         std::io::ErrorKind::PermissionDenied
@@ -291,7 +299,7 @@ fn test_gateway_bus_sync_surface_parity_and_sealed_memfd_enforcement() {
             .to_string()
             .contains("strict_allowed_peer_uids"));
         assert!(denied_bus
-            .fetch_payload_to_fd(Vec::new(), denied_mfd.as_raw_fd())
+            .fetch_payload_to_fd(Vec::new(), denied_mfd.as_raw_fd(), None)
             .await
             .unwrap_err()
             .to_string()

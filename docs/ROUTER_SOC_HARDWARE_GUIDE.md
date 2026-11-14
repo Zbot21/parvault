@@ -18,7 +18,7 @@ However, embedding modern distributed storage on consumer and enterprise router 
 
 `parvault` <!-- metric:crate_version_tag -->v0.5.0<!-- /metric --> solves all three constraints:
 - **`--profile router-soc`:** Enforces **1 MiB streaming Reed-Solomon stripes** (`ROUTER_SOC_STRIPE_SIZE_BYTES = 1,048,576`), dropping transient peak heap allocations (`VmHWM`) from <!-- metric:bench.desktop.vmhwm -->`57.91 MiB`<!-- /metric --> to **<!-- metric:bench.soc.vmhwm -->`9.72–9.74 MiB`<!-- /metric -->** (`< 16 MiB`), operating safely inside a `32–48 MiB` container or cgroup ceiling while retaining 100% wire and manifest compatibility with desktop and NAS nodes.
-- **Static Zero-Dependency `musl` & `FROM scratch` Containers:** Stripped standalone binaries (<!-- metric:size.aarch64.range -->`2.94–6.08 MiB`<!-- /metric --> ARM64, <!-- metric:size.x86_64.range -->`3.63–7.77 MiB`<!-- /metric --> x86_64 across `parvault`, `parvault-seed`, `parvault-fuse`, and `parvault-sync` — with the zero-copy Unix socket gateway and optional built-in `=y` VFS folded directly into `parvault`) and minimal `FROM scratch` Docker/OCI images under 20 MiB.
+- **Static Zero-Dependency `musl` & `FROM scratch` Containers:** Stripped standalone binaries (<!-- metric:size.aarch64.range -->`0.69–6.27 MiB`<!-- /metric --> ARM64, <!-- metric:size.x86_64.range -->`0.77–7.97 MiB`<!-- /metric --> x86_64 across `parvault`, `parvault-seed`, `parvault-fuse`, and `parvault-sync` — with the zero-copy Unix socket gateway and optional built-in `=y` VFS folded directly into `parvault`) and minimal `FROM scratch` Docker/OCI images under 20 MiB.
 - **Cryptographic Zero-IP LAN Discovery & 4-Word SAS Pairing:** Fully automated LAN beaconing over UDP port `4009` with Ed25519-signed identity binding, 4-word BIP-39 pairing codes, and DHCP self-healing.
 - **Turnkey Appliance Mode (`parvault up`):** Launches P2P daemon, signed discovery beacon, embedded status webserver, and background folder sync with a single command.
 
@@ -56,10 +56,10 @@ flowchart TD
 
 ### Flash / Disk Footprint
 - **Static `musl` stripped binaries (`soc` profile `opt-level = "z"`, `lto = "fat"`):**
-  - `parvault`: **<!-- metric:size.parvault.aarch64 -->`6.08 MiB`<!-- /metric -->** (<!-- metric:size.parvault.aarch64.bytes -->`6,376,448 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault.x86_64 -->`7.77 MiB`<!-- /metric -->** (<!-- metric:size.parvault.x86_64.bytes -->`8,146,472 B`<!-- /metric --> `x86_64`) — includes built-in `parvault up --ipc-socket`, built-in `=y` VFS (`--vfs-webdav-listen` / `--vfs-fuse-fd`), `parvault gateway`, and `parvault token`
-  - `parvault-seed`: **<!-- metric:size.parvault-seed.aarch64 -->`4.20 MiB`<!-- /metric -->** (<!-- metric:size.parvault-seed.aarch64.bytes -->`4,404,584 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-seed.x86_64 -->`5.36 MiB`<!-- /metric -->** (<!-- metric:size.parvault-seed.x86_64.bytes -->`5,617,576 B`<!-- /metric --> `x86_64`)
-  - `parvault-fuse`: **<!-- metric:size.parvault-fuse.aarch64 -->`2.94 MiB`<!-- /metric -->** (<!-- metric:size.parvault-fuse.aarch64.bytes -->`3,084,816 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-fuse.x86_64 -->`3.63 MiB`<!-- /metric -->** (<!-- metric:size.parvault-fuse.x86_64.bytes -->`3,810,344 B`<!-- /metric --> `x86_64`)
-  - `parvault-sync`: **<!-- metric:size.parvault-sync.aarch64 -->`2.94 MiB`<!-- /metric -->** (<!-- metric:size.parvault-sync.aarch64.bytes -->`3,084,840 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-sync.x86_64 -->`3.65 MiB`<!-- /metric -->** (<!-- metric:size.parvault-sync.x86_64.bytes -->`3,830,856 B`<!-- /metric --> `x86_64`) — zero-key incremental folder sync plugin (`GatewayFolderSync`)
+  - `parvault`: **<!-- metric:size.parvault.aarch64 -->`6.27 MiB`<!-- /metric -->** (<!-- metric:size.parvault.aarch64.bytes -->`6,575,456 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault.x86_64 -->`7.97 MiB`<!-- /metric -->** (<!-- metric:size.parvault.x86_64.bytes -->`8,361,864 B`<!-- /metric --> `x86_64`) — includes built-in `parvault up --ipc-socket`, built-in `=y` VFS (`--vfs-webdav-listen` / `--vfs-fuse-fd`), `parvault gateway`, and `parvault token`
+  - `parvault-seed`: **<!-- metric:size.parvault-seed.aarch64 -->`4.27 MiB`<!-- /metric -->** (<!-- metric:size.parvault-seed.aarch64.bytes -->`4,472,240 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-seed.x86_64 -->`5.48 MiB`<!-- /metric -->** (<!-- metric:size.parvault-seed.x86_64.bytes -->`5,750,760 B`<!-- /metric --> `x86_64`)
+  - `parvault-fuse`: **<!-- metric:size.parvault-fuse.aarch64 -->`1.13 MiB`<!-- /metric -->** (<!-- metric:size.parvault-fuse.aarch64.bytes -->`1,185,456 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-fuse.x86_64 -->`1.24 MiB`<!-- /metric -->** (<!-- metric:size.parvault-fuse.x86_64.bytes -->`1,300,672 B`<!-- /metric --> `x86_64`)
+  - `parvault-sync`: **<!-- metric:size.parvault-sync.aarch64 -->`0.69 MiB`<!-- /metric -->** (<!-- metric:size.parvault-sync.aarch64.bytes -->`725,264 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-sync.x86_64 -->`0.77 MiB`<!-- /metric -->** (<!-- metric:size.parvault-sync.x86_64.bytes -->`811,824 B`<!-- /metric --> `x86_64`) — zero-key incremental folder sync plugin (`GatewayFolderSync`)
 - **OCI / Docker `FROM scratch` container image (`parvault:router-soc`):** **<!-- metric:docker.unpacked -->`19.6 MB`<!-- /metric -->** total uncompressed disk usage (**<!-- metric:docker.compressed -->`6.13 MB`<!-- /metric -->** compressed content size, stripped binaries + `router.toml` configuration, 0 OS overhead).
 - **Minimum Free Disk Reserve (`min_free_disk_bytes`):**
   - `--profile router-soc`: `64 MiB` (`67,108,864` bytes), allowing deployment on small USB flash drives or flash partitions.
@@ -438,10 +438,16 @@ prplos-lxc-ctl start parvault-router-nas
 
 ## 9. Embedded WebUI & LuCI Dashboard Integration
 
-`RouterNasStatusServer` provides a zero-dependency HTTP server built entirely on `tokio::net::TcpListener`, requiring no external web server (Nginx, uHTTPd, or Lighttpd).
+`RouterNasStatusServer` is a blocking `std::net::TcpListener` on the HTTP edge it shares with WebDAV (32 connections, 8 per source IP, 8 KiB request heads, 5 s deadlines), so no external web server (Nginx, uHTTPd, Lighttpd) is needed. It starts only with `--status-http` (or `status_http_bind`); there is no default address.
+
+Every request must present a read-only token (`parvault token mint --read-only`) in the `Authorization` header: `Bearer <token>`, or the token as the Basic password when a browser prompts. A token in the URL (`?token=`) is ignored and refused. The `Host` must be an IP address or `localhost`; DNS names are refused (DNS rebinding).
 
 ### API Endpoints
-- **`GET /api/v1/health`:** Returns real-time health, RAM telemetry, storage quotas, uptime, and SAS pairing code in JSON:
+- **`GET /api/v1/health`:** Returns health, RAM telemetry, storage quotas and uptime in JSON:
+  ```bash
+  ( umask 077; printf 'Authorization: Bearer %s\n' "$(parvault token mint --read-only)" > /etc/parvault/status.header )
+  curl -s -H @/etc/parvault/status.header http://127.0.0.1:4080/api/v1/health
+  ```
   ```json
   {
     "version": "0.5.0",
@@ -451,8 +457,6 @@ prplos-lxc-ctl start parvault-router-nas
     "libp2p_peer_id": "12D3KooWSDu7w4v...",
     "owner_pq_fingerprint": "7f8b9a0c1d2e...",
     "stripe_size_bytes": 1048576,
-    "watched_folder": "/mnt/usb-nas/shared",
-    "pairing_sas_code": "shield-copper-alpine-matrix",
     "sla_tier": "HighUptimeAnchor",
     "used_storage_bytes": 48318382080,
     "max_storage_bytes": 500000000000,
@@ -470,39 +474,56 @@ prplos-lxc-ctl start parvault-router-nas
     ]
   }
   ```
-- **`GET /api/v1/peers`:** Returns an array of discovered and active LAN peers.
-- **`GET /`:** Renders an inline, zero-external-asset HTML5 dashboard (`< 6 KiB`) styled for desktop and mobile displays, featuring real-time RSS/HWM memory dials, storage progress meters, and pairing badges.
+  Since v0.5.0 the snapshot carries no pairing SAS code and no watched-folder path. Strings are capped at 256 bytes and the peer list at 128 entries.
+- **`GET /api/v1/peers`:** Returns the array of discovered LAN peers.
+- **`GET /`:** An inline, zero-external-asset HTML5 dashboard (`< 6 KiB`) with RSS/HWM memory and storage meters. Responses carry `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'`.
 
 ### OpenWrt LuCI Integration
-To display ParVault status directly inside the OpenWrt LuCI Web Interface, create `/usr/share/rpcd/acl.d/parvault.json` and a simple LuCI view at `/usr/lib/lua/luci/view/parvault_status.htm`:
+LuCI must not fetch the status page from the browser: that would need the token in the page. Instead, an `rpcd` plugin on the router reads the root-only header file above and queries the status page over loopback, and the LuCI view calls it over `ubus`, behind the LuCI login. Install `curl` (`opkg install curl`); `-H @file` keeps the token out of the process list.
 
-```html
-<div class="cbi-map">
-  <h2 name="content">ParVault Cloud-NAS Status</h2>
-  <div class="cbi-section">
-    <div id="parvault-status-box">Connecting to ParVault Status API...</div>
-  </div>
-</div>
-<script type="text/javascript">
-  fetch('http://' + window.location.hostname + ':4080/api/v1/health')
-    .then(r => r.json())
-    .then(data => {
-      document.getElementById('parvault-status-box').innerHTML = `
-        <table class="table">
-          <tr><th>Node Label</th><td><b>${data.node_label}</b></td></tr>
-          <tr><th>Hardware Profile</th><td><span class="badge badge-success">${data.hardware_profile} (1 MiB stripes)</span></td></tr>
-          <tr><th>RAM Usage (RSS / HWM)</th><td>${(data.rss_kib / 1024).toFixed(1)} MiB / ${(data.hwm_kib / 1024).toFixed(1)} MiB (Target: < 32 MiB)</td></tr>
-          <tr><th>Active Pairing Code</th><td><code>${data.pairing_sas_code || 'None'}</code></td></tr>
-          <tr><th>Storage Quota</th><td>${(data.used_storage_bytes / 1e9).toFixed(2)} GB / ${(data.max_storage_bytes / 1e9).toFixed(2)} GB</td></tr>
-          <tr><th>Discovered LAN Peers</th><td><b>${data.lan_peers.length} active peers</b></td></tr>
-        </table>
-      `;
-    })
-    .catch(err => {
-      document.getElementById('parvault-status-box').innerHTML = '<span class="text-danger">ParVault service offline</span>';
-    });
-</script>
+`/usr/libexec/rpcd/parvault` (mode `755`):
+```sh
+#!/bin/sh
+case "$1" in
+  list) echo '{ "status": {} }' ;;
+  call)
+    [ "$2" = status ] || exit 1
+    curl -s -m 5 -H @/etc/parvault/status.header http://127.0.0.1:4080/api/v1/health ;;
+esac
 ```
+
+`/usr/share/rpcd/acl.d/luci-app-parvault.json`:
+```json
+{ "luci-app-parvault": { "description": "ParVault status", "read": { "ubus": { "parvault": [ "status" ] } } } }
+```
+
+`/www/luci-static/resources/view/parvault/status.js`:
+```javascript
+'use strict';
+'require view';
+'require rpc';
+
+var callStatus = rpc.declare({ object: 'parvault', method: 'status' });
+
+return view.extend({
+  load: function () { return callStatus(); },
+  render: function (d) {
+    var row = function (k, v) { return E('tr', {}, [E('th', {}, k), E('td', {}, String(v))]); };
+    return E('div', { 'class': 'cbi-map' }, [
+      E('h2', {}, _('ParVault Cloud-NAS Status')),
+      E('table', { 'class': 'table' }, [
+        row(_('Node label'), d.node_label),
+        row(_('Hardware profile'), d.hardware_profile),
+        row(_('RAM (RSS / HWM)'), (d.rss_kib / 1024).toFixed(1) + ' / ' + (d.hwm_kib / 1024).toFixed(1) + ' MiB'),
+        row(_('Storage'), (d.used_storage_bytes / 1e9).toFixed(2) + ' / ' + (d.max_storage_bytes / 1e9).toFixed(2) + ' GB'),
+        row(_('LAN peers'), d.lan_peers.length)
+      ])
+    ]);
+  },
+  handleSave: null, handleSaveApply: null, handleReset: null
+});
+```
+Run `/etc/init.d/rpcd restart`, then add a menu entry for `parvault/status` in `/usr/share/luci/menu.d/luci-app-parvault.json`.
 
 ---
 
@@ -521,7 +542,7 @@ To display ParVault status directly inside the OpenWrt LuCI Web Interface, creat
    - Always point `--data-dir` and `--folder` to an attached USB drive or NVMe SSD, **never** to the router's internal SPI NOR/NAND flash (`/overlay` or rootfs). Internal router flash typically has limited write cycles and small block sizes.
    - ParVault enforces an internal `4x` write amplification cap and LRU quota release to prevent storage wear griefing (`ADR-07` / `ADR-19`).
 3. **Firewall & Routing Policy:**
-   - LAN auto-discovery (`UDP 4009`) and status server (`TCP 4080`) are bound to LAN interfaces only. If desired, block WAN access to port `4080` in `/etc/config/firewall`:
+   - The status server binds exactly the address you give it. `0.0.0.0:4080`, as in these examples, is every interface, WAN included, so block WAN access to port `4080` in `/etc/config/firewall`. Keep a wildcard or loopback bind for the LuCI proxy above, which connects to `127.0.0.1:4080`. LAN auto-discovery (`UDP 4009`) answers only signed beacons.
      ```text
      config rule
          option name 'Block-ParVault-Status-WAN'

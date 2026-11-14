@@ -1,0 +1,11 @@
+name: parvault CodeQL config
+# Only these test suites are excluded (L-50): they hold literal keys, nonces and tokens on
+# purpose (red-team and trust fixtures), which CodeQL reports as hard-coded secrets. src/ is
+# always scanned.
+paths-ignore:
+  - tests/red_team_hardening_tests.rs
+  - tests/sync_daemon_usability_and_cli_regression_tests.rs
+  - tests/bootstrap_and_earned_tier_tests.rs
+  - tests/seed_server_integration.rs
+  - tests/trust_enforcement.rs
+  - tests/wire_handler_equivalence.rs

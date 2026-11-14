@@ -124,8 +124,7 @@ pub(crate) async fn run_daemon(
     };
     let beacon_handle = spawn_beacon(&opts, &block_store, local, bound_tcp_port, init_explicit_ip);
 
-    let status_state_and_handle =
-        spawn_status_server(&opts, &cfg, &block_store, local, start_instant).await?;
+    let status_state = spawn_status_server(&opts, &cfg, &block_store, local, start_instant).await?;
 
     #[cfg(unix)]
     let builtin_vfs_requested = opts.vfs_webdav_listen.is_some()
@@ -133,21 +132,48 @@ pub(crate) async fn run_daemon(
         || opts.vfs_seed_dir.is_some();
 
     #[cfg(unix)]
-    let shared_gateway_engine = if opts.ipc_socket.is_some() || builtin_vfs_requested {
-        let mk = resolve_master_key(
-            &cfg.data_dir,
-            None,
-            cfg.device_sealing_passphrase.as_deref(),
-        )?;
-        let eng = parvault::gateway::GatewayEngine::from_local_block_store(block_store.clone(), mk);
-        eng.set_stripe_size_bytes(cfg.hardware_profile.stripe_size_bytes());
-        eng.set_tier(opts.sync_tier);
-        eng.set_macaroon_root_key(opts.macaroon_root_key);
-        eng.set_strict_allowed_peer_uids(opts.strict_allowed_peer_uids.clone());
-        eng.set_require_sealed_ingest_memfd(opts.require_sealed_ingest_memfd);
-        Some(Arc::new(eng))
-    } else {
-        None
+    let shared_gateway_engine =
+        if opts.ipc_socket.is_some() || builtin_vfs_requested || opts.status_http_bind.is_some() {
+            let mk = resolve_master_key(
+                &cfg.data_dir,
+                None,
+                cfg.device_sealing_passphrase.as_deref(),
+            )?;
+            let eng =
+                parvault::gateway::GatewayEngine::from_local_block_store(block_store.clone(), mk);
+            eng.set_stripe_size_bytes(cfg.hardware_profile.stripe_size_bytes());
+            eng.set_tier(opts.sync_tier);
+            eng.set_macaroon_root_key(opts.macaroon_root_key);
+            eng.set_strict_allowed_peer_uids(opts.strict_allowed_peer_uids.clone());
+            eng.set_require_sealed_ingest_memfd(opts.require_sealed_ingest_memfd);
+            eng.publish_status_snapshot(status_state.read().await.clone());
+            Some(Arc::new(eng))
+        } else {
+            None
+        };
+
+    // Item 3: the status page on the shared HTTP edge, verifying every request under the gateway
+    // root key (daemon_cmds creates one when --status-http is set). No flag, no listener.
+    #[cfg(unix)]
+    let status_http_handle = match (&opts.status_http_bind, &shared_gateway_engine) {
+        (Some(bind_str), Some(eng)) => {
+            let root_key = opts.macaroon_root_key.ok_or_else(|| {
+                anyhow::anyhow!("--status-http needs a gateway macaroon root key")
+            })?;
+            let sock_addr: SocketAddr = bind_str.parse()?;
+            let (bound_http, handle) = RouterNasStatusServer::bind_and_spawn(
+                sock_addr,
+                parvault::gateway::ipc::GatewayBus::in_process(Arc::clone(eng)),
+                parvault::http_edge::EdgeVerifier::RootKey(root_key),
+            )?;
+            println!(
+                "[parvault] Embedded Status Server listening on http://{}",
+                bound_http
+            );
+            info!(%bound_http, "RouterNasStatusServer active");
+            Some(handle)
+        }
+        _ => None,
     };
 
     #[cfg(unix)]
@@ -384,7 +410,8 @@ pub(crate) async fn run_daemon(
                 if let Some(ref beacon) = beacon_handle {
                     beacon.update_available_bytes(max_b.saturating_sub(used_b));
                 }
-                if let Some((ref state, _)) = status_state_and_handle {
+                {
+                    let state = &status_state;
                     let known = KnownPeersStore::load(&cfg.data_dir);
                     let peers_vec: Vec<RouterNasPeerEntry> = known
                         .peers
@@ -405,6 +432,10 @@ pub(crate) async fn run_daemon(
                         guard.lan_peers = peers_vec;
                     }
                     guard.update_telemetry(start_instant);
+                    #[cfg(unix)]
+                    if let Some(ref eng) = shared_gateway_engine {
+                        eng.publish_status_snapshot(guard.clone());
+                    }
                 }
             }
             _ = scrub_interval.tick() => {
@@ -449,7 +480,8 @@ pub(crate) async fn run_daemon(
     if let Some(ref mut ipc_handle) = ipc_gateway_handle {
         ipc_handle.shutdown();
     }
-    if let Some((_, http_handle)) = status_state_and_handle {
+    #[cfg(unix)]
+    if let Some(http_handle) = status_http_handle {
         http_handle.shutdown();
     }
     if let Some(beacon) = beacon_handle {
@@ -517,29 +549,23 @@ fn spawn_beacon(
     }
 }
 
-/// Starts the embedded router/NAS status HTTP server when `--status-http-bind` is set.
+/// Builds the status snapshot (always: `QueryStatus` serves it, item 3). The status page itself
+/// starts after the gateway engine, only when `--status-http` is set.
 async fn spawn_status_server(
     opts: &DaemonLaunchOptions,
     cfg: &NodeConfig,
     block_store: &BlockStore,
     local: DaemonLocal<'_>,
     start_instant: Instant,
-) -> anyhow::Result<
-    Option<(
-        Arc<RwLock<RouterNasLiveSnapshot>>,
-        parvault::router_nas::RouterNasServerHandle,
-    )>,
-> {
+) -> anyhow::Result<Arc<RwLock<RouterNasLiveSnapshot>>> {
     let DaemonLocal {
         node_identity,
         node_label,
         local_pid_str,
         pq_fp,
-        sas,
         ..
     } = local;
-    Ok(if let Some(ref bind_str) = opts.status_http_bind {
-        let sock_addr: SocketAddr = bind_str.parse()?;
+    let shared = {
         let (used_b, max_b) = {
             let q = block_store.quota();
             let g = q.lock().expect("quota lock");
@@ -564,9 +590,7 @@ async fn spawn_status_server(
             device_peer_id: node_identity.device_peer_id(),
             libp2p_peer_id: local_pid_str.clone(),
             owner_pq_fingerprint: pq_fp.clone(),
-            stripe_size_bytes: cfg.stripe_size_bytes,
-            watched_folder: opts.watch_folder.as_ref().map(|p| p.display().to_string()),
-            pairing_sas_code: Some(sas.code.clone()),
+            stripe_size_bytes: cfg.stripe_size_bytes as u64,
             sla_tier: format!("{:?}", opts.sync_tier),
             used_storage_bytes: used_b,
             max_storage_bytes: max_b,
@@ -576,18 +600,9 @@ async fn spawn_status_server(
             lan_peers: initial_lan_peers,
         };
         snap.update_telemetry(start_instant);
-        let shared = Arc::new(RwLock::new(snap));
-        let (bound_http, handle) =
-            RouterNasStatusServer::bind_and_spawn(sock_addr, shared.clone()).await?;
-        println!(
-            "[parvault] Embedded Status Server listening on http://{}",
-            bound_http
-        );
-        info!(%bound_http, "RouterNasStatusServer active");
-        Some((shared, handle))
-    } else {
-        None
-    })
+        Arc::new(RwLock::new(snap))
+    };
+    Ok(shared)
 }
 
 /// Starts the background continuous folder sync for `--watch-folder`.
