@@ -9,7 +9,7 @@
 //! Known limit: a quorum of epoch `n` that signs two different epoch `n + 1` manifests forks the
 //! council; nodes keep whichever successor they install first (no equivocation proof exists).
 //!
-//! Formal model: `specs/ParVaultZeroKeyAdminAndQuorum.tla` (guard `ring-scope`).
+//! Formal model: `specs/ParVaultZeroKeyAdminAndQuorum.tla` (guards `ring-scope`, `council-manifest`).
 
 use crate::crypto::NodeIdentity;
 use crate::storage::block_store::{BlockStore, StorageError};
@@ -217,14 +217,49 @@ pub fn load_council_manifest(data_dir: &Path) -> Option<CouncilManifest> {
     CouncilManifest::from_bytes(&bytes)
 }
 
+/// Serializes [`install_council_manifest`] (read, check, write) across the admin RPC and the
+/// council fetch paths of one process.
+static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Item 6 (plan-6 ruling change 1): a seed installs a council manifest over admin RPC only in
+/// public mode, only with a persistent store, and only against its configured scope root.
+/// Returns that root.
+pub fn seed_council_install_decision(
+    public_mode: bool,
+    in_memory: bool,
+    configured_root: Option<[u8; 32]>,
+) -> Result<[u8; 32], &'static str> {
+    if !public_mode {
+        return Err("reject.council_install_not_public");
+    }
+    if in_memory {
+        return Err("reject.council_install_in_memory");
+    }
+    configured_root
+        .filter(|r| *r != [0u8; 32])
+        .ok_or("reject.council_no_scope_root")
+}
+
+/// Epoch of the manifest installed in `data_dir`, if any.
+pub fn installed_council_epoch(data_dir: &Path) -> Option<u64> {
+    load_council_manifest(data_dir).map(|m| m.epoch)
+}
+
 /// Installs `manifest` in `data_dir` if [`council_manifest_decision`] accepts it against the
-/// installed one. Logs and returns the reason code otherwise.
+/// installed one. Logs and returns the reason code otherwise. Re-installing the manifest
+/// already installed is a no-op that succeeds.
 pub fn install_council_manifest(
     data_dir: &Path,
     manifest: &CouncilManifest,
     expected_root: [u8; 32],
 ) -> Result<(), String> {
+    let _guard = INSTALL_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let current = load_council_manifest(data_dir);
+    if current.as_ref() == Some(manifest) && manifest.scope_root == expected_root {
+        return Ok(());
+    }
     let facts = manifest.facts(expected_root, current.as_ref());
     if let Err(code) = council_manifest_decision(&facts) {
         tracing::warn!(code, epoch = manifest.epoch, "refused a council manifest");

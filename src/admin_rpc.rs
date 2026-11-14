@@ -196,6 +196,12 @@ pub enum SeedAdminRequest {
         min_public_pow_bits: u8,
         max_probationary_lease_bytes: u64,
     },
+    /// Item 6 (F-45): install a council manifest on a public seed. The seed checks it with
+    /// `council_manifest_decision` against its own configured scope root (never a field of
+    /// this request). Appended: indices 0-5 keep their encoding.
+    InstallCouncilManifest {
+        manifest_bytes: Vec<u8>,
+    },
 }
 
 /// Authenticated out-of-band control-plane response returned from `parvault-seed` to `parvault-control`.
@@ -222,6 +228,12 @@ pub enum SeedAdminResponse {
     },
     Error {
         message: String,
+    },
+    /// Reply to `InstallCouncilManifest`: `code` is `None` when installed (or already
+    /// installed), else the reason code; `installed_epoch` is the seed's epoch either way.
+    CouncilManifestResult {
+        code: Option<String>,
+        installed_epoch: Option<u64>,
     },
 }
 
@@ -798,6 +810,95 @@ async fn read_length_prefixed_frame(
         anyhow::bail!("truncated admin_rpc frame: expected {len} bytes, got {n}");
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod golden_wire {
+    //! Item 6 (plan-6 ruling change 5): the bincode encoding of every `SeedAdminRequest`
+    //! variant and of the request sign bytes is pinned, so an appended variant cannot shift
+    //! the indices or layout older seeds and `parvault-control` decode.
+    use super::*;
+    use crate::storage::EvictionTarget;
+
+    fn requests() -> Vec<(&'static str, SeedAdminRequest)> {
+        vec![
+            ("GetSeedTelemetry", SeedAdminRequest::GetSeedTelemetry),
+            (
+                "SyncTakedownQueue",
+                SeedAdminRequest::SyncTakedownQueue {
+                    since_timestamp_ms: 7,
+                },
+            ),
+            (
+                "ResolveTargetImpact",
+                SeedAdminRequest::ResolveTargetImpact {
+                    target: EvictionTarget::PeerOrIssuerPubkey([0x11; 32]),
+                },
+            ),
+            (
+                "ExecuteSignedEvictionBatch",
+                SeedAdminRequest::ExecuteSignedEvictionBatch {
+                    orders: Vec::new(),
+                    propagate_to_swarm: true,
+                },
+            ),
+            (
+                "RecordTakedownDecision",
+                SeedAdminRequest::RecordTakedownDecision {
+                    report_id: [0x22; 32],
+                    approved: true,
+                    admin_pubkey: [0x33; 32],
+                    note: "ok".to_string(),
+                },
+            ),
+            (
+                "UpdateAdmissionPolicy",
+                SeedAdminRequest::UpdateAdmissionPolicy {
+                    min_public_pow_bits: 12,
+                    max_probationary_lease_bytes: 4096,
+                },
+            ),
+            (
+                "InstallCouncilManifest",
+                SeedAdminRequest::InstallCouncilManifest {
+                    manifest_bytes: vec![1, 2, 3],
+                },
+            ),
+        ]
+    }
+
+    const GOLDEN: &[(&str, &str)] = &[
+        ("GetSeedTelemetry", "00000000"),
+        ("SyncTakedownQueue", "010000000700000000000000"),
+        ("ResolveTargetImpact", "02000000030000001111111111111111111111111111111111111111111111111111111111111111"),
+        ("ExecuteSignedEvictionBatch", "03000000000000000000000001"),
+        ("RecordTakedownDecision", "04000000222222222222222222222222222222222222222222222222222222222222222201333333333333333333333333333333333333333333333333333333333333333302000000000000006f6b"),
+        ("UpdateAdmissionPolicy", "050000000c0010000000000000"),
+        ("InstallCouncilManifest", "060000000300000000000000010203"),
+    ];
+    const GOLDEN_SIGN_BYTES: &str = "7061727661756c742d61646d696e2d7270632d7265712d76313a44444444444444444444444444444444444444444444444444444444444444440068e5cf8b010000060000000300000000000000010203";
+
+    #[test]
+    fn every_request_variant_has_pinned_bytes() {
+        let got: Vec<(&str, String)> = requests()
+            .into_iter()
+            .map(|(n, r)| (n, hex::encode(bincode::serialize(&r).unwrap())))
+            .collect();
+        let wanted: Vec<(&str, String)> = GOLDEN.iter().map(|(n, h)| (*n, h.to_string())).collect();
+        assert_eq!(
+            got, wanted,
+            "SeedAdminRequest encoding changed; got {got:#?}"
+        );
+    }
+
+    #[test]
+    fn request_sign_bytes_are_pinned() {
+        let req = SeedAdminRequest::InstallCouncilManifest {
+            manifest_bytes: vec![1, 2, 3],
+        };
+        let bytes = admin_rpc_request_sign_bytes(&[0x44; 32], 1_700_000_000_000, &req);
+        assert_eq!(hex::encode(bytes), GOLDEN_SIGN_BYTES);
+    }
 }
 
 #[cfg(test)]

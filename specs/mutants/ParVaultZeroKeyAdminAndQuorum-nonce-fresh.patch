@@ -1,8 +1,7 @@
 diff --git a/specs/ParVaultZeroKeyAdminAndQuorum.tla b/specs/ParVaultZeroKeyAdminAndQuorum.tla
-index b423315..784c55f 100644
 --- a/specs/ParVaultZeroKeyAdminAndQuorum.tla
 +++ b/specs/ParVaultZeroKeyAdminAndQuorum.tla
-@@ -122,7 +122,7 @@ OrderMeetsCouncilQuorum(ord) ==
+@@ -129,7 +129,7 @@
  
  \* The admin RPC compares the request's nonce with the connection's single active challenge
  \* (`validate_admin_rpc_slice_replay_and_auth_meta`, src/admin_rpc.rs).
