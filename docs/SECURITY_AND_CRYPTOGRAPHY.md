@@ -15,7 +15,7 @@ This document details the mathematical, cryptographic, game-theoretic, and forma
 8. [Live Multi-Container Docker P2P Regression Report](#8-live-multi-container-docker-p2p-regression-report-v020)
 9. [Empirical Cryptography, Reed-Solomon & Memory Telemetry (`parvault-bench`)](#9-empirical-cryptography-reed-solomon--memory-telemetry-parvault-bench)
 10. [Zero-IP Signed LAN Auto-Discovery & 4-Word SAS Pairing Cryptography (`ADR-22`)](#10-zero-ip-signed-lan-auto-discovery--4-word-sas-pairing-cryptography-adr-18)
-11. [Zero-IP Online WAN Rendezvous & Zero-Knowledge Dynamic-IP Presence (`ADR-23`)](#11-zero-ip-online-wan-rendezvous--zero-knowledge-dynamic-ip-presence-adr-18)
+11. [Zero-IP Online WAN Rendezvous & Dynamic-IP Presence (`ADR-23`)](#11-zero-ip-online-wan-rendezvous--dynamic-ip-presence-adr-23)
 12. [4-Vector Privacy-Preserving Bad-Actor & Content Eviction Cryptography (`ADR-19`)](#12-4-vector-privacy-preserving-bad-actor--content-eviction-cryptography-adr-19)
 13. [Zero-Copy `SCM_RIGHTS` UDS Gateway, `CapabilityMacaroon` Attenuation & `--no-fs` Seed Architecture (`v0.4.0`)](#13-zero-copy-scm_rights-uds-gateway-capabilitymacaroon-attenuation--no-fs-seed-architecture-v040)
 
@@ -327,11 +327,11 @@ flowchart TD
 
 ---
 
-## 11. Zero-IP Online WAN Rendezvous & Zero-Knowledge Dynamic-IP Presence (`ADR-23`)
+## 11. Zero-IP Online WAN Rendezvous & Dynamic-IP Presence (`ADR-23`)
 
 To enable peering across cities and residential ISPs without requiring static IPs or third-party dynamic DNS:
 
-1. **Zero-Knowledge Blinded Slot Derivation:**
+1. **Slot and Wrap Key Derivation (guessable, F-54):**
    - From a 4-word pairing phrase `W`, nodes derive:
 
 ```text
@@ -339,14 +339,14 @@ slot_key = HKDF-SHA256(W, "parvault-wan-rendezvous-slot-v1")
 wrap_key = HKDF-SHA256(W, "parvault-wan-rendezvous-wrap-v1")
 ```
 
-   - Rendezvous servers index slots strictly by 32-byte `slot_key`, possessing zero knowledge of the pairing phrase `W` or inner node details.
+   - Rendezvous servers index slots by the 32-byte `slot_key`. There is no salt and no PAKE, so a server holding a slot can test candidate codes offline (a 4-word code is 44 bits) and, once it finds `W`, decrypt the card and serve a forged one. The code `parvault up` prints is not random: it is derived from the node's `PeerId` and PQ fingerprint with a fixed nonce, so it never changes, and anyone who knows both (public tracker cards and LAN beacons carry them) computes it without guessing. A forged card redirects `parvault join` to the attacker's address but does not admit the attacker to the ring. Open finding [F-54](security/TRUST_FINDINGS.md); v0.6.0 replaces this with CPace. Until then, pair on the LAN or through a rendezvous seed you run.
 2. **Authenticated AEAD Peer Card Sealing:**
    - Nodes serialize their `WanPeerCard` (including `libp2p_peer_id`, public endpoints, relay seed fallbacks, and Ed25519 public key signed over `"parvault-wan-peercard-v1:"`).
    - The card is encrypted using `wrap_key` via `AES-256-GCM` before submission to the rendezvous mailbox.
 3. **STUN-over-Noise External Address Reflection:**
    - Seed anchors inspect the transport-level socket address during authenticated Noise XX handshakes and return `observed_external_addr` in `RegisterWanRendezvousAck`. Nodes discover their public WAN endpoints with zero external STUN dependencies.
 4. **Dynamic-IP DDNS Heartbeat:**
-   - Paired clusters maintain an encrypted presence mailbox under `HKDF-SHA256(ring_secret, "parvault-wan-ddns-v1")`. When an ISP rotates a home router's WAN IP, the new endpoint is published to the slot, allowing remote peers to resolve the change automatically.
+   - Nodes keep an encrypted presence mailbox under `HKDF-SHA256(id, "parvault-wan-ddns-v1")`, where `id` is the node's PQ fingerprint (lookups also try its `PeerId`). Neither is secret, so anyone who knows it can read the node's current address (F-54). When an ISP rotates a home router's WAN IP, the new endpoint is published to the slot, allowing remote peers to resolve the change automatically.
 5. **Anti-Spam Bounded Registry:**
    - Rendezvous anchors enforce strict bounds: maximum 16,384 slots, maximum 8 entries per slot, maximum 4 KiB per entry, and mandatory 3600-second TTL expiration. Outer envelopes are signed with Ed25519 to prevent unauthorized slot overwrites.
 

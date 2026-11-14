@@ -1763,7 +1763,7 @@ impl MeshClient {
         None
     }
 
-    /// Registers a signed zero-knowledge WAN rendezvous entry on `peer_addr` under `slot_key`,
+    /// Registers a signed WAN rendezvous entry on `peer_addr` under `slot_key`,
     /// returning the STUN-over-Noise `observed_external_addr` reflected by the remote node and
     /// automatically TOFU-pinning any advertised `tracker_admin_pubkey`.
     pub fn register_wan_rendezvous(
