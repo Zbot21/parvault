@@ -8001,3 +8001,73 @@ fn b52_corrupt_tracker_pins_council_install_refused() {
     );
     gate_ran("trust_enforcement::b52_corrupt_tracker_pins_council_install_refused");
 }
+
+/// C5 (verdict change 7, `bin=parvault`): `parvault --public council repin` moves the tracker's
+/// pin from A to B in both on-disk stores, and says the installed council (under A) must be
+/// replaced.
+#[test]
+fn f53_council_repin_moves_both_stores() {
+    let b = key(0xF4).public_key_bytes();
+    let (_root, dir) = f53_client("f53-repin");
+    let out = f53_council_cli(
+        &dir,
+        true,
+        &[
+            "repin",
+            "--tracker",
+            "/ip4/127.0.0.1/tcp/4002",
+            "--admin-pubkey",
+            &hex::encode(b),
+        ],
+    );
+    let text = combined(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("The installed council is under another root"),
+        "{text}"
+    );
+    let (known, legacy) = f53_pins(&dir);
+    assert_eq!(known, vec![b]);
+    assert_eq!(legacy.matches(&hex::encode(b)).count(), 1, "{legacy}");
+    assert!(
+        !legacy.contains(&hex::encode(key(0xF0).public_key_bytes())),
+        "{legacy}"
+    );
+    gate_ran("trust_enforcement::f53_council_repin_moves_both_stores");
+}
+
+/// Write order (B-52): with a corrupt `pinned_tracker_admins.json`, `council repin` is refused
+/// before it writes, so `known_peers.json` keeps the pin to A and the legacy file is unchanged
+/// (no half-done re-pin). No manifest is installed, so the start-up pin repair (which also reads
+/// both stores) does not run and the re-pin's own load order is what is tested.
+#[test]
+fn f53_council_repin_corrupt_legacy_leaves_both_unchanged() {
+    let b = key(0xF4).public_key_bytes();
+    let (_root, dir) = f53_client("f53-repin-corrupt");
+    std::fs::remove_file(dir.join("council_manifest.bin")).unwrap();
+    std::fs::write(dir.join("pinned_tracker_admins.json"), b"{not json").unwrap();
+    let known_before = std::fs::read(dir.join("known_peers.json")).unwrap();
+    let out = f53_council_cli(
+        &dir,
+        true,
+        &[
+            "repin",
+            "--tracker",
+            "/ip4/127.0.0.1/tcp/4002",
+            "--admin-pubkey",
+            &hex::encode(b),
+        ],
+    );
+    let text = combined(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("reject.tracker_pins_unreadable"), "{text}");
+    assert_eq!(
+        std::fs::read(dir.join("known_peers.json")).unwrap(),
+        known_before
+    );
+    assert_eq!(
+        std::fs::read(dir.join("pinned_tracker_admins.json")).unwrap(),
+        b"{not json"
+    );
+    gate_ran("trust_enforcement::f53_council_repin_corrupt_legacy_leaves_both_unchanged");
+}

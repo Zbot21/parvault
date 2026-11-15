@@ -4,7 +4,7 @@ use parvault::config::{CouncilAction, NodeConfig};
 use parvault::crypto::NodeIdentity;
 use parvault::storage::council::{
     council_scope_root, install_council_manifest, load_council_manifest, repair_council_pins,
-    repin_tracker_admin, CouncilInstallRole, CouncilManifest,
+    repin_tracker, CouncilInstallRole, CouncilManifest,
 };
 
 fn now_ms() -> u64 {
@@ -97,16 +97,9 @@ pub(crate) fn run(
             anyhow::ensure!(public_mode, "council repin is for --public mode only");
             let new = parse_key(&admin_pubkey)?;
             anyhow::ensure!(new != [0u8; 32], "the admin key must not be all zero");
-            let mut store = parvault::network::KnownPeersStore::try_load(data_dir)?;
-            let old = store.set_tracker_admin_pubkey(&tracker, new);
-            store.save(data_dir)?;
-            match old {
-                // Moves the legacy store too (every tracker pinned to `old`).
-                Some(old) if old != new => repin_tracker_admin(data_dir, old, new)
-                    .map_err(|e| anyhow::anyhow!("re-pin not persisted: {e}"))?,
-                Some(_) => {}
-                None => cfg.persist_pinned_tracker_admin(new)?,
-            }
+            // Loads both pin stores before writing either (B-52).
+            repin_tracker(data_dir, &tracker, new)
+                .map_err(|e| anyhow::anyhow!("re-pin not persisted: {e}"))?;
             println!(
                 "Pinned {} to tracker admin key {}.",
                 tracker.trim(),

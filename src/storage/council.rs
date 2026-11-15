@@ -419,6 +419,52 @@ pub fn repin_tracker_admin(data_dir: &Path, old: [u8; 32], new: [u8; 32]) -> Res
     Ok(())
 }
 
+/// `parvault council repin`: pins `tracker` to `new` in `known_peers.json`; every pin of its
+/// previous key moves too (both stores, as in [`repin_tracker_admin`]), and a tracker with no pin
+/// adds `new` to the legacy list. Both stores load before either is written (B-52), so a store that
+/// does not load leaves both files unchanged. Returns the tracker's previous pin.
+pub fn repin_tracker(
+    data_dir: &Path,
+    tracker: &str,
+    new: [u8; 32],
+) -> Result<Option<[u8; 32]>, String> {
+    let legacy = legacy_pinned_admins(data_dir).map_err(str::to_string)?;
+    let mut store =
+        crate::network::KnownPeersStore::try_load(data_dir).map_err(|e| e.to_string())?;
+    let old = store.set_tracker_admin_pubkey(tracker, new);
+    let moved = old.filter(|o| *o != new);
+    if let Some(o) = moved {
+        store.repin_tracker_admin_pubkey(o, new);
+    }
+    let legacy_out: Option<Vec<[u8; 32]>> = match (old, moved) {
+        (_, Some(o)) if legacy.contains(&o) => Some(
+            legacy
+                .iter()
+                .map(|pk| if *pk == o { new } else { *pk })
+                .collect(),
+        ),
+        (None, _) if !legacy.contains(&new) => Some(legacy.iter().copied().chain([new]).collect()),
+        _ => None,
+    };
+    store.save(data_dir).map_err(|e| e.to_string())?;
+    if let Some(keys) = legacy_out {
+        let mut out: Vec<String> = Vec::new();
+        for pk in keys {
+            let h = hex::encode(pk);
+            if !out.contains(&h) {
+                out.push(h);
+            }
+        }
+        let json = serde_json::to_vec_pretty(&out).map_err(|e| e.to_string())?;
+        crate::storage::fsio::atomic_write_file(
+            &data_dir.join("pinned_tracker_admins.json"),
+            &json,
+        )
+        .map_err(|e| format!("reject.tracker_pin_not_persisted: {e}"))?;
+    }
+    Ok(old)
+}
+
 /// A re-pin from the first root onto the second.
 pub type RePin = ([u8; 32], [u8; 32]);
 
