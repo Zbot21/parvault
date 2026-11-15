@@ -332,11 +332,14 @@ cat /proc/$(pgrep -u parvault parvault)/status | grep -E "VmRSS|VmHWM|Threads"
 
 ## 8. prplOS LXC Container Deployment
 
+> **Unverified: not yet tested on a real prplOS image (B-133).** `prplos-lxc-ctl` and this manifest schema are not confirmed to exist (prplOS ships LCM/uxc). Treat this section as a sketch.
+
 For carrier and broadband gateway environments running `prplOS`, deploy `parvault` inside an isolated, unprivileged LXC container using `deploy/prplos-lxc-manifest.json` (shown as shipped; edit `storage_mounts` for your NAS disk):
 
 ```json
 {
   "schema_version": "1.0",
+  "comment": "unverified: not yet tested on a real prplOS image (B-133). prplos-lxc-ctl and this manifest schema are not confirmed to exist; prplOS ships LCM/uxc.",
   "container_name": "parvault-daemon",
   "vendor": "Neighborhood Cloud / Project ParVault",
   "version": "0.5.2",

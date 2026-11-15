@@ -1,5 +1,6 @@
 {
   "schema_version": "1.0",
+  "comment": "unverified: not yet tested on a real prplOS image (B-133). prplos-lxc-ctl and this manifest schema are not confirmed to exist; prplOS ships LCM/uxc.",
   "container_name": "parvault-daemon",
   "vendor": "Neighborhood Cloud / Project ParVault",
   "version": "0.5.2",
