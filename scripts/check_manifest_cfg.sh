@@ -22,7 +22,8 @@ try:
 except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
     files = []
     for d, _, fs in os.walk(root):
-        if "/.git" in d or "/target" in d:
+        parts = os.path.relpath(d, root).split(os.sep)
+        if ".git" in parts or "target" in parts:
             continue
         files += [os.path.relpath(os.path.join(d, f), root) for f in fs]
 MANIFEST_CFG = re.compile(r'feature\s*=\s*"manifest-')

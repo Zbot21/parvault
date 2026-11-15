@@ -192,7 +192,7 @@ jobs:
         run: bash scripts/check_no_runtime_deps.sh .
       - name: Client-side unit tests and golden IPC wire bytes under ipc-client alone
         run: cargo test --release --lib --no-default-features --features ipc-client
-      - name: Manifest selection is compile time only; no --all-features on a compiling command (L-16)
+      - name: Manifest selection is compile time only; all-features builds are banned (L-16)
         run: bash scripts/check_manifest_cfg.sh .
       - name: Check minimal headless build (--no-default-features, VFS excluded)
         run: cargo check --no-default-features --features daemon-runtime,manifest-household-ring-v1 --bin parvault --bin parvault-seed --bin parvault-sync
@@ -308,6 +308,49 @@ jobs:
       - uses: model-checking/kani-github-action@v1
         with:
           kani-version: '0.68.0'
+
+  manifest-test-restricted:
+    # L-16 S8 (G-1 C4, C10): the CI-only test-restricted manifest, with an explicit feature list
+    # (never --all-features) for build, tests and Kani. It runs the manifest's own claims and the
+    # lib tests, not the shared claim suite (which needs HandshakeWoT, refused by this manifest).
+    name: Per-manifest job (manifest-test-restricted)
+    runs-on: ubuntu-24.04
+    env:
+      MANIFEST_FEATURES: daemon-runtime,vfs,status-ui,manifest-test-restricted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (lib and bins) under the restricted manifest
+        run: cargo clippy --lib --bins --no-default-features --features "$MANIFEST_FEATURES" -- -D warnings
+      - name: Lib tests under the restricted manifest
+        run: cargo test --release --lib --no-default-features --features "$MANIFEST_FEATURES"
+      - name: Manifest claim MAN-VARIANT against the restricted binary
+        run: cargo test --release --no-default-features --features "$MANIFEST_FEATURES" --test trust_enforcement -- --exact man_variant_enabled_served man_variant_disabled_refused
+      - name: The release check refuses the restricted binary (C10 reject)
+        run: |
+          cargo build --release --no-default-features --features "$MANIFEST_FEATURES" --bin parvault
+          if bash scripts/check_release_manifest.sh target/release/parvault; then
+            echo "::error::check_release_manifest.sh accepted a test-restricted binary"; exit 1
+          fi
+      - name: Harden apt-get mirrors before Kani installation
+        run: |
+          for attempt in 1 2 3 4; do
+            if sudo apt-get update -o Acquire::Retries=5; then
+              break
+            fi
+            if [ "$attempt" -eq 4 ]; then
+              echo "apt-get update failed after 4 attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 3))
+          done
+      - uses: model-checking/kani-github-action@v1
+        with:
+          kani-version: '0.68.0'
+          args: --no-default-features --features daemon-runtime,vfs,status-ui,manifest-test-restricted --harness proof_manifest_variant_decision
 
   tla-model-check:
     name: TLA+ TLC Formal Model Checking
