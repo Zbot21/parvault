@@ -23,9 +23,8 @@ jobs:
             strip: aarch64-linux-gnu-strip
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Rust toolchain from rust-toolchain.toml (L-17)
+        run: rustup toolchain install && rustc -V
       - name: Install musl cross-compilation toolchain
         run: |
           for attempt in 1 2 3 4; do

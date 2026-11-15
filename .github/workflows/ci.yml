@@ -163,9 +163,8 @@ jobs:
             sudo rm -rf /var/lib/apt/lists/*
             sleep $((attempt * 3))
           done
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Rust toolchain from rust-toolchain.toml (L-17)
+        run: rustup toolchain install && rustc -V
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -222,7 +221,8 @@ jobs:
       CARGO_PROFILE_RELEASE_STRIP: "none"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust toolchain from rust-toolchain.toml (L-17)
+        run: rustup toolchain install && rustc -V
       - uses: Swatinem/rust-cache@v2
       - name: No simd-accel anywhere in the feature graph
         run: |
@@ -271,7 +271,8 @@ jobs:
           bash scripts/doc_commands.sh check --base "$base"
       - name: Runner positive controls (stdin closed, failures fail, dead daemons are not ready)
         run: bash scripts/doc_commands.sh selftest
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust toolchain from rust-toolchain.toml (L-17)
+        run: rustup toolchain install && rustc -V
       - uses: Swatinem/rust-cache@v2
       - name: Build release binaries (each with its own features)
         run: bash scripts/build_bins.sh --profile release --out dist
