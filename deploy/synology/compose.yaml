@@ -1,17 +1,49 @@
-# Synology Container Manager project for the ParVault dev image (B-131); docs/SYNOLOGY.md.
-# Import parvault-image-amd64-dev.tar first (the DS923+ is x86_64). The image tag is the one
-# `docker load` (or Container Manager > Image > Import) shows; change it here on each upgrade.
-# (In the repo it is parvault:<Cargo.toml version>-dev; scripts/gen_metrics.sh fails otherwise.)
+# ParVault on a Synology NAS: START A RING. Container Manager > Project > Create; no SSH needed.
+# Guide: docs/SYNOLOGY.md. Import parvault-image-amd64-dev.tar first (the DS923+ is x86_64), from
+# inside the `docker` shared folder so it keeps its tag. Set every `image:` below to the tag
+# Container Manager shows; change it on each upgrade. (In the repo it is
+# parvault:<Cargo.toml version>-dev; scripts/gen_metrics.sh fails otherwise.)
+#
+#  - init:      run once; creates the ring on the very first start. On later starts it logs
+#               "this node is already in the ring <key>" and exits 1. That is harmless.
+#  - parvault:  the daemon. Healthy means it is running in a ring.
+#  - invite-*:  add one per joining node, AFTER the first start (see the commented example and
+#               docs/SYNOLOGY.md "Add a node"). Its token appears in its Log tab.
 name: parvault
+x-oneshot: &oneshot
+  image: parvault:0.5.3-dev
+  pull_policy: never            # a local-only image: never fall back to a registry pull
+  user: "65532:65532"
+  network_mode: none
+  restart: "no"
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  read_only: true
+  tmpfs:
+    - /tmp:mode=1777
+  healthcheck:
+    disable: true
+  volumes:
+    - parvault-data:/var/lib/parvault
 services:
+  init:
+    <<: *oneshot
+    command: ["--data-dir", "/var/lib/parvault", "wot", "init"]
   parvault:
     image: parvault:0.5.3-dev
+    pull_policy: never
     container_name: parvault
     restart: unless-stopped
     user: "65532:65532"
     # Host networking: LAN discovery (UDP 4009 broadcast) and the mesh port (TCP 4001) on the NAS's
-    # own address. A bridge network would hide both behind NAT.
+    # own address. A bridge network would hide both behind NAT. Container Manager then shows 0
+    # network use for this container; that is expected.
     network_mode: host
+    # Starts after init has started. On the very first start the daemon may exit once, "not in a
+    # ring", before init has written the ring; `restart` brings it back within seconds.
+    depends_on:
+      init:
+        condition: service_started
     # The image starts no status page. This project opts in, token-gated, on loopback only. With
     # host networking a LAN address here is the NAS's own: to view it from the LAN, replace
     # 127.0.0.1 with the NAS's LAN IP (never 0.0.0.0 or a WAN-facing address).
@@ -26,7 +58,7 @@ services:
       - /tmp:mode=1777
     volumes:
       # A named volume starts as a copy of the image's /var/lib/parvault, so it is owned by
-      # 65532:65532 with no chown on the NAS.
+      # 65532:65532 with no chown on the NAS. Container Manager does not list named volumes.
       - parvault-data:/var/lib/parvault
     healthcheck:
       test: ["CMD", "/usr/local/bin/parvault", "--data-dir", "/var/lib/parvault",
@@ -35,6 +67,16 @@ services:
       timeout: 10s
       start_period: 60s
       retries: 3
+  # Add a node: uncomment, put the joining node's key (from its `identity` Log tab) in place of
+  # NODE_KEY_64_HEX, then Project > Action > Build. The token is in this service's Log tab.
+  # `depends_on` waits for a healthy daemon, so the ring exists before the invite runs.
+  # Delete the service once the token is copied (a token admits only that key).
+  # invite-node2:
+  #   <<: *oneshot
+  #   depends_on:
+  #     parvault:
+  #       condition: service_healthy
+  #   command: ["--data-dir", "/var/lib/parvault", "wot", "invite", "--peer", "NODE_KEY_64_HEX"]
 volumes:
   parvault-data:
-    name: parvault-data   # fixed name, so the first-run command in docs/SYNOLOGY.md can use it
+    name: parvault-data   # fixed name: the project's services and later rebuilds share it

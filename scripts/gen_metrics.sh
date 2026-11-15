@@ -132,10 +132,15 @@ version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
 install_version="$(sed -n 's/^VERSION="\${PARVAULT_VERSION:-\(v[^}]*\)}"$/\1/p' scripts/install.sh)"
 [[ "$install_version" == "v$version" ]] || fail "scripts/install.sh default version is '$install_version', Cargo.toml says v$version"
 grep -q "^MIN_VERSION=v$version " scripts/install.sh || fail "scripts/install.sh MIN_VERSION is not v$version (Cargo.toml)"
-# The dev image is tagged parvault:<crate version>-dev (make_dev_image.sh); the Synology project
-# and its doc name that tag (L-10).
-compose_tag="$(sed -n 's/^    image: \(parvault:.*\)$/\1/p' deploy/synology/compose.yaml)"
-[[ "$compose_tag" == "parvault:$version-dev" ]] || fail "deploy/synology/compose.yaml image is '$compose_tag', Cargo.toml says parvault:$version-dev"
+# The dev image is tagged parvault:<crate version>-dev (make_dev_image.sh); every shipped compose
+# file and the Synology doc name that tag (L-10).
+for compose in deploy/synology/compose.yaml deploy/synology/join.compose.yaml deploy/docker/compose.yaml; do
+  compose_tags="$(sed -n 's/^ *image: *\([^ #]*\).*$/\1/p' "$compose" | sort -u)"
+  [[ "$compose_tags" == "parvault:$version-dev" ]] || fail "$compose image is '$compose_tags', Cargo.toml says parvault:$version-dev"
+  # A local-only image: every service must refuse a registry pull (B-146).
+  [[ "$(grep -c '^ *image:' "$compose")" == "$(grep -c '^ *pull_policy: never' "$compose")" ]] \
+    || fail "$compose: every image: needs pull_policy: never"
+done
 syn_tag="$(sed -n 's/^IMG=\(parvault:[^ ]*\) .*$/\1/p' docs/SYNOLOGY.md)"
 [[ "$syn_tag" == "parvault:$version-dev" ]] || fail "docs/SYNOLOGY.md IMG is '$syn_tag', Cargo.toml says parvault:$version-dev"
 lxc_version="$(sed -n 's/^  "version": "\(.*\)",$/\1/p' deploy/prplos-lxc-manifest.json)"

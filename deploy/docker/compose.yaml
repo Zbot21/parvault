@@ -1,0 +1,72 @@
+# ParVault on a Docker host (Linux, or Docker Desktop with host networking): JOIN AN EXISTING RING.
+# For a Synology NAS use deploy/synology/ instead (docs/SYNOLOGY.md). Load the image first:
+#   docker load -i parvault-image-amd64-dev.tar     # prints the tag to put in every `image:`
+#
+#  1. docker compose up -d
+#     `identity` prints this node's key:  docker compose logs identity   ("Ed25519 Public Key (hex)").
+#     `install-chain` fails (no token yet), compose reports it, and the daemon waits. Expected.
+#  2. On the ring holder: parvault wot invite --peer <that key>  (or its `invite-*` service).
+#  3. Replace PASTE_TOKEN_HERE below with the token, then docker compose up -d again.
+#     `install-chain` logs "Joined the ring ..." and the daemon starts.
+#  On later starts `install-chain` re-installs the same token, which is harmless.
+#
+# Health: the image's own HEALTHCHECK (exec form, `parvault gateway health`) is used as is. The image
+# has no shell, so do not add a `--health-cmd` or a shell-form `healthcheck:`.
+name: parvault
+x-oneshot: &oneshot
+  image: parvault:0.5.3-dev
+  pull_policy: never            # a local-only image: never fall back to a registry pull
+  user: "65532:65532"
+  network_mode: none
+  restart: "no"
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  read_only: true
+  tmpfs:
+    - /tmp:mode=1777
+  healthcheck:
+    disable: true
+  volumes:
+    - parvault-data:/var/lib/parvault
+services:
+  identity:
+    <<: *oneshot
+    command: ["--data-dir", "/var/lib/parvault", "identity"]
+  install-chain:
+    <<: *oneshot
+    depends_on:
+      identity:
+        condition: service_completed_successfully
+    # >>> Replace PASTE_TOKEN_HERE with the token from the ring holder. <<<
+    command: ["--data-dir", "/var/lib/parvault", "wot", "install-chain",
+              "--token", "PASTE_TOKEN_HERE"]
+  parvault:
+    image: parvault:0.5.3-dev
+    pull_policy: never
+    restart: unless-stopped
+    user: "65532:65532"
+    network_mode: host
+    depends_on:
+      install-chain:
+        condition: service_completed_successfully
+    # --listen: a non-default mesh port (4011), for a host where 4001 is taken or a second node runs
+    #   on the same LAN address; open it in the host firewall (TCP).
+    # --peers: the ring holder's LAN address and port (here a NAS at 192.168.1.10:4001). Needed when
+    #   LAN discovery cannot reach it (Docker Desktop, WSL2, another subnet); add more, comma-separated.
+    # --no-lan-discovery: drop it on a plain Linux host on the same LAN as the ring (UDP 4009).
+    command: ["--data-dir", "/var/lib/parvault", "up",
+              "--ipc-socket", "/run/parvault/parvault.sock",
+              "--listen", "/ip4/0.0.0.0/tcp/4011",
+              "--peers", "192.168.1.10:4001",
+              "--no-lan-discovery"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs:
+      - /run/parvault:uid=65532,gid=65532,mode=0700
+      - /tmp:mode=1777
+    volumes:
+      - parvault-data:/var/lib/parvault
+volumes:
+  parvault-data:
+    name: parvault-data

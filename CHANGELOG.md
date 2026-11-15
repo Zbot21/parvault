@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- **Synology without SSH (B-146).** `deploy/synology/compose.yaml` is now one project that starts a ring from Container Manager alone: a run-once `init` service (`wot init`, `network_mode: none`, `restart: "no"`, the same hardening) beside the daemon on the fixed-name volume `parvault-data`. On later starts `init` exits 1 (`already in the ring`) harmlessly. A commented `invite-node2` example prints a token to its Log tab and waits for a healthy daemon (`depends_on: service_healthy`), so it cannot run before the ring exists on a fresh volume. New `deploy/synology/join.compose.yaml` joins a ring: `identity` prints the key to its Log tab, `install-chain` takes the token from a marked placeholder, and the daemon starts only once it succeeds. New `deploy/docker/compose.yaml` is the same join for a Docker host, with `--peers`, a non-default `--listen` port and the image's own healthcheck. Every shipped service has `pull_policy: never`.
+- `scripts/test_compose_projects.sh` runs the three files on a real Docker host with the dev image: first start healthy, a rebuild keeps the ring, a join through an invite service, a store from the joiner restored byte-identical, the invite race on a fresh volume, and a Docker-host join on a non-default port. Unique project and volume names, removed afterwards.
+
+### Changed
+- `docs/SYNOLOGY.md` is rewritten around the Container Manager path: import from the `docker` shared folder (elsewhere the tag can be lost), the image ID per release, Project > Create, adding a node through Log tabs, what healthy and 0 network use mean, named volumes not shown and lost with a deleted project, firewall ports (TCP 4001, UDP 4009), and upgrading. The SSH commands are an appendix.
+- `scripts/gen_metrics.sh` checks the image tag in all three compose files, and fails if any service lacks `pull_policy: never`.
+
+### Fixed
+- `wot init` on a node already in a ring says `this node is already in the ring <key>`, without the misleading `Invalid key or hex encoding:` prefix (B-146). The exit code is still 1.
+
 ---
 
 ## [`0.5.3`] - 2026-11-15

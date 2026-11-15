@@ -3198,6 +3198,10 @@ fn wot_invite_needs_an_initialised_ring() {
     assert!(init.status.success(), "{}", out_text(&init));
     let again = parvault_cli(&dir, false, &["wot", "init"]);
     assert!(!again.status.success(), "{}", out_text(&again));
+    // The re-run says what happened, without a misleading key-encoding prefix (B-146).
+    let again_text = out_text(&again);
+    assert!(again_text.contains("this node is already in the ring "), "{again_text}");
+    assert!(!again_text.contains("Invalid key"), "{again_text}");
     let invite = parvault_cli(&dir, false, &["wot", "invite", "--peer", &peer]);
     assert!(invite.status.success(), "{}", out_text(&invite));
     gate_ran("trust_enforcement::wot_invite_needs_an_initialised_ring");

@@ -459,7 +459,7 @@ impl NodeIdentity {
     /// has any ring genesis source.
     pub fn init_ring_genesis_in_dir(data_dir: &Path) -> Result<Self, KeyError> {
         if let Ok(pk) = Self::resolve_genesis_root_pubkey_in_dir(data_dir, None) {
-            return Err(CryptoError::InvalidKeyMaterial(format!(
+            return Err(CryptoError::RingMembership(format!(
                 "this node is already in the ring {}",
                 hex::encode(pk)
             )));

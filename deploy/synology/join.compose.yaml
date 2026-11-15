@@ -1,0 +1,74 @@
+# ParVault on a Synology NAS: JOIN AN EXISTING RING. Container Manager > Project > Create; no SSH.
+# Guide: docs/SYNOLOGY.md "Join a ring". Set every `image:` to the tag Container Manager shows.
+#
+#  1. Build the project as it is. `identity` prints this node's key to its Log tab (the line
+#     "Ed25519 Public Key (hex)"). `install-chain` fails (no token yet: "Invalid character 'P'"),
+#     the build reports that failure, and the daemon stays in Created. That is expected.
+#  2. On the ring holder, run an `invite` service for that key and copy the token from its Log tab.
+#  3. Here, replace PASTE_TOKEN_HERE with the token, then Project > Action > Build.
+#     `install-chain` logs "Joined the ring ..." and the daemon starts and turns healthy.
+#  On later starts `install-chain` re-installs the same token, which is harmless.
+name: parvault
+x-oneshot: &oneshot
+  image: parvault:0.5.3-dev
+  pull_policy: never            # a local-only image: never fall back to a registry pull
+  user: "65532:65532"
+  network_mode: none
+  restart: "no"
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  read_only: true
+  tmpfs:
+    - /tmp:mode=1777
+  healthcheck:
+    disable: true
+  volumes:
+    - parvault-data:/var/lib/parvault
+services:
+  identity:
+    <<: *oneshot
+    command: ["--data-dir", "/var/lib/parvault", "identity"]
+  install-chain:
+    <<: *oneshot
+    depends_on:
+      identity:
+        condition: service_completed_successfully
+    # >>> Replace PASTE_TOKEN_HERE with the token from the ring holder's invite Log tab. <<<
+    command: ["--data-dir", "/var/lib/parvault", "wot", "install-chain",
+              "--token", "PASTE_TOKEN_HERE"]
+  parvault:
+    image: parvault:0.5.3-dev
+    pull_policy: never
+    container_name: parvault
+    restart: unless-stopped
+    user: "65532:65532"
+    # Host networking: LAN discovery (UDP 4009) and the mesh port (TCP 4001) on the NAS's own
+    # address. Container Manager then shows 0 network use for this container; that is expected.
+    network_mode: host
+    # Starts only once the token is installed.
+    depends_on:
+      install-chain:
+        condition: service_completed_successfully
+    # LAN discovery finds the ring holder on the same LAN. If it does not (another subnet, or
+    # broadcast blocked), add "--peers", "<holder LAN IP>:4001" to this list.
+    command: ["--data-dir", "/var/lib/parvault", "up",
+              "--ipc-socket", "/run/parvault/parvault.sock",
+              "--status-http", "127.0.0.1:4080"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs:
+      - /run/parvault:uid=65532,gid=65532,mode=0700
+      - /tmp:mode=1777
+    volumes:
+      - parvault-data:/var/lib/parvault
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/parvault", "--data-dir", "/var/lib/parvault",
+             "gateway", "--socket", "/run/parvault/parvault.sock", "health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+volumes:
+  parvault-data:
+    name: parvault-data
