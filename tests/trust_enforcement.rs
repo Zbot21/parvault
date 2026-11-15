@@ -9496,6 +9496,7 @@ fn b59_grant_nine_witnesses_not_registered() {
 /// the stripe (`Bind`), and re-puts W's shard (`Keep`), each with the owner's older grant that
 /// names no witness. Both puts are stored, the registered grant is kept
 /// (`reject.repair_grant_witness_downgrade`), and W's audits of both shards are still answered.
+/// A `Keep` re-put with a superset grant (W, W2) does replace it: W2 is then admitted.
 #[test]
 fn b59_grant_witness_downgrade_ignored() {
     let h = spawn_daemon("b59-downgrade");
@@ -9531,7 +9532,7 @@ fn b59_grant_witness_downgrade_ignored() {
     assert!(stored(&send(
         &co_host,
         &h,
-        put_shard("", sid, bytes, Some(old))
+        put_shard("", sid, bytes.clone(), Some(old))
     )));
     assert!(
         eventually(|| h
@@ -9550,6 +9551,39 @@ fn b59_grant_witness_downgrade_ignored() {
             h.log_text()
         );
     }
+    // C9 on the Keep path, accept side: a co-host's re-put of a held shard with a superset
+    // grant (W and W2) replaces the registered one, so W2 is admitted on both shards.
+    let witness2 = key(0xEC);
+    let sup = RepairGrant::issue(
+        &owner,
+        sid.stripe_merkle_root,
+        vec![witness.public_key_bytes(), witness2.public_key_bytes()],
+        ErasureTier::Homelab,
+    );
+    let refused = h
+        .log_text()
+        .matches("reject.repair_grant_witness_downgrade")
+        .count();
+    assert!(stored(&send(
+        &co_host,
+        &h,
+        put_shard("", sid, bytes, Some(sup))
+    )));
+    for s in [sid, other] {
+        let resp = send(&witness2, &h, chunk_audit(s));
+        assert!(
+            matches!(resp, MeshWireResponse::ChunkAuditResult(Some(_))),
+            "Keep-path superset not registered: {resp:?}\n{}",
+            h.log_text()
+        );
+    }
+    assert_eq!(
+        h.log_text()
+            .matches("reject.repair_grant_witness_downgrade")
+            .count(),
+        refused,
+        "a superset was refused as a downgrade"
+    );
     gate_ran("trust_enforcement::b59_grant_witness_downgrade_ignored");
 }
 
