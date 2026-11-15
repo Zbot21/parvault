@@ -288,15 +288,25 @@ fn dump_lists_secret_as_set() {
         expected,
         "secret rows"
     );
-    for (name, row) in secrets {
-        let keys: BTreeSet<&str> = row
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(keys, BTreeSet::from(["set", "source"]), "{name}: {row}");
-    }
+    // Each secret row carries only `set` and `source`. The failure message names the offending
+    // rows by their position in the `secrets` object, never a row or its value (CodeQL
+    // rust/cleartext-logging #58): the names were already checked against `expected` above.
+    let bad_rows: Vec<usize> = secrets
+        .values()
+        .enumerate()
+        .filter(|(_, row)| {
+            let keys: BTreeSet<&str> = row
+                .as_object()
+                .map(|o| o.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            keys != BTreeSet::from(["set", "source"])
+        })
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        bad_rows.is_empty(),
+        "secret rows at positions {bad_rows:?} have fields other than exactly set/source"
+    );
     assert_eq!(secrets["device_sealing_passphrase"]["set"], true);
     assert_eq!(secrets["PARVAULT_SEED_PHRASE"]["set"], true);
     assert_eq!(secrets["arg:macaroon_root_key_hex"]["set"], true);
