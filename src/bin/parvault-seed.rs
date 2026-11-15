@@ -63,6 +63,7 @@ use tracing::{info, warn};
 #[command(
     name = "parvault-seed",
     version,
+    long_version = parvault::build_facts::long_version(),
     about = "Standalone Zero-Trust Seed & Redundancy Server for ParVault (ADR-16)"
 )]
 struct SeedCli {

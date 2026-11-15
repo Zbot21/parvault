@@ -17,6 +17,7 @@ use std::path::PathBuf;
 #[command(
     name = "parvault-sync",
     version,
+    long_version = parvault::build_facts::long_version(),
     about = "ParVault Zero-Key Incremental Folder Sync Plugin (diff, push, watch, pull, list, self-test over /var/run/parvault.sock)"
 )]
 struct SyncCli {

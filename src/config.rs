@@ -100,7 +100,7 @@ const fn default_lan_discovery_port() -> u16 {
 #[command(
     name = "parvault",
     version,
-    long_version = crate::traversal_metrics::long_version(),
+    long_version = crate::build_facts::long_version(),
     about = "ParVault — Zero-IP post-quantum erasure-coded backup, Home LAN/WAN Cloud-NAS & P2P storage utility"
 )]
 pub struct Cli {

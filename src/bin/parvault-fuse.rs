@@ -21,6 +21,7 @@ use std::path::PathBuf;
 #[command(
     name = "parvault-fuse",
     version,
+    long_version = parvault::build_facts::long_version(),
     about = "ParVault Canonical Reference Plugin: Lazy-Streaming VFS (/dev/fuse, HTTP-Range/WebDAV & Userspace Sync over /var/run/parvault.sock)"
 )]
 struct FuseCli {

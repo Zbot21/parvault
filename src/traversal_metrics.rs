@@ -617,44 +617,7 @@ pub fn process_counters() -> Option<Arc<TraversalCounters>> {
     PROCESS_COUNTERS.get().cloned()
 }
 
-/// The build facts the release guard and `--version --verbose` read (one source).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BuildFacts {
-    pub insecure_metrics_feature: bool,
-    pub debug_assertions: bool,
-}
-
-pub const fn build_facts() -> BuildFacts {
-    BuildFacts {
-        insecure_metrics_feature: cfg!(feature = "lab-insecure-metrics"),
-        debug_assertions: cfg!(debug_assertions),
-    }
-}
-
-/// The two lines `--version --verbose` adds (`docs/METRICS.md`, release guard).
-pub fn build_facts_lines(f: BuildFacts) -> String {
-    let features = if f.insecure_metrics_feature {
-        "lab-insecure-metrics"
-    } else {
-        "none"
-    };
-    format!(
-        "debug_assertions: {}\nfeatures: {features}",
-        if f.debug_assertions { "on" } else { "off" }
-    )
-}
-
-/// clap's `long_version`: the version, then the build-facts lines.
-pub fn long_version() -> &'static str {
-    static LONG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    LONG.get_or_init(|| {
-        format!(
-            "{}\n{}",
-            env!("CARGO_PKG_VERSION"),
-            build_facts_lines(build_facts())
-        )
-    })
-}
+pub use crate::build_facts::{build_facts, build_facts_lines, long_version, BuildFacts};
 
 /// The facts the unauthenticated debug listener needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

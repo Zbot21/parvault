@@ -15,6 +15,7 @@ compile_error!(
 pub mod admin_rpc;
 #[cfg(feature = "daemon-runtime")]
 pub mod bootstrap;
+pub mod build_facts;
 pub mod capabilities;
 #[cfg(feature = "daemon-runtime")]
 pub mod config;

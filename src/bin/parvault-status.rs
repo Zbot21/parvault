@@ -15,6 +15,7 @@ use std::path::PathBuf;
 #[command(
     name = "parvault-status",
     version,
+    long_version = parvault::build_facts::long_version(),
     about = "ParVault status page sidecar: serves the daemon's status over HTTP to token holders"
 )]
 struct StatusCli {

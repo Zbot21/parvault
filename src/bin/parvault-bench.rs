@@ -29,6 +29,7 @@ const VALID_BIP39_SEED: &str =
 #[command(
     name = "parvault-bench",
     version,
+    long_version = parvault::build_facts::long_version(),
     about = "Empirical wall-clock and /proc/self/status memory benchmark suite for ParVault"
 )]
 struct BenchCli {
