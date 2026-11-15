@@ -7,6 +7,7 @@
 \*   const    QuorumM          -> model-only: the quorum comes from the installed council manifest
 \*   const    MaxNonces        -> model-only: model bound
 \*   const    MaxCouncilEpoch  -> model-only: model bound on council rotations
+\*   const    RootOnDisk       -> model-only: the seed's tracker_admin.seed holds the scope root key A (TLC runs both values)
 \* @end
 EXTENDS Naturals, FiniteSets, Sequences
 
@@ -38,7 +39,8 @@ CONSTANTS
     StrangerSigners,    \* Set of unvetted non-council attacker IDs (e.g. {"stranger"})
     QuorumM,            \* Strict council quorum threshold M (e.g. 2 for 2-of-3)
     MaxNonces,          \* Bounded pool of fresh single-use admin_rpc challenge nonces (e.g. 3)
-    MaxCouncilEpoch     \* Bound on installed council epochs (e.g. 2)
+    MaxCouncilEpoch,    \* Bound on installed council epochs (e.g. 3)
+    RootOnDisk          \* TRUE: the scope root A's key is in tracker_admin.seed on the seed's disk (F-53)
 
 Council == HonestCouncil \cup ByzantineCouncil
 AllSigners == Council \cup StrangerSigners
@@ -55,7 +57,8 @@ ASSUME
     /\ Cardinality(ByzantineCouncil) <= QuorumM - 1   \* @assume byzantine-below-quorum: threat model; fewer than QuorumM council members are Byzantine (which of them is chosen in Init)
     /\ Cardinality(HonestCouncil) >= QuorumM
     /\ MaxNonces >= 2
-    /\ MaxCouncilEpoch >= 2
+    /\ MaxCouncilEpoch >= 3
+    /\ RootOnDisk \in BOOLEAN
 
 VARIABLES
     vpsDiskSecrets,         \* Secrets persisted on the front-line VPS filesystem
@@ -76,15 +79,18 @@ VARIABLES
     publicSwarmEvicted,     \* Targets zero-shredded (0x00) on Public Commons nodes
     privateRingEvicted,     \* Targets zero-shredded on PrivateRing / HomelabVault nodes
     ownerOrderSigned,       \* TRUE once the HomelabOwner signs an eviction order for its own ring
-    councilLog,             \* Installed council manifests in install order (item 6, plan-6 change 6)
-    advCouncilTries         \* Bounded count of adversary InstallCouncilManifest submissions
+    councilLog,             \* The seed's installed council manifests in install order (item 6, plan-6 change 6)
+    advCouncilTries,        \* Bounded count of adversary InstallCouncilManifest submissions
+    cfgRoot,                \* The seed's configured scope root (the flag wins over tracker_admin.seed, F-53)
+    clientLog,              \* A public client's installed council manifests (it pinned A and holds A's epoch 1)
+    clientPin               \* The client's pinned tracker admin key (moves only at a re-root it installs)
 
 vars == <<vpsDiskSecrets, vpsCompromised, attackerKeys, activeChallenge, nextNonce,
           consumedNonces, acceptedRpcNonces, rejectedReplays, advRpcSubmissions,
           confirmedAbuseTargets, honestOrderSigs, forgedOrderBuilt, tamperedOrderBuilt,
           seenOrderIds, appliedOrderLog, publicSwarmEvicted, privateRingEvicted, ownerOrderSigned,
-          councilLog, advCouncilTries>>
-councilVars == <<councilLog, advCouncilTries>>
+          councilLog, advCouncilTries, cfgRoot, clientLog, clientPin>>
+councilVars == <<councilLog, advCouncilTries, cfgRoot, clientLog, clientPin>>
 
 \* Helper: Private key token for a signer identity.
 PrivKey(s) == <<"priv", s>>
@@ -142,64 +148,134 @@ OwnerRingOrder ==
     [id |-> "ord_owner", target |-> "OwnerTarget",
      sigs |-> {<<"primary", HomelabOwner, "OwnerTarget">>}]
 
-\* --- Council manifests: install and rotation (item 6, plan-6 required change 6) ---------------
+\* --- Council manifests: install, rotation and re-root (item 6; F-53, L-98) ---------------------
 \* A public seed installs `CouncilManifest`s through `InstallCouncilManifest` (admin RPC,
 \* `install_council_manifest`). Epoch 1 is signed by the scope root; epoch n + 1 by a quorum of
-\* epoch n's members; the scope root never changes; re-installing the installed manifest is a
-\* no-op; a bad shape (members or quorum) is refused.
-ScopeRoot == "scope_root"
-RogueRoot == "rogue_root"
+\* epoch n's members (a rotation, same root); or, in public mode only, epoch n + 1 moves the root
+\* (a re-root, signed under its own domain binding the old root, by a quorum of epoch n and by the
+\* new root). A seed accepts a re-root only onto its configured root, a client only away from its
+\* pinned root. A seed installs nothing while its configured root's key is on its disk and no
+\* manifest is installed under that root. Re-installing the installed manifest is a no-op.
+ScopeRoot == "scope_root"     \* A: the root a v0.5.0 seed advertised (its tracker_admin.seed key)
+NewRoot == "new_root"         \* B: the off-disk key given by --admin-rpc-pubkey
+RogueRoot == "rogue_root"     \* a root whose key the adversary holds
+Roots == {ScopeRoot, NewRoot, RogueRoot}
 ScopeRootKey == "scope_root_key"
-\* @assume scope-root-key-honest: the scope root's key is never in the adversary's hands. A seed
-\* that keeps `tracker_admin.seed` on its own disk (ADR-26) loses this on a disk seizure before
-\* its epoch 1 is installed.
-CurrentCouncil == IF councilLog = <<>> THEN {} ELSE councilLog[Len(councilLog)].members
+NewRootKey == "new_root_key"
+RogueRootKey == "rogue_root_key"
+RootKeys == {ScopeRootKey, NewRootKey, RogueRootKey}
+RootKeyOf(r) == CASE r = ScopeRoot -> ScopeRootKey [] r = NewRoot -> NewRootKey [] OTHER -> RogueRootKey
+\* @assume new-root-key-off-disk: B's key (the --admin-rpc-pubkey holder) is never on the seed's
+\* disk nor in the adversary's hands. A's key is on the disk when RootOnDisk and is then stolen by
+\* AdversarySeizeVpsDisk. (F-53: a flag equal to the on-disk key is the RootOnDisk case of A.)
+RootOnSeedDisk(r) == PrivKey(RootKeyOf(r)) \in vpsDiskSecrets
+Last(log) == log[Len(log)]
+CurrentCouncil == IF councilLog = <<>> THEN {} ELSE Last(councilLog).members
 \* @assume honest-rotation-majority: an honest rotation keeps Byzantine members below the quorum.
 \* The model uses one constant QuorumM; the code uses each manifest's own quorum field (a strict
 \* majority of its members, checked by council_manifest_decision).
 HonestMemberChoices ==
     { m \in SUBSET Council : Cardinality(m) >= QuorumM /\ Cardinality(m \cap ByzantineCouncil) < QuorumM }
 
-CouncilManifestAccepted(m) ==
-    /\ m.shapeOk
-    /\ m.scope = ScopeRoot
-    /\ m.epoch = Len(councilLog) + 1
-    /\ IF councilLog = <<>> THEN ScopeRootKey \in m.signers ELSE Cardinality(m.signers \cap CurrentCouncil) >= QuorumM   \* @guard council-manifest sym=src/storage/council.rs::council_manifest_decision
+\* The v0.5.0 state of a seed and its clients: epoch 1 under the on-disk root A, already installed.
+LegacyEpoch1 == [scope |-> ScopeRoot, epoch |-> 1, members |-> HonestCouncil, kind |-> "rotate",
+                 from |-> ScopeRoot, signers |-> {ScopeRootKey}, shapeOk |-> TRUE, legacy |-> TRUE]
 
-\* `install_council_manifest`: the installed manifest again is a no-op that succeeds; otherwise
-\* the decision runs and a refusal changes nothing.
+\* `council_manifest_decision` over `facts` (shared by seed and client): `kind` and `from` are the
+\* signing domain (a re-root's signatures bind the old root and never verify as a rotation).
+QuorumOf(m, log) == Cardinality(m.signers \cap Last(log).members) >= QuorumM
+ChainStepOk(m, log) ==
+    /\ m.shapeOk
+    /\ m.epoch = Len(log) + 1
+    /\ IF log = <<>> THEN m.kind = "rotate" /\ RootKeyOf(m.scope) \in m.signers
+       ELSE IF m.scope = Last(log).scope
+            THEN m.kind = "rotate" /\ QuorumOf(m, log)   \* @guard council-manifest sym=src/storage/council.rs::council_manifest_decision
+            ELSE /\ m.kind = "reroot"
+                 /\ m.from = Last(log).scope
+                 /\ QuorumOf(m, log)   \* @guard council-reroot-quorum sym=src/storage/council.rs::council_manifest_decision
+                 /\ RootKeyOf(m.scope) \in m.signers   \* @guard council-reroot-new-root sym=src/storage/council.rs::council_manifest_decision
+
+\* `seed_council_install_decision`: no install while the configured root's key is on the disk and
+\* nothing is installed under that root (the epoch under the configured root, not any file).
+SeedRootGateOk ==
+    ~(RootOnSeedDisk(cfgRoot) /\ (councilLog = <<>> \/ Last(councilLog).scope # cfgRoot))   \* @guard council-root-not-on-disk sym=src/storage/council.rs::seed_council_install_decision
+
+\* Seed shape (`CouncilInstallRole::PublicSeed`): every accepted manifest is under the configured root.
+CouncilManifestAccepted(m) ==
+    /\ SeedRootGateOk
+    /\ m.scope = cfgRoot
+    /\ ChainStepOk(m, councilLog)
+
+\* Client shape (`CouncilInstallRole::PublicClient`): a rotation under the pinned root, or a re-root
+\* away from it.
+ClientAccepts(m) ==
+    /\ clientLog # <<>>
+    /\ IF m.scope = Last(clientLog).scope THEN m.scope = clientPin ELSE Last(clientLog).scope = clientPin
+    /\ ChainStepOk(m, clientLog)
+
+\* `install_council_manifest` on the seed.
 InstallCouncilManifest(m) ==
-    IF councilLog # <<>> /\ m = councilLog[Len(councilLog)]
-    THEN UNCHANGED councilLog
-    ELSE IF CouncilManifestAccepted(m)
-         THEN councilLog' = Append(councilLog, m)
-         ELSE UNCHANGED councilLog
+    /\ IF councilLog # <<>> /\ m = Last(councilLog)
+       THEN UNCHANGED councilLog
+       ELSE IF CouncilManifestAccepted(m)
+            THEN councilLog' = Append(councilLog, m)
+            ELSE UNCHANGED councilLog
+    /\ UNCHANGED <<clientLog, clientPin>>
+
+\* `install_council_manifest` on the client: a re-root also moves its pin (all three stores).
+ClientInstall(m) ==
+    /\ IF clientLog # <<>> /\ m = Last(clientLog)
+       THEN UNCHANGED <<clientLog, clientPin>>
+       ELSE IF ClientAccepts(m)
+            THEN /\ clientLog' = Append(clientLog, m)
+                 /\ clientPin' = m.scope
+            ELSE UNCHANGED <<clientLog, clientPin>>
+    /\ UNCHANGED councilLog
+
+HonestManifest(mem) ==
+    IF councilLog = <<>>
+    THEN [scope |-> cfgRoot, epoch |-> 1, members |-> mem, kind |-> "rotate", from |-> cfgRoot,
+          signers |-> {RootKeyOf(cfgRoot)}, shapeOk |-> TRUE, legacy |-> FALSE]
+    ELSE IF Last(councilLog).scope = cfgRoot
+    THEN [scope |-> cfgRoot, epoch |-> Len(councilLog) + 1, members |-> mem, kind |-> "rotate",
+          from |-> cfgRoot, signers |-> CurrentCouncil \cap HonestCouncil, shapeOk |-> TRUE,
+          legacy |-> FALSE]
+    ELSE [scope |-> cfgRoot, epoch |-> Len(councilLog) + 1, members |-> mem, kind |-> "reroot",
+          from |-> Last(councilLog).scope,
+          signers |-> (CurrentCouncil \cap HonestCouncil) \cup {RootKeyOf(cfgRoot)},
+          shapeOk |-> TRUE, legacy |-> FALSE]
 
 HonestInstallCouncil ==
     /\ Len(councilLog) < MaxCouncilEpoch
-    /\ \E mem \in HonestMemberChoices :
-        LET sig == IF councilLog = <<>> THEN {ScopeRootKey} ELSE CurrentCouncil \cap HonestCouncil
-        IN InstallCouncilManifest([scope |-> ScopeRoot, epoch |-> Len(councilLog) + 1,
-                                   members |-> mem, signers |-> sig, shapeOk |-> TRUE])
-    /\ UNCHANGED advCouncilTries
+    /\ \E mem \in HonestMemberChoices : InstallCouncilManifest(HonestManifest(mem))
+    /\ UNCHANGED <<advCouncilTries, cfgRoot>>
 
-\* The adversary submits any manifest it can sign: either scope, any epoch, any members, a bad
-\* shape, signed by every key it controls (Byzantine and stranger keys, stolen VPS secrets);
-\* or replays one already installed.
+\* The client follows the seed's chain (the catch-up fetch, or `parvault council install`).
+ClientFollowSeed ==
+    /\ Len(clientLog) < Len(councilLog)
+    /\ ClientInstall(councilLog[Len(clientLog) + 1])
+    /\ UNCHANGED <<advCouncilTries, cfgRoot>>
+
+\* The adversary submits, to the seed or the client, any manifest it can sign: any root, either
+\* domain (a re-root bound to any old root), any epoch, any members, a bad shape, signed by every
+\* key it controls (Byzantine and stranger keys, the rogue root, stolen disk secrets such as A's
+\* key when RootOnDisk); or replays one already installed.
+AttackerSignerIds == { s \in AllSigners \cup RootKeys : PrivKey(s) \in attackerKeys }
 AdversaryManifests ==
-    { [scope |-> sc, epoch |-> e, members |-> mem,
-       signers |-> { s \in AllSigners : PrivKey(s) \in attackerKeys }, shapeOk |-> ok] :
-        sc \in {ScopeRoot, RogueRoot}, e \in 1..MaxCouncilEpoch,
-        mem \in (SUBSET AllSigners) \ {{}}, ok \in BOOLEAN }
+    { [scope |-> sc, epoch |-> e, members |-> mem, kind |-> k, from |-> fr,
+       signers |-> AttackerSignerIds, shapeOk |-> ok, legacy |-> FALSE] :
+        sc \in Roots, e \in 1..MaxCouncilEpoch, mem \in (SUBSET AllSigners) \ {{}},
+        k \in {"rotate", "reroot"}, fr \in Roots, ok \in BOOLEAN }
     \cup { councilLog[i] : i \in 1..Len(councilLog) }
 
 AdversaryInstallCouncil ==
     /\ advCouncilTries < 2
     /\ advCouncilTries' = advCouncilTries + 1
-    /\ \E m \in AdversaryManifests : InstallCouncilManifest(m)
+    /\ \E m \in AdversaryManifests : InstallCouncilManifest(m) \/ ClientInstall(m)
+    /\ UNCHANGED cfgRoot
 
 CouncilStep ==
-    /\ (HonestInstallCouncil \/ AdversaryInstallCouncil)
+    /\ (HonestInstallCouncil \/ ClientFollowSeed \/ AdversaryInstallCouncil)
     /\ UNCHANGED <<vpsDiskSecrets, vpsCompromised, attackerKeys, activeChallenge, nextNonce,
                    consumedNonces, acceptedRpcNonces, rejectedReplays, advRpcSubmissions,
                    confirmedAbuseTargets, honestOrderSigs, forgedOrderBuilt,
@@ -212,13 +288,13 @@ Init ==
     \* @structural no-admin-key-persist: a seed given `--admin-rpc-pubkey` writes no admin key to its disk;
     \* holds by construction; traced to test trust_enforcement::admin_key_never_persisted_on_seed
     \* That test covers the explicit-key case only. A persistent seed started WITHOUT
-    \* `--admin-rpc-pubkey` generates `tracker_admin.seed` on its disk (parvault-seed.rs,
-    \* load_or_generate_tracker_admin_identity) and roots its council on that key: F-53, outside
-    \* this model (see @assume scope-root-key-honest). vpsDiskSecrets is fixed data.
+    \* `--admin-rpc-pubkey` (or with an existing file) holds the scope root A's key in
+    \* `tracker_admin.seed` on its disk: RootOnDisk (F-53). No council member key is ever on it.
     /\ vpsDiskSecrets = {<<"vps_secret", "transport_seed">>, <<"vps_secret", "eviction_hmac_seed">>}
+                        \cup (IF RootOnDisk THEN {PrivKey(ScopeRootKey)} ELSE {})
     /\ vpsCompromised = FALSE
     \* Any subset of the (at most QuorumM - 1) Byzantine councilors is corrupt (P-03).
-    /\ attackerKeys \in { { PrivKey(s) : s \in (B \cup StrangerSigners) } : B \in SUBSET ByzantineCouncil }
+    /\ attackerKeys \in { { PrivKey(s) : s \in (B \cup StrangerSigners \cup {RogueRootKey}) } : B \in SUBSET ByzantineCouncil }
     /\ activeChallenge = 0
     /\ nextNonce = 1
     /\ consumedNonces = {}
@@ -234,8 +310,14 @@ Init ==
     /\ publicSwarmEvicted = {}
     /\ privateRingEvicted = {}
     /\ ownerOrderSigned = FALSE
-    /\ councilLog = <<>>
+    \* Fresh seed (no council) or the v0.5.0 legacy state (A's epoch 1 installed); the configured
+    \* root is A (no flag) or B (restarted with --admin-rpc-pubkey B). The client pinned A and
+    \* holds A's epoch 1 (its own epoch 1 is a manual install, outside this model).
+    /\ councilLog \in {<<>>, <<LegacyEpoch1>>}
+    /\ cfgRoot \in {ScopeRoot, NewRoot}
     /\ advCouncilTries = 0
+    /\ clientLog = <<LegacyEpoch1>>
+    /\ clientPin = ScopeRoot
 
 \* 1. Cryptographic Burden-of-Proof Abuse Report (`VerifiableAbuseReport`):
 \*    Authenticates "AbuseTarget" via AES-256-GCM + Merkle proof and queues for review
@@ -466,7 +548,10 @@ TypeOK ==
     /\ publicSwarmEvicted \subseteq Targets
     /\ privateRingEvicted \subseteq Targets
     /\ Len(councilLog) \in 0..MaxCouncilEpoch
+    /\ Len(clientLog) \in 1..MaxCouncilEpoch
     /\ advCouncilTries \in 0..2
+    /\ cfgRoot \in {ScopeRoot, NewRoot}
+    /\ clientPin \in Roots
 
 \* INVARIANT 1 (Zero-Private-Key-On-VPS):
 \* No council private key ever resides on the VPS disk, and even after full VPS disk
@@ -498,17 +583,39 @@ Safety_NoNonceOrOrderReplay ==
 Safety_PrivateRingImmuneToPublicCouncil ==
     privateRingEvicted \subseteq (IF ownerOrderSigned THEN {OwnerRingOrder.target} ELSE {})
 
-\* INVARIANT 5 (Council chain, item 6): the installed councils form one chain under one scope
-\* root: epochs 1..n in order, each of a valid shape; epoch 1 signed by the scope root; every
-\* later epoch signed by at least one honest member of the council before it (a quorum of a
-\* council with an honest majority). No stolen key set installs or rotates a council.
+\* INVARIANT 5 (Council chain, item 6; re-root, L-98), for the seed's and the client's logs:
+\* epochs 1..n in order, each of a valid shape; epoch 1 signed by its root; a later epoch under the
+\* same root is a rotation signed by at least one honest member of the council before it; a root
+\* change is a re-root bound to the previous root, signed by such a member and by the new root,
+\* onto a root the adversary does not hold. No stolen key set installs, rotates or re-roots.
+ChainAuthorised(log) ==
+    \A i \in 1..Len(log) :
+        /\ log[i].epoch = i
+        /\ log[i].shapeOk
+        /\ log[i].scope # RogueRoot
+        /\ (i = 1 => RootKeyOf(log[i].scope) \in log[i].signers)
+        /\ (i > 1 => log[i].signers \cap log[i - 1].members \cap HonestCouncil # {})
+        /\ (i > 1 /\ log[i].scope # log[i - 1].scope =>
+               /\ log[i].kind = "reroot"
+               /\ log[i].from = log[i - 1].scope
+               /\ RootKeyOf(log[i].scope) \in log[i].signers)
 Safety_CouncilChainAuthorised ==
+    /\ ChainAuthorised(councilLog)
+    /\ ChainAuthorised(clientLog)
+    /\ clientPin = Last(clientLog).scope
+
+\* INVARIANT 6 (F-53): a council installed by this model is never rooted on a key on the seed's
+\* disk: neither an epoch 1 nor a re-root onto it. (The legacy epoch 1 predates the fix.)
+Safety_Epoch1RootedOffDisk ==
     \A i \in 1..Len(councilLog) :
-        /\ councilLog[i].epoch = i
-        /\ councilLog[i].scope = ScopeRoot
-        /\ councilLog[i].shapeOk
-        /\ (i = 1 => ScopeRootKey \in councilLog[i].signers)
-        /\ (i > 1 => councilLog[i].signers \cap councilLog[i - 1].members \cap HonestCouncil # {})
+        (~councilLog[i].legacy /\ (i = 1 \/ councilLog[i].scope # councilLog[i - 1].scope))
+            => PrivKey(RootKeyOf(councilLog[i].scope)) \notin vpsDiskSecrets
+
+\* INVARIANT 7 (L-98): after a re-root, no manifest under the old root ever installs.
+Safety_NoOldRootAfterReRoot ==
+    \A log \in {councilLog, clientLog} :
+        \A j, k \in 1..Len(log) :
+            (j < k /\ log[j].kind = "reroot") => log[k].scope # log[j].from
 
 \* LIVENESS PROPERTY:
 \* Despite VPS disk compromise and M - 1 Byzantine councilors, confirmed abuse is eventually

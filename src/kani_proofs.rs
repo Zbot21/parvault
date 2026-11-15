@@ -1437,3 +1437,77 @@ fn proof_public_ticket_admission() {
     kani::cover!(d.is_ok(), "ticket admitted");
     assert_eq!(d.is_ok(), !private_ring && !quarantined && pow_ok);
 }
+
+/// F-53 (B-26), seed gate: a public seed never accepts an install while its council root's
+/// secret is on its disk and no manifest is installed under that root. That covers a re-root
+/// onto an on-disk root: the installed manifest is under the old root, so nothing is installed
+/// under the new one. Codes and order of the three earlier checks are unchanged.
+#[kani::proof]
+fn proof_seed_council_root_never_on_disk() {
+    let (public, in_memory, on_disk): (bool, bool, bool) = (kani::any(), kani::any(), kani::any());
+    let root: Option<[u8; 32]> = kani::any();
+    let installed: Option<u64> = kani::any();
+    let d = crate::storage::council::seed_council_install_decision(
+        public, in_memory, root, on_disk, installed,
+    );
+    kani::cover!(
+        d.is_ok() && on_disk,
+        "on-disk root with a council under it: rotations go on"
+    );
+    kani::cover!(
+        d == Err("reject.council_root_on_disk"),
+        "on-disk root refused"
+    );
+    if on_disk && installed.is_none() {
+        assert!(d.is_err());
+    }
+    let root_ok = root.is_some_and(|r| r != [0u8; 32]);
+    assert_eq!(
+        d.is_ok(),
+        public && !in_memory && root_ok && !(on_disk && installed.is_none())
+    );
+    if d.is_ok() {
+        assert_eq!(d, Ok(root.unwrap()));
+    }
+}
+
+/// F-53 (B-26, L-98), re-root branch: a manifest whose scope root differs from the installed
+/// one's is accepted only in public mode, at the next epoch, authorised by the installed quorum
+/// and signed by the new root. Never in private mode, never without the new root.
+#[kani::proof]
+fn proof_council_reroot_needs_quorum_and_new_root() {
+    let f = crate::storage::council::CouncilManifestFacts {
+        members: kani::any(),
+        quorum: kani::any(),
+        members_canonical: kani::any(),
+        epoch: kani::any(),
+        current_epoch: kani::any(),
+        scope_matches: kani::any(),
+        authorised: kani::any(),
+        rerooted: kani::any(),
+        public_mode: kani::any(),
+        new_root_signed: kani::any(),
+    };
+    let d = crate::storage::council::council_manifest_decision(&f);
+    kani::cover!(d.is_ok() && f.rerooted, "a re-root installs");
+    kani::cover!(
+        d == Err("reject.council_reroot_private"),
+        "private re-root refused"
+    );
+    kani::cover!(
+        d == Err("reject.council_reroot_unsigned"),
+        "unsigned re-root refused"
+    );
+    if f.rerooted && !f.public_mode {
+        assert!(d.is_err());
+    }
+    if d.is_ok() && f.rerooted {
+        assert!(f.public_mode && f.new_root_signed && f.authorised && f.scope_matches);
+        assert!(f
+            .current_epoch
+            .is_some_and(|c| c.checked_add(1) == Some(f.epoch)));
+    }
+    if d.is_ok() {
+        assert!(f.quorum > 0 && f.quorum <= f.members && 2 * f.quorum > f.members);
+    }
+}

@@ -74,6 +74,9 @@ tla-mutant TM-NULLIFIER     spec=specs/ParVaultAnonymity.tla inv=Safety_NoVouche
 tla-mutant TM-TIER-SLASH    spec=specs/ParVaultBootstrapAndEarnedTier.tla inv=Safety_TierStrictlyEarnedByUptime patch=specs/mutants/ParVaultBootstrapAndEarnedTier-tier-respects-slash.patch
 tla-mutant TM-QUORUM        spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_NoUnauthorizedOrSubQuorumEviction patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-quorum-count.patch
 tla-mutant TM-COUNCIL-MANIFEST spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_CouncilChainAuthorised patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-council-manifest.patch
+tla-mutant TM-COUNCIL-ROOT-DISK spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_Epoch1RootedOffDisk patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-council-root-disk.patch   # F-53: no council rooted on the seed's on-disk key
+tla-mutant TM-COUNCIL-REROOT spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_CouncilChainAuthorised patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-council-reroot-quorum.patch   # L-98: a re-root needs the old council's quorum
+tla-mutant TM-COUNCIL-OLDROOT spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_NoOldRootAfterReRoot patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-council-reroot-quorum.patch   # L-98: the stolen old root cannot re-root back
 tla-mutant TM-NONCE         spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_NoNonceOrOrderReplay patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-nonce-fresh.patch
 tla-mutant TM-ORDER-ID      spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_NoNonceOrOrderReplay patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-order-id-fresh.patch
 tla-mutant TM-RING-SCOPE    spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_PrivateRingImmuneToPublicCouncil patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-ring-scope.patch
@@ -87,7 +90,7 @@ waive      TM-W-ORIGIN      inv=specs/ParVaultAnonymity.tla::Safety_ZeroOriginLe
 waive      TM-W-DRAIN       inv=specs/ParVaultBootstrapAndEarnedTier.tla::Safety_SeedAnchorsDrainAtOrganicThreshold reason=structural: seed shards = MaxOrganicPeers - organic by construction
 waive      TM-W-DAY1        inv=specs/ParVaultBootstrapAndEarnedTier.tla::Safety_Day1ToScaleDataAvailability reason=structural: recoverable = TierN(tier), TierK < TierN tables
 waive      TM-W-ZK-TYPE     inv=specs/ParVaultZeroKeyAdminAndQuorum.tla::TypeOK reason=type invariant, not a security property; TM-NONCE also violates it (without the nonce guard, nonce 0, meaning no challenge, is accepted and recorded)
-waive      TM-W-VPS-KEY     inv=specs/ParVaultZeroKeyAdminAndQuorum.tla::Safety_ZeroAdminPrivKeyOnVpsDisk reason=structural no-admin-key-persist for a seed given --admin-rpc-pubkey (its test covers that case only) + assume byzantine-below-quorum; a seed without it generates tracker_admin.seed on disk as its council scope root (F-53, open, not modelled)
+waive      TM-W-VPS-KEY     inv=specs/ParVaultZeroKeyAdminAndQuorum.tla::Safety_ZeroAdminPrivKeyOnVpsDisk reason=structural no-admin-key-persist for a seed given --admin-rpc-pubkey (its test covers that case only) + assume byzantine-below-quorum; council member keys are never on a seed disk (the scope root key on disk is modelled by RootOnDisk and guarded by TM-COUNCIL-ROOT-DISK)
 waive      TM-W-SUBNET-CAP  inv=specs/ParVaultConfidentialityAndTrust.tla::Safety_SubnetTrustCapsEnforced reason=assume placement-trust-cap: select_trust_weighted_peers has no production caller in v0.5.0
 waive      TM-W-LITE-TYPE   inv=specs/ParVaultLiteClientAndSeedFailover.tla::TypeOK reason=structural: type invariant
 waive      TM-W-NAS-DEATH   inv=specs/ParVaultLiteClientAndSeedFailover.tla::NasDeathSurvivableInvariant reason=assume mesh-churn-stops-at-k (MeshPeerChurn; threat model, no Rust check)
@@ -170,6 +173,18 @@ claim      F-08      sym=src/storage/council.rs::council_manifest_decision accep
 claim      F-45      sym=src/storage/council.rs::seed_council_install_decision accept=trust_enforcement::c1_epoch1_installed_and_repush_is_idempotent reject=trust_enforcement::c1_in_memory_seed_refuses_install code=reject.council_install_in_memory bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md
 claim      F-45      sym=src/storage/council.rs::seed_council_install_decision accept=trust_enforcement::c1_epoch1_installed_and_repush_is_idempotent reject=trust_enforcement::c1_private_seed_refuses_install code=reject.council_install_not_public bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md
 claim      F-45      sym=src/storage/council.rs::council_manifest_decision accept=trust_enforcement::c1_epoch1_installed_and_repush_is_idempotent reject=trust_enforcement::c1_next_epoch_needs_quorum_of_current code=reject.council_epoch_chain bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md
+# B-26 / F-53 (L-57, L-98): no council rooted on the seed's on-disk key; re-root to an off-disk root.
+claim      F-53      sym=src/storage/council.rs::seed_council_install_decision accept=trust_enforcement::c1_flag_wins_over_existing_seed_file reject=trust_enforcement::c1_on_disk_root_refuses_epoch1 code=reject.council_root_on_disk bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-26-verifiable-abuse-and-council-quorum-governance.md
+claim      F-53      sym=src/storage/council.rs::seed_council_install_decision accept=trust_enforcement::c1_flag_wins_over_existing_seed_file reject=trust_enforcement::c1_flag_equal_to_on_disk_key_still_refused code=reject.council_root_on_disk bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md
+claim      F-53      sym=src/storage/council.rs::council_manifest_decision accept=trust_enforcement::c1_reroot_with_quorum_and_new_root_installs reject=trust_enforcement::c1_reroot_without_new_root_signature_refused code=reject.council_reroot_unsigned bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md
+claim      F-53      sym=src/storage/council.rs::council_manifest_decision accept=trust_enforcement::f53_client_follows_reroot_and_repins reject=trust_enforcement::f53_client_refuses_reroot_below_quorum_or_without_new_root code=reject.council_reroot_unsigned bin=parvault ref=docs/security/TRUST_FINDINGS.md
+claim      F-53      sym=src/storage/council.rs::council_manifest_decision accept=trust_enforcement::f53_client_follows_reroot_and_repins reject=trust_enforcement::f53_private_reroot_refused code=reject.council_reroot_private bin=parvault ref=docs/security/TRUST_FINDINGS.md
+kani       F-53      sym=src/storage/council.rs::seed_council_install_decision harness=proof_seed_council_root_never_on_disk cover=on-disk root refused
+kani       F-53      sym=src/storage/council.rs::council_manifest_decision harness=proof_council_reroot_needs_quorum_and_new_root cover=private re-root refused
+# F-53R (residual, verdict change 11): a client that pinned an on-disk root A can still be handed an
+# A-signed epoch 1 to install by hand (`parvault council install`). Tests and code do not exist yet.
+claim      F-53R     sym=src/storage/council.rs::council_manifest_decision accept=trust_enforcement::f53r_client_installs_epoch1_from_off_disk_root reject=trust_enforcement::f53r_client_refuses_epoch1_from_on_disk_root code=reject.council_root_unattested bin=parvault ref=docs/security/TRUST_FINDINGS.md
+open       F-53R     expect=claim-missing by=v0.6.0 ref=docs/security/TRUST_FINDINGS.md   # residual of B-26: a hand-installed epoch 1 under an on-disk root; design in BACKLOG
 claim      F-09      sym=src/storage/eviction.rs::order_admission_decision accept=trust_enforcement::f09_fresh_order_applied reject=trust_enforcement::f09_stale_or_replayed_order_refused code=reject.order_stale bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-25-hmac-blinded-shard-eviction-and-shredding.md covers=MeshWireRequest::BroadcastEvictionOrder
 # F-17 has no core wire or CLI consumer (only the suite broker verifies statements): a Kani
 # line on the decision, plus unit tests capabilities::tests::f17_* (accept and reject).
@@ -253,4 +268,4 @@ kani       S-SANITIZE sym=src/sync/common.rs::sanitize_sync_relative_path_into h
 claim      B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision accept=trust_enforcement::bseed_second_sender_accepted_while_one_job_runs reject=trust_enforcement::bseed_third_job_refused_busy code=reject.syndication_busy bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe
 kani       B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision harness=proof_syndication_fanout_budget cover=syndication over budget
 
-ratchet    R         open=3 waive=31
+ratchet    R         open=4 waive=31
