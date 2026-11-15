@@ -405,6 +405,13 @@ scripts/doc_commands.py             none    # the docs-commands CI job (plan-7 L
 scripts/check_no_runtime_deps.sh    test    static_build_checks   # L-48 no-runtime check (CI runs it too)
 scripts/check_claim_cfg.sh          test    static_build_checks   # ruling change 5 (CI runs it too)
 scripts/build_bins.sh               full    # builds every CI/release/metrics artifact; an edit can change a feature set
+rust-toolchain.toml                 full    # the compiler for every build and test (L-17)
+scripts/build_release.sh            none    # release flags; release.yml and repro-check.yml (L-17), proof: repro_proof.sh
+scripts/make_bundle.sh              none    # release.yml and repro-check.yml (L-17)
+scripts/make_sums.sh                none    # release.yml; scripts/test_install.sh runs it (L-17)
+scripts/repro_proof.sh              none    # repro-check.yml (L-17)
+scripts/sign_dev_build.sh           none    # run by the Lead on the desktop (L-113)
+security/*                          none    # allowed-signers; scripts/test_install.sh checks install.sh matches (L-113)
 .enforcement.map                    test    static_build_checks   # claim-cfg reads its sym= and harness= keys
 website/*                           none
 deploy/*                            none    # container/procd packaging; Docker gate covers it
@@ -536,6 +543,10 @@ src/bin/parvault-sync.rs        doc     docs/adr/ADR-33-dual-mode-vfs-and-siblin
 tests/gateway_ipc_benchmark.rs  doc     docs/BENCHMARKS.md
 tests/tla_formal_proofs_integration.rs  doc  AGENTS.md
 scripts/install.sh              doc     QUICKSTART.md
+scripts/install.sh              doc     docs/REPRODUCIBLE_BUILDS.md
+scripts/build_release.sh        doc     docs/REPRODUCIBLE_BUILDS.md
+deploy/Dockerfile.build         doc     docs/REPRODUCIBLE_BUILDS.md
+security/*                      doc     docs/REPRODUCIBLE_BUILDS.md
 scripts/gen_metrics.sh          doc     docs/metrics.txt
 src/network/placement.rs        doc     docs/adr/ADR-06-hybrid-locality-and-70-30-placement.md
 src/network/wire_handler.rs     doc     docs/SECURITY_AND_CRYPTOGRAPHY.md
