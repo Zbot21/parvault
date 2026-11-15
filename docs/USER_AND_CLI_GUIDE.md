@@ -71,6 +71,8 @@ Global options (available on all subcommands):
 | `parvault wot install-chain` | `--token <HEX>` *(required)* | Verifies the invitation against its ring key, pins that key (`ring_genesis.pub`) and installs the chain; the node then serves the ring and presents the chain before storing on ring peers. |
 
 > **Council re-pin (public mode):** a re-root installed with `council install` re-pins by itself. After a manual `parvault council repin` to another tracker key, delete `<data_dir>/council_manifest.bin` and run `parvault council install` with the new tracker's manifest; until then the node has no council and accepts no council orders.
+>
+> **New nodes after a re-root (L-104):** a node with no manifest installs epoch 1 only. If the tracker has re-rooted, its epoch 1 is under the old root, so a new node (or a seed that lost its data dir) cannot install the council and refuses council orders until `v0.6.0` (B-107). Never onboard through the old root: do not pin the old key to install its epoch 1 (F-53R). The same holds after `council repin` to a tracker that has re-rooted.
 
 ### 2.3 Continuous Folder Sync, Diff & Disaster Recovery
 | Command | Flags & Arguments | Description |

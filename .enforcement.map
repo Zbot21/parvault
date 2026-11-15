@@ -181,9 +181,11 @@ claim      F-53      sym=src/storage/council.rs::council_manifest_decision accep
 kani       F-53      sym=src/storage/council.rs::seed_council_install_decision harness=proof_seed_council_root_never_on_disk cover=on-disk root refused
 kani       F-53      sym=src/storage/council.rs::council_manifest_decision harness=proof_council_reroot_needs_quorum_and_new_root cover=private re-root refused
 # F-53R (residual, verdict change 11): a client that pinned an on-disk root A can still be handed an
-# A-signed epoch 1 to install by hand (`parvault council install`). Tests and code do not exist yet.
+# A-signed epoch 1 to install by hand (`parvault council install`); and (L-104) a node with no
+# manifest installs epoch 1 only, so new nodes of a re-rooted council get no council until a first
+# install signed by the current root exists (B-107). Tests and code do not exist yet.
 claim      F-53R     sym=src/storage/council.rs::council_manifest_decision accept=trust_enforcement::f53r_client_installs_epoch1_from_off_disk_root reject=trust_enforcement::f53r_client_refuses_epoch1_from_on_disk_root code=reject.council_root_unattested bin=parvault ref=docs/security/TRUST_FINDINGS.md
-open       F-53R     expect=claim-missing by=v0.6.0 ref=docs/security/TRUST_FINDINGS.md   # residual of B-26: a hand-installed epoch 1 under an on-disk root; design in BACKLOG
+open       F-53R     expect=claim-missing by=v0.6.0 ref=docs/security/TRUST_FINDINGS.md   # residual of B-26: a hand-installed epoch 1 under an on-disk root, and no council for new nodes after a re-root (L-104, B-107)
 claim      F-09      sym=src/storage/eviction.rs::order_admission_decision accept=trust_enforcement::f09_fresh_order_applied reject=trust_enforcement::f09_stale_or_replayed_order_refused code=reject.order_stale bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-25-hmac-blinded-shard-eviction-and-shredding.md covers=MeshWireRequest::BroadcastEvictionOrder
 # F-17 has no core wire or CLI consumer (only the suite broker verifies statements): a Kani
 # line on the decision, plus unit tests capabilities::tests::f17_* (accept and reject).
