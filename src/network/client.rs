@@ -1945,7 +1945,10 @@ impl MeshClient {
         Ok(ack_obs.or(pre_observed))
     }
 
-    /// Looks up, decrypts, verifies, and pins 4-word WAN pairing cards from `anchor_addr`.
+    /// Looks up, decrypts and verifies 4-word WAN pairing cards from `anchor_addr`. It pins
+    /// nothing: the caller pins a card only after `wan_card_pairing_decision` accepts it (F-54,
+    /// B-45), so a card a rendezvous server forged never reaches `known_peers.json` or this
+    /// client's healed and discovered address sets.
     pub fn lookup_wan_pairing_cards(
         &self,
         anchor_addr: &str,
@@ -1963,7 +1966,6 @@ impl MeshClient {
                 if !card.is_expired(now)
                     && local_pid.as_deref() != Some(card.libp2p_peer_id.as_str())
                 {
-                    self.ingest_verified_wan_card(&card);
                     out.push(card);
                 }
             }

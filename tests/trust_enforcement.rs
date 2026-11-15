@@ -1748,10 +1748,11 @@ fn b45_identity(dir: &Path) -> (NodeIdentity, String, String) {
     (ident, pid, fp)
 }
 
-/// Runs `parvault join --wan --code <code>` from a fresh data dir against `anchor`.
-fn b45_join(anchor: &Node, label: &str, code: &str) -> std::process::Output {
+/// Runs `parvault join --wan --code <code>` from a fresh data dir against `anchor`; also returns
+/// the joiner's `known_peers.json` (empty when absent).
+fn b45_join(anchor: &Node, label: &str, code: &str) -> (std::process::Output, String) {
     let (_root, dir, reg, _log) = prepare(label);
-    Command::new(env!("CARGO_BIN_EXE_parvault"))
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
         .env("PARVAULT_LAN_REGISTRY_DIR", &reg)
         .env("RUST_LOG", "warn")
         .env("NO_COLOR", "1")
@@ -1760,7 +1761,9 @@ fn b45_join(anchor: &Node, label: &str, code: &str) -> std::process::Output {
         .args(["--no-lan-discovery", "--seed-addr", &anchor.addr])
         .args(["join", "--wan", "--code", code])
         .output()
-        .expect("run parvault join --wan")
+        .expect("run parvault join --wan");
+    let known = std::fs::read_to_string(dir.join("known_peers.json")).unwrap_or_default();
+    (out, known)
 }
 
 /// B-45 accept: a card signed by the identity the typed code derives from is joined.
@@ -1771,8 +1774,9 @@ fn b45_wan_card_of_code_identity_joined() {
     let (peer, peer_pid, peer_fp) = b45_identity(&peer_dir);
     let code = derive_4word_pairing_sas(&peer_pid, Some(&peer_fp), DEFAULT_LAN_PAIRING_NONCE).code;
     b45_register(&anchor, &peer, &peer_fp, &code);
-    let out = b45_join(&anchor, "b45-a-joiner", &code);
+    let (out, known) = b45_join(&anchor, "b45-a-joiner", &code);
     let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(known.contains(&peer_pid), "known_peers.json:\n{known}");
     assert!(
         out.status.success() && stdout.contains(&peer_pid),
         "stdout:\n{stdout}\nstderr:\n{}",
@@ -1793,7 +1797,10 @@ fn b45_wan_card_of_other_identity_refused() {
     let (forger, forger_pid, _) = b45_identity(&forger_dir);
     // The forger claims the honest peer's PQ fingerprint; only its own PeerId differs.
     b45_register(&anchor, &forger, &peer_fp, &code);
-    let out = b45_join(&anchor, "b45-r-joiner", &code);
+    let (out, known) = b45_join(&anchor, "b45-r-joiner", &code);
+    // Nothing is pinned on disk; the healed and discovered address sets of the CLI's MeshClient
+    // are in-memory and end with the process, and the lookup no longer fills them either.
+    assert!(!known.contains(&forger_pid), "forged card pinned:\n{known}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
