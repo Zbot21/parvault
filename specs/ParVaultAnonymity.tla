@@ -15,9 +15,14 @@ EXTENDS Naturals, Sequences, FiniteSets, TLC
 \*     inner layer; the single-layer `RelayPqOnionEnvelope` carries `capability` and `voucher`
 \*     as outer fields (`src/network/behaviour.rs`), so that relay sees them (not modelled as a
 \*     claim). The entry relay sees the originator's connection (L-38).
-\*   - The storage target observes the relay, never the owner, on either path; the voucher
-\*     issuer is visible to the target but is a fresh key per shard (L-39). Checked:
-\*     Safety_ZeroOriginLeakage.
+\*   - The storage target observes the relay, never the owner's connection, on either path.
+\*     Checked: Safety_ZeroOriginLeakage. The voucher issuer is visible to the target and must
+\*     be one it trusts (F-24 issuer policy, `voucher_issuer_decision`): a ring member or the
+\*     configured issuer, so it is not a fresh key per shard, and originator anonymity toward
+\*     the target holds only for a voucher the originator did not issue (L-39). Ephemeral
+\*     per-shard issuers (`mint_blinded_ephemeral`) are refused by that policy and are not
+\*     modelled (L-47; unlinkable vouchers are v0.6.0). The issuer check is not yet a guard
+\*     here (no QA mutant; B-43).
 \*   - Voucher nullifiers are spent once (guard `nullifier-fresh`). Checked:
 \*     Safety_NoVoucherDoubleSpend.
 \*   - Blinded locators and K_user never on the wire make pool grouping infeasible:
@@ -44,31 +49,29 @@ Senders == {"None", "OwnerNode", "RelayNode"}
 NullifierFresh(v, spent) == v \notin spent   \* @guard nullifier-fresh sym=src/storage/anonymity.rs::redeem_voucher
 
 VARIABLES
-    mintedVouchers,             \* Count of owner-minted ephemeral-issuer bearer vouchers (0..MaxVouchers)
+    mintedVouchers,             \* Count of minted bearer vouchers, trusted issuer (0..MaxVouchers)
     spentNullifiers,            \* Set of redeemed voucher nullifier IDs (SUBSET (1..MaxVouchers))
-    ephemeralIssuerIds,         \* Set of distinct ephemeral voucher issuer pubkeys observed (SUBSET (1..MaxVouchers))
     anonymousShardsStored,      \* Count of blinded shards stored across storage cohort (0..MaxVouchers)
     relayedUploads,             \* Count of shards delivered through an onion relay (0..MaxVouchers)
     observedSender,             \* Sender identity observed by the storage node ("None" or "RelayNode")
     rejectedDoubleSpends        \* Count of rejected voucher replay attempts (0..1)
 
-vars == <<mintedVouchers, spentNullifiers, ephemeralIssuerIds, anonymousShardsStored,
+vars == <<mintedVouchers, spentNullifiers, anonymousShardsStored,
           relayedUploads, observedSender, rejectedDoubleSpends>>
 
 Init ==
     /\ mintedVouchers        = 0
     /\ spentNullifiers       = {}
-    /\ ephemeralIssuerIds    = {}
     /\ anonymousShardsStored = 0
     /\ relayedUploads        = 0
     /\ observedSender        = "None"
     /\ rejectedDoubleSpends  = 0
 
-\* The vault owner mints an unlinkable voucher under a fresh per-shard ephemeral issuer key.
+\* A voucher is minted by an issuer the target trusts (F-24); the issuer key is visible (L-39).
 MintQuotaVoucher ==
     /\ mintedVouchers < MaxVouchers
     /\ mintedVouchers' = mintedVouchers + 1
-    /\ UNCHANGED <<spentNullifiers, ephemeralIssuerIds, anonymousShardsStored,
+    /\ UNCHANGED <<spentNullifiers, anonymousShardsStored,
                    relayedUploads, observedSender, rejectedDoubleSpends>>
 
 \* A shard is relayed (2-layer or single-layer path; the target sees the relay on both) and
@@ -79,7 +82,6 @@ RelayAndStoreAnonymousShard(v, path) ==
     /\ v <= mintedVouchers
     /\ NullifierFresh(v, spentNullifiers)
     /\ spentNullifiers'       = spentNullifiers \cup {v}
-    /\ ephemeralIssuerIds'    = ephemeralIssuerIds \cup {v}
     /\ anonymousShardsStored' = anonymousShardsStored + 1
     /\ relayedUploads'        = relayedUploads + 1
     /\ observedSender'        = "RelayNode"
@@ -96,7 +98,7 @@ AttemptVoucherDoubleSpend(v) ==
             /\ UNCHANGED rejectedDoubleSpends
        ELSE /\ rejectedDoubleSpends' = rejectedDoubleSpends + 1
             /\ UNCHANGED <<anonymousShardsStored, relayedUploads>>
-    /\ UNCHANGED <<mintedVouchers, spentNullifiers, ephemeralIssuerIds, observedSender>>
+    /\ UNCHANGED <<mintedVouchers, spentNullifiers, observedSender>>
 
 \* Terminal stuttering step once all shards are stored and a replay was refused.
 Idle ==
@@ -117,12 +119,11 @@ Spec ==
     /\ WF_vars(Next)
 
 \* 1. Zero origin leakage at the target (scoped, L-38 / L-39): on either onion path the storage
-\* target observes the relay, never the owner, and every stored shard has its own issuer key.
+\* target observes the relay, never the owner's connection. The issuer is not covered (L-39).
 Safety_ZeroOriginLeakage ==
     /\ observedSender /= "OwnerNode"
     /\ observedSender \in Senders
     /\ relayedUploads = anonymousShardsStored
-    /\ Cardinality(ephemeralIssuerIds) = anonymousShardsStored
 
 \* 2. No voucher double-spend: every stored shard has its own spent nullifier.
 Safety_NoVoucherDoubleSpend ==
