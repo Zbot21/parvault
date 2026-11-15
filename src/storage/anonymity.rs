@@ -376,6 +376,12 @@ pub fn nullifier_cache_decision(live_entries: usize) -> Result<(), &'static str>
     }
 }
 
+/// A voucher is accepted only after its nullifier is on disk (when the ledger persists): a spend
+/// held only in memory is lost on restart and the voucher could be redeemed twice (F-55).
+pub fn nullifier_persist_decision<E>(persisted: Result<(), E>) -> Result<(), &'static str> {
+    persisted.map_err(|_| "reject.voucher_nullifier_not_persisted")
+}
+
 impl AnonymousQuotaVoucher {
     /// Mints a fresh single-use bearer storage voucher for up to `max_bytes` using `OsRng` (`E4`).
     pub fn mint(issuer: &NodeIdentity, max_bytes: u64) -> Self {
@@ -579,8 +585,17 @@ impl VoucherNullifierLedger {
             .insert(voucher.voucher_nonce, voucher.expires_at_ms);
         if let Some(ref path) = self.persistence_path {
             let entries: Vec<([u8; 32], u64)> = self.spent.iter().map(|(n, e)| (*n, *e)).collect();
-            if let Ok(bytes) = bincode::serialize(&entries) {
-                let _ = crate::storage::fsio::atomic_write_file(path, &bytes);
+            let persisted = bincode::serialize(&entries)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| {
+                    crate::storage::fsio::atomic_write_file(path, &bytes).map_err(|e| e.to_string())
+                });
+            if let Err(code) = nullifier_persist_decision(persisted.as_ref().map(|_| ())) {
+                // Fail closed (F-55): a spend that is not on disk would be forgotten on restart
+                // and the voucher could be redeemed again, so the voucher is refused unspent.
+                self.spent.remove(&voucher.voucher_nonce);
+                tracing::warn!(code, error = %persisted.unwrap_err(), "refused a voucher");
+                return Err(StorageError::QuotaExceeded(code.into()));
             }
         }
         Ok(())
@@ -689,6 +704,38 @@ mod tests {
 
     /// F-35 (plan 2c fact 5): a full ledger refuses a new voucher instead of evicting a live
     /// nullifier, so a spent voucher is never redeemable again while it is fresh.
+    #[test]
+    fn unpersisted_nullifier_refuses_voucher_unspent() {
+        // F-55 differential: the same voucher against a writable and a blocked ledger file.
+        let issuer = NodeIdentity::generate();
+        let v = AnonymousQuotaVoucher::mint(&issuer, 4096);
+        let ok_dir = tempfile::tempdir().unwrap();
+        let mut ok =
+            VoucherNullifierLedger::with_persistence_dir(issuer.public_key_bytes(), ok_dir.path());
+        assert!(ok.redeem_voucher(&v, 1024).is_ok());
+        let reloaded =
+            VoucherNullifierLedger::with_persistence_dir(issuer.public_key_bytes(), ok_dir.path());
+        assert_eq!(reloaded.spent_count(), 1, "the spend survives a restart");
+
+        let bad_dir = tempfile::tempdir().unwrap();
+        let blocker = bad_dir.path().join("voucher_nullifiers.bin");
+        std::fs::create_dir(&blocker).unwrap();
+        let mut bad =
+            VoucherNullifierLedger::with_persistence_dir(issuer.public_key_bytes(), bad_dir.path());
+        match bad.redeem_voucher(&v, 1024) {
+            Err(StorageError::QuotaExceeded(code)) => {
+                assert_eq!(code, "reject.voucher_nullifier_not_persisted")
+            }
+            other => panic!("expected a persist refusal, got {other:?}"),
+        }
+        assert_eq!(bad.spent_count(), 0, "a refused voucher is not burned");
+        std::fs::remove_dir(&blocker).unwrap();
+        assert!(
+            bad.redeem_voucher(&v, 1024).is_ok(),
+            "redeemable once the disk is back"
+        );
+    }
+
     #[test]
     fn spent_voucher_never_redeemable_again_while_fresh() {
         let issuer = NodeIdentity::from_seed([0x2C; 32]);

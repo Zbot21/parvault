@@ -3726,6 +3726,33 @@ fn f35_expired_voucher_refused() {
     gate_ran("trust_enforcement::f35_expired_voucher_refused");
 }
 
+/// F-55 accept: with a writable ledger file the voucher is redeemed and its nullifier is on disk.
+#[test]
+fn f55_persisted_nullifier_voucher_redeemed() {
+    let node = spawn_daemon("f55-a");
+    let sender = key(0xB5);
+    let b = blinded(0x5B, 512);
+    let resp = send(&sender, &node, blinded_put(&b, &sender));
+    assert!(format!("{resp:?}").contains("stored: true"), "{resp:?}");
+    assert!(node.dir.join("voucher_nullifiers.bin").is_file());
+    gate_ran("trust_enforcement::f55_persisted_nullifier_voucher_redeemed");
+}
+
+/// F-55 reject: the same put when the nullifier cannot be written (the ledger path is a
+/// directory) is refused unspent instead of accepted with the spend held only in memory.
+#[test]
+fn f55_unpersisted_nullifier_voucher_refused() {
+    let (root, dir, reg, log) = prepare("f55-r");
+    std::fs::create_dir_all(dir.join("voucher_nullifiers.bin")).unwrap();
+    let node = spawn(daemon_command(&dir, &reg), root, dir, log);
+    let sender = key(0xB5);
+    let b = blinded(0x5B, 512);
+    let resp = send(&sender, &node, blinded_put(&b, &sender));
+    assert!(format!("{resp:?}").contains("stored: false"), "{resp:?}");
+    assert_logged(&node, "reject.voucher_nullifier_not_persisted");
+    gate_ran("trust_enforcement::f55_unpersisted_nullifier_voucher_refused");
+}
+
 /// `evict --propagate` refuses when this node is not a member of its installed council (it has
 /// none here); the local eviction still applies.
 #[test]

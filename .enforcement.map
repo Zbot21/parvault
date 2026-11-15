@@ -178,6 +178,7 @@ claim      F-24-ISSUER sym=src/network/wire_handler.rs::voucher_issuer_decision 
 claim      F-34      sym=src/por/verifier.rs::verify_audit_response accept=trust_enforcement::f34_chunk_proof_verified reject=trust_enforcement::f34_wrong_chunk_proof_refused code=reject.por_chunk_proof_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md
 open       F-34      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
 claim      F-35      sym=src/storage/anonymity.rs::voucher_freshness_decision accept=trust_enforcement::f35_fresh_voucher_redeemed reject=trust_enforcement::f35_expired_voucher_refused code=reject.voucher_expired bin=parvault ref=docs/security/TRUST_FINDINGS.md
+claim      F-55      sym=src/storage/anonymity.rs::nullifier_persist_decision accept=trust_enforcement::f55_persisted_nullifier_voucher_redeemed reject=trust_enforcement::f55_unpersisted_nullifier_voucher_refused code=reject.voucher_nullifier_not_persisted bin=parvault ref=docs/security/TRUST_FINDINGS.md
 
 # --- F-38 (2e): a syndication repair grant must be owned by the sender (L-40) ---
 claim      F-38      sym=src/network/wire_handler.rs::syndication_grant_decision accept=trust_enforcement::f38_sender_owned_grant_accepted reject=trust_enforcement::f38_foreign_owner_grant_refused code=reject.syndication_grant_not_sender bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-20-lite-client-seed-syndication-and-failover.md

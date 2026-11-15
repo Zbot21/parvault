@@ -337,7 +337,7 @@ async fn main() -> anyhow::Result<()> {
             let _ = mesh_client.announce_and_discover_public_tracker(tracker, None);
         }
         for pk in mesh_client.pinned_tracker_admin_pubkeys() {
-            cfg.persist_pinned_tracker_admin(pk);
+            cfg.persist_pinned_tracker_admin(pk)?;
         }
     }
 

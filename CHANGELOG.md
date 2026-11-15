@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+- **A voucher whose nullifier cannot be saved is refused (F-55, B-42).** `VoucherNullifierLedger` used to accept the voucher and drop a failed write, so after a restart the same voucher could be redeemed again. It now removes the nullifier and refuses with `reject.voucher_nullifier_not_persisted`.
+- **Quota state and tracker pins fail closed on a failed write (B-52).** After a failed `quota_state.bin` write the node refuses new shards (`reject.quota_state_not_persisted`) until a write succeeds. `persist_pinned_tracker_admin` returns an error instead of dropping a failed write, and no longer replaces an unreadable pin file with a new list.
+- **The WebDAV server shuts down under packet loss (B-56).** Shutdown sent one 100 ms wake connect; a lost SYN left the accept thread waiting forever. It now retries the wake until the thread exits. The netem MP4 gate checks the median of 5 cold TTFB samples, so one TCP retransmit no longer fails it.
+
 ---
 
 ## [`0.5.0`] - 2026-11-14

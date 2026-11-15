@@ -1084,25 +1084,64 @@ impl NodeConfig {
     }
 
     /// Persists a discovered Public Tracker Admin Ed25519 pubkey into `<data_dir>/pinned_tracker_admins.json`.
-    pub fn persist_pinned_tracker_admin(&self, admin_pubkey: [u8; 32]) {
+    /// Fails closed (B-52): an unreadable or undecodable pin file is an error, not an empty list
+    /// that the next write would replace (dropping every earlier pin), and a failed write is an
+    /// error, not a pin that the next run silently re-learns.
+    pub fn persist_pinned_tracker_admin(&self, admin_pubkey: [u8; 32]) -> anyhow::Result<()> {
         let pinned_path = self.data_dir.join("pinned_tracker_admins.json");
-        let mut list: Vec<String> = std::fs::read_to_string(&pinned_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let mut list: Vec<String> = match std::fs::read_to_string(&pinned_path) {
+            Ok(s) => serde_json::from_str(&s).map_err(|e| {
+                anyhow::anyhow!(
+                    "reject.tracker_pins_unreadable: {}: {e}",
+                    pinned_path.display()
+                )
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => anyhow::bail!(
+                "reject.tracker_pins_unreadable: {}: {e}",
+                pinned_path.display()
+            ),
+        };
         let hex_pk = hex::encode(admin_pubkey);
         if !list.iter().any(|existing| existing == &hex_pk) {
             list.push(hex_pk);
-            if let Ok(json) = serde_json::to_vec_pretty(&list) {
-                let _ = crate::storage::fsio::atomic_write_file(&pinned_path, &json);
-            }
+            let json = serde_json::to_vec_pretty(&list)?;
+            crate::storage::fsio::atomic_write_file(&pinned_path, &json).map_err(|e| {
+                anyhow::anyhow!(
+                    "reject.tracker_pin_not_persisted: {}: {e}",
+                    pinned_path.display()
+                )
+            })?;
         }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tracker_pin_persist_fails_closed() {
+        // B-52: pins are written; a corrupt pin file is an error and is left untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = NodeConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..NodeConfig::default()
+        };
+        cfg.persist_pinned_tracker_admin([1; 32]).unwrap();
+        cfg.persist_pinned_tracker_admin([2; 32]).unwrap();
+        let path = dir.path().join("pinned_tracker_admins.json");
+        let pins: Vec<String> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(pins.len(), 2);
+        std::fs::write(&path, b"{not json").unwrap();
+        let err = cfg.persist_pinned_tracker_admin([3; 32]).unwrap_err();
+        assert!(
+            err.to_string().contains("reject.tracker_pins_unreadable"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"{not json");
+    }
 
     #[test]
     fn test_hardware_profile_parameters_and_backward_compatible_toml() {

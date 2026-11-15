@@ -270,7 +270,7 @@ pub(crate) async fn report_abuse(env: CliEnv, command: Commands) -> anyhow::Resu
     let (ack_report_id, ack_sha) =
         mesh_client.submit_abuse_takedown_report_detailed(&target_tracker, report)?;
     for pk in mesh_client.pinned_tracker_admin_pubkeys() {
-        cfg.persist_pinned_tracker_admin(pk);
+        cfg.persist_pinned_tracker_admin(pk)?;
     }
     let verified_sha = ack_sha.unwrap_or(local_proof.verified_plaintext_sha256);
 

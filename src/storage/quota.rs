@@ -123,6 +123,10 @@ pub struct QuotaManager {
     observed_free_disk_bytes: Option<u64>,
     #[serde(skip)]
     persistence_path: Option<std::path::PathBuf>,
+    /// Set while the last `quota_state.bin` write failed (B-52): the disk copy is stale, so
+    /// [`Self::quota_decision`] refuses new shards until a later write succeeds.
+    #[serde(skip)]
+    persist_failed: std::cell::Cell<bool>,
 }
 
 impl QuotaManager {
@@ -138,6 +142,7 @@ impl QuotaManager {
             min_free_disk_bytes: 0,
             observed_free_disk_bytes: None,
             persistence_path: None,
+            persist_failed: std::cell::Cell::new(false),
         }
     }
 
@@ -184,9 +189,19 @@ impl QuotaManager {
 
     fn persist(&self) {
         if let Some(ref path) = self.persistence_path {
-            if let Ok(bytes) = bincode::serialize(self) {
-                let _ = crate::storage::fsio::atomic_write_file(path, &bytes);
+            let written = bincode::serialize(self)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| {
+                    crate::storage::fsio::atomic_write_file(path, &bytes).map_err(|e| e.to_string())
+                });
+            if let Err(error) = &written {
+                tracing::warn!(
+                    code = "reject.quota_state_not_persisted",
+                    %error,
+                    "quota state write failed; refusing new shards until a write succeeds"
+                );
             }
+            self.persist_failed.set(written.is_err());
         }
     }
 
@@ -260,7 +275,12 @@ impl QuotaManager {
     /// ADR-07: a shard is accepted only within the disk reserve and node capacity and, for a
     /// remote peer, within its quota (bootstrap grace plus earned allowance) and its per-epoch
     /// write ceiling (4x the quota, so put/delete loops cannot wear out flash).
+    /// Fails closed while the last state write failed (B-52), so no shard is accepted that a
+    /// restart would forget.
     pub fn quota_decision(&self, peer_id: &str, shard_bytes: u64) -> Result<(), &'static str> {
+        if self.persist_failed.get() {
+            return Err("reject.quota_state_not_persisted");
+        }
         if let Some(free_bytes) = self.observed_free_disk_bytes {
             if free_bytes.saturating_sub(shard_bytes) < self.min_free_disk_bytes {
                 return Err("reject.disk_reserve");
@@ -393,5 +413,30 @@ impl QuotaManager {
             }
         }
         evicted
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_state_write_refuses_new_shards_until_a_write_succeeds() {
+        // B-52 differential: same shard, writable then blocked then restored state file.
+        let dir = tempfile::tempdir().unwrap();
+        let mut q = QuotaManager::with_persistence_dir(1 << 30, 1 << 20, dir.path());
+        assert!(q.quota_decision("local", 1024).is_ok());
+        let path = dir.path().join("quota_state.bin");
+        let _ = std::fs::remove_file(&path);
+        std::fs::create_dir(&path).unwrap();
+        q.record_shard_stored("local", "a".into(), 1024);
+        assert_eq!(
+            q.quota_decision("local", 1024),
+            Err("reject.quota_state_not_persisted")
+        );
+        std::fs::remove_dir(&path).unwrap();
+        q.flush_persistence();
+        assert!(q.quota_decision("local", 1024).is_ok());
+        assert!(path.is_file());
     }
 }
