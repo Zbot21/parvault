@@ -263,7 +263,7 @@ mkdir -p /etc/parvault /mnt/nas/.parvault-data /mnt/nas/shared
 ### Configuration File (`/etc/parvault/router.toml`)
 Copy `deploy/router-soc/parvault-router.toml`:
 ```toml
-# ParVault v0.5.1 Turnkey Router Cloud-NAS Configuration (ADR-21)
+# ParVault v0.5.2 Turnkey Router Cloud-NAS Configuration (ADR-21)
 # Designed for OpenWrt / prplOS / ARM64 & x86_64 Gateway SoCs (<= 32-48 MiB cgroup RAM)
 
 hardware_profile = "router-soc"
@@ -338,7 +338,7 @@ For carrier and broadband gateway environments running `prplOS`, deploy `parvaul
   "schema_version": "1.0",
   "container_name": "parvault-router-nas",
   "vendor": "Neighborhood Cloud / Project ParVault",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "license": "AGPL-3.0-only",
   "target_platforms": [
     "aarch64-unknown-linux-musl",
@@ -413,7 +413,7 @@ Every request must present a read-only token (`parvault token mint --read-only`)
   ```
   ```json
   {
-    "version": "0.5.1",
+    "version": "0.5.2",
     "node_label": "OpenWrt-CloudNAS",
     "hardware_profile": "router-soc",
     "device_peer_id": "12D3KooWSDu7w4v...",

@@ -14,7 +14,7 @@ INSTALL_DIR="${PARVAULT_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 # GitHub has no "Latest" release to resolve. gen_metrics.sh fails if it differs from Cargo.toml's
 # version, and release.yml fails if it differs from the tag. PARVAULT_VERSION=latest asks GitHub
 # for its "Latest" release, which does not exist (404) while every release is a pre-release.
-VERSION="${PARVAULT_VERSION:-v0.5.1}"
+VERSION="${PARVAULT_VERSION:-v0.5.2}"
 BINS="${PARVAULT_BINS:-parvault parvault-seed parvault-fuse parvault-sync parvault-status}"
 
 ARCH="$(uname -m)"
