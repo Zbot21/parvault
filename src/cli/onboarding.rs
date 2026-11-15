@@ -366,7 +366,8 @@ pub(crate) async fn join(env: CliEnv, command: Commands) -> anyhow::Result<()> {
         );
     };
 
-    let mut store = KnownPeersStore::load(&cfg.data_dir);
+    // B-52: a known_peers.json that exists but does not load is refused, never replaced.
+    let mut store = KnownPeersStore::try_load(&cfg.data_dir)?;
     store.upsert_pinned_multiaddr(&peer_id, &multiaddr, Some(&label), Some(&role));
     store.save(&cfg.data_dir)?;
 

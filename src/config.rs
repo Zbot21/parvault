@@ -1102,19 +1102,13 @@ impl NodeConfig {
     /// error, not a pin that the next run silently re-learns.
     pub fn persist_pinned_tracker_admin(&self, admin_pubkey: [u8; 32]) -> anyhow::Result<()> {
         let pinned_path = self.data_dir.join("pinned_tracker_admins.json");
-        let mut list: Vec<String> = match std::fs::read_to_string(&pinned_path) {
-            Ok(s) => serde_json::from_str(&s).map_err(|e| {
-                anyhow::anyhow!(
-                    "reject.tracker_pins_unreadable: {}: {e}",
-                    pinned_path.display()
-                )
-            })?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => anyhow::bail!(
-                "reject.tracker_pins_unreadable: {}: {e}",
-                pinned_path.display()
-            ),
+        let read = match std::fs::read(&pinned_path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
         };
+        let mut list = tracker_pins_load_decision(read)
+            .map_err(|code| anyhow::anyhow!("{code}: {}", pinned_path.display()))?;
         let hex_pk = hex::encode(admin_pubkey);
         if !list.iter().any(|existing| existing == &hex_pk) {
             list.push(hex_pk);
@@ -1127,6 +1121,20 @@ impl NodeConfig {
             })?;
         }
         Ok(())
+    }
+}
+
+/// B-52: how a `pinned_tracker_admins.json` read loads before a new pin is added. A missing file
+/// is an empty list; one that exists but cannot be read or decoded is refused
+/// (`reject.tracker_pins_unreadable`), never treated as empty: the write that follows would drop
+/// every earlier pin.
+pub fn tracker_pins_load_decision(
+    read: std::io::Result<Option<Vec<u8>>>,
+) -> Result<Vec<String>, &'static str> {
+    match read {
+        Ok(None) => Ok(Vec::new()),
+        Ok(Some(raw)) => serde_json::from_slice(&raw).map_err(|_| "reject.tracker_pins_unreadable"),
+        Err(_) => Err("reject.tracker_pins_unreadable"),
     }
 }
 

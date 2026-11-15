@@ -1815,6 +1815,177 @@ fn b45_wan_card_of_other_identity_refused() {
     gate_ran("trust_enforcement::b45_wan_card_of_other_identity_refused");
 }
 
+// --- B-52 (QA): an unloadable known_peers.json is refused, never overwritten ---------------------------
+
+/// Runs `parvault join --wan --code <code>` against `anchor` from a data dir whose
+/// `known_peers.json` is `known` (bytes) or, for `None`, a directory where the file belongs
+/// (exists but cannot be read). Returns the output, the joiner's data dir, and its temp root.
+fn b52_join_with_known_peers(
+    anchor: &Node,
+    label: &str,
+    code: &str,
+    known: Option<&[u8]>,
+) -> (std::process::Output, PathBuf, TempDir) {
+    let (root, dir, reg, _log) = prepare(label);
+    match known {
+        Some(bytes) => std::fs::write(dir.join("known_peers.json"), bytes).unwrap(),
+        None => std::fs::create_dir_all(dir.join("known_peers.json")).unwrap(),
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .env("RUST_LOG", "warn")
+        .env("NO_COLOR", "1")
+        .arg("--data-dir")
+        .arg(&dir)
+        .args(["--no-lan-discovery", "--seed-addr", &anchor.addr])
+        .args(["join", "--wan", "--code", code])
+        .output()
+        .expect("run parvault join --wan");
+    (out, dir, root)
+}
+
+/// A real `known_peers.json` holding one pinned tracker-admin key.
+fn b52_known_peers_with_admin_pin() -> Vec<u8> {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = parvault::network::KnownPeersStore::default();
+    store.pin_tracker_admin_pubkey("tracker.example:4001", [0xA7; 32]);
+    store.save(tmp.path()).unwrap();
+    std::fs::read(tmp.path().join("known_peers.json")).unwrap()
+}
+
+/// Registers an honest card on a fresh anchor; returns the anchor, the code, and the peer's PeerId.
+fn b52_anchor_with_card(label: &str) -> (Node, String, String) {
+    let anchor = spawn_daemon(label);
+    let (_peer_root, peer_dir, _, _) = prepare(&format!("{label}-peer"));
+    let (peer, peer_pid, peer_fp) = b45_identity(&peer_dir);
+    let code = derive_4word_pairing_sas(&peer_pid, Some(&peer_fp), DEFAULT_LAN_PAIRING_NONCE).code;
+    b45_register(&anchor, &peer, &peer_fp, &code);
+    (anchor, code, peer_pid)
+}
+
+/// B-52 (QA) accept: `join` with a `known_peers.json` that loads pins the new peer and keeps the
+/// earlier tracker-admin pin.
+#[test]
+fn b52_loaded_known_peers_join_keeps_pins() {
+    let (anchor, code, peer_pid) = b52_anchor_with_card("b52-ka");
+    let known = b52_known_peers_with_admin_pin();
+    let (out, dir, _root) =
+        b52_join_with_known_peers(&anchor, "b52-ka-joiner", &code, Some(&known));
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = parvault::network::KnownPeersStore::try_load(&dir).unwrap();
+    assert!(after.peers.contains_key(&peer_pid), "{after:?}");
+    assert_eq!(after.pinned_tracker_admin_pubkeys(), vec![[0xA7; 32]]);
+    gate_ran("trust_enforcement::b52_loaded_known_peers_join_keeps_pins");
+}
+
+/// B-52 (QA) reject: the same join when `known_peers.json` does not decode fails with its reason
+/// code and leaves the file as it was; saving over it would drop every pin.
+#[test]
+fn b52_corrupt_known_peers_join_refused() {
+    let (anchor, code, _) = b52_anchor_with_card("b52-kc");
+    let corrupt = b"{\"peers\": {\"truncat";
+    let (out, dir, _root) =
+        b52_join_with_known_peers(&anchor, "b52-kc-joiner", &code, Some(corrupt));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("reject.known_peers_corrupt"),
+        "stderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("known_peers.json")).unwrap(),
+        corrupt
+    );
+    gate_ran("trust_enforcement::b52_corrupt_known_peers_join_refused");
+}
+
+/// B-52 (QA) reject: the same join when `known_peers.json` exists but cannot be read.
+#[test]
+fn b52_unreadable_known_peers_join_refused() {
+    let (anchor, code, _) = b52_anchor_with_card("b52-ku");
+    let (out, dir, _root) = b52_join_with_known_peers(&anchor, "b52-ku-joiner", &code, None);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("reject.known_peers_unreadable"),
+        "stderr:\n{stderr}"
+    );
+    assert!(dir.join("known_peers.json").is_dir());
+    gate_ran("trust_enforcement::b52_unreadable_known_peers_join_refused");
+}
+
+/// Runs `parvault --public status` from a data dir whose `known_peers.json` holds one tracker-admin
+/// pin (so the run persists it to `pinned_tracker_admins.json`) and whose
+/// `pinned_tracker_admins.json` is `pins`.
+fn b52_public_run_with_tracker_pins(
+    label: &str,
+    pins: &[u8],
+) -> (std::process::Output, PathBuf, TempDir) {
+    let (root, dir, reg, _log) = prepare(label);
+    std::fs::write(
+        dir.join("known_peers.json"),
+        b52_known_peers_with_admin_pin(),
+    )
+    .unwrap();
+    std::fs::write(dir.join("pinned_tracker_admins.json"), pins).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env_remove("PARVAULT_GENESIS_SEED_HEX")
+        .env_remove("PARVAULT_PEERS")
+        .env_remove("PARVAULT_TRACKERS")
+        .env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .env("RUST_LOG", "warn")
+        .env("NO_COLOR", "1")
+        .arg("--data-dir")
+        .arg(&dir)
+        .args(["--no-lan-discovery", "--public", "status"])
+        .output()
+        .expect("run parvault --public status");
+    (out, dir, root)
+}
+
+/// B-52 accept: a `pinned_tracker_admins.json` that loads gets the learned tracker-admin pin
+/// added next to its earlier one.
+#[test]
+fn b52_loaded_tracker_pins_pin_persisted() {
+    let earlier = format!("[\"{}\"]", hex::encode([0x5E; 32]));
+    let (out, dir, _root) = b52_public_run_with_tracker_pins("b52-ta", earlier.as_bytes());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("reject.tracker_pins"), "stderr:\n{stderr}");
+    let pins: Vec<String> =
+        serde_json::from_slice(&std::fs::read(dir.join("pinned_tracker_admins.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        pins,
+        vec![hex::encode([0x5E; 32]), hex::encode([0xA7; 32])],
+        "stderr:\n{stderr}"
+    );
+    gate_ran("trust_enforcement::b52_loaded_tracker_pins_pin_persisted");
+}
+
+/// B-52 reject: the same run when `pinned_tracker_admins.json` does not decode fails with its
+/// reason code and leaves the file as it was; writing over it would drop every earlier pin.
+#[test]
+fn b52_corrupt_tracker_pins_run_refused() {
+    let corrupt = b"[\"5e5e";
+    let (out, dir, _root) = b52_public_run_with_tracker_pins("b52-tc", corrupt);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("reject.tracker_pins_unreadable"),
+        "stderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("pinned_tracker_admins.json")).unwrap(),
+        corrupt
+    );
+    gate_ran("trust_enforcement::b52_corrupt_tracker_pins_run_refused");
+}
+
 // --- F-25: syndication cert not bound to the sender; self-signed DHT records from strangers -------------
 
 fn syndicate(seed: &Node, cert_device: &NodeIdentity) -> MeshWireRequest {
