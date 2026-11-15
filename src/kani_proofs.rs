@@ -1531,23 +1531,29 @@ fn proof_council_reroot_needs_quorum_and_new_root() {
 /// LAB-DIAL-K (`v0.5.4` NEW-5, `docs/LAB_MODE.md`): `Open` allows every dial; under `Fixed`, a
 /// dial is allowed iff some entry has the address's `(ip, port, transport)` and every PeerId
 /// given (the dial's and the address's `/p2p/`) is that entry's; a peer-only check needs the peer
-/// to be some entry's. Bounds: at most 2 entries, and `PEER_KEY_MAX` is 4 under Kani (every
-/// length from 1 to 4), so the byte compares stay small. The address is checked as parsed parts;
-/// the shape parser has unit tests.
+/// to be some entry's. Bounds (kept small on purpose, CBMC memory): at most 2 entries, held in
+/// two slots and a `Vec` of fixed capacity 2 (no growth, no clone); `PEER_KEY_MAX` is 4 under
+/// Kani (every length from 1 to 4); the expected result is computed per slot, without iterators.
+/// `unwind(5)`: the 4-byte PeerKey compare and the 2-entry loop. The address is checked as parsed
+/// parts; the shape parser has unit tests.
 #[kani::proof]
-#[kani::unwind(6)]
+#[kani::unwind(5)]
 fn proof_lab_dial_only_within_fixed_set() {
     use crate::lab_dial::{lab_dial_decision, DialAddr, DialEntry, DialSet, PeerKey};
     let fixed: bool = kani::any();
-    let mut entries: Vec<DialEntry> = Vec::new();
-    if kani::any() {
-        entries.push(kani::any());
-        if kani::any() {
-            entries.push(kani::any());
-        }
-    }
+    let n: u8 = kani::any();
+    kani::assume(n <= 2);
+    let e0: DialEntry = kani::any();
+    let e1: DialEntry = kani::any();
     let set = if fixed {
-        DialSet::Fixed(entries.clone())
+        let mut entries: Vec<DialEntry> = Vec::with_capacity(2);
+        if n >= 1 {
+            entries.push(e0);
+        }
+        if n >= 2 {
+            entries.push(e1);
+        }
+        DialSet::Fixed(entries)
     } else {
         DialSet::Open
     };
@@ -1566,16 +1572,17 @@ fn proof_lab_dial_only_within_fixed_set() {
         assert!(d.is_ok());
         return;
     }
-    let expected = match addr {
-        None => peer.is_some_and(|p| entries.iter().any(|e| e.peer == p)),
-        Some(a) => entries.iter().any(|e| {
+    let matches = |e: &DialEntry| match addr {
+        None => peer.is_some_and(|p| e.peer == p),
+        Some(a) => {
             e.ip == a.ip
                 && e.port == a.port
                 && e.transport == a.transport
                 && a.peer.is_none_or(|p| p == e.peer)
                 && peer.is_none_or(|p| p == e.peer)
-        }),
+        }
     };
+    let expected = (n >= 1 && matches(&e0)) || (n >= 2 && matches(&e1));
     assert_eq!(d.is_ok(), expected);
 }
 
