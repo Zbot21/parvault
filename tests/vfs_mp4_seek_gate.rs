@@ -39,6 +39,10 @@ fn gate_ran(name: &str) {
 const MIB: u64 = 1024 * 1024;
 const CACHE_BYTES: u64 = 3 * MIB;
 const SEEK_SECS: &str = "12";
+/// Cold WebDAV TTFB samples per run; the budget applies to their median (B-56).
+const TTFB_SAMPLES: usize = 5;
+/// The VFS block size (`DEFAULT_VFS_BLOCK_BYTES`).
+const BLOCK_BYTES: u64 = parvault::vfs::DEFAULT_VFS_BLOCK_BYTES as u64;
 
 fn require_real() -> bool {
     std::env::var("GATES_REQUIRE_REAL").as_deref() == Ok("1")
@@ -235,6 +239,11 @@ fn framemd5(target: &str, bearer: Option<&str>) -> String {
 
 /// Byte offset of the first keyframe at or after the seek point (from the local file).
 fn keyframe_offset(local: &Path) -> u64 {
+    keyframe_offsets(local, &[SEEK_SECS.parse().unwrap()])[0]
+}
+
+/// For each seek time, the byte offset of the first keyframe at or after it (in input order).
+fn keyframe_offsets(local: &Path, seeks: &[f64]) -> Vec<u64> {
     let out = run(Command::new("ffprobe")
         .args([
             "-v",
@@ -247,18 +256,64 @@ fn keyframe_offset(local: &Path) -> u64 {
             "csv=p=0",
         ])
         .arg(local));
-    let seek: f64 = SEEK_SECS.parse().unwrap();
-    String::from_utf8(out.stdout)
+    let keys: Vec<(f64, u64)> = String::from_utf8(out.stdout)
         .unwrap()
         .lines()
         .filter_map(|l| {
             let f: Vec<&str> = l.split(',').collect();
             let t: f64 = f.first()?.parse().ok()?;
             let pos: u64 = f.get(1)?.parse().ok()?;
-            (t >= seek && f.get(2)?.starts_with('K')).then_some(pos)
+            f.get(2)?.starts_with('K').then_some((t, pos))
         })
-        .next()
-        .expect("a keyframe after the seek point")
+        .collect();
+    seeks
+        .iter()
+        .map(|&seek| {
+            keys.iter()
+                .find(|(t, _)| *t >= seek)
+                .map(|(_, pos)| *pos)
+                .expect("a keyframe after the seek point")
+        })
+        .collect()
+}
+
+/// One cold `Range` GET of 4096 bytes at `pos` on a fresh connection; asserts `206` and the
+/// body against the local file, returns the time to the first response byte.
+fn range_ttfb(addr: std::net::SocketAddr, bearer: &str, clip: &Path, pos: u64) -> Duration {
+    let mut conn = std::net::TcpStream::connect(addr).unwrap();
+    let t0 = Instant::now();
+    std::io::Write::write_all(
+        &mut conn,
+        format!(
+            "GET /clip.mp4 HTTP/1.1\r\nHost: gate\r\nRange: bytes={pos}-{}\r\nAuthorization: Bearer {bearer}\r\nConnection: close\r\n\r\n",
+            pos + 4095
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let mut first = [0u8; 1];
+    std::io::Read::read_exact(&mut conn, &mut first).unwrap();
+    let ttfb = t0.elapsed();
+    let mut rest = Vec::new();
+    std::io::Read::read_to_end(&mut conn, &mut rest).unwrap();
+    let mut resp = first.to_vec();
+    resp.extend(rest);
+    let split = resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("HTTP head");
+    assert!(
+        resp.starts_with(b"HTTP/1.1 206"),
+        "{}",
+        String::from_utf8_lossy(&resp[..split])
+    );
+    let mut want = vec![0u8; 4096];
+    File::open(clip)
+        .unwrap()
+        .read_exact_at(&mut want, pos)
+        .unwrap();
+    assert_eq!(&resp[split + 4..], &want[..], "Range body differs");
+    ttfb
 }
 
 /// Cached block indices (from the LRU's `ino<I>_blk<B>.blk` files).
@@ -481,47 +536,52 @@ fn webdav_206_mp4_probe_and_random_seek() {
     }
     assert!(s.used_bytes <= s.capacity_bytes);
 
-    // B3: cold time-to-first-byte of a Range request at the mid keyframe (the HTTP hop is what
-    // the Docker gate's netem stage delays).
-    let pos = keyframe_offset(&clip);
-    let mut conn = std::net::TcpStream::connect(handle.local_addr()).unwrap();
-    let t0 = Instant::now();
-    std::io::Write::write_all(
-        &mut conn,
-        format!(
-            "GET /clip.mp4 HTTP/1.1\r\nHost: gate\r\nRange: bytes={pos}-{}\r\nAuthorization: Bearer {bearer}\r\nConnection: close\r\n\r\n",
-            pos + 4095
-        )
-        .as_bytes(),
-    )
-    .unwrap();
-    let mut first = [0u8; 1];
-    std::io::Read::read_exact(&mut conn, &mut first).unwrap();
-    let ttfb = t0.elapsed();
-    let mut rest = Vec::new();
-    std::io::Read::read_to_end(&mut conn, &mut rest).unwrap();
-    let mut resp = first.to_vec();
-    resp.extend(rest);
-    let split = resp
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("HTTP head");
-    assert!(
-        resp.starts_with(b"HTTP/1.1 206"),
-        "{}",
-        String::from_utf8_lossy(&resp[..split])
+    // B3: cold time-to-first-byte of Range requests at keyframes (the HTTP hop is what the
+    // Docker gate's netem stage delays). Budget statistic (B-56): the median of
+    // `TTFB_SAMPLES` cold requests, each at a keyframe in a block not yet cached (asserted
+    // cold by the miss counter). Measured reason: netem `loss 2%` drops the request or the
+    // first response segment in about 4% of single requests, and Linux then waits its 200 ms
+    // minimum RTO. CI run 43628860330 measured 274 ms (39 ms + one RTO). Passing runs
+    // 43620456275, 43623797458 and 43626770706 measured 39.5, 40.6 and 39.1 ms. One sample
+    // gates TCP loss recovery, not this code. The median of 5 still fails if 3 or more samples
+    // are over budget.
+    let mut samples = Vec::new();
+    let mut used_blocks = Vec::new();
+    for pos in keyframe_offsets(
+        &clip,
+        &[SEEK_SECS.parse().unwrap(), 2.0, 5.0, 8.0, 15.0, 18.0, 21.0],
+    ) {
+        if samples.len() == TTFB_SAMPLES {
+            break;
+        }
+        let blk = pos / BLOCK_BYTES;
+        if blk != (pos + 4095) / BLOCK_BYTES
+            || used_blocks.contains(&blk)
+            || cached_blocks(&cache).contains(&blk)
+        {
+            continue;
+        }
+        used_blocks.push(blk);
+        let before = vfs.cache_stats().misses;
+        let ttfb = range_ttfb(handle.local_addr(), &bearer, &clip, pos);
+        assert!(
+            vfs.cache_stats().misses > before,
+            "B3 sample at offset {pos} (block {blk}) was not cold"
+        );
+        eprintln!("B3 cold WebDAV TTFB at offset {pos} (block {blk}): {ttfb:?}");
+        samples.push(ttfb);
+    }
+    assert_eq!(
+        samples.len(),
+        TTFB_SAMPLES,
+        "cold keyframe blocks: {used_blocks:?}"
     );
-    let mut want = vec![0u8; 4096];
-    File::open(&clip)
-        .unwrap()
-        .read_exact_at(&mut want, pos)
-        .unwrap();
-    assert_eq!(&resp[split + 4..], &want[..], "Range body differs");
-    eprintln!("B3 cold WebDAV TTFB at offset {pos}: {ttfb:?}");
+    samples.sort_unstable();
+    let median = samples[TTFB_SAMPLES / 2];
     assert_budget(
-        "cold WebDAV TTFB within budget",
-        ttfb < ttfb_budget(),
-        format!("{ttfb:?}"),
+        "cold WebDAV TTFB within budget (median)",
+        median < ttfb_budget(),
+        format!("median {median:?} of {samples:?}"),
     );
 
     // B2: random seek over HTTP Range.

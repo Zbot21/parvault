@@ -741,7 +741,8 @@ fi
 docker run --rm -e GATES_REQUIRE_REAL=1 parvault:acceptance-vfs webdav_206_mp4_probe_and_random_seek \
     || { echo "ERROR: stage 12c: the unprivileged WebDAV leg failed"; exit 1; }
 
-# netem leg: NET_ADMIN only for tc; a 100 ms budget, and the cache cap. The per-block miss set is
+# netem leg: NET_ADMIN only for tc; a 100 ms budget on the median of 5 cold requests (B-56: one
+# sample can carry a 200 ms loss RTO), and the cache cap. The per-block miss set is
 # logged, not asserted: under latency an abandoned `Range: bytes=N-` can hydrate up to about one
 # TCP window of extra blocks (B-23, v0.6.0).
 docker run --rm --cap-add NET_ADMIN -e GATES_REQUIRE_REAL=1 -e PARVAULT_VFS_TTFB_BUDGET_MS=100 \
