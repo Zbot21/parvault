@@ -382,8 +382,8 @@ For carrier and broadband gateway environments running `prplOS`, deploy `parvaul
     "ports": [
       { "protocol": "tcp", "port": 4001, "description": "libp2p TCP + Noise XX + Yamux" },
       { "protocol": "tcp", "port": 4002, "description": "Seed direct TCP transport" },
-      { "protocol": "udp", "port": 4009, "description": "Signed zero-IP LAN beacon discovery (ADR-18)" },
-      { "protocol": "tcp", "port": 4080, "description": "Router NAS Web status & REST API (ADR-18)" },
+      { "protocol": "udp", "port": 4009, "description": "Signed zero-IP LAN beacon discovery (ADR-22)" },
+      { "protocol": "tcp", "port": 4080, "description": "Router NAS Web status & REST API" },
       { "protocol": "udp", "port": 4001, "description": "Optional QUIC listener (ADR-08)" },
       { "protocol": "udp", "port": 5353, "description": "mDNS zero-config LAN discovery" }
     ],

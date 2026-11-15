@@ -2266,7 +2266,13 @@ fn b52_tracker_card_not_pinned_over_damaged_known_peers() {
         let (out, dir, _root) =
             b52_public_tracker_run(&format!("b52-tk-r-{name}"), &seed.addr, Some(bytes));
         let text = combined(&out);
-        assert!(text.contains(code), "{name}:\n{text}");
+        let expected = if name == "directory" {
+            "reject.known_peers_unreadable"
+        } else {
+            "reject.known_peers_corrupt"
+        };
+        assert_eq!(code, expected, "{name}: the damage table's code");
+        assert!(text.contains(expected), "{name}:\n{text}");
         assert!(
             text.contains("reject.known_peers_damaged"),
             "{name}:\n{text}"
@@ -2324,7 +2330,13 @@ fn b52_discover_refuses_damaged_known_peers() {
         let (out, data) = b52_discover(&root, &reg);
         let text = combined(&out);
         b52_assert_damage_kept(&data, bytes, &text);
-        assert!(text.contains(code), "{name}:\n{text}");
+        let expected = if name == "directory" {
+            "reject.known_peers_unreadable"
+        } else {
+            "reject.known_peers_corrupt"
+        };
+        assert_eq!(code, expected, "{name}: the damage table's code");
+        assert!(text.contains(expected), "{name}:\n{text}");
         assert!(!out.status.success(), "{name}:\n{text}");
     }
     gate_ran("trust_enforcement::b52_discover_refuses_damaged_known_peers");
