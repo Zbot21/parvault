@@ -742,8 +742,8 @@ pub fn combinatorial_reconstruction_entropy_bits(
 mod tests {
     use super::*;
 
-    /// F-35 (plan 2c fact 5): a full ledger refuses a new voucher instead of evicting a live
-    /// nullifier, so a spent voucher is never redeemable again while it is fresh.
+    /// F-55 (B-42 QA): a ledger file that exists but does not load refuses every voucher, since
+    /// starting empty would make every recorded voucher redeemable again.
     #[test]
     fn unloadable_ledger_refuses_vouchers() {
         // B-42 QA differential: the same voucher against a loadable and an unloadable ledger file.
@@ -831,6 +831,8 @@ mod tests {
         );
     }
 
+    /// F-35 (plan 2c fact 5): a full ledger refuses a new voucher instead of evicting a live
+    /// nullifier, so a spent voucher is never redeemable again while it is fresh.
     #[test]
     fn spent_voucher_never_redeemable_again_while_fresh() {
         let issuer = NodeIdentity::from_seed([0x2C; 32]);
