@@ -78,3 +78,19 @@ fn procd_requires_mounted_posix_disk_and_chowns_only_on_owner_change() {
         lines[chown - 1]
     );
 }
+
+/// P2P listens on the LAN address from uci, never `0.0.0.0` on the WAN; loopback when unset.
+#[test]
+fn procd_passes_lan_listen_addr() {
+    let lines: Vec<&str> = code_lines(PROCD).collect();
+    let cmd = lines
+        .iter()
+        .position(|l| l.starts_with("procd_set_param command"))
+        .expect("command line");
+    assert!(lines[cmd].ends_with('\\'), "{}", lines[cmd]);
+    assert_eq!(lines[cmd + 1], "--listen \"$(lan_listen_addr)\"");
+    assert!(lines.contains(&"ip=\"$(uci -q get network.lan.ipaddr)\""));
+    assert!(lines.contains(&"ip=127.0.0.1"));
+    assert!(lines.contains(&"echo \"/ip4/$ip/tcp/4001\""));
+    assert!(!lines.iter().any(|l| l.contains("0.0.0.0")));
+}

@@ -7,6 +7,8 @@ hardware_profile = "router-soc"
 data_dir = "/mnt/nas/.parvault-data"
 
 # P2P Listeners
+# The procd service overrides this with `--listen` on the uci LAN address (L-96); 0.0.0.0 is
+# only the fallback for runs without uci.
 listen_tcp = "/ip4/0.0.0.0/tcp/4001"
 enable_quic = false
 listen_quic = "/ip4/0.0.0.0/udp/4001/quic-v1"

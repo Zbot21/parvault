@@ -26,6 +26,22 @@ nas_fstype() {
     awk -v m="$NAS" '$2 == m { t = $3 } END { print t }' /proc/mounts
 }
 
+# The P2P TCP listen multiaddr: the LAN address from uci, so the daemon never binds the WAN
+# (L-96, plan R3). uci may hold a list or CIDR form (192.168.1.1/24); the first address is used.
+# With no LAN address it binds loopback and logs why. Port 4001 matches listen_tcp in $CONF.
+lan_listen_addr() {
+    local ip
+    ip="$(uci -q get network.lan.ipaddr)"
+    set -- $ip
+    ip="${1%%/*}"
+    if [ -z "$ip" ]; then
+        logger -t parvault-nas -p daemon.warn "network.lan.ipaddr is unset; P2P listens on 127.0.0.1 only"
+        echo "parvault-nas: network.lan.ipaddr is unset; P2P listens on 127.0.0.1 only" >&2
+        ip=127.0.0.1
+    fi
+    echo "/ip4/$ip/tcp/4001"
+}
+
 owner_of() {
     ls -ld "$1" | awk '{print $3}'
 }
@@ -64,7 +80,8 @@ start_service() {
     fi
 
     procd_open_instance
-    procd_set_param command "$PROG" up --profile router-soc --config "$CONF"
+    procd_set_param command "$PROG" up --profile router-soc --config "$CONF" \
+        --listen "$(lan_listen_addr)"
     procd_set_param user "$SVC_USER"
 
     # Respawn: threshold 3600 s, 5 s delay, 5 retries (procd needs all three values).
