@@ -16,6 +16,10 @@ use thiserror::Error;
 /// during an offline cohort repair (ADR-04).
 pub const MIN_WITNESS_SIGNATURES_FOR_REPAIR: usize = 2;
 
+/// Witness keys a registered grant may name (B-113, A-113 C1): one seed plus repair witnesses.
+/// A grant naming more registers nothing, so the storer check scans at most this many keys.
+pub const MAX_GRANT_WITNESSES: usize = 8;
+
 /// What the grant-registration decision needs to know (F-02a).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GrantRegFacts {
@@ -24,19 +28,41 @@ pub struct GrantRegFacts {
     /// The grant names the stripe of the shard that was just stored (`true` when no shard is
     /// involved).
     pub root_matches: bool,
+    /// How many witness keys the grant names (B59-WITNESS-BOUND).
+    pub witnesses_len: usize,
 }
 
-/// Registers a grant only if it is valid and names the stripe of the shard stored with it.
-/// Grants are keyed by (stripe root, owner), so one owner's grant never replaces another's
-/// (F-26); which grant authorises a shard is decided per shard (`grant_owner_decision`).
+/// Registers a grant only if it is valid, names at most [`MAX_GRANT_WITNESSES`] witnesses and
+/// names the stripe of the shard stored with it. Grants are keyed by (stripe root, owner), so
+/// one owner's grant never replaces another's (F-26); which grant authorises a shard is decided
+/// per shard (`grant_owner_decision`).
 pub fn grant_registration_decision(facts: &GrantRegFacts) -> Result<(), &'static str> {
     if !facts.grant_valid {
         return Err("reject.repair_grant_invalid");
+    }
+    if facts.witnesses_len > MAX_GRANT_WITNESSES {
+        return Err("reject.repair_grant_too_many_witnesses");
     }
     if !facts.root_matches {
         return Err("reject.repair_grant_root_mismatch");
     }
     Ok(())
+}
+
+/// B-113 (A-113 C9): a same-owner grant replaces the registered one for its stripe only if it
+/// names every witness the registered one names. Otherwise the registered grant stays (the put
+/// is still stored), so a host holding an older grant with fewer witnesses cannot strip a
+/// witness's audit arm. Keys compare on all 32 bytes.
+pub fn grant_replace_decision(
+    registered: Option<&[[u8; 32]]>,
+    incoming: &[[u8; 32]],
+) -> Result<(), &'static str> {
+    match registered {
+        Some(old) if !old.iter().all(|w| incoming.contains(w)) => {
+            Err("reject.repair_grant_witness_downgrade")
+        }
+        _ => Ok(()),
+    }
 }
 
 /// What the PoR pre-screen knows about a challenge, all from RAM.
@@ -68,18 +94,42 @@ pub fn por_prescreen_decision(f: &PorPrescreenFacts) -> Result<(), &'static str>
     Ok(())
 }
 
-/// L-101 / verdict change 1: a host answers a chunk audit only to the Noise-authenticated
-/// peer the shard is accounted to (the sender's device id equals the quota's shard owner, the
-/// same fact `PutShard` binds). The per-stripe session key is held by every host of the
-/// stripe, so the HMAC alone would let a co-host fetch this shard's chunks or spend the owner's
-/// audit budget. Checked in RAM before the rate check and any read.
-pub fn por_storer_decision(
-    sender_device_id: Option<&str>,
-    accounted_owner: Option<&str>,
-) -> Result<(), &'static str> {
-    match (sender_device_id, accounted_owner) {
-        (Some(s), Some(o)) if s == o => Ok(()),
-        _ => Err("reject.por_not_storer"),
+/// The keys a registered grant lets audit its shard: the owner and the witnesses it signed
+/// over (ADR-04). `witnesses.len() <= MAX_GRANT_WITNESSES`, enforced at registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrantStorers<'a> {
+    pub owner: [u8; 32],
+    pub witnesses: &'a [[u8; 32]],
+}
+
+/// What the chunk-audit storer decision knows, all from RAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PorStorerFacts<'a> {
+    /// The Noise-authenticated sender's device id.
+    pub sender_device_id: Option<&'a str>,
+    /// The same peer's Ed25519 key (`WirePeer::pubkey`).
+    pub sender_key: Option<[u8; 32]>,
+    /// The quota's shard owner (F-04: the key that stored the shard here).
+    pub accounted_owner: Option<&'a str>,
+    /// The grant registered for this shard (F-38-GRANT binding), if any.
+    pub grant: Option<GrantStorers<'a>>,
+}
+
+/// L-101 / verdict change 1, B-113: a host answers a chunk audit only to the storer of the
+/// shard. With a grant registered for the shard, the storer is the grant's owner or a witness
+/// it names, and nothing else is read (no fall-through: the accounted owner of a handed-off
+/// shard is refused). With no grant, it is the peer the shard is accounted to (F-34-STORER).
+/// The per-stripe session key is held by every host of the stripe, so the HMAC alone would let
+/// a co-host fetch this shard's chunks or spend the owner's audit budget. Checked in RAM before
+/// the rate check and any read.
+pub fn por_storer_decision(f: &PorStorerFacts<'_>) -> Result<(), &'static str> {
+    match (&f.grant, f.sender_key) {
+        (Some(g), Some(k)) if k == g.owner || g.witnesses.contains(&k) => Ok(()),
+        (Some(_), _) => Err("reject.por_not_storer"),
+        (None, _) => match (f.sender_device_id, f.accounted_owner) {
+            (Some(s), Some(o)) if s == o => Ok(()),
+            _ => Err("reject.por_not_storer"),
+        },
     }
 }
 
@@ -685,6 +735,7 @@ impl PorVerifierEngine {
             grant_valid: grant.verify(),
             root_matches: grant.stripe_merkle_root == *stored_root
                 && stored.iter().all(|s| s.stripe_merkle_root == *stored_root),
+            witnesses_len: grant.authorized_witness_pubkeys.len(),
         };
         grant_registration_decision(&facts)?;
         // F-38-GRANT: never replace a different owner a shard is already bound to.
@@ -699,8 +750,21 @@ impl PorVerifierEngine {
             self.shard_grant_owners
                 .insert(shard.file_key(), grant.owner_pubkey);
         }
-        self.repair_grants_ram
-            .insert((grant.stripe_merkle_root, grant.owner_pubkey), grant);
+        let key = (grant.stripe_merkle_root, grant.owner_pubkey);
+        let registered = self
+            .repair_grants_ram
+            .get(&key)
+            .map(|g| g.authorized_witness_pubkeys.as_slice());
+        // C9: the shards bind to this owner either way; only a witness superset replaces
+        // the registered grant.
+        if let Err(code) = grant_replace_decision(registered, &grant.authorized_witness_pubkeys) {
+            tracing::warn!(
+                code,
+                "kept the registered grant (its witnesses are not all named)"
+            );
+        } else {
+            self.repair_grants_ram.insert(key, grant);
+        }
         self.persist_state_if_configured();
         Ok(())
     }
@@ -847,12 +911,23 @@ impl PorVerifierEngine {
     pub fn admit_chunk_challenge(
         &mut self,
         ch: &crate::por::ChunkChallenge,
-        sender_device_id: Option<&str>,
+        sender_key: Option<[u8; 32]>,
         accounted_owner: Option<&str>,
         now_unix_ms: u64,
         stat_len: impl FnOnce() -> Option<u64>,
     ) -> Result<ChunkProveSpec, &'static str> {
-        if let Err(code) = por_storer_decision(sender_device_id, accounted_owner) {
+        let sender_id = sender_key.map(|pk| NodeIdentity::device_peer_id_for_pubkey(&pk));
+        let sender_device_id = sender_id.as_deref();
+        let storer = por_storer_decision(&PorStorerFacts {
+            sender_device_id,
+            sender_key,
+            accounted_owner,
+            grant: self.grant_for_shard(&ch.shard_id).map(|g| GrantStorers {
+                owner: g.owner_pubkey,
+                witnesses: &g.authorized_witness_pubkeys,
+            }),
+        });
+        if let Err(code) = storer {
             self.blocked_ddos_challenges += 1;
             return Err(code);
         }
@@ -885,7 +960,7 @@ impl PorVerifierEngine {
             return Err(code);
         }
         let key = session_key.expect("prescreen passed, so the key is known");
-        // The storer check passed, so the sender is the authenticated owner.
+        // The storer check passed, so the sender is the authenticated storer.
         let owner = sender_device_id.unwrap_or_default();
         self.chunk_rate.prune(now_unix_ms);
         if let Err(code) = por_rate_decision(&self.chunk_rate.facts(&key, owner)) {
@@ -1392,6 +1467,7 @@ mod decision_tests {
         let base = GrantRegFacts {
             grant_valid: true,
             root_matches: true,
+            witnesses_len: MAX_GRANT_WITNESSES,
         };
         assert_eq!(grant_registration_decision(&base), Ok(()));
         assert_eq!(grant_owner_decision(&[1; 32], Some(&[1; 32])), Ok(()));
@@ -1453,7 +1529,13 @@ mod chunk_admit_tests {
     use super::*;
     use crate::por::{generate_chunk_challenge, ChunkChallenge};
 
-    const OWNER: &str = "parvault-peer-owner";
+    const OWNER_K: [u8; 32] = [0x0A; 32];
+    const CO_HOST_K: [u8; 32] = [0x0B; 32];
+    const WITNESS_K: [u8; 32] = [0x0C; 32];
+
+    fn id(k: &[u8; 32]) -> String {
+        NodeIdentity::device_peer_id_for_pubkey(k)
+    }
     const KEY: [u8; 32] = [7; 32];
     const NOW: u64 = 1_800_000_000_000;
 
@@ -1476,28 +1558,115 @@ mod chunk_admit_tests {
     fn admit(
         e: &mut PorVerifierEngine,
         ch: &ChunkChallenge,
-        sender: &str,
+        sender: [u8; 32],
         now: u64,
     ) -> Result<ChunkProveSpec, &'static str> {
         // 3 chunks: 8193 bytes.
-        e.admit_chunk_challenge(ch, Some(sender), Some(OWNER), now, || Some(8193))
+        e.admit_chunk_challenge(ch, Some(sender), Some(&id(&OWNER_K)), now, || Some(8193))
     }
 
     #[test]
     fn storer_decision_needs_the_accounted_owner() {
-        assert_eq!(por_storer_decision(Some(OWNER), Some(OWNER)), Ok(()));
+        let owner = id(&OWNER_K);
+        let no_grant = |sender: Option<&str>, accounted: Option<&str>| {
+            por_storer_decision(&PorStorerFacts {
+                sender_device_id: sender,
+                sender_key: None,
+                accounted_owner: accounted,
+                grant: None,
+            })
+        };
+        assert_eq!(no_grant(Some(&owner), Some(&owner)), Ok(()));
         assert_eq!(
-            por_storer_decision(Some("co-host"), Some(OWNER)),
+            no_grant(Some("co-host"), Some(&owner)),
+            Err("reject.por_not_storer")
+        );
+        assert_eq!(no_grant(None, Some(&owner)), Err("reject.por_not_storer"));
+        assert_eq!(no_grant(Some(&owner), None), Err("reject.por_not_storer"));
+    }
+
+    /// B-113: every arm of the storer decision. With a grant, only the grant owner and its
+    /// witnesses pass, on all 32 bytes, and the accounted owner is not read (no fall-through).
+    #[test]
+    fn storer_decision_grant_arms() {
+        let departed = [0x0D; 32];
+        let witnesses = [WITNESS_K];
+        let grant = Some(GrantStorers {
+            owner: OWNER_K,
+            witnesses: &witnesses,
+        });
+        let with = |key: Option<[u8; 32]>, accounted: &[u8; 32]| {
+            let sender = key.map(|k| id(&k));
+            por_storer_decision(&PorStorerFacts {
+                sender_device_id: sender.as_deref(),
+                sender_key: key,
+                accounted_owner: Some(&id(accounted)),
+                grant,
+            })
+        };
+        assert_eq!(with(Some(OWNER_K), &departed), Ok(()));
+        assert_eq!(with(Some(WITNESS_K), &departed), Ok(()));
+        // The departing node, the accounted owner, is refused once a grant is registered.
+        assert_eq!(
+            with(Some(departed), &departed),
             Err("reject.por_not_storer")
         );
         assert_eq!(
-            por_storer_decision(None, Some(OWNER)),
+            with(Some(CO_HOST_K), &departed),
             Err("reject.por_not_storer")
+        );
+        assert_eq!(with(None, &departed), Err("reject.por_not_storer"));
+        // One byte off the owner key (same device-id prefix) is refused.
+        let mut near = OWNER_K;
+        near[31] ^= 1;
+        assert_eq!(id(&near), id(&OWNER_K));
+        assert_eq!(with(Some(near), &OWNER_K), Err("reject.por_not_storer"));
+    }
+
+    /// B59-WITNESS-BOUND and C9 (unit): nine witnesses register nothing; a same-owner grant
+    /// with fewer witnesses keeps the registered one, a superset replaces it.
+    #[test]
+    fn grant_witness_bound_and_superset() {
+        assert_eq!(
+            grant_registration_decision(&GrantRegFacts {
+                grant_valid: true,
+                root_matches: true,
+                witnesses_len: MAX_GRANT_WITNESSES + 1,
+            }),
+            Err("reject.repair_grant_too_many_witnesses")
+        );
+        let a = [[1u8; 32]];
+        let ab = [[1u8; 32], [2u8; 32]];
+        assert_eq!(grant_replace_decision(None, &[]), Ok(()));
+        assert_eq!(grant_replace_decision(Some(&[]), &a), Ok(()));
+        assert_eq!(grant_replace_decision(Some(&a), &ab), Ok(()));
+        assert_eq!(grant_replace_decision(Some(&ab), &ab), Ok(()));
+        assert_eq!(
+            grant_replace_decision(Some(&a), &[]),
+            Err("reject.repair_grant_witness_downgrade")
         );
         assert_eq!(
-            por_storer_decision(Some(OWNER), None),
-            Err("reject.por_not_storer")
+            grant_replace_decision(Some(&ab), &[[2u8; 32], [3u8; 32]]),
+            Err("reject.repair_grant_witness_downgrade")
         );
+        // On the engine: the downgrade keeps the registered witnesses; the shard still binds.
+        let owner = NodeIdentity::from_seed([0x21; 32]);
+        let seed = NodeIdentity::from_seed([0x22; 32]).public_key_bytes();
+        let mut e = PorVerifierEngine::new(300);
+        let up = RepairGrant::issue(&owner, [1; 32], vec![seed], ErasureTier::Consumer);
+        let old = RepairGrant::issue(&owner, [1; 32], vec![], ErasureTier::Consumer);
+        assert_eq!(e.register_repair_grant_for_stored(up, &[sid(0)]), Ok(()));
+        assert_eq!(e.register_repair_grant_for_stored(old, &[sid(1)]), Ok(()));
+        for i in 0..2 {
+            let (_, g) = e.get_shard_session_and_grant(&sid(i));
+            assert_eq!(g.unwrap().authorized_witness_pubkeys, vec![seed], "{i}");
+        }
+        let nine = RepairGrant::issue(&owner, [1; 32], vec![seed; 9], ErasureTier::Consumer);
+        assert_eq!(
+            e.register_repair_grant_for_stored(nine, &[sid(2)]),
+            Err("reject.repair_grant_too_many_witnesses")
+        );
+        assert_eq!(e.shard_grant_owner(&sid(2)), None);
     }
 
     #[test]
@@ -1636,7 +1805,7 @@ mod chunk_admit_tests {
         let mut e = engine();
         let ch = generate_chunk_challenge(&KEY, sid(0), 3, 2, NOW);
         let read = std::cell::Cell::new(false);
-        let r = e.admit_chunk_challenge(&ch, Some("co-host"), Some(OWNER), NOW, || {
+        let r = e.admit_chunk_challenge(&ch, Some(CO_HOST_K), Some(&id(&OWNER_K)), NOW, || {
             read.set(true);
             Some(8193)
         });
@@ -1644,7 +1813,7 @@ mod chunk_admit_tests {
         assert!(!read.get());
         assert_eq!(e.blocked_ddos_challenges, 1);
         // The same challenge from the owner still passes (nonce not burned).
-        let spec = admit(&mut e, &ch, OWNER, NOW).expect("owner admitted");
+        let spec = admit(&mut e, &ch, OWNER_K, NOW).expect("owner admitted");
         assert_eq!(spec.chunk_indices, ch.chunk_indices);
         assert_eq!(spec.shard_len, 8193);
     }
@@ -1656,14 +1825,16 @@ mod chunk_admit_tests {
         // Wrong key: HMAC refused, no stat.
         let wrong = generate_chunk_challenge(&[8; 32], sid(0), 3, 2, NOW);
         assert_eq!(
-            e.admit_chunk_challenge(&wrong, Some(OWNER), Some(OWNER), NOW, || panic!("stat")),
+            e.admit_chunk_challenge(&wrong, Some(OWNER_K), Some(&id(&OWNER_K)), NOW, || {
+                panic!("stat")
+            }),
             Err("reject.por_hmac_invalid")
         );
         // A PorAudit token does not pass as a chunk token.
         let mut cross = good.clone();
         cross.hmac_token = compute_challenge_hmac(&KEY, &sid(0), &good.nonce, 0, 1, NOW);
         assert_eq!(
-            admit(&mut e, &cross, OWNER, NOW),
+            admit(&mut e, &cross, OWNER_K, NOW),
             Err("reject.por_hmac_invalid")
         );
         // Stale.
@@ -1671,7 +1842,7 @@ mod chunk_admit_tests {
             admit(
                 &mut e,
                 &good,
-                OWNER,
+                OWNER_K,
                 NOW + CHALLENGE_FRESHNESS_WINDOW_MS + 1
             ),
             Err("reject.por_stale_or_replayed")
@@ -1679,7 +1850,7 @@ mod chunk_admit_tests {
         // Unknown session.
         let unknown = generate_chunk_challenge(&KEY, sid(9), 3, 2, NOW);
         assert_eq!(
-            admit(&mut e, &unknown, OWNER, NOW),
+            admit(&mut e, &unknown, OWNER_K, NOW),
             Err("reject.por_session_unknown")
         );
         // Width 0, 9, or repeated indices.
@@ -1694,7 +1865,7 @@ mod chunk_admit_tests {
                 NOW,
             );
             assert_eq!(
-                admit(&mut e, &c, OWNER, NOW),
+                admit(&mut e, &c, OWNER_K, NOW),
                 Err("reject.por_range_invalid")
             );
         }
@@ -1705,19 +1876,19 @@ mod chunk_admit_tests {
         past.hmac_token =
             crate::por::compute_chunk_challenge_hmac(&KEY, &past.shard_id, &past.nonce, &[3], NOW);
         assert_eq!(
-            admit(&mut e, &past, OWNER, NOW),
+            admit(&mut e, &past, OWNER_K, NOW),
             Err("reject.por_range_invalid")
         );
         // Good, then replay.
-        assert!(admit(&mut e, &good, OWNER, NOW).is_ok());
+        assert!(admit(&mut e, &good, OWNER_K, NOW).is_ok());
         assert_eq!(
-            admit(&mut e, &good, OWNER, NOW),
+            admit(&mut e, &good, OWNER_K, NOW),
             Err("reject.por_stale_or_replayed")
         );
         // Missing shard file.
         let g2 = generate_chunk_challenge(&KEY, sid(1), 3, 2, NOW);
         assert_eq!(
-            e.admit_chunk_challenge(&g2, Some(OWNER), Some(OWNER), NOW, || None),
+            e.admit_chunk_challenge(&g2, Some(OWNER_K), Some(&id(&OWNER_K)), NOW, || None),
             Err("reject.por_shard_missing")
         );
     }
@@ -1729,37 +1900,37 @@ mod chunk_admit_tests {
         let mut e = engine();
         for k in 0..6 {
             let ch = generate_chunk_challenge(&KEY, sid(k % 4), 3, 1, NOW + k as u64);
-            assert!(admit(&mut e, &ch, OWNER, NOW + k as u64).is_ok(), "{k}");
+            assert!(admit(&mut e, &ch, OWNER_K, NOW + k as u64).is_ok(), "{k}");
         }
         let ch = generate_chunk_challenge(&KEY, sid(0), 3, 1, NOW + 10);
         assert_eq!(
-            admit(&mut e, &ch, OWNER, NOW + 10),
+            admit(&mut e, &ch, OWNER_K, NOW + 10),
             Err("reject.por_rate_limited")
         );
         let later = NOW + CHUNK_AUDIT_SESSION_WINDOW_MS + 10;
         let ch = generate_chunk_challenge(&KEY, sid(0), 3, 1, later);
-        assert!(admit(&mut e, &ch, OWNER, later).is_ok());
+        assert!(admit(&mut e, &ch, OWNER_K, later).is_ok());
 
         // Host cap 2: one owner gets its share (1, D2), a second owner the other slot, and then
         // the host cap refuses everyone for the rest of the minute.
         let mut r = engine();
         r.set_chunk_audit_host_cap(2);
         let ch = generate_chunk_challenge(&KEY, sid(0), 3, 1, NOW);
-        assert!(admit(&mut r, &ch, OWNER, NOW).is_ok());
+        assert!(admit(&mut r, &ch, OWNER_K, NOW).is_ok());
         let ch = generate_chunk_challenge(&KEY, sid(0), 3, 1, NOW + 1);
         assert_eq!(
-            admit(&mut r, &ch, OWNER, NOW + 1),
+            admit(&mut r, &ch, OWNER_K, NOW + 1),
             Err("reject.por_rate_limited")
         );
         let ch = generate_chunk_challenge(&KEY, sid(1), 3, 1, NOW + 2);
         assert!(r
-            .admit_chunk_challenge(&ch, Some("owner-2"), Some("owner-2"), NOW + 2, || Some(
+            .admit_chunk_challenge(&ch, Some([2; 32]), Some(&id(&[2; 32])), NOW + 2, || Some(
                 8193
             ))
             .is_ok());
         let ch = generate_chunk_challenge(&KEY, sid(2), 3, 1, NOW + 3);
         assert_eq!(
-            r.admit_chunk_challenge(&ch, Some("owner-3"), Some("owner-3"), NOW + 3, || Some(
+            r.admit_chunk_challenge(&ch, Some([3; 32]), Some(&id(&[3; 32])), NOW + 3, || Some(
                 8193
             )),
             Err("reject.por_rate_limited")

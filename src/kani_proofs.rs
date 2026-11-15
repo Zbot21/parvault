@@ -1527,3 +1527,109 @@ fn proof_council_reroot_needs_quorum_and_new_root() {
             && (!f.rerooted || (f.public_mode && f.new_root_signed))
     );
 }
+
+/// A symbolic set of at most two 32-byte keys.
+fn any_keys_upto2() -> ([[u8; 32]; 2], usize) {
+    let keys: [[u8; 32]; 2] = [kani::any(), kani::any()];
+    let n: usize = kani::any();
+    kani::assume(n <= 2);
+    (keys, n)
+}
+
+/// A device id chosen from a small set (equal and unequal pairs both reachable).
+fn any_device_id() -> Option<&'static str> {
+    match kani::any::<u8>() % 3 {
+        0 => None,
+        1 => Some("parvault-peer-a"),
+        _ => Some("parvault-peer-b"),
+    }
+}
+
+/// B-113 (A-113 C2): with a grant registered, only the grant owner and its witnesses pass, on
+/// all 32 bytes, whatever the device ids say: a sender that is neither is refused even when it
+/// is the accounted owner (no fall-through). A missing key with a grant is refused. With no
+/// grant, the rule is the accounted owner (F-34-STORER).
+#[kani::proof]
+#[kani::unwind(34)]
+fn proof_por_storer_decision() {
+    use crate::por::{por_storer_decision, GrantStorers, PorStorerFacts};
+    let (witnesses, n) = any_keys_upto2();
+    let owner: [u8; 32] = kani::any();
+    let has_grant: bool = kani::any();
+    let has_key: bool = kani::any();
+    let key: [u8; 32] = kani::any();
+    let f = PorStorerFacts {
+        sender_device_id: any_device_id(),
+        sender_key: has_key.then_some(key),
+        accounted_owner: any_device_id(),
+        grant: has_grant.then_some(GrantStorers {
+            owner,
+            witnesses: &witnesses[..n],
+        }),
+    };
+    let decision = por_storer_decision(&f);
+    if has_grant {
+        let named =
+            key == owner || (n > 0 && key == witnesses[0]) || (n > 1 && key == witnesses[1]);
+        kani::cover!(decision.is_ok() && key == owner, "grant owner admitted");
+        kani::cover!(decision.is_ok() && key != owner, "witness admitted");
+        kani::cover!(
+            decision.is_err()
+                && f.sender_device_id.is_some()
+                && f.sender_device_id == f.accounted_owner,
+            "accounted owner refused under a grant"
+        );
+        // (a) no fall-through and (b) no key, no audit.
+        assert_eq!(decision.is_ok(), has_key && named);
+    } else {
+        kani::cover!(decision.is_ok(), "accounted owner admitted without a grant");
+        let same = matches!((f.sender_device_id, f.accounted_owner), (Some(s), Some(o)) if s == o);
+        // (c) today's rule.
+        assert_eq!(decision.is_ok(), same);
+    }
+}
+
+/// B59-WITNESS-BOUND: a grant naming more than `MAX_GRANT_WITNESSES` witnesses never
+/// registers, so the storer check scans a bounded slice.
+#[kani::proof]
+fn proof_grant_registration_witness_bound() {
+    use crate::por::{grant_registration_decision, GrantRegFacts, MAX_GRANT_WITNESSES};
+    let f = GrantRegFacts {
+        grant_valid: kani::any(),
+        root_matches: kani::any(),
+        witnesses_len: kani::any(),
+    };
+    let decision = grant_registration_decision(&f);
+    kani::cover!(
+        decision.is_err() && f.grant_valid && f.root_matches,
+        "too many witnesses refused"
+    );
+    kani::cover!(decision.is_ok(), "grant registered");
+    if f.witnesses_len > MAX_GRANT_WITNESSES {
+        assert!(decision.is_err());
+    }
+    assert_eq!(
+        decision.is_ok(),
+        f.grant_valid && f.root_matches && f.witnesses_len <= MAX_GRANT_WITNESSES
+    );
+}
+
+/// A-113 C9: a same-owner grant replaces the registered one only if it names every registered
+/// witness (all 32 bytes), so a replayed older grant can never drop a witness.
+#[kani::proof]
+#[kani::unwind(34)]
+fn proof_grant_replace_witness_superset() {
+    use crate::por::grant_replace_decision;
+    let (old, n_old) = any_keys_upto2();
+    let (new, n_new) = any_keys_upto2();
+    let has_old: bool = kani::any();
+    let decision = grant_replace_decision(has_old.then_some(&old[..n_old]), &new[..n_new]);
+    let named = |w: &[u8; 32]| (n_new > 0 && *w == new[0]) || (n_new > 1 && *w == new[1]);
+    kani::cover!(decision.is_err(), "witness downgrade kept out");
+    kani::cover!(
+        decision.is_ok() && has_old && n_old > 0,
+        "superset replaces"
+    );
+    let superset = !has_old || (0..n_old).all(|i| named(&old[i]));
+    assert_eq!(decision.is_ok(), superset);
+}
