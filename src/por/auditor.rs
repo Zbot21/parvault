@@ -634,7 +634,8 @@ fn run_due_probe(ctx: &AuditJobCtx, now: u64) -> Option<AuditJobOutcome> {
     };
     st.last_run_unix_ms = now;
     st.recent.push(now);
-    let outcome = match (relocation_accept_decision(&facts), prover) {
+    let decision = relocation_accept_decision(&facts);
+    let outcome = match (decision, prover) {
         (Ok(()), Some(prover)) => {
             info!(code = "pass", prover = %prover, shard = %short, rtt_ms, "por.audit");
             info!(code = "relocation.accepted", host = %cand, prover = %prover, shard = %short, "por.audit");
@@ -659,8 +660,9 @@ fn run_due_probe(ctx: &AuditJobCtx, now: u64) -> Option<AuditJobOutcome> {
                 verdict: AuditVerdict::Pass,
             }
         }
-        (r, prover) => {
-            let code = r.err().unwrap_or("reject.relocation_unproven");
+        // `Ok` with no prover cannot happen: an unknown prover counts as this node.
+        (_, prover) => {
+            let code = decision.err().unwrap_or_default();
             warn!(code, host = %cand, prover = ?prover, shard = %short, "por.audit");
             let next_cursor = probe.cursor.saturating_add(1);
             if next_cursor as usize >= candidates.len() {

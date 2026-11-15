@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+- **Owners can audit shards a departing node handed off (B-113, B59-HANDOFF).** A host now answers a chunk audit from the owner of the grant registered for the shard, or from a witness that grant names; the shard's accounted owner (the node that sent it) is used only when no grant is registered. A node that ran `parvault leave` therefore cannot audit the shards it handed off once the owner's grant is registered there. The owner's daemon finds the new host by probing up to 16 ring peers after its host misses two audits in a row (private-ring mode only). A grant may name at most 8 witnesses, and an older grant with fewer witnesses no longer replaces a newer one. `parvault leave` logs how many shards it sent without the owner's grant (`warn.handoff_unauditable`); their owners still cannot audit them.
+- **Lite clients name their seed as audit witness.** `watch-folder --lite-seed-dir` signs each stripe's grant over the seed's authenticated key, so the seed's audits of the hosts it fans out to are admitted. **Action needed:** stripes a lite device synced before this release name no witness. The seed fans them out as before but no longer audits them; `parvault-seed status` shows `lite stripes unwitnessed: N`, and the lite device prints a notice. Run `parvault watch-folder ... --lite-seed-dir <seed> --resyndicate-lite --once` once on the lite device (a full re-upload; use an unmetered link). Data, placement and quota are unchanged.
+
 ---
 
 ## [`0.5.2`] - 2026-11-15

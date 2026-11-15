@@ -256,6 +256,11 @@ parvault issue-device-cert \
 parvault-seed verify-device-cert --data-dir /mnt/nas/parvault-seed \
   --cert "PARVAULT-CERT-V1:<hex>" \
   --owner-pq-pubkey-hex <ISSUER_OWNER_PQ_PUBLIC_KEY_HEX>
+
+# 3. Upgrading a lite device from before v0.5.5: the seed does not audit the stripes it synced
+#    earlier ("lite stripes unwitnessed: N" in `parvault-seed status`) until you re-send them
+#    once with the same watch-folder command plus --resyndicate-lite (a full re-upload; use an
+#    unmetered link). Data, placement and quota are unaffected.
 ```
 
 ---

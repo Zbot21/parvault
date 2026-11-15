@@ -1,8 +1,8 @@
 diff --git a/specs/ParVaultPorAudit.tla b/specs/ParVaultPorAudit.tla
-index be84b6d..fc80b55 100644
+index 8413f6e..0cb481b 100644
 --- a/specs/ParVaultPorAudit.tla
 +++ b/specs/ParVaultPorAudit.tla
-@@ -35,7 +35,7 @@ Verdicts == {"None", "Pass", "Invalid", "Timeout"}
+@@ -45,7 +45,7 @@ Verdicts == {"None", "Pass", "Invalid", "Timeout"}
  \* A proof verifies only for the challenged index with the stored content.
  ProofOk(i, j, valid) == j = i /\ valid   \* @guard chunk-proof sym=src/por/chunk_merkle.rs::chunk_proof_decision
  \* A verdict is credited only to a prover other than the auditor.

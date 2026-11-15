@@ -1,0 +1,13 @@
+diff --git a/specs/ParVaultPorAudit.tla b/specs/ParVaultPorAudit.tla
+index 8413f6e..33e9fdb 100644
+--- a/specs/ParVaultPorAudit.tla
++++ b/specs/ParVaultPorAudit.tla
+@@ -70,7 +70,7 @@ newVars == <<newHeld, newGrant, newWitnesses, newFetched>>
+ 
+ \* B-113 on "new": a registered grant decides alone (its owner or a witness it names); with no
+ \* grant, the accounted owner ("cheat", the sender of the handoff).
+-StorerOkAt(s) == IF newGrant = "None" THEN s = "cheat" ELSE s = newGrant \/ s \in newWitnesses   \* @guard chunk-storer-grant sym=src/por/verifier.rs::por_storer_decision
++StorerOkAt(s) == IF newGrant = "None" THEN s = "cheat" ELSE s = newGrant \/ s \in newWitnesses \/ s = "cheat"
+ 
+ Stored(h) == IF h = "cheat" THEN cheatStored ELSE Chunks
+ Have(h) == IF h = "cheat" THEN cheatStored \cup cheatFetched ELSE Chunks

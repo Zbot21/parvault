@@ -1,8 +1,8 @@
 diff --git a/specs/ParVaultPorAudit.tla b/specs/ParVaultPorAudit.tla
-index be84b6d..f7f3bb4 100644
+index 8413f6e..009ef0a 100644
 --- a/specs/ParVaultPorAudit.tla
 +++ b/specs/ParVaultPorAudit.tla
-@@ -37,7 +37,7 @@ ProofOk(i, j, valid) == j = i /\ valid   \* @guard chunk-proof sym=src/por/chunk
+@@ -47,7 +47,7 @@ ProofOk(i, j, valid) == j = i /\ valid   \* @guard chunk-proof sym=src/por/chunk
  \* A verdict is credited only to a prover other than the auditor.
  MayCredit(v, p) == v # p   \* @guard audit-credit sym=src/por/audit.rs::audit_credit_decision
  \* Only an invalid proof is a ledger failure; a timeout never is.
