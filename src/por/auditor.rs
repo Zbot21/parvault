@@ -193,6 +193,15 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// What the verdict may look at: only a decoded answer. A transport or decode error, a refusal
+/// (`ChunkAuditResult(None)`: not storer, rate, busy, or a read error on the host) is no answer,
+/// so it can only ever be Unanswered, never a failed proof (Lead condition 2).
+pub fn usable_answer(
+    sent: anyhow::Result<Option<crate::por::ChunkAuditResponse>>,
+) -> Option<crate::por::ChunkAuditResponse> {
+    sent.ok().flatten()
+}
+
 /// The device id behind a host address (its `/p2p/` peer id or the client's pinned one).
 pub fn host_device_id(client: &MeshClient, addr: &str) -> Option<String> {
     let pid = client.pinned_peer_id(addr)?;
@@ -322,11 +331,7 @@ pub fn run_audit_job(ctx: &AuditJobCtx) -> AuditJobOutcome {
     let n = chunk_count_u64(target.shard_len);
     let challenge = generate_chunk_challenge(&session_key, target.shard_id, n, ctx.cfg.width, now);
     let t0 = Instant::now();
-    let answer = ctx
-        .client
-        .chunk_audit(&target.host_addr, challenge.clone())
-        .ok()
-        .flatten();
+    let answer = usable_answer(ctx.client.chunk_audit(&target.host_addr, challenge.clone()));
     let rtt_ms = t0.elapsed().as_millis() as u64;
     // The ledger is keyed by the Noise-authenticated device id, never by the address: an
     // address without a `/p2p/` id is resolved from the connection the request just made, and a
@@ -382,7 +387,8 @@ pub fn run_audit_job(ctx: &AuditJobCtx) -> AuditJobOutcome {
         }
         Ok(AuditCredit::Unanswered) => {
             st.unanswered = st.unanswered.saturating_add(1);
-            if matches!(verdict, AuditVerdict::Unanswered("reject.audit_timeout")) {
+            // A decoded answer that came back Unanswered was late (the only such case).
+            if answer.is_some() {
                 st.timed_out = st.timed_out.saturating_add(1);
             }
             if st.retry.is_none() {
@@ -411,6 +417,133 @@ mod tests {
         assert_eq!(AuditorState::load(dir.path()), s);
         std::fs::write(dir.path().join(AUDIT_STATE_FILE), br#"{"version":9}"#).unwrap();
         assert_eq!(AuditorState::load(dir.path()).passed, 0);
+    }
+
+    fn judge(answer: Option<&crate::por::ChunkAuditResponse>, rtt_ms: u64) -> AuditVerdict {
+        let ch = generate_chunk_challenge(&[1; 32], sid(), 2, 2, 0);
+        chunk_audit_decision(&AuditFacts {
+            challenge: &ch,
+            root: &[0; 32],
+            shard_len: 5_000,
+            response: answer,
+            rtt_ms,
+            rtt_bound_ms: DEFAULT_AUDIT_RTT_MS,
+        })
+    }
+
+    fn sid() -> ShardId {
+        ShardId {
+            stripe_merkle_root: [4; 32],
+            shard_index: 0,
+            shard_hash: [5; 32],
+        }
+    }
+
+    /// Lead condition 2: every way of not proving that is not a verifiably wrong proof is
+    /// Unanswered: a transport or decode error, a host refusal (not storer, rate, prover busy,
+    /// a host read error all answer `ChunkAuditResult(None)`), and a late answer.
+    #[test]
+    fn no_answer_is_never_a_failed_proof() {
+        let transport: anyhow::Result<Option<crate::por::ChunkAuditResponse>> =
+            Err(anyhow::anyhow!("connection reset"));
+        assert_eq!(usable_answer(transport), None);
+        assert_eq!(usable_answer(Ok(None)), None);
+        assert_eq!(
+            judge(None, 5),
+            AuditVerdict::Unanswered("reject.audit_unanswered")
+        );
+        // A late answer is Unanswered whatever it contains, even a wrong proof.
+        let wrong = crate::por::ChunkAuditResponse {
+            shard_id: sid(),
+            nonce: [0; 32],
+            proofs: Vec::new(),
+        };
+        assert_eq!(
+            judge(Some(&wrong), DEFAULT_AUDIT_RTT_MS + 1),
+            AuditVerdict::Unanswered("reject.audit_timeout")
+        );
+        for v in [
+            judge(None, 5),
+            judge(Some(&wrong), DEFAULT_AUDIT_RTT_MS + 1),
+        ] {
+            assert_eq!(
+                audit_credit_decision(&["self"], "host", v),
+                Ok(AuditCredit::Unanswered)
+            );
+        }
+    }
+
+    /// Lead condition 2, auditor side: a local manifest that does not read or decrypt is no
+    /// audit at all, and writes nothing to the ledger.
+    #[test]
+    fn unreadable_local_manifest_is_no_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(
+            dir.path(),
+            crate::storage::QuotaManager::new(1 << 30, 1 << 20),
+        )
+        .unwrap();
+        std::fs::create_dir_all(store.manifests_dir()).unwrap();
+        std::fs::write(
+            store.manifests_dir().join("ab.manifest.bin"),
+            b"not a manifest",
+        )
+        .unwrap();
+        let owner = NodeIdentity::from_seed([9; 32]);
+        let ctx = AuditJobCtx {
+            block_store: store.clone(),
+            master_key: MasterKey::from_bytes([3; 32]),
+            client: MeshClient::new(owner.clone(), Vec::new(), None),
+            self_device_ids: vec![owner.device_peer_id()],
+            cfg: AuditorConfig {
+                interval_ms: 1,
+                rtt_bound_ms: DEFAULT_AUDIT_RTT_MS,
+                width: 4,
+                max_per_hour: 30,
+            },
+            state: Arc::new(Mutex::new(AuditorState::default())),
+            data_dir: dir.path().to_path_buf(),
+        };
+        assert_eq!(run_audit_job(&ctx), AuditJobOutcome::Idle);
+        let st = ctx.state.lock().unwrap();
+        assert_eq!((st.passed, st.failed, st.unanswered), (0, 0, 0));
+    }
+
+    /// Lead condition 3 (the one automatic local consequence of an audit, ADR-03 decision 5): passes raise a
+    /// host's reciprocity factor on this node to 1.25, one invalid proof drops it to 2.0, and
+    /// unanswered audits change nothing.
+    #[test]
+    fn passes_raise_the_factor_and_one_invalid_proof_drops_it() {
+        let mut q = crate::storage::QuotaManager::new(1 << 30, 1 << 20);
+        let record =
+            |q: &mut crate::storage::QuotaManager, v: AuditVerdict| match audit_credit_decision(
+                &["self"],
+                "host",
+                v,
+            ) {
+                Ok(AuditCredit::Pass) => q.record_por_outcome("host", true),
+                Ok(AuditCredit::Fail) => q.record_por_outcome("host", false),
+                Ok(AuditCredit::Unanswered) | Err(_) => {}
+            };
+        let factor = |q: &crate::storage::QuotaManager| {
+            q.peer_account("host")
+                .map_or(crate::storage::PeerCreditAccount::default(), Clone::clone)
+                .required_reciprocity_factor()
+        };
+        assert_eq!(factor(&q), 2.0);
+        for _ in 0..20 {
+            record(&mut q, AuditVerdict::Pass);
+        }
+        assert_eq!(factor(&q), 1.25);
+        for _ in 0..5 {
+            record(&mut q, AuditVerdict::Unanswered("reject.audit_timeout"));
+        }
+        assert_eq!(factor(&q), 1.25, "unanswered audits change nothing");
+        record(
+            &mut q,
+            AuditVerdict::ProofInvalid("reject.por_chunk_proof_invalid"),
+        );
+        assert_eq!(factor(&q), 2.0);
     }
 
     #[test]

@@ -2467,3 +2467,66 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod chunk_prove_tests {
+    use super::*;
+
+    /// Lead condition 2, host side: a shard that is missing or whose length changed since the
+    /// stat is no answer (`ChunkAuditResult(None)`), never a proof the verifier could fail.
+    #[test]
+    fn host_read_error_is_no_answer() {
+        let store = BlockStore::new_in_memory(crate::storage::QuotaManager::new(1 << 30, 1 << 20));
+        let sid = crate::storage::ShardId {
+            stripe_merkle_root: [1; 32],
+            shard_index: 0,
+            shard_hash: crate::sharding::merkle::hash_shard_leaf(0, &[7u8; 5_000]),
+        };
+        let spec = |len| crate::por::ChunkProveSpec {
+            shard_id: sid,
+            nonce: [2; 32],
+            chunk_indices: vec![0],
+            shard_len: len,
+        };
+        let missing = ChunkProveJob {
+            block_store: store.clone(),
+            spec: spec(5_000),
+        };
+        assert!(matches!(
+            missing.prove(),
+            MeshWireResponse::ChunkAuditResult(None)
+        ));
+        store.put_shard("owner", &sid, &[7u8; 5_000]).unwrap();
+        let resized = ChunkProveJob {
+            block_store: store.clone(),
+            spec: spec(9_000),
+        };
+        assert!(matches!(
+            resized.prove(),
+            MeshWireResponse::ChunkAuditResult(None)
+        ));
+        let ok = ChunkProveJob {
+            block_store: store,
+            spec: spec(5_000),
+        };
+        assert!(matches!(
+            ok.prove(),
+            MeshWireResponse::ChunkAuditResult(Some(_))
+        ));
+    }
+
+    /// Lead condition 2: a busy prover refuses (no answer), it does not fail.
+    #[test]
+    fn busy_prover_refuses() {
+        use crate::network::server_events::chunk_prove_slot_decision;
+        assert_eq!(chunk_prove_slot_decision(1, 2), Ok(()));
+        assert_eq!(
+            chunk_prove_slot_decision(2, 2),
+            Err("reject.por_prover_busy")
+        );
+        assert_eq!(
+            chunk_prove_slot_decision(0, 0),
+            Err("reject.por_prover_busy")
+        );
+    }
+}
