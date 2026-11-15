@@ -203,7 +203,10 @@ pub(crate) async fn run_daemon(
                 sock_addr,
                 parvault::gateway::ipc::GatewayBus::in_process(Arc::clone(eng)),
                 parvault::http_edge::EdgeVerifier::RootKey(root_key),
-                parvault::traversal_metrics::process_counters(),
+                parvault::router_nas::StatusEdgeExtras {
+                    counters: parvault::traversal_metrics::process_counters(),
+                    config_digest: Some(opts.config_digest.clone()),
+                },
             )?;
             println!(
                 "[parvault] Embedded Status Server listening on http://{}",
@@ -675,7 +678,6 @@ async fn spawn_status_server(
             hwm_kib: 0,
             uptime_secs: 0,
             lan_peers: initial_lan_peers,
-            config_digest: opts.config_digest.clone(),
         };
         snap.update_telemetry(start_instant);
         Arc::new(RwLock::new(snap))

@@ -26,7 +26,7 @@ Lab instrumentation (NEW-3, NEW-4, NEW-5; `docs/LAB_MODE.md`, `docs/METRICS.md`)
 - **`daemon start` no longer lets a clap default override the config file** for `--listen` and `--enable-quic`: a flag wins only when given (the dump shows a clap default as `default`).
 - **The daemon dials a configured address that names its PeerId for that peer**, so a connection that authenticates as another peer is refused (`WrongPeerId`).
 - **Dial errors keep their cause.** The TCP and QUIC transport errors are flattened so a refused, unreachable or timed-out dial is not reported as a generic error.
-- `StatusSnapshot` gains `config_digest` (the daemon and `parvault-status` of one release share it).
+- `/api/v1/health` of the daemon gains `config_digest`, added at the status edge; the `StatusSnapshot` IPC frame is unchanged (`parvault-status` does not serve it).
 
 ---
 

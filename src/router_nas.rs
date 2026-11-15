@@ -63,6 +63,20 @@ fn parse_kib_field(s: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// What the daemon's status edge serves beyond the snapshot (`v0.5.4`): the traversal counters
+/// for `/metrics`, and the config digest added to `/api/v1/health`. The sidecar has neither.
+#[derive(Clone, Default)]
+pub struct StatusEdgeExtras {
+    pub counters: Option<Arc<TraversalCounters>>,
+    pub config_digest: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct EdgeView<'a> {
+    counters: Option<&'a TraversalCounters>,
+    config_digest: Option<&'a str>,
+}
+
 /// The metrics route (`docs/METRICS.md`).
 pub const METRICS_PATH: &str = "/metrics";
 /// Prometheus text format 0.0.4.
@@ -112,8 +126,13 @@ impl RouterNasStatusServer {
         bind_addr: SocketAddr,
         bus: GatewayBus,
         verifier: EdgeVerifier,
-        counters: Option<Arc<TraversalCounters>>,
+        extras: StatusEdgeExtras,
     ) -> io::Result<(SocketAddr, RouterNasServerHandle)> {
+        let StatusEdgeExtras {
+            counters,
+            config_digest,
+        } = extras;
+        let config_digest: Option<Arc<str>> = config_digest.map(Arc::from);
         let listener = TcpListener::bind(bind_addr)?;
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
@@ -129,15 +148,22 @@ impl RouterNasStatusServer {
                             if stream.set_nonblocking(false).is_err() {
                                 continue;
                             }
-                            let (bus, verifier, counters) =
-                                (bus.clone(), verifier.clone(), counters.clone());
+                            let (bus, verifier, counters, digest) = (
+                                bus.clone(),
+                                verifier.clone(),
+                                counters.clone(),
+                                config_digest.clone(),
+                            );
                             spawn_edge_conn(stream, &slots, "parvault-status-http", move |s| {
                                 let _ = handle_status_conn(
                                     s,
                                     &bus,
                                     &verifier,
                                     local_addr,
-                                    counters.as_deref(),
+                                    EdgeView {
+                                        counters: counters.as_deref(),
+                                        config_digest: digest.as_deref(),
+                                    },
                                 );
                             });
                         }
@@ -188,8 +214,9 @@ fn handle_status_conn(
     bus: &GatewayBus,
     verifier: &EdgeVerifier,
     bound: SocketAddr,
-    counters: Option<&TraversalCounters>,
+    view: EdgeView<'_>,
 ) -> io::Result<()> {
+    let counters = view.counters;
     let Some(head) = read_request_head(stream)? else {
         return Ok(());
     };
@@ -283,7 +310,16 @@ fn handle_status_conn(
     };
     match path.as_str() {
         "/api/v1/health" => {
-            let json = serde_json::to_vec_pretty(&snap).map_err(io::Error::other)?;
+            // v0.5.4 (docs/LAB_MODE.md): the daemon's edge adds `config_digest`; the snapshot
+            // and its IPC frame are unchanged.
+            let mut v = serde_json::to_value(&snap).map_err(io::Error::other)?;
+            if let (Some(d), Some(obj)) = (view.config_digest, v.as_object_mut()) {
+                obj.insert(
+                    "config_digest".into(),
+                    serde_json::Value::String(d.to_string()),
+                );
+            }
+            let json = serde_json::to_vec_pretty(&v).map_err(io::Error::other)?;
             send_response(stream, "200 OK", "application/json", &json)
         }
         "/api/v1/peers" => {
