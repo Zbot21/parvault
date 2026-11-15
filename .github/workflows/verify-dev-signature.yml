@@ -1,0 +1,43 @@
+name: Verify Dev Signature — SHA256SUMS.sig on a published release
+
+# L-113: the dev key never reaches CI, so CI cannot sign. When a release carries SHA256SUMS.sig,
+# this job verifies it against security/dev-allowed-signers, checks that the signed first line
+# names the tag, and checks every asset against SHA256SUMS. With no signature it says so and passes.
+on:
+  release:
+    types: [published, edited]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to verify
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Download the release assets
+        run: |
+          mkdir dl
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dl
+          ls -l dl
+      - name: Verify SHA256SUMS.sig (when present) and every asset
+        run: |
+          cd dl
+          if [ ! -f SHA256SUMS.sig ]; then
+            echo "::notice::$TAG has no SHA256SUMS.sig yet; nothing to verify"
+            exit 0
+          fi
+          ssh-keygen -Y verify -f ../security/dev-allowed-signers -I parvault-dev -n parvault-dev-build \
+            -s SHA256SUMS.sig < SHA256SUMS
+          test "$(head -n1 SHA256SUMS)" = "# parvault $TAG dev"
+          grep -v '^#' SHA256SUMS | sha256sum -c --strict -
