@@ -8471,3 +8471,527 @@ fn f53_reroot_repair_finishes_legacy_pin() {
     );
     gate_ran("trust_enforcement::f53_reroot_repair_finishes_legacy_pin");
 }
+
+// --- B-59: chunk-Merkle audits (F-34 storer binding, F-06 rate) ---------------------------------
+
+/// A daemon holding a 3-chunk shard of `owner`, stored with the fixture session key.
+fn chunk_audit_host(label: &str, owner: &NodeIdentity) -> (Node, ShardId, Vec<u8>) {
+    let node = spawn_daemon(label);
+    let (sid, bytes) = shard(0x3A, 2 * 4096 + 17);
+    assert!(stored(&send(
+        owner,
+        &node,
+        put_shard("", sid, bytes.clone(), None)
+    )));
+    (node, sid, bytes)
+}
+
+fn chunk_audit(sid: ShardId) -> MeshWireRequest {
+    MeshWireRequest::ChunkAudit(parvault::por::generate_chunk_challenge(
+        &[0x5E; 32],
+        sid,
+        3,
+        2,
+        now_ms(),
+    ))
+}
+
+/// F-34-STORER accept: the peer that stored the shard gets proofs that verify against the
+/// shard's chunk root (real hashes on both sides).
+#[test]
+fn f34_storer_chunk_audit_answered() {
+    let owner = key(0xB1);
+    let (node, sid, bytes) = chunk_audit_host("f34-storer-a", &owner);
+    let root = parvault::por::chunk_merkle::shard_chunk_root(&bytes);
+    let MeshWireRequest::ChunkAudit(chal) = chunk_audit(sid) else {
+        unreachable!()
+    };
+    let resp = send(&owner, &node, MeshWireRequest::ChunkAudit(chal.clone()));
+    let MeshWireResponse::ChunkAuditResult(Some(r)) = resp else {
+        panic!("{resp:?}")
+    };
+    assert_eq!((r.shard_id, r.nonce), (sid, chal.nonce));
+    let got: Vec<u32> = r.proofs.iter().map(|p| p.index).collect();
+    assert_eq!(got, chal.chunk_indices);
+    for p in &r.proofs {
+        parvault::por::chunk_proof_decision(&parvault::por::ChunkProofFacts {
+            root: &root,
+            shard_len: bytes.len() as u64,
+            index: p.index,
+            chunk: &p.chunk,
+            path: &p.path,
+        })
+        .expect("honest proof verifies");
+    }
+    gate_ran("trust_enforcement::f34_storer_chunk_audit_answered");
+}
+
+/// F-34-STORER reject (verdict change 1): a co-host holding the same per-stripe session key is
+/// refused before the rate check and any read, so it can neither fetch the shard's chunks nor
+/// spend the owner's audit budget.
+#[test]
+fn f34_co_host_chunk_audit_refused() {
+    let owner = key(0xB1);
+    let co_host = key(0xB2);
+    let (node, sid, _) = chunk_audit_host("f34-storer-r", &owner);
+    // The co-host stores its own shard of the same stripe, so it holds the stripe key.
+    let (mut other, other_bytes) = shard(0x3A, 4096);
+    other.shard_index = 1;
+    other.shard_hash = parvault::sharding::merkle::hash_shard_leaf(1, &other_bytes);
+    assert!(stored(&send(
+        &co_host,
+        &node,
+        put_shard("", other, other_bytes, None)
+    )));
+    let resp = send(&co_host, &node, chunk_audit(sid));
+    assert!(
+        matches!(resp, MeshWireResponse::ChunkAuditResult(None)),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.por_not_storer");
+    // The owner's budget is untouched: its own audit still answers.
+    let resp = send(&owner, &node, chunk_audit(sid));
+    assert!(
+        matches!(resp, MeshWireResponse::ChunkAuditResult(Some(_))),
+        "{resp:?}"
+    );
+    gate_ran("trust_enforcement::f34_co_host_chunk_audit_refused");
+}
+
+/// F-06-RATE accept: six chunk audits for one stripe key in ten minutes are all answered.
+#[test]
+fn f06_rate_six_chunk_audits_answered() {
+    let owner = key(0xB1);
+    let (node, sid, _) = chunk_audit_host("f06-rate-a", &owner);
+    for k in 0..6 {
+        let resp = send(&owner, &node, chunk_audit(sid));
+        assert!(
+            matches!(resp, MeshWireResponse::ChunkAuditResult(Some(_))),
+            "audit {k}: {resp:?}"
+        );
+    }
+    gate_ran("trust_enforcement::f06_rate_six_chunk_audits_answered");
+}
+
+/// F-06-RATE reject: the seventh chunk audit for one stripe key in ten minutes is refused.
+#[test]
+fn f06_rate_seventh_chunk_audit_refused() {
+    let owner = key(0xB1);
+    let (node, sid, _) = chunk_audit_host("f06-rate-r", &owner);
+    for _ in 0..6 {
+        assert!(matches!(
+            send(&owner, &node, chunk_audit(sid)),
+            MeshWireResponse::ChunkAuditResult(Some(_))
+        ));
+    }
+    let resp = send(&owner, &node, chunk_audit(sid));
+    assert!(
+        matches!(resp, MeshWireResponse::ChunkAuditResult(None)),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.por_rate_limited");
+    gate_ran("trust_enforcement::f06_rate_seventh_chunk_audit_refused");
+}
+
+// --- B-59: the owner daemon's audit loop (F-06 wiring, F-07, F-34) ------------------------------
+
+/// Stores one small file from the owner data dir `owner_dir` (a ring member) to `peers`.
+fn owner_store(owner_dir: &Path, cwd: &Path, peers: &str, bytes: &[u8]) {
+    let file = cwd.join("audited.bin");
+    std::fs::write(&file, bytes).unwrap();
+    let out = phrase_client(owner_dir, cwd, peers)
+        .args(["file", "store", "--path"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", out_text(&out));
+}
+
+/// Writes a config that audits each host every second (the first tick after one second).
+fn fast_audit_config(dir: &Path) {
+    std::fs::write(
+        dir.join("config.toml"),
+        "por_audit_interval_secs = 1\npor_audit_rtt_ms = 10000\n",
+    )
+    .unwrap();
+}
+
+/// The owner daemon on `dir`, auditing every second.
+fn spawn_owner_daemon(root: TempDir, dir: PathBuf) -> Node {
+    fast_audit_config(&dir);
+    let reg = root.path().join("lan-registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    let log = root.path().join("owner.log");
+    spawn(daemon_command(&dir, &reg), root, dir, log)
+}
+
+/// Waits until a `por.audit` line in the node log contains `needle`.
+fn assert_audit_logged(node: &Node, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if node
+            .log_text()
+            .lines()
+            .any(|l| l.contains("por.audit") && l.contains(needle))
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("no por.audit line with {needle}:\n{}", node.log_text());
+}
+
+/// The owner's own ledger entry for `peer` (read from its persisted quota state).
+fn owner_ledger(owner: &Node, peer: &str) -> Option<parvault::storage::PeerCreditAccount> {
+    let raw = std::fs::read(owner.dir.join("quota_state.bin")).ok()?;
+    let q: parvault::storage::QuotaManager = bincode::deserialize(&raw).ok()?;
+    q.peer_account(peer).cloned()
+}
+
+fn device_id_of(dir: &Path) -> String {
+    NodeIdentity::load_or_generate_in_dir(dir)
+        .unwrap()
+        .device_peer_id()
+}
+
+/// A host daemon and an owner data dir that stored one file on it.
+fn stored_on_host(label: &str, bytes: &[u8]) -> (Node, TempDir, PathBuf) {
+    let host = spawn_daemon(&format!("{label}-host"));
+    let root = temp_root(&format!("{label}-owner"));
+    let dir = root.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    owner_store(&dir, root.path(), &host.addr, bytes);
+    (host, root, dir)
+}
+
+/// Polls `f` for up to 10 s.
+fn eventually(mut f: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// F-34 accept: the owner daemon audits an honest host over the real wire, the proof verifies
+/// against the manifest's chunk root, and the pass is in the owner's log.
+#[test]
+fn f34_chunk_proof_verified() {
+    let (host, root, dir) = stored_on_host("f34-a", &[0x5Au8; 9_000]);
+    let owner = spawn_owner_daemon(root, dir);
+    assert_audit_logged(&owner, "pass");
+    assert!(!owner.log_text().contains("reject.por_chunk_proof_invalid"));
+    drop(host);
+    gate_ran("trust_enforcement::f34_chunk_proof_verified");
+}
+
+/// F-34 reject (verdict change 4): the host's shard files have one byte flipped in every chunk,
+/// so whichever chunk is challenged, the proof fails: `reject.por_chunk_proof_invalid`, a fail
+/// in the owner's ledger and the shard marked degraded. The host is not quarantined.
+#[test]
+fn f34_wrong_chunk_proof_refused() {
+    let (host, root, dir) = stored_on_host("f34-r", &[0x5Au8; 9_000]);
+    let shards = host.dir.join("shards");
+    let mut flipped = 0;
+    for p in files_under(&shards) {
+        let mut b = std::fs::read(&p).unwrap();
+        for off in (0..b.len()).step_by(4096) {
+            b[off] ^= 0xFF;
+        }
+        std::fs::write(&p, b).unwrap();
+        flipped += 1;
+    }
+    assert!(flipped > 0, "no shard files on the host");
+    let owner = spawn_owner_daemon(root, dir);
+    assert_audit_logged(&owner, "reject.por_chunk_proof_invalid");
+    let host_id = device_id_of(&host.dir);
+    assert!(
+        eventually(|| owner_ledger(&owner, &host_id).is_some_and(|a| a.por_failures >= 1)),
+        "no fail recorded for {host_id}"
+    );
+    let state = std::fs::read_to_string(owner.dir.join("por_audit_state.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&state).unwrap();
+    assert!(
+        !v["degraded"].as_array().unwrap().is_empty(),
+        "shard not degraded: {state}"
+    );
+    assert!(!owner.log_text().contains("quarantin"));
+    gate_ran("trust_enforcement::f34_wrong_chunk_proof_refused");
+}
+
+/// F-07 accept: the owner stores to host B, its daemon audits B, and the owner's own ledger
+/// credits B with a pass. Answering credits nothing on B.
+#[test]
+fn f07_peer_audit_pass_credited() {
+    let (host, root, dir) = stored_on_host("f07-a", &[0x6Bu8; 5_000]);
+    let owner = spawn_owner_daemon(root, dir);
+    assert_audit_logged(&owner, "pass");
+    let host_id = device_id_of(&host.dir);
+    assert!(
+        eventually(|| owner_ledger(&owner, &host_id).is_some_and(|a| a.por_passes >= 1)),
+        "no pass credited to {host_id}"
+    );
+    // Answering a challenge changes nothing in the host's own ledger.
+    let host_q: parvault::storage::QuotaManager =
+        bincode::deserialize(&std::fs::read(host.dir.join("quota_state.bin")).unwrap()).unwrap();
+    for id in [host_id.as_str(), &device_id_of(&owner.dir)] {
+        assert!(
+            host_q
+                .peer_account(id)
+                .is_none_or(|a| a.por_passes == 0 && a.por_failures == 0),
+            "host ledger changed for {id}"
+        );
+    }
+    // The owner's `parvault status` shows its own audit counts.
+    let status = parvault_cli(&owner.dir, true, &["status"]);
+    let text = out_text(&status);
+    assert!(status.status.success(), "{text}");
+    assert!(text.contains("Audits (chunk-Merkle PoR"), "{text}");
+    assert!(!text.contains("passed 0,"), "{text}");
+    gate_ran("trust_enforcement::f07_peer_audit_pass_credited");
+}
+
+/// F-07 reject (verdict change 11): an owner whose manifest names its own daemon as the host
+/// gets no credit: the sampler refuses with `reject.por_self_credit` before any network call.
+#[test]
+fn f07_self_answered_audit_not_credited() {
+    let root = temp_root("f07-r-owner");
+    let dir = root.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    NodeIdentity::load_or_generate_in_dir(&dir).unwrap();
+    // A master key before the daemon starts, so its audit loop is on.
+    let init = parvault_cli(&dir, false, &["init"]);
+    assert!(init.status.success(), "{}", out_text(&init));
+    let cwd = temp_root("f07-r-cli");
+    let owner = spawn_owner_daemon(root, dir.clone());
+    // The owner's daemon is the only peer, so the manifest names the owner's own node.
+    owner_store(&dir, cwd.path(), &owner.addr, &[0x7Cu8; 5_000]);
+    assert_logged(&owner, "reject.por_self_credit");
+    let node_id = device_id_of(&owner.dir);
+    assert!(
+        owner_ledger(&owner, &node_id).is_none_or(|a| a.por_passes == 0),
+        "self credited"
+    );
+    let audit_lines: Vec<String> = owner
+        .log_text()
+        .lines()
+        .filter(|l| l.contains("por.audit"))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        !audit_lines.iter().any(|l| l.contains("pass")),
+        "{audit_lines:#?}"
+    );
+    gate_ran("trust_enforcement::f07_self_answered_audit_not_credited");
+}
+
+/// F-06-TIMEOUT accept: the same honest host, answering inside the bound, passes.
+#[test]
+fn f06_prompt_host_passes() {
+    let (_host, root, dir) = stored_on_host("f06-to-a", &[0x4Du8; 5_000]);
+    let owner = spawn_owner_daemon(root, dir);
+    assert_audit_logged(&owner, "pass");
+    assert!(!owner.log_text().contains("reject.audit_timeout"));
+    gate_ran("trust_enforcement::f06_prompt_host_passes");
+}
+
+/// F-06-TIMEOUT reject: an answer over the RTT bound (1 ms here) is unanswered, never a fail:
+/// `reject.audit_timeout`, the unanswered count rises, no failure is recorded, and the host
+/// still answers.
+#[test]
+fn f06_slow_host_counted_unanswered_not_failed() {
+    let (host, root, dir) = stored_on_host("f06-to-r", &[0x4Du8; 5_000]);
+    std::fs::write(
+        dir.join("config.toml"),
+        "por_audit_interval_secs = 1\npor_audit_rtt_ms = 1\n",
+    )
+    .unwrap();
+    let reg = root.path().join("lan-registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    let log = root.path().join("owner.log");
+    let owner = spawn(daemon_command(&dir, &reg), root, dir, log);
+    assert_audit_logged(&owner, "reject.audit_timeout");
+    let host_id = device_id_of(&host.dir);
+    assert!(
+        owner_ledger(&owner, &host_id).is_none_or(|a| a.por_failures == 0),
+        "a timeout was recorded as a failure"
+    );
+    assert!(eventually(|| {
+        std::fs::read_to_string(owner.dir.join("por_audit_state.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .is_some_and(|v| v["timed_out"].as_u64().unwrap_or(0) >= 1)
+    }));
+    assert!(!owner.log_text().contains("reject.por_chunk_proof_invalid"));
+    gate_ran("trust_enforcement::f06_slow_host_counted_unanswered_not_failed");
+}
+
+/// A seed with `--peers` that audits each mesh host every second (F-06 seed half).
+fn spawn_auditing_seed(label: &str, peers: &[&str]) -> Node {
+    let (root, dir, reg, log) = prepare(label);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault-seed"));
+    cmd.arg("--peers").arg(peers.join(","));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .args([
+            "start",
+            "--mode",
+            "homelab-vault",
+            "--no-lan-discovery",
+            "--listen",
+            common::LOOPBACK_EPHEMERAL,
+            "--audit-interval-secs",
+            "1",
+            "--audit-rtt-ms",
+            "10000",
+            "--data-dir",
+        ])
+        .arg(&dir);
+    spawn(cmd, root, dir, log)
+}
+
+/// A device syndicates one lite stripe through `seed` to its mesh host; every shard lands.
+fn seed_fan_out(seed: &Node, host: &Node, fill: u8) {
+    let device = key(fill);
+    let (req, _root) = bseed_synd(seed, &device, fill);
+    let resp = send_with(
+        client(&device).with_timeout(Duration::from_secs(30)),
+        seed,
+        req,
+    );
+    match resp {
+        MeshWireResponse::SyndicateLiteStripeAck {
+            receipt: Some(r), ..
+        } => assert!(
+            r.mesh_peers_populated > 0,
+            "no shard reached the host: {}",
+            host.log_text()
+        ),
+        other => panic!("{other:?}\nseed log:\n{}", seed.log_text()),
+    }
+}
+
+fn seed_audit_state(seed: &Node) -> Option<serde_json::Value> {
+    let s = std::fs::read_to_string(seed.dir.join("por_audit_state.json")).ok()?;
+    serde_json::from_str(&s).ok()
+}
+
+/// F-06-SEED accept (B-59 change 9): the seed indexes the lite stripe it fanned out and audits
+/// the mesh host over the real wire as the storer; the honest host passes. The index and the
+/// counts are on the seed only (L-29).
+#[test]
+fn f06_seed_lite_audit_passes() {
+    let host = spawn_daemon("f06-seed-a-host");
+    let seed = spawn_auditing_seed("f06-seed-a", &[&host.addr]);
+    seed_fan_out(&seed, &host, 0xA6);
+    assert_audit_logged(&seed, "pass");
+    assert!(eventually(|| {
+        seed_audit_state(&seed).is_some_and(|v| v["passed"].as_u64().unwrap_or(0) >= 1)
+    }));
+    assert!(!seed.log_text().contains("reject.por_chunk_proof_invalid"));
+    assert!(
+        !host.log_text().contains("reject.por_not_storer"),
+        "{}",
+        host.log_text()
+    );
+    gate_ran("trust_enforcement::f06_seed_lite_audit_passes");
+}
+
+/// F-06-SEED reject: after the fan-out, the host's shard files get one byte flipped in every
+/// chunk, so the seed's audit fails the proof: `reject.por_chunk_proof_invalid`, a failed count
+/// and the shard degraded on the seed. The host is not quarantined.
+#[test]
+fn f06_seed_tampered_host_fails() {
+    let host = spawn_daemon("f06-seed-r-host");
+    let seed = spawn_auditing_seed("f06-seed-r", &[&host.addr]);
+    seed_fan_out(&seed, &host, 0xA7);
+    let mut flipped = 0;
+    for p in files_under(&host.dir.join("shards")) {
+        let mut b = std::fs::read(&p).unwrap();
+        for off in (0..b.len()).step_by(4096) {
+            b[off] ^= 0xFF;
+        }
+        std::fs::write(&p, b).unwrap();
+        flipped += 1;
+    }
+    assert!(flipped > 0, "no shard files on the host");
+    assert_audit_logged(&seed, "reject.por_chunk_proof_invalid");
+    assert!(
+        eventually(|| seed_audit_state(&seed).is_some_and(|v| {
+            v["failed"].as_u64().unwrap_or(0) >= 1
+                && !v["degraded"].as_array().is_none_or(Vec::is_empty)
+        })),
+        "no failed proof recorded on the seed"
+    );
+    assert!(!seed.log_text().contains("quarantin"));
+    gate_ran("trust_enforcement::f06_seed_tampered_host_fails");
+}
+
+/// D1 (qa-por): the in-flight cap is checked before `admit_chunk_challenge`, so a busy host's
+/// refusal spends neither the challenge's nonce nor a slot of the owner's 6-per-10-min stripe
+/// budget. Six distinct challenges of a 16 MiB shard go out at once to a host that proves at
+/// most 2 at a time; every one refused as busy is sent again unchanged (same nonce) and is
+/// answered, and the six answers fit the budget exactly.
+#[test]
+fn f06_busy_refusal_spends_no_nonce_or_budget() {
+    let owner = key(0xB3);
+    let node = spawn_daemon("f06-busy");
+    let (sid, bytes) = shard(0x3C, 16 * 1024 * 1024);
+    assert!(stored(&send_with(
+        client(&owner).with_timeout(Duration::from_secs(30)),
+        &node,
+        put_shard("", sid, bytes, None)
+    )));
+    let challenges: Vec<_> = (0..6)
+        .map(|_| parvault::por::generate_chunk_challenge(&[0x5E; 32], sid, 4096, 8, now_ms()))
+        .collect();
+    let addr = node.addr.clone();
+    let handles: Vec<_> = challenges
+        .iter()
+        .cloned()
+        .map(|ch| {
+            let (owner, addr) = (owner.clone(), addr.clone());
+            std::thread::spawn(move || {
+                client(&owner)
+                    .with_timeout(Duration::from_secs(20))
+                    .send_request(&addr, MeshWireRequest::ChunkAudit(ch))
+                    .map_err(|e| e.to_string())
+            })
+        })
+        .collect();
+    let mut refused = Vec::new();
+    for (ch, h) in challenges.iter().zip(handles) {
+        match h.join().unwrap() {
+            Ok(MeshWireResponse::ChunkAuditResult(Some(_))) => {}
+            Ok(MeshWireResponse::ChunkAuditResult(None)) => refused.push(ch.clone()),
+            other => panic!("{other:?}\n{}", node.log_text()),
+        }
+    }
+    assert!(
+        !refused.is_empty() && node.log_text().contains("reject.por_prover_busy"),
+        "no busy refusal in the burst; the test proves nothing:\n{}",
+        node.log_text()
+    );
+    assert!(!node.log_text().contains("reject.por_rate_limited"));
+    for ch in refused {
+        let resp = send_with(
+            client(&owner).with_timeout(Duration::from_secs(20)),
+            &node,
+            MeshWireRequest::ChunkAudit(ch),
+        );
+        assert!(
+            matches!(resp, MeshWireResponse::ChunkAuditResult(Some(_))),
+            "a challenge refused as busy was not answered later: {resp:?}\n{}",
+            node.log_text()
+        );
+    }
+    // The six answers used the whole budget: a seventh is refused.
+    let resp = send(&owner, &node, chunk_audit(sid));
+    assert!(
+        matches!(resp, MeshWireResponse::ChunkAuditResult(None)),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.por_rate_limited");
+}

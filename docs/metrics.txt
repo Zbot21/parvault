@@ -160,6 +160,11 @@ tlc.distinct.ParVaultZeroKeyAdminAndQuorum.RootOffDisk = 873,792
 tlc.depth.ParVaultZeroKeyAdminAndQuorum.RootOffDisk = 21
 tlc.distinct.ParVaultGatewayPluginBus = 7,540
 tlc.depth.ParVaultGatewayPluginBus = 10
+# ParVaultPorAudit measured 2026-11-15 at b522cdb on evo-x2 (B-59; tla2tools v1.8.0):
+# java -cp tla2tools.jar tlc2.TLC -workers 4 -config ParVaultPorAudit.cfg ParVaultPorAudit.tla
+tlc.generated.ParVaultPorAudit = 16,201
+tlc.distinct.ParVaultPorAudit = 1,944
+tlc.depth.ParVaultPorAudit = 14
 
 # --- Latest PUBLISHED release ----------------------------------------------------
 # The newest tag that exists on GitHub with its release assets. Install and fetch
@@ -180,9 +185,9 @@ kani_pass_compact = 31/31
 kani_harnesses.capabilities = 1
 kani_harnesses.aes = 1
 kani_harnesses.reed_solomon = 1
-tla_specs = 8
-wire_request_variants = 23
-tla_pass = 8 / 8
+tla_specs = 9
+wire_request_variants = 24
+tla_pass = 9 / 9
 adr_count = 33
 adr_last = ADR-33
 tests_unit = 137

@@ -51,9 +51,14 @@ pub struct PeerCreditAccount {
     pub bytes_hosted_for_peer: u64,
     /// Physical bytes the remote peer is currently hosting on behalf of this local node.
     pub bytes_contributed_by_peer: u64,
-    /// Cumulative successful PoR audits (< 300 ms valid salted commitments).
+    /// Chunk audits of this peer that this node ran and that verified (B-59, `por::auditor`).
     pub por_passes: u64,
-    /// Cumulative failed or timed-out PoR audits.
+    /// Chunk audits of this peer whose proof was verifiably invalid against the manifest root.
+    /// An unanswered, refused or late audit is never counted here (L-27); the auditor counts
+    /// those in `por_audit_state.json`. The one automatic consequence (ADR-03 decision 5): with
+    /// `por_passes` this sets the peer's reciprocity factor on this node, 1.25 at >= 20 audits
+    /// and >= 99.5 % passes, else 2.0, so an invalid proof narrows the peer's allowance here. No
+    /// repair, quarantine or gossip follows.
     pub por_failures: u64,
     /// Whether this peer has been slashed for Byzantine shard poisoning or egress withholding.
     pub is_slashed: bool,

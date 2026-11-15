@@ -230,3 +230,144 @@ pub fn generate_multi_segment_por_challenge(
         hmac_token,
     }
 }
+
+/// Indices per chunk challenge by default; the host accepts `1..=MAX_CHUNK_AUDIT_WIDTH`.
+pub const DEFAULT_CHUNK_AUDIT_WIDTH: u32 = 4;
+/// Most indices a host proves for one chunk challenge.
+pub const MAX_CHUNK_AUDIT_WIDTH: usize = 8;
+
+/// A chunk-Merkle audit challenge (F-34, ADR-03 as amended by B-59). The indices are drawn
+/// from the OS RNG, never derived from the nonce or the time: proofs are not bound to the
+/// nonce, so freshness comes only from unpredictable indices.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChunkChallenge {
+    pub shard_id: ShardId,
+    pub nonce: [u8; 32],
+    pub chunk_indices: Vec<u32>,
+    pub issued_at_unix_ms: u64,
+    /// [`compute_chunk_challenge_hmac`] under the stripe's session key.
+    pub hmac_token: [u8; 32],
+}
+
+/// A host's answer to a [`ChunkChallenge`]: one proof per index, in challenge order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChunkAuditResponse {
+    pub shard_id: ShardId,
+    pub nonce: [u8; 32],
+    pub proofs: Vec<crate::por::chunk_merkle::ChunkProof>,
+}
+
+/// `HMAC-SHA256(K_stripe, "parvault-por-chunk-v1:" || root || u32_be(shard_index) || shard_hash
+/// || nonce || u32_be(count) || u32_be(index)* || u64_be(issued_at))`. Its own domain, so a
+/// `PorAudit` token is never valid as a `ChunkAudit` token or the reverse.
+pub fn compute_chunk_challenge_hmac(
+    session_key: &[u8; 32],
+    shard_id: &ShardId,
+    nonce: &[u8; 32],
+    chunk_indices: &[u32],
+    issued_at_unix_ms: u64,
+) -> [u8; 32] {
+    let mut mac = <HmacSha256 as hmac::digest::KeyInit>::new_from_slice(session_key)
+        .expect("HMAC accepts any key length");
+    mac.update(b"parvault-por-chunk-v1:");
+    mac.update(&shard_id.stripe_merkle_root);
+    mac.update(&shard_id.shard_index.to_be_bytes());
+    mac.update(&shard_id.shard_hash);
+    mac.update(nonce);
+    mac.update(&(chunk_indices.len() as u32).to_be_bytes());
+    for i in chunk_indices {
+        mac.update(&i.to_be_bytes());
+    }
+    mac.update(&issued_at_unix_ms.to_be_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&mac.finalize().into_bytes());
+    out
+}
+
+/// `min(width, n)` distinct random indices in `0..n` from the OS RNG (verdict ruling 4).
+pub fn random_chunk_indices(n: u32, width: u32) -> Vec<u32> {
+    let want = width.clamp(1, MAX_CHUNK_AUDIT_WIDTH as u32).min(n.max(1)) as usize;
+    let mut out: Vec<u32> = Vec::with_capacity(want);
+    while out.len() < want {
+        let i = OsRng.gen_range(0..n.max(1));
+        if !out.contains(&i) {
+            out.push(i);
+        }
+    }
+    out
+}
+
+/// Builds a [`ChunkChallenge`] for `n` chunks with a fresh OS-random nonce and indices.
+pub fn generate_chunk_challenge(
+    session_key: &[u8; 32],
+    shard_id: ShardId,
+    n: u32,
+    width: u32,
+    issued_at_unix_ms: u64,
+) -> ChunkChallenge {
+    let mut nonce = [0u8; 32];
+    OsRng.fill_bytes(&mut nonce);
+    let chunk_indices = random_chunk_indices(n, width);
+    let hmac_token = compute_chunk_challenge_hmac(
+        session_key,
+        &shard_id,
+        &nonce,
+        &chunk_indices,
+        issued_at_unix_ms,
+    );
+    ChunkChallenge {
+        shard_id,
+        nonce,
+        chunk_indices,
+        issued_at_unix_ms,
+        hmac_token,
+    }
+}
+
+#[cfg(test)]
+mod chunk_challenge_tests {
+    use super::*;
+
+    fn sid() -> ShardId {
+        ShardId {
+            stripe_merkle_root: [1; 32],
+            shard_index: 2,
+            shard_hash: [3; 32],
+        }
+    }
+
+    #[test]
+    fn indices_are_distinct_and_clamped_to_n() {
+        assert_eq!(random_chunk_indices(1, 4), vec![0]);
+        let v = random_chunk_indices(3, 4);
+        assert_eq!(v.len(), 3);
+        let mut s = v.clone();
+        s.sort_unstable();
+        s.dedup();
+        assert_eq!(s.len(), 3);
+        assert_eq!(random_chunk_indices(256, 4).len(), 4);
+        assert_eq!(random_chunk_indices(256, 99).len(), MAX_CHUNK_AUDIT_WIDTH);
+    }
+
+    /// Verdict change 12: a byte-range token is never a chunk token and the reverse.
+    #[test]
+    fn por_and_chunk_tokens_do_not_cross() {
+        let k = [9u8; 32];
+        let nonce = [4u8; 32];
+        let chunk = compute_chunk_challenge_hmac(&k, &sid(), &nonce, &[0, 1], 7);
+        let range = compute_challenge_hmac(&k, &sid(), &nonce, 0, 1, 7);
+        assert_ne!(chunk, range);
+        // Same numbers in the other layout still differ (domain prefix and length).
+        let range2 = compute_challenge_hmac(&k, &sid(), &nonce, 2, 0, 7);
+        assert_ne!(chunk, range2);
+        let c = generate_chunk_challenge(&k, sid(), 16, 4, 7);
+        assert_eq!(
+            compute_chunk_challenge_hmac(&k, &sid(), &c.nonce, &c.chunk_indices, 7),
+            c.hmac_token
+        );
+        assert_ne!(
+            compute_chunk_challenge_hmac(&[8u8; 32], &sid(), &c.nonce, &c.chunk_indices, 7),
+            c.hmac_token
+        );
+    }
+}

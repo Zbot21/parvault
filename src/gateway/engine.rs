@@ -353,8 +353,10 @@ mod unix_engine {
         /// Infallibly wraps a local/embedded [`BlockStore`] with default Router-SoC streaming parameters.
         pub fn from_local_block_store(block_store: BlockStore, master_key: MasterKey) -> Self {
             let stripe_size = GATEWAY_STRIPE_BYTES;
-            let block_store = block_store.with_stripe_size_bytes(stripe_size);
             let owner_identity = NodeIdentity::from_master_key(&master_key);
+            let block_store = block_store
+                .with_stripe_size_bytes(stripe_size)
+                .with_owner_mesh_identity(&owner_identity);
             let owner_peer_id = Arc::new(owner_identity.device_peer_id());
             Self {
                 block_store,
@@ -388,8 +390,10 @@ mod unix_engine {
             let stripe_size = cfg
                 .stripe_size_bytes
                 .clamp(MIN_STRIPE_SIZE_BYTES, DEFAULT_STRIPE_SIZE_BYTES);
-            let block_store = block_store.with_stripe_size_bytes(stripe_size);
             let owner_identity = NodeIdentity::from_master_key(&master_key);
+            let block_store = block_store
+                .with_stripe_size_bytes(stripe_size)
+                .with_owner_mesh_identity(&owner_identity);
             let owner_peer_id = Arc::new(owner_identity.device_peer_id());
 
             let normalized_peers: Vec<String> = cfg
@@ -1209,6 +1213,47 @@ mod unix_engine {
                 }
             }
             anyhow::bail!("manifest not found for requested ephemeral shard IDs")
+        }
+    }
+
+    #[cfg(test)]
+    mod owner_writer_tests {
+        use super::*;
+        use crate::crypto::{MasterKey, NodeIdentity};
+        use crate::gateway::GatewayConfig;
+        use crate::network::MeshClient;
+        use crate::storage::{BlockStore, QuotaManager};
+
+        /// B-59 commit 1 (verdict ruling 3, change 14): the embedded gateway (the daemon's IPC path,
+        /// `cli/daemon.rs`) writes as the owner, not the node identity it was handed, so the owner
+        /// is the accounted storer and its session key is the one the auditor derives.
+        #[test]
+        fn embedded_gateway_writes_as_the_owner() {
+            let node = NodeIdentity::from_seed([0x41; 32]);
+            let mk = MasterKey::from_bytes([0x42; 32]);
+            let owner = NodeIdentity::from_master_key(&mk);
+            let store = BlockStore::new_in_memory(QuotaManager::new(1 << 20, 1 << 20))
+                .with_mesh_client(MeshClient::new(node.clone(), Vec::new(), None));
+            assert_eq!(store.mesh_writer_pubkey(), Some(node.public_key_bytes()));
+            let gw = GatewayEngine::from_local_block_store(store.clone(), mk.clone());
+            assert_eq!(
+                gw.block_store.mesh_writer_pubkey(),
+                Some(owner.public_key_bytes())
+            );
+            let gw = GatewayEngine::from_block_store(store, mk, GatewayConfig::default()).unwrap();
+            assert_eq!(
+                gw.block_store.mesh_writer_pubkey(),
+                Some(owner.public_key_bytes())
+            );
+            let root = [7u8; 32];
+            assert_eq!(
+                gw.owner_identity.derive_stripe_por_session_key(&root),
+                owner.derive_stripe_por_session_key(&root)
+            );
+            assert_ne!(
+                node.derive_stripe_por_session_key(&root),
+                owner.derive_stripe_por_session_key(&root)
+            );
         }
     }
 }

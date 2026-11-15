@@ -1,4 +1,5 @@
 //! Formal model: `specs/ParVaultProtocol.tla` (guards `read-auth-owner`, `read-auth-repair`).
+//! Formal model: `specs/ParVaultPorAudit.tla` (guard `chunk-storer`).
 use crate::config::ErasureTier;
 use crate::crypto::keys::NodeIdentity;
 use crate::por::challenger::{
@@ -65,6 +66,152 @@ pub fn por_prescreen_decision(f: &PorPrescreenFacts) -> Result<(), &'static str>
         return Err("reject.por_hmac_invalid");
     }
     Ok(())
+}
+
+/// L-101 / verdict change 1: a host answers a chunk audit only to the Noise-authenticated
+/// peer the shard is accounted to (the sender's device id equals the quota's shard owner, the
+/// same fact `PutShard` binds). The per-stripe session key is held by every host of the
+/// stripe, so the HMAC alone would let a co-host fetch this shard's chunks or spend the owner's
+/// audit budget. Checked in RAM before the rate check and any read.
+pub fn por_storer_decision(
+    sender_device_id: Option<&str>,
+    accounted_owner: Option<&str>,
+) -> Result<(), &'static str> {
+    match (sender_device_id, accounted_owner) {
+        (Some(s), Some(o)) if s == o => Ok(()),
+        _ => Err("reject.por_not_storer"),
+    }
+}
+
+/// Chunk audits one session key may ask for per window (the owner's budget per stripe).
+pub const CHUNK_AUDITS_PER_SESSION_WINDOW: usize = 6;
+/// The per-session window: 10 minutes.
+pub const CHUNK_AUDIT_SESSION_WINDOW_MS: u64 = 600_000;
+/// Chunk audits a host proves per minute in all (desktop and NAS).
+pub const CHUNK_AUDITS_PER_MINUTE_HOST: usize = 60;
+/// The same on `router-soc` (verdict change 8, ADR-21): 12 per minute of 1 MiB shards is
+/// about 1.2 s CPU per minute on a MIPS 24Kc at the plan's inferred rate.
+pub const CHUNK_AUDITS_PER_MINUTE_ROUTER: usize = 12;
+/// Session keys the rate map tracks; when full it refuses new keys, it never evicts.
+pub const MAX_CHUNK_RATE_KEYS: usize = 4096;
+
+/// What the chunk-audit rate decision knows, all from RAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PorRateFacts {
+    pub session_in_window: usize,
+    pub host_last_minute: usize,
+    pub host_per_minute_cap: usize,
+    /// Audits this owner (the authenticated storer) had proved in the last minute.
+    pub owner_last_minute: usize,
+    /// This owner's share of the host cap ([`owner_minute_share`]).
+    pub owner_per_minute_cap: usize,
+    /// P1: this owner had no audit proved here in the last session window (10 min). Only a
+    /// quiet owner may take the host's last slot of the minute.
+    pub owner_quiet: bool,
+    /// The key is new and the map already holds `MAX_CHUNK_RATE_KEYS` live keys.
+    pub map_full_for_new_key: bool,
+}
+
+/// D2 (fairness): an owner's share of the per-host minute cap when `other_owners` other owners
+/// had audits proved in the last minute: the cap split across the active owners plus one free
+/// share, with a floor of 1. The floor alone does not protect a quiet owner once the active
+/// owners number the cap, so [`por_rate_decision`] also keeps the host's last slot of each
+/// minute for an owner with no audit here in the last 10 minutes (P1).
+pub fn owner_minute_share(host_cap: usize, other_owners: usize) -> usize {
+    (host_cap / other_owners.saturating_add(2)).max(1)
+}
+
+/// F-06-RATE: at most 6 chunk audits per session key per 10 minutes, a per-host cap per
+/// minute and each owner's share of it (D2); a full rate map refuses (no eviction an attacker
+/// could drive).
+pub fn por_rate_decision(f: &PorRateFacts) -> Result<(), &'static str> {
+    if f.map_full_for_new_key
+        || f.session_in_window >= CHUNK_AUDITS_PER_SESSION_WINDOW
+        || f.host_last_minute >= f.host_per_minute_cap
+        || (!f.owner_quiet && f.host_last_minute.saturating_add(1) >= f.host_per_minute_cap)
+        || f.owner_last_minute >= f.owner_per_minute_cap
+    {
+        return Err("reject.por_rate_limited");
+    }
+    Ok(())
+}
+
+/// RAM-only counters behind [`por_rate_decision`].
+#[derive(Debug, Default)]
+struct ChunkRateState {
+    per_session: HashMap<[u8; 32], VecDeque<u64>>,
+    /// Proved audits in the last minute and their owner (bounded by the host cap).
+    host_minute: VecDeque<(u64, String)>,
+    /// P1: owner -> time of its last proved audit, for the last session window. Bounded by
+    /// `MAX_CHUNK_RATE_KEYS`; an owner not in a full map counts as not quiet.
+    owner_last_proved: HashMap<String, u64>,
+    host_per_minute_cap: Option<usize>,
+}
+
+impl ChunkRateState {
+    fn prune(&mut self, now: u64) {
+        while self
+            .host_minute
+            .front()
+            .is_some_and(|(t, _)| now.saturating_sub(*t) >= 60_000)
+        {
+            self.host_minute.pop_front();
+        }
+        self.owner_last_proved
+            .retain(|_, t| now.saturating_sub(*t) < CHUNK_AUDIT_SESSION_WINDOW_MS);
+        self.per_session.retain(|_, q| {
+            while q
+                .front()
+                .is_some_and(|t| now.saturating_sub(*t) >= CHUNK_AUDIT_SESSION_WINDOW_MS)
+            {
+                q.pop_front();
+            }
+            !q.is_empty()
+        });
+    }
+
+    fn facts(&self, key: &[u8; 32], owner: &str) -> PorRateFacts {
+        let session = self.per_session.get(key);
+        let host_cap = self
+            .host_per_minute_cap
+            .unwrap_or(CHUNK_AUDITS_PER_MINUTE_HOST);
+        let others: std::collections::BTreeSet<&str> = self
+            .host_minute
+            .iter()
+            .map(|(_, o)| o.as_str())
+            .filter(|o| *o != owner)
+            .collect();
+        PorRateFacts {
+            session_in_window: session.map_or(0, VecDeque::len),
+            host_last_minute: self.host_minute.len(),
+            host_per_minute_cap: host_cap,
+            owner_last_minute: self.host_minute.iter().filter(|(_, o)| o == owner).count(),
+            owner_per_minute_cap: owner_minute_share(host_cap, others.len()),
+            owner_quiet: !self.owner_last_proved.contains_key(owner)
+                && self.owner_last_proved.len() < MAX_CHUNK_RATE_KEYS,
+            map_full_for_new_key: session.is_none()
+                && self.per_session.len() >= MAX_CHUNK_RATE_KEYS,
+        }
+    }
+
+    fn record(&mut self, key: [u8; 32], owner: &str, now: u64) {
+        self.per_session.entry(key).or_default().push_back(now);
+        self.host_minute.push_back((now, owner.to_string()));
+        if self.owner_last_proved.contains_key(owner)
+            || self.owner_last_proved.len() < MAX_CHUNK_RATE_KEYS
+        {
+            self.owner_last_proved.insert(owner.to_string(), now);
+        }
+    }
+}
+
+/// What a host needs to build the proofs off the swarm task once a challenge is admitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkProveSpec {
+    pub shard_id: ShardId,
+    pub nonce: [u8; 32],
+    pub chunk_indices: Vec<u32>,
+    pub shard_len: u64,
 }
 
 /// What the shard-rebind decision needs to know (F-38-GRANT, L-41).
@@ -398,6 +545,8 @@ pub struct PorVerifierEngine {
     shard_grant_owners: HashMap<String, [u8; 32]>,
     /// Counter of disk reads prevented by RAM-only stateless HMAC/nonce rejection.
     blocked_ddos_challenges: u64,
+    /// Chunk-audit rate state, RAM only (B-59).
+    chunk_rate: ChunkRateState,
     /// Optional path to persist `session_keys_ram` and `repair_grants_ram` across daemon restarts.
     persistence_path: Option<std::path::PathBuf>,
 }
@@ -412,6 +561,7 @@ impl PorVerifierEngine {
             repair_grants_ram: HashMap::new(),
             shard_grant_owners: HashMap::new(),
             blocked_ddos_challenges: 0,
+            chunk_rate: ChunkRateState::default(),
             persistence_path: None,
         }
     }
@@ -458,6 +608,7 @@ impl PorVerifierEngine {
             repair_grants_ram,
             shard_grant_owners,
             blocked_ddos_challenges: 0,
+            chunk_rate: ChunkRateState::default(),
             persistence_path: Some(path),
         }
     }
@@ -679,6 +830,82 @@ impl PorVerifierEngine {
             } else {
                 PorError::InvalidHmacToken
             }
+        })
+    }
+
+    /// Sets the per-host chunk-audit cap per minute (`router-soc` uses
+    /// [`CHUNK_AUDITS_PER_MINUTE_ROUTER`]).
+    pub fn set_chunk_audit_host_cap(&mut self, per_minute: usize) {
+        self.chunk_rate.host_per_minute_cap = Some(per_minute);
+    }
+
+    /// Admits a [`ChunkChallenge`] on the host, all in RAM until the last step: the storer
+    /// binding ([`por_storer_decision`]), then the pre-screen (width `1..=8`, distinct indices,
+    /// session key, freshness, nonce, HMAC under `parvault-por-chunk-v1:`), then the rate
+    /// ([`por_rate_decision`]), then index bounds from the shard length (`stat_len`, a stat,
+    /// no read). Returns what the prover needs; the read happens off the swarm task.
+    pub fn admit_chunk_challenge(
+        &mut self,
+        ch: &crate::por::ChunkChallenge,
+        sender_device_id: Option<&str>,
+        accounted_owner: Option<&str>,
+        now_unix_ms: u64,
+        stat_len: impl FnOnce() -> Option<u64>,
+    ) -> Result<ChunkProveSpec, &'static str> {
+        if let Err(code) = por_storer_decision(sender_device_id, accounted_owner) {
+            self.blocked_ddos_challenges += 1;
+            return Err(code);
+        }
+        let n = ch.chunk_indices.len();
+        let distinct = ch
+            .chunk_indices
+            .iter()
+            .enumerate()
+            .all(|(k, i)| !ch.chunk_indices[..k].contains(i));
+        let range_ok = (1..=crate::por::MAX_CHUNK_AUDIT_WIDTH).contains(&n) && distinct;
+        let session_key = self.session_keys_ram.get(&ch.shard_id.file_key()).copied();
+        let hmac_valid = session_key.is_some_and(|k| {
+            crate::por::compute_chunk_challenge_hmac(
+                &k,
+                &ch.shard_id,
+                &ch.nonce,
+                &ch.chunk_indices,
+                ch.issued_at_unix_ms,
+            ) == ch.hmac_token
+        });
+        let facts = PorPrescreenFacts {
+            range_ok,
+            session_known: session_key.is_some(),
+            fresh: now_unix_ms.abs_diff(ch.issued_at_unix_ms) <= CHALLENGE_FRESHNESS_WINDOW_MS,
+            nonce_unseen: !self.seen_nonces_ram.contains(&ch.nonce),
+            hmac_valid,
+        };
+        if let Err(code) = por_prescreen_decision(&facts) {
+            self.blocked_ddos_challenges += 1;
+            return Err(code);
+        }
+        let key = session_key.expect("prescreen passed, so the key is known");
+        // The storer check passed, so the sender is the authenticated owner.
+        let owner = sender_device_id.unwrap_or_default();
+        self.chunk_rate.prune(now_unix_ms);
+        if let Err(code) = por_rate_decision(&self.chunk_rate.facts(&key, owner)) {
+            self.blocked_ddos_challenges += 1;
+            return Err(code);
+        }
+        self.record_seen_nonce(ch.nonce);
+        self.chunk_rate.record(key, owner, now_unix_ms);
+        let Some(shard_len) = stat_len() else {
+            return Err("reject.por_shard_missing");
+        };
+        let count = crate::por::chunk_merkle::chunk_count_u64(shard_len);
+        if ch.chunk_indices.iter().any(|&i| i >= count) {
+            return Err("reject.por_range_invalid");
+        }
+        Ok(ChunkProveSpec {
+            shard_id: ch.shard_id,
+            nonce: ch.nonce,
+            chunk_indices: ch.chunk_indices.clone(),
+            shard_len,
         })
     }
 
@@ -1218,5 +1445,324 @@ mod decision_tests {
         assert_eq!(del(None, false), Err("reject.delete_not_shard_owner"));
         assert_eq!(read(false, 2), Err("reject.repair_grant_unregistered"));
         assert_eq!(read(true, 1), Err("reject.repair_witness_quorum"));
+    }
+}
+
+#[cfg(test)]
+mod chunk_admit_tests {
+    use super::*;
+    use crate::por::{generate_chunk_challenge, ChunkChallenge};
+
+    const OWNER: &str = "parvault-peer-owner";
+    const KEY: [u8; 32] = [7; 32];
+    const NOW: u64 = 1_800_000_000_000;
+
+    fn sid(i: u32) -> ShardId {
+        ShardId {
+            stripe_merkle_root: [1; 32],
+            shard_index: i,
+            shard_hash: [i as u8; 32],
+        }
+    }
+
+    fn engine() -> PorVerifierEngine {
+        let mut e = PorVerifierEngine::new(300);
+        for i in 0..4 {
+            e.register_shard_session(&sid(i), KEY);
+        }
+        e
+    }
+
+    fn admit(
+        e: &mut PorVerifierEngine,
+        ch: &ChunkChallenge,
+        sender: &str,
+        now: u64,
+    ) -> Result<ChunkProveSpec, &'static str> {
+        // 3 chunks: 8193 bytes.
+        e.admit_chunk_challenge(ch, Some(sender), Some(OWNER), now, || Some(8193))
+    }
+
+    #[test]
+    fn storer_decision_needs_the_accounted_owner() {
+        assert_eq!(por_storer_decision(Some(OWNER), Some(OWNER)), Ok(()));
+        assert_eq!(
+            por_storer_decision(Some("co-host"), Some(OWNER)),
+            Err("reject.por_not_storer")
+        );
+        assert_eq!(
+            por_storer_decision(None, Some(OWNER)),
+            Err("reject.por_not_storer")
+        );
+        assert_eq!(
+            por_storer_decision(Some(OWNER), None),
+            Err("reject.por_not_storer")
+        );
+    }
+
+    #[test]
+    fn rate_decision_rules() {
+        let ok = PorRateFacts {
+            session_in_window: 5,
+            host_last_minute: 58,
+            host_per_minute_cap: 60,
+            owner_last_minute: 29,
+            owner_per_minute_cap: 30,
+            owner_quiet: false,
+            map_full_for_new_key: false,
+        };
+        assert_eq!(por_rate_decision(&ok), Ok(()));
+        // A quiet owner may take the last slot.
+        let quiet_last = PorRateFacts {
+            host_last_minute: 59,
+            owner_last_minute: 0,
+            owner_quiet: true,
+            ..ok
+        };
+        assert_eq!(por_rate_decision(&quiet_last), Ok(()));
+        for bad in [
+            PorRateFacts {
+                session_in_window: 6,
+                ..ok
+            },
+            PorRateFacts {
+                host_last_minute: 60,
+                ..ok
+            },
+            PorRateFacts {
+                map_full_for_new_key: true,
+                ..ok
+            },
+            PorRateFacts {
+                owner_last_minute: 30,
+                ..ok
+            },
+            // P1: the last slot is only for a quiet owner.
+            PorRateFacts {
+                host_last_minute: 59,
+                owner_quiet: false,
+                ..ok
+            },
+        ] {
+            assert_eq!(por_rate_decision(&bad), Err("reject.por_rate_limited"));
+        }
+    }
+
+    /// D2: owner B saturating its share of a host never starves owner A of that host: A is
+    /// still admitted while B is refused, on desktop and router caps.
+    #[test]
+    fn one_owner_cannot_starve_another() {
+        assert_eq!(owner_minute_share(60, 0), 30);
+        assert_eq!(owner_minute_share(60, 1), 20);
+        assert_eq!(owner_minute_share(12, 0), 6);
+        assert_eq!(owner_minute_share(12, 20), 1);
+        for cap in [CHUNK_AUDITS_PER_MINUTE_HOST, CHUNK_AUDITS_PER_MINUTE_ROUTER] {
+            let mut r = ChunkRateState {
+                host_per_minute_cap: Some(cap),
+                ..ChunkRateState::default()
+            };
+            // B asks with a fresh stripe key each time (its per-stripe budget never binds).
+            let mut b_admitted = 0;
+            for i in 0..cap * 4 {
+                let key = [i as u8; 32];
+                if por_rate_decision(&r.facts(&key, "owner-b")).is_ok() {
+                    r.record(key, "owner-b", NOW);
+                    b_admitted += 1;
+                }
+            }
+            assert_eq!(b_admitted, cap / 2, "B alone gets half the host cap");
+            for j in 0..owner_minute_share(cap, 1) {
+                let a_key = [250 - j as u8; 32];
+                assert_eq!(por_rate_decision(&r.facts(&a_key, "owner-a")), Ok(()));
+                r.record(a_key, "owner-a", NOW);
+            }
+            assert_eq!(
+                por_rate_decision(&r.facts(&[0xBB; 32], "owner-b")),
+                Err("reject.por_rate_limited")
+            );
+            assert!(r.host_minute.len() <= cap);
+        }
+    }
+
+    /// P1: cap-many Sybil owners saturating a router host minute after minute never starve a
+    /// quiet owner A: from the minute after their first burst they are no longer quiet, so the
+    /// host's last slot of every minute stays for A.
+    #[test]
+    fn cap_many_sybils_cannot_starve_a_quiet_owner() {
+        let cap = CHUNK_AUDITS_PER_MINUTE_ROUTER;
+        let mut r = ChunkRateState {
+            host_per_minute_cap: Some(cap),
+            ..ChunkRateState::default()
+        };
+        let sybils: Vec<String> = (0..cap).map(|i| format!("sybil-{i}")).collect();
+        let mut key_n = 0u32;
+        let mut fresh_key = || {
+            key_n += 1;
+            let mut k = [0u8; 32];
+            k[..4].copy_from_slice(&key_n.to_be_bytes());
+            k
+        };
+        for minute in 0..8u64 {
+            let t = NOW + minute * 60_000;
+            r.prune(t);
+            // Every Sybil asks until refused, with fresh stripe keys.
+            for _ in 0..4 {
+                for s in &sybils {
+                    let k = fresh_key();
+                    if por_rate_decision(&r.facts(&k, s)).is_ok() {
+                        r.record(k, s, t);
+                    }
+                }
+            }
+            assert!(r.host_minute.len() <= cap);
+            if minute == 0 {
+                continue; // the first burst: every Sybil was quiet too
+            }
+            let owner_a = format!("owner-a-{minute}");
+            let k = fresh_key();
+            assert_eq!(
+                por_rate_decision(&r.facts(&k, &owner_a)),
+                Ok(()),
+                "minute {minute}: the quiet owner is starved"
+            );
+            r.record(k, &owner_a, t);
+        }
+    }
+
+    /// Verdict change 1: a co-host holding the stripe key is refused before anything else,
+    /// and its attempt spends none of the owner's budget.
+    #[test]
+    fn co_host_refused_before_rate_and_read() {
+        let mut e = engine();
+        let ch = generate_chunk_challenge(&KEY, sid(0), 3, 2, NOW);
+        let read = std::cell::Cell::new(false);
+        let r = e.admit_chunk_challenge(&ch, Some("co-host"), Some(OWNER), NOW, || {
+            read.set(true);
+            Some(8193)
+        });
+        assert_eq!(r, Err("reject.por_not_storer"));
+        assert!(!read.get());
+        assert_eq!(e.blocked_ddos_challenges, 1);
+        // The same challenge from the owner still passes (nonce not burned).
+        let spec = admit(&mut e, &ch, OWNER, NOW).expect("owner admitted");
+        assert_eq!(spec.chunk_indices, ch.chunk_indices);
+        assert_eq!(spec.shard_len, 8193);
+    }
+
+    #[test]
+    fn prescreen_and_bounds() {
+        let mut e = engine();
+        let good = generate_chunk_challenge(&KEY, sid(0), 3, 2, NOW);
+        // Wrong key: HMAC refused, no stat.
+        let wrong = generate_chunk_challenge(&[8; 32], sid(0), 3, 2, NOW);
+        assert_eq!(
+            e.admit_chunk_challenge(&wrong, Some(OWNER), Some(OWNER), NOW, || panic!("stat")),
+            Err("reject.por_hmac_invalid")
+        );
+        // A PorAudit token does not pass as a chunk token.
+        let mut cross = good.clone();
+        cross.hmac_token = compute_challenge_hmac(&KEY, &sid(0), &good.nonce, 0, 1, NOW);
+        assert_eq!(
+            admit(&mut e, &cross, OWNER, NOW),
+            Err("reject.por_hmac_invalid")
+        );
+        // Stale.
+        assert_eq!(
+            admit(
+                &mut e,
+                &good,
+                OWNER,
+                NOW + CHALLENGE_FRESHNESS_WINDOW_MS + 1
+            ),
+            Err("reject.por_stale_or_replayed")
+        );
+        // Unknown session.
+        let unknown = generate_chunk_challenge(&KEY, sid(9), 3, 2, NOW);
+        assert_eq!(
+            admit(&mut e, &unknown, OWNER, NOW),
+            Err("reject.por_session_unknown")
+        );
+        // Width 0, 9, or repeated indices.
+        for idx in [vec![], (0..9).collect(), vec![1, 1]] {
+            let mut c = good.clone();
+            c.chunk_indices = idx;
+            c.hmac_token = crate::por::compute_chunk_challenge_hmac(
+                &KEY,
+                &c.shard_id,
+                &c.nonce,
+                &c.chunk_indices,
+                NOW,
+            );
+            assert_eq!(
+                admit(&mut e, &c, OWNER, NOW),
+                Err("reject.por_range_invalid")
+            );
+        }
+        // Index past the chunk count (3 chunks at 8193 bytes).
+        let mut past = good.clone();
+        past.nonce = [0xAB; 32];
+        past.chunk_indices = vec![3];
+        past.hmac_token =
+            crate::por::compute_chunk_challenge_hmac(&KEY, &past.shard_id, &past.nonce, &[3], NOW);
+        assert_eq!(
+            admit(&mut e, &past, OWNER, NOW),
+            Err("reject.por_range_invalid")
+        );
+        // Good, then replay.
+        assert!(admit(&mut e, &good, OWNER, NOW).is_ok());
+        assert_eq!(
+            admit(&mut e, &good, OWNER, NOW),
+            Err("reject.por_stale_or_replayed")
+        );
+        // Missing shard file.
+        let g2 = generate_chunk_challenge(&KEY, sid(1), 3, 2, NOW);
+        assert_eq!(
+            e.admit_chunk_challenge(&g2, Some(OWNER), Some(OWNER), NOW, || None),
+            Err("reject.por_shard_missing")
+        );
+    }
+
+    /// F-06-RATE: the 7th challenge for one session key in 10 minutes is refused; the window
+    /// slides; the router cap is per host per minute.
+    #[test]
+    fn seventh_challenge_in_window_refused() {
+        let mut e = engine();
+        for k in 0..6 {
+            let ch = generate_chunk_challenge(&KEY, sid(k % 4), 3, 1, NOW + k as u64);
+            assert!(admit(&mut e, &ch, OWNER, NOW + k as u64).is_ok(), "{k}");
+        }
+        let ch = generate_chunk_challenge(&KEY, sid(0), 3, 1, NOW + 10);
+        assert_eq!(
+            admit(&mut e, &ch, OWNER, NOW + 10),
+            Err("reject.por_rate_limited")
+        );
+        let later = NOW + CHUNK_AUDIT_SESSION_WINDOW_MS + 10;
+        let ch = generate_chunk_challenge(&KEY, sid(0), 3, 1, later);
+        assert!(admit(&mut e, &ch, OWNER, later).is_ok());
+
+        // Host cap 2: one owner gets its share (1, D2), a second owner the other slot, and then
+        // the host cap refuses everyone for the rest of the minute.
+        let mut r = engine();
+        r.set_chunk_audit_host_cap(2);
+        let ch = generate_chunk_challenge(&KEY, sid(0), 3, 1, NOW);
+        assert!(admit(&mut r, &ch, OWNER, NOW).is_ok());
+        let ch = generate_chunk_challenge(&KEY, sid(0), 3, 1, NOW + 1);
+        assert_eq!(
+            admit(&mut r, &ch, OWNER, NOW + 1),
+            Err("reject.por_rate_limited")
+        );
+        let ch = generate_chunk_challenge(&KEY, sid(1), 3, 1, NOW + 2);
+        assert!(r
+            .admit_chunk_challenge(&ch, Some("owner-2"), Some("owner-2"), NOW + 2, || Some(
+                8193
+            ))
+            .is_ok());
+        let ch = generate_chunk_challenge(&KEY, sid(2), 3, 1, NOW + 3);
+        assert_eq!(
+            r.admit_chunk_challenge(&ch, Some("owner-3"), Some("owner-3"), NOW + 3, || Some(
+                8193
+            )),
+            Err("reject.por_rate_limited")
+        );
     }
 }

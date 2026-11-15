@@ -404,6 +404,9 @@ pub enum MeshWireRequest {
         scope_root: [u8; 32],
         from_epoch: u64,
     },
+    /// A chunk-Merkle audit (F-34, ADR-03 as amended by B-59), appended. Answered only to the
+    /// peer the shard is accounted to (`reject.por_not_storer`), after the RAM pre-screen.
+    ChunkAudit(crate::por::ChunkChallenge),
 }
 
 /// Wire-level response messages exchanged over `/parvault/wire/1.0.0`.
@@ -513,6 +516,9 @@ pub enum MeshWireResponse {
     CouncilManifestResult {
         manifests: Vec<crate::storage::council::CouncilManifest>,
     },
+    /// Result of `ChunkAudit` (appended): `None` for every refusal (the verifier counts it as
+    /// unanswered, never as a failed proof).
+    ChunkAuditResult(Option<crate::por::ChunkAuditResponse>),
 }
 
 /// Composite libp2p `NetworkBehaviour` combining Kademlia DHT, Gossipsub, mDNS, Ping, Identify,
@@ -635,3 +641,112 @@ pub fn effective_kademlia_distance(
 // Re-exported so `parvault::network::behaviour::*` paths keep resolving.
 pub use super::placement::{PeerTopologyMetrics, PlacementEngine, ShardPlacementPlan};
 pub use super::rate_limit::TokenBucketRateLimiter;
+
+#[cfg(test)]
+mod wire_golden_tests {
+    use super::*;
+    use crate::por::{ChunkAuditResponse, ChunkChallenge, ChunkProof};
+
+    fn enc<T: Serialize>(v: &T) -> Vec<u8> {
+        BincodeWireCodec::bincode_options(MAX_WIRE_FRAME_BYTES)
+            .serialize(v)
+            .unwrap()
+    }
+
+    fn tag(b: &[u8]) -> u32 {
+        u32::from_le_bytes(b[..4].try_into().unwrap())
+    }
+
+    fn sid() -> ShardId {
+        ShardId {
+            stripe_merkle_root: [0x11; 32],
+            shard_index: 2,
+            shard_hash: [0x22; 32],
+        }
+    }
+
+    fn challenge() -> ChunkChallenge {
+        ChunkChallenge {
+            shard_id: sid(),
+            nonce: [0x33; 32],
+            chunk_indices: vec![0, 5],
+            issued_at_unix_ms: 0x0102_0304_0506_0708,
+            hmac_token: [0x44; 32],
+        }
+    }
+
+    /// Verdict change 12: the new variants are appended, so no existing discriminant moves.
+    #[test]
+    fn appended_variants_do_not_move_discriminants() {
+        let gcm = enc(&MeshWireRequest::GetCouncilManifest {
+            scope_root: [0; 32],
+            from_epoch: 0,
+        });
+        let ca = enc(&MeshWireRequest::ChunkAudit(challenge()));
+        let cmr = enc(&MeshWireResponse::CouncilManifestResult {
+            manifests: Vec::new(),
+        });
+        let car = enc(&MeshWireResponse::ChunkAuditResult(None));
+        let por = enc(&MeshWireRequest::PorAudit(
+            crate::por::generate_por_challenge(&[0; 32], sid(), 64, 1),
+        ));
+        // Existing discriminants (pinned): PorAudit 2, GetCouncilManifest 22, its result 21.
+        assert_eq!(
+            (tag(&por), tag(&gcm), tag(&cmr)),
+            (2, 22, 21),
+            "an existing variant moved"
+        );
+        assert_eq!(
+            (tag(&ca), tag(&car)),
+            (23, 22),
+            "new variants are appended last"
+        );
+        assert_eq!(
+            hex::encode(&ca),
+            concat!(
+                "17000000",
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                "02000000",
+                "2222222222222222222222222222222222222222222222222222222222222222",
+                "3333333333333333333333333333333333333333333333333333333333333333",
+                "0200000000000000",
+                "00000000",
+                "05000000",
+                "0807060504030201",
+                "4444444444444444444444444444444444444444444444444444444444444444",
+            )
+        );
+        let resp = MeshWireResponse::ChunkAuditResult(Some(ChunkAuditResponse {
+            shard_id: sid(),
+            nonce: [0x33; 32],
+            proofs: vec![ChunkProof {
+                index: 5,
+                chunk: vec![0xAA, 0xBB],
+                path: vec![[0x55; 32]],
+            }],
+        }));
+        assert_eq!(
+            hex::encode(enc(&resp)),
+            concat!(
+                "16000000",
+                "01",
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                "02000000",
+                "2222222222222222222222222222222222222222222222222222222222222222",
+                "3333333333333333333333333333333333333333333333333333333333333333",
+                "0100000000000000",
+                "05000000",
+                "0200000000000000",
+                "aabb",
+                "0100000000000000",
+                "5555555555555555555555555555555555555555555555555555555555555555",
+            )
+        );
+        // Round trip through the bounded decoder.
+        let codec = BincodeWireCodec::default();
+        assert!(matches!(
+            codec.deserialize_request_bounded(&ca).unwrap(),
+            MeshWireRequest::ChunkAudit(c) if c == challenge()
+        ));
+    }
+}

@@ -715,6 +715,7 @@ fn covering_case(req: &MeshWireRequest) -> &'static str {
             "broadcast_eviction_order"
         }
         MeshWireRequest::AdmitPublicTicket(_) => "admit_public_ticket",
+        MeshWireRequest::ChunkAudit(_) => "chunk_audit",
     }
 }
 
@@ -1071,6 +1072,63 @@ fn multi_segment_por_audit() {
     let o = t.run(&peer, &MeshWireRequest::MultiSegmentPorAudit(chal));
     assert!(o[0].resp.contains("MultiSegmentPorAuditResult(None)"));
     assert_eq!((o[0].por_delta, o[1].por_delta, o[2].por_delta), (0, 0, 0));
+}
+
+/// B-59: a chunk audit is answered identically on every role, only to the storer, and earns
+/// the prover nothing (F-07); the proof verifies against the shard's chunk root.
+#[test]
+fn chunk_audit() {
+    let _g = env_guard();
+    let mut t = Trio::new("chunk");
+    let peer = Peer::new(0x66, "198.51.100.7");
+    let co_host = Peer::new(0x67, "198.51.100.8");
+    t.admit(&peer);
+    t.admit(&co_host);
+    let (sid, bytes) = shard(9, 3 * 4096 + 5);
+    let session = [0x97; 32];
+    t.run(&peer, &put_shard_req("", sid, bytes.clone(), session));
+    let root = parvault::por::chunk_merkle::shard_chunk_root(&bytes);
+    let chal = parvault::por::generate_chunk_challenge(&session, sid, 4, 4, now_ms());
+    // A co-host holding the same stripe key is refused (verdict change 1).
+    let o = t.run(&co_host, &MeshWireRequest::ChunkAudit(chal.clone()));
+    assert!(
+        o[0].resp.contains("ChunkAuditResult(None)"),
+        "{}",
+        o[0].resp
+    );
+    assert_identical(&o);
+    let o = t.run(&peer, &MeshWireRequest::ChunkAudit(chal.clone()));
+    assert!(o[0].resp.contains("ChunkAuditResult(Some"), "{}", o[0].resp);
+    assert_eq!((o[0].por_delta, o[1].por_delta, o[2].por_delta), (0, 0, 0));
+    assert_identical(&o);
+    // Replay: refused in RAM.
+    let o = t.run(&peer, &MeshWireRequest::ChunkAudit(chal.clone()));
+    assert!(o[0].resp.contains("ChunkAuditResult(None)"));
+    // The answered proofs verify against the root (real hashes, no fixture).
+    let mut fx_resp = None;
+    t.each(|fx, _| {
+        if fx_resp.is_none() {
+            let c2 = parvault::por::generate_chunk_challenge(&session, sid, 4, 4, now_ms());
+            fx_resp = Some((
+                c2.clone(),
+                fx.store
+                    .chunk_proofs(&sid, bytes.len() as u64, &c2.chunk_indices)
+                    .unwrap(),
+            ));
+        }
+    });
+    let (c2, proofs) = fx_resp.unwrap();
+    assert_eq!(proofs.len(), c2.chunk_indices.len());
+    for p in &proofs {
+        parvault::por::chunk_proof_decision(&parvault::por::ChunkProofFacts {
+            root: &root,
+            shard_len: bytes.len() as u64,
+            index: p.index,
+            chunk: &p.chunk,
+            path: &p.path,
+        })
+        .expect("honest proof verifies");
+    }
 }
 
 // --- 5. GetCiphertextShard (identical) ----------------------------------------------------------
@@ -1754,6 +1812,7 @@ fn syndicate_lite_stripe() {
         fx.syndication_load = parvault::network::server_events::SyndicationLoad {
             in_flight_total: parvault::network::server_events::MAX_SYNDICATIONS_IN_FLIGHT,
             in_flight_sender: 0,
+            ..Default::default()
         }
     });
     let o = t.run(&peer, &busy_req);

@@ -413,6 +413,7 @@ pub const fn admission_class(request: &MeshWireRequest) -> AdmissionClass {
         | MeshWireRequest::DeleteShard { .. }
         | MeshWireRequest::PorAudit(_)
         | MeshWireRequest::MultiSegmentPorAudit(_)
+        | MeshWireRequest::ChunkAudit(_)
         | MeshWireRequest::GetDhtEnvelope { .. } => AdmissionClass::SelfAuthorised,
         MeshWireRequest::RelayPqOnionEnvelope { .. }
         | MeshWireRequest::GetCouncilManifest { .. } => AdmissionClass::AdmittedPeer,
@@ -653,6 +654,7 @@ pub fn reject_response(request: &MeshWireRequest, reason: String) -> MeshWireRes
             error: Some(reason),
         },
         MeshWireRequest::PorAudit(_) => MeshWireResponse::PorAuditResult(None),
+        MeshWireRequest::ChunkAudit(_) => MeshWireResponse::ChunkAuditResult(None),
         MeshWireRequest::GetCiphertextShard { .. } => MeshWireResponse::CiphertextShardResult {
             shard_bytes: None,
             error: Some(reason),
@@ -774,6 +776,40 @@ pub enum WireReply {
 pub enum DeferredJob {
     Relay(Box<RelayForward>),
     LiteFanOut(Box<crate::bootstrap::LiteFanOutPlan>),
+    /// A chunk-audit proof (B-59, verdict change 5): one shard read and its leaf hashes on the
+    /// blocking pool, under the prover's in-flight cap.
+    ChunkProve(Box<ChunkProveJob>),
+}
+
+/// The prover side of an admitted `ChunkAudit`, run off the swarm task.
+pub struct ChunkProveJob {
+    pub block_store: BlockStore,
+    pub spec: crate::por::ChunkProveSpec,
+}
+
+impl ChunkProveJob {
+    /// Reads the shard chunk by chunk (no leaf-hash check, so corruption shows as an invalid
+    /// proof on the verifier) and builds the proofs. Any read error is no answer.
+    pub fn prove(self) -> MeshWireResponse {
+        let s = self.spec;
+        match self
+            .block_store
+            .chunk_proofs(&s.shard_id, s.shard_len, &s.chunk_indices)
+        {
+            Ok(proofs) if proofs.len() == s.chunk_indices.len() => {
+                MeshWireResponse::ChunkAuditResult(Some(crate::por::ChunkAuditResponse {
+                    shard_id: s.shard_id,
+                    nonce: s.nonce,
+                    proofs,
+                }))
+            }
+            Ok(_) => MeshWireResponse::ChunkAuditResult(None),
+            Err(e) => {
+                warn!(code = "reject.por_shard_missing", error = %e, "chunk audit read failed");
+                MeshWireResponse::ChunkAuditResult(None)
+            }
+        }
+    }
 }
 
 impl DeferredJob {
@@ -782,10 +818,21 @@ impl DeferredJob {
         matches!(self, DeferredJob::LiteFanOut(_))
     }
 
+    /// Whether this job counts against the chunk-prove budget.
+    pub fn is_chunk_prove(&self) -> bool {
+        matches!(self, DeferredJob::ChunkProve(_))
+    }
+
     /// Runs the job off the swarm task and returns the response to send.
     pub async fn run(self) -> MeshWireResponse {
         match self {
             DeferredJob::Relay(job) => (*job).run().await,
+            DeferredJob::ChunkProve(job) => {
+                match tokio::task::spawn_blocking(move || job.prove()).await {
+                    Ok(r) => r,
+                    Err(_) => MeshWireResponse::ChunkAuditResult(None),
+                }
+            }
             DeferredJob::LiteFanOut(plan) => {
                 let t0 = std::time::Instant::now();
                 let done = tokio::task::spawn_blocking(move || {
@@ -1174,6 +1221,46 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                 Err(e) => {
                     warn!(peer = remote_peer_id, error = %e, "Dropped PoR challenge in RAM pre-check");
                     MeshWireResponse::PorAuditResult(None)
+                }
+            }
+        }
+        MeshWireRequest::ChunkAudit(challenge) => {
+            // Verdict change 5: refuse in RAM when the prover is at its in-flight cap, before
+            // the nonce or the owner's budget is spent.
+            let load = peer.syndication_load;
+            if let Err(code) = crate::network::server_events::chunk_prove_slot_decision(
+                load.chunk_proves_in_flight,
+                load.chunk_prove_cap,
+            ) {
+                warn!(code, peer = remote_peer_id, "refused a chunk audit");
+                return MeshWireResponse::ChunkAuditResult(None);
+            }
+            let sender = peer
+                .pubkey
+                .map(|pk| NodeIdentity::device_peer_id_for_pubkey(&pk));
+            let accounted_owner = block_store.quota().lock().ok().and_then(|q| {
+                q.shard_owner(&challenge.shard_id.file_key())
+                    .map(str::to_string)
+            });
+            let shard_id = challenge.shard_id;
+            match por_verifier.admit_chunk_challenge(
+                &challenge,
+                sender.as_deref(),
+                accounted_owner.as_deref(),
+                now_unix_ms(),
+                || block_store.regular_shard_len(&shard_id),
+            ) {
+                // Answering earns the prover nothing (F-07).
+                Ok(spec) => {
+                    *deferred = Some(DeferredJob::ChunkProve(Box::new(ChunkProveJob {
+                        block_store: block_store.clone(),
+                        spec,
+                    })));
+                    MeshWireResponse::ChunkAuditResult(None)
+                }
+                Err(code) => {
+                    warn!(code, peer = remote_peer_id, "refused a chunk audit");
+                    MeshWireResponse::ChunkAuditResult(None)
                 }
             }
         }
@@ -2394,6 +2481,69 @@ mod tests {
             shard_owner_decision(&keyless),
             Err("reject.owner_not_sender"),
             "a sender without an Ed25519 key fails closed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod chunk_prove_tests {
+    use super::*;
+
+    /// Lead condition 2, host side: a shard that is missing or whose length changed since the
+    /// stat is no answer (`ChunkAuditResult(None)`), never a proof the verifier could fail.
+    #[test]
+    fn host_read_error_is_no_answer() {
+        let store = BlockStore::new_in_memory(crate::storage::QuotaManager::new(1 << 30, 1 << 20));
+        let sid = crate::storage::ShardId {
+            stripe_merkle_root: [1; 32],
+            shard_index: 0,
+            shard_hash: crate::sharding::merkle::hash_shard_leaf(0, &[7u8; 5_000]),
+        };
+        let spec = |len| crate::por::ChunkProveSpec {
+            shard_id: sid,
+            nonce: [2; 32],
+            chunk_indices: vec![0],
+            shard_len: len,
+        };
+        let missing = ChunkProveJob {
+            block_store: store.clone(),
+            spec: spec(5_000),
+        };
+        assert!(matches!(
+            missing.prove(),
+            MeshWireResponse::ChunkAuditResult(None)
+        ));
+        store.put_shard("owner", &sid, &[7u8; 5_000]).unwrap();
+        let resized = ChunkProveJob {
+            block_store: store.clone(),
+            spec: spec(9_000),
+        };
+        assert!(matches!(
+            resized.prove(),
+            MeshWireResponse::ChunkAuditResult(None)
+        ));
+        let ok = ChunkProveJob {
+            block_store: store,
+            spec: spec(5_000),
+        };
+        assert!(matches!(
+            ok.prove(),
+            MeshWireResponse::ChunkAuditResult(Some(_))
+        ));
+    }
+
+    /// Lead condition 2: a busy prover refuses (no answer), it does not fail.
+    #[test]
+    fn busy_prover_refuses() {
+        use crate::network::server_events::chunk_prove_slot_decision;
+        assert_eq!(chunk_prove_slot_decision(1, 2), Ok(()));
+        assert_eq!(
+            chunk_prove_slot_decision(2, 2),
+            Err("reject.por_prover_busy")
+        );
+        assert_eq!(
+            chunk_prove_slot_decision(0, 0),
+            Err("reject.por_prover_busy")
         );
     }
 }

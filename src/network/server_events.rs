@@ -84,10 +84,41 @@ pub fn syndication_fanout_decision(
 pub const SYNDICATION_BUSY_TEXT: &str = "seed syndication busy; retry later";
 
 /// Lite syndication load seen by one request: fan-outs in flight in total and for its sender.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyndicationLoad {
     pub in_flight_total: usize,
     pub in_flight_sender: usize,
+    /// Chunk-audit proofs in flight on this node (B-59, verdict change 5).
+    pub chunk_proves_in_flight: usize,
+    /// The node's cap on them: [`MAX_CHUNK_PROVES_IN_FLIGHT`] by default, 1 on `router-soc`.
+    pub chunk_prove_cap: usize,
+}
+
+impl Default for SyndicationLoad {
+    fn default() -> Self {
+        Self {
+            in_flight_total: 0,
+            in_flight_sender: 0,
+            chunk_proves_in_flight: 0,
+            chunk_prove_cap: MAX_CHUNK_PROVES_IN_FLIGHT,
+        }
+    }
+}
+
+/// Chunk-audit proofs in flight on a desktop or NAS host (one shard read and hash each).
+pub const MAX_CHUNK_PROVES_IN_FLIGHT: usize = 2;
+/// The same on `router-soc` (verdict change 5).
+pub const MAX_CHUNK_PROVES_IN_FLIGHT_ROUTER: usize = 1;
+
+/// B-59 (verdict change 5): admits one more chunk-audit proof only under the prover's in-flight
+/// cap. Checked by the handler before admission (so a busy host spends no nonce and none of the
+/// owner's budget) and again, authoritatively, when the job is queued.
+pub fn chunk_prove_slot_decision(in_flight: usize, cap: usize) -> Result<(), &'static str> {
+    if in_flight >= cap {
+        Err("reject.por_prover_busy")
+    } else {
+        Ok(())
+    }
 }
 
 /// Which budget a deferred job holds a slot in.
@@ -95,6 +126,7 @@ pub struct SyndicationLoad {
 pub enum DeferredKind {
     Relay,
     Syndication,
+    ChunkProve,
 }
 
 pub type DeferredResponse = (
@@ -196,6 +228,9 @@ pub struct ServerSwarmEvents {
     /// B-SEED-SYND: lite syndication fan-outs in flight (total and per sender).
     syndications_total: usize,
     syndications_per_peer: HashMap<String, usize>,
+    /// Chunk-audit proofs in flight (B-59) and their cap.
+    chunk_proves: usize,
+    chunk_prove_cap: usize,
 }
 
 impl ServerSwarmEvents {
@@ -211,7 +246,15 @@ impl ServerSwarmEvents {
             relay_cap,
             syndications_total: 0,
             syndications_per_peer: HashMap::new(),
+            chunk_proves: 0,
+            chunk_prove_cap: MAX_CHUNK_PROVES_IN_FLIGHT,
         }
+    }
+
+    /// Sets the chunk-audit prover's in-flight cap (`router-soc`:
+    /// [`MAX_CHUNK_PROVES_IN_FLIGHT_ROUTER`]).
+    pub fn set_chunk_prove_cap(&mut self, cap: usize) {
+        self.chunk_prove_cap = cap;
     }
 
     /// True while deferred forwards are pending; guard the `select!` arm on it.
@@ -232,6 +275,14 @@ impl ServerSwarmEvents {
     ) {
         let (channel, peer, response, kind) = done;
         let per_peer = match kind {
+            DeferredKind::ChunkProve => {
+                self.chunk_proves = self.chunk_proves.saturating_sub(1);
+                let _ = swarm
+                    .behaviour_mut()
+                    .req_resp
+                    .send_response(channel, response);
+                return;
+            }
             DeferredKind::Relay => &mut self.relays_per_peer,
             DeferredKind::Syndication => {
                 self.syndications_total = self.syndications_total.saturating_sub(1);
@@ -358,9 +409,27 @@ impl ServerSwarmEvents {
                         .get(&peer_str)
                         .copied()
                         .unwrap_or(0),
+                    chunk_proves_in_flight: self.chunk_proves,
+                    chunk_prove_cap: self.chunk_prove_cap,
                 };
                 let response = match on_request(&peer_str, remote_addr.as_ref(), request, load) {
                     WireReply::Ready(response) => *response,
+                    WireReply::Deferred(job) if job.is_chunk_prove() => {
+                        // Authoritative cap check (the handler checked before admitting too).
+                        match chunk_prove_slot_decision(self.chunk_proves, self.chunk_prove_cap) {
+                            Ok(()) => {
+                                self.chunk_proves += 1;
+                                self.deferred.push(Box::pin(async move {
+                                    (channel, peer_str, job.run().await, DeferredKind::ChunkProve)
+                                }));
+                                return None;
+                            }
+                            Err(code) => {
+                                warn!(code, peer = %peer_str, "refused a chunk audit");
+                                MeshWireResponse::ChunkAuditResult(None)
+                            }
+                        }
+                    }
                     WireReply::Deferred(job) if job.is_syndication() => {
                         // Authoritative enqueue check (the handler checked before ingest too).
                         match syndication_fanout_decision(

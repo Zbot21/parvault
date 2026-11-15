@@ -1,0 +1,13 @@
+diff --git a/specs/ParVaultPorAudit.tla b/specs/ParVaultPorAudit.tla
+index be84b6d..500bace 100644
+--- a/specs/ParVaultPorAudit.tla
++++ b/specs/ParVaultPorAudit.tla
+@@ -39,7 +39,7 @@ MayCredit(v, p) == v # p   \* @guard audit-credit sym=src/por/audit.rs::audit_cr
+ \* Only an invalid proof is a ledger failure; a timeout never is.
+ IsFail(verdict) == verdict = "Invalid"   \* @guard verdict-classes sym=src/por/audit.rs::chunk_audit_decision
+ \* A host answers a chunk audit only to the peer the shard is accounted to (the owner).
+-StorerOk(sender) == sender = Owner   \* @guard chunk-storer sym=src/por/verifier.rs::por_storer_decision
++StorerOk(sender) == TRUE
+ 
+ VARIABLES
+     cheatStored,   \* chunks "cheat" still holds of its shard
