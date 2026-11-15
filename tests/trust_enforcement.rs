@@ -7340,3 +7340,124 @@ fn status_http_security_headers() {
         assert!(head.contains("x-content-type-options: nosniff"));
     }
 }
+
+// --- B-59: chunk-Merkle audits (F-34 storer binding, F-06 rate) ---------------------------------
+
+/// A daemon holding a 3-chunk shard of `owner`, stored with the fixture session key.
+fn chunk_audit_host(label: &str, owner: &NodeIdentity) -> (Node, ShardId, Vec<u8>) {
+    let node = spawn_daemon(label);
+    let (sid, bytes) = shard(0x3A, 2 * 4096 + 17);
+    assert!(stored(&send(
+        owner,
+        &node,
+        put_shard("", sid, bytes.clone(), None)
+    )));
+    (node, sid, bytes)
+}
+
+fn chunk_audit(sid: ShardId) -> MeshWireRequest {
+    MeshWireRequest::ChunkAudit(parvault::por::generate_chunk_challenge(
+        &[0x5E; 32],
+        sid,
+        3,
+        2,
+        now_ms(),
+    ))
+}
+
+/// F-34-STORER accept: the peer that stored the shard gets proofs that verify against the
+/// shard's chunk root (real hashes on both sides).
+#[test]
+fn f34_storer_chunk_audit_answered() {
+    let owner = key(0xB1);
+    let (node, sid, bytes) = chunk_audit_host("f34-storer-a", &owner);
+    let root = parvault::por::chunk_merkle::shard_chunk_root(&bytes);
+    let MeshWireRequest::ChunkAudit(chal) = chunk_audit(sid) else {
+        unreachable!()
+    };
+    let resp = send(&owner, &node, MeshWireRequest::ChunkAudit(chal.clone()));
+    let MeshWireResponse::ChunkAuditResult(Some(r)) = resp else {
+        panic!("{resp:?}")
+    };
+    assert_eq!((r.shard_id, r.nonce), (sid, chal.nonce));
+    let got: Vec<u32> = r.proofs.iter().map(|p| p.index).collect();
+    assert_eq!(got, chal.chunk_indices);
+    for p in &r.proofs {
+        parvault::por::chunk_proof_decision(&parvault::por::ChunkProofFacts {
+            root: &root,
+            shard_len: bytes.len() as u64,
+            index: p.index,
+            chunk: &p.chunk,
+            path: &p.path,
+        })
+        .expect("honest proof verifies");
+    }
+    gate_ran("trust_enforcement::f34_storer_chunk_audit_answered");
+}
+
+/// F-34-STORER reject (verdict change 1): a co-host holding the same per-stripe session key is
+/// refused before the rate check and any read, so it can neither fetch the shard's chunks nor
+/// spend the owner's audit budget.
+#[test]
+fn f34_co_host_chunk_audit_refused() {
+    let owner = key(0xB1);
+    let co_host = key(0xB2);
+    let (node, sid, _) = chunk_audit_host("f34-storer-r", &owner);
+    // The co-host stores its own shard of the same stripe, so it holds the stripe key.
+    let (mut other, other_bytes) = shard(0x3A, 4096);
+    other.shard_index = 1;
+    other.shard_hash = parvault::sharding::merkle::hash_shard_leaf(1, &other_bytes);
+    assert!(stored(&send(
+        &co_host,
+        &node,
+        put_shard("", other, other_bytes, None)
+    )));
+    let resp = send(&co_host, &node, chunk_audit(sid));
+    assert!(
+        matches!(resp, MeshWireResponse::ChunkAuditResult(None)),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.por_not_storer");
+    // The owner's budget is untouched: its own audit still answers.
+    let resp = send(&owner, &node, chunk_audit(sid));
+    assert!(
+        matches!(resp, MeshWireResponse::ChunkAuditResult(Some(_))),
+        "{resp:?}"
+    );
+    gate_ran("trust_enforcement::f34_co_host_chunk_audit_refused");
+}
+
+/// F-06-RATE accept: six chunk audits for one stripe key in ten minutes are all answered.
+#[test]
+fn f06_rate_six_chunk_audits_answered() {
+    let owner = key(0xB1);
+    let (node, sid, _) = chunk_audit_host("f06-rate-a", &owner);
+    for k in 0..6 {
+        let resp = send(&owner, &node, chunk_audit(sid));
+        assert!(
+            matches!(resp, MeshWireResponse::ChunkAuditResult(Some(_))),
+            "audit {k}: {resp:?}"
+        );
+    }
+    gate_ran("trust_enforcement::f06_rate_six_chunk_audits_answered");
+}
+
+/// F-06-RATE reject: the seventh chunk audit for one stripe key in ten minutes is refused.
+#[test]
+fn f06_rate_seventh_chunk_audit_refused() {
+    let owner = key(0xB1);
+    let (node, sid, _) = chunk_audit_host("f06-rate-r", &owner);
+    for _ in 0..6 {
+        assert!(matches!(
+            send(&owner, &node, chunk_audit(sid)),
+            MeshWireResponse::ChunkAuditResult(Some(_))
+        ));
+    }
+    let resp = send(&owner, &node, chunk_audit(sid));
+    assert!(
+        matches!(resp, MeshWireResponse::ChunkAuditResult(None)),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.por_rate_limited");
+    gate_ran("trust_enforcement::f06_rate_seventh_chunk_audit_refused");
+}
