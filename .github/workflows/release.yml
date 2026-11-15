@@ -1,76 +1,114 @@
-name: Release — Static musl Binaries & SHA256SUMS
+name: Release — Reproducible Static musl Dev Builds
 
+# L-17, L-113: every v0.5.x artifact is a DEV build. Each target is built twice, on separate
+# runners, at different paths and CARGO_HOMEs, inside deploy/Dockerfile.build; the assets must
+# match byte for byte. The release is published as a draft pre-release with provenance
+# attestations and no signature: the Lead signs SHA256SUMS with the dev key on the desktop
+# (scripts/sign_dev_build.sh), uploads SHA256SUMS.sig, then publishes the draft
+# (docs/REPRODUCIBLE_BUILDS.md). verify-dev-signature.yml then checks that signature.
 on:
   push:
     tags:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build-static-musl:
-    name: Build Static musl (${{ matrix.target }})
+  build:
+    name: ${{ matrix.side }} (${{ matrix.target }})
     runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+        side: [build, rebuild]
         include:
-          - target: x86_64-unknown-linux-musl
-            linker: x86_64-linux-musl-gcc
-            strip: strip
-          - target: aarch64-unknown-linux-musl
-            linker: aarch64-linux-gnu-gcc
-            strip: aarch64-linux-gnu-strip
+          - side: build
+            src: src/parvault
+            mnt: /w
+          - side: rebuild
+            src: rebuild/elsewhere/pv-checkout
+            mnt: /rebuild/other-root
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - name: Rust toolchain from rust-toolchain.toml (L-17)
-        run: rustup toolchain install && rustc -V
-      - name: Install musl cross-compilation toolchain
+        with:
+          path: ${{ matrix.src }}
+          persist-credentials: false
+      - name: Build image (deploy/Dockerfile.build, base pinned by digest)
+        run: docker build -f "${{ matrix.src }}/deploy/Dockerfile.build" -t parvault-build "${{ matrix.src }}"
+      - name: Reproducible build (scripts/build_release.sh)
+        env:
+          TARGET: ${{ matrix.target }}
+          SRC: ${{ matrix.src }}
+          MNT: ${{ matrix.mnt }}
+          SIDE: ${{ matrix.side }}
         run: |
-          for attempt in 1 2 3 4; do
-            if sudo apt-get update -o Acquire::Retries=5 && \
-               sudo apt-get install -y -o Acquire::Retries=5 musl-tools gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu; then
-              break
-            fi
-            if [ "$attempt" -eq 4 ]; then
-              echo "apt-get failed after 4 attempts" >&2
-              exit 1
-            fi
-            echo "apt-get attempt ${attempt} failed; rewriting flaky azure/mirror+file sources to https://archive.ubuntu.com/ubuntu ..."
-            sudo find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) -exec sed -i \
-              -e 's|http://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-              -e 's|https://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-              -e 's|mirror+file:/etc/apt/apt-mirrors\.txt|https://archive.ubuntu.com/ubuntu|g' {} + || true
-            sudo rm -rf /var/lib/apt/lists/*
-            sleep $((attempt * 3))
-          done
-      - name: Build static parvault, parvault-seed, parvault-fuse, and parvault-sync binaries
-        run: |
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
-          fi
-          # Each binary is built with its own feature set (plan-3 ruling change 9).
-          bash scripts/build_bins.sh --profile soc --target ${{ matrix.target }} --out release-dist \
-            parvault parvault-seed parvault-fuse parvault-sync parvault-status
-          for bin in parvault parvault-seed parvault-fuse parvault-sync parvault-status; do
-            ${{ matrix.strip }} "release-dist/${bin}-${{ matrix.target }}"
-          done
-          bash scripts/check_scalar_erasure_coding.sh release-dist/*   # L-102
-          echo "### Binary sizes for ${{ matrix.target }} (--profile soc, stripped static musl):"
-          ls -lh release-dist/
+          SOURCE_DATE_EPOCH="$(git -C "$SRC" log -1 --format=%ct)"; export SOURCE_DATE_EPOCH
+          bundle=""; [ "$TARGET" = x86_64-unknown-linux-musl ] && bundle=--bundle
+          mkdir -p out cargo-home-$SIDE target-$SIDE
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e SOURCE_DATE_EPOCH \
+            -e CARGO_HOME="$MNT/cargo-home-$SIDE" -e CARGO_TARGET_DIR="$MNT/target-$SIDE" \
+            -v "$GITHUB_WORKSPACE:$MNT" -w "$MNT/$SRC" parvault-build \
+            bash scripts/build_release.sh --target "$TARGET" --out "$MNT/out" $bundle
+          ls -l out/
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: binaries-${{ matrix.target }}
-          path: release-dist/*
+          name: dev-${{ matrix.side }}-${{ matrix.target }}
+          path: out/*
+          if-no-files-found: error
 
-  publish-release:
-    name: Generate SHA256SUMS & Publish GitHub Release
-    needs: build-static-musl
+  compare:
+    name: build and rebuild match byte for byte
+    needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
+          pattern: dev-build-*
+          path: a
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: dev-rebuild-*
+          path: b
+          merge-multiple: true
+      - name: Compare sha256 of every asset
+        run: |
+          (cd a && sha256sum -- * | LC_ALL=C sort -k2) > a.sums
+          (cd b && sha256sum -- * | LC_ALL=C sort -k2) > b.sums
+          cat a.sums
+          diff a.sums b.sums
+          echo "build and rebuild match: $(wc -l < a.sums) assets"
+      - name: diffoscope on mismatch
+        if: failure()
+        run: |
+          sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y -o Acquire::Retries=5 diffoscope-minimal
+          mkdir -p diffoscope
+          for f in $(cd a && ls); do
+            cmp -s "a/$f" "b/$f" || diffoscope --text "diffoscope/$f.txt" "a/$f" "b/$f" || true
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: failure()
+        with:
+          name: diffoscope
+          path: diffoscope/
+
+  publish:
+    name: SHA256SUMS, attestations and draft dev pre-release
+    needs: compare
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: dev-build-*
           path: artifacts
           merge-multiple: true
       - name: install.sh defaults to this tag (plan-7; no Latest release to resolve)
@@ -81,39 +119,29 @@ jobs:
             exit 1
           fi
           cp scripts/install.sh artifacts/install.sh
-      - name: Bundle Router-SoC configuration and generate checksums
+      - name: Self-tests on the x86_64 dev binaries
         run: |
-          tar -czvf artifacts/parvault-router-soc-bundle.tar.gz -C deploy/router-soc parvault-router.toml parvault-nas.procd -C ../ prplos-lxc-manifest.json
           cd artifacts
-          chmod +x parvault-x86_64-* parvault-aarch64-* parvault-seed-* parvault-fuse-* parvault-sync-* parvault-status-*
-          echo "=== Measured Stripped Binary Sizes ==="
-          ls -lh parvault-x86_64-* parvault-aarch64-* parvault-seed-* parvault-fuse-* parvault-sync-* parvault-status-*
-          ./parvault-seed-x86_64-unknown-linux-musl self-test
-          ./parvault-x86_64-unknown-linux-musl gateway self-test
-          bash ../scripts/plugin_self_test.sh ./parvault-x86_64-unknown-linux-musl ./parvault-fuse-x86_64-unknown-linux-musl ./parvault-sync-x86_64-unknown-linux-musl
-          sha256sum \
-            parvault-x86_64-unknown-linux-musl parvault-aarch64-unknown-linux-musl \
-            parvault-seed-x86_64-unknown-linux-musl parvault-seed-aarch64-unknown-linux-musl \
-            parvault-fuse-x86_64-unknown-linux-musl parvault-fuse-aarch64-unknown-linux-musl \
-            parvault-sync-x86_64-unknown-linux-musl parvault-sync-aarch64-unknown-linux-musl \
-            parvault-status-x86_64-unknown-linux-musl parvault-status-aarch64-unknown-linux-musl \
-            parvault-router-soc-bundle.tar.gz install.sh > SHA256SUMS
-          cat SHA256SUMS
-      - name: Create GitHub Release
+          chmod +x ./*-musl-dev
+          ls -lh
+          ./parvault-seed-x86_64-unknown-linux-musl-dev self-test
+          ./parvault-x86_64-unknown-linux-musl-dev gateway self-test
+          bash ../scripts/plugin_self_test.sh ./parvault-x86_64-unknown-linux-musl-dev ./parvault-fuse-x86_64-unknown-linux-musl-dev ./parvault-sync-x86_64-unknown-linux-musl-dev
+      - name: SHA256SUMS (first line binds the tag and the dev kind)
+        run: bash scripts/make_sums.sh artifacts "$GITHUB_REF_NAME" dev
+      - name: Provenance attestations for every asset
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: artifacts/*
+      - name: Create the draft dev pre-release (unsigned until the Lead adds SHA256SUMS.sig)
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           # Every ParVault release is a pre-release until the owner says otherwise (2026-11-11):
-          # never "Latest".
+          # never "Latest". Drafts stay hidden until the dev signature is uploaded (L-113).
+          draft: true
           prerelease: true
           make_latest: false
-          files: |
-            artifacts/parvault-x86_64-unknown-linux-musl
-            artifacts/parvault-aarch64-unknown-linux-musl
-            artifacts/parvault-seed-*
-            artifacts/parvault-fuse-*
-            artifacts/parvault-sync-*
-            artifacts/parvault-status-*
-            artifacts/parvault-router-soc-bundle.tar.gz
-            artifacts/SHA256SUMS
-            artifacts/install.sh
+          body: |
+            **DEV build** (L-113). Every `v0.5.x` artifact is a dev build: reproducible, and signed with the ParVault **dev/test key** (principal `parvault-dev`, namespace `parvault-dev-build`, fingerprint `SHA256:w3YrtCVqvG0hUxHHdnrlxuxg/X8LkeuUaZudDswGQ+A`), not a release key. No release builds exist yet. `install.sh` installs it only with `PARVAULT_ALLOW_DEV_BUILD=1`. Verify with `docs/REPRODUCIBLE_BUILDS.md`.
+          files: artifacts/*
           generate_release_notes: true
