@@ -1,7 +1,7 @@
 diff --git a/specs/ParVaultGatewayPluginBus.tla b/specs/ParVaultGatewayPluginBus.tla
 --- a/specs/ParVaultGatewayPluginBus.tla
 +++ b/specs/ParVaultGatewayPluginBus.tla
-@@ -134,7 +134,7 @@
+@@ -156,7 +156,7 @@
  \* Item 3 gives FetchPayload the same per-frame check (before it, FetchPayload had none).
  FetchPayload(u, t) ==
      /\ u \in conns
@@ -9,4 +9,4 @@ diff --git a/specs/ParVaultGatewayPluginBus.tla b/specs/ParVaultGatewayPluginBus
 +    /\ TRUE   \* @guard fetch-payload-macaroon sym=src/gateway/engine.rs::fetch_by_shard_ids_to_owned_fd_with_peer_uid
      /\ lastRead' = <<u, t>>
      /\ UNCHANGED <<allowlistSet, rootKeySet, requireSealed, snapshotPublished, conns,
-                    lastStatus, lastUnauth, stored>>
+                    lastStatus, lastWrite, lastHealth, stored>>

@@ -1541,3 +1541,90 @@ fn proof_manifest_variant_decision() {
         assert!(code == "reject.variant_disabled_by_manifest");
     }
 }
+
+/// B-16 (A-16 C5, claims G-STORE, G-REG, G-HEALTH, G-NOKEY): exhaustive over the six facts.
+/// `!root_key_set` gives `Err` for every input, with its own code first; `Ok` implies a root key,
+/// a token, a valid tag, caveats that allow the frame, and a write permit when the command writes.
+#[kani::proof]
+fn proof_gateway_macaroon_decision() {
+    let f = crate::gateway::engine::GatewayMacaroonFacts {
+        root_key_set: kani::any(),
+        token_present: kani::any(),
+        tag_valid: kani::any(),
+        is_write: kani::any(),
+        write_permitted: kani::any(),
+        caveats_allow: kani::any(),
+    };
+    let d = crate::gateway::engine::gateway_macaroon_decision(&f);
+    kani::cover!(d.is_err() && !f.root_key_set, "no root key refused");
+    kani::cover!(
+        d.is_err()
+            && f.root_key_set
+            && f.token_present
+            && f.tag_valid
+            && f.is_write
+            && !f.write_permitted,
+        "read-only token refused a write"
+    );
+    kani::cover!(d.is_ok() && f.is_write, "write served");
+    if !f.root_key_set {
+        assert!(d == Err("reject.gateway_macaroon_no_root_key"));
+    }
+    if d.is_ok() {
+        assert!(f.root_key_set && f.token_present && f.tag_valid && f.caveats_allow);
+        assert!(!f.is_write || f.write_permitted);
+    }
+    assert_eq!(
+        d.is_ok(),
+        f.root_key_set
+            && f.token_present
+            && f.tag_valid
+            && (!f.is_write || f.write_permitted)
+            && f.caveats_allow
+    );
+}
+
+/// B-16 (plan §2, the caveat harness extended to `is_write = true`): a `ReadOnly` caveat refuses
+/// every write and allows every read, and a token permits a write iff it carries no `ReadOnly`
+/// (and, for an unscoped `StorePayload`, no `AllowedManifest` or `ByteRange`).
+#[kani::proof]
+#[kani::unwind(3)]
+fn proof_readonly_refuses_write_and_write_permit() {
+    use crate::capabilities::{AccessRequestContext, CapabilityMacaroon, Caveat};
+    let ctx = AccessRequestContext {
+        manifest_root: kani::any(),
+        offset: kani::any(),
+        length: kani::any(),
+        is_write: kani::any(),
+        now_unix_ms: kani::any(),
+        peer_uid: if kani::any() { Some(kani::any()) } else { None },
+    };
+    assert_eq!(Caveat::ReadOnly.allows(&ctx), !ctx.is_write);
+    let kind: u8 = kani::any();
+    kani::assume(kind < 5);
+    let c = match kind {
+        0 => Caveat::AllowedManifest(kani::any()),
+        1 => Caveat::ByteRange {
+            offset: kani::any(),
+            length: kani::any(),
+        },
+        2 => Caveat::ExpiresAtUnixMs(kani::any()),
+        3 => Caveat::ReadOnly,
+        _ => Caveat::AllowedPeerUid(kani::any()),
+    };
+    let unscoped: bool = kani::any();
+    let tok = CapabilityMacaroon {
+        nonce_id: [0; 32],
+        issuer_fingerprint: [0; 32],
+        caveats: vec![c],
+        tag: [0; 32],
+    };
+    let permit = tok.permits_write(unscoped);
+    kani::cover!(!permit && kind == 3, "read-only token cannot write");
+    let expected = match kind {
+        3 => false,
+        0 | 1 => !unscoped,
+        _ => true,
+    };
+    assert_eq!(permit, expected);
+}

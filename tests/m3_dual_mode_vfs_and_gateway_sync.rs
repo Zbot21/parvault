@@ -37,6 +37,24 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 
+/// B-16: every gated gateway command needs a token; tests present this write token (no caveats).
+fn wtok(key: [u8; 32]) -> Option<std::sync::Arc<parvault::capabilities::GatewayTokenSource>> {
+    Some(std::sync::Arc::new(
+        parvault::capabilities::GatewayTokenSource::Fixed(
+            parvault::capabilities::CapabilityMacaroon::mint(
+                &key,
+                [0x5A; 32],
+                [0x5B; 32],
+                Vec::new(),
+            )
+            .unwrap(),
+        ),
+    ))
+}
+
+/// The root key of the tests' gateways that had none before B-16.
+const TEST_GW_KEY: [u8; 32] = [0x6C; 32];
+
 fn deterministic_bytes(seed: u64, len: usize) -> Vec<u8> {
     let mut out = vec![0u8; len];
     let mut s = seed ^ 0x9E37_79B9_7F4A_7C15;
@@ -109,7 +127,7 @@ fn test_gateway_bus_sync_surface_parity_and_sealed_memfd_enforcement() {
         .with_require_sealed_ingest_memfd(true)
         .spawn()
         .expect("spawn GatewayIpcServer");
-    let bus_sock = GatewayBus::unix_socket(&sock_path);
+    let bus_sock = GatewayBus::unix_socket(&sock_path).with_token_source(wtok(root_key));
 
     for (label, bus) in [("inproc", &bus_inproc), ("unix_sock", &bus_sock)] {
         // 1. Unsealed memfd must be rejected by `store_memfd_sync`
@@ -406,19 +424,22 @@ fn test_dual_mode_vfs_no_socket_inprocess_vs_unix_socket_webdav_range_and_lru() 
                 stripe_size_bytes: HardwareProfile::RouterSoc.stripe_size_bytes(),
                 tier: ErasureTier::Consumer,
                 peers: Vec::new(),
-                macaroon_root_key: None,
+                macaroon_root_key: Some(TEST_GW_KEY),
                 strict_allowed_peer_uids: None,
                 require_sealed_ingest_memfd: true,
             },
         )
         .unwrap(),
     );
+    // B-16: reads in either mode present a token (the daemon's built-in VFS mints its own).
+    let read_tok = wtok(TEST_GW_KEY).unwrap().current().unwrap();
     let vfs_inproc = VirtualVaultFs::with_bus(
         GatewayBus::in_process(Arc::clone(&inproc_engine)),
         inproc_root.join("cache"),
         2 * 1024 * 1024,
     )
-    .expect("VirtualVaultFs::with_bus in_process");
+    .expect("VirtualVaultFs::with_bus in_process")
+    .with_default_macaroon(Some(read_tok));
     let seeded_inproc = vfs_inproc
         .ingest_local_directory(&seed_dir)
         .expect("ingest inproc");
@@ -444,11 +465,16 @@ fn test_dual_mode_vfs_no_socket_inprocess_vs_unix_socket_webdav_range_and_lru() 
     .unwrap();
     let mut srv = GatewayIpcServer::new(&sock_path, sock_store, MasterKey::generate())
         .with_profile(HardwareProfile::RouterSoc)
+        .with_macaroon_root_key(TEST_GW_KEY)
         .with_require_sealed_ingest_memfd(true)
         .spawn()
         .unwrap();
-    let vfs_sock = VirtualVaultFs::new(&sock_path, sock_root.join("cache"), 2 * 1024 * 1024)
-        .expect("VirtualVaultFs::new unix_socket");
+    let vfs_sock = VirtualVaultFs::with_bus(
+        GatewayBus::unix_socket(&sock_path).with_token_source(wtok(TEST_GW_KEY)),
+        sock_root.join("cache"),
+        2 * 1024 * 1024,
+    )
+    .expect("VirtualVaultFs unix_socket");
     let seeded_sock = vfs_sock
         .ingest_local_directory(&seed_dir)
         .expect("ingest sock");
@@ -554,13 +580,20 @@ fn test_gateway_folder_sync_inprocess_and_socket_incremental_macaroon_and_filter
             .unwrap(),
         );
 
+        // B-16: the socket bus presents a write token; `bus_no_token` is the same socket without
+        // one, for the tokenless-restore refusal below.
+        let mut bus_no_token = None;
         let (bus, mut maybe_srv) = if use_socket {
             let sock = mode_dir.join("gw.sock");
             let srv = GatewayIpcServer::bind(&sock, Arc::clone(&engine))
                 .unwrap()
                 .spawn()
                 .unwrap();
-            (GatewayBus::unix_socket(&sock), Some(srv))
+            bus_no_token = Some(GatewayBus::unix_socket(&sock));
+            (
+                GatewayBus::unix_socket(&sock).with_token_source(wtok(root_key)),
+                Some(srv),
+            )
         } else {
             (GatewayBus::in_process(Arc::clone(&engine)), None)
         };
@@ -627,7 +660,10 @@ fn test_gateway_folder_sync_inprocess_and_socket_incremental_macaroon_and_filter
 
         // 4. Unauthorized restores MUST fail cleanly before writing output files:
         // (a) Missing macaroon
-        let no_mac_puller = GatewayFolderSync::with_catalog(bus.clone(), loaded_cat.clone());
+        let no_mac_puller = GatewayFolderSync::with_catalog(
+            bus_no_token.clone().unwrap_or_else(|| bus.clone()),
+            loaded_cat.clone(),
+        );
         assert!(no_mac_puller
             .restore_to_folder(&mode_dir.join("out_nomac"), &[])
             .is_err());

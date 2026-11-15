@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- **One compiled-in manifest (L-16 seam S1-S4, `v0.5.5`).** Cargo feature `manifest-household-ring-v1` (in `default`) selects the manifest under `daemon-runtime`; no manifest, or two, fail to build with a `compile_error!`. `--version` of `parvault`, `parvault-seed` and `parvault-bench`, and local status, print it. Admission facts, a per-variant gate (`reject.variant_disabled_by_manifest`) and the `HandshakeWoT` and `AdmitPublicTicket` arms now come from the manifest; behaviour is unchanged. `--all-features` no longer builds (it enables two manifests; `cargo tree` is fine). The manifest name is not sent on the wire. A CI-only `manifest-test-restricted` manifest exists; `scripts/build_bins.sh` refuses to ship it.
+
+### Changed
+- **Breaking (gateway socket, `ipc-client` linkers): every gateway command carries a macaroon, and a gateway without a root key serves nothing (B-16, L-86).** `StorePayload` and `RegisterManifest` gain an appended `macaroon` field and need a write token (one without `ReadOnly`; a store token also without `AllowedManifest` or `ByteRange`). `QueryHealthStatus` (index 4) is always refused; new `QueryHealthStatusAuthed { macaroon }` (index 6) replaces it. Fetches without a root key are refused (`reject.gateway_macaroon_no_root_key`). Every daemon (`up`, `daemon start`) and `gateway serve` now creates `<data_dir>/macaroon_root.key` (`0600`) when it is absent. The token is checked before the memfd seal and before the descriptor is read. Clients built against an older `parvault` fail to decode (the appended field), so plugins and the suite must re-pin to this release.
+- **`parvault token mint` mints `ReadOnly` tokens unless `--write` (B-16).** A token without `ReadOnly` may store and register. `--read-only` is still accepted and is the default.
+- **`parvault-fuse` and `parvault-sync` mint their own token (B-16, D-45 Q2).** Without `--macaroon`/`--macaroon-file` they read `<--data-dir>/macaroon_root.key` (default `.parvault-data`; refused unless owned by the caller with mode `0600`) and mint a 15-minute token bound to their UID: `ReadOnly` for reads and `pull`, write for `push`, `watch`, `sync` and ingest. A long-lived mount re-mints before expiry. A daemon started with `--macaroon-key-hex` writes no key file; its clients need `--macaroon-file`. `parvault gateway health` and `ipc-roundtrip` do the same from the node's data directory.
+
 ---
 
 ## [`0.5.2`] - 2026-11-15

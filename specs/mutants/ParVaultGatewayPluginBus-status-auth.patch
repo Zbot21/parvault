@@ -1,7 +1,7 @@
 diff --git a/specs/ParVaultGatewayPluginBus.tla b/specs/ParVaultGatewayPluginBus.tla
 --- a/specs/ParVaultGatewayPluginBus.tla
 +++ b/specs/ParVaultGatewayPluginBus.tla
-@@ -102,7 +102,7 @@
+@@ -123,7 +123,7 @@
  \* unscoped token whose AllowedPeerUid (if any) is the caller's.
  StatusAuthorized(t, u) ==
      /\ rootKeySet /\ snapshotPublished   \* @guard status-verifier sym=src/http_edge.rs::status_auth_decision

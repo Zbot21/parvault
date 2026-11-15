@@ -9,9 +9,10 @@
 #![forbid(unsafe_code)]
 
 use clap::{Parser, Subcommand};
-use parvault::capabilities::CapabilityMacaroon;
+use parvault::capabilities::{CapabilityMacaroon, GatewayTokenSource};
 use parvault::gateway::ipc::DEFAULT_IPC_SOCKET_PATH;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -36,6 +37,12 @@ struct SyncCli {
     /// File holding the token (mode 600; refused if group or others can read it).
     #[arg(long, value_name = "PATH", global = true)]
     macaroon_file: Option<PathBuf>,
+
+    /// The daemon's data directory. Without `--macaroon` or `--macaroon-file`, a 15-minute token
+    /// for this UID is minted from its `0600` `macaroon_root.key` (`push`/`watch` may write,
+    /// `pull` is read-only); the daemon refuses every request without a token (B-16).
+    #[arg(long, default_value = ".parvault-data", global = true)]
+    data_dir: PathBuf,
 
     #[command(subcommand)]
     command: SyncCommand,
@@ -111,11 +118,14 @@ fn main() -> anyhow::Result<()> {
         use parvault::sync::{GatewayFolderCatalog, GatewayFolderSync};
         use std::time::{Duration, Instant};
 
+        let data_dir = cli.data_dir.clone();
         let load_sync_client = |socket: &std::path::Path,
                                 catalog_path: &std::path::Path,
-                                mac: Option<CapabilityMacaroon>|
+                                mac: Option<CapabilityMacaroon>,
+                                write: bool|
          -> anyhow::Result<GatewayFolderSync> {
-            let bus = GatewayBus::unix_socket(socket);
+            let source = GatewayTokenSource::from_args_or_auto(mac.clone(), &data_dir, write);
+            let bus = GatewayBus::unix_socket(socket).with_token_source(Some(Arc::new(source)));
             let mut sync = GatewayFolderSync::new(bus).with_default_macaroon(mac);
             if catalog_path.is_file() {
                 let existing = GatewayFolderCatalog::load_from_file(catalog_path)?;
@@ -126,7 +136,7 @@ fn main() -> anyhow::Result<()> {
 
         match cli.command {
             SyncCommand::Diff { folder } => {
-                let sync = load_sync_client(&cli.socket, &cli.catalog, default_macaroon)?;
+                let sync = load_sync_client(&cli.socket, &cli.catalog, default_macaroon, false)?;
                 let diff = sync.diff_folder(&folder)?;
                 println!(
                     "Gateway Sync Diff for {} (catalog v{}):",
@@ -154,7 +164,7 @@ fn main() -> anyhow::Result<()> {
                 ephemeral,
                 allow_local_only,
             } => {
-                let mut sync = load_sync_client(&cli.socket, &cli.catalog, default_macaroon)?;
+                let mut sync = load_sync_client(&cli.socket, &cli.catalog, default_macaroon, true)?;
                 let retention = if ephemeral {
                     RetentionPolicy::Ephemeral
                 } else {
@@ -185,7 +195,7 @@ fn main() -> anyhow::Result<()> {
                 interval_secs,
             } => {
                 let poll = Duration::from_secs(interval_secs.max(1));
-                let mut sync = load_sync_client(&cli.socket, &cli.catalog, default_macaroon)?;
+                let mut sync = load_sync_client(&cli.socket, &cli.catalog, default_macaroon, true)?;
                 println!(
                     "[parvault-sync] watching {} every {}s over {} (catalog={})",
                     folder.display(),
@@ -231,7 +241,7 @@ fn main() -> anyhow::Result<()> {
                         cli.catalog.display()
                     );
                 }
-                let sync = load_sync_client(&cli.socket, &cli.catalog, default_macaroon)?;
+                let sync = load_sync_client(&cli.socket, &cli.catalog, default_macaroon, false)?;
                 let t0 = Instant::now();
                 let restored = sync.restore_to_folder(&output, &filters)?;
                 println!(
@@ -268,7 +278,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             SyncCommand::SelfTest => {
-                run_self_test(&cli.socket, default_macaroon.clone())?;
+                run_self_test(&cli.socket, &cli.data_dir, default_macaroon.clone())?;
             }
         }
         Ok(())
@@ -282,6 +292,7 @@ fn main() -> anyhow::Result<()> {
 #[cfg(unix)]
 fn run_self_test(
     socket: &std::path::Path,
+    data_dir: &std::path::Path,
     macaroon: Option<parvault::capabilities::CapabilityMacaroon>,
 ) -> anyhow::Result<()> {
     use parvault::{
@@ -323,7 +334,14 @@ fn run_self_test(
     std::fs::write(src_dir.join("skip.ignored"), b"must never be uploaded")?;
 
     // 1. Initial push
-    let mut pusher = GatewayFolderSync::new(GatewayBus::unix_socket(&sock_path));
+    // B-16: the push needs a write token: the given one, or one auto-minted for this UID.
+    let write_src = Arc::new(GatewayTokenSource::from_args_or_auto(
+        macaroon.clone(),
+        data_dir,
+        true,
+    ));
+    let write_bus = GatewayBus::unix_socket(&sock_path).with_token_source(Some(write_src.clone()));
+    let mut pusher = GatewayFolderSync::new(write_bus.clone());
     let cat1 = pusher
         .sync_folder_once(&src_dir, RetentionPolicy::Persistent)
         .map_err(|e| {
@@ -348,8 +366,7 @@ fn run_self_test(
     std::fs::remove_file(src_dir.join("alpha.txt"))?;
 
     let reloaded = GatewayFolderCatalog::load_from_file(&catalog_path)?;
-    let mut inc_sync =
-        GatewayFolderSync::with_catalog(GatewayBus::unix_socket(&sock_path), reloaded);
+    let mut inc_sync = GatewayFolderSync::with_catalog(write_bus.clone(), reloaded);
     let diff = inc_sync.diff_folder(&src_dir)?;
     anyhow::ensure!(
         diff.added == vec!["nested/charlie.txt".to_string()],
@@ -380,15 +397,15 @@ fn run_self_test(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let attenuated_mac = match macaroon {
-        Some(token) => Some(
-            token
-                .attenuate(Caveat::ReadOnly)?
-                .attenuate(Caveat::AllowedPeerUid(local_uid))?
-                .attenuate(Caveat::ExpiresAtUnixMs(now_ms + 60_000))?,
-        ),
-        None => None,
+    let base = match macaroon {
+        Some(token) => token,
+        None => write_src.current().map_err(|e| anyhow::anyhow!(e))?,
     };
+    let attenuated_mac = Some(
+        base.attenuate(Caveat::ReadOnly)?
+            .attenuate(Caveat::AllowedPeerUid(local_uid))?
+            .attenuate(Caveat::ExpiresAtUnixMs(now_ms + 60_000))?,
+    );
 
     let pull_cat = GatewayFolderCatalog::load_from_file(&catalog_path)?;
     let puller = GatewayFolderSync::with_catalog(GatewayBus::unix_socket(&sock_path), pull_cat)

@@ -1,10 +1,10 @@
 diff --git a/specs/ParVaultGatewayPluginBus.tla b/specs/ParVaultGatewayPluginBus.tla
 --- a/specs/ParVaultGatewayPluginBus.tla
 +++ b/specs/ParVaultGatewayPluginBus.tla
-@@ -97,7 +97,7 @@
-     \* The manifest and byte-range caveats (AllowedManifest, ByteRange arms of `allows`): a token
-     \* scoped to another file is not a capability for this one.
-     /\ t /= NoToken => t.scope \in {"in", "any"}   \* @guard macaroon-scope sym=src/capabilities.rs::evaluate_caveats
+@@ -118,7 +118,7 @@
+ WriteAuthorized(t, u) ==
+     /\ GatedAuthorized(t, u)
+     /\ t.write /\ t.scope = "any"   \* @guard macaroon-write sym=src/gateway/engine.rs::gateway_macaroon_decision
 -IngestSealedOk(sealed) == ~requireSealed \/ sealed   \* @guard memfd-seal sym=src/gateway/engine.rs::gateway_memfd_seal_decision
 +IngestSealedOk(sealed) == TRUE   \* @guard memfd-seal sym=src/gateway/engine.rs::gateway_memfd_seal_decision
  \* status_auth_decision: a verifier (root key) and a snapshot, then a valid, ReadOnly,

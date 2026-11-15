@@ -837,15 +837,25 @@ mod unix_vfs {
         /// Synchronizes all non-ignored regular files in `local_dir` into `parvault` via sealed
         /// `memfd` (`store_sealed_memfd_sync`) and mounts them as lazy VFS inodes, honoring
         /// [`crate::sync::ParvaultIgnore::from_folder`].
+        ///
+        /// B-16: each store presents the bus's token source; a socket bus without one presents
+        /// this VFS's default macaroon (which must then be a write token).
         pub fn ingest_local_directory(&self, local_dir: &Path) -> io::Result<usize> {
             let ignore = crate::sync::ParvaultIgnore::from_folder(local_dir);
             let mut count = 0usize;
-            self.ingest_dir_recursive(local_dir, local_dir, &ignore, &mut count)?;
+            let bus = match (&self.default_macaroon, self.bus.has_token_source()) {
+                (Some(m), false) => self.bus.clone().with_token_source(Some(std::sync::Arc::new(
+                    crate::capabilities::GatewayTokenSource::Fixed(m.clone()),
+                ))),
+                _ => self.bus.clone(),
+            };
+            self.ingest_dir_recursive(&bus, local_dir, local_dir, &ignore, &mut count)?;
             Ok(count)
         }
 
         fn ingest_dir_recursive(
             &self,
+            bus: &GatewayBus,
             base: &Path,
             cur: &Path,
             ignore: &crate::sync::ParvaultIgnore,
@@ -867,7 +877,7 @@ mod unix_vfs {
                     if ignore.is_ignored(&rel, true) {
                         continue;
                     }
-                    self.ingest_dir_recursive(base, &path, ignore, count)?;
+                    self.ingest_dir_recursive(bus, base, &path, ignore, count)?;
                 } else if ft.is_file() {
                     if ignore.is_ignored(&rel, false) {
                         continue;
@@ -877,7 +887,7 @@ mod unix_vfs {
                     let mut src = std::fs::File::open(&path)?;
                     let copied = io::copy(&mut src, &mut mfd_file)?;
                     mfd_file.seek(SeekFrom::Start(0))?;
-                    let manifest = self.bus.store_sealed_memfd_sync(
+                    let manifest = bus.store_sealed_memfd_sync(
                         mfd_file.as_raw_fd(),
                         copied,
                         RetentionPolicy::Persistent,

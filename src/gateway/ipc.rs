@@ -123,6 +123,8 @@ pub enum IpcCommand {
         payload_fd: RawFd,
         bytes_len: u64,
         retention_policy: RetentionPolicy,
+        /// B-16 (appended): a write token (no `ReadOnly`, `AllowedManifest` or `ByteRange`).
+        macaroon: Option<CapabilityMacaroon>,
     },
     FetchPayload {
         ephemeral_shard_ids: Vec<[u8; 32]>,
@@ -139,12 +141,20 @@ pub enum IpcCommand {
     },
     RegisterManifest {
         file_manifest: FileManifest,
+        /// B-16 (appended): a write token whose caveats allow `file_manifest.file_merkle_root`.
+        macaroon: Option<CapabilityMacaroon>,
     },
+    /// Carries no token, so it is always refused (B-16); kept at index 4 so an old client gets
+    /// a reason. Use [`IpcCommand::QueryHealthStatusAuthed`].
     QueryHealthStatus,
     /// Appended (item 3): the node's [`StatusSnapshot`]. Always carries a token, checked by
     /// [`crate::http_edge::status_auth_decision`]; refused without a root key or a published
     /// snapshot.
     QueryStatus {
+        macaroon: Option<CapabilityMacaroon>,
+    },
+    /// Appended (B-16, index 6): `QueryHealthStatus` with a token.
+    QueryHealthStatusAuthed {
         macaroon: Option<CapabilityMacaroon>,
     },
 }
@@ -420,17 +430,52 @@ mod unix_impl {
     #[derive(Debug, Clone)]
     pub struct GatewayIpcClient {
         socket_path: PathBuf,
+        /// B-16: the token sent on `StorePayload`, `RegisterManifest` and health, and on a fetch
+        /// that names none.
+        token: Option<std::sync::Arc<crate::capabilities::GatewayTokenSource>>,
     }
 
     impl GatewayIpcClient {
         pub fn new(socket_path: impl AsRef<Path>) -> Self {
             Self {
                 socket_path: socket_path.as_ref().to_path_buf(),
+                token: None,
             }
+        }
+
+        /// The same client presenting tokens from `source` (B-16).
+        pub fn with_token_source(
+            mut self,
+            source: Option<std::sync::Arc<crate::capabilities::GatewayTokenSource>>,
+        ) -> Self {
+            self.token = source;
+            self
         }
 
         pub fn socket_path(&self) -> &Path {
             &self.socket_path
+        }
+
+        /// The token to present: the source's current one (re-minted when near expiry), or none.
+        /// A failed auto-mint is an error, never a silent tokenless send (A-16 C1).
+        pub fn current_token(&self) -> io::Result<Option<CapabilityMacaroon>> {
+            match &self.token {
+                None => Ok(None),
+                Some(src) => src
+                    .current()
+                    .map(Some)
+                    .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e)),
+            }
+        }
+
+        fn token_or(
+            &self,
+            explicit: Option<CapabilityMacaroon>,
+        ) -> io::Result<Option<CapabilityMacaroon>> {
+            match explicit {
+                Some(t) => Ok(Some(t)),
+                None => self.current_token(),
+            }
         }
     }
 
@@ -481,6 +526,7 @@ mod unix_impl {
                 payload_fd,
                 bytes_len,
                 retention_policy,
+                macaroon: self.current_token()?,
             };
             match self.send_command(&cmd, Some(payload_fd)).await? {
                 IpcResponse::StoreSuccessLocalOnly {
@@ -536,7 +582,7 @@ mod unix_impl {
             let cmd = IpcCommand::FetchPayload {
                 ephemeral_shard_ids,
                 output_fd,
-                macaroon,
+                macaroon: self.token_or(macaroon)?,
             };
             match self.send_command(&cmd, Some(output_fd)).await? {
                 IpcResponse::FetchSuccess { bytes_streamed } => Ok(bytes_streamed),
@@ -562,7 +608,7 @@ mod unix_impl {
                 offset,
                 len,
                 output_fd,
-                macaroon,
+                macaroon: self.token_or(macaroon)?,
             };
             match self.send_command(&cmd, Some(output_fd)).await? {
                 IpcResponse::FetchSuccess { bytes_streamed } => Ok(bytes_streamed),
@@ -605,7 +651,10 @@ mod unix_impl {
             &self,
             file_manifest: FileManifest,
         ) -> anyhow::Result<EphemeralShardManifest> {
-            let cmd = IpcCommand::RegisterManifest { file_manifest };
+            let cmd = IpcCommand::RegisterManifest {
+                file_manifest,
+                macaroon: self.current_token()?,
+            };
             match self.send_command(&cmd, None).await? {
                 IpcResponse::StoreSuccess { manifest } => Ok(manifest),
                 IpcResponse::Error { message } => {
@@ -618,7 +667,12 @@ mod unix_impl {
         /// Queries real-time gateway IOPS, connected peer count, and PoR SLA compliance score asynchronously.
         pub async fn query_health(&self) -> anyhow::Result<(u64, usize, f32)> {
             match self
-                .send_command(&IpcCommand::QueryHealthStatus, None)
+                .send_command(
+                    &IpcCommand::QueryHealthStatusAuthed {
+                        macaroon: self.current_token()?,
+                    },
+                    None,
+                )
                 .await?
             {
                 IpcResponse::HealthStatus {
@@ -635,7 +689,9 @@ mod unix_impl {
     impl GatewayIpcClient {
         // --- Synchronous Blocking Client Surface (FUSE / Sync CLI / Benchmarks) ---
 
-        fn send_request_sync(
+        /// Sends one raw [`IpcCommand`] (with an optional `SCM_RIGHTS` descriptor) and returns the
+        /// raw response.
+        pub fn send_request_sync(
             &self,
             cmd: &IpcCommand,
             attached_fd: Option<RawFd>,
@@ -663,6 +719,7 @@ mod unix_impl {
                 payload_fd,
                 bytes_len,
                 retention_policy,
+                macaroon: self.current_token()?,
             };
             match self.send_request_sync(&cmd, Some(payload_fd))? {
                 IpcResponse::StoreSuccessLocalOnly {
@@ -706,7 +763,7 @@ mod unix_impl {
             let cmd = IpcCommand::FetchPayload {
                 ephemeral_shard_ids,
                 output_fd,
-                macaroon,
+                macaroon: self.token_or(macaroon)?,
             };
             match self.send_request_sync(&cmd, Some(output_fd))? {
                 IpcResponse::FetchSuccess { bytes_streamed } => Ok(bytes_streamed),
@@ -746,7 +803,7 @@ mod unix_impl {
                 offset,
                 len,
                 output_fd,
-                macaroon,
+                macaroon: self.token_or(macaroon)?,
             };
             match self.send_request_sync(&cmd, Some(output_fd))? {
                 IpcResponse::FetchSuccess { bytes_streamed } => Ok(bytes_streamed),
@@ -781,7 +838,10 @@ mod unix_impl {
             &self,
             file_manifest: FileManifest,
         ) -> io::Result<EphemeralShardManifest> {
-            let cmd = IpcCommand::RegisterManifest { file_manifest };
+            let cmd = IpcCommand::RegisterManifest {
+                file_manifest,
+                macaroon: self.current_token()?,
+            };
             match self.send_request_sync(&cmd, None)? {
                 IpcResponse::StoreSuccess { manifest } => Ok(manifest),
                 IpcResponse::Error { message } => Err(io::Error::other(message)),
@@ -829,7 +889,10 @@ mod unix_impl {
 
         /// Queries live gateway IOPS, peer count, and PoR SLA compliance score synchronously.
         pub fn query_health_sync(&self) -> io::Result<(u64, usize, f32)> {
-            match self.send_request_sync(&IpcCommand::QueryHealthStatus, None)? {
+            let cmd = IpcCommand::QueryHealthStatusAuthed {
+                macaroon: self.current_token()?,
+            };
+            match self.send_request_sync(&cmd, None)? {
                 IpcResponse::HealthStatus {
                     iops,
                     peer_count,
@@ -875,6 +938,29 @@ mod unix_impl {
 
         pub fn unix_socket(socket_path: impl AsRef<Path>) -> Self {
             Self::UnixSocket(GatewayIpcClient::new(socket_path))
+        }
+
+        /// Whether the socket client has a token source (always `true` for the in-process bus,
+        /// which needs none for store, register and health).
+        pub fn has_token_source(&self) -> bool {
+            match self {
+                Self::UnixSocket(c) => c.token.is_some(),
+                #[cfg(feature = "daemon-runtime")]
+                _ => true,
+            }
+        }
+
+        /// The same bus presenting tokens from `source` on the socket (B-16). The in-process bus
+        /// is the daemon itself and is unchanged.
+        pub fn with_token_source(
+            self,
+            source: Option<std::sync::Arc<crate::capabilities::GatewayTokenSource>>,
+        ) -> Self {
+            match self {
+                Self::UnixSocket(c) => Self::UnixSocket(c.with_token_source(source)),
+                #[cfg(feature = "daemon-runtime")]
+                other => other,
+            }
         }
     }
 
@@ -1333,6 +1419,7 @@ mod golden_wire {
                 payload_fd: 3,
                 bytes_len: 4096,
                 retention_policy: RetentionPolicy::Persistent,
+                macaroon: Some(tok()),
             },
             IpcCommand::FetchPayload {
                 ephemeral_shard_ids: vec![[0x77; 32]],
@@ -1357,9 +1444,13 @@ mod golden_wire {
                     stripes: Vec::new(),
                     witness_peers: vec!["w".into()],
                 },
+                macaroon: Some(tok()),
             },
             IpcCommand::QueryHealthStatus,
             IpcCommand::QueryStatus {
+                macaroon: Some(tok()),
+            },
+            IpcCommand::QueryHealthStatusAuthed {
                 macaroon: Some(tok()),
             },
         ]
@@ -1404,6 +1495,7 @@ mod golden_wire {
             IpcCommand::RegisterManifest { .. } => "RegisterManifest",
             IpcCommand::QueryHealthStatus => "QueryHealthStatus",
             IpcCommand::QueryStatus { .. } => "QueryStatus",
+            IpcCommand::QueryHealthStatusAuthed { .. } => "QueryHealthStatusAuthed",
         }
     }
 
@@ -1424,12 +1516,13 @@ mod golden_wire {
     }
 
     const GOLDEN: &[&str] = &[
-        "cmd StorePayload 0 7b0dbf38038f7d8066e4ba2c6b92391311224d8fdd74b9ca8e177582d1655144",
+        "cmd StorePayload 0 0351dfed08c3624803d8e83166b233f4030eb5713ac2bd564693b28039454b2a",
         "cmd FetchPayload 1 cb9ee27d569a133d75be31d0bfd6262c40ce321ab590c9acf14d8652517a9a66",
         "cmd FetchRange 2 0f48d64bf090dec6706c52c923f99c9ebb550605bad2a329329909fcfa23d61b",
-        "cmd RegisterManifest 3 bb9d2f5b2ef768d98e3f4b80ba0c63e4a4e74b14f71ac816610103854faad27e",
+        "cmd RegisterManifest 3 0b502cb593bfe650d8235d4f3559ff30897f84593dd60198c3c8a88a0a88dc7e",
         "cmd QueryHealthStatus 4 fb5e512425fc9449316ec95969ebe71e2d576dbab833d61e2a5b9330fd70ee02",
         "cmd QueryStatus 5 90690e4aee4f4c975bb59f0b9edcc0b1603f1e3e871933889e314a4e5d768f64",
+        "cmd QueryHealthStatusAuthed 6 6b41862b8d62efa8a3116822fb4ac88c49909a308dd65a7dfc2ecc3bd7f3e818",
         "resp StoreSuccess 0 d0cbeed4caa773256e6190330f1d22bc4a0bb707981381ea504318bb9dd22d28",
         "resp FetchSuccess 1 3cf4c6d7d35690bf9cefc706492dccabc67d6e25ff145e0a681864bc0e3db0da",
         "resp HealthStatus 2 42c3ccd517cfe720bf02dd2c56c9f606cc40fbd10ff238e4d9ef3215faeda5a1",

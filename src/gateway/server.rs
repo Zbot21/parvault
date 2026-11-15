@@ -5,7 +5,7 @@
 //! Formal model: `specs/ParVaultGatewayPluginBus.tla` (the dispatch actions it maps here).
 
 use crate::crypto::MasterKey;
-use crate::gateway::engine::GatewayEngine;
+use crate::gateway::engine::{GatedFrame, GatewayEngine};
 use crate::gateway::ipc::*;
 use crate::gateway::shm::{recv_frame_with_fd, send_frame_with_fd};
 use crate::profile::{ErasureTier, HardwareProfile};
@@ -235,8 +235,24 @@ fn execute_engine_command(
         IpcCommand::StorePayload {
             bytes_len,
             retention_policy,
+            macaroon,
             ..
         } => {
+            // B-16 (A-16 C4): UID (at accept), then the token, then the seal, and the passed
+            // descriptor is not read before the token is checked.
+            if let Err(code) = engine.authorize_frame(
+                macaroon.as_ref(),
+                GatedFrame::Store,
+                [0u8; 32],
+                0,
+                bytes_len,
+                peer_uid,
+            ) {
+                drop(maybe_fd);
+                return IpcResponse::Error {
+                    message: format!("StorePayload refused: {code}"),
+                };
+            }
             let Some(owned_fd) = maybe_fd else {
                 return IpcResponse::Error {
                     message: "StorePayload missing SCM_RIGHTS payload_fd".into(),
@@ -310,17 +326,29 @@ fn execute_engine_command(
                 },
             }
         }
-        IpcCommand::RegisterManifest { file_manifest } => {
+        IpcCommand::RegisterManifest {
+            file_manifest,
+            macaroon,
+        } => {
+            if let Err(code) = engine.authorize_frame(
+                macaroon.as_ref(),
+                GatedFrame::Register,
+                file_manifest.file_merkle_root,
+                0,
+                file_manifest.original_file_size,
+                peer_uid,
+            ) {
+                return IpcResponse::Error {
+                    message: format!("RegisterManifest refused: {code}"),
+                };
+            }
             let manifest = engine.register_manifest(file_manifest);
             IpcResponse::StoreSuccess { manifest }
         }
-        IpcCommand::QueryHealthStatus => {
-            let (iops, peer_count, por_sla_score) = engine.health_snapshot();
-            IpcResponse::HealthStatus {
-                iops,
-                peer_count,
-                por_sla_score,
-            }
+        // B-16: the tokenless health frame (index 4) is always refused, with a reason.
+        IpcCommand::QueryHealthStatus => health_response(engine, None, peer_uid),
+        IpcCommand::QueryHealthStatusAuthed { macaroon } => {
+            health_response(engine, macaroon.as_ref(), peer_uid)
         }
         IpcCommand::QueryStatus { macaroon } => {
             match engine.query_status(macaroon.as_ref(), peer_uid) {
@@ -330,6 +358,25 @@ fn execute_engine_command(
                 },
             }
         }
+    }
+}
+
+fn health_response(
+    engine: &GatewayEngine,
+    macaroon: Option<&crate::capabilities::CapabilityMacaroon>,
+    peer_uid: Option<u32>,
+) -> IpcResponse {
+    if let Err(code) = engine.authorize_frame(macaroon, GatedFrame::Read, [0u8; 32], 0, 0, peer_uid)
+    {
+        return IpcResponse::Error {
+            message: format!("QueryHealthStatus refused: {code}"),
+        };
+    }
+    let (iops, peer_count, por_sla_score) = engine.health_snapshot();
+    IpcResponse::HealthStatus {
+        iops,
+        peer_count,
+        por_sla_score,
     }
 }
 

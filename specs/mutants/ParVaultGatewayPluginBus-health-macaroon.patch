@@ -1,0 +1,12 @@
+diff --git a/specs/ParVaultGatewayPluginBus.tla b/specs/ParVaultGatewayPluginBus.tla
+--- a/specs/ParVaultGatewayPluginBus.tla
++++ b/specs/ParVaultGatewayPluginBus.tla
+@@ -179,7 +179,7 @@
+ 
+ QueryHealthStatusAuthed(u, t) ==
+     /\ u \in conns
+-    /\ ReadAuthorized(t, u)   \* @guard health-macaroon sym=src/gateway/engine.rs::gateway_macaroon_decision
++    /\ TRUE   \* @guard health-macaroon sym=src/gateway/engine.rs::gateway_macaroon_decision
+     /\ lastHealth' = <<u, t>>
+     /\ UNCHANGED <<allowlistSet, rootKeySet, requireSealed, snapshotPublished, conns,
+                    lastRead, lastStatus, lastWrite, stored>>

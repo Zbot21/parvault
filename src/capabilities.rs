@@ -542,6 +542,17 @@ impl CapabilityMacaroon {
         self.attenuate_with(caveat, chain_caveat_tag)
     }
 
+    /// Whether this token may write (B-16, A-16 C3): a token without `ReadOnly` is a write
+    /// token. With `unscoped_write` (a `StorePayload`, which has no manifest root yet) it must
+    /// also carry no `AllowedManifest` or `ByteRange` caveat.
+    pub fn permits_write(&self, unscoped_write: bool) -> bool {
+        !self.caveats.iter().any(|c| match c {
+            Caveat::ReadOnly => true,
+            Caveat::AllowedManifest(_) | Caveat::ByteRange { .. } => unscoped_write,
+            Caveat::ExpiresAtUnixMs(_) | Caveat::AllowedPeerUid(_) => false,
+        })
+    }
+
     /// Evaluates all attached caveats purely in RAM (`O(caveats.len())`, zero allocations).
     pub fn evaluate_caveats(&self, ctx: &AccessRequestContext) -> bool {
         let mut idx = 0;
@@ -909,6 +920,167 @@ pub fn token_from_args(
     CapabilityMacaroon::from_compact_token(&text)
         .map(Some)
         .map_err(|e| format!("invalid token: {e}"))
+}
+
+/// Lifetime of an auto-minted gateway token (B-16, D-45 Q2).
+pub const AUTO_MINT_TTL_MS: u64 = 15 * 60 * 1000;
+/// An auto-minted token is replaced once less than this is left (A-16 C1: a long-lived mount
+/// re-mints before expiry).
+pub const AUTO_MINT_REMINT_MARGIN_MS: u64 = 60 * 1000;
+/// The root key file `parvault` keeps in its data directory.
+pub const MACAROON_ROOT_KEY_FILE: &str = "macaroon_root.key";
+
+/// Where a gateway client's token comes from (B-16).
+pub enum GatewayTokenSource {
+    /// A token given by `--macaroon` or `--macaroon-file`.
+    Fixed(CapabilityMacaroon),
+    /// Minted by this process for its own UID from the daemon's `0600` root key file (D-45 Q2):
+    /// `ExpiresAtUnixMs` now + 15 min, `AllowedPeerUid` = the effective UID, and `ReadOnly`
+    /// unless `write`. The file is read per mint; the key is zeroized after each.
+    AutoMint {
+        key_file: std::path::PathBuf,
+        write: bool,
+        cache: std::sync::Mutex<Option<(CapabilityMacaroon, u64)>>,
+    },
+}
+
+impl std::fmt::Debug for GatewayTokenSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fixed(_) => f.write_str("GatewayTokenSource::Fixed(<redacted>)"),
+            Self::AutoMint {
+                key_file, write, ..
+            } => f
+                .debug_struct("GatewayTokenSource::AutoMint")
+                .field("key_file", key_file)
+                .field("write", write)
+                .finish(),
+        }
+    }
+}
+
+impl GatewayTokenSource {
+    /// Auto-mint from `<data_dir>/macaroon_root.key`.
+    pub fn auto_mint(data_dir: &std::path::Path, write: bool) -> Self {
+        Self::AutoMint {
+            key_file: data_dir.join(MACAROON_ROOT_KEY_FILE),
+            write,
+            cache: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// `--macaroon` / `--macaroon-file` if given, else an auto-mint source for `data_dir`.
+    pub fn from_args_or_auto(
+        explicit: Option<CapabilityMacaroon>,
+        data_dir: &std::path::Path,
+        write: bool,
+    ) -> Self {
+        match explicit {
+            Some(t) => Self::Fixed(t),
+            None => Self::auto_mint(data_dir, write),
+        }
+    }
+
+    /// The token to present now. An auto-mint source re-mints when the cached token has less
+    /// than [`AUTO_MINT_REMINT_MARGIN_MS`] left. Errors say why no token could be minted; the
+    /// caller never falls back to sending none.
+    pub fn current(&self) -> Result<CapabilityMacaroon, String> {
+        match self {
+            Self::Fixed(t) => Ok(t.clone()),
+            Self::AutoMint {
+                key_file,
+                write,
+                cache,
+            } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let mut guard = cache
+                    .lock()
+                    .map_err(|_| "token cache poisoned".to_string())?;
+                if let Some((tok, exp)) = guard.as_ref() {
+                    if now.saturating_add(AUTO_MINT_REMINT_MARGIN_MS) < *exp {
+                        return Ok(tok.clone());
+                    }
+                }
+                let exp = now.saturating_add(AUTO_MINT_TTL_MS);
+                let tok = auto_mint_token(key_file, *write, exp)?;
+                *guard = Some((tok.clone(), exp));
+                Ok(tok)
+            }
+        }
+    }
+}
+
+/// Mints a gateway token for this process's effective UID from the root key file at `key_file`
+/// (B-16, A-16 C1). The file must be a regular file (no symlink) owned by the effective UID with
+/// mode `0600`; the key bytes are zeroized after the mint.
+#[cfg(unix)]
+pub fn auto_mint_token(
+    key_file: &std::path::Path,
+    write: bool,
+    expires_at_unix_ms: u64,
+) -> Result<CapabilityMacaroon, String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use zeroize::Zeroize;
+    let shown = key_file.display();
+    let hint = "pass --macaroon-file, or --data-dir of the running daemon (a daemon started with --macaroon-key-hex writes no key file)";
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(key_file)
+        .map_err(|e| {
+            format!("cannot auto-mint a gateway token: cannot open {shown}: {e}; {hint}")
+        })?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("cannot auto-mint a gateway token: cannot stat {shown}: {e}"))?;
+    let euid = crate::os_sys::geteuid();
+    if !meta.file_type().is_file() || meta.uid() != euid || meta.mode() & 0o777 != 0o600 {
+        return Err(format!(
+            "cannot auto-mint a gateway token: {shown} must be a regular file owned by UID {euid} with mode 0600 (it is UID {}, mode {:o}); {hint}",
+            meta.uid(),
+            meta.mode() & 0o777
+        ));
+    }
+    let mut raw = Vec::with_capacity(65);
+    let read = file.take(128).read_to_end(&mut raw);
+    let mut key = [0u8; 32];
+    let parsed = read.is_ok()
+        && match raw.len() {
+            32 => {
+                key.copy_from_slice(&raw);
+                true
+            }
+            _ => {
+                let text = std::str::from_utf8(&raw).unwrap_or("").trim();
+                text.len() == 64 && hex::decode_to_slice(text, &mut key).is_ok()
+            }
+        };
+    raw.zeroize();
+    if !parsed || key == [0u8; 32] {
+        key.zeroize();
+        return Err(format!(
+            "cannot auto-mint a gateway token: {shown} is not a 32-byte root key"
+        ));
+    }
+    let mut caveats = vec![
+        Caveat::ExpiresAtUnixMs(expires_at_unix_ms),
+        Caveat::AllowedPeerUid(euid),
+    ];
+    if !write {
+        caveats.push(Caveat::ReadOnly);
+    }
+    let mut nonce = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    let mut fp_hasher = <sha2::Sha256 as sha2::Digest>::new();
+    sha2::Digest::update(&mut fp_hasher, b"parvault-macaroon-key-id-v1:auto-mint");
+    let issuer: [u8; 32] = sha2::Digest::finalize(fp_hasher).into();
+    let minted = CapabilityMacaroon::mint(&key, nonce, issuer, caveats);
+    key.zeroize();
+    minted.map_err(|e| format!("cannot auto-mint a gateway token: {e}"))
 }
 
 /// Largest `--macaroon-file` read (a compact token is a few KiB at most).
