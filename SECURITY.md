@@ -4,8 +4,8 @@
 
 | Version | Supported | Cryptographic & Memory-Safety Suite |
 | :--- | :---: | :--- |
-| `0.4.x` | Yes | Classical (`AES-256-GCM`, `ChaCha20-Poly1305`, `Argon2id`, `Ed25519`, `X25519`) + Post-Quantum Hybrid (`ML-KEM-768`, `ML-DSA-65`, Dual-Cipher `PqVaultMasterKey`) + `#![deny/forbid(unsafe_code)]` (`15` Kani + `7` TLA+ proofs) |
-| `< 0.4.0` | No (Superseded by `0.4.0`) | Prior releases |
+| `0.5.x` | Yes (pre-release; no published security advisory process yet) | Classical (`AES-256-GCM`, `ChaCha20-Poly1305`, `Argon2id`, `Ed25519`, `X25519`) + Post-Quantum Hybrid (`ML-KEM-768`, `ML-DSA-65`, Dual-Cipher `PqVaultMasterKey`) + `#![deny/forbid(unsafe_code)]` |
+| `< 0.5.0` | No (superseded by `0.5.0`) | Prior pre-releases |
 
 ## Zero-Trust & Adversarial Security Guarantees ([ADR index](docs/ADR.md))
 
