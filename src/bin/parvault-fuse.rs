@@ -175,8 +175,7 @@ fn main() -> anyhow::Result<()> {
                         let _ = std::fs::remove_dir_all(&self.0);
                     }
                 }
-                let mut nonce = [0u8; 6];
-                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+                let nonce: [u8; 6] = rand::Rng::gen(&mut rand::rngs::OsRng);
                 let tmp_dir = std::env::temp_dir().join(format!(
                     "parvault_vfs_selftest_{}_{}",
                     std::process::id(),

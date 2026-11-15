@@ -298,8 +298,7 @@ fn run_self_test(
         }
     }
 
-    let mut nonce = [0u8; 6];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    let nonce: [u8; 6] = rand::Rng::gen(&mut rand::rngs::OsRng);
     let tmp_dir = std::env::temp_dir().join(format!(
         "parvault_sync_selftest_{}_{}",
         std::process::id(),

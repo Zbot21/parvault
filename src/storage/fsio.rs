@@ -21,8 +21,7 @@ pub fn atomic_write_file(target_path: &Path, bytes: &[u8]) -> Result<(), Storage
     if !parent.as_os_str().is_empty() {
         fs::create_dir_all(parent)?;
     }
-    let mut rnd = [0u8; 8];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut rnd);
+    let rnd: [u8; 8] = rand::Rng::gen(&mut rand::rngs::OsRng);
     let file_name = target_path
         .file_name()
         .and_then(|n| n.to_str())
