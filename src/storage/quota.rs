@@ -51,9 +51,10 @@ pub struct PeerCreditAccount {
     pub bytes_hosted_for_peer: u64,
     /// Physical bytes the remote peer is currently hosting on behalf of this local node.
     pub bytes_contributed_by_peer: u64,
-    /// Cumulative successful PoR audits (< 300 ms valid salted commitments).
+    /// Chunk audits of this peer that this node ran and that verified (B-59, `por::auditor`).
     pub por_passes: u64,
-    /// Cumulative failed or timed-out PoR audits.
+    /// Chunk audits of this peer whose proof was invalid. An unanswered or late audit is never
+    /// counted here (L-27); the auditor counts those in `por_audit_state.json`.
     pub por_failures: u64,
     /// Whether this peer has been slashed for Byzantine shard poisoning or egress withholding.
     pub is_slashed: bool,

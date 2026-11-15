@@ -7650,3 +7650,44 @@ fn f07_self_answered_audit_not_credited() {
     );
     gate_ran("trust_enforcement::f07_self_answered_audit_not_credited");
 }
+
+/// F-06-TIMEOUT accept: the same honest host, answering inside the bound, passes.
+#[test]
+fn f06_prompt_host_passes() {
+    let (_host, root, dir) = stored_on_host("f06-to-a", &[0x4Du8; 5_000]);
+    let owner = spawn_owner_daemon(root, dir);
+    assert_audit_logged(&owner, "pass");
+    assert!(!owner.log_text().contains("reject.audit_timeout"));
+    gate_ran("trust_enforcement::f06_prompt_host_passes");
+}
+
+/// F-06-TIMEOUT reject: an answer over the RTT bound (1 ms here) is unanswered, never a fail:
+/// `reject.audit_timeout`, the unanswered count rises, no failure is recorded, and the host
+/// still answers.
+#[test]
+fn f06_slow_host_counted_unanswered_not_failed() {
+    let (host, root, dir) = stored_on_host("f06-to-r", &[0x4Du8; 5_000]);
+    std::fs::write(
+        dir.join("config.toml"),
+        "por_audit_interval_secs = 1\npor_audit_rtt_ms = 1\n",
+    )
+    .unwrap();
+    let reg = root.path().join("lan-registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    let log = root.path().join("owner.log");
+    let owner = spawn(daemon_command(&dir, &reg), root, dir, log);
+    assert_audit_logged(&owner, "reject.audit_timeout");
+    let host_id = device_id_of(&host.dir);
+    assert!(
+        owner_ledger(&owner, &host_id).is_none_or(|a| a.por_failures == 0),
+        "a timeout was recorded as a failure"
+    );
+    assert!(eventually(|| {
+        std::fs::read_to_string(owner.dir.join("por_audit_state.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .is_some_and(|v| v["timed_out"].as_u64().unwrap_or(0) >= 1)
+    }));
+    assert!(!owner.log_text().contains("reject.por_chunk_proof_invalid"));
+    gate_ran("trust_enforcement::f06_slow_host_counted_unanswered_not_failed");
+}
