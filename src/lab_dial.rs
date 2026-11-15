@@ -49,33 +49,33 @@ impl PartialEq for PeerKey {
 }
 impl Eq for PeerKey {}
 
-/// An IP literal: IPv4 uses the first 4 octets, the rest are ignored.
+/// An IP literal as an integer (no byte loop in the compare, which keeps Kani small): IPv6 uses
+/// all 128 bits, IPv4 the low 32, and the rest is ignored.
 #[derive(Clone, Copy, Debug)]
 pub struct LabIp {
     pub v6: bool,
-    pub octets: [u8; 16],
+    pub bits: u128,
 }
 
 impl LabIp {
     pub fn from_std(ip: std::net::IpAddr) -> Self {
-        let mut octets = [0u8; 16];
         match ip {
-            std::net::IpAddr::V4(v4) => {
-                octets[..4].copy_from_slice(&v4.octets());
-                Self { v6: false, octets }
-            }
+            std::net::IpAddr::V4(v4) => Self {
+                v6: false,
+                bits: u128::from(u32::from(v4)),
+            },
             std::net::IpAddr::V6(v6) => Self {
                 v6: true,
-                octets: v6.octets(),
+                bits: u128::from(v6),
             },
         }
     }
 
-    fn significant(&self) -> &[u8] {
+    fn significant(&self) -> u128 {
         if self.v6 {
-            &self.octets
+            self.bits
         } else {
-            &self.octets[..4]
+            self.bits & u128::from(u32::MAX)
         }
     }
 }
@@ -222,7 +222,7 @@ impl kani::Arbitrary for LabIp {
     fn any() -> Self {
         Self {
             v6: kani::any(),
-            octets: kani::any(),
+            bits: kani::any(),
         }
     }
 }
@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn ipv6_entries_compare_all_octets_and_v4_ignores_padding() {
         let mut a = ip("10.0.0.1");
-        a.octets[10] = 9;
+        a.bits |= 1 << 80;
         assert_eq!(a, ip("10.0.0.1"));
         assert_ne!(ip("fe80::1"), ip("fe80::2"));
         assert_ne!(ip("::"), ip("0.0.0.0"));
