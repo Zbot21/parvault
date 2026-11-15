@@ -132,6 +132,8 @@ docker.router_soc_stage12_vmhwm = 15.8 MiB
 # model, MaxCouncilEpoch 3; TLC -workers auto on the box): ParVaultZeroKeyAdminAndQuorum.cfg
 # (RootOnDisk = TRUE) and the variant ParVaultZeroKeyAdminAndQuorum.RootOffDisk.cfg (RootOnDisk =
 # FALSE, keys <Spec>.RootOffDisk). CI runs both; the sums include both.
+# Generated counts re-measured 2026-11-15 at c3ab8d5 (F-53 QA D3, PartialReroots epoch bound;
+# distinct counts unchanged): TLA2TOOLS_JAR=... bash scripts/gen_metrics.sh --measured tlc
 # bash scripts/gen_metrics.sh --measured tlc (every specs/<Spec>.cfg and <Spec>.<Variant>.cfg)
 tlc.generated.ParVaultProtocol = 61,009
 tlc.generated.ParVaultConfidentialityAndTrust = 2,318
@@ -139,7 +141,7 @@ tlc.generated.ParVaultAnonymity = 2,742
 tlc.generated.ParVaultPostQuantum = 6,979
 tlc.generated.ParVaultBootstrapAndEarnedTier = 331
 tlc.generated.ParVaultLiteClientAndSeedFailover = 212
-tlc.generated.ParVaultZeroKeyAdminAndQuorum = 741,561,992
+tlc.generated.ParVaultZeroKeyAdminAndQuorum = 744,403,592
 tlc.distinct.ParVaultProtocol = 3,040
 tlc.generated.ParVaultGatewayPluginBus = 215,120
 tlc.distinct.ParVaultConfidentialityAndTrust = 944
@@ -149,7 +151,7 @@ tlc.distinct.ParVaultBootstrapAndEarnedTier = 136
 tlc.distinct.ParVaultLiteClientAndSeedFailover = 95
 tlc.distinct.ParVaultZeroKeyAdminAndQuorum = 511,488
 tlc.depth.ParVaultZeroKeyAdminAndQuorum = 21
-tlc.generated.ParVaultZeroKeyAdminAndQuorum.RootOffDisk = 1,266,790,664
+tlc.generated.ParVaultZeroKeyAdminAndQuorum.RootOffDisk = 1,271,394,056
 tlc.distinct.ParVaultZeroKeyAdminAndQuorum.RootOffDisk = 873,792
 tlc.depth.ParVaultZeroKeyAdminAndQuorum.RootOffDisk = 21
 tlc.distinct.ParVaultGatewayPluginBus = 7,540
@@ -179,10 +181,10 @@ wire_request_variants = 23
 tla_pass = 8 / 8
 adr_count = 33
 adr_last = ADR-33
-tests_unit = 133
+tests_unit = 135
 tests_integration = 358
-tests_total = 491
-tests_pass = 491 / 491
+tests_total = 493
+tests_pass = 493 / 493
 size.parvault.aarch64 = 6.27 MiB
 size.parvault-seed.aarch64 = 4.27 MiB
 size.parvault-fuse.aarch64 = 1.13 MiB
@@ -203,6 +205,6 @@ bench.soc.headroom_32m = 22.26 MiB
 bench.soc.headroom_48m = 38.26 MiB
 bench.soc.vmhwm_reduction = 5.9x
 aes.enc.span = 496.5–589.2 MiB/s
-tlc.generated = 2,008,641,367
+tlc.generated = 2,016,086,359
 tlc.distinct = 1,399,132
 # <<< end generated
