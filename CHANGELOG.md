@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- **Reproducible, signed dev builds (L-17, L-113).** The static musl binaries and the router bundle are built twice on a tag, at different paths, inside a build image pinned by digest (`deploy/Dockerfile.build`), and must match byte for byte; PRs that touch build inputs run the same check (`repro-check.yml`). `rust-toolchain.toml` pins rustc `1.100.0`; every `cargo` call passes `--locked`; every action is pinned by SHA. Every `v0.5.x` artifact is a **dev build** (`<bin>-<target>-dev`), signed with the dev/test key (`ssh-keygen -Y`, principal `parvault-dev`, namespace `parvault-dev-build`) on the Lead's desktop, never in CI. Release builds and the release key do not exist yet. See `docs/REPRODUCIBLE_BUILDS.md`.
+- **`install.sh` verifies `SHA256SUMS.sig`.** It refuses a signature from any other key, sums changed after signing, a dev signature in the release namespace, and signed sums of another tag. It installs a dev build only with `PARVAULT_ALLOW_DEV_BUILD=1` and an unsigned one only with `PARVAULT_ALLOW_UNSIGNED=1`. With no `ssh-keygen -Y` (OpenWrt, dropbear) it warns and continues on SHA-256 alone (L-81) unless `PARVAULT_REQUIRE_SIGNATURE=1`.
+
+### Changed
+- Release binaries are no longer stripped a second time; the `soc` profile strips them. The x86_64 linker is now set explicitly, as the aarch64 one was. The router bundle is a deterministic tarball.
+
 ---
 
 ## [`0.5.2`] - 2026-11-15
