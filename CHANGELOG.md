@@ -9,7 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Removed
-- **The `simd-accel` feature (L-102).** Erasure coding is scalar-only, enforced in CI: `reed-solomon-erasure` is built with `default-features = false, features = ["std"]`, and `scripts/check_scalar_erasure_coding.sh` fails on the SIMD GF(2^8) kernel in shipped binaries (table content, plus symbols and scoped byte-shuffle instructions on unstripped builds). A CI job proves the check flags a SIMD-enabled build.
+- **The `simd-accel` feature (L-102).** Erasure coding is scalar-only, enforced in CI: `reed-solomon-erasure` is built with `default-features = false, features = ["std"]`, and `scripts/check_scalar_erasure_coding.sh` fails on the SIMD GF(2^8) kernel in shipped binaries (table content, plus symbols and scoped byte-shuffle instructions on unstripped builds). A CI job proves the check flags a SIMD-enabled build. The same script with `--cargo-lock Cargo.lock` refuses any other erasure-coding or GF crate (`reed-solomon-simd`, `reed-solomon-novelpoly`, a renamed or non-crates.io fork), since the binary checks know only `reed-solomon-erasure`; CI also runs the scoped instruction scan alone (`--insn-only`) on the SIMD build and requires it to flag it.
 
 ### Changed
 - **The shipped router config binds the status page to loopback (B-54).** `deploy/router-soc/parvault-router.toml` sets `status_http_bind = "127.0.0.1:4080"`; `0.0.0.0` includes the WAN. Pass `--status-http <LAN-IP>:4080` for the LAN and `--listen /ip4/<LAN-IP>/tcp/4001` for P2P. Router examples in the docs use the LAN address. Desktop and homelab defaults are unchanged.

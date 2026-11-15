@@ -229,6 +229,10 @@ jobs:
           if cargo tree -e features -i reed-solomon-erasure --all-features | grep -q 'simd-accel'; then
             echo "::error::reed-solomon-erasure/simd-accel is enabled"; exit 1
           fi
+      - name: Cargo.lock holds no erasure-coding or GF crate but reed-solomon-erasure
+        # The binary checks know only reed-solomon-erasure's kernel; this catches a SIMD kernel from
+        # any other crate (reed-solomon-simd, reed-solomon-novelpoly, a renamed or git fork).
+        run: bash scripts/check_scalar_erasure_coding.sh --cargo-lock Cargo.lock
       - name: Unstripped scalar build passes the symbol and instruction checks
         run: |
           cargo build --release --bin parvault-bench
@@ -238,6 +242,9 @@ jobs:
         run: |
           cargo build --release --bin parvault-bench --features reed-solomon-erasure/simd-accel
           bash scripts/check_scalar_erasure_coding.sh --expect-simd --require-symbols target/release/parvault-bench
+          # The symbol-name check answers first on reedsolomon_gal_mul, so run the scoped
+          # instruction scan alone too: it must flag the SIMD build by itself.
+          bash scripts/check_scalar_erasure_coding.sh --expect-simd --insn-only target/release/parvault-bench
           if bash scripts/check_scalar_erasure_coding.sh target/release/parvault-bench; then
             echo "::error::the gate passed a SIMD build"; exit 1
           fi
