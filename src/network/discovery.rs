@@ -1041,6 +1041,31 @@ pub struct KnownPeerRecord {
     pub owner_pq_fingerprint: Option<String>,
 }
 
+/// Reads `path`; `Ok(None)` when it does not exist.
+fn read_if_present(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// B-52: how a `known_peers.json` read loads. A missing file is an empty store (`Ok(None)`); a
+/// file that exists but cannot be read (`reject.known_peers_unreadable`) or decoded
+/// (`reject.known_peers_corrupt`) is refused, never treated as empty: the next save would drop
+/// every pinned peer and tracker-admin key.
+pub fn known_peers_load_decision(
+    read: std::io::Result<Option<Vec<u8>>>,
+) -> Result<Option<KnownPeersStore>, &'static str> {
+    match read {
+        Ok(None) => Ok(None),
+        Ok(Some(raw)) => serde_json::from_slice::<KnownPeersStore>(&raw)
+            .map(Some)
+            .map_err(|_| "reject.known_peers_corrupt"),
+        Err(_) => Err("reject.known_peers_unreadable"),
+    }
+}
+
 /// DHCP-resilient persistent peer store at `<data_dir>/known_peers.json`.
 ///
 /// Keyed by cryptographic `libp2p_peer_id`: when a home router's DHCP server or ISP assigns a
@@ -1058,17 +1083,36 @@ pub struct KnownPeersStore {
 impl KnownPeersStore {
     pub const FILE_NAME: &'static str = "known_peers.json";
 
+    /// Read-only view of the store: a missing file is empty, and so (logged with its reason code)
+    /// is one that exists but does not load. Pins are allow-lists, so an empty view trusts fewer
+    /// keys, never more. Never `save` a store obtained here; writers use [`Self::try_load`], and
+    /// `save` refuses to replace an unloadable file anyway (B-52).
     pub fn load(data_dir: &Path) -> Self {
-        let path = data_dir.join(Self::FILE_NAME);
-        let Ok(bytes) = std::fs::read(&path) else {
-            return Self::default();
-        };
-        serde_json::from_slice(&bytes).unwrap_or_default()
+        Self::try_load(data_dir).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "known_peers.json does not load; using no pins");
+            Self::default()
+        })
     }
 
+    /// B-52: the store on disk, failing closed. A missing file is empty; one that exists but cannot
+    /// be read or decoded is an error carrying its reason code, so it is never replaced by a store
+    /// that would drop every pin.
+    pub fn try_load(data_dir: &Path) -> anyhow::Result<Self> {
+        let path = data_dir.join(Self::FILE_NAME);
+        known_peers_load_decision(read_if_present(&path))
+            .map(Option::unwrap_or_default)
+            .map_err(|code| anyhow::anyhow!("{code}: {}", path.display()))
+    }
+
+    /// Writes the store atomically. Refused (B-52) when a `known_peers.json` exists that does not
+    /// load: it is kept for the operator, never overwritten.
     pub fn save(&self, data_dir: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(data_dir)?;
         let path = data_dir.join(Self::FILE_NAME);
+        if let Err(code) = known_peers_load_decision(read_if_present(&path)) {
+            tracing::warn!(code, path = %path.display(), "refused to overwrite known_peers.json");
+            anyhow::bail!("{code}: {}", path.display());
+        }
         let mut nonce = [0u8; 6];
         OsRng.fill_bytes(&mut nonce);
         let tmp_path = data_dir.join(format!(".tmp.known_peers.{}.json", hex::encode(nonce)));
@@ -1532,6 +1576,51 @@ pub fn resolve_zero_config_peers_with_wan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B-52: a missing `known_peers.json` is empty; one that does not read or decode is refused and
+    /// `save` leaves it as it was.
+    #[test]
+    fn unloadable_known_peers_is_refused_and_kept() {
+        assert_eq!(known_peers_load_decision(Ok(None)), Ok(None));
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            KnownPeersStore::try_load(dir.path()).unwrap(),
+            KnownPeersStore::default()
+        );
+        let path = dir.path().join(KnownPeersStore::FILE_NAME);
+        let mut pinned = KnownPeersStore::default();
+        pinned.pin_tracker_admin_pubkey("t", [7; 32]);
+        for (bytes, code) in [
+            (b"{\"peers\":".to_vec(), "reject.known_peers_corrupt"),
+            (vec![0xFF; 4], "reject.known_peers_corrupt"),
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            let err = KnownPeersStore::try_load(dir.path())
+                .unwrap_err()
+                .to_string();
+            assert!(err.starts_with(code), "{err}");
+            assert_eq!(
+                KnownPeersStore::load(dir.path()),
+                KnownPeersStore::default()
+            );
+            assert!(pinned
+                .save(dir.path())
+                .unwrap_err()
+                .to_string()
+                .starts_with(code));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let err = KnownPeersStore::try_load(dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("reject.known_peers_unreadable"), "{err}");
+        assert!(pinned.save(dir.path()).is_err());
+        std::fs::remove_dir(&path).unwrap();
+        pinned.save(dir.path()).unwrap();
+        assert_eq!(KnownPeersStore::try_load(dir.path()).unwrap(), pinned);
+    }
 
     #[test]
     fn test_signed_lan_beacon_rejects_tampering_and_peer_id_spoofing() {

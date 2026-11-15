@@ -89,6 +89,7 @@ GENERATOR="$(abs_path "${GENERATOR:-scripts/gen_metrics.sh}")"
 
 WORKDIR="$(mktemp -d)" || die "mktemp failed."
 trap 'rm -rf "$WORKDIR"' EXIT
+trap 'exit 130' INT TERM HUP  # signals exit through the EXIT trap, so cleanup runs
 
 git -C "$REPO" ls-files -z --cached --others --exclude-standard -- '*.md' > "$WORKDIR/md-files" \
   || die "git ls-files failed; refusing to check a partial file list."
@@ -309,6 +310,23 @@ def scan_ignored(text, where):
         ignored.append((where, m.group(1)))
 
 
+def span_markers_balanced(content, where):
+    """A code span may quote a marker as a syntax example, but a span that
+    holds an unpaired marker plus other text is a marker spliced by a stray
+    backtick (it renders as literal comment text and is never synced)."""
+    depth, bad = 0, False
+    for cm in COMMENT_RE.finditer(content):
+        if OPEN_RE.match(cm.group(1)):
+            depth += 1
+        elif CLOSE_RE.match(cm.group(1)):
+            depth -= 1
+            bad = bad or depth < 0
+    rest = COMMENT_RE.sub("", content).strip()
+    if (bad or depth > 0) and rest:
+        errors.append(f"{where}: unbalanced metric marker inside a code span with other text "
+                      f"(a stray backtick may have spliced a marker): `{content[:60]}`")
+
+
 markers = []  # (file, lineno, key, content)
 edits = {}  # path -> list of lines (with EOL) after replacement
 used = set()
@@ -348,6 +366,7 @@ for md in md_files:
         masked = list(line)
         for cm in CODESPAN_RE.finditer(line):
             scan_ignored(cm.group(0), where)
+            span_markers_balanced(cm.group(2), where)
             for i in range(cm.start(), cm.end()):
                 masked[i] = "\0"
         masked = "".join(masked)

@@ -8,16 +8,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+---
+
+## [`0.5.1`] - 2026-11-14
+
 ### Changed
 - **`vfs`: `VfsStubNode` is now `VfsLazyNode`, `register_stub_file` is now `register_lazy_file` (public API rename).** Names only; the serialized fields, the FUSE ABI and the WebDAV wire are unchanged.
 - **CI runs on every PR and pins its tools (B-67).** `pull_request` no longer filters on `main`, so stacked PRs get CI. Kani is pinned to `0.68.0`. `tla2tools.jar` (v1.8.0) is fetched into `$RUNNER_TEMP`, checked against a pinned sha256 and exported as `TLA2TOOLS_JAR`.
+- **Every shipped binary is staged through `stage_artifact.sh` (A-DOCKER).** The Docker gate now builds `parvault`, `parvault-seed`, `parvault-fuse` and `parvault-status` with their shipped feature sets and records their provenance; the vendored helper is at `360b586`. The gate summary prints the crate version from `Cargo.toml`, not `v0.3.0` (B-44).
+- **The site copies `install.sh` at deploy (B-40).** The tracked `website/install.sh` copy is deleted; `pages.yml` copies `scripts/install.sh` before upload.
+- **The client's dead mDNS event arm is removed (B-41).** The client swarm is built with mDNS off; `client_swarm_has_mdns_off` pins that.
+- **Formal specs (B-43, B-47).** `ParVaultAnonymity` no longer models per-shard ephemeral voucher issuers, which the code refuses (F-24); F-56 and F-57 are registered. The `@assume` and `@structural` tags in `ParVaultProtocol` and `ParVaultZeroKeyAdminAndQuorum` give their reasons, and `gateway/ipc.rs` and `gateway/server.rs` name `ParVaultGatewayPluginBus.tla`.
+- **PoR audit-loop findings move to v0.5.2 (B-59).** The F-06, F-07 and F-34 open lines are due in v0.5.2 (L-100, L-101); F-07 is fixed in code but has no claim tests yet.
+- **`scripts/sync_doc_metrics.sh` is re-vendored at `cd36260`.** It exits through its cleanup trap on INT, TERM and HUP and refuses a metric marker spliced into a code span.
 
 ### Fixed
 - **A voucher whose nullifier cannot be saved is refused (F-55, B-42).** `VoucherNullifierLedger` used to accept the voucher and drop a failed write, so after a restart the same voucher could be redeemed again. It now removes the nullifier and refuses with `reject.voucher_nullifier_not_persisted`.
 - **Quota state and tracker pins fail closed on a failed write (B-52).** After a failed `quota_state.bin` write the node refuses new shards (`reject.quota_state_not_persisted`) until a write succeeds. `persist_pinned_tracker_admin` returns an error instead of dropping a failed write, and no longer replaces an unreadable pin file with a new list.
+- **Behaviour change: an unloadable `known_peers.json`, quota state, voucher ledger or tracker pin file is refused, never treated as empty (B-52, B-42).** A `known_peers.json` that exists but cannot be read or decoded used to load as empty, and `join` then saved over it, dropping every pinned peer and tracker-admin key. Writers now fail with `reject.known_peers_unreadable` or `reject.known_peers_corrupt` and the file is kept. A corrupt `voucher_nullifiers.bin` or `quota_state.bin` refuses vouchers or new shards (`reject.voucher_ledger_*`, `reject.quota_state_*`), and a corrupt `pinned_tracker_admins.json` fails with `reject.tracker_pins_unreadable`. A missing file is still empty. To recover, stop the daemon and restore the file from a backup, or move it aside and restart (that state then starts empty: a moved-aside voucher ledger lets already-redeemed vouchers be redeemed again until they expire; see README "Known Limits").
 - **WAN `join` checks the card against the code (F-54, B-45).** As on the LAN path, the typed code must re-derive from the card's `PeerId` and PQ fingerprint, and the card's address must pin that `PeerId` (`reject.wan_card_code_mismatch`, `reject.wan_card_addr_peer_mismatch`). The WAN pairing lookup no longer pins every card it opens, so a refused card is not written to `known_peers.json`; only the accepted card is pinned. This raises a rendezvous server's cost to forge a card for its own `PeerId` to about 2^44 offline hashes (it chooses the PQ fingerprint, and the nonce is a constant); it does not refuse a forged card. The card stays readable by the server. PAKE pairing (v0.5.7) is the fix.
 - **The OpenWrt procd service starts, runs as `parvault`, and no longer touches flash or the whole store (B-53).** It had a 48 MiB address-space (`as`) limit, which counts every thread's reserved stack, so the daemon could not start. Now it sets only `nofile=1024`, runs as the `parvault` user (uid `4001`), uses procd's own stop (no `killall`), and respawns `3600 5 5`. It refuses to start unless `/mnt/nas` is a mounted ext4, f2fs, btrfs or xfs disk, and chowns the data directory only when its owner differs. P2P listens on the uci LAN address (`--listen`), not `0.0.0.0` on the WAN, falling back to loopback with a log line. `install.sh` installs to `/usr/bin` on OpenWrt. The `router-soc` profile runs tokio with 2 workers and at most 8 blocking threads, and admits at most 4 relay forwards at once so relays cannot take every blocking thread from the owner's gateway, admin RPC, status and sync work. These cap tokio's threads, not the daemon's memory.
 - **The WebDAV server shuts down under packet loss (B-56).** Shutdown sent one 100 ms wake connect; a lost SYN left the accept thread waiting forever. It now retries the wake until the thread exits. The netem MP4 gate checks the median of 5 cold TTFB samples, so one TCP retransmit no longer fails it, and bounds their max at 5x the budget, so a second retransmit or a stall still does.
+- **WebDAV shutdown can no longer hang (B-68).** After 40 wake attempts an accept thread that has not exited is detached with a warning instead of joined; it exits at its next accept.
+- **Docs no longer say a failed nullifier write is ignored or that vouchers use per-shard issuers (B-43).**
+- **`--admin-rpc-pubkey` on a seed that already has a tracker admin key (F-53, B-26).** _Placeholder: filled in when the B-26 branch merges._
 
 ---
 
