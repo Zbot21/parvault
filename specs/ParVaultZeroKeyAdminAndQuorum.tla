@@ -262,6 +262,17 @@ ClientFollowSeed ==
 \* key when RootOnDisk); or replays one already installed. A rotation never reads `from`, so it is
 \* fixed to the manifest's own root (no loss of adversary power).
 AttackerSignerIds == { s \in AllSigners \cup RootKeys : PrivKey(s) \in attackerKeys }
+\* @assume reroot-ceremony-files-public: a re-root is signed by passing one manifest file between
+\* holders (`CouncilManifest::sign_reroot`, once per key, any order), so a file signed by the old
+\* council's honest quorum but not (yet, or ever) by the new root exists and the adversary may read
+\* it: the new root's holder may not have signed or may have declined. Only the new-root guard
+\* keeps such a file from installing. The intended new root is B.
+PartialReroots(log) ==
+    IF log = <<>> THEN {}
+    ELSE { [scope |-> NewRoot, epoch |-> Len(log) + 1, members |-> mem, kind |-> "reroot",
+            from |-> Last(log).scope,
+            signers |-> ((Last(log).members \cap HonestCouncil) \cup AttackerSignerIds) \ {NewRootKey},
+            shapeOk |-> TRUE, legacy |-> FALSE] : mem \in HonestMemberChoices }
 AdversaryManifests ==
     { m \in { [scope |-> sc, epoch |-> e, members |-> mem, kind |-> k, from |-> fr,
                 signers |-> AttackerSignerIds, shapeOk |-> ok, legacy |-> FALSE] :
@@ -269,6 +280,7 @@ AdversaryManifests ==
                  k \in {"rotate", "reroot"}, fr \in Roots, ok \in BOOLEAN } :
         m.kind = "reroot" \/ m.from = m.scope }
     \cup { councilLog[i] : i \in 1..Len(councilLog) }
+    \cup PartialReroots(councilLog) \cup PartialReroots(clientLog)
 
 AdversaryInstallCouncil ==
     /\ advCouncilTries < 2
