@@ -310,4 +310,18 @@ suite      S-DUMP-NOFX test=config_dump::dump_paths_have_no_side_effects needs=c
 kani       DUMP-K    sym=src/config_dump.rs::dump_field_repr harness=proof_dump_secret_never_yields_value cover=secret set
 reach      DUMP-REACH sym=src/config_dump.rs::dump_field_repr from=src/config_dump.rs::render_dump
 
+# --- v0.5.4 NEW-3: /metrics on the status listener (docs/METRICS.md) --------------------------------
+claim      METRICS-AUTH sym=src/http_edge.rs::status_auth_decision accept=trust_enforcement::metrics_http_readonly_bearer_served reject=trust_enforcement::metrics_http_no_token_unauthorized code=reject.status_token_missing bin=parvault ref=docs/security/TRUST_FINDINGS.md
+claim      METRICS-SCOPED sym=src/http_edge.rs::status_auth_decision accept=trust_enforcement::metrics_http_readonly_bearer_served reject=trust_enforcement::metrics_http_scoped_token_forbidden code=reject.status_token_scoped bin=parvault ref=docs/security/TRUST_FINDINGS.md
+claim      METRICS-HOST sym=src/http_edge.rs::status_auth_decision accept=trust_enforcement::metrics_http_readonly_bearer_served reject=trust_enforcement::metrics_http_dns_host_refused code=reject.status_host_mismatch bin=parvault ref=docs/security/TRUST_FINDINGS.md
+claim      METRICS-INSEC sym=src/traversal_metrics.rs::insecure_metrics_listener_decision accept=traversal_metrics::insecure_listener_on_named_iface_debug_only reject=traversal_metrics::insecure_listener_iface_mismatch_refused code=reject.metrics_insecure_iface_mismatch bin=parvault ref=docs/METRICS.md
+kani       METRICS-K sym=src/traversal_metrics.rs::insecure_metrics_listener_decision harness=proof_insecure_metrics_requires_debug_feature_and_iface cover=insecure listener allowed
+kani       METRICS-IDX sym=src/traversal_metrics.rs::flat_index harness=proof_reason_index_in_bounds cover=last index reached
+suite      S-METRICS-ORD test=traversal_metrics::metrics_arm_below_status_auth needs=cmd:sh
+suite      S-METRICS-CARD test=traversal_metrics::metrics_series_count_is_constant needs=cmd:sh
+# The artifact kind is staging provenance (stage_artifact.sh); a binary-absence check is not
+# that, so the release guard and its negative control are a suite (Lead asked whether a new
+# kind is warranted, v0.5.4 plan section 2.7).
+suite      S-NOINSECURE test=static_build_checks::shipped_binaries_lack_insecure_metrics needs=cmd:sh
+
 ratchet    R         open=2 waive=32

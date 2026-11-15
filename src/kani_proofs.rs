@@ -1596,3 +1596,59 @@ fn proof_dump_secret_never_yields_value() {
         FieldClass::Control => assert!(r == DumpRepr::Omitted),
     }
 }
+
+/// METRICS-K (`v0.5.4` NEW-3, `docs/METRICS.md`): the unauthenticated debug listener is allowed
+/// iff the feature is compiled in, debug assertions are on, the bind IP is specified, and the
+/// named interface owns it. Every fact is free.
+#[kani::proof]
+fn proof_insecure_metrics_requires_debug_feature_and_iface() {
+    use crate::traversal_metrics::{insecure_metrics_listener_decision, InsecureMetricsFacts};
+    let f: InsecureMetricsFacts = kani::any();
+    let d = insecure_metrics_listener_decision(&f);
+    kani::cover!(d.is_ok(), "insecure listener allowed");
+    kani::cover!(
+        d.is_err() && f.feature && f.debug_assertions,
+        "built but refused"
+    );
+    assert_eq!(
+        d.is_ok(),
+        f.feature && f.debug_assertions && !f.unspecified && f.iface_owns_ip
+    );
+}
+
+/// METRICS-IDX (`v0.5.4` NEW-3): every index function the `record_*` methods use is in bounds
+/// of its array and injective, so the fixed `[AtomicU64; N]` arrays cannot be indexed out of
+/// bounds and no two label sets share a counter.
+#[kani::proof]
+fn proof_reason_index_in_bounds() {
+    use crate::traversal_metrics::*;
+    let (o1, p1, t1, r1): (Origin, PathKind, TransportKind, TraversalReason) =
+        (kani::any(), kani::any(), kani::any(), kani::any());
+    let (o2, p2, t2, r2): (Origin, PathKind, TransportKind, TraversalReason) =
+        (kani::any(), kani::any(), kani::any(), kani::any());
+    let i = flat_index(o1, p1, t1, r1);
+    let j = flat_index(o2, p2, t2, r2);
+    assert!(i < N_OUTCOMES);
+    assert!((i == j) == (o1 == o2 && p1 == p2 && t1 == t2 && r1 == r2));
+    kani::cover!(i == N_OUTCOMES - 1, "last index reached");
+
+    assert!(attempt_index(o1) < N_ATTEMPTS);
+    let (c1, c2): (ConnTransport, ConnTransport) = (kani::any(), kani::any());
+    let s1 = conn_series_index(p1, c1);
+    assert!(s1 < N_INBOUND && s1 < N_HIST_SERIES);
+    assert!((s1 == conn_series_index(p2, c2)) == (p1 == p2 && c1 == c2));
+    let (b1, b2): (usize, usize) = (kani::any(), kani::any());
+    kani::assume(b1 < N_BUCKETS && b2 < N_BUCKETS);
+    let h1 = hist_index(p1, c1, b1);
+    assert!(h1 < N_HIST_BUCKETS);
+    assert!((h1 == hist_index(p2, c2, b2)) == (p1 == p2 && c1 == c2 && b1 == b2));
+    let any_bucket: usize = kani::any();
+    assert!(hist_index(p1, c1, any_bucket) < N_HIST_BUCKETS);
+    let (d1, d2): (Direction, Direction) = (kani::any(), kani::any());
+    let k1 = connection_index(d1, p1, c1);
+    assert!(k1 < N_CONNECTIONS);
+    assert!((k1 == connection_index(d2, p2, c2)) == (d1 == d2 && p1 == p2 && c1 == c2));
+    let (sr1, sr2): (StatusRefusal, StatusRefusal) = (kani::any(), kani::any());
+    assert!(refused_index(sr1) < N_REFUSED);
+    assert!((refused_index(sr1) == refused_index(sr2)) == (sr1 == sr2));
+}
