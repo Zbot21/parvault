@@ -299,7 +299,7 @@ por_timeout_ms = 300
 local_rtt_threshold_ms = 5
 intra_asn_ratio = 0.70
 bootstrap_grace_bytes = 1073741824 # 1 GiB bootstrap grace
-max_connections = 24
+max_connections = 24 # not applied in v0.5.x: no swarm connection limit yet (B-64); status page caps at 32, WebDAV at 64
 ```
 
 ### Procd Service Script (`/etc/init.d/parvault-nas`)

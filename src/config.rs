@@ -703,6 +703,9 @@ pub struct NodeConfig {
     #[serde(default, alias = "profile")]
     pub hardware_profile: HardwareProfile,
     pub stripe_size_bytes: usize,
+    /// Parsed and set per profile, but no production path reads it in v0.5.x: the swarm has no
+    /// connection limit yet (B-64), and the HTTP servers use fixed caps
+    /// (`router_nas::STATUS_MAX_CONNECTIONS`, the WebDAV `WEBDAV_MAX_CONNECTIONS`).
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
     pub default_tier: ErasureTier,
