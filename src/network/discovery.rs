@@ -1352,8 +1352,10 @@ pub fn verify_lan_pairing_code(peer: &DiscoveredLanPeer, code: &str) -> bool {
 
 /// F-54 hardening (B-45): a WAN rendezvous card is accepted for `join` only if the code the user
 /// typed re-derives from the card's own `PeerId` and PQ fingerprint, as on the LAN path. A
-/// rendezvous server that can open the slot can still forge a self-signed card, but that card's
-/// `PeerId` no longer derives the code. A card whose multiaddr pins another `PeerId` is refused.
+/// rendezvous server that can open the slot can still forge a self-signed card, but it must find a
+/// `PeerId` and (attacker-chosen) PQ fingerprint that derive the same code under the constant
+/// nonce: about 2^44 offline hashes, not a refusal (B-92; PAKE pairing is the fix). A card whose
+/// multiaddr pins another `PeerId` is refused.
 pub fn wan_card_pairing_decision(
     card_peer_id: &str,
     owner_pq_fingerprint: Option<&str>,
