@@ -797,6 +797,10 @@ pub struct NodeConfig {
     /// `router-soc`). Separate from `por_timeout_ms`, the prover-side SLA.
     #[serde(default)]
     pub por_audit_rtt_ms: u64,
+    /// B-162: the per-peer write-ceiling epoch in ms (`0`: 24 h). Each epoch a peer may write
+    /// up to 4x its allowance to this node; a restart also starts a new epoch.
+    #[serde(default)]
+    pub quota_write_epoch_ms: u64,
 }
 
 fn default_por_audit_enabled() -> bool {
@@ -840,6 +844,7 @@ impl Default for NodeConfig {
             por_audit_enabled: true,
             por_audit_interval_secs: 0,
             por_audit_rtt_ms: 0,
+            quota_write_epoch_ms: 0,
         }
     }
 }

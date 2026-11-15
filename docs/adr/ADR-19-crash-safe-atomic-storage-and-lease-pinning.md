@@ -20,3 +20,7 @@ Power loss mid-write can leave truncated `.shard` or ledger files on flash media
 
 - **Consequences:** Eliminates torn-write corruption, arbitrary file-overwrite traversal, forged or replayed blinded deletes, and silent media bit-rot.
 - **Verification:** `tests/red_team_hardening_tests.rs` and Stage 8 of `scripts/docker_acceptance_gate.sh`.
+
+## v0.5.5 status (B-162)
+
+The per-peer write ceiling (4x the allowance, ADR-07 item 3; `epoch_ingress_bytes_written`) resets every 24 h (`DEFAULT_WRITE_EPOCH_MS`; `quota_write_epoch_ms` in `config.toml`), so it is a daily upload budget per peer and host. Before v0.5.5 it never reset outside tests, a lifetime cap. The epoch timer is RAM only on the monotonic clock (`roll_epoch_if_due`, `epoch_rollover_decision`; claim and Kani `B-162`): `quota_state.bin` keeps its v0.5.3 layout, and a restart starts a new epoch, so restarting a node reopens every peer's budget.

@@ -11,6 +11,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Security
 - **A full node no longer evicts other members' shards (B-161).** In every released `v0.5.x`, a file-backed node that was full evicted the least recently used shards of any owner to admit a put, so a member within its own allowance could push other members' live shards off the node. It now refuses with `reject.node_capacity` and evicts nothing. Puts to a full node that used to succeed by evicting now fail with `reject.node_capacity`. The in-memory `--no-fs` store is unchanged (ADR-30; B-164).
 
+### Fixed
+- **The per-host write ceiling resets daily (B-162).** The ceiling on what one peer may write to a host (4x its allowance) never reset in any released `v0.5.x`, so after about 40 GiB of total writes to a host an owner was refused for good (`reject.peer_write_amplification`), whatever it deleted; a churning `watch-folder` could reach it. It now resets every 24 h (`quota_write_epoch_ms`). The epoch timer is kept in RAM only, so `quota_state.bin` keeps its `v0.5.3` format; restarting a host also starts a new epoch.
+
 ---
 
 ## [`0.5.3`] - 2026-11-15

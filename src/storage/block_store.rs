@@ -614,6 +614,7 @@ impl BlockStore {
         if let Some(ref mem) = self.in_memory {
             let max_cap = {
                 let mut q = self.quota.lock().expect("quota mutex poisoned");
+                q.roll_epoch_if_due(std::time::Instant::now()); // B-162
                 if !q.can_accept_shard(owner_peer_id, shard_size) {
                     let evicted = q.evict_lru_to_fit(shard_size);
                     {
@@ -674,9 +675,10 @@ impl BlockStore {
         }
 
         {
-            let q = self.quota.lock().expect("quota mutex poisoned");
-            // B-161: a full file-backed node refuses (`reject.node_capacity`); it never evicts
-            // shards held for other accounts to admit a put.
+            let mut q = self.quota.lock().expect("quota mutex poisoned");
+            q.roll_epoch_if_due(std::time::Instant::now()); // B-162
+                                                            // B-161: a full file-backed node refuses (`reject.node_capacity`); it never evicts
+                                                            // shards held for other accounts to admit a put.
             if let Err(code) = q.quota_decision(owner_peer_id, shard_size) {
                 tracing::warn!(code, owner = owner_peer_id, "refused a shard over quota");
                 return Err(StorageError::QuotaExceeded(owner_peer_id.to_string()));
@@ -2098,8 +2100,9 @@ impl BlockStore {
         }
         let shard_size = bytes.len() as u64;
         {
-            let q = self.quota.lock().expect("quota mutex poisoned");
-            // B-161: as `put_shard`, refuse rather than evict other accounts' shards.
+            let mut q = self.quota.lock().expect("quota mutex poisoned");
+            q.roll_epoch_if_due(std::time::Instant::now()); // B-162
+                                                            // B-161: as `put_shard`, refuse rather than evict other accounts' shards.
             if let Err(code) = q.quota_decision(owner_peer_id, shard_size) {
                 tracing::warn!(code, owner = owner_peer_id, "refused a shard over quota");
                 return Err(StorageError::QuotaExceeded(owner_peer_id.to_string()));

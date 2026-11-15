@@ -6013,6 +6013,68 @@ fn b161_node_with_room_stores_gateway_push() {
     gate_ran("trust_enforcement::b161_node_with_room_stores_gateway_push");
 }
 
+// --- B-162: the per-peer write ceiling resets each epoch ---------------------------------------
+
+/// B-162: a daemon with a 4 KiB per-peer grace (a 16 KiB write ceiling per epoch) and, when
+/// set, a write-ceiling epoch of `epoch_ms` (`config.toml`; else the 24 h default).
+fn b162_host(label: &str, epoch_ms: Option<u64>) -> Node {
+    let (root, dir, reg, log) = prepare(label);
+    let mut cfg = String::from("bootstrap_grace_bytes = 4096\n");
+    if let Some(ms) = epoch_ms {
+        cfg.push_str(&format!("quota_write_epoch_ms = {ms}\n"));
+    }
+    std::fs::write(dir.join("config.toml"), cfg).unwrap();
+    spawn(daemon_command(&dir, &reg), root, dir, log)
+}
+
+/// B-162: five put-and-delete cycles of a 3,000-byte shard (15,000 bytes written, nothing held),
+/// then a sixth put, over the 16,384-byte ceiling. Returns that put's response.
+fn b162_churn_then_put(node: &Node, member: &NodeIdentity) -> MeshWireResponse {
+    for seed in 0x60u8..0x65 {
+        let (sid, bytes) = shard(seed, 3000);
+        assert!(stored(&send(member, node, put_shard("", sid, bytes, None))));
+        assert!(deleted(&send(member, node, delete_req(member, sid))));
+    }
+    let (sid, bytes) = shard(0x65, 3000);
+    send(member, node, put_shard("", sid, bytes, None))
+}
+
+/// B-162 reject: within one epoch, a peer that churned past 4x its allowance is refused
+/// (`reject.peer_write_amplification`) although it holds nothing.
+#[test]
+fn b162_write_ceiling_refuses_within_epoch() {
+    let node = b162_host("b162-r", None);
+    let resp = b162_churn_then_put(&node, &key(0xD6));
+    assert!(!stored(&resp), "{resp:?}");
+    assert_logged(&node, "reject.peer_write_amplification");
+    gate_ran("trust_enforcement::b162_write_ceiling_refuses_within_epoch");
+}
+
+/// B-162 accept: with a 6 s epoch the same peer is refused within the epoch and accepted in the
+/// next (released versions refused it for good: the ceiling never reset).
+#[test]
+fn b162_write_ceiling_reopens_next_epoch() {
+    const EPOCH_MS: u64 = 6_000;
+    let node = b162_host("b162-a", Some(EPOCH_MS));
+    let member = key(0xD6);
+    // The epoch starts at the node's first put, no earlier than `t0`.
+    let t0 = Instant::now();
+    let resp = b162_churn_then_put(&node, &member);
+    assert!(
+        t0.elapsed() < Duration::from_millis(EPOCH_MS),
+        "the churn outlasted the epoch; the refusal check is inconclusive"
+    );
+    assert!(!stored(&resp), "{resp:?}");
+    assert_logged(&node, "reject.peer_write_amplification");
+    std::thread::sleep(
+        (t0 + Duration::from_millis(EPOCH_MS + 2_000)).saturating_duration_since(Instant::now()),
+    );
+    let (sid, bytes) = shard(0x65, 3000);
+    let resp = send(&member, &node, put_shard("", sid, bytes, None));
+    assert!(stored(&resp), "{resp:?}\n{}", node.log_text());
+    gate_ran("trust_enforcement::b162_write_ceiling_reopens_next_epoch");
+}
+
 // --- ADR-12: hybrid signatures need both halves ------------------------------------------------------
 
 /// ADR-12 reject: a device cert whose Ed25519 half is valid but whose ML-DSA-65 half is broken is
