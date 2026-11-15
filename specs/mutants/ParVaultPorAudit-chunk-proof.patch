@@ -1,0 +1,13 @@
+diff --git a/specs/ParVaultPorAudit.tla b/specs/ParVaultPorAudit.tla
+index be84b6d..01f029a 100644
+--- a/specs/ParVaultPorAudit.tla
++++ b/specs/ParVaultPorAudit.tla
+@@ -33,7 +33,7 @@ NoChallenge == 0
+ Verdicts == {"None", "Pass", "Invalid", "Timeout"}
+ 
+ \* A proof verifies only for the challenged index with the stored content.
+-ProofOk(i, j, valid) == j = i /\ valid   \* @guard chunk-proof sym=src/por/chunk_merkle.rs::chunk_proof_decision
++ProofOk(i, j, valid) == TRUE
+ \* A verdict is credited only to a prover other than the auditor.
+ MayCredit(v, p) == v # p   \* @guard audit-credit sym=src/por/audit.rs::audit_credit_decision
+ \* Only an invalid proof is a ledger failure; a timeout never is.

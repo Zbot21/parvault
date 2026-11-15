@@ -83,6 +83,10 @@ tla-mutant TM-ORDER-ID      spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Saf
 tla-mutant TM-RING-SCOPE    spec=specs/ParVaultZeroKeyAdminAndQuorum.tla inv=Safety_PrivateRingImmuneToPublicCouncil patch=specs/mutants/ParVaultZeroKeyAdminAndQuorum-ring-scope.patch
 tla-mutant TM-SLASH-STICKY  spec=specs/ParVaultConfidentialityAndTrust.tla inv=Safety_SlashedNeverTrusted patch=specs/mutants/ParVaultConfidentialityAndTrust-slashed-sticky.patch
 tla-mutant TM-HYBRID-SIG    spec=specs/ParVaultPostQuantum.tla inv=Safety_QuantumSignatureUnforgeability patch=specs/mutants/ParVaultPostQuantum-hybrid-sig-both.patch
+tla-mutant TM-POR-CHUNK-PROOF   spec=specs/ParVaultPorAudit.tla inv=NoCreditWithoutProof patch=specs/mutants/ParVaultPorAudit-chunk-proof.patch
+tla-mutant TM-POR-CHUNK-STORER  spec=specs/ParVaultPorAudit.tla inv=NoCreditWithoutProof patch=specs/mutants/ParVaultPorAudit-chunk-storer.patch
+tla-mutant TM-POR-AUDIT-CREDIT  spec=specs/ParVaultPorAudit.tla inv=SelfNeverCredited patch=specs/mutants/ParVaultPorAudit-audit-credit.patch
+tla-mutant TM-POR-VERDICT       spec=specs/ParVaultPorAudit.tla inv=HonestNeverFails patch=specs/mutants/ParVaultPorAudit-verdict-classes.patch
 # L-47 invariants with no guard to remove (structural or assumption; each reason names its tag).
 waive      TM-W-DURABILITY  inv=specs/ParVaultProtocol.tla::DurabilitySafetyInvariant reason=assume bounded-epoch-churn (threat model, no Rust check)
 waive      TM-W-SLASH-BOUND inv=specs/ParVaultProtocol.tla::SlashingBoundInvariant reason=assume leaf-quarantine-not-run: record_failure is cfg(test), nothing slashes in v0.5.0 (ADR-09, N-09)
