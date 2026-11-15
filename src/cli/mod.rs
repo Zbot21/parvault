@@ -16,6 +16,10 @@ use crate::*;
 
 /// State `main()` prepares before dispatching a command.
 pub(crate) struct CliEnv {
+    /// The resolved configuration (one resolver for the dump and the command).
+    pub(crate) eff: Arc<parvault::config::EffectiveConfig>,
+    /// Hex SHA-256 of this command's `parvault.config-dump/1`.
+    pub(crate) config_digest: String,
     pub(crate) cfg: NodeConfig,
     pub(crate) lan_port: u16,
     pub(crate) lan_enabled: bool,
@@ -35,4 +39,26 @@ pub(crate) struct CliGlobals {
     pub(crate) lan_discovery_port: Option<u16>,
     pub(crate) seed_addr: Option<String>,
     pub(crate) config: Option<PathBuf>,
+}
+
+/// The one `MeshClient` constructor of the `parvault` binary (`docs/LAB_MODE.md`, A2). In
+/// deterministic mode: no data-dir discovery (`known_peers.json` is never loaded, no healed
+/// rewrite), LAN discovery off, and the fixed dial set on its swarm. Otherwise the data-dir
+/// discovery and the resolved LAN setting.
+pub(crate) fn mesh_client(
+    eff: &parvault::config::EffectiveConfig,
+    identity: NodeIdentity,
+    peers: Vec<String>,
+    seed_addr: Option<String>,
+) -> MeshClient {
+    let client = MeshClient::new(identity, peers, seed_addr);
+    if eff.deterministic() {
+        client
+            .with_lan_discovery(false)
+            .with_dial_set(Arc::new(eff.dial_set()), eff.dial_set_entries())
+    } else {
+        client
+            .with_data_dir_discovery(eff.cfg.data_dir.clone(), eff.lan_port)
+            .with_lan_discovery(eff.lan_enabled)
+    }
 }

@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod cli;
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use cli::daemon::{run_daemon, DaemonLaunchOptions};
 use libp2p::{futures::StreamExt, swarm::SwarmEvent, Multiaddr};
 use parvault::network::server_events::ServerSwarmEvents;
@@ -18,14 +18,14 @@ use parvault::{
     },
     network::{
         behaviour::{DhtEnvelopeKind, DhtWireEnvelope},
-        build_mesh_server_swarm, derive_4word_pairing_sas, derive_slot_key_from_code,
-        discover_lan_peers, extract_listen_port_and_ip, is_network_peer_addr,
-        node_identity_libp2p_peer_id, reflect_observed_wan_multiaddr,
-        resolve_zero_config_peers_with_wan, verify_lan_pairing_code, wan_card_pairing_decision,
-        DiscoveredLanPeer, KnownPeersStore, LanBeaconConfig, LanBeaconResponder, MeshClient,
-        TrustPoolMode, WanPeerCard, WanRendezvousRegistry, WebOfTrustRegistry,
-        DEFAULT_LAN_PAIRING_NONCE, DEFAULT_PUBLIC_WOT_POW_BITS, DEFAULT_SUBTREE_SLASH_LIMIT,
-        DEFAULT_WAN_TTL_SECS, PUBLIC_COMMONS_SWARM_SLOT,
+        derive_4word_pairing_sas, derive_slot_key_from_code, discover_lan_peers,
+        extract_listen_port_and_ip, is_network_peer_addr, node_identity_libp2p_peer_id,
+        reflect_observed_wan_multiaddr, resolve_zero_config_peers_with_wan,
+        verify_lan_pairing_code, wan_card_pairing_decision, DiscoveredLanPeer, KnownPeersStore,
+        LanBeaconConfig, LanBeaconResponder, MeshClient, TrustPoolMode, WanPeerCard,
+        WanRendezvousRegistry, WebOfTrustRegistry, DEFAULT_LAN_PAIRING_NONCE,
+        DEFAULT_PUBLIC_WOT_POW_BITS, DEFAULT_SUBTREE_SLASH_LIMIT, DEFAULT_WAN_TTL_SECS,
+        PUBLIC_COMMONS_SWARM_SLOT,
     },
     por::{PorVerifierEngine, RepairGrant},
     router_nas::{RouterNasLiveSnapshot, RouterNasPeerEntry, RouterNasStatusServer},
@@ -142,7 +142,49 @@ fn command_needs_network_discovery(cmd: &Commands) -> bool {
             | Commands::Wot { .. }
             | Commands::Council { .. }
             | Commands::Gateway { .. }
+            | Commands::Config { .. }
     )
+}
+
+/// `config dump`, `up --dump-config` and `daemon start --dump-config`.
+fn dump_requested(cmd: &Commands) -> bool {
+    matches!(
+        cmd,
+        Commands::Config {
+            action: parvault::config::ConfigAction::Dump
+        } | Commands::Up {
+            dump_config: true,
+            ..
+        } | Commands::Daemon {
+            action: DaemonAction::Start {
+                dump_config: true,
+                ..
+            }
+        }
+    )
+}
+
+/// The dump branch (`docs/LAB_MODE.md`): runs before identity, data-dir, key or network work,
+/// so it reads only the config file. Exit 0 dumped, 3 when the config does not resolve.
+fn run_dump(resolved: anyhow::Result<parvault::config::EffectiveConfig>) -> ! {
+    let eff = match resolved {
+        Ok(eff) => eff,
+        Err(e) => {
+            print!(
+                "{}",
+                parvault::config_dump::render_dump_error("reject.config_unreadable")
+            );
+            eprintln!("reject.config_unreadable: {e}");
+            std::process::exit(3);
+        }
+    };
+    if let Err((code, detail)) = parvault::config::lab_startup_decision(&eff) {
+        print!("{}", parvault::config_dump::render_dump_error(code));
+        eprintln!("{code}: {detail}");
+        std::process::exit(3);
+    }
+    print!("{}", parvault::config_dump::render_dump(&eff));
+    std::process::exit(0);
 }
 
 fn format_bytes_human(bytes: u64) -> String {
@@ -258,26 +300,65 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     // Stores nothing and needs no data directory or configuration.
     if matches!(cli.command, Commands::NewSeedPhrase) {
         println!("{}", generate_bip39_mnemonic(24)?);
         return Ok(());
     }
-    let cfg = NodeConfig::load_for_cli(cli.config.as_ref(), cli.data_dir.as_deref(), cli.profile)?;
-    parvault::runtime::build_runtime(cfg.hardware_profile)?.block_on(run(cli, cfg))
+    // NEW-5: one resolver for the dump and the command (`docs/LAB_MODE.md`).
+    let resolved =
+        parvault::config::ConfigFileInput::load(cli.config.as_deref(), cli.data_dir.as_deref())
+            .and_then(|file| {
+                parvault::config::EffectiveConfig::resolve(
+                    &cli,
+                    &matches,
+                    parvault::config::EnvSnapshot::capture(),
+                    file,
+                )
+            });
+    if dump_requested(&cli.command) {
+        run_dump(resolved);
+    }
+    let eff = resolved?;
+    if let Err((code, detail)) = parvault::config::lab_startup_decision(&eff) {
+        eprintln!("{code}: {detail}");
+        std::process::exit(3);
+    }
+    // The digest of the dump this command would print, taken before any file is created.
+    let config_digest = hex::encode(parvault::config_dump::config_digest(
+        &parvault::config_dump::render_dump(&eff),
+    ));
+    parvault::runtime::build_runtime(eff.cfg.hardware_profile)?.block_on(run(
+        cli,
+        Arc::new(eff),
+        config_digest,
+    ))
 }
 
-async fn run(cli: Cli, cfg: NodeConfig) -> anyhow::Result<()> {
-    let lan_port = cfg.effective_lan_discovery_port(cli.lan_discovery_port);
-    let lan_enabled = cfg.effective_lan_discovery_enabled(cli.no_lan_discovery);
-    let trust_mode = cfg.effective_trust_mode(cli.public, &cli.trackers);
+async fn run(
+    cli: Cli,
+    eff: Arc<parvault::config::EffectiveConfig>,
+    config_digest: String,
+) -> anyhow::Result<()> {
+    let cfg: NodeConfig = eff.cfg.clone();
+    let lan_port = eff.lan_port;
+    let lan_enabled = eff.lan_enabled;
+    let trust_mode = eff.trust_mode;
     let public_mode = trust_mode.allows_public_commons();
+    let deterministic = eff.deterministic();
+    if deterministic {
+        // Before any MeshClient exists: every client in this process is gated.
+        parvault::network::client::install_process_dial_set(
+            Arc::new(eff.dial_set()),
+            eff.dial_set_entries(),
+        );
+    }
     parvault::network::admission::install_process_source(&cfg.data_dir, public_mode);
-    let public_trackers =
-        cfg.effective_public_trackers(&cli.trackers, cli.seed_addr.as_deref(), public_mode);
-    let wan_seeds = cfg.effective_wan_rendezvous_seeds(cli.seed_addr.as_deref());
-    let external_addrs = cfg.effective_external_addrs(&cli.external_addrs);
+    let public_trackers = eff.public_trackers.clone();
+    let wan_seeds = eff.wan_seeds.clone();
+    let external_addrs = eff.external_addrs.clone();
 
     // Handle `parvault init` first before pre-creating default keys so we can print initialization cleanly
     if matches!(cli.command, Commands::Init { .. }) {
@@ -304,10 +385,11 @@ async fn run(cli: Cli, cfg: NodeConfig) -> anyhow::Result<()> {
     validate_early_command_flags(&cli.command)?;
 
     let node_identity = NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?;
-    let explicit_peers = cfg.effective_peers(&cli.peers);
-    let effective_seed = cfg.effective_seed_addr(cli.seed_addr.as_deref());
+    let explicit_peers = eff.explicit_peers.clone();
+    let effective_seed = eff.seed_addr.clone();
 
-    let resolved_peers = if !explicit_peers.is_empty() {
+    // Lab mode skips zero-config resolution: the resolved peers are the explicit ones.
+    let resolved_peers = if !explicit_peers.is_empty() || deterministic {
         explicit_peers.clone()
     } else if command_needs_network_discovery(&cli.command) {
         let anchors: &[String] = if public_mode && !public_trackers.is_empty() {
@@ -338,9 +420,7 @@ async fn run(cli: Cli, cfg: NodeConfig) -> anyhow::Result<()> {
         parvault::storage::council::repair_council_pins(&cfg.data_dir)
             .map_err(|e| anyhow::anyhow!("council re-pin repair: {e}"))?;
     }
-    let mesh_client = MeshClient::new(node_identity.clone(), resolved_peers, effective_seed)
-        .with_data_dir_discovery(cfg.data_dir.clone(), lan_port)
-        .with_lan_discovery(lan_enabled);
+    let mesh_client = cli::mesh_client(&eff, node_identity.clone(), resolved_peers, effective_seed);
 
     if public_mode && command_needs_network_discovery(&cli.command) {
         for tracker in &public_trackers {
@@ -356,6 +436,8 @@ async fn run(cli: Cli, cfg: NodeConfig) -> anyhow::Result<()> {
         .with_mesh_client(mesh_client.clone());
 
     let env = cli::CliEnv {
+        eff: Arc::clone(&eff),
+        config_digest,
         cfg,
         lan_port,
         lan_enabled,
@@ -379,7 +461,8 @@ async fn run(cli: Cli, cfg: NodeConfig) -> anyhow::Result<()> {
         | Commands::Token { .. }
         | Commands::Wot { .. }
         | Commands::Council { .. }
-        | Commands::Gateway { .. } => {
+        | Commands::Gateway { .. }
+        | Commands::Config { .. } => {
             unreachable!("handled above")
         }
 

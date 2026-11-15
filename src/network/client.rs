@@ -11,7 +11,7 @@ use crate::network::discovery::{
     pin_discovered_lan_peers, tracker_pin_decision, wan_ddns_card_decision, KnownPeersStore,
     DEFAULT_LAN_DISCOVERY_PORT,
 };
-use crate::network::transport::build_mesh_client_swarm;
+use crate::network::transport::{build_mesh_client_swarm_gated, GateParams};
 use crate::network::wan_rendezvous::{
     derive_peer_ddns_slot_key, derive_slot_key_from_code, now_ms as wan_now_ms,
     open_ddns_heartbeat, open_public_tracker_card, open_wan_peer_card, seal_ddns_heartbeat,
@@ -542,14 +542,24 @@ fn build_swarm_runtime() -> std::io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
+/// The lab dial gate for one client worker: the set and, under `Fixed`, the configured
+/// endpoints that seed Kademlia once at worker start (no learned address ever does).
+#[derive(Clone, Debug)]
+struct WorkerGate {
+    set: Arc<crate::lab_dial::DialSet>,
+    kad_entries: Arc<Vec<String>>,
+}
+
 fn spawn_swarm_worker(
     identity: NodeIdentity,
     pinned_peers: Arc<Mutex<HashMap<String, PeerId>>>,
     peer_rtt_ms: Arc<Mutex<HashMap<String, f64>>>,
     peer_status_cache: Arc<Mutex<HashMap<String, CachedNodeStatus>>>,
     discovered_peers: Arc<Mutex<HashSet<String>>>,
+    gate: WorkerGate,
 ) -> anyhow::Result<SwarmWorkerHandle> {
     let keypair = identity.to_libp2p_keypair()?;
+    let fixed = gate.set.is_fixed();
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<SwarmCommand>();
 
     std::thread::Builder::new()
@@ -560,9 +570,25 @@ fn spawn_swarm_worker(
             };
 
             rt.block_on(async move {
-                let Ok(mut swarm) = build_mesh_client_swarm(keypair, false) else {
+                let Ok(mut swarm) = build_mesh_client_swarm_gated(
+                    keypair,
+                    false,
+                    GateParams::for_set(Arc::clone(&gate.set)),
+                ) else {
                     return;
                 };
+                if fixed {
+                    for raw in gate.kad_entries.iter() {
+                        if let Ok(maddr) = raw.parse::<Multiaddr>() {
+                            if let Some(pid) = extract_expected_peer_id(&maddr) {
+                                swarm
+                                    .behaviour_mut()
+                                    .kademlia
+                                    .add_address(&pid, strip_p2p_protocol(&maddr));
+                            }
+                        }
+                    }
+                }
 
                 let mut pending_dials: Vec<PendingDialRpc> = Vec::new();
                 let mut inflight_requests: HashMap<OutboundRequestId, InflightRpc> = HashMap::new();
@@ -689,12 +715,16 @@ fn spawn_swarm_worker(
                                 } => {
                                     let remote_addr = endpoint.get_remote_address().clone();
                                     let remote_base = strip_p2p_protocol(&remote_addr);
-                                    swarm
-                                        .behaviour_mut()
-                                        .kademlia
-                                        .add_address(&peer_id, remote_addr);
-                                    if let Ok(mut disc) = discovered_peers.lock() {
-                                        disc.insert(format!("{remote_base}/p2p/{peer_id}"));
+                                    // Lab mode: Kademlia gets no learned address (the dial-set
+                                    // entries were added at worker start).
+                                    if !fixed {
+                                        swarm
+                                            .behaviour_mut()
+                                            .kademlia
+                                            .add_address(&peer_id, remote_addr);
+                                        if let Ok(mut disc) = discovered_peers.lock() {
+                                            disc.insert(format!("{remote_base}/p2p/{peer_id}"));
+                                        }
                                     }
 
                                     let mut remaining = Vec::with_capacity(pending_dials.len());
@@ -871,7 +901,10 @@ fn spawn_swarm_worker(
                                 SwarmEvent::Behaviour(MeshNetworkBehaviourEvent::Identify(
                                     identify::Event::Received { peer_id, info, .. },
                                 )) => {
-                                    for addr in info.listen_addrs {
+                                    // Lab mode: remote-supplied listen addresses are never
+                                    // learned.
+                                    let learned = if fixed { Vec::new() } else { info.listen_addrs };
+                                    for addr in learned {
                                         if let Some(ip) = extract_ip_from_multiaddr(&addr) {
                                             if ip.is_unspecified() {
                                                 continue;
@@ -889,6 +922,9 @@ fn spawn_swarm_worker(
                                         peer, addresses, ..
                                     },
                                 )) => {
+                                    if fixed {
+                                        continue;
+                                    }
                                     if let Ok(mut disc) = discovered_peers.lock() {
                                         for addr in addresses.iter() {
                                             let base = strip_p2p_protocol(addr);
@@ -1059,6 +1095,28 @@ pub struct MeshClient {
     admitted_at: Arc<Mutex<HashSet<AdmittedAt>>>,
     /// When a handshake with (sender, peer) was last refused (backoff).
     admission_refused_at: Arc<Mutex<HashMap<AdmittedAt, Instant>>>,
+    /// The lab dial gate (`docs/LAB_MODE.md`); `Open` outside deterministic mode.
+    dial_set: Arc<crate::lab_dial::DialSet>,
+    /// Under a fixed set: the configured endpoints that seed the worker's Kademlia.
+    lab_kad_entries: Arc<Vec<String>>,
+}
+
+/// The process-wide lab dial set, installed once by the `parvault` binary in deterministic mode
+/// before any client exists. Every `MeshClient` built afterwards in the process (the CLI's, the
+/// gateway engine's, the block store's, the auditor's) starts with it: LAN discovery off,
+/// `known_peers.json` never loaded, and its swarm gated.
+static PROCESS_DIAL_SET: std::sync::OnceLock<(Arc<crate::lab_dial::DialSet>, Arc<Vec<String>>)> =
+    std::sync::OnceLock::new();
+
+/// Installs the process-wide lab dial set (`Fixed` only; a second call is ignored).
+pub fn install_process_dial_set(set: Arc<crate::lab_dial::DialSet>, kad_entries: Vec<String>) {
+    if set.is_fixed() {
+        let _ = PROCESS_DIAL_SET.set((set, Arc::new(kad_entries)));
+    }
+}
+
+fn process_dial_set() -> Option<&'static (Arc<crate::lab_dial::DialSet>, Arc<Vec<String>>)> {
+    PROCESS_DIAL_SET.get()
 }
 
 impl MeshClient {
@@ -1104,7 +1162,38 @@ impl MeshClient {
             admission: None,
             admitted_at: Arc::new(Mutex::new(HashSet::new())),
             admission_refused_at: Arc::new(Mutex::new(HashMap::new())),
+            dial_set: Arc::new(crate::lab_dial::DialSet::Open),
+            lab_kad_entries: Arc::new(Vec::new()),
         }
+        .with_process_dial_set()
+    }
+
+    fn with_process_dial_set(self) -> Self {
+        match process_dial_set() {
+            Some((set, entries)) => self.with_dial_set(Arc::clone(set), entries.to_vec()),
+            None => self,
+        }
+    }
+
+    /// Gates this client's swarm with `set` (`docs/LAB_MODE.md`). A fixed set also turns LAN
+    /// discovery off; `kad_entries` (the configured dial set) seed the worker's Kademlia.
+    pub fn with_dial_set(
+        mut self,
+        set: Arc<crate::lab_dial::DialSet>,
+        kad_entries: Vec<String>,
+    ) -> Self {
+        if set.is_fixed() {
+            self.lan_discovery_enabled = false;
+        }
+        self.dial_set = set;
+        self.lab_kad_entries = Arc::new(kad_entries);
+        self.worker = Arc::new(Mutex::new(None));
+        self
+    }
+
+    /// The dial set this client's swarm is gated with.
+    pub fn dial_set(&self) -> &crate::lab_dial::DialSet {
+        &self.dial_set
     }
 
     /// Uses `source` for ring admission instead of the process-wide source.
@@ -1228,6 +1317,12 @@ impl MeshClient {
     /// endpoints after a home DHCP renewal, it automatically re-scans LAN beacons and updates
     /// pinned `/p2p/<PeerId>` Multiaddrs seamlessly.
     pub fn with_data_dir_discovery(mut self, data_dir: PathBuf, discovery_port: u16) -> Self {
+        if self.dial_set.is_fixed() {
+            // Lab mode: no state-file peers, no healed rewrite, no scan (`docs/LAB_MODE.md`).
+            // This also drops the tracker-admin pin store (pins stay in memory only), which is
+            // harmless while lab mode refuses trackers.
+            return self;
+        }
         let store = KnownPeersStore::load(&data_dir);
         if let (Ok(mut disc), Ok(mut healed)) =
             (self.discovered_peers.lock(), self.healed_peer_addrs.lock())
@@ -1254,7 +1349,7 @@ impl MeshClient {
     /// mappings, and returns all active discovered peer Multiaddrs.
     /// Turns LAN scanning and pinning off (`--no-lan-discovery`); pinned peers are still used.
     pub fn with_lan_discovery(mut self, enabled: bool) -> Self {
-        self.lan_discovery_enabled = enabled;
+        self.lan_discovery_enabled = enabled && !self.dial_set.is_fixed();
         self
     }
 
@@ -1529,6 +1624,10 @@ impl MeshClient {
                 Arc::clone(&self.peer_rtt_ms),
                 Arc::clone(&self.peer_status_cache),
                 Arc::clone(&self.discovered_peers),
+                WorkerGate {
+                    set: Arc::clone(&self.dial_set),
+                    kad_entries: Arc::clone(&self.lab_kad_entries),
+                },
             )?;
             *guard = Some(handle);
         }

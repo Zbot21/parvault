@@ -2,9 +2,44 @@ use crate::network::behaviour::{BincodeWireCodec, MeshNetworkBehaviour};
 use libp2p::{
     gossipsub, identify, kad, mdns, noise, ping,
     request_response::{self, ProtocolSupport},
-    tcp, yamux, StreamProtocol, Swarm, SwarmBuilder,
+    tcp, yamux, StreamProtocol, Swarm,
 };
 use std::time::Duration;
+
+/// What the dial gate needs to build a swarm (`v0.5.4` NEW-5, `docs/LAB_MODE.md`): the dial
+/// set (`Open` outside deterministic mode) and the identify address cache (`0` when
+/// deterministic, so identify supplies no dial addresses).
+#[derive(Clone, Debug)]
+pub struct GateParams {
+    pub set: std::sync::Arc<crate::lab_dial::DialSet>,
+    pub identify_cache: usize,
+}
+
+impl GateParams {
+    /// No gate: every dial allowed, identify's default cache.
+    pub fn open() -> Self {
+        Self {
+            set: std::sync::Arc::new(crate::lab_dial::DialSet::Open),
+            identify_cache: IDENTIFY_DEFAULT_CACHE,
+        }
+    }
+
+    /// The gate for `set`: a fixed set also turns the identify cache off.
+    pub fn for_set(set: std::sync::Arc<crate::lab_dial::DialSet>) -> Self {
+        let identify_cache = if set.is_fixed() {
+            0
+        } else {
+            IDENTIFY_DEFAULT_CACHE
+        };
+        Self {
+            set,
+            identify_cache,
+        }
+    }
+}
+
+/// libp2p-identify 0.45's default `cache_size`.
+const IDENTIFY_DEFAULT_CACHE: usize = 100;
 
 /// Builds the `libp2p::Swarm` configured per ADR-08:
 /// - Primary transport: **TCP + Noise XX + Yamux** (stateless cryptographic framing, minimal musl footprint)
@@ -24,7 +59,17 @@ pub fn build_mesh_server_swarm(
     enable_quic: bool,
     enable_mdns: bool,
 ) -> anyhow::Result<Swarm<MeshNetworkBehaviour>> {
-    build_swarm(keypair, enable_quic, enable_mdns, true)
+    build_swarm(keypair, enable_quic, enable_mdns, true, GateParams::open())
+}
+
+/// The server swarm with the lab dial gate.
+pub fn build_mesh_server_swarm_gated(
+    keypair: libp2p::identity::Keypair,
+    enable_quic: bool,
+    enable_mdns: bool,
+    gate: GateParams,
+) -> anyhow::Result<Swarm<MeshNetworkBehaviour>> {
+    build_swarm(keypair, enable_quic, enable_mdns, true, gate)
 }
 
 /// Builds a lightweight client `libp2p::Swarm` for outbound RPCs without binding a multicast mDNS listener.
@@ -32,43 +77,64 @@ pub fn build_mesh_client_swarm(
     keypair: libp2p::identity::Keypair,
     enable_quic: bool,
 ) -> anyhow::Result<Swarm<MeshNetworkBehaviour>> {
-    build_swarm(keypair, enable_quic, false, false)
+    build_swarm(keypair, enable_quic, false, false, GateParams::open())
 }
 
+/// The client swarm with the lab dial gate.
+pub fn build_mesh_client_swarm_gated(
+    keypair: libp2p::identity::Keypair,
+    enable_quic: bool,
+    gate: GateParams,
+) -> anyhow::Result<Swarm<MeshNetworkBehaviour>> {
+    build_swarm(keypair, enable_quic, false, false, gate)
+}
+
+/// Both swarms are built here. The transport is built by hand so the whole TCP (+ QUIC)
+/// transport is wrapped in `LabDialTransport`, the choke point every dialled address passes.
 fn build_swarm(
     keypair: libp2p::identity::Keypair,
     enable_quic: bool,
     enable_mdns: bool,
     kad_server: bool,
+    gate: GateParams,
 ) -> anyhow::Result<Swarm<MeshNetworkBehaviour>> {
-    let builder = SwarmBuilder::with_existing_identity(keypair).with_tokio();
-
-    let builder = builder.with_tcp(
-        tcp::Config::default().nodelay(true),
-        noise::Config::new,
-        yamux::Config::default,
-    )?;
-
-    let swarm = if enable_quic {
-        builder
-            .with_quic()
-            .with_behaviour(|key| construct_behaviour(key, enable_mdns, kad_server))?
-            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
-            .build()
+    use libp2p::core::{muxing::StreamMuxerBox, upgrade::Version, Transport};
+    let tcp = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
+        .upgrade(Version::V1Lazy)
+        .authenticate(noise::Config::new(&keypair)?)
+        .multiplex(yamux::Config::default())
+        .map(|(p, c), _| (p, StreamMuxerBox::new(c)));
+    let inner = if enable_quic {
+        let quic = libp2p::quic::tokio::Transport::new(libp2p::quic::Config::new(&keypair))
+            .map(|(p, c), _| (p, StreamMuxerBox::new(c)));
+        tcp.or_transport(quic)
+            .map(|either, _| either.into_inner())
+            .boxed()
     } else {
-        builder
-            .with_behaviour(|key| construct_behaviour(key, enable_mdns, kad_server))?
-            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
-            .build()
+        tcp.boxed()
     };
-
-    Ok(swarm)
+    let transport = crate::network::traversal_gate::LabDialTransport::new(
+        inner,
+        std::sync::Arc::clone(&gate.set),
+    )
+    .boxed();
+    let behaviour = construct_behaviour(&keypair, enable_mdns, kad_server, &gate)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let peer_id = keypair.public().to_peer_id();
+    Ok(Swarm::new(
+        transport,
+        behaviour,
+        peer_id,
+        libp2p::swarm::Config::with_tokio_executor()
+            .with_idle_connection_timeout(Duration::from_secs(60)),
+    ))
 }
 
 fn construct_behaviour(
     key: &libp2p::identity::Keypair,
     enable_mdns: bool,
     kad_server: bool,
+    gate: &GateParams,
 ) -> Result<MeshNetworkBehaviour, Box<dyn std::error::Error + Send + Sync>> {
     let local_peer_id = key.public().to_peer_id();
 
@@ -117,10 +183,10 @@ fn construct_behaviour(
 
     // 4. Active RTT probing (Ping) & Identify.
     let ping = ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(5)));
-    let identify = identify::Behaviour::new(identify::Config::new(
-        "/parvault/id/1.0.0".to_string(),
-        key.public(),
-    ));
+    let identify = identify::Behaviour::new(
+        identify::Config::new("/parvault/id/1.0.0".to_string(), key.public())
+            .with_cache_size(gate.identify_cache),
+    );
 
     // 5. Bincode Request-Response wire protocol (32 MiB max frame) for 16 MiB stripes, PoR & RepairGrants.
     let req_resp = request_response::Behaviour::with_codec(
@@ -133,6 +199,7 @@ fn construct_behaviour(
     );
 
     Ok(MeshNetworkBehaviour {
+        gate: crate::network::traversal_gate::TraversalGate::new(std::sync::Arc::clone(&gate.set)),
         kademlia,
         gossipsub,
         mdns,

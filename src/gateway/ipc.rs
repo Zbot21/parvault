@@ -217,6 +217,10 @@ pub struct StatusSnapshot {
     pub hwm_kib: u64,
     pub uptime_secs: u64,
     pub lan_peers: Vec<StatusPeerEntry>,
+    /// Lowercase hex SHA-256 of this daemon's `parvault.config-dump/1` (`v0.5.4`,
+    /// `docs/LAB_MODE.md`); empty when not known (a sidecar, or a test snapshot).
+    #[serde(default)]
+    pub config_digest: String,
 }
 
 impl Default for StatusSnapshot {
@@ -236,6 +240,7 @@ impl Default for StatusSnapshot {
             hwm_kib: 0,
             uptime_secs: 0,
             lan_peers: Vec::new(),
+            config_digest: String::new(),
         }
     }
 }
@@ -262,6 +267,7 @@ impl StatusSnapshot {
             &mut self.libp2p_peer_id,
             &mut self.owner_pq_fingerprint,
             &mut self.sla_tier,
+            &mut self.config_digest,
         ] {
             cap_string(s);
         }
@@ -286,6 +292,7 @@ impl StatusSnapshot {
             &self.libp2p_peer_id,
             &self.owner_pq_fingerprint,
             &self.sla_tier,
+            &self.config_digest,
         ]
         .into_iter()
         .all(ok)

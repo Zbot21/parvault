@@ -5,7 +5,9 @@ use crate::*;
 
 pub(crate) async fn up(env: CliEnv, command: Commands) -> anyhow::Result<()> {
     let CliEnv {
-        mut cfg,
+        eff,
+        config_digest,
+        cfg,
         lan_port,
         lan_enabled,
         trust_mode,
@@ -22,7 +24,7 @@ pub(crate) async fn up(env: CliEnv, command: Commands) -> anyhow::Result<()> {
         status_http,
         pair,
         wan,
-        listen,
+        listen: _,
         tier,
         ipc_socket,
         no_socket,
@@ -35,6 +37,7 @@ pub(crate) async fn up(env: CliEnv, command: Commands) -> anyhow::Result<()> {
         vfs_fuse_fd,
         vfs_seed_dir,
         vfs_cache_mib,
+        dump_config: _,
     } = command
     else {
         unreachable!("up() is only dispatched for Commands::Up")
@@ -55,14 +58,11 @@ pub(crate) async fn up(env: CliEnv, command: Commands) -> anyhow::Result<()> {
         macaroon_root_key_hex.as_deref(),
         vfs_webdav_listen.is_some() || status_http.is_some(),
     )?;
-    if let Some(listen_override) = listen {
-        cfg.listen_tcp = listen_override;
-    }
-    if no_audit {
-        cfg.por_audit_enabled = false;
-    }
-    let effective_folder = folder.or_else(|| cfg.watched_folder.clone());
-    let effective_status_http = status_http.or_else(|| cfg.status_http_bind.clone());
+    // The resolver applied --listen, --no-audit, --folder and --status-http to `cfg`.
+    let _ = (folder, status_http, no_audit);
+    let deterministic = eff.deterministic();
+    let effective_folder = cfg.watched_folder.clone();
+    let effective_status_http = cfg.status_http_bind.clone();
     let effective_tier = if public_mode {
         ErasureTier::Consumer
     } else {
@@ -84,12 +84,14 @@ pub(crate) async fn up(env: CliEnv, command: Commands) -> anyhow::Result<()> {
         watch_folder: effective_folder,
         sync_interval_secs: interval_secs.max(1),
         sync_tier: effective_tier,
-        wan_announce: wan || !wan_seeds.is_empty(),
+        wan_announce: !deterministic && (wan || !wan_seeds.is_empty()),
         wan_seeds,
         public_mode,
         public_trackers,
         external_addrs,
         trust_mode,
+        eff,
+        config_digest,
     };
     run_daemon(cfg, block_store, opts).await?;
     Ok(())
@@ -97,7 +99,9 @@ pub(crate) async fn up(env: CliEnv, command: Commands) -> anyhow::Result<()> {
 
 pub(crate) async fn daemon(env: CliEnv, command: Commands) -> anyhow::Result<()> {
     let CliEnv {
-        mut cfg,
+        eff,
+        config_digest,
+        cfg,
         lan_port,
         lan_enabled,
         trust_mode,
@@ -113,8 +117,8 @@ pub(crate) async fn daemon(env: CliEnv, command: Commands) -> anyhow::Result<()>
     };
     match action {
         DaemonAction::Start {
-            listen,
-            enable_quic,
+            listen: _,
+            enable_quic: _,
             status_http,
             ipc_socket,
             no_socket,
@@ -127,6 +131,7 @@ pub(crate) async fn daemon(env: CliEnv, command: Commands) -> anyhow::Result<()>
             vfs_fuse_fd,
             vfs_seed_dir,
             vfs_cache_mib,
+            dump_config: _,
         } => {
             validate_builtin_vfs_flags(
                 vfs_webdav_listen.as_deref(),
@@ -144,16 +149,14 @@ pub(crate) async fn daemon(env: CliEnv, command: Commands) -> anyhow::Result<()>
                 macaroon_root_key_hex.as_deref(),
                 vfs_webdav_listen.is_some() || status_http.is_some(),
             )?;
-            cfg.listen_tcp = listen;
-            cfg.enable_quic = enable_quic;
-            if no_audit {
-                cfg.por_audit_enabled = false;
-            }
+            // The resolver applied --listen, --enable-quic, --no-audit and --status-http.
+            let _ = no_audit;
+            let deterministic = eff.deterministic();
             let opts = DaemonLaunchOptions {
                 lan_discovery_enabled: lan_enabled,
                 lan_discovery_port: lan_port,
                 print_pairing_banner: false,
-                status_http_bind: status_http.or_else(|| cfg.status_http_bind.clone()),
+                status_http_bind: cfg.status_http_bind.clone(),
                 ipc_socket: if no_socket { None } else { ipc_socket },
                 strict_allowed_peer_uids,
                 require_sealed_ingest_memfd: require_sealed_memfd,
@@ -165,12 +168,14 @@ pub(crate) async fn daemon(env: CliEnv, command: Commands) -> anyhow::Result<()>
                 watch_folder: None,
                 sync_interval_secs: 5,
                 sync_tier: cfg.default_tier,
-                wan_announce: !wan_seeds.is_empty(),
+                wan_announce: !deterministic && !wan_seeds.is_empty(),
                 wan_seeds,
                 public_mode,
                 public_trackers,
                 external_addrs,
                 trust_mode,
+                eff,
+                config_digest,
             };
             run_daemon(cfg, block_store, opts).await?;
         }

@@ -9,9 +9,13 @@ pub mod bootstrap;
 pub mod capabilities;
 #[cfg(feature = "daemon-runtime")]
 pub mod config;
+pub mod config_dump;
 pub mod crypto;
+#[cfg(feature = "daemon-runtime")]
+pub mod effective_config;
 pub mod gateway;
 pub mod http_edge;
+pub mod lab_dial;
 #[cfg(feature = "daemon-runtime")]
 pub mod network;
 #[cfg(unix)]

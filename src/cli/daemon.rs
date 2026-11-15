@@ -25,6 +25,10 @@ pub(crate) struct DaemonLaunchOptions {
     pub(crate) public_trackers: Vec<String>,
     pub(crate) external_addrs: Vec<String>,
     pub(crate) trust_mode: TrustPoolMode,
+    /// The resolved configuration (`docs/LAB_MODE.md`).
+    pub(crate) eff: Arc<parvault::config::EffectiveConfig>,
+    /// Hex SHA-256 of the `parvault.config-dump/1` of this command.
+    pub(crate) config_digest: String,
 }
 
 pub(crate) async fn run_daemon(
@@ -33,6 +37,15 @@ pub(crate) async fn run_daemon(
     opts: DaemonLaunchOptions,
 ) -> anyhow::Result<()> {
     let start_instant = Instant::now();
+    // Deterministic lab mode: the side-channel and conflict rule, then every listener and
+    // dial-set address (main ran the same checks before creating any file).
+    parvault::config::lab_side_channel_decision(&opts.eff)
+        .map_err(|code| anyhow::anyhow!("{code}"))?;
+    parvault::config::lab_startup_decision(&opts.eff)
+        .map_err(|(code, detail)| anyhow::anyhow!("{code}: {detail}"))?;
+    let deterministic = opts.eff.deterministic();
+    let dial_set = Arc::new(opts.eff.dial_set());
+    info!(config_digest = %opts.config_digest, deterministic, "effective configuration");
     let node_identity = NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?;
     let keypair = node_identity.to_libp2p_keypair()?;
     let local_peer_id = keypair.public().to_peer_id();
@@ -93,7 +106,13 @@ pub(crate) async fn run_daemon(
         por_verifier.set_chunk_audit_host_cap(parvault::por::CHUNK_AUDITS_PER_MINUTE_ROUTER);
     }
 
-    let mut swarm = build_mesh_server_swarm(keypair, cfg.enable_quic, opts.lan_discovery_enabled)?;
+    server_events.set_dial_set(Arc::clone(&dial_set));
+    let mut swarm = parvault::network::build_mesh_server_swarm_gated(
+        keypair,
+        cfg.enable_quic,
+        opts.lan_discovery_enabled && !deterministic,
+        parvault::network::GateParams::for_set(Arc::clone(&dial_set)),
+    )?;
     let tcp_addr: Multiaddr = cfg.listen_tcp.parse()?;
     swarm.listen_on(tcp_addr.clone())?;
 
@@ -550,7 +569,7 @@ fn spawn_beacon(
         beacon_role,
         ..
     } = local;
-    if opts.lan_discovery_enabled {
+    if opts.lan_discovery_enabled && !opts.eff.deterministic() {
         let (used, max_b) = {
             let q = block_store.quota();
             let g = q.lock().expect("quota lock");
@@ -630,6 +649,7 @@ async fn spawn_status_server(
             hwm_kib: 0,
             uptime_secs: 0,
             lan_peers: initial_lan_peers,
+            config_digest: opts.config_digest.clone(),
         };
         snap.update_telemetry(start_instant);
         Arc::new(RwLock::new(snap))

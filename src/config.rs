@@ -153,8 +153,22 @@ pub struct Cli {
     )]
     pub trackers: Vec<String>,
 
+    /// Deterministic lab mode (`[lab] deterministic = true`, `docs/LAB_MODE.md`): fixed ports,
+    /// a fixed dial set, and every discovery side channel off. No environment variable sets it.
+    #[arg(long, global = true, default_value_t = false)]
+    pub lab_deterministic: bool,
+
     #[command(subcommand)]
     pub command: Commands,
+}
+
+/// `parvault config` subcommands.
+#[derive(Debug, Clone, Subcommand)]
+pub enum ConfigAction {
+    /// Print the effective configuration (`parvault.config-dump/1` JSON, secret-free) from the
+    /// global flags, the config file and the environment, then exit. Creates, opens or writes no
+    /// file but the config file it reads.
+    Dump,
 }
 
 #[derive(Debug, Subcommand)]
@@ -304,6 +318,11 @@ pub enum Commands {
         /// Bounded local LRU block cache capacity in MiB for the built-in (`=y`) VFS.
         #[arg(long, default_value_t = 64, value_name = "MIB")]
         vfs_cache_mib: u64,
+
+        /// Print the effective configuration of this command (`parvault.config-dump/1`) and exit
+        /// 0 without binding, creating, reading or writing any file but the config file.
+        #[arg(long, default_value_t = false)]
+        dump_config: bool,
     },
     /// Evict a bad actor or illegal content (0x00 zero-wipe + unlink + keyed HMAC ingress firewall, zero plaintext IPs on disk — ADR-25).
     Evict {
@@ -585,6 +604,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: crate::gateway::TokenAction,
     },
+    /// The effective configuration (`dump`; `docs/LAB_MODE.md`).
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Zero-copy Unix Domain Socket IPC gateway & 40-lane outbound mesh router (`serve`, `health`, `ipc-roundtrip`, `self-test`).
     Gateway {
         #[command(flatten)]
@@ -654,6 +678,11 @@ pub enum DaemonAction {
         /// Bounded local LRU block cache capacity in MiB for the built-in (`=y`) VFS.
         #[arg(long, default_value_t = 64, value_name = "MIB")]
         vfs_cache_mib: u64,
+
+        /// Print the effective configuration of this command (`parvault.config-dump/1`) and exit
+        /// 0 without binding, creating, reading or writing any file but the config file.
+        #[arg(long, default_value_t = false)]
+        dump_config: bool,
     },
 }
 
@@ -797,6 +826,20 @@ pub struct NodeConfig {
     /// `router-soc`). Separate from `por_timeout_ms`, the prover-side SLA.
     #[serde(default)]
     pub por_audit_rtt_ms: u64,
+    /// Deterministic lab mode (`[lab]`, `docs/LAB_MODE.md`).
+    #[serde(default)]
+    pub lab: LabConfig,
+}
+
+/// The `[lab]` table (`v0.5.4` NEW-5).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LabConfig {
+    /// Fixed ports, a fixed dial set, every discovery side channel off.
+    pub deterministic: bool,
+    /// The only relay source (from `v0.5.9`); part of the dial set. Required when deterministic
+    /// (it may be empty): `reject.lab_relays_missing`.
+    pub relays: Option<Vec<String>>,
 }
 
 fn default_por_audit_enabled() -> bool {
@@ -840,6 +883,7 @@ impl Default for NodeConfig {
             por_audit_enabled: true,
             por_audit_interval_secs: 0,
             por_audit_rtt_ms: 0,
+            lab: LabConfig::default(),
         }
     }
 }
@@ -1150,6 +1194,92 @@ impl NodeConfig {
         }
         Ok(())
     }
+}
+
+pub use crate::effective_config::{
+    lab_startup_decision, CommandScope, ConfigFileInput, EffectiveConfig, EnvSnapshot, Source,
+};
+
+/// Deterministic lab mode, the command and side-channel rule (`docs/LAB_MODE.md`): `discover`,
+/// `pair` and `join` are refused (`reject.lab_side_channel`), and so is any explicit setting
+/// (file, environment or flag) that turns a side channel on (`reject.lab_config_conflict`;
+/// `EffectiveConfig::lab_conflicts` names each). Defaults that would turn one on were already
+/// overridden by the resolver (source `lab`). Outside lab mode everything passes.
+pub fn lab_side_channel_decision(eff: &EffectiveConfig) -> Result<(), &'static str> {
+    if !eff.deterministic() {
+        return Ok(());
+    }
+    if eff.scope == CommandScope::Discovery {
+        return Err("reject.lab_side_channel");
+    }
+    if !eff.lab_conflicts().is_empty() {
+        return Err("reject.lab_config_conflict");
+    }
+    Ok(())
+}
+
+/// Deterministic lab mode, the listener rule: a bind is an IP literal (Q2) that is not
+/// unspecified, with a nonzero port. `bind` is a multiaddr (`/ip4/<ip>/tcp/<port>`,
+/// `/ip6/<ip>/udp/<port>/quic-v1`) or an `IP:port` socket address.
+pub fn lab_bind_decision(bind: &str) -> Result<(), &'static str> {
+    let b = bind.trim();
+    let (ip, port) = if b.starts_with('/') {
+        let maddr: libp2p::Multiaddr = b.parse().map_err(|_| "reject.lab_bind_not_ip_literal")?;
+        let mut ip = None;
+        let mut port = None;
+        for p in maddr.iter() {
+            match p {
+                libp2p::multiaddr::Protocol::Ip4(v4) => ip = Some(std::net::IpAddr::V4(v4)),
+                libp2p::multiaddr::Protocol::Ip6(v6) => ip = Some(std::net::IpAddr::V6(v6)),
+                libp2p::multiaddr::Protocol::Tcp(p) | libp2p::multiaddr::Protocol::Udp(p) => {
+                    port = Some(p)
+                }
+                _ => {}
+            }
+        }
+        match (ip, port) {
+            (Some(ip), Some(port)) => (ip, port),
+            _ => return Err("reject.lab_bind_not_ip_literal"),
+        }
+    } else {
+        let sa: std::net::SocketAddr = b.parse().map_err(|_| "reject.lab_bind_not_ip_literal")?;
+        (sa.ip(), sa.port())
+    };
+    if port == 0 {
+        return Err("reject.lab_ephemeral_port");
+    }
+    if ip.is_unspecified() {
+        return Err("reject.lab_unspecified_bind");
+    }
+    Ok(())
+}
+
+/// Deterministic lab mode, the address rule for every dial-set and relay entry: an IP-literal
+/// TCP or QUIC multiaddr ending in `/p2p/<id>`. A name (`/dns*`, or `host:port`) is refused
+/// (`reject.lab_dns_addr`), so no name is ever resolved; an address without a PeerId is
+/// `reject.lab_addr_without_peer_id`; any other shape is `reject.lab_dial_shape`.
+pub fn lab_addr_decision(addr: &str) -> Result<(), &'static str> {
+    use crate::lab_dial::AddrPart;
+    let a = addr.trim();
+    if !a.starts_with('/') {
+        // `host:port` socket form: an IP literal still lacks the PeerId; a name is a name.
+        let host = a.rsplit_once(':').map(|(h, _)| h).unwrap_or(a);
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        return if host.parse::<std::net::IpAddr>().is_ok() {
+            Err("reject.lab_addr_without_peer_id")
+        } else {
+            Err("reject.lab_dns_addr")
+        };
+    }
+    let maddr: libp2p::Multiaddr = a.parse().map_err(|_| "reject.lab_dial_shape")?;
+    let parts = crate::network::traversal_gate::multiaddr_parts(&maddr);
+    if parts.iter().any(|p| matches!(p, AddrPart::Dns)) {
+        return Err("reject.lab_dns_addr");
+    }
+    if !parts.iter().any(|p| matches!(p, AddrPart::P2p(_))) {
+        return Err("reject.lab_addr_without_peer_id");
+    }
+    crate::lab_dial::dial_addr_from_parts(&parts).map(|_| ())
 }
 
 /// B-52: how a `pinned_tracker_admins.json` read loads before a new pin is added. A missing file

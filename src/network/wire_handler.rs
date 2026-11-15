@@ -1552,6 +1552,16 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
             }
             if let Some(next_hop) = target_peer_addr {
                 if let Some(client) = block_store.mesh_client() {
+                    // Lab mode: a next hop a remote peer names is never dialled; the dial gate
+                    // is the backstop for any other remote-triggered dial (`docs/LAB_MODE.md`).
+                    if client.dial_set().is_fixed() {
+                        let code = "reject.lab_relay_forward";
+                        warn!(code, "refused an onion relay forward in lab mode");
+                        return MeshWireResponse::RelayPqOnionAck {
+                            delivered: false,
+                            error: Some(code.to_string()),
+                        };
+                    }
                     *deferred = Some(DeferredJob::Relay(Box::new(RelayForward {
                         client: client.clone(),
                         delay_ms: 0,

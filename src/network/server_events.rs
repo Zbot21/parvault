@@ -231,6 +231,9 @@ pub struct ServerSwarmEvents {
     /// Chunk-audit proofs in flight (B-59) and their cap.
     chunk_proves: usize,
     chunk_prove_cap: usize,
+    /// The lab dial gate (`docs/LAB_MODE.md`): an admitted peer's address enters Kademlia only
+    /// if the gate allows dialling it.
+    dial_set: std::sync::Arc<crate::lab_dial::DialSet>,
 }
 
 impl ServerSwarmEvents {
@@ -248,7 +251,13 @@ impl ServerSwarmEvents {
             syndications_per_peer: HashMap::new(),
             chunk_proves: 0,
             chunk_prove_cap: MAX_CHUNK_PROVES_IN_FLIGHT,
+            dial_set: std::sync::Arc::new(crate::lab_dial::DialSet::Open),
         }
+    }
+
+    /// Sets the lab dial set (`Open` by default).
+    pub fn set_dial_set(&mut self, set: std::sync::Arc<crate::lab_dial::DialSet>) {
+        self.dial_set = set;
     }
 
     /// Sets the chunk-audit prover's in-flight cap (`router-soc`:
@@ -487,7 +496,15 @@ impl ServerSwarmEvents {
                 if kad_routing_decision(admits_sender(&response)).is_ok() {
                     self.admitted_peers.insert(peer);
                     if let Some(addr) = remote_addr {
-                        swarm.behaviour_mut().kademlia.add_address(&peer, addr);
+                        if crate::network::traversal_gate::gate_addr_decision(
+                            &addr,
+                            Some(&peer),
+                            &self.dial_set,
+                        )
+                        .is_ok()
+                        {
+                            swarm.behaviour_mut().kademlia.add_address(&peer, addr);
+                        }
                     }
                 }
                 let _ = swarm

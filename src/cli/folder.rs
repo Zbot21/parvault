@@ -114,8 +114,8 @@ pub(crate) fn vault_keys(
 
 pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Result<()> {
     let CliEnv {
+        eff,
         cfg,
-        lan_port,
         public_mode,
         mesh_client,
         block_store,
@@ -234,12 +234,12 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                 // prints. Only the seed is contacted for syndication. `net_client` (default
                 // timeout) also carries the manifest and snapshot DHT puts to every mesh endpoint;
                 // only `syndication_client` waits LITE_SYNDICATION_TIMEOUT.
-                let net_client = MeshClient::new(
+                let net_client = super::mesh_client(
+                    &eff,
                     owner_identity.clone(),
                     mesh_client.all_network_endpoints(),
                     Some(seed_str.clone()),
-                )
-                .with_data_dir_discovery(cfg.data_dir.clone(), lan_port);
+                );
                 let syndication_client = lite_syndication_client(&net_client);
                 let store_with_net = block_store.clone().with_mesh_client(net_client.clone());
                 let mut receipt_count = 0usize;
@@ -406,12 +406,12 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                 let seed_str = lite_seed_dir
                     .as_ref()
                     .map(|d| d.to_string_lossy().to_string());
-                let net_client = MeshClient::new(
+                let net_client = super::mesh_client(
+                    &eff,
                     owner_identity.clone(),
                     mesh_client.all_network_endpoints(),
                     seed_str,
-                )
-                .with_data_dir_discovery(cfg.data_dir.clone(), lan_port);
+                );
                 let net_engine = FolderSyncEngine::new(
                     block_store.clone().with_mesh_client(net_client),
                     master_key.clone(),
@@ -462,12 +462,12 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                 let seed_str = lite_seed_dir
                     .as_ref()
                     .map(|d| d.to_string_lossy().to_string());
-                let net_client = MeshClient::new(
+                let net_client = super::mesh_client(
+                    &eff,
                     owner_identity.clone(),
                     mesh_client.all_network_endpoints(),
                     seed_str,
-                )
-                .with_data_dir_discovery(cfg.data_dir.clone(), lan_port);
+                );
                 let _ =
                     net_client.put_dht_envelope(DhtWireEnvelope::VaultCatalog(envelope.clone()));
             }
@@ -482,12 +482,12 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                 let seed_str = lite_seed_dir
                     .as_ref()
                     .map(|d| d.to_string_lossy().to_string());
-                let net_client = MeshClient::new(
+                let net_client = super::mesh_client(
+                    &eff,
                     owner_identity.clone(),
                     mesh_client.all_network_endpoints(),
                     seed_str,
-                )
-                .with_data_dir_discovery(cfg.data_dir.clone(), lan_port);
+                );
                 let _ =
                     net_client.put_dht_envelope(DhtWireEnvelope::VaultCatalog(envelope.clone()));
             }

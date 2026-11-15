@@ -7,6 +7,7 @@ pub mod placement;
 pub mod rate_limit;
 pub mod server_events;
 pub mod transport;
+pub mod traversal_gate;
 pub mod wan_rendezvous;
 pub mod wire_handler;
 pub mod wot;
@@ -30,7 +31,10 @@ pub use discovery::{
 };
 pub use placement::{PeerTopologyMetrics, PlacementEngine, ShardPlacementPlan};
 pub use rate_limit::TokenBucketRateLimiter;
-pub use transport::{build_mesh_client_swarm, build_mesh_server_swarm, build_mesh_swarm};
+pub use transport::{
+    build_mesh_client_swarm, build_mesh_client_swarm_gated, build_mesh_server_swarm,
+    build_mesh_server_swarm_gated, build_mesh_swarm, GateParams,
+};
 pub use wan_rendezvous::*;
 pub use wot::{
     DelegationChain, InvitationHop, PublicCommonsTicket, SlashingEvidence, SlashingReason,

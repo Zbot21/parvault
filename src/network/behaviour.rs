@@ -525,6 +525,9 @@ pub enum MeshWireResponse {
 /// and Bincode Request-Response streams (`network::behaviour`).
 #[derive(NetworkBehaviour)]
 pub struct MeshNetworkBehaviour {
+    /// The lab dial gate (`v0.5.4`, `docs/LAB_MODE.md`). It must stay the first field: the
+    /// derive calls fields in order, so it refuses a dial before any other field sees it.
+    pub gate: crate::network::traversal_gate::TraversalGate,
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
     pub gossipsub: gossipsub::Behaviour,
     pub mdns: libp2p::swarm::behaviour::toggle::Toggle<mdns::tokio::Behaviour>,
