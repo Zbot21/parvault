@@ -179,7 +179,9 @@ fn parvault() -> Command {
     ] {
         cmd.env_remove(v);
     }
-    cmd.env("RUST_LOG", "info").env("NO_COLOR", "1");
+    cmd.env("RUST_LOG", "info")
+        .env("NO_COLOR", "1")
+        .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED));
     cmd
 }
 
@@ -681,9 +683,7 @@ fn relay_daemon(lab: bool, label: &str) -> (Node, String) {
     let (root, dir) = prepare(label);
     let listen = lab_listen();
     let mut cmd = parvault();
-    cmd.env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
-        .arg("--data-dir")
-        .arg(&dir);
+    cmd.arg("--data-dir").arg(&dir);
     if lab {
         let toml = lab_toml(root.path(), "");
         cmd.arg("--config").arg(toml);
@@ -774,6 +774,7 @@ fn folder_command_in_lab_mode_dials_no_state_file_peer() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(!text.contains("not in a ring"), "{text}");
     std::thread::sleep(Duration::from_secs(1));
     assert_eq!(x.accepts(), 0, "dialled a known_peers.json entry:\n{text}");
     assert_eq!(
