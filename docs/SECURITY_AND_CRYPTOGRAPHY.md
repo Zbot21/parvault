@@ -124,7 +124,7 @@ To protect long-lived backup shards and P2P envelopes against **Harvest-Now, Dec
 
 ### Correlated Regional ISP Outage Protection (`CorrelatedOutageController`)
 - Because **70%** of a stripe's shards are placed intra-ASN ($\le 5\text{ ms}$) and **30%** cross-region (`ADR-06`), combined with a strict $\le 4$ shards per `/24` fault-domain cap, a single `/24` router failure never exceeds the parity budget $M = N - K$.
-- No weather quorum gates a correlated outage in `v0.5.0`: an earlier `verify_weather_quorum` had no caller and was removed (finding F-15). SLA grace during a regional outage is not implemented.
+- No weather quorum gates a correlated outage in `v0.5.2`: an earlier `verify_weather_quorum` had no caller and was removed (finding F-15). SLA grace during a regional outage is not implemented.
 
 ---
 
