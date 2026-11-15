@@ -160,6 +160,11 @@ docker build -t "$IMG_ACCEPT" "$BUILD_CTX"
 # host namespace, and the exact devices and network.
 #   FUSE_WAIVED: the stage 12c FUSE harness (vfs_mp4_seek_gate plus parvault-fuse, not a shipped
 #     image) runs as uid 0, adds only SYS_ADMIN, has no-new-privileges, and gets only /dev/fuse.
+#     Why root: the image does ship a setuid-root /usr/bin/fusermount3 (`find / -perm -4000` in it
+#     also lists chfn chsh gpasswd mount newgrp passwd su umount), but a setuid exec cannot gain
+#     CAP_SYS_ADMIN outside the bounding set (Docker's default has none), and no-new-privileges
+#     disables setuid. mount(2) needs SYS_ADMIN either way, so root plus only SYS_ADMIN is the
+#     smallest grant.
 #   NETEM_TC_WAIVED: the stage 12c one-shot tc sidecar runs as uid 0 with CapDrop ALL plus only
 #     NET_ADMIN, in the netem test container's network namespace, and nothing else.
 FUSE_WAIVED="parvault-vfs-fuse-${RUN_ID}"
