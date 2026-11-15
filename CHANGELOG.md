@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+- **CI runs on every PR and pins its tools (B-67).** `pull_request` no longer filters on `main`, so stacked PRs get CI. Kani is pinned to `0.68.0`. `tla2tools.jar` (v1.8.0) is fetched into `$RUNNER_TEMP`, checked against a pinned sha256 and exported as `TLA2TOOLS_JAR`.
+
 ### Fixed
 - **A voucher whose nullifier cannot be saved is refused (F-55, B-42).** `VoucherNullifierLedger` used to accept the voucher and drop a failed write, so after a restart the same voucher could be redeemed again. It now removes the nullifier and refuses with `reject.voucher_nullifier_not_persisted`.
 - **Quota state and tracker pins fail closed on a failed write (B-52).** After a failed `quota_state.bin` write the node refuses new shards (`reject.quota_state_not_persisted`) until a write succeeds. `persist_pinned_tracker_admin` returns an error instead of dropping a failed write, and no longer replaces an unreadable pin file with a new list.
