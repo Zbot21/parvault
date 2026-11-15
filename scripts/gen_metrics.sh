@@ -141,8 +141,10 @@ for compose in deploy/synology/compose.yaml deploy/synology/join.compose.yaml de
   [[ "$(grep -c '^ *image:' "$compose")" == "$(grep -c '^ *pull_policy: never' "$compose")" ]] \
     || fail "$compose: every image: needs pull_policy: never"
 done
-syn_tag="$(sed -n 's/^IMG=\(parvault:[^ ]*\) .*$/\1/p' docs/SYNOLOGY.md)"
-[[ "$syn_tag" == "parvault:$version-dev" ]] || fail "docs/SYNOLOGY.md IMG is '$syn_tag', Cargo.toml says parvault:$version-dev"
+for doc in docs/SYNOLOGY.md docs/DOCKER.md; do
+  doc_tag="$(sed -n 's/^IMG=\(parvault:[^ ]*\) .*$/\1/p' "$doc")"
+  [[ "$doc_tag" == "parvault:$version-dev" ]] || fail "$doc IMG is '$doc_tag', Cargo.toml says parvault:$version-dev"
+done
 lxc_version="$(sed -n 's/^  "version": "\(.*\)",$/\1/p' deploy/prplos-lxc-manifest.json)"
 [[ "$lxc_version" == "$version" ]] || fail "deploy/prplos-lxc-manifest.json version is '$lxc_version', Cargo.toml says $version"
 

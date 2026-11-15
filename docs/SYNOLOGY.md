@@ -2,7 +2,7 @@
 
 Every `v0.5.x` image is a **dev build** (B-131, L-113): reproducible, and signed with the ParVault dev/test key, not a release key. The DS923+ (AMD Ryzen R1600) is x86_64, so use `parvault-image-amd64-dev.tar`. `parvault-image-arm64-dev.tar` is for ARM NAS models and has not been tested on one.
 
-The image has no OS and no shell: just the five static binaries, user `65532:65532`, data in `/var/lib/parvault`, and a healthcheck through `parvault gateway health`. Everything below is done in the DSM web UI (File Station and Container Manager), so SSH can stay off. The SSH commands are in the [appendix](#appendix-the-same-over-ssh).
+The image has no OS and no shell: just the five static binaries, user `65532:65532`, data in `/var/lib/parvault`, and a healthcheck through `parvault gateway health`. Everything below is done in the DSM web UI (File Station and Container Manager), so SSH can stay off. The SSH commands are in the [appendix](#appendix-the-same-over-ssh). For any other Docker host, or a NAS used over SSH, see [DOCKER.md](DOCKER.md).
 
 Three compose files ship, one per role:
 
@@ -71,7 +71,7 @@ Once the node has joined, you can delete its `invite-*` service on the first nod
 
 **Why the invite waits for a healthy daemon.** An invite reads the ring's genesis, which `init` writes on the very first start. Started beside `init` on a fresh volume, an invite can run first and fail with `this node does not hold a ring genesis`. So the example invite has `depends_on: parvault: condition: service_healthy`: the daemon only runs, and so only turns healthy, once the ring exists. It does not use `init` with `service_completed_successfully`, because `init` exits 1 on every later start and would block those starts. Both the race and the fix are covered by the test script.
 
-**A node on another Docker host** (a Linux server, a desktop with Docker): use `deploy/docker/compose.yaml` with `docker compose up -d`, in the same three steps. Read the key with `docker compose logs identity`. Set `--peers` to the first node's LAN address and port (`<NAS IP>:4001`); LAN discovery does not reach into Docker Desktop or WSL2. Its example `--listen` port is TCP 4011, for a host where 4001 is taken. It uses the image's own healthcheck. Do not add `--health-cmd` or a shell-form `healthcheck:`: the image has no shell, so those always fail.
+**A node on another Docker host** (a Linux server, a desktop with Docker): follow [DOCKER.md](DOCKER.md), or use `deploy/docker/compose.yaml` with `docker compose up -d` in the same three steps. Read the key with `docker compose logs identity`. Set `--peers` to the first node's LAN address and port (`<NAS IP>:4001`); LAN discovery does not reach into Docker Desktop or WSL2. Its example `--listen` port is TCP 4011, for a host where 4001 is taken. It uses the image's own healthcheck. Do not add `--health-cmd` or a shell-form `healthcheck:`: the image has no shell, so those always fail.
 
 ## 5. What you will see in Container Manager
 
@@ -104,7 +104,7 @@ The volume is kept. `init` or `install-chain` runs again and exits as on any lat
 
 ## Appendix: the same over SSH
 
-Optional. Over SSH on the NAS, the first run can be done with `docker run` on the same volume (it starts owned by `65532:65532`). After that, use `deploy/synology/compose.yaml` on that node, whether it started the ring or joined one: its `init` exits 1 (`already in the ring`) and the daemon starts. Do not use `join.compose.yaml` there: its placeholder token would hold the daemon back.
+Optional; [DOCKER.md](DOCKER.md) is the full shell guide. Over SSH on the NAS, the first run can be done with `docker run` on the same volume (it starts owned by `65532:65532`). After that, use `deploy/synology/compose.yaml` on that node, whether it started the ring or joined one: its `init` exits 1 (`already in the ring`) and the daemon starts. Do not use `join.compose.yaml` there: its placeholder token would hold the daemon back.
 
 ```sh
 IMG=parvault:0.5.3-dev   # the tag you imported
