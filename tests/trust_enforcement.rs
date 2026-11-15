@@ -1919,6 +1919,48 @@ fn b52_unreadable_known_peers_join_refused() {
     gate_ran("trust_enforcement::b52_unreadable_known_peers_join_refused");
 }
 
+/// B-52 (QA, M1): the `try_load` guard on its own. No `save` runs here, so the `save` guard cannot
+/// stand in for it: a writer that loads a damaged `known_peers.json` must get the reason code
+/// before it holds any store to change, and the file must be as it was. Real files, no mocks.
+#[test]
+fn b52_try_load_refuses_damaged_known_peers_without_save() {
+    use parvault::network::KnownPeersStore;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let path = dir.join(KnownPeersStore::FILE_NAME);
+    for bytes in [
+        &b"{\"peers\": {\"truncat"[..],
+        &[0xFF, 0xFE, 0x00, 0x01][..],
+    ] {
+        std::fs::write(&path, bytes).unwrap();
+        let err = KnownPeersStore::try_load(dir).expect_err("damaged file must not load as empty");
+        assert!(
+            err.to_string().starts_with("reject.known_peers_corrupt"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let err = KnownPeersStore::try_load(dir).expect_err("unreadable file must not load as empty");
+    assert!(
+        err.to_string().starts_with("reject.known_peers_unreadable"),
+        "{err}"
+    );
+    assert!(path.is_dir());
+    std::fs::remove_dir(&path).unwrap();
+    // Accept: a missing file is an empty store, and a saved store loads back.
+    assert_eq!(
+        KnownPeersStore::try_load(dir).unwrap(),
+        KnownPeersStore::default()
+    );
+    let mut pinned = KnownPeersStore::default();
+    pinned.pin_tracker_admin_pubkey("tracker.example:4001", [0xA7; 32]);
+    pinned.save(dir).unwrap();
+    assert_eq!(KnownPeersStore::try_load(dir).unwrap(), pinned);
+    gate_ran("trust_enforcement::b52_try_load_refuses_damaged_known_peers_without_save");
+}
+
 /// Runs `parvault --public status` from a data dir whose `known_peers.json` holds one tracker-admin
 /// pin (so the run persists it to `pinned_tracker_admins.json`) and whose
 /// `pinned_tracker_admins.json` is `pins`.
