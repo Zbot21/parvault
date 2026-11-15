@@ -3,7 +3,7 @@
   "comment": "unverified: not yet tested on a real prplOS image (B-133). prplos-lxc-ctl and this manifest schema are not confirmed to exist; prplOS ships LCM/uxc.",
   "container_name": "parvault-daemon",
   "vendor": "Neighborhood Cloud / Project ParVault",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "license": "AGPL-3.0-only",
   "target_platforms": [
     "aarch64-unknown-linux-musl",
