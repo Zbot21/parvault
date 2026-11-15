@@ -68,6 +68,7 @@ CONTAINERS=(
     "parvault-outsider-${RUN_ID}"
     "parvault-status-sidecar-${RUN_ID}"
     "parvault-vfs-netem-${RUN_ID}"
+    "parvault-vfs-netem-tc-${RUN_ID}"
     "parvault-vfs-fuse-${RUN_ID}"
 )
 for i in $(seq 1 11); do
@@ -980,19 +981,24 @@ docker run --rm --label "$RUN_LABEL" -e GATES_REQUIRE_REAL=1 "$IMG_VFS" webdav_2
 # logged, not asserted: under latency an abandoned `Range: bytes=N-` can hydrate up to about one
 # TCP window of extra blocks (B-23, v0.6.0).
 # Bounded (B-56): a hang (seen once as ~590 s, a lost shutdown wake SYN) fails the gate loudly.
-VFS_NETEM="parvault-vfs-netem-${RUN_ID}"
-# B-106: the test container runs as uid 65532 with no capability. A one-shot sidecar joins its
-# network namespace with NET_ADMIN and adds netem on lo; the test waits for that, then runs.
-docker rm -f "$VFS_NETEM" >/dev/null 2>&1 || true
+VFS_NETEM="$NETEM_TC_TARGET"
+# B-106: the test container runs as uid 65532 with no capability. A one-shot root sidecar,
+# NETEM_TC_WAIVED (waived by name in assert_nonroot), joins its network namespace with only
+# NET_ADMIN and adds netem on lo; the test waits for that, then runs.
+docker rm -f "$VFS_NETEM" "$NETEM_TC_WAIVED" >/dev/null 2>&1 || true
 docker run -d --name "$VFS_NETEM" --label "$RUN_LABEL" "${CONFINE[@]}" -e GATES_REQUIRE_REAL=1 -e PARVAULT_VFS_TTFB_BUDGET_MS=100 \
     -e PARVAULT_VFS_GATE_LATENCY=1 \
     --entrypoint sh "$IMG_VFS" -c \
     'i=0; while [ ! -e /tmp/netem.ready ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done
      [ -e /tmp/netem.ready ] || { echo "netem was never applied"; exit 97; }
      exec /usr/local/bin/vfs_mp4_seek_gate --test-threads=1 --nocapture webdav_206_mp4_probe_and_random_seek' >/dev/null
-docker run --rm --label "$RUN_LABEL" --network "container:$VFS_NETEM" --user 0:0 --cap-add NET_ADMIN --entrypoint tc \
-    "$IMG_VFS" qdisc add dev lo root netem delay 15ms loss 2% \
+docker create --label "$RUN_LABEL" --name "$NETEM_TC_WAIVED" --network "container:$VFS_NETEM" --user 0:0 \
+    "${CONFINE[@]}" --cap-add NET_ADMIN --entrypoint tc \
+    "$IMG_VFS" qdisc add dev lo root netem delay 15ms loss 2% >/dev/null
+assert_nonroot "$NETEM_TC_WAIVED"
+docker start -a "$NETEM_TC_WAIVED" \
     || { echo "ERROR: stage 12c: the netem sidecar could not add netem on lo"; exit 1; }
+docker rm -f "$NETEM_TC_WAIVED" >/dev/null
 VFS_NETEM_QDISC="$(docker exec "$VFS_NETEM" tc qdisc show dev lo)"
 grep -q "netem" <<<"$VFS_NETEM_QDISC" || { echo "ERROR: stage 12c: no netem qdisc on lo: $VFS_NETEM_QDISC"; exit 1; }
 VFS_NETEM_CAPS="$(docker inspect -f '{{json .HostConfig.CapAdd}}' "$VFS_NETEM")"
@@ -1029,6 +1035,6 @@ echo " 48 MiB Cgroup SoC Gate : PASS (5 x 1 MiB stripes store+restore, 0 OOM kil
 echo " Status page (item 3)   : PASS (router-soc: no token 401, read-only token 200)"
 echo " parvault-status sidecar: PASS (200 / 401 / DNS Host 403 / ?token= 401; no files; ${SIDE_BIN_BYTES} B)"
 echo " Mounted MP4 (item 5)   : FUSE ${VFS_FUSE_RESULT}; WebDAV 206 PASS (plain + netem 15ms/2%, < 100 ms)"
-echo " Non-root (B-106)       : PASS (uid 65532 in every daemon container; netem from a sidecar, no NET_ADMIN; waived: ${FUSE_WAIVED}, FUSE harness)"
+echo " Non-root (B-106)       : PASS (uid/gid 65532, CapEff empty, no-new-privileges in every daemon container; waived: ${FUSE_WAIVED} (FUSE harness, SYS_ADMIN), ${NETEM_TC_WAIVED} (tc sidecar, NET_ADMIN)"
 echo "================================================================================"
 echo "=== ACCEPTANCE GATE PASSED ==="
