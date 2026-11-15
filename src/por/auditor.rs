@@ -427,20 +427,21 @@ pub fn run_audit_job(ctx: &AuditJobCtx) -> AuditJobOutcome {
     st.last_run_unix_ms = now;
     st.recent.push(now);
     st.note_host(&target.host_addr, now);
-    // The ledger is credited after the audit state is saved, so a reader that sees the outcome
-    // in the ledger also finds it (and a degraded mark) in `por_audit_state.json`.
-    let mut ledger_outcome = None;
     match credit {
         Ok(AuditCredit::Pass) => {
             st.passed = st.passed.saturating_add(1);
-            ledger_outcome = Some(true);
+            if let Ok(mut q) = ctx.block_store.quota().lock() {
+                q.record_por_outcome(&prover, true);
+            }
         }
         Ok(AuditCredit::Fail) => {
             st.failed = st.failed.saturating_add(1);
             if st.degraded.len() < MAX_AUDIT_STATE_ENTRIES {
                 st.degraded.insert(file_key);
             }
-            ledger_outcome = Some(false);
+            if let Ok(mut q) = ctx.block_store.quota().lock() {
+                q.record_por_outcome(&prover, false);
+            }
         }
         Ok(AuditCredit::Unanswered) => {
             st.unanswered = st.unanswered.saturating_add(1);
@@ -456,12 +457,6 @@ pub fn run_audit_job(ctx: &AuditJobCtx) -> AuditJobOutcome {
         Err(_) => st.self_refused = st.self_refused.saturating_add(1),
     }
     st.save(ctx.data_dir.as_deref());
-    drop(st);
-    if let Some(passed) = ledger_outcome {
-        if let Ok(mut q) = ctx.block_store.quota().lock() {
-            q.record_por_outcome(&prover, passed);
-        }
-    }
     AuditJobOutcome::Judged { prover, verdict }
 }
 
