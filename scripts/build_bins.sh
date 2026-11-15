@@ -30,7 +30,7 @@ TDIR=${CARGO_TARGET_DIR:-target}
 for bin in "${BINS[@]}"; do
   feats=$(features_for "$bin")
   # shellcheck disable=SC2086
-  cargo build --profile "$PROFILE" ${TARGET:+--target "$TARGET"} $feats --bin "$bin"
+  cargo build --locked --profile "$PROFILE" ${TARGET:+--target "$TARGET"} $feats --bin "$bin"
   dir="$TDIR/${TARGET:+$TARGET/}$( [[ $PROFILE == dev ]] && echo debug || echo "$PROFILE")"
   cp "$dir/$bin" "$OUT/$bin${TARGET:+-$TARGET}"
   echo "built $OUT/$bin${TARGET:+-$TARGET} ($feats)"

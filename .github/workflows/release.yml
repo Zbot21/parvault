@@ -22,7 +22,7 @@ jobs:
             linker: aarch64-linux-gnu-gcc
             strip: aarch64-linux-gnu-strip
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Rust toolchain from rust-toolchain.toml (L-17)
         run: rustup toolchain install && rustc -V
       - name: Install musl cross-compilation toolchain
@@ -58,7 +58,7 @@ jobs:
           bash scripts/check_scalar_erasure_coding.sh release-dist/*   # L-102
           echo "### Binary sizes for ${{ matrix.target }} (--profile soc, stripped static musl):"
           ls -lh release-dist/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: binaries-${{ matrix.target }}
           path: release-dist/*
@@ -68,8 +68,8 @@ jobs:
     needs: build-static-musl
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
           merge-multiple: true
@@ -100,7 +100,7 @@ jobs:
             parvault-router-soc-bundle.tar.gz install.sh > SHA256SUMS
           cat SHA256SUMS
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           # Every ParVault release is a pre-release until the owner says otherwise (2026-11-11):
           # never "Latest".

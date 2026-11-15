@@ -20,8 +20,8 @@ COPY src ./src
 ENV RUST_MIN_STACK=33554432
 
 # Same profile as .github/workflows/release.yml (--profile soc).
-RUN cargo build --profile soc --target ${TARGET_ARCH} --bin parvault \
-    && cargo build --profile soc --target ${TARGET_ARCH} --bin parvault-seed \
+RUN cargo build --locked --profile soc --target ${TARGET_ARCH} --bin parvault \
+    && cargo build --locked --profile soc --target ${TARGET_ARCH} --bin parvault-seed \
     && cp target/${TARGET_ARCH}/soc/parvault /build/parvault-static \
     && cp target/${TARGET_ARCH}/soc/parvault-seed /build/parvault-seed-static \
     && strip /build/parvault-static /build/parvault-seed-static

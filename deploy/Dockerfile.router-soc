@@ -20,8 +20,8 @@ COPY src ./src
 ENV RUST_MIN_STACK=33554432
 
 # Build with --profile soc (opt-level="z", lto="fat") for maximum size reduction
-RUN cargo build --profile soc --target ${TARGET_ARCH} --bin parvault \
-    && cargo build --profile soc --target ${TARGET_ARCH} --bin parvault-seed \
+RUN cargo build --locked --profile soc --target ${TARGET_ARCH} --bin parvault \
+    && cargo build --locked --profile soc --target ${TARGET_ARCH} --bin parvault-seed \
     && cp target/${TARGET_ARCH}/soc/parvault /build/parvault \
     && cp target/${TARGET_ARCH}/soc/parvault-seed /build/parvault-seed \
     && strip --strip-all /build/parvault /build/parvault-seed
