@@ -1528,9 +1528,28 @@ fn proof_council_reroot_needs_quorum_and_new_root() {
     );
 }
 
-/// A symbolic set of at most two 32-byte keys.
+/// One 32-byte key from a pool of three: `A`, `A` with only its last byte changed, and `B`.
+/// Fully symbolic keys made CBMC blow up (80 GB on the superset harness); the pool keeps the
+/// cases that matter (equal, a one-byte near miss that only an all-32-byte compare tells
+/// apart, and unrelated) with constant bytes.
+fn any_pool_key() -> [u8; 32] {
+    const A: [u8; 32] = [0xA5; 32];
+    const A_NEAR: [u8; 32] = {
+        let mut k = [0xA5; 32];
+        k[31] = 0x5A;
+        k
+    };
+    const B: [u8; 32] = [0x3C; 32];
+    match kani::any::<u8>() % 3 {
+        0 => A,
+        1 => A_NEAR,
+        _ => B,
+    }
+}
+
+/// A set of at most two keys from [`any_pool_key`].
 fn any_keys_upto2() -> ([[u8; 32]; 2], usize) {
-    let keys: [[u8; 32]; 2] = [kani::any(), kani::any()];
+    let keys: [[u8; 32]; 2] = [any_pool_key(), any_pool_key()];
     let n: usize = kani::any();
     kani::assume(n <= 2);
     (keys, n)
@@ -1554,10 +1573,10 @@ fn any_device_id() -> Option<&'static str> {
 fn proof_por_storer_decision() {
     use crate::por::{por_storer_decision, GrantStorers, PorStorerFacts};
     let (witnesses, n) = any_keys_upto2();
-    let owner: [u8; 32] = kani::any();
+    let owner = any_pool_key();
     let has_grant: bool = kani::any();
     let has_key: bool = kani::any();
-    let key: [u8; 32] = kani::any();
+    let key = any_pool_key();
     let f = PorStorerFacts {
         sender_device_id: any_device_id(),
         sender_key: has_key.then_some(key),
