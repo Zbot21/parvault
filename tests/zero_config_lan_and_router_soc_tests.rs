@@ -1216,10 +1216,15 @@ fn test_5_zero_ip_online_wan_rendezvous_stun_reflection_and_ddns_ip_rotation() {
         alice_restart.expect("Alice restart kept binding an already-used port");
     guards.push(alice_child_2);
 
+    // Bob's data dir pins Alice from the `join --wan` above: DDNS heals only pinned peers (B-91).
     let bob_client = MeshClient::new(
         NodeIdentity::load_or_generate_in_dir(&bob_dir).unwrap(),
         vec![],
         Some(seed_maddr.clone()),
+    )
+    .with_data_dir_discovery(
+        bob_dir.clone(),
+        parvault::network::DEFAULT_LAN_DISCOVERY_PORT,
     );
     let alice_client = MeshClient::new(alice_id.clone(), vec![], Some(seed_maddr.clone()));
     let ddns_secret = "shared-coop-ring-ddns-secret-v1";

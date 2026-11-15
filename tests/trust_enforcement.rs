@@ -19,10 +19,11 @@ use parvault::crypto::{
 };
 use parvault::network::admission::AdmissionSource;
 use parvault::network::{
-    build_mesh_client_swarm, derive_4word_pairing_sas, derive_slot_key_from_code,
-    node_identity_libp2p_peer_id, seal_wan_peer_card, DelegationChain, DhtWireEnvelope,
-    InvitationHop, MeshClient, MeshNetworkBehaviour, MeshWireRequest, MeshWireResponse,
-    PublicCommonsTicket, SlashingEvidence, SlashingReason, WanPeerCard, DEFAULT_LAN_PAIRING_NONCE,
+    build_mesh_client_swarm, derive_4word_pairing_sas, derive_peer_ddns_slot_key,
+    derive_slot_key_from_code, node_identity_libp2p_peer_id, seal_ddns_heartbeat,
+    seal_wan_peer_card, DelegationChain, DhtWireEnvelope, InvitationHop, KnownPeersStore,
+    MeshClient, MeshNetworkBehaviour, MeshWireRequest, MeshWireResponse, PublicCommonsTicket,
+    SlashingEvidence, SlashingReason, WanPeerCard, DEFAULT_LAN_PAIRING_NONCE,
     DEFAULT_PUBLIC_WOT_POW_BITS,
 };
 use parvault::por::{RepairGrant, WitnessFailureReceipt};
@@ -1813,6 +1814,120 @@ fn b45_wan_card_of_other_identity_refused() {
         "stdout:\n{stdout}\nstderr:\n{stderr}"
     );
     gate_ran("trust_enforcement::b45_wan_card_of_other_identity_refused");
+}
+
+// --- B-91: WAN DDNS cards heal only pinned peers -------------------------------------------------------
+
+/// Registers on `anchor` a DDNS heartbeat signed by `signer` under `fingerprint`, pointing at `addr`.
+fn b91_register(anchor: &Node, signer: &NodeIdentity, fingerprint: &str, addr: &str) {
+    let card = WanPeerCard::new(
+        signer,
+        "b91-peer",
+        "daemon",
+        vec![addr.to_string()],
+        None,
+        None,
+        3600,
+        now_ms(),
+    )
+    .unwrap();
+    let resp = send(
+        signer,
+        anchor,
+        MeshWireRequest::RegisterWanRendezvous {
+            slot_key: derive_peer_ddns_slot_key(fingerprint),
+            entry: seal_ddns_heartbeat(fingerprint, &card, signer).unwrap(),
+        },
+    );
+    assert!(
+        matches!(
+            resp,
+            MeshWireResponse::RegisterWanRendezvousAck { stored: true, .. }
+        ),
+        "{resp:?}"
+    );
+}
+
+/// Sets up a discoverer and a peer, registers the peer's heartbeat under the discoverer's own PQ
+/// fingerprint (a public value, so anyone can), optionally pins the peer at an old address first,
+/// then runs `parvault discover --wan`. Returns the peer's PeerId, the new address, the output and
+/// the discoverer's `known_peers.json`.
+fn b91_discover(label: &str, pre_pin: bool) -> (String, String, std::process::Output, String) {
+    let anchor = spawn_daemon(&format!("{label}-anchor"));
+    let (_peer_root, peer_dir, _, _) = prepare(&format!("{label}-peer"));
+    let (peer, peer_pid, _) = b45_identity(&peer_dir);
+    let (_root, dir, reg, _log) = prepare(&format!("{label}-discoverer"));
+    let (_, _, fp) = b45_identity(&dir);
+    if pre_pin {
+        let mut store = KnownPeersStore::load(&dir);
+        store.upsert_pinned_multiaddr(
+            &peer_pid,
+            &format!("/ip4/198.51.100.91/tcp/4001/p2p/{peer_pid}"),
+            Some("b91-peer"),
+            Some("daemon"),
+        );
+        store.save(&dir).unwrap();
+    }
+    let new_addr = format!("/ip4/203.0.113.91/tcp/4001/p2p/{peer_pid}");
+    b91_register(&anchor, &peer, &fp, &new_addr);
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .env("RUST_LOG", "warn")
+        .env("NO_COLOR", "1")
+        .arg("--data-dir")
+        .arg(&dir)
+        .args(["--no-lan-discovery", "--seed-addr", &anchor.addr])
+        .args(["discover", "--wan", "--json", "--timeout-ms", "100"])
+        .output()
+        .expect("run parvault discover --wan");
+    let known = std::fs::read_to_string(dir.join("known_peers.json")).unwrap_or_default();
+    (peer_pid, new_addr, out, known)
+}
+
+/// B-91 accept: a heartbeat of a peer already pinned heals its address in `known_peers.json`.
+#[test]
+fn b91_ddns_card_of_pinned_peer_heals() {
+    let (peer_pid, new_addr, out, known) = b91_discover("b91-a", true);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr:\n{stderr}");
+    let store: KnownPeersStore = serde_json::from_str(&known).unwrap();
+    assert_eq!(
+        store.multiaddr_for_peer_id(&peer_pid),
+        Some(new_addr.as_str()),
+        "known_peers.json:\n{known}\nstderr:\n{stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stderr.contains("reject.wan_ddns_peer_unknown")
+            && !stdout.contains("reject.wan_ddns_peer_unknown"),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    gate_ran("trust_enforcement::b91_ddns_card_of_pinned_peer_heals");
+}
+
+/// B-91 reject: the same heartbeat from a peer this node never pinned is refused; nothing is
+/// pinned and `discover` does not list it.
+#[test]
+fn b91_ddns_card_of_unknown_peer_refused() {
+    let (peer_pid, _new_addr, out, known) = b91_discover("b91-r", false);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr:\n{stderr}");
+    assert!(!known.contains(&peer_pid), "stranger pinned:\n{known}");
+    // Log lines go to stdout too; only the refusal line may name the stranger.
+    assert!(
+        stdout
+            .lines()
+            .filter(|l| l.contains(&peer_pid))
+            .all(|l| l.contains("reject.wan_ddns_peer_unknown")),
+        "stranger listed:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("reject.wan_ddns_peer_unknown")
+            || stdout.contains("reject.wan_ddns_peer_unknown"),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    gate_ran("trust_enforcement::b91_ddns_card_of_unknown_peer_refused");
 }
 
 // --- F-25: syndication cert not bound to the sender; self-signed DHT records from strangers -------------

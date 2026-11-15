@@ -95,6 +95,8 @@ pub(crate) async fn discover(env: CliEnv, command: Commands) -> anyhow::Result<(
             .map(|kp| kp.public_key().fingerprint_hex());
         for anchor in &wan_seeds {
             if let Some(ref fp) = pq_fp {
+                // B-91: the lookup returns only cards that heal an already pinned peer
+                // (`wan_ddns_card_decision`); a stranger's heartbeat is refused there.
                 if let Ok(cards) = mesh_client.lookup_wan_ddns_cards(anchor, fp) {
                     for card in cards {
                         if card.libp2p_peer_id == local_pid
@@ -102,12 +104,7 @@ pub(crate) async fn discover(env: CliEnv, command: Commands) -> anyhow::Result<(
                         {
                             continue;
                         }
-                        if let Some(raw_maddr) = card.wan_multiaddrs.first() {
-                            let pinned = if raw_maddr.contains("/p2p/") {
-                                raw_maddr.clone()
-                            } else {
-                                format!("{raw_maddr}/p2p/{}", card.libp2p_peer_id)
-                            };
+                        if let Some(pinned) = card.pinned_multiaddr() {
                             known_store.upsert_pinned_multiaddr(
                                 &card.libp2p_peer_id,
                                 &pinned,

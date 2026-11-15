@@ -1362,13 +1362,37 @@ pub fn wan_card_pairing_decision(
     pinned_multiaddr: &str,
     code: &str,
 ) -> Result<(), &'static str> {
+    wan_card_addr_decision(card_peer_id, pinned_multiaddr)?;
+    if !pairing_code_matches(card_peer_id, owner_pq_fingerprint, None, code) {
+        return Err("reject.wan_card_code_mismatch");
+    }
+    Ok(())
+}
+
+/// B-91: a DDNS heartbeat may only heal the address of a peer this node already pinned. The DDNS
+/// slot key and wrap key derive from a public PQ fingerprint (or a shared secret), and nothing
+/// binds a card to the owner, so any key holder can plant a self-signed card there. The card is
+/// signed by the key behind its own `PeerId` (`WanPeerCard::verify_signature`), so requiring that
+/// `PeerId` to be pinned already means only that peer can move its own address. A card whose
+/// multiaddr pins another `PeerId` is refused as on the pairing path.
+pub fn wan_ddns_card_decision(
+    card_peer_id: &str,
+    pinned_multiaddr: &str,
+    known: &KnownPeersStore,
+) -> Result<(), &'static str> {
+    wan_card_addr_decision(card_peer_id, pinned_multiaddr)?;
+    if known.multiaddr_for_peer_id(card_peer_id).is_none() {
+        return Err("reject.wan_ddns_peer_unknown");
+    }
+    Ok(())
+}
+
+/// A WAN card's multiaddr must not pin a `PeerId` other than the card's own.
+fn wan_card_addr_decision(card_peer_id: &str, pinned_multiaddr: &str) -> Result<(), &'static str> {
     if let Some((_, tail)) = pinned_multiaddr.rsplit_once("/p2p/") {
         if tail.split('/').next().unwrap_or(tail) != card_peer_id {
             return Err("reject.wan_card_addr_peer_mismatch");
         }
-    }
-    if !pairing_code_matches(card_peer_id, owner_pq_fingerprint, None, code) {
-        return Err("reject.wan_card_code_mismatch");
     }
     Ok(())
 }

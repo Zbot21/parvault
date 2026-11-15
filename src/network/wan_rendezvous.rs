@@ -286,6 +286,21 @@ impl WanPeerCard {
         NodeIdentity::verify_with_pubkey(&self.ed25519_pubkey, &payload, &sig_bytes)
     }
 
+    /// The address a card pins: its first non-empty multiaddr, with `/p2p/<PeerId>` appended when
+    /// it carries none. `None` when the card lists no address.
+    pub fn pinned_multiaddr(&self) -> Option<String> {
+        let first = self
+            .wan_multiaddrs
+            .iter()
+            .map(|s| s.trim())
+            .find(|s| !s.is_empty())?;
+        Some(if first.contains("/p2p/") {
+            first.to_string()
+        } else {
+            format!("{first}/p2p/{}", self.libp2p_peer_id)
+        })
+    }
+
     /// Checks whether this peer card has expired.
     pub fn is_expired(&self, current_time_ms: u64) -> bool {
         let ttl_ms = self.ttl_secs.saturating_mul(1000);
