@@ -19,10 +19,11 @@ use parvault::crypto::{
 };
 use parvault::network::admission::AdmissionSource;
 use parvault::network::{
-    build_mesh_client_swarm, derive_slot_key_from_code, node_identity_libp2p_peer_id,
-    seal_wan_peer_card, DelegationChain, DhtWireEnvelope, InvitationHop, MeshClient,
-    MeshNetworkBehaviour, MeshWireRequest, MeshWireResponse, PublicCommonsTicket, SlashingEvidence,
-    SlashingReason, WanPeerCard, DEFAULT_PUBLIC_WOT_POW_BITS,
+    build_mesh_client_swarm, derive_4word_pairing_sas, derive_slot_key_from_code,
+    node_identity_libp2p_peer_id, seal_wan_peer_card, DelegationChain, DhtWireEnvelope,
+    InvitationHop, MeshClient, MeshNetworkBehaviour, MeshWireRequest, MeshWireResponse,
+    PublicCommonsTicket, SlashingEvidence, SlashingReason, WanPeerCard, DEFAULT_LAN_PAIRING_NONCE,
+    DEFAULT_PUBLIC_WOT_POW_BITS,
 };
 use parvault::por::{RepairGrant, WitnessFailureReceipt};
 use parvault::sharding::encode_ciphertext_stripe;
@@ -1702,6 +1703,109 @@ fn f22_rendezvous_over_quota_refused() {
     );
     assert_logged(&node, "reject.rendezvous_quota");
     gate_ran("trust_enforcement::f22_rendezvous_over_quota_refused");
+}
+
+// --- B-45 / F-54: the WAN join card check --------------------------------------------------------------
+
+/// Registers on `anchor` a card signed by `signer` (with `signer_pq_fp`) under `code`.
+fn b45_register(anchor: &Node, signer: &NodeIdentity, signer_pq_fp: &str, code: &str) {
+    let card = WanPeerCard::new(
+        signer,
+        "b45-peer",
+        "daemon",
+        vec!["/ip4/203.0.113.45/tcp/4001".into()],
+        None,
+        Some(signer_pq_fp.to_string()),
+        3600,
+        now_ms(),
+    )
+    .unwrap();
+    let resp = send(
+        signer,
+        anchor,
+        MeshWireRequest::RegisterWanRendezvous {
+            slot_key: derive_slot_key_from_code(code),
+            entry: seal_wan_peer_card(code, &card, signer).unwrap(),
+        },
+    );
+    assert!(
+        matches!(
+            resp,
+            MeshWireResponse::RegisterWanRendezvousAck { stored: true, .. }
+        ),
+        "{resp:?}"
+    );
+}
+
+/// The pairing identity (`NodeIdentity`, PeerId, PQ fingerprint) kept in `dir`.
+fn b45_identity(dir: &Path) -> (NodeIdentity, String, String) {
+    let ident = NodeIdentity::load_or_generate_in_dir(dir).unwrap();
+    let pid = node_identity_libp2p_peer_id(&ident).unwrap().to_string();
+    let fp = HybridPqSigningKeypair::load_or_generate_in_dir(dir)
+        .unwrap()
+        .public_key()
+        .fingerprint_hex();
+    (ident, pid, fp)
+}
+
+/// Runs `parvault join --wan --code <code>` from a fresh data dir against `anchor`.
+fn b45_join(anchor: &Node, label: &str, code: &str) -> std::process::Output {
+    let (_root, dir, reg, _log) = prepare(label);
+    Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .env("RUST_LOG", "warn")
+        .env("NO_COLOR", "1")
+        .arg("--data-dir")
+        .arg(&dir)
+        .args(["--no-lan-discovery", "--seed-addr", &anchor.addr])
+        .args(["join", "--wan", "--code", code])
+        .output()
+        .expect("run parvault join --wan")
+}
+
+/// B-45 accept: a card signed by the identity the typed code derives from is joined.
+#[test]
+fn b45_wan_card_of_code_identity_joined() {
+    let anchor = spawn_daemon("b45-a");
+    let (_peer_root, peer_dir, _, _) = prepare("b45-a-peer");
+    let (peer, peer_pid, peer_fp) = b45_identity(&peer_dir);
+    let code = derive_4word_pairing_sas(&peer_pid, Some(&peer_fp), DEFAULT_LAN_PAIRING_NONCE).code;
+    b45_register(&anchor, &peer, &peer_fp, &code);
+    let out = b45_join(&anchor, "b45-a-joiner", &code);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains(&peer_pid),
+        "stdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    gate_ran("trust_enforcement::b45_wan_card_of_code_identity_joined");
+}
+
+/// B-45 reject: the slot holds a self-signed card of another identity under the honest code (what a
+/// rendezvous server that saw the code can plant); `join` refuses it and pins nothing.
+#[test]
+fn b45_wan_card_of_other_identity_refused() {
+    let anchor = spawn_daemon("b45-r");
+    let (_peer_root, peer_dir, _, _) = prepare("b45-r-peer");
+    let (_, peer_pid, peer_fp) = b45_identity(&peer_dir);
+    let code = derive_4word_pairing_sas(&peer_pid, Some(&peer_fp), DEFAULT_LAN_PAIRING_NONCE).code;
+    let (_forger_root, forger_dir, _, _) = prepare("b45-r-forger");
+    let (forger, forger_pid, _) = b45_identity(&forger_dir);
+    // The forger claims the honest peer's PQ fingerprint; only its own PeerId differs.
+    b45_register(&anchor, &forger, &peer_fp, &code);
+    let out = b45_join(&anchor, "b45-r-joiner", &code);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && !stdout.contains(&format!("Paired with b45-peer ({forger_pid})")),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("reject.wan_card_code_mismatch")
+            || stdout.contains("reject.wan_card_code_mismatch"),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    gate_ran("trust_enforcement::b45_wan_card_of_other_identity_refused");
 }
 
 // --- F-25: syndication cert not bound to the sender; self-signed DHT records from strangers -------------
@@ -3852,6 +3956,35 @@ fn b52_unreadable_quota_state_shard_refused() {
     assert!(!stored(&resp), "{resp:?}");
     assert_logged(&node, "reject.quota_state_unreadable");
     gate_ran("trust_enforcement::b52_unreadable_quota_state_shard_refused");
+}
+
+/// B-52 accept: while the quota state writes succeed, a second shard is stored too.
+#[test]
+fn b52_persisted_quota_state_second_shard_stored() {
+    let node = spawn_daemon("b52-pa");
+    for seed in [0x51u8, 0x52] {
+        let (sid, bytes) = shard(seed, 3000);
+        let resp = send(&key(0xD3), &node, put_shard("", sid, bytes, None));
+        assert!(stored(&resp), "shard {seed:#x}: {resp:?}");
+    }
+    gate_ran("trust_enforcement::b52_persisted_quota_state_second_shard_stored");
+}
+
+/// B-52 reject: once a quota state write fails (a directory now sits at `quota_state.bin`), the
+/// next shard is refused: a restart would forget the accounting of the first one.
+#[test]
+fn b52_unpersisted_quota_state_next_shard_refused() {
+    let node = spawn_daemon("b52-pr");
+    let path = node.dir.join("quota_state.bin");
+    let _ = std::fs::remove_file(&path);
+    std::fs::create_dir_all(&path).unwrap();
+    let (sid, bytes) = shard(0x51, 3000);
+    let _ = send(&key(0xD3), &node, put_shard("", sid, bytes, None));
+    let (sid, bytes) = shard(0x52, 3000);
+    let resp = send(&key(0xD3), &node, put_shard("", sid, bytes, None));
+    assert!(!stored(&resp), "{resp:?}");
+    assert_logged(&node, "reject.quota_state_not_persisted");
+    gate_ran("trust_enforcement::b52_unpersisted_quota_state_next_shard_refused");
 }
 
 /// `evict --propagate` refuses when this node is not a member of its installed council (it has

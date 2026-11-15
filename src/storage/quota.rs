@@ -123,10 +123,10 @@ pub struct QuotaManager {
     observed_free_disk_bytes: Option<u64>,
     #[serde(skip)]
     persistence_path: Option<std::path::PathBuf>,
-    /// Set while the last `quota_state.bin` write failed (B-52): the disk copy is stale, so
+    /// The refusal code while the last `quota_state.bin` write failed (B-52): the disk copy is stale, so
     /// [`Self::quota_decision`] refuses new shards until a later write succeeds.
     #[serde(skip)]
-    persist_failed: std::cell::Cell<bool>,
+    persist_failed: std::cell::Cell<Option<&'static str>>,
     /// Set when `quota_state.bin` exists but cannot be read or decoded (B-52 QA): the recorded
     /// accounting is unknown, so [`Self::quota_decision`] refuses with this code and the file is
     /// never overwritten. Cleared only by a restart that loads the file.
@@ -148,6 +148,16 @@ pub fn quota_state_load_decision(
     }
 }
 
+/// B-52: after a failed state write the accounting on disk is behind memory, and a restart would
+/// forget the shards since; new shards are refused (by [`QuotaManager::quota_decision`]) until a
+/// later write succeeds.
+pub fn quota_state_persist_decision<E>(written: &Result<(), E>) -> Result<(), &'static str> {
+    match written {
+        Ok(()) => Ok(()),
+        Err(_) => Err("reject.quota_state_not_persisted"),
+    }
+}
+
 impl QuotaManager {
     pub fn new(max_storage_bytes: u64, bootstrap_grace_bytes: u64) -> Self {
         Self {
@@ -161,7 +171,7 @@ impl QuotaManager {
             min_free_disk_bytes: 0,
             observed_free_disk_bytes: None,
             persistence_path: None,
-            persist_failed: std::cell::Cell::new(false),
+            persist_failed: std::cell::Cell::new(None),
             load_error: None,
         }
     }
@@ -217,14 +227,15 @@ impl QuotaManager {
                 .and_then(|bytes| {
                     crate::storage::fsio::atomic_write_file(path, &bytes).map_err(|e| e.to_string())
                 });
-            if let Err(error) = &written {
+            let refused = quota_state_persist_decision(&written).err();
+            if let (Some(code), Err(error)) = (refused, &written) {
                 tracing::warn!(
-                    code = "reject.quota_state_not_persisted",
+                    code,
                     %error,
                     "quota state write failed; refusing new shards until a write succeeds"
                 );
             }
-            self.persist_failed.set(written.is_err());
+            self.persist_failed.set(refused);
         }
     }
 
@@ -304,8 +315,8 @@ impl QuotaManager {
         if let Some(code) = self.load_error {
             return Err(code);
         }
-        if self.persist_failed.get() {
-            return Err("reject.quota_state_not_persisted");
+        if let Some(code) = self.persist_failed.get() {
+            return Err(code);
         }
         if let Some(free_bytes) = self.observed_free_disk_bytes {
             if free_bytes.saturating_sub(shard_bytes) < self.min_free_disk_bytes {
