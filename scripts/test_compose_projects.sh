@@ -226,4 +226,24 @@ up "$B" || fail "ring A after import over it: $(tail -3 "$WORK/up.log")"
 wait_healthy "$B"
 [[ "$(logs "$B" init | tail -1)" == *"this node is already in the ring $GB" ]] || fail "ring A changed: $(logs "$B" init | tail -1)"
 ok "import over ring A's own volume: the newer extra file is gone, ring A healthy"
+# Refusals: a wrong or empty share, or a tar of something else, must leave the volume untouched.
+refuse() { # <label> <backup dir>: run the documented import on ring A's volume; it must fail, print no "imported", and change nothing
+  local before after
+  before=$(sh_vol "$ID-6-data" 'cd /data && find . | sort | md5sum; cat ring_genesis.seed 2>/dev/null | md5sum')
+  doc_project parvault-import "$WORK/pref.yaml" "$ID-6-data" "$2"
+  up "$WORK/pref.yaml" 2>/dev/null || true
+  logs "$WORK/pref.yaml" import | grep -qx imported && fail "$1: import said imported"
+  [[ "$(state "$WORK/pref.yaml" import)" == "exited 0" ]] && fail "$1: import exited 0"
+  after=$(sh_vol "$ID-6-data" 'cd /data && find . | sort | md5sum; cat ring_genesis.seed 2>/dev/null | md5sum')
+  [[ -n "$before" && "$before" == "$after" ]] || fail "$1: the volume changed ($before vs $after)"
+  [[ "$(sh_vol "$ID-6-data" 'wc -c < /data/ring_genesis.seed')" -gt 0 ]] || fail "$1: genesis seed is gone"
+  docker compose -f "$WORK/pref.yaml" down >/dev/null 2>&1
+}
+docker run --rm -v "$WORK/bak:/b:ro" --entrypoint tar "$BB" -tf /b/parvault-data.tar | grep -q 'node_identity[.]seed$' \
+  || fail "a real export has no node_identity.seed (the doc's content check is wrong)"
+mkdir "$WORK/empty" "$WORK/other"
+refuse "empty backup folder" "$WORK/empty"
+echo hello > "$WORK/other/f.txt"; tar -C "$WORK/other" -cf "$WORK/other/parvault-data.tar" f.txt; rm "$WORK/other/f.txt"
+refuse "tar that is not a ParVault export" "$WORK/other"
+ok "import refuses an empty share and a foreign tar, and leaves the volume untouched"
 echo "test_compose_projects: PASS ($TAG)"

@@ -119,7 +119,7 @@ The tar keeps the files' owner (65532) and modes. The tar itself is owned by `ro
 *Restore (import).* This **replaces the volume's entire contents**: everything in `parvault-data` is deleted first, including anything not in the backup, and then the tar is extracted. Use it to bring back a lost or damaged node, never on a node that is working. The volume must exist (the project declares it `external`): if it is gone, build and start the `parvault` project once to create it, then continue.
 
 1. **Stop the `parvault` project.**
-2. Make a project (folder `docker/parvault-import`) from this `compose.yaml`, and build it. It empties the volume, then extracts `/backup/parvault-data.tar` into it, keeping owners (65532) and modes:
+2. Make a project (folder `docker/parvault-import`) from this `compose.yaml`, and build it. It first checks that `/backup/parvault-data.tar` is a readable tar holding the node's identity (`node_identity.seed`), then empties the volume and extracts the tar into it, keeping owners (65532) and modes. If the import prints nothing or an error (no tar, a wrong share path, or a tar that is not a ParVault export), the volume was not touched:
 
 ```yaml
 name: parvault-import
@@ -133,7 +133,7 @@ services:
     cap_drop: [ALL]
     cap_add: [CHOWN, FOWNER, DAC_OVERRIDE]   # to delete the old files, keep owners and modes, and write into the volume
     security_opt: ["no-new-privileges:true"]
-    command: ["sh", "-c", "find /data -mindepth 1 -delete && tar -xpf /backup/parvault-data.tar -C /data && echo imported"]
+    command: ["sh", "-c", "tar -tf /backup/parvault-data.tar >/dev/null && tar -tf /backup/parvault-data.tar | grep -q 'node_identity[.]seed$' && find /data -mindepth 1 -delete && tar -xpf /backup/parvault-data.tar -C /data && echo imported"]
     volumes:
       - parvault-data:/data
       - /volume1/parvault-backup:/backup:ro
