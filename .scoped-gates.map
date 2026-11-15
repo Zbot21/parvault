@@ -400,6 +400,7 @@ scripts/docker_acceptance_gate.sh   none    # Docker gate, run by hand; not one 
 scripts/install.sh                  none
 scripts/test_install.sh             none    # run by the docs-commands CI job (plan-7)
 scripts/doc_commands.sh             none    # the docs-commands CI job (plan-7 L-34)
+scripts/check_scalar_erasure_coding.sh none  # the scalar-erasure-coding CI job (L-102)
 scripts/doc_commands.py             none    # the docs-commands CI job (plan-7 L-34)
 scripts/check_no_runtime_deps.sh    test    static_build_checks   # L-48 no-runtime check (CI runs it too)
 scripts/check_claim_cfg.sh          test    static_build_checks   # ruling change 5 (CI runs it too)

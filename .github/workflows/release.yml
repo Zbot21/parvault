@@ -56,6 +56,7 @@ jobs:
           for bin in parvault parvault-seed parvault-fuse parvault-sync parvault-status; do
             ${{ matrix.strip }} "release-dist/${bin}-${{ matrix.target }}"
           done
+          bash scripts/check_scalar_erasure_coding.sh release-dist/*   # L-102
           echo "### Binary sizes for ${{ matrix.target }} (--profile soc, stripped static musl):"
           ls -lh release-dist/
       - uses: actions/upload-artifact@v4

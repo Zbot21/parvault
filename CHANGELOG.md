@@ -11,6 +11,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 - **`parvault token init-key` (B-93).** Creates `<data_dir>/macaroon_root.key` (`0600`) without minting a token; an existing key is validated and kept. It prints the path (`--json`: `path`, `created`), never the key. Deploy scripts no longer have to mint and discard a token.
 
+### Removed
+- **The `simd-accel` feature (L-102).** Erasure coding is scalar-only, enforced in CI: `reed-solomon-erasure` is built with `default-features = false, features = ["std"]`, and `scripts/check_scalar_erasure_coding.sh` fails on the SIMD GF(2^8) kernel in shipped binaries (table content, plus symbols and scoped byte-shuffle instructions on unstripped builds). A CI job proves the check flags a SIMD-enabled build.
+
 ### Changed
 - **The shipped router config binds the status page to loopback (B-54).** `deploy/router-soc/parvault-router.toml` sets `status_http_bind = "127.0.0.1:4080"`; `0.0.0.0` includes the WAN. Pass `--status-http <LAN-IP>:4080` for the LAN and `--listen /ip4/<LAN-IP>/tcp/4001` for P2P. Router examples in the docs use the LAN address. Desktop and homelab defaults are unchanged.
 - **`max_connections` is documented as not applied (B-64).** No production path reads it in v0.5.x (no swarm connection limit yet); the status page and WebDAV use fixed caps of 32 and 64.
