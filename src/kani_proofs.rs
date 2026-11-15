@@ -1532,7 +1532,7 @@ fn proof_council_reroot_needs_quorum_and_new_root() {
 /// over before its length, always does from it on, and once rolled stays rolled as time grows.
 #[kani::proof]
 fn proof_epoch_rollover_decision() {
-    use crate::storage::quota::{epoch_rollover_decision, DEFAULT_WRITE_EPOCH_MS};
+    use crate::storage::quota::{epoch_rollover_decision, QUOTA_WRITE_EPOCH_SECS};
     let elapsed: u64 = kani::any();
     let later: u64 = kani::any();
     let len: u64 = kani::any();
@@ -1550,7 +1550,7 @@ fn proof_epoch_rollover_decision() {
         "rolls at the epoch length"
     );
     assert!(!epoch_rollover_decision(
-        DEFAULT_WRITE_EPOCH_MS - 1,
-        DEFAULT_WRITE_EPOCH_MS
+        QUOTA_WRITE_EPOCH_SECS * 1000 - 1,
+        QUOTA_WRITE_EPOCH_SECS * 1000
     ));
 }

@@ -6016,12 +6016,12 @@ fn b161_node_with_room_stores_gateway_push() {
 // --- B-162: the per-peer write ceiling resets each epoch ---------------------------------------
 
 /// B-162: a daemon with a 4 KiB per-peer grace (a 16 KiB write ceiling per epoch) and, when
-/// set, a write-ceiling epoch of `epoch_ms` (`config.toml`; else the 24 h default).
-fn b162_host(label: &str, epoch_ms: Option<u64>) -> Node {
+/// set, a write-ceiling epoch of `epoch_secs` (`config.toml`; else the 24 h default).
+fn b162_host(label: &str, epoch_secs: Option<u64>) -> Node {
     let (root, dir, reg, log) = prepare(label);
     let mut cfg = String::from("bootstrap_grace_bytes = 4096\n");
-    if let Some(ms) = epoch_ms {
-        cfg.push_str(&format!("quota_write_epoch_ms = {ms}\n"));
+    if let Some(secs) = epoch_secs {
+        cfg.push_str(&format!("quota_write_epoch_secs = {secs}\n"));
     }
     std::fs::write(dir.join("config.toml"), cfg).unwrap();
     spawn(daemon_command(&dir, &reg), root, dir, log)
@@ -6054,8 +6054,9 @@ fn b162_write_ceiling_refuses_within_epoch() {
 /// next (released versions refused it for good: the ceiling never reset).
 #[test]
 fn b162_write_ceiling_reopens_next_epoch() {
-    const EPOCH_MS: u64 = 6_000;
-    let node = b162_host("b162-a", Some(EPOCH_MS));
+    const EPOCH_SECS: u64 = 6;
+    const EPOCH_MS: u64 = EPOCH_SECS * 1000;
+    let node = b162_host("b162-a", Some(EPOCH_SECS));
     let member = key(0xD6);
     // The epoch starts at the node's first put, no earlier than `t0`.
     let t0 = Instant::now();

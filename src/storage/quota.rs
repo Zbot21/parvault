@@ -144,14 +144,19 @@ pub struct QuotaManager {
     #[serde(skip)]
     epoch_started: Option<std::time::Instant>,
     /// B-162: the write-ceiling epoch length in ms (RAM only; 0 means
-    /// [`DEFAULT_WRITE_EPOCH_MS`]; `quota_write_epoch_ms` in `config.toml`).
+    /// [`QUOTA_WRITE_EPOCH_SECS`]; `quota_write_epoch_secs` in `config.toml`).
     #[serde(skip)]
     write_epoch_ms: u64,
 }
 
 /// B-162: the write-ceiling epoch (24 h). The per-peer ceiling of 4x the allowance resets at
 /// the start of each epoch, so it is a daily upload budget, not a lifetime cap.
-pub const DEFAULT_WRITE_EPOCH_MS: u64 = 24 * 60 * 60 * 1000;
+pub const QUOTA_WRITE_EPOCH_SECS: u64 = 86_400;
+
+const QUOTA_WRITE_EPOCH_MS: u64 = QUOTA_WRITE_EPOCH_SECS * 1000;
+
+/// B-162: the info code logged when a new write-ceiling epoch starts.
+pub const INFO_QUOTA_WRITE_EPOCH_ROLLED: &str = "info.quota_write_epoch_rolled";
 
 /// B-162: a new write-ceiling epoch starts once `elapsed_ms` since the current one started
 /// reaches `epoch_len_ms`.
@@ -199,20 +204,20 @@ impl QuotaManager {
             persist_failed: std::cell::Cell::new(None),
             load_error: None,
             epoch_started: None,
-            write_epoch_ms: DEFAULT_WRITE_EPOCH_MS,
+            write_epoch_ms: QUOTA_WRITE_EPOCH_MS,
         }
     }
 
-    /// B-162: sets the write-ceiling epoch length (0 keeps [`DEFAULT_WRITE_EPOCH_MS`]). Call
-    /// before binding persistence; a loaded state keeps it.
-    pub fn set_write_epoch_ms(&mut self, epoch_ms: u64) {
-        self.write_epoch_ms = epoch_ms;
+    /// B-162: sets the write-ceiling epoch length in seconds (0 keeps
+    /// [`QUOTA_WRITE_EPOCH_SECS`]). Call before binding persistence; a loaded state keeps it.
+    pub fn set_write_epoch_secs(&mut self, epoch_secs: u64) {
+        self.write_epoch_ms = epoch_secs.saturating_mul(1000);
     }
 
     /// B-162: the write-ceiling epoch length in ms.
     pub const fn write_epoch_ms(&self) -> u64 {
         if self.write_epoch_ms == 0 {
-            DEFAULT_WRITE_EPOCH_MS
+            QUOTA_WRITE_EPOCH_MS
         } else {
             self.write_epoch_ms
         }
@@ -232,6 +237,11 @@ impl QuotaManager {
         self.reset_epoch_ingress_counters();
         self.epoch_started = Some(now);
         self.persist();
+        tracing::info!(
+            code = INFO_QUOTA_WRITE_EPOCH_ROLLED,
+            epoch_ms = self.write_epoch_ms(),
+            "new write-ceiling epoch; per-peer write counters reset"
+        );
         true
     }
 
@@ -603,7 +613,7 @@ mod tests {
     /// B-162: the rollover boundary: not before the epoch length, from it on.
     #[test]
     fn b162_epoch_rollover_boundaries() {
-        let len = DEFAULT_WRITE_EPOCH_MS;
+        let len = QUOTA_WRITE_EPOCH_SECS * 1000;
         assert!(!epoch_rollover_decision(0, len));
         assert!(!epoch_rollover_decision(len - 1, len));
         assert!(epoch_rollover_decision(len, len));
@@ -613,8 +623,10 @@ mod tests {
         let q = QuotaManager::new(1 << 30, 1 << 20);
         assert_eq!(q.write_epoch_ms(), 24 * 60 * 60 * 1000);
         let mut z = QuotaManager::new(1 << 30, 1 << 20);
-        z.set_write_epoch_ms(0);
-        assert_eq!(z.write_epoch_ms(), DEFAULT_WRITE_EPOCH_MS);
+        z.set_write_epoch_secs(0);
+        assert_eq!(z.write_epoch_ms(), QUOTA_WRITE_EPOCH_SECS * 1000);
+        z.set_write_epoch_secs(6);
+        assert_eq!(z.write_epoch_ms(), 6_000);
     }
 
     /// Fills `peer`'s write ceiling (4x a 5,000-byte grace) by put-and-delete churn, leaving
@@ -638,7 +650,7 @@ mod tests {
     #[test]
     fn b162_refused_peer_accepted_after_rollover() {
         let mut q = QuotaManager::new(1 << 30, 5_000);
-        q.set_write_epoch_ms(60_000);
+        q.set_write_epoch_secs(60);
         let t0 = std::time::Instant::now();
         assert!(!q.roll_epoch_if_due(t0), "the first call starts the epoch");
         b162_churn_to_ceiling(&mut q, "peer-a");
@@ -680,7 +692,7 @@ mod tests {
         assert!(q.quota_decision("peer-a", 1_000).is_ok());
         b162_churn_to_ceiling(&mut q, "peer-b");
         let later =
-            std::time::Instant::now() + std::time::Duration::from_millis(DEFAULT_WRITE_EPOCH_MS);
+            std::time::Instant::now() + std::time::Duration::from_secs(QUOTA_WRITE_EPOCH_SECS);
         assert!(q.roll_epoch_if_due(later));
         let raw = std::fs::read(dir.path().join("quota_state.bin")).unwrap();
         let on_disk: QuotaManager = bincode::deserialize(&raw).unwrap();
