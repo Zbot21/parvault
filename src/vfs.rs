@@ -463,12 +463,30 @@ mod unix_vfs {
                 self.local_addr.ip()
             };
             let wake_addr = SocketAddr::new(wake_ip, self.local_addr.port());
-            let _ = TcpStream::connect_timeout(&wake_addr, Duration::from_millis(100));
+            // One wake connect is not enough: a lost SYN (packet loss on the listen interface)
+            // fails a short connect, the accept loop never wakes and the join blocks forever
+            // (B-56, netem 2% loss). Retry the wake until the accept thread has exited.
             if let Some(jh) = self.join_handle.take() {
+                for _ in 0..WAKE_ATTEMPTS {
+                    if jh.is_finished() {
+                        break;
+                    }
+                    let _ = TcpStream::connect_timeout(&wake_addr, Duration::from_millis(250));
+                    for _ in 0..25 {
+                        if jh.is_finished() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
                 let _ = jh.join();
             }
         }
     }
+
+    /// Wake connects tried by [`VfsWebdavServerHandle::shutdown`] (about 0.5 s each) before it
+    /// joins the accept thread regardless.
+    const WAKE_ATTEMPTS: usize = 40;
 
     impl Drop for VfsWebdavServerHandle {
         fn drop(&mut self) {
