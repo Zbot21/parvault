@@ -1422,6 +1422,14 @@ fn print_status_report(
         "Holds Own Plaintext Files : {} (strictly zero-knowledge seed server)",
         report.holds_own_plaintext_files
     );
+    // B-113 (A-113 §10.3): lite stripes whose grant names no seed witness are not audited.
+    let audits = AuditorState::load(data_dir);
+    if audits.unwitnessed > 0 {
+        println!(
+            "lite stripes unwitnessed: {} (run 'parvault watch-folder --resyndicate-lite' on the lite device)",
+            audits.unwitnessed
+        );
+    }
     println!("------------------------------------------------------------------------");
     println!("JSON Telemetry: {}", serde_json::to_string(report)?);
     Ok(())

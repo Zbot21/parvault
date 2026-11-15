@@ -1109,6 +1109,9 @@ pub struct LiteFanOutPlan {
     repair_grant: Option<crate::por::RepairGrant>,
     session_key: [u8; 32],
     audit_index: Option<LiteAuditIndexHandle>,
+    /// B-113: the grant names this seed as a witness (or there is no grant), so the hosts
+    /// admit the seed's audits.
+    witnessed: bool,
 }
 
 /// The seed's shared lite audit index.
@@ -1189,7 +1192,7 @@ pub fn run_lite_fan_out(
     let primary = primary.into_inner().unwrap_or_else(|p| p.into_inner());
     let populated = primary.iter().filter(|p| p.is_some()).count();
     if let Some(index) = &plan.audit_index {
-        record_lite_audit(index, &plan.ingest, &primary);
+        record_lite_audit(index, &plan.ingest, &primary, !plan.witnessed);
     }
     let syndicated_peers = primary
         .into_iter()
@@ -1204,6 +1207,7 @@ fn record_lite_audit(
     index: &LiteAuditIndexHandle,
     ingest: &LiteIngest,
     primary: &[Option<String>],
+    unwitnessed: bool,
 ) {
     use crate::por::lite_index::{LiteAuditRecord, LiteAuditShard};
     let shards: Vec<LiteAuditShard> = primary
@@ -1224,6 +1228,7 @@ fn record_lite_audit(
         stripe_merkle_root: ingest.stripe_merkle_root,
         shard_len: ingest.shard_len,
         shards,
+        unwitnessed,
     });
 }
 
@@ -1514,6 +1519,20 @@ impl ZeroTrustSeedServer {
         let session_key = client
             .identity()
             .derive_stripe_por_session_key(&ingest.stripe_merkle_root);
+        // B-113 (A-113 §10.2): with a grant registered, a host admits the seed's audits only
+        // if the grant names the seed. A pre-upgrade lite client names none: fan out anyway
+        // (old clients keep working) and mark the stripe unwitnessed.
+        let seed_key = client.identity().public_key_bytes();
+        let witnessed = repair_grant
+            .as_ref()
+            .is_none_or(|g| g.authorized_witness_pubkeys.contains(&seed_key));
+        if !witnessed {
+            tracing::warn!(
+                code = "warn.lite_grant_no_seed_witness",
+                client = %ingest.client_device_id,
+                "lite stripe fanned out unwitnessed: its grant does not name this seed, so it is not audited until the device re-syndicates (watch-folder --resyndicate-lite)"
+            );
+        }
         Ok(LiteFanOutPlan {
             ingest: ingest.clone(),
             peers: peers.to_vec(),
@@ -1523,6 +1542,7 @@ impl ZeroTrustSeedServer {
             repair_grant,
             session_key,
             audit_index: self.lite_audit_index.clone(),
+            witnessed,
         })
     }
 

@@ -490,6 +490,12 @@ pub enum Commands {
         /// Optional PersonalDeviceCert file or `PARVAULT-CERT-V1:` token for Lite-Client seed authentication (ADR-20).
         #[arg(long)]
         device_cert: Option<String>,
+
+        /// Lite client: re-send every stripe to the seed once, with a grant naming the seed as
+        /// audit witness (B-113). Stripes syndicated before v0.5.5 are not audited until then.
+        /// A full re-upload: run it on an unmetered link.
+        #[arg(long, default_value_t = false)]
+        resyndicate_lite: bool,
     },
     /// Browse and list all files, sizes, and stripe counts in a Folder Snapshot Manifest without downloading shards (ADR-20).
     ListSnapshot {

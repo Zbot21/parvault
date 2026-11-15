@@ -1491,6 +1491,21 @@ impl MeshClient {
         None
     }
 
+    /// B-113 (A-113 C1): the Ed25519 key of the node at `addr`, from the Noise-authenticated
+    /// peer id pinned for it. With no pin and no `/p2p/` suffix, dials `addr` once (a status
+    /// query; its answer is not used) so the connection pins the id. A later request over this
+    /// client to `addr` fails `PeerIdMismatch` if another key answers.
+    pub fn remote_ed25519_pubkey(&self, addr: &str) -> anyhow::Result<[u8; 32]> {
+        if self.pinned_peer_id(addr).is_none() {
+            let _ = self.send_request(addr, MeshWireRequest::QueryNodeStatus);
+        }
+        let pid = self
+            .pinned_peer_id(addr)
+            .ok_or_else(|| anyhow::anyhow!("no authenticated peer id for {addr}"))?;
+        crate::config::NodeConfig::extract_ed25519_pubkey_from_peer_str(&pid.to_string())
+            .ok_or_else(|| anyhow::anyhow!("peer id of {addr} carries no Ed25519 key"))
+    }
+
     /// Explicitly pins an expected `PeerId` for `peer_addr` (`C2`).
     pub fn pin_peer_id(&self, peer_addr: &str, peer_id: PeerId) {
         if let Ok(mut guard) = self.pinned_peers.lock() {

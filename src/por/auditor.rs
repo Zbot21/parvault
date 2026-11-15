@@ -122,6 +122,10 @@ pub struct AuditorState {
     /// so an idle node does not list and decrypt manifests every tick.
     #[serde(default)]
     pub next_scan_unix_ms: u64,
+    /// B-113 (seed): lite stripes not audited because their grant names no seed witness (set
+    /// from the lite index at each scan; a separate count from unauditable and unanswered).
+    #[serde(default)]
+    pub unwitnessed: u64,
 }
 
 impl AuditorState {
@@ -233,12 +237,20 @@ pub fn host_device_id(client: &MeshClient, addr: &str) -> Option<String> {
 /// The bounded scan: the auditable shards of up to [`MANIFESTS_PER_TICK`] random local
 /// manifests (decrypted) or lite-index records. Returns the targets and the number of v1
 /// stripes seen.
-fn scan_targets(ctx: &AuditJobCtx) -> (Vec<AuditTarget>, u64) {
+/// The third value is the lite index's unwitnessed count (seed only).
+fn scan_targets(ctx: &AuditJobCtx) -> (Vec<AuditTarget>, u64, Option<u64>) {
     match &ctx.source {
-        AuditSource::OwnerManifests(mk) => scan_manifests(&ctx.block_store, mk),
+        AuditSource::OwnerManifests(mk) => {
+            let (t, u) = scan_manifests(&ctx.block_store, mk);
+            (t, u, None)
+        }
         AuditSource::LiteIndex(idx) => match idx.lock() {
-            Ok(i) => (i.sample_targets(MANIFESTS_PER_TICK), 0),
-            Err(_) => (Vec::new(), 0),
+            Ok(i) => (
+                i.sample_targets(MANIFESTS_PER_TICK),
+                0,
+                Some(i.unwitnessed_count() as u64),
+            ),
+            Err(_) => (Vec::new(), 0, None),
         },
     }
 }
@@ -327,9 +339,15 @@ fn pick_target(ctx: &AuditJobCtx, now: u64) -> Option<AuditTarget> {
             return None;
         }
     }
-    let (targets, unauditable) = scan_targets(ctx);
+    let (targets, unauditable, unwitnessed) = scan_targets(ctx);
     let mut st = ctx.state.lock().ok()?;
     st.unauditable = st.unauditable.saturating_add(unauditable);
+    if let Some(n) = unwitnessed {
+        if st.unwitnessed != n {
+            st.unwitnessed = n;
+            st.save(ctx.data_dir.as_deref());
+        }
+    }
     let last = |a: &str| st.host_last_audit.get(a).copied().unwrap_or(0);
     let oldest = targets.iter().map(|t| last(&t.host_addr)).min();
     // ±20 % jitter on the per-host interval, so audits of one host do not land on a fixed grid.
@@ -637,6 +655,7 @@ mod tests {
                 chunk_root: [6; 32],
                 host_addr: host_addr.into(),
             }],
+            unwitnessed: false,
         });
         idx
     }

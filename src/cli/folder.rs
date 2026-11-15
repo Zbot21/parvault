@@ -80,6 +80,27 @@ pub(crate) fn lite_syndication_client(base: &MeshClient) -> MeshClient {
     base.clone().with_timeout(LITE_SYNDICATION_TIMEOUT)
 }
 
+/// B-113: the lite client's marker that every stripe it holds on the seed was sent with a
+/// grant naming the seed as witness.
+pub(crate) const LITE_WITNESS_MARKER: &str = "lite_seed_witness.v1";
+
+/// B-113 (A-113 C12): printed by a lite pass while stripes from before the upgrade may be
+/// unwitnessed.
+pub(crate) fn lite_unwitnessed_notice() -> &'static str {
+    "[parvault] lite stripes unwitnessed: stripes syndicated before v0.5.5 are not audited by the seed until you run 'parvault watch-folder --resyndicate-lite' (a full re-upload)"
+}
+
+/// B-113 (A-113 §10.2): the lite client's grant for one stripe names exactly one witness, the
+/// seed's pinned key.
+pub(crate) fn lite_grant(
+    owner: &NodeIdentity,
+    stripe_merkle_root: [u8; 32],
+    seed_key: [u8; 32],
+    tier: ErasureTier,
+) -> RepairGrant {
+    RepairGrant::issue(owner, stripe_merkle_root, vec![seed_key], tier)
+}
+
 /// The recovery phrase from `--seed-phrase` or `PARVAULT_SEED_PHRASE`, if any.
 pub(crate) fn effective_seed_phrase(arg: Option<String>) -> Option<String> {
     arg.or_else(|| std::env::var("PARVAULT_SEED_PHRASE").ok())
@@ -136,6 +157,7 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
         catalog_out,
         lite_seed_dir,
         device_cert,
+        resyndicate_lite,
     } = command
     else {
         unreachable!("watch_folder() is only dispatched for Commands::WatchFolder")
@@ -184,11 +206,33 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
         effective_tier,
     );
 
+    let mut prev_syndicated = false;
     if snapshot_out.exists() {
         if let Ok(raw_prev) = std::fs::read(&snapshot_out) {
             if let Ok(prev_snapshot) = FolderSnapshotManifest::decode_bytes(&raw_prev) {
+                prev_syndicated = prev_snapshot
+                    .files
+                    .values()
+                    .flat_map(|f| f.manifest.stripes.iter())
+                    .any(|s| s.assigned_peers.iter().any(|p| is_network_peer_addr(p)));
                 engine.load_previous_snapshot(&prev_snapshot);
             }
+        }
+    }
+    anyhow::ensure!(
+        !resyndicate_lite || is_lite_net_seed,
+        "--resyndicate-lite needs --lite-seed-dir with a seed address"
+    );
+    // B-113 (A-113 C12): stripes syndicated before this client named its seed as witness are
+    // not audited by the seed. The marker says every stripe this client still holds on the
+    // seed was sent with a witness grant.
+    let witness_marker = cfg.data_dir.join(LITE_WITNESS_MARKER);
+    let mut resyndicate_pending = resyndicate_lite;
+    if is_lite_net_seed && !dry_run && !witness_marker.exists() {
+        if !prev_syndicated {
+            let _ = BlockStore::atomic_write_file(&witness_marker, b"1\n");
+        } else if !resyndicate_lite {
+            println!("{}", lite_unwitnessed_notice());
         }
     }
 
@@ -243,7 +287,29 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                 let syndication_client = lite_syndication_client(&net_client);
                 let store_with_net = block_store.clone().with_mesh_client(net_client.clone());
                 let mut receipt_count = 0usize;
+                let mut syndication_failures = 0usize;
+                // B-113 (A-113 §10.2): the grant names the seed (its Noise-pinned key) as audit
+                // witness. With no key there is no grant: the stripes wait for the next pass,
+                // as with a busy seed. Requests then go over the same pinned connection, so a
+                // seed with another key fails `PeerIdMismatch`.
+                let seed_key = match syndication_client.remote_ed25519_pubkey(&seed_str) {
+                    Ok(k) => Some(k),
+                    Err(e) => {
+                        tracing::error!(
+                            code = "error.lite_seed_key_unresolved",
+                            seed = %seed_str,
+                            error = %e,
+                            "the seed's key is unknown; no stripe is syndicated this pass"
+                        );
+                        None
+                    }
+                };
+                let resyndicate = resyndicate_pending;
                 for entry in snap.files.values_mut() {
+                    let Some(seed_key) = seed_key else {
+                        syndication_failures += 1;
+                        break;
+                    };
                     // A stripe with fewer than k shards on peers is not backed up (QA 2e M2-1).
                     let backed_up = |s: &parvault::storage::StripeManifestEntry| {
                         s.assigned_peers
@@ -252,7 +318,8 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                             .count()
                             >= s.k_data
                     };
-                    let needs_syndication = entry.manifest.stripes.iter().any(|s| !backed_up(s));
+                    let needs_syndication =
+                        resyndicate || entry.manifest.stripes.iter().any(|s| !backed_up(s));
                     if !needs_syndication {
                         continue;
                     }
@@ -261,7 +328,7 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                         use std::io::{Read, Seek, SeekFrom};
                         let stripe_cap = entry.manifest.stripe_size_bytes.max(1024);
                         for stripe_meta in &mut entry.manifest.stripes {
-                            if backed_up(stripe_meta) {
+                            if !resyndicate && backed_up(stripe_meta) {
                                 continue;
                             }
                             let start = stripe_meta.stripe_index * (stripe_cap as u64);
@@ -284,10 +351,10 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                                     expected_stripe_merkle_root: stripe_meta.stripe_merkle_root,
                                     expected_shard_hashes: stripe_meta.shard_hashes.clone(),
                                 };
-                                let grant = RepairGrant::issue(
+                                let grant = lite_grant(
                                     &owner_identity,
                                     stripe_meta.stripe_merkle_root,
-                                    Vec::new(),
+                                    seed_key,
                                     snap.tier,
                                 );
                                 // B-SEED-SYND (L-46): a busy seed is retried after 2, 5
@@ -303,13 +370,16 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                                     },
                                     std::thread::sleep,
                                 ) {
-                                    Err(e) => tracing::error!(
-                                        code = "error.lite_syndication_failed",
-                                        stripe_index = stripe_meta.stripe_index,
-                                        seed = %seed_str,
-                                        error = %e,
-                                        "lite seed refused or failed to syndicate the stripe; it stays only on this machine (the seed log has its reject code)"
-                                    ),
+                                    Err(e) => {
+                                        syndication_failures += 1;
+                                        tracing::error!(
+                                            code = "error.lite_syndication_failed",
+                                            stripe_index = stripe_meta.stripe_index,
+                                            seed = %seed_str,
+                                            error = %e,
+                                            "lite seed refused or failed to syndicate the stripe; it stays only on this machine (the seed log has its reject code)"
+                                        )
+                                    }
                                     Ok((_receipt, syndicated_peers)) => {
                                         receipt_count += 1;
                                         let has_net = syndicated_peers
@@ -355,6 +425,19 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                             }
                         }
                         let _ = store_with_net.save_manifest(&master_key, &entry.manifest);
+                    }
+                }
+                if resyndicate {
+                    resyndicate_pending = false;
+                    if syndication_failures == 0 {
+                        let _ = BlockStore::atomic_write_file(&witness_marker, b"1\n");
+                        println!(
+                            "[parvault] re-syndicated {receipt_count} lite stripe(s) with the seed as audit witness"
+                        );
+                    } else {
+                        println!(
+                            "[parvault] re-syndication incomplete ({syndication_failures} stripe(s) failed); run --resyndicate-lite again"
+                        );
                     }
                 }
                 // The first local pass counted every new stripe as local-only; after
@@ -728,6 +811,32 @@ pub(crate) async fn recover_from_seed(env: CliEnv, command: Commands) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B-113 (A-113 §10.2): the lite grant names exactly the seed's pinned key; with no
+    /// resolvable key (no pin, no `/p2p/` id, nothing listening) there is no key, so no grant.
+    #[test]
+    fn lite_client_grant_names_pinned_seed() {
+        let owner = NodeIdentity::from_seed([0x31; 32]);
+        let seed = NodeIdentity::from_seed([0x32; 32]);
+        let seed_pid = seed.to_libp2p_keypair().unwrap().public().to_peer_id();
+        let addr = "/ip4/127.0.0.1/tcp/9";
+        let client = MeshClient::new(owner.clone(), Vec::new(), None)
+            .with_timeout(std::time::Duration::from_millis(500));
+        client.pin_peer_id(addr, seed_pid);
+        let key = client.remote_ed25519_pubkey(addr).unwrap();
+        assert_eq!(key, seed.public_key_bytes());
+        let g = lite_grant(&owner, [7; 32], key, ErasureTier::Consumer);
+        assert!(g.verify());
+        assert_eq!(g.authorized_witness_pubkeys, vec![seed.public_key_bytes()]);
+        assert_eq!(g.owner_pubkey, owner.public_key_bytes());
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            drop(l);
+            format!("/ip4/127.0.0.1/tcp/{port}")
+        };
+        assert!(client.remote_ed25519_pubkey(&dead).is_err());
+    }
 
     fn busy() -> anyhow::Error {
         anyhow::anyhow!(
