@@ -652,3 +652,55 @@ fn gateway_socket_is_mode_0600() {
     let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "gateway socket mode is {mode:o}");
 }
+
+/// B-93: `parvault token init-key` creates `<data_dir>/macaroon_root.key` (`0600`) without minting
+/// a token, keeps an existing key on a second run, and never prints the key. A token minted
+/// afterwards verifies under that same key.
+#[test]
+fn token_init_key_creates_root_key_without_minting() {
+    let parvault_bin = env!("CARGO_BIN_EXE_parvault");
+    let tmp = tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let key_path = data_dir.join("macaroon_root.key");
+    let run = |extra: &[&str]| {
+        let out = Command::new(parvault_bin)
+            .args(["--data-dir", data_dir.to_str().unwrap(), "token"])
+            .args(extra)
+            .output()
+            .expect("run parvault token");
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+
+    let first = run(&["init-key"]);
+    assert!(first.starts_with("created "), "{first}");
+    let key_text = std::fs::read_to_string(&key_path).expect("key file created");
+    let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "key file mode {mode:o}");
+    assert!(
+        !first.contains("PARVAULT-MAC-V1:"),
+        "init-key minted a token: {first}"
+    );
+    assert!(!first.contains(key_text.trim()), "init-key printed the key");
+
+    let second = run(&["init-key", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(second.trim()).unwrap();
+    assert_eq!(v["created"], serde_json::Value::Bool(false), "{second}");
+    assert_eq!(std::fs::read_to_string(&key_path).unwrap(), key_text);
+
+    let token = run(&["mint", "--read-only"]).trim().to_string();
+    let inspected = run(&[
+        "inspect",
+        "--token",
+        &token,
+        "--verify-key-hex",
+        key_text.trim(),
+        "--json",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(inspected.trim()).unwrap();
+    assert_eq!(v["verified"], serde_json::Value::Bool(true), "{inspected}");
+}

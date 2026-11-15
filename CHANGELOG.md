@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- **`parvault token init-key` (B-93).** Creates `<data_dir>/macaroon_root.key` (`0600`) without minting a token; an existing key is validated and kept. It prints the path (`--json`: `path`, `created`), never the key. Deploy scripts no longer have to mint and discard a token.
+
 ### Changed
 - **The shipped router config binds the status page to loopback (B-54).** `deploy/router-soc/parvault-router.toml` sets `status_http_bind = "127.0.0.1:4080"`; `0.0.0.0` includes the WAN. Pass `--status-http <LAN-IP>:4080` for the LAN and `--listen /ip4/<LAN-IP>/tcp/4001` for P2P. Router examples in the docs use the LAN address. Desktop and homelab defaults are unchanged.
 - **`vfs`: `VfsStubNode` is now `VfsLazyNode`, `register_stub_file` is now `register_lazy_file` (public API rename).** Names only; the serialized fields, the FUSE ABI and the WebDAV wire are unchanged.

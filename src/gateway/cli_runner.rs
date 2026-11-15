@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Canonical filename inside `<data_dir>` storing a `0600` hex-encoded 32-byte Macaroon root key.
 pub const DEFAULT_MACAROON_ROOT_KEY_FILE: &str = "macaroon_root.key";
 
-/// CLI subcommands under `parvault token { mint, attenuate, inspect }`.
+/// CLI subcommands under `parvault token { mint, init-key, attenuate, inspect }`.
 #[derive(Debug, Clone, Subcommand)]
 pub enum TokenAction {
     /// Mint a new root or pre-attenuated `PARVAULT-MAC-V1:` capability macaroon.
@@ -51,6 +51,14 @@ pub enum TokenAction {
         allow_peer_uid: Option<u32>,
 
         /// Emit structured JSON output instead of the raw `PARVAULT-MAC-V1:...` string.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Create `<data_dir>/macaroon_root.key` (`0600`) if it is missing, without minting a token (B-93).
+    /// Idempotent: an existing key is validated and kept. Prints the path, never the key.
+    InitKey {
+        /// Emit structured JSON output (`path`, `created`).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -440,6 +448,24 @@ pub fn execute_token_cli(action: TokenAction, data_dir: &Path) -> anyhow::Result
                 );
             } else {
                 println!("{compact}");
+            }
+            Ok(())
+        }
+
+        TokenAction::InitKey { json } => {
+            let key_path = data_dir.join(DEFAULT_MACAROON_ROOT_KEY_FILE);
+            let created = !key_path.is_file();
+            // Loads (and validates) an existing key, or creates one; never prints it.
+            load_or_create_macaroon_root_key(data_dir, None)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "path": key_path.display().to_string(), "created": created })
+                );
+            } else if created {
+                println!("created {}", key_path.display());
+            } else {
+                println!("exists {}", key_path.display());
             }
             Ok(())
         }

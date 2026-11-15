@@ -144,6 +144,8 @@ The status page needs a read-only token on every request (v0.5.0): run `parvault
 `parvault-status` serves the same status page from outside the daemon. It holds no key and links no tokio or libp2p. It pins one read-only token, and asks the daemon for the snapshot over the gateway socket:
 ```bash
 ( umask 077; parvault token mint --read-only > ~/.parvault-status.token )
+# To create the root key without minting a token (for example in a deploy script):
+parvault token init-key
 parvault-status --socket /var/run/parvault.sock --listen 127.0.0.1:4080 \
   --macaroon-file ~/.parvault-status.token
 ```
