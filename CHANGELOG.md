@@ -29,6 +29,7 @@ Lab instrumentation (NEW-3, NEW-4, NEW-5; `docs/LAB_MODE.md`, `docs/METRICS.md`)
 - **`daemon start` no longer lets a clap default override the config file** for `--listen` and `--enable-quic` (every user, not only lab mode): a config-file `listen_tcp` or `enable_quic` was silently replaced by `/ip4/0.0.0.0/tcp/4001` and `false` when the flag was absent. A flag now wins only when given; the dump shows a clap default as `default`.
 
 ### Changed
+- **Vendored stager updated (`scripts/stage_artifact.sh`, skill `1b3b43c`): it records `GATE_SOURCE_SHA`**, the commit the enforcement runner checks out, instead of the checkout's own `HEAD`, so A-DOCKER provenance holds when the gate runs on a snapshot of the source.
 - **Dial errors keep their cause.** The TCP and QUIC transport errors are flattened so a refused, unreachable or timed-out dial is not reported as a generic error.
 - `/api/v1/health` of the daemon gains `config_digest`, added at the status edge; the `StatusSnapshot` IPC frame is unchanged (`parvault-status` does not serve it).
 

@@ -8,11 +8,19 @@
 # it to --dest (optionally stripping it), and prints one provenance line:
 #
 #   GATE-ARTIFACT bin=<bin> sha256=<staged hex> src_sha256=<built hex>
-#                 commit=<sha>[-dirty] pinned=<crate|none> srcdir=<source>
+#                 commit=<sha>[-dirty] tree_commit=<sha>[-dirty]
+#                 pinned=<crate|none> srcdir=<source>
 #                 strip=<tool|none> cache=<hit|miss|off> features=<list|none>
 #                 default_features=<yes|no> src=<exe> dest=<dest>
 # Each value is percent-encoded: '%' %25, space %20, tab %09, CR %0D, LF %0A.
 # features is the sorted, de-duplicated --features list joined with commas.
+#
+# commit is the tested source; tree_commit is what git reports for the build
+# tree (HEAD, or the pinned commit in --rev/--git modes; `none` outside git).
+# They differ only when GATE_SOURCE_SHA is set: a job scheduler that runs the
+# gates in a copied or snapshot tree exports the source commit it copied, and
+# a working-tree build without --lock-crate records it as commit=.
+# A dirty build tree adds -dirty to that commit= as well.
 # Hashes read stdin: sha256sum escapes a file name holding a backslash, LF or CR.
 #
 # srcdir is a directory (working tree), git:<url> (cargo install at the pin)
@@ -32,6 +40,66 @@
 # ==============================================================================
 
 set -euo pipefail
+
+# >>> skill-version: keep this block byte-identical in every skill script.
+# The skill SHA is the git tree hash of the skill directory, so identical
+# content gives the same SHA wherever it is committed. Sources, in order: a
+# SKILL_SHA file at the skill root (written by the install step; next to the
+# script for a script vendored without the skill tree), then git when the
+# skill runs from a checkout ('-dirty' with uncommitted skill changes), else
+# 'unknown'. A repository may pin the SHA it expects in .qavs-version; see
+# SKILL.md, "Skill version pin". QAVS_ALLOW_SKILL_MISMATCH=1 turns a mismatch
+# into a warning, for deliberate testing of a new skill version.
+QAVS_SCRIPT="$(basename "${BASH_SOURCE[0]}")"
+QAVS_SHA=""
+qavs_sha() {  # sets QAVS_SHA once per run
+  local here root file sha=""
+  if [[ -z "$QAVS_SHA" ]]; then
+    if here="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)"; then
+      root="$(dirname "$here")"
+      if [[ -f "$root/SKILL.md" ]]; then file="$root/SKILL_SHA"; else file="$here/SKILL_SHA"; fi
+      if [[ -f "$file" ]]; then
+        IFS= read -r sha < "$file" || true
+        sha="${sha//[[:space:]]/}"
+      elif [[ -f "$root/SKILL.md" ]]; then
+        sha="$( (unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
+                 cd "$root" && git rev-parse --verify --quiet 'HEAD:./') 2>/dev/null)" || sha=""
+        if [[ -n "$sha" ]] && [[ -n "$( (unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
+                 cd "$root" && git --no-optional-locks status --porcelain -- .) 2>/dev/null)" ]]; then
+          sha="$sha-dirty"
+        fi
+      fi
+    fi
+    [[ "$sha" =~ ^[0-9a-f]{7,64}(-dirty)?$ ]] || sha="unknown"
+    QAVS_SHA="$sha"
+  fi
+}
+qavs_version_line() { qavs_sha; printf '%s skill %s\n' "$QAVS_SCRIPT" "$QAVS_SHA"; }
+# qavs_check_pin <dir>: exit 2 when the repository holding <dir> pins, in
+# .qavs-version at its root, a skill SHA other than the running one.
+qavs_check_pin() {
+  local top pin="" line sha
+  top="$( (unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
+           git -C "$1" rev-parse --show-toplevel) 2>/dev/null)" || top="$1"
+  [[ -f "$top/.qavs-version" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"; line="${line//[[:space:]]/}"
+    [[ -n "$line" ]] && { pin="$line"; break; }
+  done < "$top/.qavs-version"
+  if [[ ! "$pin" =~ ^[0-9a-f]{7,64}$ ]]; then
+    echo "ERROR: $QAVS_SCRIPT: malformed skill pin '$pin' in $top/.qavs-version (want one 7- to 64-digit lowercase hex skill SHA)." >&2
+    exit 2
+  fi
+  qavs_sha; sha="$QAVS_SHA"
+  [[ "$sha" != *-dirty && "$sha" == "$pin"* ]] && return 0
+  if [[ "${QAVS_ALLOW_SKILL_MISMATCH:-}" == 1 ]]; then
+    echo "WARNING: $QAVS_SCRIPT: running skill $sha, but $top/.qavs-version pins $pin; continuing (QAVS_ALLOW_SKILL_MISMATCH=1)." >&2
+    return 0
+  fi
+  echo "ERROR: $QAVS_SCRIPT: running skill $sha, but $top/.qavs-version pins $pin. A stale or unpinned skill copy gives false gate results: update the skill copy or the pin, or set QAVS_ALLOW_SKILL_MISMATCH=1 to test a new skill version on purpose." >&2
+  exit 2
+}
+# <<< skill-version
 
 BIN=""
 DEST=""
@@ -74,6 +142,7 @@ Options:
   --strip               Strip the staged copy before recording its sha256.
                         STRIP_TOOL (default: strip) must be a command name on
                         PATH named strip or <prefix>-strip, outside the repo.
+  --version             Print this script's skill SHA and exit.
   -h, --help            Show this help message and exit.
 EOF
 }
@@ -106,10 +175,13 @@ while [[ $# -gt 0 ]]; do
       ;;
     --strip) STRIP=1; shift ;;
     --no-default-features) DEFAULT_FEATURES="no"; shift ;;
+    --version) qavs_version_line; exit 0 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "Unknown argument: $1" ;;
   esac
 done
+
+qavs_version_line >&2
 
 [[ -n "$BIN" && -n "$DEST" ]] || { usage >&2; die "--bin and --dest are required."; }
 [[ -z "$LOCK" && -z "$LOCK_CRATE" ]] || [[ -n "$LOCK" && -n "$LOCK_CRATE" ]] \
@@ -250,6 +322,14 @@ else
   fi
   SRCDIR="$(cd "$SRC" && pwd)"
 fi
+TREE_COMMIT="$COMMIT"
+if [[ -n "${GATE_SOURCE_SHA:-}" && -z "$GIT_URL" && -z "$GIT_REV" && -z "$LOCK_CRATE" ]]; then
+  [[ "$GATE_SOURCE_SHA" =~ ^[0-9a-f]{7,64}(-dirty)?$ ]] \
+    || die "GATE_SOURCE_SHA must be a 7- to 64-digit lowercase hex commit, got '$GATE_SOURCE_SHA'"
+  COMMIT="$GATE_SOURCE_SHA"
+  # A dirty build tree stays dirty in commit=, whatever the exported source.
+  [[ "$TREE_COMMIT" != *-dirty || "$COMMIT" == *-dirty ]] || COMMIT="$COMMIT-dirty"
+fi
 
 # Optional cache for pinned builds, keyed by crate, full commit, target,
 # profile and a hash of the build configuration (rustc and cargo versions,
@@ -339,7 +419,7 @@ pct() {
   v="${v// /%20}"; v="${v//$'\t'/%09}"; v="${v//$'\r'/%0D}"; v="${v//$'\n'/%0A}"
   printf '%s' "$v"
 }
-LINE="GATE-ARTIFACT bin=$(pct "$BIN") sha256=$SUM src_sha256=$SRC_SUM commit=$(pct "$COMMIT") pinned=$(pct "${LOCK_CRATE:-none}") srcdir=$(pct "$SRCDIR") strip=$(pct "$STRIP_BIN") cache=$CACHE_STATE features=$(pct "$FEATURES") default_features=$DEFAULT_FEATURES src=$(pct "$EXE") dest=$(pct "$DEST")"
+LINE="GATE-ARTIFACT bin=$(pct "$BIN") sha256=$SUM src_sha256=$SRC_SUM commit=$(pct "$COMMIT") tree_commit=$(pct "$TREE_COMMIT") pinned=$(pct "${LOCK_CRATE:-none}") srcdir=$(pct "$SRCDIR") strip=$(pct "$STRIP_BIN") cache=$CACHE_STATE features=$(pct "$FEATURES") default_features=$DEFAULT_FEATURES src=$(pct "$EXE") dest=$(pct "$DEST")"
 if [[ -n "${GATES_SENTINEL_DIR:-}" ]]; then
   printf '%s\n' "$LINE" >> "$GATES_SENTINEL_DIR/artifacts" || die "cannot record to $GATES_SENTINEL_DIR/artifacts"
 fi
