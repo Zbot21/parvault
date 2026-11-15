@@ -9194,3 +9194,111 @@ fn f06_busy_refusal_spends_no_nonce_or_budget() {
     );
     assert_logged(&node, "reject.por_rate_limited");
 }
+
+// --- MAN-VARIANT (L-16 S3): the compiled-in manifest gates wire variants --------------------------
+
+/// The manifest the `parvault` binary under test was built with, from its `--version` line.
+fn active_manifest() -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .arg("--version")
+        .output()
+        .expect("parvault --version");
+    let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let name = line
+        .rsplit_once("(manifest ")
+        .and_then(|(_, rest)| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("no manifest in --version: {line}"));
+    name.to_string()
+}
+
+const VARIANT_DISABLED_TEXT: &str = "request type not served by this node's manifest";
+
+/// MAN-VARIANT accept: a variant the manifest enables is served. In the household build that is
+/// `AdmitPublicTicket` (a stranger's ticket admits it); in the test-restricted build, which serves
+/// no credential arm, it is `QueryNodeStatus`. No variant refusal is logged.
+#[test]
+fn man_variant_enabled_served() {
+    let node = spawn_public_daemon("man-on");
+    match active_manifest().as_str() {
+        "household-ring-v1" => {
+            let stranger = key(0xB1);
+            let resp = admit_ticket(&node, &stranger, DEFAULT_PUBLIC_WOT_POW_BITS);
+            assert!(
+                matches!(
+                    resp,
+                    MeshWireResponse::AdmitPublicTicketAck { admitted: true, .. }
+                ),
+                "{resp:?}\n{}",
+                node.log_text()
+            );
+        }
+        "test-restricted" => {
+            let resp = send_as_stranger(&key(0xB1), &node, MeshWireRequest::QueryNodeStatus);
+            assert!(
+                matches!(&resp, MeshWireResponse::NodeStatusResult { peer_id, .. } if !peer_id.is_empty()),
+                "{resp:?}\n{}",
+                node.log_text()
+            );
+        }
+        other => panic!("unknown manifest {other}"),
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !node.log_text().contains("variant_disabled_by_manifest"),
+        "{}",
+        node.log_text()
+    );
+    gate_ran("trust_enforcement::man_variant_enabled_served");
+}
+
+/// MAN-VARIANT reject: the test-restricted build refuses `AdmitPublicTicket` and `HandshakeWoT`
+/// before admission, in each request's existing refusal shape, logs the code, and admits nothing
+/// (the stranger's put is then refused as not admitted). In the household build the same ticket
+/// admits (the twin, so the shared suite asserts the default manifest refuses nothing).
+#[test]
+fn man_variant_disabled_refused() {
+    let node = spawn_public_daemon("man-off");
+    let stranger = key(0xB2);
+    let resp = admit_ticket(&node, &stranger, DEFAULT_PUBLIC_WOT_POW_BITS);
+    match active_manifest().as_str() {
+        "test-restricted" => {
+            match &resp {
+                MeshWireResponse::AdmitPublicTicketAck {
+                    admitted: false,
+                    reason: Some(r),
+                    ..
+                } => assert_eq!(r, VARIANT_DISABLED_TEXT),
+                other => panic!("{other:?}\n{}", node.log_text()),
+            }
+            assert_logged(&node, "reject.variant_disabled_by_manifest");
+            let hs = send_as_stranger(
+                &stranger,
+                &node,
+                MeshWireRequest::HandshakeWoT {
+                    chain: DelegationChain { hops: Vec::new() },
+                    asn: None,
+                    region: None,
+                },
+            );
+            assert!(
+                matches!(&hs, MeshWireResponse::HandshakeAck { accepted: false, reason: Some(r) } if r == VARIANT_DISABLED_TEXT),
+                "{hs:?}"
+            );
+            let (sid, bytes) = shard(0x17, 1024);
+            let put = send_as_stranger(&stranger, &node, put_shard("", sid, bytes, None));
+            assert_eq!(refusal_text(&put).as_deref(), Some(NOT_ADMITTED), "{put:?}");
+        }
+        "household-ring-v1" => {
+            assert!(
+                matches!(
+                    resp,
+                    MeshWireResponse::AdmitPublicTicketAck { admitted: true, .. }
+                ),
+                "{resp:?}"
+            );
+            assert!(!node.log_text().contains("variant_disabled_by_manifest"));
+        }
+        other => panic!("unknown manifest {other}"),
+    }
+    gate_ran("trust_enforcement::man_variant_disabled_refused");
+}

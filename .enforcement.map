@@ -136,6 +136,10 @@ reach      P-01      sym=src/network/wot.rs::verify_and_admit_public_ticket_deci
 kani       P-01      sym=src/network/wot.rs::is_peer_trust_decision harness=proof_peer_trust_never_quarantined cover=quarantined peer refused
 kani       P-01      sym=src/network/wot.rs::verify_and_admit_chain_shape_decision harness=proof_chain_shape_bounded_and_rooted cover=too deep or empty refused
 kani       P-01      sym=src/network/wot.rs::verify_and_admit_public_ticket_decision harness=proof_public_ticket_admission cover=revoked ticket refused
+# L-16 S3: the manifest variant gate. The claim pair runs per manifest (manifests/test-restricted.enforcement.map);
+# the shared Kani harness runs once here (G-1 ruling 6).
+kani       MAN-VARIANT sym=src/manifest/mod.rs::manifest_variant_decision harness=proof_manifest_variant_decision cover=disabled variant refused
+reach      MAN-VARIANT sym=src/manifest/mod.rs::manifest_variant_decision from=src/network/wire_handler.rs::handle_mesh_wire_request
 waive      P-01      sym=src/network/wot.rs::is_peer_trusted reason=stateful wrapper over is_peer_trust_decision (kani proof_peer_trust_never_quarantined); registry HashMaps are outside CBMC
 waive      P-01      sym=src/network/wot.rs::is_peer_quarantined reason=set lookup with no decision; its use in trust is proven by proof_peer_trust_never_quarantined
 waive      P-01      sym=src/network/wot.rs::verify_and_admit_chain reason=stateful wrapper over verify_and_admit_chain_shape_decision (kani proof_chain_shape_bounded_and_rooted) and chain_admission_decision; Ed25519 hop signatures are outside CBMC

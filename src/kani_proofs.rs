@@ -1527,3 +1527,17 @@ fn proof_council_reroot_needs_quorum_and_new_root() {
             && (!f.rerooted || (f.public_mode && f.new_root_signed))
     );
 }
+
+/// L-16 S3 (claim `MAN-VARIANT`): the manifest variant gate refuses iff the variant is disabled,
+/// with its one reason code.
+#[kani::proof]
+fn proof_manifest_variant_decision() {
+    let enabled: bool = kani::any();
+    let d = crate::manifest::manifest_variant_decision(enabled);
+    kani::cover!(d.is_err(), "disabled variant refused");
+    kani::cover!(d.is_ok(), "enabled variant served");
+    assert_eq!(d.is_ok(), enabled);
+    if let Err(code) = d {
+        assert!(code == "reject.variant_disabled_by_manifest");
+    }
+}
