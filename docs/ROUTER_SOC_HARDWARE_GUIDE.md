@@ -303,54 +303,15 @@ max_connections = 24
 ```
 
 ### Procd Service Script (`/etc/init.d/parvault-nas`)
-Copy `deploy/router-soc/parvault-nas.procd` to `/etc/init.d/parvault-nas` and make it executable (`chmod +x /etc/init.d/parvault-nas`):
+Copy `deploy/router-soc/parvault-nas.procd` to `/etc/init.d/parvault-nas` and make it executable (`chmod +x /etc/init.d/parvault-nas`). The script:
 
-```sh
-#!/bin/sh /etc/rc.common
-# /etc/init.d/parvault-nas — ParVault Router Cloud-NAS procd service
-# START=95 starts after network, storage mounts (/mnt/nas), and firewall
-# STOP=10
+- creates the `parvault` user and group (uid and gid `4001`) on first start, creates `/mnt/nas/.parvault-data`, gives it to that user (`0700`), and refuses to start if the user does not own it;
+- runs `parvault up --profile router-soc --config /etc/parvault/router.toml` as `parvault`, not root (ports `4001`, `4009` and `4080` need no root); the daemon writes its keys on first start, so no separate `parvault init` is needed;
+- sets `respawn 3600 5 5` (threshold, delay, retries; procd needs all three) and `term_timeout 10`;
+- sets only `limits nofile=1024`. There is no address-space (`as`) limit: it counts every thread's reserved stack and the mapped binary, so a tokio daemon cannot start under 48 MiB of it. The router profile bounds the runtime instead: 2 tokio workers and at most 8 blocking threads (`HardwareProfile::runtime_worker_threads`, `runtime_max_blocking_threads` in `src/profile.rs`);
+- has no `stop_service`: procd sends `TERM` to its own instance, so a CLI `parvault` run on the box is not killed.
 
-START=95
-STOP=10
-USE_PROCD=1
-
-PROG=/usr/bin/parvault
-CONF=/etc/parvault/router.toml
-
-start_service() {
-    # Ensure USB / NVMe mount directory exists
-    if [ ! -d /mnt/nas ]; then
-        mkdir -p /mnt/nas
-    fi
-
-    procd_open_instance
-    procd_set_param command "$PROG" up --profile router-soc --config "$CONF"
-    
-    # Automatic respawn policy: threshold 3600s, timeout 5s, retry 5 times
-    procd_set_param respawn 3600 5 5
-    
-    # Process limits tuned for tiny router SoCs:
-    # Memory ceiling: 48 MiB address space (as) limit to prevent OOM panic
-    # File descriptors: 1024
-    procd_set_param limits as=50331648 nofile=1024
-    
-    # Forward stdout and stderr to logd / syslog
-    procd_set_param stdout 1
-    procd_set_param stderr 1
-    
-    procd_close_instance
-}
-
-stop_service() {
-    killall -TERM parvault 2>/dev/null
-}
-
-reload_service() {
-    stop
-    start
-}
-```
+`scripts/install.sh` installs to `/usr/bin` when `/etc/openwrt_release` exists, which is where the script runs the binary.
 
 Enable and start the service:
 ```bash
@@ -361,7 +322,7 @@ Enable and start the service:
 Check service status and memory:
 ```bash
 /etc/init.d/parvault-nas status
-cat /proc/$(pgrep parvault)/status | grep -E "VmRSS|VmHWM"
+cat /proc/$(pgrep -u parvault parvault)/status | grep -E "VmRSS|VmHWM|Threads"
 ```
 
 ---

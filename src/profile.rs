@@ -135,6 +135,24 @@ impl HardwareProfile {
         }
     }
 
+    /// Tokio worker threads for the daemon runtime: `Some(2)` on `router-soc` (L-96, B-53), else
+    /// `None` (tokio's default, one per core).
+    pub const fn runtime_worker_threads(self) -> Option<usize> {
+        match self {
+            Self::RouterSoc => Some(2),
+            Self::Desktop | Self::HomelabNas => None,
+        }
+    }
+
+    /// Tokio blocking-pool ceiling: `Some(8)` on `router-soc` (L-96, B-53), else `None` (tokio's
+    /// default, 512). Stack size stays at the 2 MiB default until the KVM canary measures it.
+    pub const fn runtime_max_blocking_threads(self) -> Option<usize> {
+        match self {
+            Self::RouterSoc => Some(8),
+            Self::Desktop | Self::HomelabNas => None,
+        }
+    }
+
     /// Recommended default local storage allocation when initializing a fresh node.
     pub const fn default_max_storage_gib(self) -> u64 {
         match self {
@@ -226,3 +244,23 @@ pub const GATEWAY_STRIPE_BYTES: usize = ROUTER_SOC_STRIPE_SIZE_BYTES;
 /// Default minimum free OS filesystem space (5 GiB) reserved as a safety guard against disk
 /// exhaustion (moved from `storage::quota`, which re-exports it).
 pub const DEFAULT_MIN_FREE_DISK_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+#[cfg(test)]
+mod tests {
+    use super::HardwareProfile;
+
+    /// B-53 / L-96: the router runtime is bounded to 2 workers and 8 blocking threads; the
+    /// other profiles keep tokio's defaults.
+    #[test]
+    fn router_profile_runtime_limits() {
+        assert_eq!(HardwareProfile::RouterSoc.runtime_worker_threads(), Some(2));
+        assert_eq!(
+            HardwareProfile::RouterSoc.runtime_max_blocking_threads(),
+            Some(8)
+        );
+        for p in [HardwareProfile::Desktop, HardwareProfile::HomelabNas] {
+            assert_eq!(p.runtime_worker_threads(), None);
+            assert_eq!(p.runtime_max_blocking_threads(), None);
+        }
+    }
+}

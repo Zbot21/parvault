@@ -3,7 +3,13 @@
 set -eu
 
 REPO="${PARVAULT_REPO:-Zbot21/parvault}"
-INSTALL_DIR="${PARVAULT_INSTALL_DIR:-/usr/local/bin}"
+# OpenWrt keeps binaries in /usr/bin, where the procd service (deploy/router-soc) runs them.
+if [ -f /etc/openwrt_release ]; then
+  DEFAULT_INSTALL_DIR=/usr/bin
+else
+  DEFAULT_INSTALL_DIR=/usr/local/bin
+fi
+INSTALL_DIR="${PARVAULT_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 # The default version is this release's own tag: every ParVault release is a pre-release, so
 # GitHub has no "Latest" release to resolve. gen_metrics.sh fails if it differs from Cargo.toml's
 # version, and release.yml fails if it differs from the tag. PARVAULT_VERSION=latest asks GitHub
