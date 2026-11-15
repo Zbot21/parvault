@@ -99,3 +99,32 @@ Schema `parvault.config-dump/1` (`docs/schemas/config-dump-1.json`):
 - `unknown_file_keys` counts file keys that are no config key, never naming them: a mistyped secret key (`device_sealing_pasphrase`) shows only as a count.
 
 The renderer iterates one classification table (`config_dump::DUMP_SCHEMA`) and nothing else. `tests/config_dump.rs` fails on an unclassified config key or argument, and on an environment read under `src/` that is not a table row.
+
+## 5. `net probe --force-direct`
+
+```text
+parvault net probe --peer <MULTIADDR/p2p/ID | PEER_ID> --force-direct [--timeout-ms 10000] [--no-rpc]
+```
+
+One connection attempt against a named peer, with a JSON result: the primitive each VF-6 matrix cell runs.
+
+- `--peer`: a multiaddr ending in `/p2p/<id>`, or (outside lab mode) a bare PeerId resolved from `known_peers.json`; zero or more than one pinned address is refused. In lab mode a bare PeerId and a name are refused, so the probe reads no state file and resolves no name.
+- `--force-direct` is required in `v0.5.4` (`--force-relay` and an `auto` mode come with the relay, `v0.5.9`; today clap rejects `--force-relay`, exit `2`).
+- `--timeout-ms` (`100..=60000`, default `10000`) covers the dial, the upgrade and the RPC. `--no-rpc` skips the RPC.
+
+What it does, and nothing else: it runs before any identity, key or data-dir work, with an ephemeral Ed25519 identity (it pins nothing and writes no file). It builds a client swarm with mDNS off and no listener (under lab mode the dial gate allows only the target), dials exactly one address once (no retry, no other address, no address from a behaviour), and on success sends one ping (its RTT) and, unless `--no-rpc`, one public `QueryNodeStatus` (the first-response time). Then it exits.
+
+Output: one JSON document on stdout (`docs/schemas/net-probe-1.json`, schema `parvault.net-probe/1`); human text goes to stderr only. No remote-supplied string appears in it.
+
+```json
+{"schema":"parvault.net-probe/1","version":"0.5.4","mode":"force-direct","peer_id":"12D3KooW...","addr":"/ip4/10.9.0.2/tcp/4001/p2p/12D3KooW...","transport":"tcp","result":"connected","path":"direct","reason":"ok","timings_us":{"established":1830,"ping_rtt":410,"first_response":2950},"local":{"nat_status":"unknown"},"relay":null,"started_unix_ms":1794787200000}
+```
+
+- `result`: `connected`, `failed` (the attempt ran and did not connect) or `error` (no attempt was made).
+- `reason`: a traversal reason (`docs/METRICS.md`) for `connected` and `failed`; a reason code for `error`.
+- A timing is `null` when its step did not run. An RPC failure after a connection keeps `connected` and adds `"rpc_error"`.
+- `nat_status` is `unknown` and `relay` is `null` until `v0.5.9`.
+
+Exit codes: `0` connected (RPC ok or skipped), `1` failed, `4` connected but the RPC failed, `3` error, `2` usage error (no JSON).
+
+Refusal codes (`probe::probe_target_decision`, Kani `proof_probe_target_requires_peer_id_and_direct`): `reject.probe_mode_required`, `reject.probe_peer_id_required` (Noise must authenticate a named peer), `reject.probe_relay_addr_forced_direct`, `reject.probe_peer_unknown`, `reject.probe_ambiguous_peer`, `reject.probe_bare_peer_id_lab`, and in lab mode `reject.lab_dns_addr`.

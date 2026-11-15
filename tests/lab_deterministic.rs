@@ -449,8 +449,8 @@ fn pin_known_peer(dir: &Path, pid: &PeerId, target: &str) -> Vec<u8> {
 fn deterministic_empty_bootstrap_no_scan() {
     let (root, dir) = prepare("noscan");
     let x = CountingListener::bind();
-    let fake = node_identity_libp2p_peer_id(&NodeIdentity::generate()).unwrap();
-    let before = pin_known_peer(&dir, &fake, &x.multiaddr());
+    let planted = node_identity_libp2p_peer_id(&NodeIdentity::generate()).unwrap();
+    let before = pin_known_peer(&dir, &planted, &x.multiaddr());
     let listen = lab_listen();
     let toml = lab_toml(root.path(), "");
     let cmd = daemon_cmd(&dir, &toml, &listen);
@@ -756,8 +756,8 @@ fn folder_command_in_lab_mode_dials_no_state_file_peer() {
     let (root, dir) = prepare("folder");
     let x = CountingListener::bind();
     let y = CountingListener::bind();
-    let fake = node_identity_libp2p_peer_id(&NodeIdentity::generate()).unwrap();
-    pin_known_peer(&dir, &fake, &x.multiaddr());
+    let planted = node_identity_libp2p_peer_id(&NodeIdentity::generate()).unwrap();
+    pin_known_peer(&dir, &planted, &x.multiaddr());
     let seed_pid = node_identity_libp2p_peer_id(&NodeIdentity::generate()).unwrap();
     let folder = root.path().join("folder");
     std::fs::create_dir_all(&folder).unwrap();

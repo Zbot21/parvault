@@ -10,6 +10,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [`0.5.4`] - 2026-11-15
+
+Lab instrumentation (NEW-3, NEW-4, NEW-5; `docs/LAB_MODE.md`, `docs/METRICS.md`).
+
+### Added
+- **Deterministic lab mode (`[lab] deterministic = true`, `--lab-deterministic`).** Every listener needs a fixed port and an IP literal that is not unspecified. The dial set is fixed (`bootstrap_peers` ∪ `lite_seed_addr` ∪ `[lab] relays`, IP-literal TCP or QUIC addresses ending in `/p2p/`), and both swarms refuse every other dial, whatever started it: `LabDialTransport` checks every dialled address before a socket opens, and `TraversalGate` (the first behaviour) checks pending and established dials. Lab mode turns mDNS, the LAN beacon, the LAN registry, `known_peers.json`, zero-config resolution, WAN DDNS, trackers and onion relay forwards off, and gives Kademlia and identify no learned address. `discover`, `pair` and `join` exit 3. An explicit setting that turns a side channel on is refused with the key and its source. Codes: `reject.lab_*`. `[lab] relays` is required (it may be empty); the relay client of `v0.5.9` reads only it.
+- **`parvault config dump`, `daemon start --dump-config`, `up --dump-config`** (`parvault.config-dump/1`, `docs/schemas/config-dump-1.json`). They print the effective configuration with each value's source (`default`, `profile`, `file`, `env:<NAME>`, `flag:--<name>`, `lab`), byte-stable, and exit without binding, contacting or creating anything; they read only the config file. Secrets print only `{"set", "source"}`; URLs lose their userinfo; unknown file keys are a count. The daemon logs `config_digest=` and serves it in `/api/v1/health`.
+- **`GET /metrics` on the status listener** (Prometheus text `0.0.4`, `docs/schemas/traversal-metrics-1.txt`): per-attempt traversal outcomes by origin, path, transport and reason, inbound connections, connect-time histogram, open connections, status refusals by code, and build info; 203 pre-registered series with no identifier in any label. It is behind the status page's read-only token and is decided at the edge alone (no gateway engine check; the counters are in-process).
+- **`parvault net probe --force-direct`** (`parvault.net-probe/1`, `docs/schemas/net-probe-1.json`): one dial of one address with an ephemeral identity, a ping, and one `QueryNodeStatus`; exit 0/1/4/3. It writes no file.
+- **`--version --verbose`** on every binary prints `debug_assertions: on|off` and `features: <list|none>`.
+- **Debug-only `lab-insecure-metrics` feature** with `--lab-insecure-metrics <IFACE>=<IP:PORT>` (unauthenticated `/metrics`, only on an IP the named interface owns). A release build with it is a compile error; `scripts/check_release_build_env.sh` and `scripts/check_no_insecure_metrics.sh` run in CI and in the release workflow on the published files, with two negative controls.
+
+### Changed
+- **`daemon start` no longer lets a clap default override the config file** for `--listen` and `--enable-quic`: a flag wins only when given (the dump shows a clap default as `default`).
+- **The daemon dials a configured address that names its PeerId for that peer**, so a connection that authenticates as another peer is refused (`WrongPeerId`).
+- **Dial errors keep their cause.** The TCP and QUIC transport errors are flattened so a refused, unreachable or timed-out dial is not reported as a generic error.
+- `StatusSnapshot` gains `config_digest` (the daemon and `parvault-status` of one release share it).
+
+---
+
 ## [`0.5.2`] - 2026-11-15
 
 ### Added
