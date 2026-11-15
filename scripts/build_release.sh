@@ -41,14 +41,18 @@ fi
 export SOURCE_DATE_EPOCH
 
 case "$TARGET" in
-  x86_64-unknown-linux-musl)  CC=x86_64-linux-gnu-gcc;  AR=ar ;;
-  aarch64-unknown-linux-musl) CC=aarch64-linux-gnu-gcc; AR=aarch64-linux-gnu-ar ;;
+  x86_64-unknown-linux-musl)  CC=musl-gcc; LD=x86_64-linux-gnu-gcc; AR=ar ;;
+  aarch64-unknown-linux-musl) CC=aarch64-linux-gnu-gcc; LD=aarch64-linux-gnu-gcc; AR=aarch64-linux-gnu-ar ;;
   *) echo "build_release.sh: unsupported target $TARGET" >&2; exit 2 ;;
 esac
-command -v "$CC" >/dev/null || { echo "build_release.sh: $CC not found (use deploy/Dockerfile.build)" >&2; exit 2; }
+for t in "$CC" "$LD" "$AR"; do
+  command -v "$t" >/dev/null || { echo "build_release.sh: $t not found (use deploy/Dockerfile.build)" >&2; exit 2; }
+done
 T_UP=$(tr 'a-z-' 'A-Z_' <<<"$TARGET"); T_LO=${TARGET//-/_}
-# One explicit C compiler and linker per target (rustc's self-contained musl CRT, gcc as driver).
-export "CARGO_TARGET_${T_UP}_LINKER=$CC" "CC_${T_LO}=$CC" "AR_${T_LO}=$AR"
+# One explicit C compiler and linker per target. C (ring) builds against musl headers on x86_64
+# (musl-gcc) and with the GNU cross gcc on aarch64; rustc links with its self-contained musl CRT
+# and gcc as the driver on both.
+export "CARGO_TARGET_${T_UP}_LINKER=$LD" "CC_${T_LO}=$CC" "AR_${T_LO}=$AR"
 
 # Paths that reach the binary: the checkout, the registry sources under CARGO_HOME, and OUT_DIRs
 # under the target dir. On a match rustc applies the last remap given, so the most specific
