@@ -42,7 +42,7 @@ path = "src/lib.rs"
 [features]
 default = ["daemon-runtime", "vfs", "status-ui"]
 # The full daemon: tokio, libp2p and everything that drives the ring (item 3, L-48).
-daemon-runtime = ["ipc-client", "status-ui", "dep:tokio", "dep:libp2p", "dep:async-trait"]
+daemon-runtime = ["ipc-client", "status-ui", "dep:tokio", "dep:libp2p", "dep:async-trait", "dep:either"]
 # The gateway socket client, wire types and client-side crypto: what a plugin links. No tokio or libp2p.
 ipc-client = []
 vfs = ["ipc-client"]
@@ -58,6 +58,8 @@ flags = { lib = true }
 
 [dependencies]
 tokio = { version = "1.40", optional = true, features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal"] }
+# The transport error shape libp2p-core 0.42 builds (Either); named to classify dial errors (v0.5.4).
+either = { version = "1.13", optional = true }
 libp2p = { version = "0.54", optional = true, features = [
     "tokio",
     "gossipsub",

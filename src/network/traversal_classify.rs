@@ -18,6 +18,50 @@ use libp2p::Multiaddr;
 use std::error::Error as StdError;
 use std::io;
 
+/// An upgrade (security or multiplexer negotiation) failed after the TCP connection opened: the
+/// remote was reached. NEW-3 counts it as `noise_failed`.
+#[derive(Debug)]
+pub struct UpgradeFailed(pub String);
+
+impl std::fmt::Display for UpgradeFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "connection upgrade failed: {}", self.0)
+    }
+}
+
+impl StdError for UpgradeFailed {}
+
+/// The TCP stack's error (`Either<Either<tcp io::Error, security>, multiplexer>` in libp2p-core
+/// 0.42) as one `io::Error`: the TCP error itself, or an [`UpgradeFailed`]. `Either`'s
+/// `source()` skips the error it wraps, so without this the TCP kind is unreachable.
+pub fn flatten_tcp_stack_error<A, B>(
+    e: either::Either<either::Either<io::Error, A>, B>,
+) -> io::Error
+where
+    A: StdError,
+    B: StdError,
+{
+    match e {
+        either::Either::Left(either::Either::Left(tcp)) => tcp,
+        either::Either::Left(either::Either::Right(sec)) => {
+            io::Error::other(UpgradeFailed(sec.to_string()))
+        }
+        either::Either::Right(mux) => io::Error::other(UpgradeFailed(mux.to_string())),
+    }
+}
+
+/// The TCP-or-QUIC transport's error (`Either<tcp io::Error, quic::Error>`) as one `io::Error`
+/// whose inner error is downcastable.
+pub fn flatten_or_error<B>(e: either::Either<io::Error, B>) -> io::Error
+where
+    B: StdError + Send + Sync + 'static,
+{
+    match e {
+        either::Either::Left(tcp) => tcp,
+        either::Either::Right(other) => io::Error::other(other),
+    }
+}
+
 /// `relayed` iff the address has `/p2p-circuit`; `quic` iff it has `/quic-v1` (else `tcp`).
 pub fn classify_addr(addr: &Multiaddr) -> (PathKind, TransportKind) {
     let mut path = PathKind::Direct;
@@ -51,7 +95,8 @@ pub fn classify_error_chain(err: &(dyn StdError + 'static)) -> TraversalReason {
         if e.downcast_ref::<LabDialDenied>().is_some() {
             return TraversalReason::Denied;
         }
-        if e.downcast_ref::<libp2p::noise::Error>().is_some()
+        if e.downcast_ref::<UpgradeFailed>().is_some()
+            || e.downcast_ref::<libp2p::noise::Error>().is_some()
             || e.downcast_ref::<libp2p::core::upgrade::NegotiationError>()
                 .is_some()
         {
@@ -240,6 +285,52 @@ mod tests {
             TransportUnsupported
         );
         assert_eq!(classify_error_chain(&io::Error::other("x")), Other);
+    }
+
+    /// Real dials through the crate's own transport stack (TCP and TCP+QUIC): a closed port is
+    /// `refused`, and a listener that accepts and closes is `noise_failed` (the upgrade failed
+    /// after the remote was reached).
+    #[test]
+    fn real_dial_errors_classify() {
+        use libp2p::futures::StreamExt;
+        fn dial_reason(quic: bool, addr: Multiaddr) -> TraversalReason {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut sw = crate::network::build_mesh_client_swarm(
+                    libp2p::identity::Keypair::generate_ed25519(),
+                    quic,
+                )
+                .unwrap();
+                sw.dial(addr).unwrap();
+                loop {
+                    if let libp2p::swarm::SwarmEvent::OutgoingConnectionError { error, .. } =
+                        sw.select_next_some().await
+                    {
+                        return classify_dial_error(&error).unwrap().2;
+                    }
+                }
+            })
+        }
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        for quic in [false, true] {
+            let a: Multiaddr = format!("/ip4/127.0.0.1/tcp/{closed}").parse().unwrap();
+            assert_eq!(dial_reason(quic, a), Refused, "quic={quic}");
+        }
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                drop(s);
+            }
+        });
+        let a: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+        assert_eq!(dial_reason(false, a), NoiseFailed);
     }
 
     #[test]

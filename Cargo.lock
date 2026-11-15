@@ -2293,6 +2293,7 @@ dependencies = [
  "chacha20poly1305",
  "clap",
  "ed25519-dalek",
+ "either",
  "fips203",
  "fips204",
  "hex",

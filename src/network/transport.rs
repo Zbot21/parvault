@@ -121,11 +121,13 @@ fn build_swarm(
         .upgrade(Version::V1Lazy)
         .authenticate(noise::Config::new(&keypair)?)
         .multiplex(yamux::Config::default())
+        .map_err(crate::network::traversal_classify::flatten_tcp_stack_error)
         .map(|(p, c), _| (p, StreamMuxerBox::new(c)));
     let inner = if enable_quic {
         let quic = libp2p::quic::tokio::Transport::new(libp2p::quic::Config::new(&keypair))
             .map(|(p, c), _| (p, StreamMuxerBox::new(c)));
         tcp.or_transport(quic)
+            .map_err(crate::network::traversal_classify::flatten_or_error)
             .map(|either, _| either.into_inner())
             .boxed()
     } else {
