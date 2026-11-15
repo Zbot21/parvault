@@ -142,7 +142,7 @@ docker build -t "$IMG_ACCEPT" "$BUILD_CTX"
 FUSE_WAIVED="parvault-vfs-fuse-${RUN_ID}"
 FUSE_WAIVER_REASON="stage 12c FUSE harness: mount(2) of /dev/fuse needs CAP_SYS_ADMIN (gate harness, not a shipped image)"
 assert_nonroot() {
-    local need_daemon=0 c top root_rows img caps
+    local need_daemon=0 c top root_rows img caps checked=()
     if [ "${1:-}" = "--daemon" ]; then need_daemon=1; shift; fi
     for c in "$@"; do
         if [ "$c" = "$FUSE_WAIVED" ]; then
@@ -172,8 +172,9 @@ assert_nonroot() {
             echo "$top"
             exit 1
         fi
+        checked+=("$c")
     done
-    echo "B-106: non-root verified in: $*"
+    [ "${#checked[@]}" -eq 0 ] || echo "B-106: non-root verified in: ${checked[*]}"
 }
 
 echo "=== [2/12] Creating isolated Docker bridge network (per-run 172.28.X.0/24) ==="
