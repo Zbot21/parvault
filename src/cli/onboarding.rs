@@ -37,8 +37,8 @@ pub(crate) async fn discover(env: CliEnv, command: Commands) -> anyhow::Result<(
         Vec::new()
     };
 
-    let mut known_store = KnownPeersStore::load(&cfg.data_dir);
-    known_store.upsert_discovered(&lan_found);
+    // B-52: the cards to pin, written once at the end through `KnownPeersStore::update`.
+    let mut wan_pins: Vec<(String, String, String, String)> = Vec::new();
 
     let mut entries: Vec<DiscoverOutputEntry> = lan_found
         .iter()
@@ -68,12 +68,12 @@ pub(crate) async fn discover(env: CliEnv, command: Commands) -> anyhow::Result<(
                         } else {
                             format!("{raw_maddr}/p2p/{}", card.libp2p_peer_id)
                         };
-                        known_store.upsert_pinned_multiaddr(
-                            &card.libp2p_peer_id,
-                            &pinned,
-                            Some(&card.node_label),
-                            Some(&card.role),
-                        );
+                        wan_pins.push((
+                            card.libp2p_peer_id.clone(),
+                            pinned.clone(),
+                            card.node_label.clone(),
+                            card.role.clone(),
+                        ));
                         entries.push(DiscoverOutputEntry {
                             peer_id: card.libp2p_peer_id,
                             device_peer_id: card.device_peer_id,
@@ -105,12 +105,12 @@ pub(crate) async fn discover(env: CliEnv, command: Commands) -> anyhow::Result<(
                             continue;
                         }
                         if let Some(pinned) = card.pinned_multiaddr() {
-                            known_store.upsert_pinned_multiaddr(
-                                &card.libp2p_peer_id,
-                                &pinned,
-                                Some(&card.node_label),
-                                Some(&card.role),
-                            );
+                            wan_pins.push((
+                                card.libp2p_peer_id.clone(),
+                                pinned.clone(),
+                                card.node_label.clone(),
+                                card.role.clone(),
+                            ));
                             entries.push(DiscoverOutputEntry {
                                 peer_id: card.libp2p_peer_id,
                                 device_peer_id: card.device_peer_id,
@@ -127,7 +127,15 @@ pub(crate) async fn discover(env: CliEnv, command: Commands) -> anyhow::Result<(
         }
     }
 
-    let _ = known_store.save(&cfg.data_dir);
+    // B-52: a damaged `known_peers.json` is refused with its `reject.known_peers_*` code and kept;
+    // the command fails closed instead of reporting peers it could not pin.
+    KnownPeersStore::update(&cfg.data_dir, |store| {
+        store.upsert_discovered(&lan_found);
+        for (pid, maddr, label, role) in &wan_pins {
+            store.upsert_pinned_multiaddr(pid, maddr, Some(label.as_str()), Some(role.as_str()));
+        }
+    })
+    .inspect_err(parvault::network::discovery::log_known_peers_write_refused)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&entries)?);
