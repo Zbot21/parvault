@@ -137,6 +137,7 @@ Refusal codes (`probe::probe_target_decision`, Kani `proof_probe_target_requires
 | :-- | :-- | :-- |
 | LAB-CONFLICT | claim | an explicit side-channel setting is refused (`reject.lab_config_conflict`) |
 | LAB-PORT | claim | port 0 is refused (`reject.lab_ephemeral_port`) |
+| LAB-UNSPEC-V4M | claim | the v4-mapped wildcard `[::ffff:0.0.0.0]` is refused like `0.0.0.0` (`reject.lab_unspecified_bind`); a v4-mapped specific address is accepted |
 | LAB-DNS | claim | a name in the dial set is refused (`reject.lab_dns_addr`) |
 | LAB-SIDE | claim | `discover` exits 3 in lab mode (`reject.lab_side_channel`) |
 | LAB-DIAL | claim | a learned address is never dialled (`reject.lab_dial_outside_set`) |

@@ -619,22 +619,37 @@ fn insecure_listener_iface_mismatch_refused() {
     gate_ran("traversal_metrics::insecure_listener_iface_mismatch_refused");
 }
 
-/// A link-local IPv6 address of a non-loopback interface, read from `/proc/net/if_inet6` (the
-/// kernel's own list, independent of `getifaddrs`): `(iface, address, ifindex)`.
+/// A usable link-local IPv6 address, read from `/proc/net/if_inet6` (the kernel's own list,
+/// independent of `getifaddrs`): `(iface, address, ifindex)`. Only a settled address (not
+/// tentative, DAD-failed or deprecated, so it can be bound), and the default-route interface's
+/// first: on a host running containers, veth interfaces come and go during the test.
 fn link_local_v6() -> (String, std::net::Ipv6Addr, u32) {
+    // IFA_F_DADFAILED | IFA_F_DEPRECATED | IFA_F_TENTATIVE
+    const UNSETTLED: u32 = 0x08 | 0x20 | 0x40;
+    let route = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+    let default_iface: Option<String> = route.lines().skip(1).find_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        (f.get(1) == Some(&"00000000")).then(|| f[0].to_string())
+    });
     let table = std::fs::read_to_string("/proc/net/if_inet6").expect("/proc/net/if_inet6");
-    table
+    let mut found: Vec<(String, std::net::Ipv6Addr, u32)> = table
         .lines()
         .filter_map(|l| {
             let f: Vec<&str> = l.split_whitespace().collect();
             let bits = u128::from_str_radix(f.first()?, 16).ok()?;
             let idx = u32::from_str_radix(f.get(1)?, 16).ok()?;
+            let flags = u32::from_str_radix(f.get(4)?, 16).ok()?;
             let ip = std::net::Ipv6Addr::from(bits);
             let name = f.get(5)?.to_string();
-            (ip.segments()[0] & 0xffc0 == 0xfe80 && name != "lo").then_some((name, ip, idx))
+            (ip.segments()[0] & 0xffc0 == 0xfe80 && name != "lo" && flags & UNSETTLED == 0)
+                .then_some((name, ip, idx))
         })
+        .collect();
+    found.sort_by_key(|(name, _, _)| Some(name) != default_iface.as_ref());
+    found
+        .into_iter()
         .next()
-        .expect("this test needs a link-local IPv6 address on a non-loopback interface")
+        .expect("this test needs a settled link-local IPv6 address on a non-loopback interface")
 }
 
 /// METRICS-INSEC link-local (feature build, CodeQL #59 port to `if-addrs`): an `fe80::…%<index>`
