@@ -90,7 +90,7 @@ config = {
         "Volumes": {DATA: {}},
         "ExposedPorts": {"4001/tcp": {}, "4009/udp": {}, "4080/tcp": {}},
         "Healthcheck": {
-            "Test": ["CMD", pv, "--data-dir", DATA, "gateway", "health", "--socket", SOCK],
+            "Test": ["CMD", pv, "--data-dir", DATA, "gateway", "--socket", SOCK, "health"],
             "Interval": 30_000_000_000,
             "Timeout": 10_000_000_000,
             "StartPeriod": 60_000_000_000,

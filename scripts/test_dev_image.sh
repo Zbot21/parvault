@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tests a dev container archive (B-131) the way deploy/synology/compose.yaml runs it: docker load,
-# then run with a fresh named volume, cap_drop ALL, no-new-privileges, a read-only root and tmpfs
+# `wot init` once, then run with a fresh named volume, cap_drop ALL, no-new-privileges, a read-only root and tmpfs
 # /run/parvault and /tmp. Checks that every process runs as 65532, the data volume is owned by
 # 65532, and the healthcheck turns healthy. Needs Docker; the archive's arch must match the host.
 # Usage: scripts/test_dev_image.sh <parvault-image-<arch>-dev.tar>
@@ -16,10 +16,14 @@ TAG=$(docker load -i "$TAR" | sed -n 's/^Loaded image: //p')
 echo "loaded $TAG ($(docker image inspect -f '{{.Architecture}} {{.Id}}' "$TAG"))"
 [[ "$(docker image inspect -f '{{.Config.User}}' "$TAG")" == "65532:65532" ]] || fail "image user is not 65532:65532"
 
-docker run -d --name "$NAME" -v "$VOL:/var/lib/parvault" \
-  --cap-drop ALL --security-opt no-new-privileges:true --read-only \
-  --tmpfs /run/parvault:uid=65532,gid=65532,mode=0700 --tmpfs /tmp:mode=1777 \
-  "$TAG" >/dev/null
+HARD=(--cap-drop ALL --security-opt no-new-privileges:true --read-only
+  --tmpfs /run/parvault:uid=65532,gid=65532,mode=0700 --tmpfs /tmp:mode=1777)
+# First run (docs/SYNOLOGY.md step 4): a fresh node must start a ring or join one before `up`.
+docker run --rm -v "$VOL:/var/lib/parvault" "${HARD[@]}" "$TAG" --data-dir /var/lib/parvault wot init \
+  > "/tmp/$NAME-init.log" 2>&1 || { cat "/tmp/$NAME-init.log" >&2; fail "wot init failed"; }
+rm -f "/tmp/$NAME-init.log"
+echo "first run: wot init ok (as 65532, hardened)"
+docker run -d --name "$NAME" -v "$VOL:/var/lib/parvault" "${HARD[@]}" "$TAG" >/dev/null
 
 health=""
 for _ in $(seq 1 60); do
@@ -31,9 +35,9 @@ done
 [[ "$health" == healthy ]] || fail "health is '$health' after 180 s: $(docker inspect -f '{{json .State.Health.Log}}' "$NAME" | tail -c 600)"
 echo "health: healthy ($(docker inspect -f '{{(index .State.Health.Log 0).Output}}' "$NAME" | tr -d '\n' | cut -c1-120))"
 
-uids=$(docker top "$NAME" -eo uid,args | awk 'NR>1 {print $1}' | sort -u)
+uids=$(docker top "$NAME" -eo pid,uid,args | awk 'NR>1 {print $2}' | sort -u)
 [[ "$uids" == 65532 ]] || fail "processes run as uid(s) '$uids', want only 65532"
-echo "processes: uid 65532 only ($(docker top "$NAME" -eo uid,args | awk 'NR>1' | cut -c1-100 | head -3 | tr '\n' ';'))"
+echo "processes: uid 65532 only ($(docker top "$NAME" -eo pid,uid,comm | awk 'NR>1 {print $2" "$3}' | head -3 | tr '\n' ';'))"
 caps=$(awk '/^CapEff/ {print $2}' "/proc/$(docker inspect -f '{{.State.Pid}}' "$NAME")/status")
 [[ "$caps" == 0000000000000000 ]] || fail "effective capabilities $caps, want none"
 echo "capabilities: none (CapEff=$caps)"

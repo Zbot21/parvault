@@ -23,7 +23,21 @@ The signature must say `Good "parvault-dev-build" signature for parvault-dev` wi
 
 Container Manager > Image > Add > Import from file, and pick `parvault-image-amd64-dev.tar`. Or over SSH: `sudo docker load -i parvault-image-amd64-dev.tar`. Either way the result is `parvault:<version>-dev`.
 
-## 3. Create the project
+## 3. Start a ring or join one (first run only)
+
+The daemon refuses to start until the node is in a ring. Over SSH on the NAS, create the data volume and do one of these with the same tag (the volume starts owned by `65532:65532`):
+
+```sh
+IMG=parvault:0.5.3-dev   # the tag you imported
+# This NAS starts a new ring (the first node):
+sudo docker run --rm -v parvault-data:/var/lib/parvault "$IMG" --data-dir /var/lib/parvault wot init
+# Or it joins an existing ring: print its key, get a token from a member, install it.
+sudo docker run --rm -v parvault-data:/var/lib/parvault "$IMG" --data-dir /var/lib/parvault identity
+#   on a ring member: parvault wot invite --peer <that 64-hex key>
+sudo docker run --rm -v parvault-data:/var/lib/parvault "$IMG" --data-dir /var/lib/parvault wot install-chain --token <TOKEN>
+```
+
+## 4. Create the project
 
 1. Make a folder for it, for example `/volume1/docker/parvault`, and copy [`deploy/synology/compose.yaml`](../deploy/synology/compose.yaml) into it.
 2. Set `image:` in it to the tag you imported.
@@ -33,7 +47,7 @@ What the project does:
 
 - Runs as `65532:65532`, with `cap_drop: [ALL]`, `no-new-privileges`, a read-only root, and tmpfs for `/run/parvault` and `/tmp`.
 - Uses host networking, so LAN discovery (UDP 4009) and the mesh port (TCP 4001) work on the NAS's own address.
-- Keeps state in the named volume `parvault-data`, which starts owned by `65532:65532`. If you bind a NAS folder instead, `chown -R 65532:65532` it first.
+- Keeps state in the named volume `parvault-data` (from step 3), which starts owned by `65532:65532`. If you bind a NAS folder instead, `chown -R 65532:65532` it first.
 - Turns healthy once the daemon answers on its gateway socket.
 - Binds the token-gated status page to loopback. To use it from the LAN, change `127.0.0.1:4080` in `command:` to the NAS's LAN address.
 

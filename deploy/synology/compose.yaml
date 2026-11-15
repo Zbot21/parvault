@@ -28,10 +28,11 @@ services:
       - parvault-data:/var/lib/parvault
     healthcheck:
       test: ["CMD", "/usr/local/bin/parvault", "--data-dir", "/var/lib/parvault",
-             "gateway", "health", "--socket", "/run/parvault/parvault.sock"]
+             "gateway", "--socket", "/run/parvault/parvault.sock", "health"]
       interval: 30s
       timeout: 10s
       start_period: 60s
       retries: 3
 volumes:
-  parvault-data: {}
+  parvault-data:
+    name: parvault-data   # fixed name, so the first-run command in docs/SYNOLOGY.md can use it
