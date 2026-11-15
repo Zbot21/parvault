@@ -1004,7 +1004,7 @@ echo "=== [12c/12] Mounted MP4 probe and random seek: /dev/fuse and WebDAV 206, 
 VFS_CTX="$STAGE_DIR/acceptance-vfs"
 rm -rf "$VFS_CTX"
 mkdir -p "$VFS_CTX"
-VFS_TEST_BIN="$(cargo test --release --test vfs_mp4_seek_gate --no-run --message-format=json 2>/dev/null \
+VFS_TEST_BIN="$(cargo test --locked --release --test vfs_mp4_seek_gate --no-run --message-format=json 2>/dev/null \
     | sed -n 's/.*"executable":"\([^"]*vfs_mp4_seek_gate[^"]*\)".*/\1/p' | tail -1)"
 [ -x "$VFS_TEST_BIN" ] || { echo "ERROR: stage 12c: no vfs_mp4_seek_gate test binary"; exit 1; }
 # The test binary is not staged through stage_artifact.sh: the helper stages `--bin` targets

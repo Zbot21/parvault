@@ -20,13 +20,30 @@ Lab instrumentation (NEW-3, NEW-4, NEW-5; `docs/LAB_MODE.md`, `docs/METRICS.md`)
 - **`GET /metrics` on the status listener** (Prometheus text `0.0.4`, `docs/schemas/traversal-metrics-1.txt`): per-attempt traversal outcomes by origin, path, transport and reason, inbound connections, connect-time histogram, open connections, status refusals by code, and build info; 203 pre-registered series with no identifier in any label. It is behind the status page's read-only token and is decided at the edge alone (no gateway engine check; the counters are in-process).
 - **`parvault net probe --force-direct`** (`parvault.net-probe/1`, `docs/schemas/net-probe-1.json`): one dial of one address with an ephemeral identity, a ping, and one `QueryNodeStatus`; exit 0/1/4/3. It writes no file.
 - **`--version --verbose`** on every binary prints `debug_assertions: on|off` and `features: <list|none>`.
-- **Debug-only `lab-insecure-metrics` feature** with `--lab-insecure-metrics <IFACE>=<IP:PORT>` (unauthenticated `/metrics`, only on an IP the named interface owns). A release build with it is a compile error; `scripts/check_release_build_env.sh` and `scripts/check_no_insecure_metrics.sh` run in CI and in the release workflow on the published files, with two negative controls.
+- **Debug-only `lab-insecure-metrics` feature** with `--lab-insecure-metrics <IFACE>=<IP:PORT>` (unauthenticated `/metrics`, only on an IP the named interface owns). A release build with it is a compile error; `scripts/check_release_build_env.sh` runs in CI and at the start of `scripts/build_release.sh`, and `scripts/check_no_insecure_metrics.sh` runs in CI, in `build_release.sh`, in the release workflow before `SHA256SUMS`, and in `scripts/sign_dev_build.sh` on the listed binaries before `ssh-keygen -Y sign`, with two negative controls in CI.
+
+### Security
+- **A bootstrap peer's PeerId is enforced on the daemon's startup dial (B-142).** Released `v0.5.x` dialled each `--peers` / `bootstrap_peers` address as an unknown peer, so an address ending in `/p2p/<id>` connected to whoever answered there, under any identity. The daemon now dials such an address for that PeerId; a connection that authenticates as another peer is refused before any request (`WrongPeerId`), logged as `reject.dial_peer_id_mismatch` and counted as `peer_id_mismatch` (claim B-142). `MeshClient` requests were not affected: they already refuse a mismatched PeerId after the handshake and before sending (`verify_and_pin_peer_id`).
+
+### Fixed
+- **`daemon start` no longer lets a clap default override the config file** for `--listen` and `--enable-quic` (every user, not only lab mode): a config-file `listen_tcp` or `enable_quic` was silently replaced by `/ip4/0.0.0.0/tcp/4001` and `false` when the flag was absent. A flag now wins only when given; the dump shows a clap default as `default`.
 
 ### Changed
-- **`daemon start` no longer lets a clap default override the config file** for `--listen` and `--enable-quic`: a flag wins only when given (the dump shows a clap default as `default`).
-- **The daemon dials a configured address that names its PeerId for that peer**, so a connection that authenticates as another peer is refused (`WrongPeerId`).
 - **Dial errors keep their cause.** The TCP and QUIC transport errors are flattened so a refused, unreachable or timed-out dial is not reported as a generic error.
 - `/api/v1/health` of the daemon gains `config_digest`, added at the status edge; the `StatusSnapshot` IPC frame is unchanged (`parvault-status` does not serve it).
+
+---
+
+## [`0.5.3`] - 2026-11-15
+
+### Added
+- **Reproducible, signed dev builds (L-17, L-113).** The static musl binaries and the router bundle are built twice on a tag, at different paths, inside a build image pinned by digest (`deploy/Dockerfile.build`), and must match byte for byte; PRs that touch build inputs (including the image, sums and scalar-check scripts) build the same outputs, the container archive included, twice (`repro-check.yml`). `rust-toolchain.toml` pins rustc `1.100.0`; every `cargo` build, test, clippy and tree call in the build scripts, workflows and the Docker gate passes `--locked`; every action is pinned by SHA. `verify-dev-signature.yml` fails a published release that has no `SHA256SUMS.sig` or is not a pre-release. Every `v0.5.x` artifact is a **dev build** (`<bin>-<target>-dev`), signed with the dev/test key (`ssh-keygen -Y`, principal `parvault-dev`, namespace `parvault-dev-build`) on the Lead's desktop, never in CI. Release builds and the release key do not exist yet. See `docs/REPRODUCIBLE_BUILDS.md`.
+- **`install.sh` verifies `SHA256SUMS.sig`.** It refuses a signature from any other key, sums changed after signing, a dev signature in the release namespace, and signed sums of another tag. It installs a dev build only with `PARVAULT_ALLOW_DEV_BUILD=1` and an unsigned one only with `PARVAULT_ALLOW_UNSIGNED=1`. With no `ssh-keygen -Y` (OpenWrt, dropbear) it warns that origin, kind and tag are unverified, prints the `dev-allowed-signers` URL and fingerprint, and continues on SHA-256 alone (L-81) unless `PARVAULT_REQUIRE_SIGNATURE=1`; the unsigned first line must still name the tag, and a `release` kind without a verified release signature is refused. `PARVAULT_VERSION=latest` resolves the Latest tag first, refuses one older than the installer, and checks `SHA256SUMS` against it.
+- **Dev container image (B-131).** `parvault:<version>-dev` ships as `parvault-image-amd64-dev.tar` (and `-arm64-`), a `docker load` archive built byte for byte from the reproducible binaries and listed in the signed `SHA256SUMS`. No OS, user `65532:65532`, data in `/var/lib/parvault`, healthcheck through `parvault gateway health`, and no status page unless asked for (the default command has no `--status-http`). `deploy/synology/compose.yaml` is a Container Manager project (host networking for LAN discovery, `cap_drop: [ALL]`, `no-new-privileges`, read-only root, named data volume owned by 65532, status page on loopback); `scripts/gen_metrics.sh` fails if its image tag or the one in `docs/SYNOLOGY.md` is not `parvault:<Cargo.toml version>-dev`; `docs/SYNOLOGY.md` covers verify, import, first run and the project.
+
+### Changed
+- `scripts/repro_proof.sh` keeps a `SOURCE_DATE_EPOCH` that is already set, as `build_release.sh` does, and refuses to run unset in a `pvjob` snapshot copy, whose HEAD is not the source commit.
+- Release binaries are no longer stripped a second time; the `soc` profile strips them. The x86_64 linker is now set explicitly, as the aarch64 one was. The router bundle is a deterministic tarball.
 
 ---
 

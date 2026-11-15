@@ -1,0 +1,58 @@
+name: Verify Dev Signature — SHA256SUMS.sig on a published release
+
+# L-113: the dev key never reaches CI, so CI cannot sign; the Lead signs before publishing. This
+# job verifies SHA256SUMS.sig against security/dev-allowed-signers, checks that the signed first
+# line names the tag, and checks every asset against SHA256SUMS. A published release must be a
+# pre-release (every v0.5.x build is a dev build) and must carry the signature, or the job fails.
+# Only a manual run on a draft without a signature passes with a notice.
+on:
+  release:
+    types: [published, edited]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to verify
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      EVENT: ${{ github.event_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Published releases are dev pre-releases
+        run: |
+          read -r draft pre < <(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease --jq '"\(.isDraft) \(.isPrerelease)"')
+          echo "DRAFT=$draft" >> "$GITHUB_ENV"
+          if [ "$draft" != true ] && [ "$pre" != true ]; then
+            echo "::error::$TAG is published but not a pre-release; every v0.5.x build is a dev build (L-113)"
+            exit 1
+          fi
+      - name: Download the release assets
+        run: |
+          mkdir dl
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dl
+          ls -l dl
+      - name: Verify SHA256SUMS.sig (when present) and every asset
+        run: |
+          cd dl
+          if [ ! -f SHA256SUMS.sig ]; then
+            if [ "$EVENT" = workflow_dispatch ] && [ "$DRAFT" = true ]; then
+              echo "::notice::draft $TAG has no SHA256SUMS.sig yet; nothing to verify"
+              exit 0
+            fi
+            echo "::error::$TAG is published without SHA256SUMS.sig; sign SHA256SUMS before publishing (L-113)"
+            exit 1
+          fi
+          ssh-keygen -Y verify -f ../security/dev-allowed-signers -I parvault-dev -n parvault-dev-build \
+            -s SHA256SUMS.sig < SHA256SUMS
+          test "$(head -n1 SHA256SUMS)" = "# parvault $TAG dev"
+          grep -v '^#' SHA256SUMS | sha256sum -c --strict -

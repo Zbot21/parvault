@@ -11,7 +11,7 @@ SETS=("ipc-client" "vfs" "status-ui" "ipc-client,vfs" "vfs,status-ui" "ipc-clien
 BANNED='^(tokio|libp2p[a-z0-9_-]*|mio|quinn[a-z0-9_-]*)$'
 fail=0
 for set in "${SETS[@]}"; do
-  crates=$("$CARGO" tree -e normal --target all --no-default-features --features "$set" \
+  crates=$("$CARGO" tree --locked -e normal --target all --no-default-features --features "$set" \
     --prefix none --format '{p}' 2>/dev/null | awk '{print $1}' | sort -u) \
     || { echo "[ERROR] cargo tree failed for --features $set" >&2; exit 2; }
   [[ -n "$crates" ]] || { echo "[ERROR] empty dependency tree for --features $set" >&2; exit 2; }
