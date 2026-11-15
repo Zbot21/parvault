@@ -41,7 +41,7 @@ Authorized(Order)   <=> |ValidSigners(Order)| >= M  AND  now_ms <= expires_at_ms
   | :-- | :-- | :-- |
   | Private-mode daemon | ring genesis | `council::tests::scope_root_follows_the_mode`, `f08_*`, equivalence `broadcast_eviction_order` |
   | Homelab seed | ring genesis | equivalence `broadcast_eviction_order` |
-  | Public-mode daemon | the pinned tracker admin key that rooted its installed manifest (while still pinned); with none installed, the first pinned key in `known_peers.json` order (sorted by tracker address), else the legacy `pinned_tracker_admins.json` | `scope_root_follows_the_mode`, `public_scope_root_follows_the_installed_manifest`, `zero_config` test 7 |
+  | Public-mode daemon | the pinned tracker admin key that rooted its installed manifest (while still pinned); with none installed, the first pinned key in `known_peers.json` order (sorted by tracker address), else the legacy `pinned_tracker_admins.json`; no root while either store does not load (B-52, B-123: never a fall-back to the legacy pins on a damaged `known_peers.json`) | `scope_root_follows_the_mode`, `public_scope_root_follows_the_installed_manifest`, `zero_config` test 7 |
   | Public seed | its own tracker admin key | equivalence (a genesis-rooted council is not its council: `[true, true, false]`), `zero_config` test 7 |
 
   A hybrid node (in a ring and in public mode) uses the public row: public mode wins, so one node has one council. A private ring is never governed by a tracker key.
