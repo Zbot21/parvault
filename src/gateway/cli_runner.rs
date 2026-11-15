@@ -9,7 +9,7 @@ use crate::crypto::{write_secret_file_atomic_0600, LocalFileKeystore, MasterKey}
 use crate::gateway::{GatewayConfig, DEFAULT_IPC_SOCKET_PATH, GATEWAY_STRIPE_BYTES};
 use clap::{Args, Subcommand};
 use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -414,8 +414,7 @@ pub fn execute_token_cli(action: TokenAction, data_dir: &Path) -> anyhow::Result
             json,
         } => {
             let root_key = load_or_create_macaroon_root_key(data_dir, macaroon_key_hex.as_deref())?;
-            let mut nonce_id = [0u8; 32];
-            OsRng.fill_bytes(&mut nonce_id);
+            let nonce_id: [u8; 32] = OsRng.gen();
             let issuer_fp = derive_key_id_bytes(&key_id);
             let caveats = collect_cli_caveats(
                 manifest_hex.as_deref(),
@@ -780,8 +779,7 @@ pub async fn execute_gateway_cli(
                         let _ = std::fs::remove_dir_all(&self.0);
                     }
                 }
-                let mut nonce = [0u8; 6];
-                OsRng.fill_bytes(&mut nonce);
+                let nonce: [u8; 6] = OsRng.gen();
                 let tmp_dir = std::env::temp_dir().join(format!(
                     "parvault_gw_selftest_{}_{}",
                     std::process::id(),

@@ -782,9 +782,8 @@ pub(crate) fn spawn_wan_and_tracker_announce(task_cfg: WanAnnounceTaskConfig) {
 fn builtin_vfs_read_token(
     root_key: &[u8; 32],
 ) -> anyhow::Result<parvault::capabilities::CapabilityMacaroon> {
-    use rand::RngCore;
-    let mut nonce = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    use rand::Rng;
+    let nonce: [u8; 32] = rand::rngs::OsRng.gen();
     parvault::capabilities::CapabilityMacaroon::mint(
         root_key,
         nonce,

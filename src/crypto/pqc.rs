@@ -15,7 +15,7 @@ use fips204::ml_dsa_65;
 use fips204::traits::{SerDes as DsaSerDes, Signer as DsaSigner, Verifier as DsaVerifier};
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Sha512};
 use unicode_normalization::UnicodeNormalization;
@@ -124,8 +124,7 @@ impl HybridKemKeypair {
                 }
             }
         }
-        let mut x25519_seed = [0u8; 32];
-        OsRng.fill_bytes(&mut x25519_seed);
+        let mut x25519_seed: [u8; 32] = OsRng.gen();
         let x25519_secret = X25519Secret::from(x25519_seed);
         let x25519_pub = X25519Public::from(&x25519_secret).to_bytes();
         let (ek, dk) = ml_kem_768::KG::try_keygen()
@@ -532,8 +531,7 @@ pub struct PqVaultMasterKey([u8; 64]);
 
 impl PqVaultMasterKey {
     pub fn generate() -> Self {
-        let mut bytes = [0u8; 64];
-        OsRng.fill_bytes(&mut bytes);
+        let bytes: [u8; 64] = std::array::from_fn(|_| OsRng.gen());
         Self(bytes)
     }
 

@@ -7,7 +7,7 @@ use bincode::Options;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroize;
@@ -56,8 +56,7 @@ pub fn deserialize_bounded<T: serde::de::DeserializeOwned>(
 
 /// Generates a fresh 32-byte cryptographic file salt (`FileSalt`) for stripe nonce derivation using `OsRng`.
 pub fn generate_file_salt() -> [u8; SALT_LEN] {
-    let mut salt = [0u8; SALT_LEN];
-    OsRng.fill_bytes(&mut salt);
+    let salt: [u8; SALT_LEN] = OsRng.gen();
     salt
 }
 
@@ -215,8 +214,7 @@ pub fn encrypt_manifest(
     manifest_subkey.zeroize();
     let cipher = cipher?;
 
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce_bytes: [u8; NONCE_LEN] = OsRng.gen();
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher

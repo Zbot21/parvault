@@ -11,7 +11,7 @@ use bincode::Options;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -97,8 +97,7 @@ pub fn load_or_generate_tracker_admin_identity(
     if seed_path.exists() {
         read_tracker_admin_seed(&seed_path)
     } else {
-        let mut seed = [0u8; 32];
-        OsRng.fill_bytes(&mut seed);
+        let mut seed: [u8; 32] = OsRng.gen();
         write_secret_file_atomic_0600(&seed_path, &seed)?;
         let id = NodeIdentity::from_seed(seed);
         seed.zeroize();
@@ -215,8 +214,7 @@ impl SignedBadActorEvictionOrder {
         expires_at_ms: u64,
         council_epoch: u64,
     ) -> Self {
-        let mut order_id = [0u8; 32];
-        OsRng.fill_bytes(&mut order_id);
+        let order_id: [u8; 32] = OsRng.gen();
         let truncated_reason = truncate_utf8_bytes(reason.into(), MAX_EVICTION_REASON_BYTES);
         let issuer_pubkey = issuer.public_key_bytes();
         let msg = Self::encode_signing_payload(
@@ -852,8 +850,7 @@ impl VerifiableAbuseReport {
         sample_shards: Vec<(u32, Vec<u8>)>,
         submitted_at_ms: u64,
     ) -> Self {
-        let mut report_id = [0u8; 32];
-        OsRng.fill_bytes(&mut report_id);
+        let report_id: [u8; 32] = OsRng.gen();
         let reporter_id_or_contact =
             truncate_utf8_bytes(reporter_id_or_contact.into(), MAX_EVICTION_REASON_BYTES);
         let legal_allegation =
@@ -1466,8 +1463,7 @@ impl PublicTrackerTakedownQueue {
         eviction_engine: &mut PrivacyPreservingEvictionEngine,
         block_store: &BlockStore,
     ) -> Result<(Vec<SignedBadActorEvictionOrder>, EvictionPurgeReport), StorageError> {
-        let mut action_id = [0u8; 32];
-        OsRng.fill_bytes(&mut action_id);
+        let action_id: [u8; 32] = OsRng.gen();
 
         let clean_ref = truncate_utf8_bytes(
             warrant_or_emergency_ref.trim().to_string(),
@@ -1744,8 +1740,7 @@ impl PrivacyPreservingEvictionEngine {
             arr.zeroize();
             wrapped
         } else {
-            let mut arr = [0u8; 32];
-            OsRng.fill_bytes(&mut arr);
+            let mut arr: [u8; 32] = OsRng.gen();
             write_secret_file_atomic_0600(&seed_path, &arr)?;
             let wrapped = EvictionHmacSeed(arr);
             arr.zeroize();
@@ -1805,8 +1800,7 @@ impl PrivacyPreservingEvictionEngine {
     /// Constructs an in-memory `PrivacyPreservingEvictionEngine` seeded from `OsRng` with zero
     /// filesystem directories or files created (`parvault-seed --no-fs` / `--in-memory-mb`).
     pub fn new_in_memory() -> Self {
-        let mut seed = [0u8; 32];
-        OsRng.fill_bytes(&mut seed);
+        let mut seed: [u8; 32] = OsRng.gen();
         let eng = Self::in_memory_from_seed(seed);
         seed.zeroize();
         eng

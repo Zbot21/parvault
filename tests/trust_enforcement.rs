@@ -2143,6 +2143,193 @@ fn b52_corrupt_tracker_pins_run_refused() {
     gate_ran("trust_enforcement::b52_corrupt_tracker_pins_run_refused");
 }
 
+// --- B-52 (QA MED, v0.5.2): no writer pins a peer over a damaged known_peers.json -------------------
+
+/// The three ways `known_peers.json` is damaged (truncated JSON, bytes that are not UTF-8, a
+/// directory where the file belongs), each with its reason code.
+const B52_DAMAGE: [(&str, Option<&[u8]>, &str); 3] = [
+    (
+        "truncated",
+        Some(b"{\"peers\": {\"truncat"),
+        "reject.known_peers_corrupt",
+    ),
+    (
+        "non-utf8",
+        Some(&[0xFF, 0xFE, 0x00, 0x01]),
+        "reject.known_peers_corrupt",
+    ),
+    ("directory", None, "reject.known_peers_unreadable"),
+];
+
+/// Writes damage `bytes` (`None`: a directory holding one operator file) to `known_peers.json`.
+fn b52_damage(dir: &Path, bytes: Option<&[u8]>) {
+    let path = dir.join("known_peers.json");
+    match bytes {
+        Some(b) => std::fs::write(&path, b).unwrap(),
+        None => {
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("keep"), b"operator data").unwrap();
+        }
+    }
+}
+
+/// Asserts `known_peers.json` still holds damage `bytes` exactly.
+fn b52_assert_damage_kept(dir: &Path, bytes: Option<&[u8]>, ctx: &str) {
+    let path = dir.join("known_peers.json");
+    match bytes {
+        Some(b) => assert_eq!(std::fs::read(&path).unwrap(), b, "file changed:\n{ctx}"),
+        None => {
+            assert!(path.is_dir(), "directory replaced:\n{ctx}");
+            assert_eq!(std::fs::read(path.join("keep")).unwrap(), b"operator data");
+        }
+    }
+}
+
+/// Runs `parvault --public --tracker <tracker> status` from a fresh data dir whose
+/// `known_peers.json` holds `damage` (`B52_DAMAGE` entry) or, for `None`, does not exist.
+fn b52_public_tracker_run(
+    label: &str,
+    tracker: &str,
+    damage: Option<Option<&[u8]>>,
+) -> (std::process::Output, PathBuf, TempDir) {
+    let (root, dir, reg, _log) = prepare(label);
+    if let Some(bytes) = damage {
+        b52_damage(&dir, bytes);
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env_remove("PARVAULT_GENESIS_SEED_HEX")
+        .env_remove("PARVAULT_PEERS")
+        .env_remove("PARVAULT_TRACKERS")
+        .env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .env("RUST_LOG", "warn")
+        .env("NO_COLOR", "1")
+        .arg("--data-dir")
+        .arg(&dir)
+        .args([
+            "--no-lan-discovery",
+            "--public",
+            "--tracker",
+            tracker,
+            "status",
+        ])
+        .output()
+        .expect("run parvault --public status");
+    (out, dir, root)
+}
+
+/// A public-bootstrap tracker holding one honest peer's sealed card; returns it and the PeerId.
+fn b52_tracker_with_card(label: &str) -> (Node, String) {
+    let (seed, _admin) = f53_seed(label, None, None, |_| {});
+    let peer = key(0x5B);
+    let card = WanPeerCard::new(
+        &peer,
+        "b52-tracker-peer",
+        "daemon",
+        vec!["/ip4/198.51.100.30/tcp/4001".to_string()],
+        None,
+        None,
+        600,
+        now_ms(),
+    )
+    .unwrap();
+    let pid = card.libp2p_peer_id.clone();
+    let cards = MeshClient::new(peer, Vec::new(), None)
+        .announce_and_discover_public_tracker(&seed.addr, Some(&card))
+        .expect("announce the honest card");
+    assert!(
+        cards.is_empty(),
+        "the announcer skips its own card: {cards:?}"
+    );
+    (seed, pid)
+}
+
+/// B-52 (QA MED) accept (`bin=parvault`): a `--public --tracker` run with a store that loads
+/// (here: none yet) pins the tracker's verified card.
+#[test]
+fn b52_tracker_card_pinned_when_known_peers_loads() {
+    let (seed, pid) = b52_tracker_with_card("b52-tk-a-seed");
+    let (out, dir, _root) = b52_public_tracker_run("b52-tk-a", &seed.addr, None);
+    let text = combined(&out);
+    assert!(!text.contains("reject.known_peers"), "{text}");
+    let after = KnownPeersStore::try_load(&dir).unwrap();
+    assert!(after.peers.contains_key(&pid), "{after:?}\n{text}");
+    gate_ran("trust_enforcement::b52_tracker_card_pinned_when_known_peers_loads");
+}
+
+/// B-52 (QA MED) reject (`bin=parvault`): the same run with a damaged `known_peers.json` (each
+/// of `B52_DAMAGE`) logs the load's `reject.known_peers_*` code and keeps the file as it was, so
+/// no pin is lost and B-123's guard stays armed (`reject.known_peers_damaged` still logged).
+#[test]
+fn b52_tracker_card_not_pinned_over_damaged_known_peers() {
+    let (seed, _pid) = b52_tracker_with_card("b52-tk-r-seed");
+    for (name, bytes, code) in B52_DAMAGE {
+        let (out, dir, _root) =
+            b52_public_tracker_run(&format!("b52-tk-r-{name}"), &seed.addr, Some(bytes));
+        let text = combined(&out);
+        assert!(text.contains(code), "{name}:\n{text}");
+        assert!(
+            text.contains("reject.known_peers_damaged"),
+            "{name}:\n{text}"
+        );
+        b52_assert_damage_kept(&dir, bytes, &text);
+    }
+    gate_ran("trust_enforcement::b52_tracker_card_not_pinned_over_damaged_known_peers");
+}
+
+/// Runs `parvault discover` from `<root>/data`, reading LAN beacons from `reg`.
+fn b52_discover(root: &TempDir, reg: &Path) -> (std::process::Output, PathBuf) {
+    let data = root.path().join("data");
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env("PARVAULT_LAN_REGISTRY_DIR", reg)
+        .env("RUST_LOG", "warn")
+        .env("NO_COLOR", "1")
+        .arg("--data-dir")
+        .arg(&data)
+        .args(["discover", "--timeout-ms", "300", "--port", "0"])
+        .output()
+        .expect("run parvault discover");
+    (out, data)
+}
+
+/// B-52 (QA) accept (`bin=parvault`): `parvault discover` with no `known_peers.json` yet lists
+/// and pins a signed LAN beacon.
+#[test]
+fn b52_discover_pins_when_known_peers_loads() {
+    let root = temp_root("b52-disc-a");
+    let reg = root.path().join("reg");
+    let id = plant_beacon(&reg, &key(0x5C), false);
+    let (out, data) = b52_discover(&root, &reg);
+    let text = combined(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        KnownPeersStore::try_load(&data)
+            .unwrap()
+            .peers
+            .contains_key(&id),
+        "{text}"
+    );
+    gate_ran("trust_enforcement::b52_discover_pins_when_known_peers_loads");
+}
+
+/// B-52 (QA) reject (`bin=parvault`): the same run with a damaged `known_peers.json` (each of
+/// `B52_DAMAGE`) keeps the file and fails closed with the load's code.
+#[test]
+fn b52_discover_refuses_damaged_known_peers() {
+    for (name, bytes, code) in B52_DAMAGE {
+        let root = temp_root(&format!("b52-disc-r-{name}"));
+        let reg = root.path().join("reg");
+        plant_beacon(&reg, &key(0x5C), false);
+        std::fs::create_dir_all(root.path().join("data")).unwrap();
+        b52_damage(&root.path().join("data"), bytes);
+        let (out, data) = b52_discover(&root, &reg);
+        let text = combined(&out);
+        b52_assert_damage_kept(&data, bytes, &text);
+        assert!(text.contains(code), "{name}:\n{text}");
+        assert!(!out.status.success(), "{name}:\n{text}");
+    }
+    gate_ran("trust_enforcement::b52_discover_refuses_damaged_known_peers");
+}
+
 // --- B-123: no tracker-admin TOFU pin, no legacy pin, no council root while known_peers.json is damaged
 
 /// Runs `parvault --public --tracker <tracker> status` from a fresh data dir whose

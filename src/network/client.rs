@@ -7,8 +7,9 @@ use crate::network::behaviour::{
     PlacementEngine, SignedWanRendezvousEntry,
 };
 use crate::network::discovery::{
-    discover_lan_peers, node_identity_libp2p_peer_id, tracker_pin_decision, wan_ddns_card_decision,
-    KnownPeersStore, DEFAULT_LAN_DISCOVERY_PORT,
+    discover_lan_peers, lan_view, log_known_peers_write_refused, node_identity_libp2p_peer_id,
+    pin_discovered_lan_peers, tracker_pin_decision, wan_ddns_card_decision, KnownPeersStore,
+    DEFAULT_LAN_DISCOVERY_PORT,
 };
 use crate::network::transport::build_mesh_client_swarm;
 use crate::network::wan_rendezvous::{
@@ -1268,11 +1269,13 @@ impl MeshClient {
 
         let mut active_addrs = Vec::new();
         if let Some(ref dir) = self.discovery_data_dir {
-            let mut store = KnownPeersStore::load(dir);
-            if !found.is_empty() {
-                store.upsert_discovered(&found);
-                let _ = store.save(dir);
-            }
+            // B-52: pinned through `KnownPeersStore::update`; a damaged file is refused and kept,
+            // and this refresh uses only the verified beacons it found.
+            let mut store = if found.is_empty() {
+                KnownPeersStore::load(dir)
+            } else {
+                pin_discovered_lan_peers(dir, &found).unwrap_or_else(|_| lan_view(&found))
+            };
             if let Some(ref seed) = self.seed_addr {
                 if is_network_peer_addr(seed) {
                     let lan_pids: HashSet<&str> =
@@ -1898,15 +1901,18 @@ impl MeshClient {
         }
     }
 
-    fn ingest_verified_wan_card(&self, card: &WanPeerCard) {
+    /// Adds a verified card to this client's peer maps and pins it in `known_peers.json` through
+    /// [`KnownPeersStore::update`]. A damaged file is refused with its `reject.known_peers_*` code,
+    /// left as it was, and logged once (B-52); the in-memory maps still take the card.
+    fn ingest_verified_wan_card(&self, card: &WanPeerCard) -> anyhow::Result<()> {
         let local_pid_str = node_identity_libp2p_peer_id(&self.identity)
             .ok()
             .map(|p| p.to_string());
         if local_pid_str.as_deref() == Some(card.libp2p_peer_id.as_str()) {
-            return;
+            return Ok(());
         }
         let Some(pinned_maddr) = card.pinned_multiaddr() else {
-            return;
+            return Ok(());
         };
 
         if let Ok(pid) = card.libp2p_peer_id.parse::<PeerId>() {
@@ -1921,15 +1927,17 @@ impl MeshClient {
             disc.insert(pinned_maddr.clone());
         }
         if let Some(ref dir) = self.discovery_data_dir {
-            let mut store = KnownPeersStore::load(dir);
-            store.upsert_pinned_multiaddr(
-                &card.libp2p_peer_id,
-                &pinned_maddr,
-                Some(&card.node_label),
-                Some(&card.role),
-            );
-            let _ = store.save(dir);
+            KnownPeersStore::update(dir, |store| {
+                store.upsert_pinned_multiaddr(
+                    &card.libp2p_peer_id,
+                    &pinned_maddr,
+                    Some(&card.node_label),
+                    Some(&card.role),
+                );
+            })
+            .inspect_err(log_known_peers_write_refused)?;
         }
+        Ok(())
     }
 
     fn enrich_card_with_observed_addr(
@@ -1993,7 +2001,7 @@ impl MeshClient {
                 if !opened.is_expired(now)
                     && local_pid.as_deref() != Some(opened.libp2p_peer_id.as_str())
                 {
-                    self.ingest_verified_wan_card(&opened);
+                    self.ingest_verified_wan_card(&opened)?;
                     peers.push(opened);
                 }
             }
@@ -2108,7 +2116,7 @@ impl MeshClient {
                 tracing::warn!(code, peer = %card.libp2p_peer_id, "refused a WAN DDNS card");
                 continue;
             }
-            self.ingest_verified_wan_card(&card);
+            self.ingest_verified_wan_card(&card)?;
             out.push(card);
         }
         Ok(out)
@@ -3530,5 +3538,100 @@ mod tests {
         client.persist_tracker_admin_pins(&cfg).unwrap();
         let pins: Vec<String> = serde_json::from_slice(&std::fs::read(&legacy).unwrap()).unwrap();
         assert_eq!(pins, vec![hex::encode([0xC4; 32])]);
+    }
+
+    /// B-52 (QA MED, `ingest_verified_wan_card`): a verified tracker or DDNS card is not pinned
+    /// over a damaged `known_peers.json`. The ingest fails with the load's `reject.known_peers_*`
+    /// code, the file is as it was, and the B-123 guard stays armed (the file still does not
+    /// load). Accept side: a healthy store gains the card and keeps its pin. Real files, no mocks.
+    #[test]
+    fn b52_ingest_wan_card_keeps_damaged_known_peers() {
+        use crate::network::discovery::tests::{known_peers_damage_cases, snapshot};
+        let peer = NodeIdentity::generate();
+        let card = WanPeerCard::new(
+            &peer,
+            "b52-wan",
+            "daemon",
+            vec!["/ip4/198.51.100.20/tcp/4001".to_string()],
+            None,
+            None,
+            600,
+            wan_now_ms(),
+        )
+        .unwrap();
+        for (name, damage, code) in known_peers_damage_cases() {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().to_path_buf();
+            let path = dir.join(KnownPeersStore::FILE_NAME);
+            damage(&path);
+            let before = snapshot(&path);
+            let client = MeshClient::new(NodeIdentity::generate(), Vec::new(), None)
+                .with_data_dir_discovery(dir.clone(), DEFAULT_LAN_DISCOVERY_PORT);
+            let err = client
+                .ingest_verified_wan_card(&card)
+                .expect_err(name)
+                .to_string();
+            assert!(err.starts_with(code), "{name}: {err}");
+            assert_eq!(snapshot(&path), before, "{name}: file changed");
+            assert_eq!(
+                client.tracker_pin_store().err(),
+                Some("reject.known_peers_damaged"),
+                "{name}: B-123 guard disarmed"
+            );
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let mut pinned = KnownPeersStore::default();
+        pinned.pin_tracker_admin_pubkey("tracker.example:4001", [0xA7; 32]);
+        pinned.save(&dir).unwrap();
+        let client = MeshClient::new(NodeIdentity::generate(), Vec::new(), None)
+            .with_data_dir_discovery(dir.clone(), DEFAULT_LAN_DISCOVERY_PORT);
+        client.ingest_verified_wan_card(&card).unwrap();
+        let after = KnownPeersStore::try_load(&dir).unwrap();
+        assert!(after.peers.contains_key(&card.libp2p_peer_id), "{after:?}");
+        assert_eq!(after.pinned_tracker_admin_pubkeys(), vec![[0xA7; 32]]);
+    }
+
+    /// B-52 (QA, `refresh_lan_peers`): a live signed LAN beacon is found, but a damaged
+    /// `known_peers.json` is kept as it was; the refresh still returns the verified beacon.
+    /// Accept side: a healthy store gains the peer. Real files and real UDP, no mocks.
+    #[test]
+    fn b52_refresh_lan_peers_keeps_damaged_known_peers() {
+        use crate::network::discovery::tests::{known_peers_damage_cases, snapshot};
+        use crate::network::discovery::{LanBeaconConfig, LanBeaconResponder};
+        let probe_port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let id = NodeIdentity::generate();
+        let pid = node_identity_libp2p_peer_id(&id).unwrap().to_string();
+        let cfg = LanBeaconConfig::new("b52-refresh", "daemon", 14122)
+            .with_discovery_port(probe_port)
+            .with_explicit_listen_ip(Some("127.0.0.1".to_string()));
+        let handle = LanBeaconResponder::spawn(id, cfg).expect("spawn responder");
+        let want = format!("/ip4/127.0.0.1/tcp/14122/p2p/{pid}");
+        for (name, damage, _code) in known_peers_damage_cases() {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().to_path_buf();
+            let path = dir.join(KnownPeersStore::FILE_NAME);
+            damage(&path);
+            let before = snapshot(&path);
+            let client = MeshClient::new(NodeIdentity::generate(), Vec::new(), None)
+                .with_data_dir_discovery(dir.clone(), probe_port);
+            let found = client.refresh_lan_peers();
+            assert!(found.contains(&want), "{name}: {found:?}");
+            assert_eq!(snapshot(&path), before, "{name}: file changed");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let client = MeshClient::new(NodeIdentity::generate(), Vec::new(), None)
+            .with_data_dir_discovery(dir.clone(), probe_port);
+        assert!(client.refresh_lan_peers().contains(&want));
+        assert!(KnownPeersStore::try_load(&dir)
+            .unwrap()
+            .peers
+            .contains_key(&pid));
+        handle.shutdown();
     }
 }

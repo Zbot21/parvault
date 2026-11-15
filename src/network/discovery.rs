@@ -1,7 +1,7 @@
 use crate::crypto::{NodeIdentity, BIP39_ENGLISH_WORDLIST};
 use hkdf::Hkdf;
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
-use rand::{rngs::OsRng, RngCore};
+use rand::{rngs::OsRng, Rng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -466,8 +466,7 @@ fn write_registry_beacon_atomic(dir: &Path, pkt: &LanBeaconPacket) -> anyhow::Re
     }
     std::fs::create_dir_all(dir)?;
     let bytes = pkt.to_wire_bytes()?;
-    let mut nonce = [0u8; 6];
-    OsRng.fill_bytes(&mut nonce);
+    let nonce: [u8; 6] = OsRng.gen();
     let final_path = dir.join(format!("{}.beacon", pkt.libp2p_peer_id));
     let tmp_path = dir.join(format!(
         ".tmp.{}.{}.beacon",
@@ -1102,7 +1101,7 @@ impl KnownPeersStore {
     /// tracker advertised would be pinned in memory, and the `--public` run would write it to
     /// `pinned_tracker_admins.json`, where the council scope root reads it. Once a key is pinned,
     /// a different key for the same tracker is refused (`or_insert`, never overwritten). Never
-    /// `save` a store obtained here; writers use [`Self::try_load`] (B-52).
+    /// `save` a store obtained here; writers use [`Self::update`] or [`Self::try_load`] (B-52).
     pub fn load(data_dir: &Path) -> Self {
         Self::try_load(data_dir).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "known_peers.json does not load; using no pins");
@@ -1120,6 +1119,18 @@ impl KnownPeersStore {
             .map_err(|code| anyhow::anyhow!("{code}: {}", path.display()))
     }
 
+    /// B-52: the one read-modify-write of `known_peers.json`. `change` runs on the store from
+    /// [`Self::try_load`], never on the empty view [`Self::load`] gives for a damaged file, and the
+    /// result is saved. A damaged file is refused with its `reject.known_peers_*` code before
+    /// `change` runs, so no caller holds a store that would drop the pins it cannot see. `save`
+    /// re-checks the file, which also covers damage that appears after the load.
+    pub fn update(data_dir: &Path, change: impl FnOnce(&mut Self)) -> anyhow::Result<Self> {
+        let mut store = Self::try_load(data_dir)?;
+        change(&mut store);
+        store.save(data_dir)?;
+        Ok(store)
+    }
+
     /// Writes the store atomically. Refused (B-52) when a `known_peers.json` exists that does not
     /// load: it is kept for the operator, never overwritten.
     pub fn save(&self, data_dir: &Path) -> anyhow::Result<()> {
@@ -1129,8 +1140,7 @@ impl KnownPeersStore {
             tracing::warn!(code, path = %path.display(), "refused to overwrite known_peers.json");
             anyhow::bail!("{code}: {}", path.display());
         }
-        let mut nonce = [0u8; 6];
-        OsRng.fill_bytes(&mut nonce);
+        let nonce: [u8; 6] = OsRng.gen();
         let tmp_path = data_dir.join(format!(".tmp.known_peers.{}.json", hex::encode(nonce)));
         let serialized = serde_json::to_vec_pretty(self)?;
         let mut file = std::fs::File::create(&tmp_path)?;
@@ -1330,8 +1340,7 @@ impl std::fmt::Display for LanPairingCode {
 
 /// Generates a fresh 128-bit cryptographic nonce for `derive_4word_pairing_sas`.
 pub fn generate_random_pairing_nonce() -> [u8; 16] {
-    let mut nonce = [0u8; 16];
-    OsRng.fill_bytes(&mut nonce);
+    let nonce: [u8; 16] = OsRng.gen();
     nonce
 }
 
@@ -1574,12 +1583,46 @@ pub fn resolve_zero_config_peers(
     }
 
     let discovered = discover_lan_peers(timeout, discovery_port);
-    let mut store = KnownPeersStore::load(data_dir);
-    if !discovered.is_empty() {
-        store.upsert_discovered(&discovered);
-        let _ = store.save(data_dir);
+    if discovered.is_empty() {
+        return KnownPeersStore::load(data_dir).active_multiaddrs();
     }
-    store.active_multiaddrs()
+    match pin_discovered_lan_peers(data_dir, &discovered) {
+        Ok(store) => store.active_multiaddrs(),
+        // Fail closed (B-52): nothing is pinned; this run dials only the verified beacons.
+        Err(_) => lan_view(&discovered).active_multiaddrs(),
+    }
+}
+
+/// An in-memory store holding only `discovered`; it is never saved.
+pub fn lan_view(discovered: &[DiscoveredLanPeer]) -> KnownPeersStore {
+    let mut view = KnownPeersStore::default();
+    view.upsert_discovered(discovered);
+    view
+}
+
+static KNOWN_PEERS_WRITE_REFUSED_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// B-52: logs a refused `known_peers.json` write once per process at warn, later ones at debug.
+pub fn log_known_peers_write_refused(err: &anyhow::Error) {
+    if !KNOWN_PEERS_WRITE_REFUSED_LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            error = %err,
+            "known_peers.json is damaged: no peer is pinned until the operator restores it"
+        );
+    } else {
+        debug!(error = %err, "known_peers.json write refused");
+    }
+}
+
+/// B-52: pins freshly discovered LAN peers into `known_peers.json` through
+/// [`KnownPeersStore::update`]. A damaged file is refused with its `reject.known_peers_*` code,
+/// left as it was, and logged once.
+pub fn pin_discovered_lan_peers(
+    data_dir: &Path,
+    discovered: &[DiscoveredLanPeer],
+) -> anyhow::Result<KnownPeersStore> {
+    KnownPeersStore::update(data_dir, |s| s.upsert_discovered(discovered))
+        .inspect_err(log_known_peers_write_refused)
 }
 
 /// Extended Zero-Config peer resolver combining Home LAN Auto-Discovery, Persistent `KnownPeersStore`,
@@ -1651,7 +1694,7 @@ pub fn resolve_zero_config_peers_with_wan(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// B-52: a missing `known_peers.json` is empty; one that does not read or decode is refused and
@@ -1697,6 +1740,139 @@ mod tests {
         std::fs::remove_dir(&path).unwrap();
         pinned.save(dir.path()).unwrap();
         assert_eq!(KnownPeersStore::try_load(dir.path()).unwrap(), pinned);
+    }
+
+    /// A damage case: its name, a writer of the damage, and the reason code it loads with.
+    pub(crate) type DamageCase = (&'static str, fn(&Path), &'static str);
+
+    /// The three ways a `known_peers.json` is damaged: truncated JSON, bytes that are not UTF-8,
+    /// and a directory where the file belongs.
+    pub(crate) fn known_peers_damage_cases() -> Vec<DamageCase> {
+        fn truncated(p: &Path) {
+            std::fs::write(p, b"{\"peers\": {\"truncat").unwrap();
+        }
+        fn non_utf8(p: &Path) {
+            std::fs::write(p, [0xFF, 0xFE, 0x00, 0x01]).unwrap();
+        }
+        fn directory(p: &Path) {
+            std::fs::create_dir(p).unwrap();
+            std::fs::write(p.join("keep"), b"operator data").unwrap();
+        }
+        vec![
+            ("truncated", truncated, "reject.known_peers_corrupt"),
+            ("non-utf8", non_utf8, "reject.known_peers_corrupt"),
+            ("directory", directory, "reject.known_peers_unreadable"),
+        ]
+    }
+
+    /// A byte snapshot of `path` (a file's bytes, or a directory's entries and their bytes).
+    pub(crate) fn snapshot(path: &Path) -> Vec<(String, Vec<u8>)> {
+        if path.is_dir() {
+            let mut out: Vec<_> = std::fs::read_dir(path)
+                .unwrap()
+                .map(|e| {
+                    let e = e.unwrap();
+                    (
+                        e.file_name().to_string_lossy().into_owned(),
+                        std::fs::read(e.path()).unwrap(),
+                    )
+                })
+                .collect();
+            out.sort();
+            out.insert(0, ("<dir>".into(), Vec::new()));
+            out
+        } else {
+            vec![("<file>".into(), std::fs::read(path).unwrap())]
+        }
+    }
+
+    /// B-52: `update` never runs its change on a damaged file. Here the change restores a healthy
+    /// store, as an operator would between a load and a save: a store from `load` (empty) would
+    /// then pass the `save` re-check and overwrite the restored pins. With `try_load` the change
+    /// never runs and the file stays damaged. Real files, no mocks.
+    #[test]
+    fn b52_update_refuses_damaged_known_peers_before_change() {
+        let mut pinned = KnownPeersStore::default();
+        pinned.pin_tracker_admin_pubkey("tracker.example:4001", [0xA7; 32]);
+        for (name, damage, code) in known_peers_damage_cases() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(KnownPeersStore::FILE_NAME);
+            damage(&path);
+            let before = snapshot(&path);
+            let healthy = pinned.clone();
+            let dir_path = dir.path().to_path_buf();
+            let err = KnownPeersStore::update(dir.path(), move |s| {
+                // The operator restores the file while the writer holds its store.
+                let p = dir_path.join(KnownPeersStore::FILE_NAME);
+                if p.is_dir() {
+                    std::fs::remove_dir_all(&p).unwrap();
+                } else {
+                    std::fs::remove_file(&p).unwrap();
+                }
+                healthy.save(&dir_path).unwrap();
+                s.pin_tracker_admin_pubkey("mitm.example:4001", [0x66; 32]);
+            })
+            .expect_err(name)
+            .to_string();
+            assert!(err.starts_with(code), "{name}: {err}");
+            assert_eq!(snapshot(&path), before, "{name}: file changed");
+        }
+        // Accept: a loading store is changed and saved, keeping its earlier pins.
+        let dir = tempfile::tempdir().unwrap();
+        pinned.save(dir.path()).unwrap();
+        let out = KnownPeersStore::update(dir.path(), |s| {
+            s.pin_tracker_admin_pubkey("other.example:4001", [0x11; 32])
+        })
+        .unwrap();
+        assert_eq!(KnownPeersStore::try_load(dir.path()).unwrap(), out);
+        assert_eq!(out.pinned_tracker_admin_pubkeys().len(), 2);
+    }
+
+    /// B-52 (QA, `resolve_zero_config_peers`): a live signed LAN beacon is found, but a damaged
+    /// `known_peers.json` is refused with its code and kept; the run still returns the verified
+    /// beacon. Accept side: a healthy store gains the peer and keeps its pin. Real files and real
+    /// UDP, no mocks.
+    #[test]
+    fn b52_resolve_zero_config_peers_keeps_damaged_known_peers() {
+        let probe_port = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let id = NodeIdentity::generate();
+        let pid = node_identity_libp2p_peer_id(&id).unwrap().to_string();
+        let cfg = LanBeaconConfig::new("b52-lan", "daemon", 14121)
+            .with_discovery_port(probe_port)
+            .with_explicit_listen_ip(Some("127.0.0.1".to_string()));
+        let handle = LanBeaconResponder::spawn(id, cfg).expect("spawn responder");
+        let want = format!("/ip4/127.0.0.1/tcp/14121/p2p/{pid}");
+        let discovered = discover_lan_peers(Duration::from_millis(300), probe_port);
+        assert!(discovered.iter().any(|p| p.libp2p_peer_id == pid));
+        for (name, damage, code) in known_peers_damage_cases() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(KnownPeersStore::FILE_NAME);
+            damage(&path);
+            let before = snapshot(&path);
+            let err = pin_discovered_lan_peers(dir.path(), &discovered)
+                .expect_err(name)
+                .to_string();
+            assert!(err.starts_with(code), "{name}: {err}");
+            let resolved =
+                resolve_zero_config_peers(dir.path(), &[], probe_port, Duration::from_millis(300));
+            assert!(resolved.contains(&want), "{name}: {resolved:?}");
+            assert_eq!(snapshot(&path), before, "{name}: file changed");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut pinned = KnownPeersStore::default();
+        pinned.pin_tracker_admin_pubkey("tracker.example:4001", [0xA7; 32]);
+        pinned.save(dir.path()).unwrap();
+        let resolved =
+            resolve_zero_config_peers(dir.path(), &[], probe_port, Duration::from_millis(300));
+        assert!(resolved.contains(&want), "{resolved:?}");
+        let after = KnownPeersStore::try_load(dir.path()).unwrap();
+        assert!(after.peers.contains_key(&pid));
+        assert_eq!(after.pinned_tracker_admin_pubkeys(), vec![[0xA7; 32]]);
+        handle.shutdown();
     }
 
     #[test]
