@@ -844,6 +844,37 @@ echo "parvault-router-soc-${RUN_ID} /api/v1/health: $SOC_HEALTH_JSON"
 echo "$SOC_HEALTH_JSON" | grep -Eq '"hardware_profile"[[:space:]]*:[[:space:]]*"router-soc"'
 soc_proc idle
 
+# v0.5.4 NEW-3 (docs/METRICS.md): /metrics on the same listener, behind the same token.
+SOC_METRICS_NONE="$(status_get http://${NET_PREFIX}.60:4080/metrics | head -1)"
+if [ "$SOC_METRICS_NONE" != "401" ]; then
+    echo "ERROR: router-soc /metrics answered $SOC_METRICS_NONE without a token (want 401)"
+    exit 1
+fi
+SOC_METRICS="$(status_get http://${NET_PREFIX}.60:4080/metrics "$SOC_STATUS_TOKEN")"
+if ! printf '%s\n' "$SOC_METRICS" | grep -Eq '^parvault_build_info\{version="[^"]+",profile="router-soc",deterministic="0"\} 1$'; then
+    echo "ERROR: router-soc /metrics has no parvault_build_info line"
+    printf '%s\n' "$SOC_METRICS" | head -20
+    exit 1
+fi
+echo "router-soc /metrics: $(printf '%s\n' "$SOC_METRICS" | grep -c '^parvault_') series"
+
+# v0.5.4 NEW-4 (docs/LAB_MODE.md): one direct probe from the client container to the appliance,
+# against an empty data directory.
+SOC_PEER_ID="$(docker logs parvault-router-soc-${RUN_ID} 2>&1 | grep 'parvault-daemon started' \
+    | grep -o '12D3KooW[1-9A-HJ-NP-Za-km-z]*' | head -1)"
+if [ -z "$SOC_PEER_ID" ]; then
+    echo "ERROR: no PeerId in the router-soc log"; docker logs parvault-router-soc-${RUN_ID} || true
+    exit 1
+fi
+SOC_PROBE_RC=0
+SOC_PROBE="$(docker exec parvault-client-${RUN_ID} /usr/local/bin/parvault --data-dir /tmp/probe-empty \
+    net probe --peer "/ip4/${NET_PREFIX}.60/tcp/4001/p2p/${SOC_PEER_ID}" --force-direct)" || SOC_PROBE_RC=$?
+echo "client -> router-soc probe (exit ${SOC_PROBE_RC}): ${SOC_PROBE}"
+if [ "$SOC_PROBE_RC" != "0" ] || ! printf '%s' "$SOC_PROBE" | grep -q '"result":"connected"'; then
+    echo "ERROR: the probe of the router-soc appliance did not connect"
+    exit 1
+fi
+
 # Store and restore a multi-stripe (5 MiB = 5 x 1 MiB stripes) payload inside a 48 MiB cgroup container!
 docker volume rm -f "$SOC_VOL_NAME" >/dev/null 2>&1 || true
 docker volume create "$SOC_VOL_NAME" >/dev/null
