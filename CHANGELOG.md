@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+- **Two Docker acceptance gates can run on one host at once (B-110).** `scripts/docker_acceptance_gate.sh` names everything it creates with a per-run id, `RUN_ID="${PARVAULT_GATE_RUN_ID:-$$-$RANDOM}"`: containers, the network, the volume, the `parvault:acceptance`, `parvault:acceptance-vfs` and `parvault:router-soc` tags (now `-<RUN_ID>`), and a `parvault.gate.run=<RUN_ID>` label on the unnamed `--rm` containers. Build contexts move to a per-run `mktemp -d`. The subnet is `172.28.X.0/24`, with X from the run id, moving on when Docker reports a pool overlap; every IP the stages use comes from it. The `EXIT` trap removes only this run's resources. Stages and assertions are unchanged.
+
 ---
 
 ## [`0.5.1`] - 2026-11-14
