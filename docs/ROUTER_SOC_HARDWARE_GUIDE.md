@@ -16,9 +16,9 @@ However, embedding modern distributed storage on consumer and enterprise router 
 2. **Flash Storage Constraints:** Embedded NOR/NAND or eMMC partitions for router operating systems require ultra-compact static binaries (`< 15 MiB`) with zero external dynamic runtime dependencies (glibc, libssl, Python, or node.js).
 3. **Zero-IP Consumer Usability:** Homeowners and non-technical users cannot be expected to look up DHCP leases, configure static IPv4 subnets, or type `/ip4/192.168.1.142/tcp/4001/p2p/...` addresses.
 
-`parvault` <!-- metric:crate_version_tag -->v0.5.1<!-- /metric --> solves all three constraints:
+`parvault` <!-- metric:crate_version_tag -->v0.5.2<!-- /metric --> solves all three constraints:
 - **`--profile router-soc`:** Enforces **1 MiB streaming Reed-Solomon stripes** (`ROUTER_SOC_STRIPE_SIZE_BYTES = 1,048,576`), dropping transient peak heap allocations (`VmHWM`) from <!-- metric:bench.desktop.vmhwm -->`57.91 MiB`<!-- /metric --> to **<!-- metric:bench.soc.vmhwm -->`9.72–9.74 MiB`<!-- /metric -->** (`< 16 MiB`), operating safely inside a `32–48 MiB` container or cgroup ceiling while retaining 100% wire and manifest compatibility with desktop and NAS nodes.
-- **Static Zero-Dependency `musl` & `FROM scratch` Containers:** Stripped standalone binaries (<!-- metric:size.aarch64.range -->`0.69–6.27 MiB`<!-- /metric --> ARM64, <!-- metric:size.x86_64.range -->`0.77–7.97 MiB`<!-- /metric --> x86_64 across `parvault`, `parvault-seed`, `parvault-fuse`, and `parvault-sync` — with the zero-copy Unix socket gateway and optional built-in `=y` VFS folded directly into `parvault`) and minimal `FROM scratch` Docker/OCI images under 20 MiB.
+- **Static Zero-Dependency `musl` & `FROM scratch` Containers:** Stripped standalone binaries (<!-- metric:size.aarch64.range -->`0.67–6.30 MiB`<!-- /metric --> ARM64, <!-- metric:size.x86_64.range -->`0.78–8.09 MiB`<!-- /metric --> x86_64 across `parvault`, `parvault-seed`, `parvault-fuse`, and `parvault-sync` — with the zero-copy Unix socket gateway and optional built-in `=y` VFS folded directly into `parvault`) and minimal `FROM scratch` Docker/OCI images under 20 MiB.
 - **Cryptographic Zero-IP LAN Discovery & 4-Word SAS Pairing:** Fully automated LAN beaconing over UDP port `4009` with Ed25519-signed identity binding, 4-word BIP-39 pairing codes, and DHCP self-healing.
 - **Turnkey Appliance Mode (`parvault up`):** Launches P2P daemon, signed discovery beacon, embedded status webserver, and background folder sync with a single command.
 
@@ -56,10 +56,10 @@ flowchart TD
 
 ### Flash / Disk Footprint
 - **Static `musl` stripped binaries (`soc` profile `opt-level = "z"`, `lto = "fat"`):**
-  - `parvault`: **<!-- metric:size.parvault.aarch64 -->`6.27 MiB`<!-- /metric -->** (<!-- metric:size.parvault.aarch64.bytes -->`6,575,456 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault.x86_64 -->`7.97 MiB`<!-- /metric -->** (<!-- metric:size.parvault.x86_64.bytes -->`8,361,864 B`<!-- /metric --> `x86_64`) — includes built-in `parvault up --ipc-socket`, built-in `=y` VFS (`--vfs-webdav-listen` / `--vfs-fuse-fd`), `parvault gateway`, and `parvault token`
-  - `parvault-seed`: **<!-- metric:size.parvault-seed.aarch64 -->`4.27 MiB`<!-- /metric -->** (<!-- metric:size.parvault-seed.aarch64.bytes -->`4,472,240 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-seed.x86_64 -->`5.48 MiB`<!-- /metric -->** (<!-- metric:size.parvault-seed.x86_64.bytes -->`5,750,760 B`<!-- /metric --> `x86_64`)
-  - `parvault-fuse`: **<!-- metric:size.parvault-fuse.aarch64 -->`1.13 MiB`<!-- /metric -->** (<!-- metric:size.parvault-fuse.aarch64.bytes -->`1,185,456 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-fuse.x86_64 -->`1.24 MiB`<!-- /metric -->** (<!-- metric:size.parvault-fuse.x86_64.bytes -->`1,300,672 B`<!-- /metric --> `x86_64`)
-  - `parvault-sync`: **<!-- metric:size.parvault-sync.aarch64 -->`0.69 MiB`<!-- /metric -->** (<!-- metric:size.parvault-sync.aarch64.bytes -->`725,264 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-sync.x86_64 -->`0.77 MiB`<!-- /metric -->** (<!-- metric:size.parvault-sync.x86_64.bytes -->`811,824 B`<!-- /metric --> `x86_64`) — zero-key incremental folder sync plugin (`GatewayFolderSync`)
+  - `parvault`: **<!-- metric:size.parvault.aarch64 -->`6.30 MiB`<!-- /metric -->** (<!-- metric:size.parvault.aarch64.bytes -->`6,608,896 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault.x86_64 -->`8.09 MiB`<!-- /metric -->** (<!-- metric:size.parvault.x86_64.bytes -->`8,485,512 B`<!-- /metric --> `x86_64`) — includes built-in `parvault up --ipc-socket`, built-in `=y` VFS (`--vfs-webdav-listen` / `--vfs-fuse-fd`), `parvault gateway`, and `parvault token`
+  - `parvault-seed`: **<!-- metric:size.parvault-seed.aarch64 -->`4.36 MiB`<!-- /metric -->** (<!-- metric:size.parvault-seed.aarch64.bytes -->`4,571,272 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-seed.x86_64 -->`5.63 MiB`<!-- /metric -->** (<!-- metric:size.parvault-seed.x86_64.bytes -->`5,903,112 B`<!-- /metric --> `x86_64`)
+  - `parvault-fuse`: **<!-- metric:size.parvault-fuse.aarch64 -->`1.08 MiB`<!-- /metric -->** (<!-- metric:size.parvault-fuse.aarch64.bytes -->`1,128,048 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-fuse.x86_64 -->`1.24 MiB`<!-- /metric -->** (<!-- metric:size.parvault-fuse.x86_64.bytes -->`1,304,768 B`<!-- /metric --> `x86_64`)
+  - `parvault-sync`: **<!-- metric:size.parvault-sync.aarch64 -->`0.67 MiB`<!-- /metric -->** (<!-- metric:size.parvault-sync.aarch64.bytes -->`700,608 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-sync.x86_64 -->`0.78 MiB`<!-- /metric -->** (<!-- metric:size.parvault-sync.x86_64.bytes -->`815,920 B`<!-- /metric --> `x86_64`) — zero-key incremental folder sync plugin (`GatewayFolderSync`)
 - **OCI / Docker `FROM scratch` container image (`parvault:router-soc`):** **<!-- metric:docker.unpacked -->`20.6 MB`<!-- /metric -->** total uncompressed disk usage (**<!-- metric:docker.compressed -->`6.48 MB`<!-- /metric -->** compressed content size, stripped binaries + `router.toml` configuration, 0 OS overhead).
 - **Minimum Free Disk Reserve (`min_free_disk_bytes`):**
   - `--profile router-soc`: `64 MiB` (`67,108,864` bytes), allowing deployment on small USB flash drives or flash partitions.
@@ -224,7 +224,7 @@ sequenceDiagram
 
 ## 6. Zero-Pairing BitTorrent-Style Public Commons Mode (`--public --tracker ...`)
 
-For users and router operators who do not wish to manage private join codes, device certificates, or invitation lists, `parvault` <!-- metric:crate_version_tag -->v0.5.1<!-- /metric --> supports **Public Commons Mode** (`--public`), analogous to joining a public BitTorrent swarm:
+For users and router operators who do not wish to manage private join codes, device certificates, or invitation lists, `parvault` <!-- metric:crate_version_tag -->v0.5.2<!-- /metric --> supports **Public Commons Mode** (`--public`), analogous to joining a public BitTorrent swarm:
 
 ```bash
 # Launch Router Cloud-NAS connecting directly to the Public Commons tracker:

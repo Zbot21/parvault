@@ -1,6 +1,6 @@
 # AI Agent & Systems Engineer Guide (`AGENTS.md`)
 
-This document is the authoritative architectural, security, and verification manual for AI coding agents and human systems engineers working on **`parvault`** (<!-- metric:crate_version_tag -->`v0.5.1`<!-- /metric -->, library crate `parvault`, binaries `parvault`, `parvault-seed`, `parvault-fuse`, `parvault-sync`, and `parvault-bench`).
+This document is the authoritative architectural, security, and verification manual for AI coding agents and human systems engineers working on **`parvault`** (<!-- metric:crate_version_tag -->`v0.5.2`<!-- /metric -->, library crate `parvault`, binaries `parvault`, `parvault-seed`, `parvault-fuse`, `parvault-sync`, and `parvault-bench`).
 
 ---
 
@@ -137,8 +137,8 @@ CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
   bash scripts/build_bins.sh --profile soc --target aarch64-unknown-linux-musl --out dist
 ```
 
-### Kani Bounded Model Checking (<!-- metric:kani_harnesses -->`31`<!-- /metric --> Harnesses) & TLA+ TLC Formal Model Checking (<!-- metric:tla_specs -->`8`<!-- /metric --> Specs)
-All **<!-- metric:kani_harnesses -->31<!-- /metric -->** Kani symbolic harnesses (`cargo kani`) and all **<!-- metric:tla_specs -->8<!-- /metric -->** TLA+ specifications in `specs/` must complete with **0 errors** (see [`docs/SAFETY_AND_LINT_AUDIT.md`](docs/SAFETY_AND_LINT_AUDIT.md)):
+### Kani Bounded Model Checking (<!-- metric:kani_harnesses -->`31`<!-- /metric --> Harnesses) & TLA+ TLC Formal Model Checking (<!-- metric:tla_specs -->`9`<!-- /metric --> Specs)
+All **<!-- metric:kani_harnesses -->31<!-- /metric -->** Kani symbolic harnesses (`cargo kani`) and all **<!-- metric:tla_specs -->9<!-- /metric -->** TLA+ specifications in `specs/` must complete with **0 errors** (see [`docs/SAFETY_AND_LINT_AUDIT.md`](docs/SAFETY_AND_LINT_AUDIT.md)):
 ```bash
 bash scripts/verify_formal_proofs.sh
 
