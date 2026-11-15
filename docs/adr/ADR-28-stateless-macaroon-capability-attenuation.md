@@ -9,7 +9,7 @@
 
 ## Context
 
-When local brokers (`parvault-auth-broker`, `parvault-media-daemon`, `parvault-fuse`) request stripe reads or writes through `/var/run/parvault.sock`, `parvault-gateway` must enforce fine-grained least-privilege scoping (read-only access, single manifest root, byte-range slice, short TTL) in `< 1 ms` without querying a session database or round-tripping to mint sub-tokens.
+When local brokers (`parvault-auth-broker`, `parvault-media-daemon`, `parvault-fuse`) request stripe reads or writes through `/var/run/parvault.sock`, the gateway hosted by the `parvault` daemon (`parvault up --ipc-socket`, `daemon-runtime` feature; ADR-32) must enforce fine-grained least-privilege scoping (read-only access, single manifest root, byte-range slice, short TTL) in `< 1 ms` without querying a session database or round-tripping to mint sub-tokens.
 
 ## Decision
 
@@ -24,6 +24,6 @@ tag_i = HMAC-SHA256(tag_{i-1},       "parvault-macaroon-caveat-v1:" || encode_st
 
 ## Consequences & Verification
 
-- **Consequences:** Offline monotonic privilege attenuation (`Allowed(Child) => Allowed(Parent)`) verified in `< 1 ms` with zero database state on `parvault-gateway`.
+- **Consequences:** Offline monotonic privilege attenuation (`Allowed(Child) => Allowed(Parent)`) verified in `< 1 ms` with zero database state in the `parvault` gateway.
 - **v0.5.0 status (F-47).** `IpcCommand::FetchRange` and (item 3) `IpcCommand::FetchPayload` carry and verify a macaroon (`gateway_macaroon_decision`, claim G-MAC, attenuation checked per `FetchRange` frame). `StorePayload`, `RegisterManifest` and `QueryHealthStatus` carry no token: their boundary is the socket itself (`0600`, `--allow-peer-uid` / `SO_PEERCRED`, claim G-UID). With no gateway root key configured, `gateway_macaroon_decision` passes. `QueryStatus` (item 3) carries and verifies a token; tokens on the other commands are planned for v0.6.0.
 - **Verification:** Kani harness `proof_macaroon_caveat_attenuation_monotonic_and_zero_key_rejected` and `tests/gateway_ipc_benchmark.rs`.

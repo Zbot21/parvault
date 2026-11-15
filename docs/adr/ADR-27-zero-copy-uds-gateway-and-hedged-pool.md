@@ -1,8 +1,8 @@
-# ADR-27: Zero-Copy Unix Socket & `SCM_RIGHTS` `memfd` Data-Plane Gateway (`parvault-gateway`)
+# ADR-27: Zero-Copy Unix Socket & `SCM_RIGHTS` `memfd` Data-Plane Gateway
 
-- **Status:** Accepted (`v0.4.0`)
+- **Status:** Accepted (`v0.4.0`); Superseded by [ADR-32](ADR-32-transport-agnostic-gateway-bus-and-memfd-sealing.md) (`v0.5.0`): the separate gateway binary was folded into `parvault` (`parvault up --ipc-socket`, `parvault gateway {serve, health, ipc-roundtrip, self-test}`)
 - **Formal model:** `specs/ParVaultGatewayPluginBus.tla`
-- **Subsystem:** `gateway::engine` / `gateway::ipc` / `gateway::shm` / `bin/parvault-gateway`
+- **Subsystem:** `gateway::engine` / `gateway::ipc` / `gateway::shm` / `parvault gateway` (`src/gateway/cli_runner.rs`)
 - **Index:** [Master ADR Index & Cryptographic Suite Guide (`docs/ADR.md`)](../ADR.md)
 
 ---
@@ -20,4 +20,4 @@ Downstream companion daemons (`parvault-fuse`, `parvault-media-daemon`, `parvaul
 ## Consequences & Verification
 
 - **Consequences:** Sustains `730.88–957.01 MiB/s` `Store` and `1,724.51–2,213.86 MiB/s` `FetchRange` over `/var/run/parvault.sock` (`0.49 ms` local TTFB, <!-- metric:gw.ipc.gateway_vmhwm -->`10.98 MiB`<!-- /metric --> peak `VmHWM`, `3.07 MiB` ARM64 / `3.80 MiB` x86_64 stripped `musl` binary).
-- **Verification:** Kani harnesses `proof_pinned_ring_capacity_invariant` and `proof_gateway_ipc_frame_header_bounds`; `tests/gateway_ipc_benchmark.rs`; `parvault-gateway self-test`.
+- **Verification:** Kani harnesses `proof_pinned_ring_capacity_invariant` and `proof_gateway_ipc_frame_header_bounds`; `tests/gateway_ipc_benchmark.rs`; `parvault gateway self-test`.
