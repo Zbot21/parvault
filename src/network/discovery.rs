@@ -1342,6 +1342,43 @@ fn constant_time_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
 /// Verifies a user-supplied 4-word BIP-39 SAS pairing code (or `pvpair1:...` compact token)
 /// against a cryptographically verified `DiscoveredLanPeer`.
 pub fn verify_lan_pairing_code(peer: &DiscoveredLanPeer, code: &str) -> bool {
+    pairing_code_matches(
+        &peer.libp2p_peer_id,
+        peer.owner_pq_fingerprint.as_deref(),
+        peer.pairing_sas_commitment.as_ref(),
+        code,
+    )
+}
+
+/// F-54 hardening (B-45): a WAN rendezvous card is accepted for `join` only if the code the user
+/// typed re-derives from the card's own `PeerId` and PQ fingerprint, as on the LAN path. A
+/// rendezvous server that can open the slot can still forge a self-signed card, but that card's
+/// `PeerId` no longer derives the code. A card whose multiaddr pins another `PeerId` is refused.
+pub fn wan_card_pairing_decision(
+    card_peer_id: &str,
+    owner_pq_fingerprint: Option<&str>,
+    pinned_multiaddr: &str,
+    code: &str,
+) -> Result<(), &'static str> {
+    if let Some((_, tail)) = pinned_multiaddr.rsplit_once("/p2p/") {
+        if tail.split('/').next().unwrap_or(tail) != card_peer_id {
+            return Err("reject.wan_card_addr_peer_mismatch");
+        }
+    }
+    if !pairing_code_matches(card_peer_id, owner_pq_fingerprint, None, code) {
+        return Err("reject.wan_card_code_mismatch");
+    }
+    Ok(())
+}
+
+/// Whether `code` (4 words or a `pvpair1:` token) derives from `peer_id` and `owner_pq_fingerprint`,
+/// checked against `commitment` when the peer published one.
+fn pairing_code_matches(
+    peer_id: &str,
+    owner_pq_fingerprint: Option<&str>,
+    commitment: Option<&[u8; 32]>,
+    code: &str,
+) -> bool {
     let trimmed = code.trim();
     if trimmed.is_empty() {
         return false;
@@ -1353,7 +1390,7 @@ pub fn verify_lan_pairing_code(peer: &DiscoveredLanPeer, code: &str) -> bool {
             return false;
         }
         let (token_peer_id, nonce_hex, token_words) = (parts[0], parts[1], parts[2]);
-        if token_peer_id != peer.libp2p_peer_id {
+        if token_peer_id != peer_id {
             return false;
         }
         let Ok(nonce_bytes) = hex::decode(nonce_hex) else {
@@ -1362,15 +1399,11 @@ pub fn verify_lan_pairing_code(peer: &DiscoveredLanPeer, code: &str) -> bool {
         let Some(norm_words) = normalize_4word_sas_code(token_words) else {
             return false;
         };
-        let expected = derive_4word_pairing_sas(
-            &peer.libp2p_peer_id,
-            peer.owner_pq_fingerprint.as_deref(),
-            &nonce_bytes,
-        );
+        let expected = derive_4word_pairing_sas(peer_id, owner_pq_fingerprint, &nonce_bytes);
         if expected.code != norm_words {
             return false;
         }
-        if let Some(ref peer_commit) = peer.pairing_sas_commitment {
+        if let Some(peer_commit) = commitment {
             return constant_time_eq_32(peer_commit, &expected.commitment);
         }
         return true;
@@ -1380,22 +1413,16 @@ pub fn verify_lan_pairing_code(peer: &DiscoveredLanPeer, code: &str) -> bool {
         return false;
     };
 
-    if let Some(ref peer_commit) = peer.pairing_sas_commitment {
-        let candidate_commit = compute_pairing_sas_commitment(
-            &peer.libp2p_peer_id,
-            peer.owner_pq_fingerprint.as_deref(),
-            &norm_words,
-        );
+    if let Some(peer_commit) = commitment {
+        let candidate_commit =
+            compute_pairing_sas_commitment(peer_id, owner_pq_fingerprint, &norm_words);
         return constant_time_eq_32(peer_commit, &candidate_commit);
     }
 
     // Fallback when a running storage daemon did not set a custom ephemeral pairing commitment
     // (e.g. `parvault pair --once` derived the standing node SAS using `DEFAULT_LAN_PAIRING_NONCE`).
-    let default_sas = derive_4word_pairing_sas(
-        &peer.libp2p_peer_id,
-        peer.owner_pq_fingerprint.as_deref(),
-        DEFAULT_LAN_PAIRING_NONCE,
-    );
+    let default_sas =
+        derive_4word_pairing_sas(peer_id, owner_pq_fingerprint, DEFAULT_LAN_PAIRING_NONCE);
     default_sas.code == norm_words
 }
 
@@ -1569,6 +1596,42 @@ mod tests {
         assert!(valid
             .verify(now_ms + MAX_LAN_BEACON_AGE_MS + 100, MAX_LAN_BEACON_AGE_MS)
             .is_err());
+    }
+
+    #[test]
+    fn wan_card_needs_the_code_to_derive_from_its_own_identity() {
+        // B-45 / F-54: the real card passes; a self-signed forged card (any other PeerId, even
+        // with the real PQ fingerprint) and an address pinning another PeerId are refused.
+        let real = node_identity_libp2p_peer_id(&NodeIdentity::generate())
+            .unwrap()
+            .to_string();
+        let forged = node_identity_libp2p_peer_id(&NodeIdentity::generate())
+            .unwrap()
+            .to_string();
+        let fp = "ab".repeat(32);
+        let sas = derive_4word_pairing_sas(&real, Some(&fp), DEFAULT_LAN_PAIRING_NONCE);
+        let addr = format!("/ip4/203.0.113.7/tcp/4001/p2p/{real}");
+        assert_eq!(
+            wan_card_pairing_decision(&real, Some(&fp), &addr, &sas.code),
+            Ok(())
+        );
+        assert_eq!(
+            wan_card_pairing_decision(&real, Some(&fp), &addr, &sas.compact_token),
+            Ok(())
+        );
+        let forged_addr = format!("/ip4/198.51.100.9/tcp/4001/p2p/{forged}");
+        assert_eq!(
+            wan_card_pairing_decision(&forged, Some(&fp), &forged_addr, &sas.code),
+            Err("reject.wan_card_code_mismatch")
+        );
+        assert_eq!(
+            wan_card_pairing_decision(&real, None, &addr, &sas.code),
+            Err("reject.wan_card_code_mismatch")
+        );
+        assert_eq!(
+            wan_card_pairing_decision(&real, Some(&fp), &forged_addr, &sas.code),
+            Err("reject.wan_card_addr_peer_mismatch")
+        );
     }
 
     #[test]

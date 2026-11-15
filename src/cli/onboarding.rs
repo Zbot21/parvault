@@ -323,7 +323,7 @@ pub(crate) async fn join(env: CliEnv, command: Commands) -> anyhow::Result<()> {
             for candidate_code in [code.trim(), normalized_words.as_str()] {
                 if let Ok((cards, _)) = mesh_client.lookup_wan_pairing_cards(anchor, candidate_code)
                 {
-                    if let Some(card) = cards.into_iter().find(|c| c.libp2p_peer_id != local_pid) {
+                    for card in cards.into_iter().filter(|c| c.libp2p_peer_id != local_pid) {
                         let raw_maddr = card
                             .wan_multiaddrs
                             .first()
@@ -335,7 +335,20 @@ pub(crate) async fn join(env: CliEnv, command: Commands) -> anyhow::Result<()> {
                         } else {
                             format!("{raw_maddr}/p2p/{}", card.libp2p_peer_id)
                         };
+                        // F-54 / B-45: the typed code must derive from the card's own identity.
+                        if let Err(code) = wan_card_pairing_decision(
+                            &card.libp2p_peer_id,
+                            card.owner_pq_fingerprint.as_deref(),
+                            &pinned,
+                            candidate_code,
+                        ) {
+                            tracing::warn!(code, peer = %card.libp2p_peer_id, "refused a WAN pairing card");
+                            continue;
+                        }
                         matched = Some((card.libp2p_peer_id, card.node_label, card.role, pinned));
+                        break;
+                    }
+                    if matched.is_some() {
                         break;
                     }
                 }
