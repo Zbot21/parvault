@@ -1,4 +1,5 @@
 //! Formal model: `specs/ParVaultProtocol.tla` (guards `read-auth-owner`, `read-auth-repair`).
+//! Formal model: `specs/ParVaultPorAudit.tla` (guard `chunk-storer`).
 use crate::config::ErasureTier;
 use crate::crypto::keys::NodeIdentity;
 use crate::por::challenger::{

@@ -54,6 +54,10 @@ tla-spec   T-SPECS   path=specs/*.tla
 # M5a: spec <-> ADR <-> Rust traceability; each @guard sym is reached from a production entry.
 tla-trace  T-TRACE   path=specs/*.tla complete=specs/ParVaultGatewayPluginBus.tla
 reach      TR-NULLIFIER-FRESH sym=src/storage/anonymity.rs::redeem_voucher from=src/network/wire_handler.rs::handle_mesh_wire_request
+reach      TR-CHUNK-PROOF sym=src/por/chunk_merkle.rs::chunk_proof_decision from=src/por/auditor.rs::run_audit_job   # ParVaultPorAudit guard chunk-proof
+reach      TR-AUDIT-CREDIT sym=src/por/audit.rs::audit_credit_decision from=src/por/auditor.rs::run_audit_job   # ParVaultPorAudit guard audit-credit
+reach      TR-VERDICT-CLASSES sym=src/por/audit.rs::chunk_audit_decision from=src/por/auditor.rs::run_audit_job   # ParVaultPorAudit guard verdict-classes
+reach      TR-CHUNK-STORER sym=src/por/verifier.rs::por_storer_decision from=src/network/wire_handler.rs::handle_mesh_wire_request   # ParVaultPorAudit guard chunk-storer
 reach      TR-TIER-RESPECTS-SLASH sym=src/bootstrap.rs::evaluate from=src/cli/daemon.rs::run_daemon
 reach      TR-SLASHED-STICKY sym=src/storage/quota.rs::trust_level from=src/cli/daemon.rs::run_daemon
 reach      TR-HYBRID-SIG-BOTH sym=src/crypto/pqc.rs::hybrid_signature_decision from=src/network/wire_handler.rs::handle_mesh_wire_request
@@ -83,6 +87,7 @@ waive      TM-W-DURABILITY  inv=specs/ParVaultProtocol.tla::DurabilitySafetyInva
 waive      TM-W-SLASH-BOUND inv=specs/ParVaultProtocol.tla::SlashingBoundInvariant reason=assume leaf-quarantine-not-run: record_failure is cfg(test), nothing slashes in v0.5.0 (ADR-09, N-09)
 waive      TM-W-PROTECTED    inv=specs/ParVaultProtocol.tla::ProtectedKeysNeverSlashedInvariant reason=assume slash-target-not-run: slash_target_decision is called only from cfg(test) may_slash; nothing slashes in v0.5.0 (ADR-09, N-09)
 waive      TM-W-ORIGIN      inv=specs/ParVaultAnonymity.tla::Safety_ZeroOriginLeakage reason=observedSender conjunct structural (only RelayNode is ever recorded, L-38/L-39 scope); the issuer is not claimed (L-39; the ephemeral-issuer conjunct was removed, B-43)
+waive      TM-W-POR-TYPE    inv=specs/ParVaultPorAudit.tla::TypeOK reason=Type invariant; no guard to remove.
 waive      TM-W-DRAIN       inv=specs/ParVaultBootstrapAndEarnedTier.tla::Safety_SeedAnchorsDrainAtOrganicThreshold reason=structural: seed shards = MaxOrganicPeers - organic by construction
 waive      TM-W-DAY1        inv=specs/ParVaultBootstrapAndEarnedTier.tla::Safety_Day1ToScaleDataAvailability reason=structural: recoverable = TierN(tier), TierK < TierN tables
 waive      TM-W-ZK-TYPE     inv=specs/ParVaultZeroKeyAdminAndQuorum.tla::TypeOK reason=type invariant, not a security property; TM-NONCE also violates it (without the nonce guard, nonce 0, meaning no challenge, is accepted and recorded)
@@ -191,6 +196,8 @@ claim      E-POR     sym=src/por/verifier.rs::por_prescreen_decision accept=trus
 claim      F-34-STORER sym=src/por/verifier.rs::por_storer_decision accept=trust_enforcement::f34_storer_chunk_audit_answered reject=trust_enforcement::f34_co_host_chunk_audit_refused code=reject.por_not_storer bin=parvault adr=docs/adr/ADR-03-stateless-witness-por-auditing.md covers=MeshWireRequest::ChunkAudit   # B-59 verdict change 1: the per-stripe key is held by every host of the stripe
 claim      F-06-RATE sym=src/por/verifier.rs::por_rate_decision accept=trust_enforcement::f06_rate_six_chunk_audits_answered reject=trust_enforcement::f06_rate_seventh_chunk_audit_refused code=reject.por_rate_limited bin=parvault adr=docs/adr/ADR-03-stateless-witness-por-auditing.md covers=MeshWireRequest::ChunkAudit   # B-59: 6 per stripe key per 10 min
 claim      F-06-TIMEOUT sym=src/por/audit.rs::chunk_audit_decision accept=trust_enforcement::f06_prompt_host_passes reject=trust_enforcement::f06_slow_host_counted_unanswered_not_failed code=reject.audit_timeout bin=parvault adr=docs/adr/ADR-03-stateless-witness-por-auditing.md   # B-59 verdict change 3: not answering is never a ledger failure
+claim      B59-HANDOFF sym=src/por/verifier.rs::por_storer_decision accept=trust_enforcement::b59_handoff_shard_audited_by_owner reject=trust_enforcement::b59_handoff_shard_foreign_sender_refused code=reject.por_not_storer bin=parvault ref=docs/security/TRUST_FINDINGS.md   # B-59 change 14: handed-off shards are written as the departing node
+open       B59-HANDOFF expect=claim-missing by=v0.5.3 ref=docs/security/TRUST_FINDINGS.md   # the departing node holds no owner key, so its handoff cannot send as the owner; the owner's audits of those shards are refused (reject.por_not_storer) and counted unanswered
 claim      E-ABUSE   sym=src/storage/eviction.rs::abuse_report_decision accept=trust_enforcement::ewire_signed_abuse_report_queued reject=trust_enforcement::ewire_forged_abuse_report_refused code=reject.abuse_report_sig_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-26-verifiable-abuse-and-council-quorum-governance.md covers=MeshWireRequest::SubmitAbuseTakedownReport
 claim      E-COUNCIL sym=src/network/wire_handler.rs::admission_decision accept=trust_enforcement::ewire_admitted_peer_gets_council_manifest reject=trust_enforcement::ewire_unadmitted_peer_council_manifest_refused code=reject.peer_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::GetCouncilManifest
 claim      E-BREAD   sym=src/storage/anonymity.rs::blinded_read_decision accept=trust_enforcement::ewire_blinded_read_by_capability_holder_served reject=trust_enforcement::ewire_blinded_read_by_other_key_refused code=reject.blinded_read_sig_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::GetBlindedShard
@@ -253,4 +260,4 @@ kani       S-SANITIZE sym=src/sync/common.rs::sanitize_sync_relative_path_into h
 claim      B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision accept=trust_enforcement::bseed_second_sender_accepted_while_one_job_runs reject=trust_enforcement::bseed_third_job_refused_busy code=reject.syndication_busy bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe
 kani       B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision harness=proof_syndication_fanout_budget cover=syndication over budget
 
-ratchet    R         open=0 waive=31
+ratchet    R         open=1 waive=32

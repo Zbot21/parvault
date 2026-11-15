@@ -16,6 +16,8 @@
 //! A shard of `L` bytes has `max(1, ceil(L / 4096))` chunks; the last chunk may be short and an
 //! empty shard has one empty chunk. Binding the index and count into each leaf stops a storer
 //! from answering for chunk `i` with chunk `j`, or from presenting a truncated tree.
+//!
+//! Formal model: `specs/ParVaultPorAudit.tla` (guard `chunk-proof`).
 
 use sha2::{Digest, Sha256};
 

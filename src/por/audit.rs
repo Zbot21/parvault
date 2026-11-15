@@ -4,6 +4,8 @@
 //! [`chunk_proof_decision`] is [`AuditVerdict::ProofInvalid`]. Everything a host can cause by not
 //! answering (no answer, a refusal, a decode error, a late answer) is
 //! [`AuditVerdict::Unanswered`] and never a ledger failure (L-27).
+//!
+//! Formal model: `specs/ParVaultPorAudit.tla` (guards `audit-credit`, `verdict-classes`).
 use crate::por::chunk_merkle::{chunk_proof_decision, ChunkProofFacts};
 use crate::por::{ChunkAuditResponse, ChunkChallenge};
 
