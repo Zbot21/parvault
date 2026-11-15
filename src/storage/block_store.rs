@@ -773,6 +773,58 @@ impl BlockStore {
         Ok(buf)
     }
 
+    /// Chunk-Merkle proofs for `indices` of a regular shard of `shard_len` bytes (B-59). The
+    /// file is opened once and read one chunk at a time; no leaf-hash check, so corruption on
+    /// disk surfaces as an invalid proof on the verifier (verdict change 4). Peak RAM is one
+    /// chunk, the leaf level and the challenged chunks.
+    pub fn chunk_proofs(
+        &self,
+        id: &ShardId,
+        shard_len: u64,
+        indices: &[u32],
+    ) -> Result<Vec<crate::por::ChunkProof>, StorageError> {
+        use crate::por::chunk_merkle::{
+            chunk_proof_streaming, expected_chunk_len, CHUNK_SIZE_BYTES,
+        };
+        let range_err = |i: u32| StorageError::InvalidRange {
+            offset: u64::from(i) * CHUNK_SIZE_BYTES as u64,
+            length: CHUNK_SIZE_BYTES as u64,
+            size: shard_len,
+        };
+        let proofs = if let Some(ref mem) = self.in_memory {
+            let m = mem.lock().expect("in_memory mutex poisoned");
+            let bytes = m
+                .regular_shards
+                .get(&id.file_key())
+                .ok_or_else(|| StorageError::ShardNotFound(id.file_key()))?;
+            if bytes.len() as u64 != shard_len {
+                return Err(range_err(0));
+            }
+            chunk_proof_streaming(shard_len, indices, |i| {
+                let len = expected_chunk_len(shard_len, i).ok_or_else(|| range_err(i))?;
+                let start = i as usize * CHUNK_SIZE_BYTES;
+                Ok::<_, StorageError>(bytes[start..start + len].to_vec())
+            })?
+        } else {
+            let mut file = File::open(self.shard_path(id))
+                .map_err(|_| StorageError::ShardNotFound(id.file_key()))?;
+            if file.metadata()?.len() != shard_len {
+                return Err(range_err(0));
+            }
+            chunk_proof_streaming(shard_len, indices, |i| {
+                let len = expected_chunk_len(shard_len, i).ok_or_else(|| range_err(i))?;
+                let mut buf = vec![0u8; len];
+                file.seek(SeekFrom::Start(u64::from(i) * CHUNK_SIZE_BYTES as u64))?;
+                file.read_exact(&mut buf)?;
+                Ok::<_, StorageError>(buf)
+            })?
+        };
+        if let Ok(mut q) = self.quota.lock() {
+            q.touch_shard(&id.file_key());
+        }
+        Ok(proofs)
+    }
+
     /// Deletes a shard from local disk or bounded RAM storage.
     pub fn delete_shard(&self, owner_peer_id: &str, id: &ShardId) -> Result<bool, StorageError> {
         if self.is_in_memory() {

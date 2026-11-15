@@ -2435,6 +2435,22 @@ impl MeshClient {
         }
     }
 
+    /// Sends a chunk-Merkle audit (B-59). `Ok(None)` is any refusal or a host that does not
+    /// know the variant: the auditor counts it as unanswered, never as a failed proof.
+    pub fn chunk_audit(
+        &self,
+        peer_addr: &str,
+        challenge: crate::por::ChunkChallenge,
+    ) -> anyhow::Result<Option<crate::por::ChunkAuditResponse>> {
+        match self.send_request(peer_addr, MeshWireRequest::ChunkAudit(challenge))? {
+            MeshWireResponse::ChunkAuditResult(r) => Ok(r),
+            other => Err(MeshClientError::ProtocolError(format!(
+                "unexpected response to ChunkAudit: {other:?}"
+            ))
+            .into()),
+        }
+    }
+
     pub fn multi_segment_por_audit(
         &self,
         peer_addr: &str,
