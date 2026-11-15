@@ -127,6 +127,25 @@ pub struct QuotaManager {
     /// [`Self::quota_decision`] refuses new shards until a later write succeeds.
     #[serde(skip)]
     persist_failed: std::cell::Cell<bool>,
+    /// Set when `quota_state.bin` exists but cannot be read or decoded (B-52 QA): the recorded
+    /// accounting is unknown, so [`Self::quota_decision`] refuses with this code and the file is
+    /// never overwritten. Cleared only by a restart that loads the file.
+    #[serde(skip)]
+    load_error: Option<&'static str>,
+}
+
+/// Loads `quota_state.bin` (B-52 QA): an absent file is a fresh state; any other read or decode
+/// failure is refused, since starting empty would forget every peer's used quota.
+pub fn quota_state_load_decision(
+    read: std::io::Result<Option<Vec<u8>>>,
+) -> Result<Option<QuotaManager>, &'static str> {
+    match read {
+        Ok(None) => Ok(None),
+        Ok(Some(raw)) => bincode::deserialize::<QuotaManager>(&raw)
+            .map(Some)
+            .map_err(|_| "reject.quota_state_corrupt"),
+        Err(_) => Err("reject.quota_state_unreadable"),
+    }
 }
 
 impl QuotaManager {
@@ -143,6 +162,7 @@ impl QuotaManager {
             observed_free_disk_bytes: None,
             persistence_path: None,
             persist_failed: std::cell::Cell::new(false),
+            load_error: None,
         }
     }
 
@@ -153,41 +173,44 @@ impl QuotaManager {
         data_dir: &std::path::Path,
     ) -> Self {
         let path = data_dir.join("quota_state.bin");
-        if path.exists() {
-            if let Ok(raw) = std::fs::read(&path) {
-                if let Ok(mut loaded) = bincode::deserialize::<Self>(&raw) {
-                    loaded.max_storage_bytes = max_storage_bytes;
-                    loaded.bootstrap_grace_bytes = bootstrap_grace_bytes;
-                    loaded.persistence_path = Some(path);
-                    return loaded;
-                }
-            }
-        }
         let mut q = Self::new(max_storage_bytes, bootstrap_grace_bytes);
-        q.persistence_path = Some(path);
+        q.load_from(path);
         q
     }
 
     pub fn bind_persistence_dir(&mut self, data_dir: &std::path::Path) {
         let path = data_dir.join("quota_state.bin");
-        if self.used_storage_bytes == 0 && self.peer_accounts.is_empty() && path.exists() {
-            if let Ok(raw) = std::fs::read(&path) {
-                if let Ok(mut loaded) = bincode::deserialize::<Self>(&raw) {
-                    loaded.max_storage_bytes = self.max_storage_bytes;
-                    loaded.bootstrap_grace_bytes = self.bootstrap_grace_bytes;
-                    if self.min_free_disk_bytes > 0 {
-                        loaded.min_free_disk_bytes = self.min_free_disk_bytes;
-                    }
-                    loaded.persistence_path = Some(path);
-                    *self = loaded;
-                    return;
+        if self.used_storage_bytes == 0 && self.peer_accounts.is_empty() {
+            self.load_from(path);
+        } else {
+            self.persistence_path = Some(path);
+        }
+    }
+
+    /// Binds `path` and loads it, keeping this manager's limits; fails closed on a bad file.
+    fn load_from(&mut self, path: std::path::PathBuf) {
+        match quota_state_load_decision(crate::storage::fsio::read_state_file(&path)) {
+            Ok(Some(mut loaded)) => {
+                loaded.max_storage_bytes = self.max_storage_bytes;
+                loaded.bootstrap_grace_bytes = self.bootstrap_grace_bytes;
+                if self.min_free_disk_bytes > 0 {
+                    loaded.min_free_disk_bytes = self.min_free_disk_bytes;
                 }
+                *self = loaded;
+            }
+            Ok(None) => {}
+            Err(code) => {
+                tracing::warn!(code, path = %path.display(), "quota state not loaded; refusing new shards");
+                self.load_error = Some(code);
             }
         }
         self.persistence_path = Some(path);
     }
 
     fn persist(&self) {
+        if self.load_error.is_some() {
+            return; // keep the unreadable file for the operator; never replace it with a fresh state
+        }
         if let Some(ref path) = self.persistence_path {
             let written = bincode::serialize(self)
                 .map_err(|e| e.to_string())
@@ -278,6 +301,9 @@ impl QuotaManager {
     /// Fails closed while the last state write failed (B-52), so no shard is accepted that a
     /// restart would forget.
     pub fn quota_decision(&self, peer_id: &str, shard_bytes: u64) -> Result<(), &'static str> {
+        if let Some(code) = self.load_error {
+            return Err(code);
+        }
         if self.persist_failed.get() {
             return Err("reject.quota_state_not_persisted");
         }
@@ -419,6 +445,45 @@ impl QuotaManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unloadable_state_file_refuses_new_shards_and_is_kept() {
+        // B-52 QA differential: the same shard against a loadable and an unloadable state file.
+        let ok_dir = tempfile::tempdir().unwrap();
+        let mut seed = QuotaManager::with_persistence_dir(1 << 30, 1 << 20, ok_dir.path());
+        seed.record_shard_stored("peer", "a".into(), 1024);
+        let ok = QuotaManager::with_persistence_dir(1 << 30, 1 << 20, ok_dir.path());
+        assert!(ok.quota_decision("local", 1024).is_ok());
+        assert_eq!(
+            ok.peer_accounts
+                .get("peer")
+                .map(|a| a.bytes_hosted_for_peer),
+            Some(1024)
+        );
+
+        for (bytes, code) in [
+            (vec![0xFFu8; 3], "reject.quota_state_corrupt"),
+            (Vec::new(), "reject.quota_state_unreadable"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("quota_state.bin");
+            if bytes.is_empty() {
+                std::fs::create_dir(&path).unwrap(); // exists but cannot be read
+            } else {
+                std::fs::write(&path, &bytes).unwrap();
+            }
+            let mut q = QuotaManager::with_persistence_dir(1 << 30, 1 << 20, dir.path());
+            assert_eq!(q.quota_decision("local", 1024), Err(code));
+            let mut bound = QuotaManager::new(1 << 30, 1 << 20);
+            bound.bind_persistence_dir(dir.path());
+            assert_eq!(bound.quota_decision("local", 1024), Err(code));
+            q.record_shard_stored("local", "b".into(), 1024);
+            q.flush_persistence();
+            if !bytes.is_empty() {
+                assert_eq!(std::fs::read(&path).unwrap(), bytes, "the bad file is kept");
+            }
+        }
+    }
 
     #[test]
     fn failed_state_write_refuses_new_shards_until_a_write_succeeds() {

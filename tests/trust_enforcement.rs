@@ -3738,13 +3738,13 @@ fn f55_persisted_nullifier_voucher_redeemed() {
     gate_ran("trust_enforcement::f55_persisted_nullifier_voucher_redeemed");
 }
 
-/// F-55 reject: the same put when the nullifier cannot be written (the ledger path is a
-/// directory) is refused unspent instead of accepted with the spend held only in memory.
+/// F-55 reject: the same put when the nullifier cannot be written (the ledger path becomes a
+/// directory after the daemon loaded it) is refused unspent instead of accepted with the spend
+/// held only in memory.
 #[test]
 fn f55_unpersisted_nullifier_voucher_refused() {
-    let (root, dir, reg, log) = prepare("f55-r");
-    std::fs::create_dir_all(dir.join("voucher_nullifiers.bin")).unwrap();
-    let node = spawn(daemon_command(&dir, &reg), root, dir, log);
+    let node = spawn_daemon("f55-r");
+    std::fs::create_dir_all(node.dir.join("voucher_nullifiers.bin")).unwrap();
     let sender = key(0xB5);
     let b = blinded(0x5B, 512);
     let resp = send(&sender, &node, blinded_put(&b, &sender));

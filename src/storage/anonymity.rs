@@ -480,6 +480,30 @@ pub struct VoucherNullifierLedger {
     spent: HashMap<[u8; 32], u64>,
     #[serde(skip)]
     persistence_path: Option<std::path::PathBuf>,
+    /// Set while `voucher_nullifiers.bin` exists but cannot be read or decoded: the spends it
+    /// holds are unknown, so every voucher is refused with this code until a load succeeds.
+    #[serde(skip)]
+    load_error: Option<&'static str>,
+}
+
+/// Loads the persisted spends (B-42 QA): an absent file is an empty ledger; a pre-F-35 file
+/// (nonces only) is empty too, because those vouchers no longer verify. Any other read or decode
+/// failure is refused, since starting empty would let every recorded voucher be redeemed again.
+pub fn nullifier_load_decision(
+    read: std::io::Result<Option<Vec<u8>>>,
+) -> Result<HashMap<[u8; 32], u64>, &'static str> {
+    let raw = match read {
+        Ok(None) => return Ok(HashMap::new()),
+        Ok(Some(raw)) => raw,
+        Err(_) => return Err("reject.voucher_ledger_unreadable"),
+    };
+    if let Ok(v) = deserialize_bounded::<Vec<([u8; 32], u64)>>(&raw, MAX_NULLIFIER_LEDGER_BYTES) {
+        return Ok(v.into_iter().collect());
+    }
+    if deserialize_bounded::<Vec<[u8; 32]>>(&raw, MAX_NULLIFIER_LEDGER_BYTES).is_ok() {
+        return Ok(HashMap::new());
+    }
+    Err("reject.voucher_ledger_corrupt")
 }
 
 impl VoucherNullifierLedger {
@@ -488,6 +512,20 @@ impl VoucherNullifierLedger {
             trusted_issuer_pubkey,
             spent: HashMap::new(),
             persistence_path: None,
+            load_error: None,
+        }
+    }
+
+    /// Re-reads the ledger file while the last load failed; clears the error once it loads.
+    fn retry_load(&mut self) {
+        if let (Some(_), Some(path)) = (self.load_error, self.persistence_path.as_ref()) {
+            match nullifier_load_decision(crate::storage::fsio::read_state_file(path)) {
+                Ok(spent) => {
+                    self.spent = spent;
+                    self.load_error = None;
+                }
+                Err(code) => self.load_error = Some(code),
+            }
         }
     }
 
@@ -498,24 +536,20 @@ impl VoucherNullifierLedger {
         data_dir: &std::path::Path,
     ) -> Self {
         let path = data_dir.join("voucher_nullifiers.bin");
-        // Format `Vec<([u8; 32], u64)>` since F-35; an older file (nonces only) does not decode
-        // and starts empty, which is safe because pre-F-35 vouchers no longer verify.
-        let spent: HashMap<[u8; 32], u64> = if path.exists() {
-            std::fs::read(&path)
-                .ok()
-                .and_then(|raw| {
-                    deserialize_bounded::<Vec<([u8; 32], u64)>>(&raw, MAX_NULLIFIER_LEDGER_BYTES)
-                        .ok()
-                })
-                .map(|v| v.into_iter().collect())
-                .unwrap_or_default()
-        } else {
-            HashMap::new()
+        let (spent, load_error) = match nullifier_load_decision(
+            crate::storage::fsio::read_state_file(&path),
+        ) {
+            Ok(spent) => (spent, None),
+            Err(code) => {
+                tracing::warn!(code, path = %path.display(), "voucher ledger not loaded; refusing vouchers");
+                (HashMap::new(), Some(code))
+            }
         };
         Self {
             trusted_issuer_pubkey,
             spent,
             persistence_path: Some(path),
+            load_error,
         }
     }
 
@@ -560,6 +594,12 @@ impl VoucherNullifierLedger {
         shard_size_bytes: u64,
         now_ms: u64,
     ) -> Result<(), StorageError> {
+        self.retry_load();
+        if let Some(code) = self.load_error {
+            // Fail closed: the recorded spends are unknown, and the unreadable file is kept.
+            tracing::warn!(code, "refused a voucher: the nullifier ledger did not load");
+            return Err(StorageError::QuotaExceeded(code.into()));
+        }
         if shard_size_bytes > voucher.max_bytes || !voucher.verify(&self.trusted_issuer_pubkey) {
             return Err(StorageError::QuotaExceeded(
                 "invalid_or_undersized_voucher".into(),
@@ -705,6 +745,59 @@ mod tests {
     /// F-35 (plan 2c fact 5): a full ledger refuses a new voucher instead of evicting a live
     /// nullifier, so a spent voucher is never redeemable again while it is fresh.
     #[test]
+    fn unloadable_ledger_refuses_vouchers() {
+        // B-42 QA differential: the same voucher against a loadable and an unloadable ledger file.
+        let issuer = NodeIdentity::generate();
+        let v = AnonymousQuotaVoucher::mint(&issuer, 4096);
+        let pk = issuer.public_key_bytes();
+        let ok_dir = tempfile::tempdir().unwrap();
+        let entries: Vec<([u8; 32], u64)> = vec![([7u8; 32], u64::MAX)];
+        std::fs::write(
+            ok_dir.path().join("voucher_nullifiers.bin"),
+            bincode::serialize(&entries).unwrap(),
+        )
+        .unwrap();
+        let mut ok = VoucherNullifierLedger::with_persistence_dir(pk, ok_dir.path());
+        assert_eq!(ok.spent_count(), 1);
+        assert!(ok.redeem_voucher(&v, 1024).is_ok());
+
+        let legacy_dir = tempfile::tempdir().unwrap();
+        let legacy: Vec<[u8; 32]> = vec![[7u8; 32]];
+        std::fs::write(
+            legacy_dir.path().join("voucher_nullifiers.bin"),
+            bincode::serialize(&legacy).unwrap(),
+        )
+        .unwrap();
+        let mut old = VoucherNullifierLedger::with_persistence_dir(pk, legacy_dir.path());
+        assert!(
+            old.redeem_voucher(&v, 1024).is_ok(),
+            "a pre-F-35 file loads empty"
+        );
+
+        for (bytes, code) in [
+            (vec![0xFFu8; 5], "reject.voucher_ledger_corrupt"),
+            (Vec::new(), "reject.voucher_ledger_unreadable"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("voucher_nullifiers.bin");
+            if bytes.is_empty() {
+                std::fs::create_dir(&path).unwrap(); // exists but cannot be read
+            } else {
+                std::fs::write(&path, &bytes).unwrap();
+            }
+            let mut bad = VoucherNullifierLedger::with_persistence_dir(pk, dir.path());
+            match bad.redeem_voucher(&v, 1024) {
+                Err(StorageError::QuotaExceeded(c)) => assert_eq!(c, code),
+                other => panic!("expected {code}, got {other:?}"),
+            }
+            assert_eq!(bad.spent_count(), 0);
+            if !bytes.is_empty() {
+                assert_eq!(std::fs::read(&path).unwrap(), bytes, "the bad file is kept");
+            }
+        }
+    }
+
+    #[test]
     fn unpersisted_nullifier_refuses_voucher_unspent() {
         // F-55 differential: the same voucher against a writable and a blocked ledger file.
         let issuer = NodeIdentity::generate();
@@ -717,11 +810,13 @@ mod tests {
             VoucherNullifierLedger::with_persistence_dir(issuer.public_key_bytes(), ok_dir.path());
         assert_eq!(reloaded.spent_count(), 1, "the spend survives a restart");
 
+        // The blocker goes in after the load: a file that cannot be loaded is refused on its own
+        // code (see `unloadable_ledger_refuses_vouchers`).
         let bad_dir = tempfile::tempdir().unwrap();
-        let blocker = bad_dir.path().join("voucher_nullifiers.bin");
-        std::fs::create_dir(&blocker).unwrap();
         let mut bad =
             VoucherNullifierLedger::with_persistence_dir(issuer.public_key_bytes(), bad_dir.path());
+        let blocker = bad_dir.path().join("voucher_nullifiers.bin");
+        std::fs::create_dir(&blocker).unwrap();
         match bad.redeem_voucher(&v, 1024) {
             Err(StorageError::QuotaExceeded(code)) => {
                 assert_eq!(code, "reject.voucher_nullifier_not_persisted")
