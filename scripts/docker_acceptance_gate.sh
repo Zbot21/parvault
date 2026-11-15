@@ -6,10 +6,16 @@
 # suffixes every container (parvault-<role>-$RUN_ID), the network (parvault-acceptance-net-$RUN_ID),
 # the volume, the image tags (parvault:acceptance-$RUN_ID, parvault:acceptance-vfs-$RUN_ID,
 # parvault:router-soc-$RUN_ID) and labels the unnamed --rm containers (parvault.gate.run=$RUN_ID).
-# Build contexts and the extracted SoC binary live in a per-run mktemp directory. The /24 subnet
+# The extracted SoC binary and other scratch live in a per-run mktemp directory (RUN_TMP). The
+# two image build contexts, which hold the binaries staged by stage_artifact.sh, live in a per-run
+# stage directory, STAGE_DIR="${PARVAULT_GATE_STAGE_ROOT:-$HOME/.cache/parvault-gate-stage}/$RUN_ID",
+# which the EXIT trap keeps: run_enforcement_gates.sh re-hashes every recorded dest after the gate
+# exits (A-DOCKER). The run holds an flock on STAGE_DIR/.lock while it runs; at start, stage dirs
+# older than PARVAULT_GATE_STAGE_TTL_MIN (default 1440, 24 h) whose lock is free are pruned, so a
+# run in progress is never pruned, and a second live run with the same RUN_ID is refused. The /24 subnet
 # is 172.28.X.0/24 with X derived from RUN_ID; on a pool overlap (another run, or any other
 # network) the next X is tried, so Docker's own pool check makes the choice atomic. Every IP is
-# ${NET_PREFIX}.N. The EXIT trap removes only this run's names, label, tags and directory, never
+# ${NET_PREFIX}.N. The EXIT trap removes only this run's names, label, tags and RUN_TMP, never
 # a shared prefix. KEEP_CONTAINERS=1 keeps them for debugging.
 set -e -o pipefail
 set -u
@@ -30,7 +36,26 @@ IMG_SOC="parvault:router-soc-${RUN_ID}"
 SOC_VOL_NAME="parvault-soc-nas-vol-${RUN_ID}"
 RUN_TMP="$(mktemp -d "${TMPDIR:-/tmp}/parvault-gate-${RUN_ID}.XXXXXX")"
 NET_PREFIX=""  # 172.28.X, set in stage 2
-echo "=== Gate run id: ${RUN_ID} (network ${NET_NAME}, temp ${RUN_TMP}) ==="
+
+# Per-run stage directory, kept after exit (see header). Lock it, then prune old unlocked ones.
+STAGE_ROOT="${PARVAULT_GATE_STAGE_ROOT:-$HOME/.cache/parvault-gate-stage}"
+STAGE_TTL_MIN="${PARVAULT_GATE_STAGE_TTL_MIN:-1440}"
+[[ "$STAGE_TTL_MIN" =~ ^[0-9]+$ ]] || { echo "ERROR: PARVAULT_GATE_STAGE_TTL_MIN must be a number of minutes"; exit 2; }
+STAGE_DIR="${STAGE_ROOT}/${RUN_ID}"
+mkdir -p "$STAGE_DIR"
+exec 9>"$STAGE_DIR/.lock"
+if ! flock -n 9; then
+    echo "ERROR: another gate run with id ${RUN_ID} holds ${STAGE_DIR}/.lock"
+    exit 2
+fi
+touch "$STAGE_DIR"
+find "$STAGE_ROOT" -mindepth 1 -maxdepth 1 -type d -mmin "+${STAGE_TTL_MIN}" -print0 2>/dev/null \
+    | while IFS= read -r -d '' old; do
+        [ "$old" = "$STAGE_DIR" ] && continue
+        # Hold the old run's lock while removing it; a live run keeps its lock, so it is skipped.
+        flock -n "$old/.lock" rm -rf -- "$old" 2>/dev/null || true
+    done
+echo "=== Gate run id: ${RUN_ID} (network ${NET_NAME}, temp ${RUN_TMP}, stage ${STAGE_DIR}) ==="
 
 CONTAINERS=(
     "parvault-seed-0-${RUN_ID}"
@@ -66,7 +91,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "=== [1/12] Building ParVault binaries & "$IMG_ACCEPT" container image ==="
-BUILD_CTX="$RUN_TMP/acceptance-image"
+BUILD_CTX="$STAGE_DIR/acceptance-image"
 rm -rf "$BUILD_CTX"
 mkdir -p "$BUILD_CTX"
 
@@ -250,9 +275,9 @@ fi
 # Also prove zero-`--peers` file store & restore over Docker bridge auto-discovery.
 # The CLI never prints the master key (W-02): store and restore with one explicit key.
 ZKEY="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
-docker exec -e ZKEY="$ZKEY" parvault-client-${RUN_ID} sh -cex '
+docker exec -e ZKEY="$ZKEY" -e NET_SUBNET="$NET_SUBNET" parvault-client-${RUN_ID} sh -cex '
     mkdir -p /tmp/zero-ip-store /tmp/zero-ip-restore
-    echo "Zero-IP LAN discovery file store/restore over 172.28.0.0/24 bridge" > /tmp/zero-ip-store/lan_zero_ip.txt
+    echo "Zero-IP LAN discovery file store/restore over ${NET_SUBNET} bridge" > /tmp/zero-ip-store/lan_zero_ip.txt
     sha256sum /tmp/zero-ip-store/lan_zero_ip.txt > /tmp/lan_zero_ip.sha256
     ZOUT=$(/usr/local/bin/parvault --data-dir /tmp/zero-ip-store/data file store --path /tmp/zero-ip-store/lan_zero_ip.txt --key-hex "$ZKEY")
     echo "$ZOUT"
@@ -738,7 +763,7 @@ echo "=== [12c/12] Mounted MP4 probe and random seek: /dev/fuse and WebDAV 206, 
 # unprivileged container (no device, no caps), then the same leg with tc netem on its loopback,
 # which delays the HTTP hop between ffmpeg and the WebDAV edge (stripes stay local: a mesh-fetched
 # netem leg is deferred). A missing /dev/fuse is SKIPPED, and a FAIL under GATES_REQUIRE_REAL=1.
-VFS_CTX="$RUN_TMP/acceptance-vfs"
+VFS_CTX="$STAGE_DIR/acceptance-vfs"
 rm -rf "$VFS_CTX"
 mkdir -p "$VFS_CTX"
 VFS_TEST_BIN="$(cargo test --release --test vfs_mp4_seek_gate --no-run --message-format=json 2>/dev/null \

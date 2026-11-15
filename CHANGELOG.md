@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 - **Two Docker acceptance gates can run on one host at once (B-110).** `scripts/docker_acceptance_gate.sh` names everything it creates with a per-run id, `RUN_ID="${PARVAULT_GATE_RUN_ID:-$$-$RANDOM}"`: containers, the network, the volume, the `parvault:acceptance`, `parvault:acceptance-vfs` and `parvault:router-soc` tags (now `-<RUN_ID>`), and a `parvault.gate.run=<RUN_ID>` label on the unnamed `--rm` containers. Build contexts move to a per-run `mktemp -d`. The subnet is `172.28.X.0/24`, with X from the run id, moving on when Docker reports a pool overlap; every IP the stages use comes from it. The `EXIT` trap removes only this run's resources. Stages and assertions are unchanged.
+- **The Docker acceptance gate keeps its staged binaries after exit (B-110 follow-up).** The two image build contexts, which hold the `stage_artifact.sh` outputs, move from the per-run temp dir to `${PARVAULT_GATE_STAGE_ROOT:-~/.cache/parvault-gate-stage}/<RUN_ID>/`, which the `EXIT` trap keeps, so the enforcement runner's A-DOCKER re-hash finds every recorded `dest`. A run holds an `flock` on its stage dir; at start, unlocked stage dirs older than `PARVAULT_GATE_STAGE_TTL_MIN` (default 1440) are pruned, and a second live run with the same id is refused. The stage 4 sample file names the run's real subnet, not `172.28.0.0/24`.
 
 ---
 
