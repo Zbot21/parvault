@@ -16,6 +16,7 @@ NAME=parvault                 # this node's daemon container
 PORT=4001                     # this node's mesh port (TCP); e.g. 4011 if 4001 is taken
 PEERS=192.168.1.10:4001       # joining nodes: a ring member's address and port
 CHECK=$HOME/pv-check          # a scratch folder for the round trip in step 5
+BACKUP=$HOME/pv-backup        # a private folder for the secrets backup in step 7
 ```
 
 ## 1. Verify and load the image
@@ -46,11 +47,11 @@ A node must be in a ring before its daemon starts. `wot init` creates one, once,
 
 <!-- docker-doc: ring -->
 ```sh
-docker run --rm --network none --user 65532:65532 --read-only --cap-drop ALL -v "$VOL:/var/lib/parvault" "$IMG" --data-dir /var/lib/parvault wot init
+docker run --rm --network none --user 65532:65532 --read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp:mode=1777 -v "$VOL:/var/lib/parvault" "$IMG" --data-dir /var/lib/parvault wot init
 docker run -d --name "$NAME" --restart unless-stopped --network host --user 65532:65532 --read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /run/parvault:uid=65532,gid=65532,mode=0700 --tmpfs /tmp:mode=1777 -v "$VOL:/var/lib/parvault" "$IMG" --data-dir /var/lib/parvault up --ipc-socket /run/parvault/parvault.sock --listen "/ip4/0.0.0.0/tcp/$PORT"
 ```
 
-`wot init` prints `Started a new ring. Genesis public key: <64 hex>`. Run again, it refuses with `this node is already in the ring <key>` and exit 1, and changes nothing. Wait for the daemon to turn healthy (usually seconds):
+`wot init` prints `Started a new ring. Genesis public key: <64 hex>`. Run again, it refuses with `Error: Invalid key or hex encoding: this node is already in the ring <key>` (versions after 0.5.3 drop the `Invalid key or hex encoding:` prefix) and exit 1, and changes nothing. Wait for the daemon to turn healthy (usually seconds):
 
 <!-- docker-doc: health -->
 ```sh
@@ -65,7 +66,7 @@ On the new node, set the variables (with `PEERS` pointing at a ring member) and 
 
 <!-- docker-doc: identity -->
 ```sh
-docker run --rm --network none --user 65532:65532 --read-only --cap-drop ALL -v "$VOL:/var/lib/parvault" "$IMG" --data-dir /var/lib/parvault identity
+docker run --rm --network none --user 65532:65532 --read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp:mode=1777 -v "$VOL:/var/lib/parvault" "$IMG" --data-dir /var/lib/parvault identity
 ```
 
 Copy the value of `Ed25519 Public Key (hex)`. On the ring's first node (the one that ran `wot init`; it holds the genesis key), issue a token for that key:
@@ -73,7 +74,7 @@ Copy the value of `Ed25519 Public Key (hex)`. On the ring's first node (the one 
 <!-- docker-doc: invite -->
 ```sh
 KEY=PASTE_KEY_HERE           # the 64-hex key from identity
-docker run --rm --network none --user 65532:65532 --read-only --cap-drop ALL -v "$VOL:/var/lib/parvault" "$IMG" --data-dir /var/lib/parvault wot invite --peer "$KEY"
+docker run --rm --network none --user 65532:65532 --read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp:mode=1777 -v "$VOL:/var/lib/parvault" "$IMG" --data-dir /var/lib/parvault wot invite --peer "$KEY"
 ```
 
 It prints one long hex line, the token; it admits only that key. Back on the new node, install it and start the daemon with `--peers`:
@@ -81,7 +82,7 @@ It prints one long hex line, the token; it admits only that key. Back on the new
 <!-- docker-doc: join -->
 ```sh
 TOKEN=PASTE_TOKEN_HERE       # the token from wot invite
-docker run --rm --network none --user 65532:65532 --read-only --cap-drop ALL -v "$VOL:/var/lib/parvault" "$IMG" --data-dir /var/lib/parvault wot install-chain --token "$TOKEN"
+docker run --rm --network none --user 65532:65532 --read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp:mode=1777 -v "$VOL:/var/lib/parvault" "$IMG" --data-dir /var/lib/parvault wot install-chain --token "$TOKEN"
 docker run -d --name "$NAME" --restart unless-stopped --network host --user 65532:65532 --read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /run/parvault:uid=65532,gid=65532,mode=0700 --tmpfs /tmp:mode=1777 -v "$VOL:/var/lib/parvault" "$IMG" --data-dir /var/lib/parvault up --ipc-socket /run/parvault/parvault.sock --listen "/ip4/0.0.0.0/tcp/$PORT" --peers "$PEERS"
 ```
 
@@ -105,7 +106,7 @@ The project and volume are named `parvault` and `parvault-data`; rename both to 
 
 <!-- docker-doc: firewall -->
 ```sh
-sudo ufw allow 4001/tcp
+sudo ufw allow "$PORT/tcp"
 sudo ufw allow 4009/udp
 ```
 
@@ -118,8 +119,8 @@ From a node that has joined (on the first node, set `PEERS` to another member), 
 <!-- docker-doc: roundtrip -->
 ```sh
 mkdir -p "$CHECK" && chmod 0777 "$CHECK" && head -c 65536 /dev/urandom > "$CHECK/sample.bin"
-ROOT=$(docker run --rm --network host --user 65532:65532 --read-only --tmpfs /tmp --cap-drop ALL -v "$VOL:/var/lib/parvault" -v "$CHECK:/io" "$IMG" --data-dir /var/lib/parvault file store --path /io/sample.bin --peers "127.0.0.1:$PORT,$PEERS" | sed -n 's/^File Merkle Root : //p'); echo "root $ROOT"
-docker run --rm --network host --user 65532:65532 --read-only --tmpfs /tmp --cap-drop ALL -v "$VOL:/var/lib/parvault" -v "$CHECK:/io" "$IMG" --data-dir /var/lib/parvault file restore --manifest-or-root "$ROOT" --output /io/restored.bin --peers "127.0.0.1:$PORT,$PEERS"
+ROOT=$(docker run --rm --network host --user 65532:65532 --read-only --tmpfs /tmp:mode=1777 --cap-drop ALL --security-opt no-new-privileges:true -v "$VOL:/var/lib/parvault" -v "$CHECK:/io" "$IMG" --data-dir /var/lib/parvault file store --path /io/sample.bin --peers "127.0.0.1:$PORT,$PEERS" | sed -n 's/^File Merkle Root : //p'); echo "root $ROOT"
+docker run --rm --network host --user 65532:65532 --read-only --tmpfs /tmp:mode=1777 --cap-drop ALL --security-opt no-new-privileges:true -v "$VOL:/var/lib/parvault" -v "$CHECK:/io" "$IMG" --data-dir /var/lib/parvault file restore --manifest-or-root "$ROOT" --output /io/restored.bin --peers "127.0.0.1:$PORT,$PEERS"
 cmp "$CHECK/sample.bin" "$CHECK/restored.bin" && echo "byte-identical"
 ```
 
@@ -144,7 +145,8 @@ The volume holds the node's keys, and for the first node the ring's genesis key,
 <!-- docker-doc: remove -->
 ```sh
 docker stop "$NAME"
-docker cp "$NAME:/var/lib/parvault" "$CHECK/$NAME-backup" && chmod -R go-rwx "$CHECK/$NAME-backup"
+mkdir -p -m 0700 "$BACKUP"
+docker cp "$NAME:/var/lib/parvault" "$BACKUP/$NAME-backup" && chmod -R go-rwx "$BACKUP/$NAME-backup"
 docker rm "$NAME"
 docker volume rm "$VOL"
 ```

@@ -45,7 +45,7 @@ run() {
   {
     echo 'set -euo pipefail'
     echo 'docker() { if [[ "$1" == run ]]; then shift; command docker run -e PARVAULT_NO_LAN_DISCOVERY=1 "$@"; else command docker "$@"; fi; }'
-    echo "IMG=$IMG VOL=$ID-$node NAME=$ID-$node PORT=$port PEERS=$peers CHECK=$WORK/check-$node"
+    echo "IMG=$IMG VOL=$ID-$node NAME=$ID-$node PORT=$port PEERS=$peers CHECK=$WORK/check-$node BACKUP=$WORK/backup-$node"
     echo "$pre"
     block "$name" | grep -vE '^(KEY|TOKEN)=PASTE_'
   } > "$WORK/$node-$name.sh"
@@ -102,6 +102,6 @@ ok "upgrade: node b replaced, healthy, still in the ring (a second round trip pa
 # 7. remove node b
 run b remove >/dev/null
 command docker volume inspect "$ID-b" >/dev/null 2>&1 && fail "remove left the volume"
-[[ -n "$(ls -A "$WORK/check-b/$ID-b-backup")" ]] || fail "remove made no backup"
-ok "remove: node b stopped, copied ($(ls "$WORK/check-b/$ID-b-backup" | wc -l) entries), container and volume gone"
+[[ -n "$(ls -A "$WORK/backup-b/$ID-b-backup")" ]] || fail "remove made no backup"
+ok "remove: node b stopped, copied ($(ls "$WORK/backup-b/$ID-b-backup" | wc -l) entries), container and volume gone"
 echo "test_docker_doc: PASS ($IMG)"

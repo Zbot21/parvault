@@ -52,7 +52,7 @@ Every service in the shipped files has `pull_policy: never`. Without it, a misty
 
 On the first build, `init` creates the ring and exits 0. Its Log tab says `Started a new ring. Genesis public key: <64 hex>`. The daemon, `parvault`, turns healthy within about a minute (about 5 s on the test host).
 
-On every later start, `init` runs again, logs `Error: this node is already in the ring <key>` and exits 1. That is harmless: it refuses before writing anything. Container Manager shows it as stopped.
+On every later start, `init` runs again, logs `Error: Invalid key or hex encoding: this node is already in the ring <key>` (versions after 0.5.3 drop the `Invalid key or hex encoding:` prefix) and exits 1. That is harmless: it refuses before writing anything. Container Manager shows it as stopped.
 
 ## 4. Add a node
 
@@ -79,6 +79,36 @@ Once the node has joined, you can delete its `invite-*` service on the first nod
 - **0 network use.** With `network_mode: host` there is no per-container interface, so Container Manager shows 0 network use for ParVault even while it stores and serves shards (B-148). Host networking is needed: LAN discovery (UDP 4009 broadcast) and the mesh port (TCP 4001) must be on the NAS's own address, not behind a bridge's NAT.
 - **No volume in the UI.** Data lives in the named volume `parvault-data`, which starts owned by `65532:65532`. Container Manager does not list named volumes, but it is there and survives rebuilds.
 - **Deleting a project can delete its data.** Deleting a project in Container Manager can remove its volume, and with it the node's keys and ring membership. To change a project, stop it, edit `compose.yaml`, and build. Never delete the first node's project: its volume holds the ring genesis, which every invite needs.
+
+**Back up the first node's volume (UI only).** `parvault-data` holds the node's keys and, on the first node, the ring genesis secret, which every invite needs. Without a copy, losing it ends the ring. Make one once, and again after any change of ring:
+
+1. Control Panel > Shared Folder > Create a folder, for example `parvault-backup`. Give only your own account Read/Write and everyone else No access; leave "Hide this shared folder in My Network Places" on. Do not enable a recycle bin or a share to other users.
+2. Pull `busybox` (Container Manager > Registry), then make a second project (folder `docker/parvault-export`) from this `compose.yaml`, and build it:
+
+```yaml
+name: parvault-export
+services:
+  export:
+    image: busybox:latest
+    pull_policy: never
+    network_mode: none
+    restart: "no"
+    cap_drop: [ALL]
+    cap_add: [DAC_OVERRIDE]    # to read files owned by 65532 and write the copy
+    security_opt: ["no-new-privileges:true"]
+    command: ["sh", "-c", "umask 077 && cp -R /data/. /backup/ && echo exported"]
+    volumes:
+      - parvault-data:/data:ro
+      - /volume1/parvault-backup:/backup
+volumes:
+  parvault-data:
+    external: true
+    name: parvault-data
+```
+
+It prints `exported` and exits 0; the copy is in the share, readable only by root and you (DSM administrators can always read it). Set the share's path in place of `/volume1/parvault-backup` if the share is on another volume. Then stop and delete the `parvault-export` project, which touches no data (its volume is `external`).
+
+**Keep it private: anyone with that copy can admit nodes to your ring.** Do not put it in a shared folder others can read, a cloud sync folder, or a backup job that uploads it unencrypted. If you also back up the share with Hyper Backup, encrypt that task (Hyper Backup > Backup Settings > Enable client-side encryption). Backing up the Docker volume path directly (`/volume1/@docker/volumes/parvault-data`) in Hyper Backup is not documented by Synology, so this guide does not rely on it.
 
 What every project also does:
 
@@ -110,10 +140,10 @@ Optional; [DOCKER.md](DOCKER.md) is the full shell guide. Over SSH on the NAS, t
 IMG=parvault:0.5.3-dev   # the tag you imported
 sudo docker load -i parvault-image-amd64-dev.tar
 # This NAS starts a new ring (the first node):
-sudo docker run --rm -v parvault-data:/var/lib/parvault "$IMG" --data-dir /var/lib/parvault wot init
+sudo docker run --rm --network none --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges:true --read-only --tmpfs /tmp:mode=1777 -v parvault-data:/var/lib/parvault "$IMG" --data-dir /var/lib/parvault wot init
 # On the first node, invite a node by its 64-hex key:
-sudo docker run --rm -v parvault-data:/var/lib/parvault "$IMG" --data-dir /var/lib/parvault wot invite --peer <KEY>
+sudo docker run --rm --network none --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges:true --read-only --tmpfs /tmp:mode=1777 -v parvault-data:/var/lib/parvault "$IMG" --data-dir /var/lib/parvault wot invite --peer <KEY>
 # Or this NAS joins a ring: print its key, get a token from the first node, install it.
-sudo docker run --rm -v parvault-data:/var/lib/parvault "$IMG" --data-dir /var/lib/parvault identity
-sudo docker run --rm -v parvault-data:/var/lib/parvault "$IMG" --data-dir /var/lib/parvault wot install-chain --token <TOKEN>
+sudo docker run --rm --network none --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges:true --read-only --tmpfs /tmp:mode=1777 -v parvault-data:/var/lib/parvault "$IMG" --data-dir /var/lib/parvault identity
+sudo docker run --rm --network none --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges:true --read-only --tmpfs /tmp:mode=1777 -v parvault-data:/var/lib/parvault "$IMG" --data-dir /var/lib/parvault wot install-chain --token <TOKEN>
 ```

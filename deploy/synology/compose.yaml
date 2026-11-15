@@ -5,7 +5,8 @@
 # parvault:<Cargo.toml version>-dev; scripts/gen_metrics.sh fails otherwise.)
 #
 #  - init:      run once; creates the ring on the very first start. On later starts it logs
-#               "this node is already in the ring <key>" and exits 1. That is harmless.
+#               "Error: Invalid key or hex encoding: this node is already in the ring <key>" (versions after 0.5.3
+#               drop the "Invalid key or hex encoding:" prefix) and exits 1. That is harmless.
 #  - parvault:  the daemon. Healthy means it is running in a ring.
 #  - invite-*:  add one per joining node, AFTER the first start (see the commented example and
 #               docs/SYNOLOGY.md "Add a node"). Its token appears in its Log tab.
