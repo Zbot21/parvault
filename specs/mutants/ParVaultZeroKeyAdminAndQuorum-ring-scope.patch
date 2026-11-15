@@ -1,7 +1,7 @@
 diff --git a/specs/ParVaultZeroKeyAdminAndQuorum.tla b/specs/ParVaultZeroKeyAdminAndQuorum.tla
 --- a/specs/ParVaultZeroKeyAdminAndQuorum.tla
 +++ b/specs/ParVaultZeroKeyAdminAndQuorum.tla
-@@ -135,7 +135,7 @@
+@@ -141,7 +141,7 @@
  \* A PrivateRing node resolves its order authority from the manifest whose scope root is its
  \* genesis (owner) key (council_scope_root / council_from_manifest), never the public council.
  OrderMeetsPrivateRingAuth(ord) ==

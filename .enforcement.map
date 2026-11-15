@@ -66,6 +66,7 @@ reach      TR-NONCE-FRESH sym=src/admin_rpc.rs::validate_admin_rpc_slice_replay_
 reach      TR-ORDER-ID-FRESH sym=src/storage/eviction.rs::replay_slot_check from=src/network/wire_handler.rs::handle_mesh_wire_request
 reach      TR-RING-SCOPE sym=src/storage/council.rs::council_from_manifest from=src/network/wire_handler.rs::handle_mesh_wire_request
 reach      TR-COUNCIL-MANIFEST sym=src/storage/council.rs::council_manifest_decision from=src/bin/parvault-seed.rs::main
+reach      TR-COUNCIL-ROOT-DISK sym=src/storage/council.rs::seed_council_install_decision from=src/bin/parvault-seed.rs::main   # F-53 guard council-root-not-on-disk
 # L-47 guard-removal mutants (QA, independent); each @guard line names its Rust decision via sym=.
 tla-mutant TM-READ-OWNER    spec=specs/ParVaultProtocol.tla inv=DataSecrecyInvariant patch=specs/mutants/ParVaultProtocol-read-auth-owner.patch
 tla-mutant TM-READ-REPAIR   spec=specs/ParVaultProtocol.tla inv=DataSecrecyInvariant patch=specs/mutants/ParVaultProtocol-read-auth-repair.patch
