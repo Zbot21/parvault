@@ -128,9 +128,11 @@ docker.router_soc_stage12_vmhwm = 15.8 MiB
 # the 21eee6a record. tlc.generated and tlc.distinct (sums) are generated.
 # ParVaultZeroKeyAdminAndQuorum re-measured 2026-11-13 (item 6, council install model):
 # TLA2TOOLS_JAR=/opt/tla2tools.jar bash scripts/gen_metrics.sh --measured tlc
-# ParVaultZeroKeyAdminAndQuorum re-measured 2026-11-15 at 5c237e4 (B-26 / F-53 re-root model,
-# MaxCouncilEpoch 3, cfg RootOnDisk = TRUE; TLC -workers auto on the dev box). The RootOnDisk =
-# FALSE run (same spec, cfg value flipped) is 1,266,790,664 generated, 873,792 distinct, depth 21.
+# ParVaultZeroKeyAdminAndQuorum re-measured 2026-11-15 at the F-53 C3 commit (B-26 / F-53 re-root
+# model, MaxCouncilEpoch 3; TLC -workers auto on the box): ParVaultZeroKeyAdminAndQuorum.cfg
+# (RootOnDisk = TRUE) and the variant ParVaultZeroKeyAdminAndQuorum.RootOffDisk.cfg (RootOnDisk =
+# FALSE, keys <Spec>.RootOffDisk). CI runs both; the sums include both.
+# bash scripts/gen_metrics.sh --measured tlc (every specs/<Spec>.cfg and <Spec>.<Variant>.cfg)
 tlc.generated.ParVaultProtocol = 61,009
 tlc.generated.ParVaultConfidentialityAndTrust = 2,318
 tlc.generated.ParVaultAnonymity = 2,742
@@ -147,6 +149,9 @@ tlc.distinct.ParVaultBootstrapAndEarnedTier = 136
 tlc.distinct.ParVaultLiteClientAndSeedFailover = 95
 tlc.distinct.ParVaultZeroKeyAdminAndQuorum = 511,488
 tlc.depth.ParVaultZeroKeyAdminAndQuorum = 21
+tlc.generated.ParVaultZeroKeyAdminAndQuorum.RootOffDisk = 1,266,790,664
+tlc.distinct.ParVaultZeroKeyAdminAndQuorum.RootOffDisk = 873,792
+tlc.depth.ParVaultZeroKeyAdminAndQuorum.RootOffDisk = 21
 tlc.distinct.ParVaultGatewayPluginBus = 7,540
 tlc.depth.ParVaultGatewayPluginBus = 10
 
@@ -175,9 +180,9 @@ tla_pass = 8 / 8
 adr_count = 33
 adr_last = ADR-33
 tests_unit = 131
-tests_integration = 353
-tests_total = 484
-tests_pass = 484 / 484
+tests_integration = 355
+tests_total = 486
+tests_pass = 486 / 486
 size.parvault.aarch64 = 6.27 MiB
 size.parvault-seed.aarch64 = 4.27 MiB
 size.parvault-fuse.aarch64 = 1.13 MiB
@@ -198,6 +203,6 @@ bench.soc.headroom_32m = 22.26 MiB
 bench.soc.headroom_48m = 38.26 MiB
 bench.soc.vmhwm_reduction = 5.9x
 aes.enc.span = 496.5–589.2 MiB/s
-tlc.generated = 741,850,703
-tlc.distinct = 525,340
+tlc.generated = 2,008,641,367
+tlc.distinct = 1,399,132
 # <<< end generated
