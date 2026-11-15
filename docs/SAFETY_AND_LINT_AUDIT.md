@@ -58,6 +58,8 @@ Across the entire repository (`src/`, `tests/`, `benches/`), **22 avoidable `#[a
 
 Every `unsafe` block in `parvault` resides in `src/os_sys.rs` (`#[cfg(unix)]`). No raw pointers, borrowed descriptors, or uninitialized buffers escape any wrapper:
 
+`v0.5.4` (CodeQL #59, `rust/access-invalid-pointer`): the `getifaddrs` / `freeifaddrs` unsafe block of `interface_has_ip` (debug feature `lab-insecure-metrics` only) is removed; the function now calls `if_addrs::get_if_addrs()` (optional dep `if-addrs` `=0.15.0` with its `link-local` feature), so `src/os_sys.rs` has 3 fewer `unsafe` blocks and no wrapper differs between builds. Pinned by `traversal_metrics::insecure_listener_on_named_iface_debug_only`, `insecure_listener_iface_mismatch_refused` and `insecure_listener_link_local_v6_on_its_iface`.
+
 | File:Line | Syscall | Preconditions Enforced | Test / Kani Coverage |
 | :--- | :--- | :--- | :--- |
 | `src/os_sys.rs:130` | `libc::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &mut ts)` | `ts` is a stack-allocated, zero-initialized `libc::timespec` exclusively borrowed via `&mut ts` for the synchronous syscall; negative `rc` falls back to `0`, and `tv_sec`/`tv_nsec` are clamped `.max(0)` with saturating nanosecond arithmetic. | `os_sys::tests::test_safe_pread_pwrite_memfd_and_cpu_clocks` (`src/os_sys.rs:652`), `parvault-bench` |

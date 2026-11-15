@@ -619,6 +619,86 @@ fn insecure_listener_iface_mismatch_refused() {
     gate_ran("traversal_metrics::insecure_listener_iface_mismatch_refused");
 }
 
+/// A link-local IPv6 address of a non-loopback interface, read from `/proc/net/if_inet6` (the
+/// kernel's own list, independent of `getifaddrs`): `(iface, address, ifindex)`.
+fn link_local_v6() -> (String, std::net::Ipv6Addr, u32) {
+    let table = std::fs::read_to_string("/proc/net/if_inet6").expect("/proc/net/if_inet6");
+    table
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let bits = u128::from_str_radix(f.first()?, 16).ok()?;
+            let idx = u32::from_str_radix(f.get(1)?, 16).ok()?;
+            let ip = std::net::Ipv6Addr::from(bits);
+            let name = f.get(5)?.to_string();
+            (ip.segments()[0] & 0xffc0 == 0xfe80 && name != "lo").then_some((name, ip, idx))
+        })
+        .next()
+        .expect("this test needs a link-local IPv6 address on a non-loopback interface")
+}
+
+/// METRICS-INSEC link-local (feature build, CodeQL #59 port to `if-addrs`): an `fe80::…%<index>`
+/// address is owned by its own interface, so the listener starts on it; the same address claimed
+/// for `lo` is refused. Pins the `if-addrs` `link-local` feature (its default drops `fe80::`).
+#[test]
+fn insecure_listener_link_local_v6_on_its_iface() {
+    let bin = insecure_bin();
+    let (iface, ip, idx) = link_local_v6();
+    let port = closed_port();
+    let d = spawn_daemon_with(
+        Command::new(&bin),
+        "insec-ll",
+        &[],
+        false,
+        &[
+            "--lab-insecure-metrics".into(),
+            format!("{iface}=[{ip}%{idx}]:{port}"),
+        ],
+    );
+    assert!(
+        eventually(Duration::from_secs(10), || d
+            .log_text()
+            .contains("PARVAULT-LAB-INSECURE-METRICS-v1")),
+        "{}",
+        d.log_text()
+    );
+    assert!(!d
+        .log_text()
+        .contains("reject.metrics_insecure_iface_mismatch"));
+
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cmd = Command::new(&bin);
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", root.path().join("reg"))
+        .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+        .env("RUST_LOG", "info")
+        .arg("--data-dir")
+        .arg(&dir)
+        .args([
+            "--no-lan-discovery",
+            "daemon",
+            "start",
+            "--listen",
+            common::LOOPBACK_EPHEMERAL,
+            "--no-socket",
+            "--lab-insecure-metrics",
+        ])
+        .arg(format!("lo=[{ip}%{idx}]:9100"));
+    let out = common::output_within_deadline(&mut cmd);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("reject.metrics_insecure_iface_mismatch"),
+        "{text}"
+    );
+    gate_ran("traversal_metrics::insecure_listener_link_local_v6_on_its_iface");
+}
+
 /// B-142 accept: a bootstrap address naming the right PeerId connects (`ok`), with no refusal.
 #[test]
 fn b142_bootstrap_peer_id_matches_and_connects() {

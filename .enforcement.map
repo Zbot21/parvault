@@ -315,6 +315,7 @@ claim      METRICS-AUTH sym=src/http_edge.rs::status_auth_decision accept=trust_
 claim      METRICS-SCOPED sym=src/http_edge.rs::status_auth_decision accept=trust_enforcement::metrics_http_readonly_bearer_served reject=trust_enforcement::metrics_http_scoped_token_forbidden code=reject.status_token_scoped bin=parvault ref=docs/security/TRUST_FINDINGS.md
 claim      METRICS-HOST sym=src/http_edge.rs::status_auth_decision accept=trust_enforcement::metrics_http_readonly_bearer_served reject=trust_enforcement::metrics_http_dns_host_refused code=reject.status_host_mismatch bin=parvault ref=docs/security/TRUST_FINDINGS.md
 claim      METRICS-INSEC sym=src/traversal_metrics.rs::insecure_metrics_listener_decision accept=traversal_metrics::insecure_listener_on_named_iface_debug_only reject=traversal_metrics::insecure_listener_iface_mismatch_refused code=reject.metrics_insecure_iface_mismatch bin=parvault ref=docs/METRICS.md
+suite      S-METRICS-LL test=traversal_metrics::insecure_listener_link_local_v6_on_its_iface needs=cmd:sh   # v0.5.4 CodeQL #59: if-addrs link-local feature keeps fe80:: (needs a link-local IPv6 address)
 kani       METRICS-K sym=src/traversal_metrics.rs::insecure_metrics_listener_decision harness=proof_insecure_metrics_requires_debug_feature_and_iface cover=insecure listener allowed
 kani       METRICS-IDX sym=src/traversal_metrics.rs::flat_index harness=proof_reason_index_in_bounds cover=last index reached
 suite      S-METRICS-ORD test=traversal_metrics::metrics_arm_below_status_auth needs=cmd:sh
