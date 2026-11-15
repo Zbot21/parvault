@@ -745,11 +745,12 @@ docker run --rm -e GATES_REQUIRE_REAL=1 parvault:acceptance-vfs webdav_206_mp4_p
 # sample can carry a 200 ms loss RTO), and the cache cap. The per-block miss set is
 # logged, not asserted: under latency an abandoned `Range: bytes=N-` can hydrate up to about one
 # TCP window of extra blocks (B-23, v0.6.0).
-docker run --rm --cap-add NET_ADMIN -e GATES_REQUIRE_REAL=1 -e PARVAULT_VFS_TTFB_BUDGET_MS=100 \
+# Bounded (B-56): a hang (seen once as ~590 s, a lost shutdown wake SYN) fails the gate loudly.
+timeout --kill-after=30 600 docker run --rm --cap-add NET_ADMIN -e GATES_REQUIRE_REAL=1 -e PARVAULT_VFS_TTFB_BUDGET_MS=100 \
     -e PARVAULT_VFS_GATE_LATENCY=1 \
     --entrypoint sh parvault:acceptance-vfs -c \
     'tc qdisc add dev lo root netem delay 15ms loss 2% && exec /usr/local/bin/vfs_mp4_seek_gate --test-threads=1 --nocapture webdav_206_mp4_probe_and_random_seek' \
-    || { echo "ERROR: stage 12c: the WebDAV leg under netem 15ms/2% failed"; exit 1; }
+    || { echo "ERROR: stage 12c: the WebDAV leg under netem 15ms/2% failed or exceeded 600 s"; exit 1; }
 echo "Mounted MP4 gate verified: FUSE ${VFS_FUSE_RESULT}; WebDAV 206 PASS (plain and under netem)."
 
 echo "================================================================================"

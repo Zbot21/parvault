@@ -578,6 +578,11 @@ fn webdav_206_mp4_probe_and_random_seek() {
     );
     samples.sort_unstable();
     let median = samples[TTFB_SAMPLES / 2];
+    // The max is logged, not asserted, so a tail regression stays visible in the gate output.
+    eprintln!(
+        "B3 cold WebDAV TTFB median {median:?} max {:?} over {TTFB_SAMPLES} samples",
+        samples[TTFB_SAMPLES - 1]
+    );
     assert_budget(
         "cold WebDAV TTFB within budget (median)",
         median < ttfb_budget(),
