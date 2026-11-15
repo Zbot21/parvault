@@ -6425,7 +6425,9 @@ fn bseed_silent_peer_gets_one_put_per_job() {
 /// root is ignored; the order is refused and nothing is installed.
 #[test]
 fn council_public_first_epoch_not_auto_installed() {
-    use parvault::storage::council::{install_council_manifest, CouncilManifest};
+    use parvault::storage::council::{
+        install_council_manifest, CouncilInstallRole, CouncilManifest,
+    };
     let tracker = key(0x7A);
     let members = [key(0x81)];
     let mut m = CouncilManifest::new(
@@ -6438,7 +6440,13 @@ fn council_public_first_epoch_not_auto_installed() {
     m.sign(&tracker);
     // The serving peer holds the manifest (it reads it per request).
     let ahead = spawn_daemon("cpub-ahead");
-    install_council_manifest(&ahead.dir, &m, tracker.public_key_bytes()).unwrap();
+    install_council_manifest(
+        &ahead.dir,
+        &m,
+        tracker.public_key_bytes(),
+        CouncilInstallRole::PublicClient,
+    )
+    .unwrap();
     // The public node pins the tracker key and has `ahead` as its peer.
     let (root_dir, dir, reg, log) = prepare("cpub-behind");
     std::fs::write(

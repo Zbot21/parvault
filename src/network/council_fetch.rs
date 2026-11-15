@@ -10,7 +10,7 @@
 
 use crate::network::{MeshClient, MeshWireRequest, MeshWireResponse};
 use crate::storage::council::{
-    install_council_chain, load_council_manifest, MAX_COUNCIL_MANIFEST_BYTES,
+    install_council_chain, load_council_manifest, CouncilInstallRole, MAX_COUNCIL_MANIFEST_BYTES,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -55,6 +55,7 @@ pub fn spawn_council_fetch(
     admitted_peers: Vec<String>,
     data_dir: PathBuf,
     scope_root: [u8; 32],
+    role: CouncilInstallRole,
 ) -> Result<(), &'static str> {
     let peers: Vec<String> = {
         let mut l = limiter().lock().unwrap_or_else(|p| p.into_inner());
@@ -79,6 +80,9 @@ pub fn spawn_council_fetch(
     let spawned = std::thread::Builder::new()
         .name("council-fetch".into())
         .spawn(move || {
+            // `in_flight` stays keyed by the root the fetch started under; the request root is
+            // re-resolved after each install, since a re-root moves it (verdict change 6).
+            let mut root = scope_root;
             for peer in &peers {
                 // Step forward: each answer is the oldest manifests that fit; ask again from the
                 // new epoch until the peer has nothing newer or a manifest is refused.
@@ -87,7 +91,7 @@ pub fn spawn_council_fetch(
                     let resp = client.send_request(
                         peer,
                         MeshWireRequest::GetCouncilManifest {
-                            scope_root,
+                            scope_root: root,
                             from_epoch,
                         },
                     );
@@ -98,7 +102,12 @@ pub fn spawn_council_fetch(
                     if manifests.is_empty() || size > MAX_COUNCIL_MANIFEST_BYTES {
                         break;
                     }
-                    let n = install_council_chain(&data_dir, &manifests, scope_root);
+                    let (n, new_root) = install_council_chain(&data_dir, &manifests, root, role);
+                    if new_root != root {
+                        // The third pin store: this process's in-memory map.
+                        client.repin_tracker_admin_pubkey(root, new_root);
+                        root = new_root;
+                    }
                     if n > 0 {
                         tracing::info!(installed = n, peer = %peer, "installed newer council manifests");
                     }

@@ -14,7 +14,9 @@ pub enum CouncilAction {
         quorum: u32,
     },
     /// Install a council manifest (hex, from `council show` or the public tracker admin): epoch 1
-    /// signed by the scope root, or the next epoch signed by a quorum of the installed one.
+    /// signed by the scope root, the next epoch signed by a quorum of the installed one, or (in
+    /// `--public` mode) a re-root away from the pinned root signed by that quorum and the new
+    /// root, after which this node is pinned to the new root.
     Install {
         /// The hex-encoded manifest.
         #[arg(long)]
@@ -22,6 +24,17 @@ pub enum CouncilAction {
     },
     /// Print the installed council and its hex manifest.
     Show,
+    /// Manual re-pin (public mode, F-53): pin `--tracker` to `--admin-pubkey` in
+    /// `known_peers.json` and `pinned_tracker_admins.json`, replacing its earlier pin. A running
+    /// daemon loads the new pin at its next start. The installed council stays until removed.
+    Repin {
+        /// The tracker address as pinned (its multiaddr).
+        #[arg(long)]
+        tracker: String,
+        /// The tracker admin's 32-byte Ed25519 public key (64 hex).
+        #[arg(long = "admin-pubkey")]
+        admin_pubkey: String,
+    },
 }
 
 /// `parvault wot` subcommands (ring admission, bootstrap option A).

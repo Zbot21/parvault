@@ -1718,6 +1718,21 @@ impl MeshClient {
         }
     }
 
+    /// Re-pins the in-memory map from `old` onto `new` (the third pin store; the two on-disk
+    /// ones move in `council::repin_tracker_admin`). Called only after a council re-root.
+    pub fn repin_tracker_admin_pubkey(&self, old: [u8; 32], new: [u8; 32]) {
+        if new == [0u8; 32] {
+            return;
+        }
+        if let Ok(mut guard) = self.tracker_admin_pubkeys.lock() {
+            for pk in guard.values_mut() {
+                if *pk == old {
+                    *pk = new;
+                }
+            }
+        }
+    }
+
     /// Returns all TOFU-pinned `tracker_admin_pubkey` keys learned from Public Trackers (`ADR-26`).
     pub fn pinned_tracker_admin_pubkeys(&self) -> Vec<[u8; 32]> {
         let mut out = Vec::new();

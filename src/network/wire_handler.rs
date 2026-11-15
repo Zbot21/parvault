@@ -114,6 +114,11 @@ pub fn handle_daemon_wire_request(
                 .map(|mc| mc.pinned_tracker_admin_pubkeys())
                 .unwrap_or_default(),
         ),
+        council_role: if ctx.public_mode {
+            crate::storage::council::CouncilInstallRole::PublicClient
+        } else {
+            crate::storage::council::CouncilInstallRole::Private
+        },
         node_identity: ctx.node_identity,
         genesis_pubkey: ctx.genesis_pubkey,
         block_store: ctx.block_store,
@@ -152,6 +157,14 @@ pub fn handle_seed_wire_request(
         council_root: match ctx.server.mode() {
             SeedServerMode::PublicNetworkBootstrapper => ctx.advertised_admin_pk,
             SeedServerMode::HomelabRedundancyVault => ctx.genesis_pubkey,
+        },
+        council_role: match ctx.server.mode() {
+            SeedServerMode::PublicNetworkBootstrapper => {
+                crate::storage::council::CouncilInstallRole::PublicSeed
+            }
+            SeedServerMode::HomelabRedundancyVault => {
+                crate::storage::council::CouncilInstallRole::Private
+            }
         },
         node_identity: ctx.node_identity,
         genesis_pubkey: ctx.genesis_pubkey,
@@ -214,6 +227,8 @@ pub struct WireState<'a> {
     pub data_dir: &'a Path,
     /// This role's council scope root (`council_scope_root`), resolved at the entry point.
     pub council_root: Option<[u8; 32]>,
+    /// Which re-root shape a fetched manifest may take (F-53, verdict change 3).
+    pub council_role: crate::storage::council::CouncilInstallRole,
     pub node_identity: &'a NodeIdentity,
     pub genesis_pubkey: Option<[u8; 32]>,
     pub block_store: &'a BlockStore,
@@ -902,6 +917,7 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
     let WireState {
         data_dir,
         council_root,
+        council_role,
         node_identity,
         genesis_pubkey,
         block_store,
@@ -1980,6 +1996,7 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                         admitted,
                         data_dir.to_path_buf(),
                         root,
+                        council_role,
                     ) {
                         info!(code, "no council manifest fetch started");
                     }
