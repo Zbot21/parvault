@@ -9,8 +9,9 @@
 #   deploy/docker/compose.yaml         join from a Docker host on a non-default --listen port,
 #                                      healthy through the image's own HEALTHCHECK
 #   docs/SYNOLOGY.md export + import  the documented backup projects: stop a ring's daemon, export its
-#                                      volume to one tar, import it into a NEW volume, start a daemon
-#                                      there: healthy, the same genesis key, `wot invite` works
+#                                      volume to one tar, import it over a throwaway ring's volume (the main
+#                                      project started once, with a planted file) and over A's own volume
+#                                      with an extra file: A's genesis and node key, extras gone
 # Each run uses its own project and volume names (pvct-<pid>-<n>) and loopback ports, adds
 # --no-lan-discovery so it never meets a real ring, and removes everything with `down -v`.
 # Usage: scripts/test_compose_projects.sh [image tag]   (default parvault:<Cargo.toml version>-dev,
@@ -187,16 +188,42 @@ logs "$WORK/pexp.yaml" export | grep -qx exported || fail "export said: $(logs "
 docker run --rm -v "$WORK/bak:/b:ro" --entrypoint tar "$BB" -tvf /b/parvault-data.tar | grep -q '65532' \
   || fail "tar does not keep the 65532 owner"
 ok "export: one tar, root 0600, files owned by 65532 inside"
-docker volume create "$ID-7-data" >/dev/null
+# The documented restore: build and start the main project once on a NEW volume (init makes a
+# throwaway ring B), let its daemon write, plant a file, then stop, import, start.
+sh_vol() { docker run --rm -v "$1:/data" --entrypoint sh "$BB" -c "$2"; }   # one-shot busybox on a volume
+KA=$(client 6 identity | sed -n 's/^Ed25519 Public Key (hex): //p'); [[ ${#KA} == 64 ]] || fail "no node key of ring A"
+M=$(variant deploy/synology/compose.yaml 7 $((PB + 5)))
+up "$M" || fail "main project on the new volume: $(tail -3 "$WORK/up.log")"
+wait_healthy "$M"
+GT=$(genesis_of "$M"); [[ ${#GT} == 64 && "$GT" != "$GB" ]] || fail "throwaway ring B genesis '$GT' (ring A $GB)"
+KT=$(client 7 identity | sed -n 's/^Ed25519 Public Key (hex): //p'); [[ ${#KT} == 64 && "$KT" != "$KA" ]] || fail "throwaway node key '$KT'"
+[[ "$(client 7 wot invite --peer "$K" | tr -d ' \n')" == "$GT"* ]] || fail "daemon of ring B could not write an invite"
+sh_vol "$ID-7-data" 'echo planted > /data/planted-file' || fail "could not plant a file"
+docker compose -f "$M" stop parvault >/dev/null 2>&1
 doc_project parvault-import "$WORK/pimp.yaml" "$ID-7-data" "$WORK/bak"
 up "$WORK/pimp.yaml" || fail "import project: $(tail -3 "$WORK/up.log")"
 logs "$WORK/pimp.yaml" import | grep -qx imported || fail "import said: $(logs "$WORK/pimp.yaml" import)"
-M=$(variant deploy/synology/compose.yaml 7 $((PB + 5)))
-docker compose -f "$B" down >/dev/null 2>&1     # frees the port; its volume stays for the compare below
+docker compose -f "$B" down >/dev/null 2>&1     # frees the port; its volume stays for the case below
 up "$M" || fail "daemon on the restored volume: $(tail -3 "$WORK/up.log")"
 wait_healthy "$M"
-logs "$M" init | grep -q "this node is already in the ring $GB" || fail "restored volume is not ring $GB: $(logs "$M" init)"
+# the init container is restarted, so its log still holds the first run: read the last line only
+LAST=$(logs "$M" init | tail -1)
+[[ "$LAST" == *"this node is already in the ring $GB" ]] || fail "restored volume is not ring $GB: $LAST"
+[[ "$LAST" != *"$GT"* ]] || fail "throwaway genesis $GT survived the import"
+[[ "$(client 7 identity | sed -n 's/^Ed25519 Public Key (hex): //p')" == "$KA" ]] || fail "node key is not ring A's"
 INV=$(client 7 wot invite --peer "$K" | tr -d ' \n')
 [[ "$INV" == "$GB"* ]] || fail "wot invite on the restored volume gave: ${INV:0:80}"
-ok "import into a NEW volume: daemon healthy with the same genesis $GB; wot invite works"
+sh_vol "$ID-7-data" 'test ! -e /data/planted-file' || fail "planted file survived the import"
+ok "import over a throwaway ring: healthy, genesis $GB, node key $KA, invite is A's; ring B $GT and the planted file are gone"
+docker compose -f "$M" down >/dev/null 2>&1
+# Over an existing volume of ring A that has a newer extra file.
+sh_vol "$ID-6-data" 'echo newer > /data/newer-extra'
+doc_project parvault-import "$WORK/pimp6.yaml" "$ID-6-data" "$WORK/bak"
+up "$WORK/pimp6.yaml" || fail "import over ring A's volume: $(tail -3 "$WORK/up.log")"
+logs "$WORK/pimp6.yaml" import | grep -qx imported || fail "import over A said: $(logs "$WORK/pimp6.yaml" import)"
+sh_vol "$ID-6-data" 'test ! -e /data/newer-extra' || fail "extra file survived the import over ring A's volume"
+up "$B" || fail "ring A after import over it: $(tail -3 "$WORK/up.log")"
+wait_healthy "$B"
+[[ "$(logs "$B" init | tail -1)" == *"this node is already in the ring $GB" ]] || fail "ring A changed: $(logs "$B" init | tail -1)"
+ok "import over ring A's own volume: the newer extra file is gone, ring A healthy"
 echo "test_compose_projects: PASS ($TAG)"
