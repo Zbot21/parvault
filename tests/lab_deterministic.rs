@@ -468,7 +468,9 @@ fn deterministic_empty_bootstrap_no_scan() {
 
 /// A real libp2p peer B in this process (the crate's own server swarm): it listens on loopback,
 /// records who connected, and names peer C' at `x` in its Kademlia routing table, so a Kademlia
-/// query to B returns C' at `x`: a remote-supplied ("learned") address.
+/// query to B returns C' at `x`: a remote-supplied ("learned") address. A's client Kademlia
+/// bootstraps 500 ms after B enters its routing table (libp2p-kad 0.46), asks B, and would dial
+/// C' at `x`.
 struct PeerB {
     addr: String,
     connected: Arc<Mutex<Vec<PeerId>>>,
@@ -495,7 +497,17 @@ fn spawn_peer_b(x: &str) -> PeerB {
         rt.block_on(async move {
             let kp = libp2p::identity::Keypair::generate_ed25519();
             let pid = kp.public().to_peer_id();
-            let mut sw = parvault::network::build_mesh_server_swarm(kp, false, false).unwrap();
+            // B never dials out (its own gate with an empty fixed set), so every connection X
+            // sees comes from A. B still accepts A and answers its Kademlia queries.
+            let mut sw = parvault::network::build_mesh_server_swarm_gated(
+                kp,
+                false,
+                false,
+                parvault::network::GateParams::for_set(Arc::new(
+                    parvault::lab_dial::DialSet::Fixed(Vec::new()),
+                )),
+            )
+            .unwrap();
             let c_prime = libp2p::identity::Keypair::generate_ed25519()
                 .public()
                 .to_peer_id();
@@ -597,13 +609,13 @@ fn deterministic_dials_only_dial_set() {
     let x = CountingListener::bind();
     let b = spawn_peer_b(&x.multiaddr());
     let a = store_via(&b, true, "dial-ok");
-    let a_pid = a.peer_id();
+    // A sends as its owner identity (from the master key), so any connection at B is A's.
     assert!(
-        eventually(Duration::from_secs(15), || b
+        eventually(Duration::from_secs(15), || !b
             .connected
             .lock()
             .unwrap()
-            .contains(&a_pid)),
+            .is_empty()),
         "A never connected to B:\n{}",
         a.log_text()
     );
