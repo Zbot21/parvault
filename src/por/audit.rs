@@ -4,8 +4,6 @@
 //! [`chunk_proof_decision`] is [`AuditVerdict::ProofInvalid`]. Everything a host can cause by not
 //! answering (no answer, a refusal, a decode error, a late answer) is
 //! [`AuditVerdict::Unanswered`] and never a ledger failure (L-27).
-//!
-//! Formal model: `specs/ParVaultPorAudit.tla` (guards `chunk-proof`, `audit-credit`).
 use crate::por::chunk_merkle::{chunk_proof_decision, ChunkProofFacts};
 use crate::por::{ChunkAuditResponse, ChunkChallenge};
 
@@ -78,14 +76,16 @@ pub enum AuditCredit {
     Unanswered,
 }
 
-/// F-07: a verdict credits only a prover other than the auditor. A self-named host is refused
-/// here without any network call, so a manifest that names the auditor earns it nothing.
+/// F-07: a verdict credits only a prover other than the auditor. `self_device_ids` are every
+/// identity of the auditing node (the owner key and the node key differ on a daemon). A
+/// self-named host is refused here, before any network call, so a manifest that names the
+/// auditor earns it nothing.
 pub fn audit_credit_decision(
-    verifier_device_id: &str,
+    self_device_ids: &[&str],
     prover_device_id: &str,
     verdict: AuditVerdict,
 ) -> Result<AuditCredit, &'static str> {
-    if verifier_device_id == prover_device_id {
+    if self_device_ids.contains(&prover_device_id) {
         return Err("reject.por_self_credit");
     }
     Ok(match verdict {
@@ -190,15 +190,15 @@ mod tests {
     #[test]
     fn credit_only_another_prover() {
         assert_eq!(
-            audit_credit_decision("a", "b", AuditVerdict::Pass),
+            audit_credit_decision(&["a", "n"], "b", AuditVerdict::Pass),
             Ok(AuditCredit::Pass)
         );
         assert_eq!(
-            audit_credit_decision("a", "b", AuditVerdict::ProofInvalid("x")),
+            audit_credit_decision(&["a", "n"], "b", AuditVerdict::ProofInvalid("x")),
             Ok(AuditCredit::Fail)
         );
         assert_eq!(
-            audit_credit_decision("a", "b", AuditVerdict::Unanswered("x")),
+            audit_credit_decision(&["a", "n"], "b", AuditVerdict::Unanswered("x")),
             Ok(AuditCredit::Unanswered)
         );
         for v in [
@@ -207,7 +207,11 @@ mod tests {
             AuditVerdict::Unanswered("x"),
         ] {
             assert_eq!(
-                audit_credit_decision("a", "a", v),
+                audit_credit_decision(&["a", "n"], "a", v),
+                Err("reject.por_self_credit")
+            );
+            assert_eq!(
+                audit_credit_decision(&["a", "n"], "n", v),
                 Err("reject.por_self_credit")
             );
         }

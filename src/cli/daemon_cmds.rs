@@ -26,6 +26,7 @@ pub(crate) async fn up(env: CliEnv, command: Commands) -> anyhow::Result<()> {
         tier,
         ipc_socket,
         no_socket,
+        no_audit,
         strict_plugins,
         allow_peer_uid,
         require_sealed_memfd,
@@ -56,6 +57,9 @@ pub(crate) async fn up(env: CliEnv, command: Commands) -> anyhow::Result<()> {
     )?;
     if let Some(listen_override) = listen {
         cfg.listen_tcp = listen_override;
+    }
+    if no_audit {
+        cfg.por_audit_enabled = false;
     }
     let effective_folder = folder.or_else(|| cfg.watched_folder.clone());
     let effective_status_http = status_http.or_else(|| cfg.status_http_bind.clone());
@@ -114,6 +118,7 @@ pub(crate) async fn daemon(env: CliEnv, command: Commands) -> anyhow::Result<()>
             status_http,
             ipc_socket,
             no_socket,
+            no_audit,
             strict_plugins,
             allow_peer_uid,
             require_sealed_memfd,
@@ -141,6 +146,9 @@ pub(crate) async fn daemon(env: CliEnv, command: Commands) -> anyhow::Result<()>
             )?;
             cfg.listen_tcp = listen;
             cfg.enable_quic = enable_quic;
+            if no_audit {
+                cfg.por_audit_enabled = false;
+            }
             let opts = DaemonLaunchOptions {
                 lan_discovery_enabled: lan_enabled,
                 lan_discovery_port: lan_port,

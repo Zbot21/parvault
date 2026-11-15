@@ -82,6 +82,13 @@ pub(crate) async fn run_daemon(
     let mut eviction = PrivacyPreservingEvictionEngine::load_or_init(&cfg.data_dir)?;
     let mut takedown_queue = PublicTrackerTakedownQueue::load_or_init(&cfg.data_dir)?;
     let mut server_events = ServerSwarmEvents::new(true);
+    // B-59 prover budget on `router-soc` (verdict changes 5 and 8, ADR-21).
+    if cfg.hardware_profile == parvault::profile::HardwareProfile::RouterSoc {
+        server_events.set_chunk_prove_cap(
+            parvault::network::server_events::MAX_CHUNK_PROVES_IN_FLIGHT_ROUTER,
+        );
+        por_verifier.set_chunk_audit_host_cap(parvault::por::CHUNK_AUDITS_PER_MINUTE_ROUTER);
+    }
 
     let mut swarm = build_mesh_server_swarm(keypair, cfg.enable_quic, opts.lan_discovery_enabled)?;
     let tcp_addr: Multiaddr = cfg.listen_tcp.parse()?;
@@ -328,6 +335,17 @@ pub(crate) async fn run_daemon(
     let mut maint_epoch: u64 = 1;
     let mut announced_wan_once = false;
 
+    // B-59 (F-06): the chunk-audit loop, off without a master key or with `--no-audit`. Each
+    // audit runs on the blocking pool, at most one in flight.
+    let auditor = audit_job_ctx(&cfg, &block_store, &node_identity);
+    let audit_cfg = parvault::por::auditor::AuditorConfig::from_node_config(&cfg);
+    let mut audit_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_millis(audit_cfg.first_delay_ms()),
+        Duration::from_millis(audit_cfg.tick_ms()),
+    );
+    audit_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let audit_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     info!(
         %local_peer_id,
         profile = %cfg.hardware_profile,
@@ -435,6 +453,17 @@ pub(crate) async fn run_daemon(
                     #[cfg(unix)]
                     if let Some(ref eng) = shared_gateway_engine {
                         eng.publish_status_snapshot(guard.clone());
+                    }
+                }
+            }
+            _ = audit_interval.tick(), if auditor.is_some() => {
+                if let Some(ctx) = auditor.clone() {
+                    if !audit_busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        let busy = Arc::clone(&audit_busy);
+                        tokio::task::spawn_blocking(move || {
+                            let _ = parvault::por::auditor::run_audit_job(&ctx);
+                            busy.store(false, std::sync::atomic::Ordering::SeqCst);
+                        });
                     }
                 }
             }
@@ -760,4 +789,55 @@ fn builtin_vfs_read_token(
         vec![parvault::capabilities::Caveat::ReadOnly],
     )
     .map_err(|e| anyhow::anyhow!("built-in VFS read token: {e:?}"))
+}
+
+/// B-59: the auditor's context, or `None` (logged) when audits are off: `--no-audit`, no master
+/// key in the data dir, or no network client. The auditor sends as the owner identity, the
+/// writer of every stripe (B-59 commit 1), and never as the node identity.
+fn audit_job_ctx(
+    cfg: &NodeConfig,
+    block_store: &BlockStore,
+    node_identity: &NodeIdentity,
+) -> Option<parvault::por::auditor::AuditJobCtx> {
+    if !cfg.por_audit_enabled {
+        info!("audits: off (--no-audit)");
+        return None;
+    }
+    if !cfg.data_dir.join("master_key.sealed").exists() {
+        info!("audits: off (no master key)");
+        return None;
+    }
+    let mk = match resolve_master_key(
+        &cfg.data_dir,
+        None,
+        cfg.device_sealing_passphrase.as_deref(),
+    ) {
+        Ok(mk) => mk,
+        Err(e) => {
+            warn!(error = %e, "audits: off (master key does not open)");
+            return None;
+        }
+    };
+    let Some(client) = block_store.mesh_client() else {
+        info!("audits: off (no network client)");
+        return None;
+    };
+    let owner = NodeIdentity::from_master_key(&mk);
+    let auditor_cfg = parvault::por::auditor::AuditorConfig::from_node_config(cfg);
+    info!(
+        interval_ms = auditor_cfg.interval_ms,
+        rtt_bound_ms = auditor_cfg.rtt_bound_ms,
+        "audits: on"
+    );
+    Some(parvault::por::auditor::AuditJobCtx {
+        block_store: block_store.clone(),
+        client: client.with_identity(owner.clone()),
+        master_key: mk,
+        self_device_ids: vec![owner.device_peer_id(), node_identity.device_peer_id()],
+        cfg: auditor_cfg,
+        state: Arc::new(std::sync::Mutex::new(
+            parvault::por::auditor::AuditorState::load(&cfg.data_dir),
+        )),
+        data_dir: cfg.data_dir.clone(),
+    })
 }

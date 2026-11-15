@@ -1,4 +1,6 @@
 pub mod audit;
+#[cfg(feature = "daemon-runtime")]
+pub mod auditor;
 pub mod challenger;
 pub mod chunk_merkle;
 #[cfg(feature = "daemon-runtime")]

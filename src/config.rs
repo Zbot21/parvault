@@ -256,6 +256,10 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         no_socket: bool,
 
+        /// Do not run the chunk-audit loop (B-59; it also stays off without a master key).
+        #[arg(long, default_value_t = false)]
+        no_audit: bool,
+
         /// Reject any Unix socket plugin client whose kernel `SO_PEERCRED` UID is not in `--allow-peer-uid`.
         #[arg(long, default_value_t = false)]
         strict_plugins: bool,
@@ -602,6 +606,10 @@ pub enum DaemonAction {
         #[arg(long, default_value_t = false)]
         no_socket: bool,
 
+        /// Do not run the chunk-audit loop (B-59; it also stays off without a master key).
+        #[arg(long, default_value_t = false)]
+        no_audit: bool,
+
         /// Reject any Unix socket plugin client whose kernel `SO_PEERCRED` UID is not in `--allow-peer-uid`.
         #[arg(long, default_value_t = false)]
         strict_plugins: bool,
@@ -763,6 +771,20 @@ pub struct NodeConfig {
     /// Optional download bandwidth limit in Mbps (`0` = unlimited).
     #[serde(default)]
     pub max_download_mbps: u64,
+    /// B-59: run the chunk-audit loop when the master key resolves (`--no-audit` turns it off).
+    #[serde(default = "default_por_audit_enabled")]
+    pub por_audit_enabled: bool,
+    /// B-59: seconds between audits of one host (`0`: 3,600, or 21,600 on `router-soc`).
+    #[serde(default)]
+    pub por_audit_interval_secs: u64,
+    /// B-59: the pass bound on an audit's round trip in ms (`0`: 2,000, or 5,000 on
+    /// `router-soc`). Separate from `por_timeout_ms`, the prover-side SLA.
+    #[serde(default)]
+    pub por_audit_rtt_ms: u64,
+}
+
+fn default_por_audit_enabled() -> bool {
+    true
 }
 
 impl Default for NodeConfig {
@@ -799,6 +821,9 @@ impl Default for NodeConfig {
             min_free_disk_bytes: default_min_free_disk_bytes(),
             max_upload_mbps: 0,
             max_download_mbps: 0,
+            por_audit_enabled: true,
+            por_audit_interval_secs: 0,
+            por_audit_rtt_ms: 0,
         }
     }
 }
