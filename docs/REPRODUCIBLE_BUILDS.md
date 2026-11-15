@@ -10,7 +10,7 @@ Since `v0.5.3` (L-17), the static musl binaries and the router bundle are reprod
 | Key | dev/test key, desktop only, never in CI | owner key (`ed25519-sk`), not created yet |
 | Principal, namespace | `parvault-dev`, `parvault-dev-build` | `parvault-release`, `parvault-release-build` |
 | Allowed signers | [`security/dev-allowed-signers`](../security/dev-allowed-signers) | [`security/release-allowed-signers`](../security/release-allowed-signers) (empty) |
-| Asset names | `<bin>-<target>-dev`, `parvault-router-soc-bundle-dev.tar.gz` | `<bin>-<target>` |
+| Asset names | `<bin>-<target>-dev`, `parvault-router-soc-bundle-dev.tar.gz`, `parvault-image-<amd64\|arm64>-dev.tar` | `<bin>-<target>` |
 | `SHA256SUMS` first line | `# parvault <tag> dev` | `# parvault <tag> release` |
 | `install.sh` | only with `PARVAULT_ALLOW_DEV_BUILD=1` | by default |
 
@@ -63,6 +63,7 @@ gh attestation verify parvault-x86_64-unknown-linux-musl-dev --repo Zbot21/parva
 - Every `cargo` call passes `--locked`. Every action is pinned by commit SHA.
 - Builds run inside [`deploy/Dockerfile.build`](../deploy/Dockerfile.build): a Rust base image pinned by digest, and apt packages from a fixed `snapshot.debian.org` date.
 - [`scripts/build_release.sh`](../scripts/build_release.sh) sets all build flags in one place: `--remap-path-prefix` for the checkout, `CARGO_HOME` and the target dir; the same maps as `-ffile-prefix-map` for C (ring); one C compiler and linker per target; `SOURCE_DATE_EPOCH` from the commit. The `soc` profile strips symbols; there is no second strip.
+- [`scripts/make_dev_image.sh`](../scripts/make_dev_image.sh) writes the container image `parvault:<version>-dev` as a `docker load` archive, byte by byte from the binaries (one layer, user `65532`), so it is reproducible too and the signed `SHA256SUMS` covers it. Synology use: [SYNOLOGY.md](SYNOLOGY.md).
 - [`scripts/make_bundle.sh`](../scripts/make_bundle.sh) writes the bundle with sorted names, a fixed mtime, owner `0:0`, fixed modes and `gzip -n`.
 - On a tag, `release.yml` builds each target twice on separate runners, at different paths and `CARGO_HOME`s, and fails unless every asset matches. It then writes `SHA256SUMS`, attests provenance and creates a **draft** pre-release with no signature.
 - On a PR that touches the build inputs, `repro-check.yml` builds `parvault` and the bundle twice in different directories and compares.

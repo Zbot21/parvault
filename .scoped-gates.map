@@ -410,6 +410,8 @@ scripts/build_release.sh            none    # release flags; release.yml and rep
 scripts/make_bundle.sh              none    # release.yml and repro-check.yml (L-17)
 scripts/make_sums.sh                none    # release.yml; scripts/test_install.sh runs it (L-17)
 scripts/repro_proof.sh              none    # repro-check.yml (L-17)
+scripts/make_dev_image.sh           none    # release.yml via build_release.sh --image (B-131)
+scripts/test_dev_image.sh           none    # run by hand on a Docker host (B-131)
 scripts/sign_dev_build.sh           none    # run by the Lead on the desktop (L-113)
 security/*                          none    # allowed-signers; scripts/test_install.sh checks install.sh matches (L-113)
 .enforcement.map                    test    static_build_checks   # claim-cfg reads its sym= and harness= keys
@@ -547,6 +549,8 @@ scripts/install.sh              doc     docs/REPRODUCIBLE_BUILDS.md
 scripts/build_release.sh        doc     docs/REPRODUCIBLE_BUILDS.md
 deploy/Dockerfile.build         doc     docs/REPRODUCIBLE_BUILDS.md
 security/*                      doc     docs/REPRODUCIBLE_BUILDS.md
+scripts/make_dev_image.sh       doc     docs/SYNOLOGY.md
+deploy/*                        doc     docs/SYNOLOGY.md
 scripts/gen_metrics.sh          doc     docs/metrics.txt
 src/network/placement.rs        doc     docs/adr/ADR-06-hybrid-locality-and-70-30-placement.md
 src/network/wire_handler.rs     doc     docs/SECURITY_AND_CRYPTOGRAPHY.md

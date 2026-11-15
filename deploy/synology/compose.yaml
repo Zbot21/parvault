@@ -1,0 +1,37 @@
+# Synology Container Manager project for the ParVault dev image (B-131); docs/SYNOLOGY.md.
+# Import parvault-image-amd64-dev.tar first (the DS923+ is x86_64). The image tag is the one
+# `docker load` (or Container Manager > Image > Import) shows; change it here on each upgrade.
+name: parvault
+services:
+  parvault:
+    image: parvault:0.5.3-dev
+    container_name: parvault
+    restart: unless-stopped
+    user: "65532:65532"
+    # Host networking: LAN discovery (UDP 4009 broadcast) and the mesh port (TCP 4001) on the NAS's
+    # own address. A bridge network would hide both behind NAT.
+    network_mode: host
+    # The status page is token-gated; it binds loopback here. To view it from the LAN, replace
+    # 127.0.0.1 with the NAS's LAN address (never a WAN-facing one).
+    command: ["--data-dir", "/var/lib/parvault", "up",
+              "--ipc-socket", "/run/parvault/parvault.sock",
+              "--status-http", "127.0.0.1:4080"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs:
+      - /run/parvault:uid=65532,gid=65532,mode=0700
+      - /tmp:mode=1777
+    volumes:
+      # A named volume starts as a copy of the image's /var/lib/parvault, so it is owned by
+      # 65532:65532 with no chown on the NAS.
+      - parvault-data:/var/lib/parvault
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/parvault", "--data-dir", "/var/lib/parvault",
+             "gateway", "health", "--socket", "/run/parvault/parvault.sock"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+volumes:
+  parvault-data: {}
