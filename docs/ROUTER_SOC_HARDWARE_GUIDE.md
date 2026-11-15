@@ -305,10 +305,11 @@ max_connections = 24
 ### Procd Service Script (`/etc/init.d/parvault-nas`)
 Copy `deploy/router-soc/parvault-nas.procd` to `/etc/init.d/parvault-nas` and make it executable (`chmod +x /etc/init.d/parvault-nas`). The script:
 
-- creates the `parvault` user and group (uid and gid `4001`) on first start, creates `/mnt/nas/.parvault-data`, gives it to that user (`0700`), and refuses to start if the user does not own it;
+- refuses to start, with a `logread` line, unless `/mnt/nas` is a mountpoint (so the data directory is never written to flash) on a filesystem with POSIX owners: ext4, f2fs, btrfs or xfs. vfat, exfat and NTFS are not supported; format the NAS disk as ext4;
+- creates the `parvault` user and group (uid and gid `4001`) on first start, creates `/mnt/nas/.parvault-data` (`0700`), and chowns it to that user only when its owner differs (a new directory, or one a root-run release left behind, whose contents move with it once). It refuses to start if the user still does not own it;
 - runs `parvault up --profile router-soc --config /etc/parvault/router.toml` as `parvault`, not root (ports `4001`, `4009` and `4080` need no root); the daemon writes its keys on first start, so no separate `parvault init` is needed;
 - sets `respawn 3600 5 5` (threshold, delay, retries; procd needs all three) and `term_timeout 10`;
-- sets only `limits nofile=1024`. There is no address-space (`as`) limit: it counts every thread's reserved stack and the mapped binary, so a tokio daemon cannot start under 48 MiB of it. The router profile bounds the runtime instead: 2 tokio workers and at most 8 blocking threads (`HardwareProfile::runtime_worker_threads`, `runtime_max_blocking_threads` in `src/profile.rs`);
+- sets only `limits nofile=1024`. There is no address-space (`as`) limit: it counts every thread's reserved stack and the mapped binary, so a tokio daemon cannot start under 48 MiB of it. The router profile caps tokio's threads: 2 workers and at most 8 blocking threads (`HardwareProfile::runtime_worker_threads`, `runtime_max_blocking_threads` in `src/profile.rs`), with at most 4 relay forwards in flight so relays leave blocking threads for owner work. This is not a memory bound: the daemon also runs threads outside tokio (gateway lanes, the mesh client, the HTTP edge, the status page, discovery). The measured RSS and thread count under the router profile are in `docs/metrics.txt` (`router_soc.*`);
 - has no `stop_service`: procd sends `TERM` to its own instance, so a CLI `parvault` run on the box is not killed.
 
 `scripts/install.sh` installs to `/usr/bin` when `/etc/openwrt_release` exists, which is where the script runs the binary.
