@@ -14,6 +14,8 @@ trap cleanup EXIT
 case "$(uname -m)" in x86_64|amd64) T=x86_64-unknown-linux-musl ;; aarch64|arm64) T=aarch64-unknown-linux-musl ;; esac
 VERSION=$(sed -n 's/^VERSION="\${PARVAULT_VERSION:-\(v[^}]*\)}"$/\1/p' "$ROOT/scripts/install.sh")
 [[ -n "$VERSION" ]] || { echo "install.sh has no stamped default version" >&2; exit 1; }
+grep -q "^MIN_VERSION=$VERSION " "$ROOT/scripts/install.sh" \
+  || { echo "test_install: FAIL: install.sh MIN_VERSION differs from its default version $VERSION" >&2; exit 1; }
 ASSETS="$WORK/srv/$VERSION"; mkdir -p "$ASSETS" "$WORK/bin" "$WORK/bin-upper" "$WORK/keys"
 # The key in install.sh is the one in security/dev-allowed-signers.
 want=$(grep -v '^#' "$ROOT/security/dev-allowed-signers")
@@ -90,7 +92,37 @@ PATH="$WORK/nokeygen" PARVAULT_BASE_URL="http://127.0.0.1:$PORT/$VERSION" PARVAU
   "$WORK/nokeygen/sh" "$ROOT/scripts/install.sh" >"$WORK/noverify.log" 2>&1 \
   || { echo "test_install: FAIL: no-verifier install refused" >&2; cat "$WORK/noverify.log" >&2; exit 1; }
 grep -qF "cannot verify SHA256SUMS.sig" "$WORK/noverify.log" || { echo "test_install: FAIL: no-verifier install did not warn" >&2; exit 1; }
-echo "positive control ok: no verifier warns and continues (L-81)"
+for w in "kind (dev/release) and tag are UNVERIFIED" "raw.githubusercontent.com/Zbot21/parvault/main/security/dev-allowed-signers" \
+    "$(sed -n 's/^DEV_FINGERPRINT="\(.*\)"$/\1/p' "$ROOT/scripts/install.sh")"; do
+  grep -qF "$w" "$WORK/noverify.log" || { echo "test_install: FAIL: no-verifier warning lacks '$w'" >&2; cat "$WORK/noverify.log" >&2; exit 1; }
+done
+echo "positive control ok: no verifier warns (kind and tag unverified, signers URL, fingerprint) and continues (L-81)"
+# On that unverified path the first line still binds the tag, must be present, and cannot claim 'release' (L-81).
+PATH="$WORK/nokeygen" must_fail no-verifier-replay "SHA256SUMS is for v0.0.1, not $VERSION" replay
+PATH="$WORK/nokeygen" must_fail no-verifier-no-header "has no '# parvault <tag> <kind>' first line, so its tag cannot be checked" no-header
+mk unverified-release; sed -i "1s/.*/# parvault $VERSION release/" "$WORK/srv/unverified-release/SHA256SUMS"
+for b in parvault parvault-seed parvault-fuse parvault-sync parvault-status; do mv "$WORK/srv/unverified-release/$b-$T-dev" "$WORK/srv/unverified-release/$b-$T"; done
+sed -i "s/-dev\$//" "$WORK/srv/unverified-release/SHA256SUMS"; sign "$WORK/srv/unverified-release" dev parvault-dev-build
+PATH="$WORK/nokeygen" must_fail no-verifier-release-header "says 'release' but no release signature was verified (no ssh-keygen -Y here)" unverified-release
+mk unsigned-release; rm "$WORK/srv/unsigned-release/SHA256SUMS.sig"; sed -i "1s/.*/# parvault $VERSION release/" "$WORK/srv/unsigned-release/SHA256SUMS"
+PARVAULT_ALLOW_UNSIGNED=1 must_fail unsigned-release-header "says 'release' but no release signature was verified" unsigned-release
+# PARVAULT_VERSION=latest resolves the tag first (L3): the tag check then applies, and no downgrade.
+latest() { mkdir -p "$WORK/srv/latest-$1"; printf '{\n  "url": "x",\n  "tag_name": "%s",\n  "prerelease": false\n}\n' "$1" > "$WORK/srv/latest-$1/latest.json"; }
+latest "$VERSION"; latest v0.0.1; latest v9.0.0
+mkdir -p "$WORK/bin-latest"
+PARVAULT_VERSION=latest PARVAULT_TEST_LATEST_URL="http://127.0.0.1:$PORT/latest-$VERSION/latest.json" \
+  PARVAULT_BASE_URL="http://127.0.0.1:$PORT/$VERSION" PARVAULT_INSTALL_DIR="$WORK/bin-latest" \
+  sh "$ROOT/scripts/install.sh" >"$WORK/latest.log" 2>&1 || { echo "test_install: FAIL: PARVAULT_VERSION=latest refused" >&2; cat "$WORK/latest.log" >&2; exit 1; }
+grep -qF "Latest release: $VERSION" "$WORK/latest.log" || { echo "test_install: FAIL: latest did not resolve to $VERSION" >&2; exit 1; }
+echo "positive control ok: PARVAULT_VERSION=latest resolves to $VERSION and installs"
+PARVAULT_VERSION=latest PARVAULT_TEST_LATEST_URL="http://127.0.0.1:$PORT/latest-$VERSION/latest.json" \
+  must_fail latest-replayed-old-sums "SHA256SUMS is for v0.0.1, not $VERSION" replay
+PARVAULT_VERSION=latest PARVAULT_TEST_LATEST_URL="http://127.0.0.1:$PORT/latest-v9.0.0/latest.json" \
+  must_fail latest-sums-for-other-tag "SHA256SUMS is for $VERSION, not v9.0.0" "$VERSION"
+PARVAULT_VERSION=latest PARVAULT_TEST_LATEST_URL="http://127.0.0.1:$PORT/latest-v0.0.1/latest.json" \
+  must_fail latest-downgrade "Latest release v0.0.1 is older than this installer ($VERSION)" replay
+PARVAULT_VERSION=latest PARVAULT_TEST_LATEST_URL="http://127.0.0.1:$PORT/no-such/latest.json" \
+  must_fail latest-missing "no Latest release at" "$VERSION"
 # A missing signature installs only with PARVAULT_ALLOW_UNSIGNED=1, and says so.
 mkdir -p "$WORK/bin-unsigned"
 PARVAULT_ALLOW_UNSIGNED=1 PARVAULT_BASE_URL="http://127.0.0.1:$PORT/missing-sig" PARVAULT_INSTALL_DIR="$WORK/bin-unsigned" \

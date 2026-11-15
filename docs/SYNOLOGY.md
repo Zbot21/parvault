@@ -2,7 +2,7 @@
 
 Every `v0.5.x` image is a **dev build** (B-131, L-113): reproducible, and signed with the ParVault dev/test key, not a release key. The DS923+ (AMD Ryzen R1600) is x86_64, so use `parvault-image-amd64-dev.tar`. `parvault-image-arm64-dev.tar` is for ARM NAS models and has not been tested on one.
 
-The image has no OS: just the five static binaries, user `65532:65532`, data in `/var/lib/parvault`, and a healthcheck through `parvault gateway health`.
+The image has no OS: just the five static binaries, user `65532:65532`, data in `/var/lib/parvault`, and a healthcheck through `parvault gateway health`. Run on its own, it starts no status page; the project below turns it on, on loopback.
 
 ## 1. Verify the download
 
@@ -49,7 +49,7 @@ What the project does:
 - Uses host networking, so LAN discovery (UDP 4009) and the mesh port (TCP 4001) work on the NAS's own address.
 - Keeps state in the named volume `parvault-data` (from step 3), which starts owned by `65532:65532`. If you bind a NAS folder instead, `chown -R 65532:65532` it first.
 - Turns healthy once the daemon answers on its gateway socket.
-- Binds the token-gated status page to loopback. To use it from the LAN, change `127.0.0.1:4080` in `command:` to the NAS's LAN address.
+- Turns on the token-gated status page, bound to loopback (`--status-http 127.0.0.1:4080` in `command:`); the image alone has none. To use it from the LAN, change `127.0.0.1` to the NAS's LAN address. With host networking that is the NAS's own interface, so never use `0.0.0.0` or a WAN-facing address.
 
 ## Upgrading
 

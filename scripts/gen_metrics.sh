@@ -131,6 +131,15 @@ version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
 # install.sh's default version is the crate's tag (plan-7: no Latest release to resolve).
 install_version="$(sed -n 's/^VERSION="\${PARVAULT_VERSION:-\(v[^}]*\)}"$/\1/p' scripts/install.sh)"
 [[ "$install_version" == "v$version" ]] || fail "scripts/install.sh default version is '$install_version', Cargo.toml says v$version"
+grep -q "^MIN_VERSION=v$version " scripts/install.sh || fail "scripts/install.sh MIN_VERSION is not v$version (Cargo.toml)"
+# The dev image is tagged parvault:<crate version>-dev (make_dev_image.sh); the Synology project
+# and its doc name that tag (L-10).
+compose_tag="$(sed -n 's/^    image: \(parvault:.*\)$/\1/p' deploy/synology/compose.yaml)"
+[[ "$compose_tag" == "parvault:$version-dev" ]] || fail "deploy/synology/compose.yaml image is '$compose_tag', Cargo.toml says parvault:$version-dev"
+syn_tag="$(sed -n 's/^IMG=\(parvault:[^ ]*\) .*$/\1/p' docs/SYNOLOGY.md)"
+[[ "$syn_tag" == "parvault:$version-dev" ]] || fail "docs/SYNOLOGY.md IMG is '$syn_tag', Cargo.toml says parvault:$version-dev"
+lxc_version="$(sed -n 's/^  "version": "\(.*\)",$/\1/p' deploy/prplos-lxc-manifest.json)"
+[[ "$lxc_version" == "$version" ]] || fail "deploy/prplos-lxc-manifest.json version is '$lxc_version', Cargo.toml says $version"
 
 counts="crate_version_tag = v$version
 kani_harnesses = $kani_total

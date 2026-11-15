@@ -23,7 +23,19 @@ done
 [[ -n "$TARGET" && -n "$WORK" ]] || { echo "repro_proof.sh: --target and --work are required" >&2; exit 2; }
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
 mkdir -p "$WORK"; WORK=$(cd "$WORK" && pwd -P)
-SOURCE_DATE_EPOCH=$(git -C "$ROOT" log -1 --format=%ct); export SOURCE_DATE_EPOCH
+# A box copy (pvjob) commits a snapshot over the real source, so HEAD is not the source commit:
+# its commit time is wrong for SOURCE_DATE_EPOCH. Pass the source commit's time in that case.
+if [[ -e "$ROOT/.git/pvjob-snapshot" ]]; then
+  echo "repro_proof.sh: WARNING: $ROOT/.git/pvjob-snapshot exists: HEAD is a snapshot, not the source commit" \
+    "(${PVJOB_SRC_SHA:-unknown}); SOURCE_DATE_EPOCH must be the source commit's time (git log -1 --format=%ct <sha>)" >&2
+  [[ -n "${SOURCE_DATE_EPOCH:-}" ]] || { echo "repro_proof.sh: SOURCE_DATE_EPOCH is not set on a snapshot; refusing to use the snapshot's time" >&2; exit 2; }
+fi
+# A SOURCE_DATE_EPOCH already set wins, as in build_release.sh; else HEAD's commit time.
+if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
+  SOURCE_DATE_EPOCH=$(git -C "$ROOT" log -1 --format=%ct)
+fi
+[[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]] || { echo "repro_proof.sh: SOURCE_DATE_EPOCH '$SOURCE_DATE_EPOCH' is not a number" >&2; exit 2; }
+export SOURCE_DATE_EPOCH
 COMMIT=$(git -C "$ROOT" rev-parse HEAD)
 # Two layouts that differ in every path the build sees.
 declare -A SRC=([a]=a/src/parvault [b]=b/elsewhere/deeper/pv-checkout)

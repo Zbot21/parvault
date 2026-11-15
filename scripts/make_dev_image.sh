@@ -84,11 +84,11 @@ config = {
         "Env": ["PATH=/usr/local/bin", f"HOME={DATA}"],
         "WorkingDir": DATA,
         "Entrypoint": [pv],
-        # The status page binds the container's own interface (B-54 note in Dockerfile.router-soc);
-        # with host networking, set --status-http to the NAS's LAN address instead (compose.yaml).
-        "Cmd": ["--data-dir", DATA, "up", "--ipc-socket", SOCK, "--status-http", "0.0.0.0:4080"],
+        # No --status-http: no status listener unless asked for (router_nas.rs: no flag, no
+        # listener). deploy/synology/compose.yaml opts in on loopback.
+        "Cmd": ["--data-dir", DATA, "up", "--ipc-socket", SOCK],
         "Volumes": {DATA: {}},
-        "ExposedPorts": {"4001/tcp": {}, "4009/udp": {}, "4080/tcp": {}},
+        "ExposedPorts": {"4001/tcp": {}, "4009/udp": {}},
         "Healthcheck": {
             "Test": ["CMD", pv, "--data-dir", DATA, "gateway", "--socket", SOCK, "health"],
             "Interval": 30_000_000_000,

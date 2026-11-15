@@ -1,7 +1,7 @@
 name: Repro Check — two builds in different directories match
 
-# L-17: on a PR that touches the build inputs, build parvault (and the router bundle) twice per
-# target inside deploy/Dockerfile.build, from two exports at different paths with different target
+# L-17: on a PR that touches the build inputs, build all five binaries, the container archive
+# (B-131) and, on x86_64, the router bundle twice per target inside deploy/Dockerfile.build, from two exports at different paths with different target
 # dirs and CARGO_HOMEs, and fail unless every output matches byte for byte. The tag workflow
 # (release.yml) does the same for every asset on separate runners.
 on:
@@ -16,6 +16,9 @@ on:
       - scripts/build_bins.sh
       - scripts/build_release.sh
       - scripts/make_bundle.sh
+      - scripts/make_dev_image.sh
+      - scripts/make_sums.sh
+      - scripts/check_scalar_erasure_coding.sh
       - scripts/repro_proof.sh
       - .github/workflows/release.yml
       - .github/workflows/repro-check.yml
@@ -43,7 +46,8 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           bundle=""; [ "$TARGET" = x86_64-unknown-linux-musl ] && bundle=--bundle
-          bash scripts/repro_proof.sh --target "$TARGET" --work "$RUNNER_TEMP/repro" --image parvault-build $bundle parvault
+          # --image-archive needs all five binaries, so no bin list.
+          bash scripts/repro_proof.sh --target "$TARGET" --work "$RUNNER_TEMP/repro" --image parvault-build --image-archive $bundle
       - name: diffoscope on mismatch
         if: failure()
         run: |

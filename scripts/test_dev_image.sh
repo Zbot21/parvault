@@ -15,10 +15,14 @@ TAG=$(docker load -i "$TAR" | sed -n 's/^Loaded image: //p')
 [[ "$TAG" =~ ^parvault:[0-9]+\.[0-9]+\.[0-9]+-dev$ ]] || fail "loaded '$TAG', want parvault:<ver>-dev"
 echo "loaded $TAG ($(docker image inspect -f '{{.Architecture}} {{.Id}}' "$TAG"))"
 [[ "$(docker image inspect -f '{{.Config.User}}' "$TAG")" == "65532:65532" ]] || fail "image user is not 65532:65532"
+# No status listener by default (router_nas.rs: no flag, no listener); compose.yaml opts in.
+cmd=$(docker image inspect -f '{{json .Config.Cmd}}' "$TAG")
+[[ "$cmd" != *status-http* ]] || fail "image Cmd passes --status-http: $cmd"
+echo "default Cmd: $cmd (no --status-http)"
 
 HARD=(--cap-drop ALL --security-opt no-new-privileges:true --read-only
   --tmpfs /run/parvault:uid=65532,gid=65532,mode=0700 --tmpfs /tmp:mode=1777)
-# First run (docs/SYNOLOGY.md step 4): a fresh node must start a ring or join one before `up`.
+# First run (docs/SYNOLOGY.md step 3): a fresh node must start a ring or join one before `up`.
 docker run --rm -v "$VOL:/var/lib/parvault" "${HARD[@]}" "$TAG" --data-dir /var/lib/parvault wot init \
   > "/tmp/$NAME-init.log" 2>&1 || { cat "/tmp/$NAME-init.log" >&2; fail "wot init failed"; }
 rm -f "/tmp/$NAME-init.log"
@@ -41,6 +45,12 @@ echo "processes: uid 65532 only ($(docker top "$NAME" -eo pid,uid,comm | awk 'NR
 caps=$(awk '/^CapEff/ {print $2}' "/proc/$(docker inspect -f '{{.State.Pid}}' "$NAME")/status")
 [[ "$caps" == 0000000000000000 ]] || fail "effective capabilities $caps, want none"
 echo "capabilities: none (CapEff=$caps)"
+# Nothing listens on 4080 in the container's network namespace (TCP LISTEN = state 0A, port 0FF0).
+pid=$(docker inspect -f '{{.State.Pid}}' "$NAME")
+if awk 'FNR>1 && $4 == "0A" {split($2, a, ":"); if (a[2] == "0FF0") f=1} END {exit !f}' "/proc/$pid/net/tcp" "/proc/$pid/net/tcp6"; then
+  fail "a socket listens on port 4080 with the default Cmd"
+fi
+echo "status page: no listener on 4080 by default"
 # docker cp streams a tar that keeps numeric owners: the volume root and what the daemon wrote.
 owners=$(docker cp "$NAME:/var/lib/parvault" - | tar -tv --numeric-owner | awk '{print $2}' | sort -u)
 [[ "$owners" == "65532/65532" ]] || fail "data volume entries owned by '$owners', want only 65532/65532"
