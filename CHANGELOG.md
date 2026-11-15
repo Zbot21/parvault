@@ -8,9 +8,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-### Added
-- **`parvault token init-key` (B-93).** Creates `<data_dir>/macaroon_root.key` (`0600`) without minting a token; an existing key is validated and kept. It prints the path (`--json`: `path`, `created`), never the key. Deploy scripts no longer have to mint and discard a token.
-
 ### Removed
 - **The `simd-accel` feature (L-102).** Erasure coding is scalar-only, enforced in CI: `reed-solomon-erasure` is built with `default-features = false, features = ["std"]`, and `scripts/check_scalar_erasure_coding.sh` fails on the SIMD GF(2^8) kernel in shipped binaries (table content, plus symbols and scoped byte-shuffle instructions on unstripped builds). A CI job proves the check flags a SIMD-enabled build.
 
