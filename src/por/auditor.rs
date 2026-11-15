@@ -93,14 +93,7 @@ impl AuditorConfig {
     }
 }
 
-/// One shard to audit, as a local manifest names it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuditTarget {
-    pub host_addr: String,
-    pub shard_id: ShardId,
-    pub shard_len: u64,
-    pub chunk_root: [u8; 32],
-}
+pub use crate::por::lite_index::AuditTarget;
 
 /// Counts shown by `parvault status` (`audits`) and the state the sampler needs. RAM, mirrored
 /// to [`AUDIT_STATE_FILE`].

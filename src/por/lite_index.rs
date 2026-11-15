@@ -21,7 +21,6 @@
 //!   runs without lite audits and leaves the file untouched for the operator.
 //!
 //! The seed's audit results stay on the seed (L-29).
-use crate::por::auditor::AuditTarget;
 use crate::storage::ShardId;
 use rand::{rngs::OsRng, seq::SliceRandom};
 use serde::{Deserialize, Serialize};
@@ -37,6 +36,17 @@ const LITE_AUDIT_INDEX_VERSION: u32 = 1;
 /// The largest index file `load` reads (the encoding is below the charged cost; twice the byte
 /// bound leaves room for the header).
 pub const LITE_AUDIT_INDEX_MAX_FILE: u64 = 2 * LITE_AUDIT_INDEX_MAX_BYTES as u64;
+
+/// One shard to audit: its host, id, length and chunk root, as a local manifest or the lite
+/// index names it. Defined here, outside the `daemon-runtime` gate, because the seed's
+/// fan-out records into the index in every build.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditTarget {
+    pub host_addr: String,
+    pub shard_id: ShardId,
+    pub shard_len: u64,
+    pub chunk_root: [u8; 32],
+}
 
 /// One shard of a lite stripe on one mesh host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
