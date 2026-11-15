@@ -294,4 +294,20 @@ kani       S-SANITIZE sym=src/sync/common.rs::sanitize_sync_relative_path_into h
 claim      B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision accept=trust_enforcement::bseed_second_sender_accepted_while_one_job_runs reject=trust_enforcement::bseed_third_job_refused_busy code=reject.syndication_busy bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe
 kani       B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision harness=proof_syndication_fanout_budget cover=syndication over budget
 
+# --- v0.5.4 NEW-5: deterministic lab mode and config dump (docs/LAB_MODE.md) -----------------------
+claim      LAB-CONFLICT sym=src/config.rs::lab_side_channel_decision accept=lab_deterministic::deterministic_daemon_starts_with_fixed_ports reject=lab_deterministic::deterministic_refuses_explicit_lan_discovery code=reject.lab_config_conflict bin=parvault ref=docs/LAB_MODE.md
+claim      LAB-PORT  sym=src/config.rs::lab_bind_decision accept=lab_deterministic::deterministic_daemon_starts_with_fixed_ports reject=lab_deterministic::deterministic_refuses_ephemeral_port code=reject.lab_ephemeral_port bin=parvault ref=docs/LAB_MODE.md
+claim      LAB-DNS   sym=src/config.rs::lab_addr_decision accept=lab_deterministic::deterministic_daemon_starts_with_fixed_ports reject=lab_deterministic::deterministic_refuses_dns_addr code=reject.lab_dns_addr bin=parvault ref=docs/LAB_MODE.md
+claim      LAB-SIDE  sym=src/config.rs::lab_side_channel_decision accept=lab_deterministic::discover_allowed_outside_lab_mode reject=lab_deterministic::discover_refused_in_lab_mode code=reject.lab_side_channel bin=parvault ref=docs/LAB_MODE.md
+claim      LAB-DIAL  sym=src/lab_dial.rs::lab_dial_decision accept=lab_deterministic::deterministic_dials_only_dial_set reject=lab_deterministic::deterministic_refuses_learned_addr code=reject.lab_dial_outside_set bin=parvault ref=docs/LAB_MODE.md
+kani       LAB-DIAL-K sym=src/lab_dial.rs::lab_dial_decision harness=proof_lab_dial_only_within_fixed_set cover=fixed set dial allowed
+reach      LAB-DIAL-TX sym=src/lab_dial.rs::lab_dial_decision from=src/network/traversal_gate.rs::LabDialTransport::dial
+reach      LAB-DIAL-BHV sym=src/lab_dial.rs::lab_dial_decision from=src/network/traversal_gate.rs::TraversalGate::handle_established_outbound_connection
+reach      LAB-REACH sym=src/config.rs::lab_side_channel_decision from=src/cli/daemon.rs::run_daemon
+suite      S-DUMP-SECRET test=config_dump::dump_never_prints_secret_canary needs=cmd:sh
+suite      S-DUMP-CLASS test=config_dump::dump_schema_covers_every_env_read needs=cmd:sh
+suite      S-DUMP-NOFX test=config_dump::dump_paths_have_no_side_effects needs=cmd:sh
+kani       DUMP-K    sym=src/config_dump.rs::dump_field_repr harness=proof_dump_secret_never_yields_value cover=secret set
+reach      DUMP-REACH sym=src/config_dump.rs::dump_field_repr from=src/config_dump.rs::render_dump
+
 ratchet    R         open=2 waive=32

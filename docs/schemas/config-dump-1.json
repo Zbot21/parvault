@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "parvault.config-dump/1",
+  "title": "parvault config dump",
+  "description": "Output of `parvault config dump`, `parvault up --dump-config` and `parvault daemon start --dump-config` (docs/LAB_MODE.md). Keys are sorted; secrets carry only set and source.",
+  "type": "object",
+  "required": ["schema", "binary", "version", "config_file", "unknown_file_keys", "values", "args", "env", "secrets", "effective"],
+  "additionalProperties": false,
+  "$defs": {
+    "source": {"type": "string", "pattern": "^(default|profile|file|lab|env:[A-Z_]+|flag:--[a-z0-9-]+)$"},
+    "plain": {
+      "type": "object",
+      "required": ["value", "source"],
+      "properties": {"value": {}, "source": {"$ref": "#/$defs/source"}, "userinfo_removed": {"const": true}},
+      "additionalProperties": false
+    },
+    "unparsed": {
+      "type": "object",
+      "required": ["set", "unparsed", "source"],
+      "properties": {"set": {"const": true}, "unparsed": {"const": true}, "source": {"$ref": "#/$defs/source"}},
+      "additionalProperties": false
+    },
+    "secret": {
+      "type": "object",
+      "required": ["set", "source"],
+      "properties": {"set": {"type": "boolean"}, "source": {"type": "string"}},
+      "additionalProperties": false
+    }
+  },
+  "properties": {
+    "schema": {"const": "parvault.config-dump/1"},
+    "binary": {"const": "parvault"},
+    "version": {"type": "string"},
+    "config_file": {"type": ["string", "null"]},
+    "unknown_file_keys": {"type": "integer", "minimum": 0},
+    "values": {"type": "object", "additionalProperties": {"oneOf": [{"$ref": "#/$defs/plain"}, {"$ref": "#/$defs/unparsed"}]}},
+    "args": {"type": "object", "additionalProperties": {"oneOf": [{"$ref": "#/$defs/plain"}, {"$ref": "#/$defs/unparsed"}]}},
+    "env": {"type": "object", "additionalProperties": {"type": "object", "required": ["set"], "properties": {"set": {"type": "boolean"}}, "additionalProperties": false}},
+    "secrets": {"type": "object", "additionalProperties": {"$ref": "#/$defs/secret"}},
+    "effective": {
+      "type": "object",
+      "required": ["deterministic", "listeners", "dial_set", "relays", "side_channels", "metrics"],
+      "properties": {
+        "deterministic": {"type": "boolean"},
+        "listeners": {
+          "type": "object",
+          "required": ["tcp", "quic", "status_http", "webdav", "ipc_socket"],
+          "additionalProperties": {"type": ["string", "null"]}
+        },
+        "dial_set": {"type": ["array", "null"], "items": {"type": ["string", "null"]}},
+        "relays": {"type": ["array", "null"], "items": {"type": ["string", "null"]}},
+        "side_channels": {"type": "object", "additionalProperties": {"type": "boolean"}},
+        "metrics": {
+          "type": "object",
+          "required": ["path", "auth", "insecure_listener"],
+          "properties": {"path": {"const": "/metrics"}, "auth": {"const": "readonly-macaroon"}, "insecure_listener": {"type": ["string", "null"]}}
+        }
+      }
+    }
+  }
+}

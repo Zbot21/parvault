@@ -29,6 +29,9 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
+/// The refusal text for an onion forward in lab mode (the reason code is logged, never sent).
+pub const LAB_RELAY_FORWARD_OFF_TEXT: &str = "relay forwarding is off in deterministic lab mode";
+
 /// Returns the first IPv4 / IPv6 address in a multiaddr.
 pub fn extract_ip_from_multiaddr(addr: &Multiaddr) -> Option<std::net::IpAddr> {
     for proto in addr.iter() {
@@ -1559,7 +1562,7 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                         warn!(code, "refused an onion relay forward in lab mode");
                         return MeshWireResponse::RelayPqOnionAck {
                             delivered: false,
-                            error: Some(code.to_string()),
+                            error: Some(LAB_RELAY_FORWARD_OFF_TEXT.to_string()),
                         };
                     }
                     *deferred = Some(DeferredJob::Relay(Box::new(RelayForward {

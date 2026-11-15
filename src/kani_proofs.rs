@@ -1527,3 +1527,72 @@ fn proof_council_reroot_needs_quorum_and_new_root() {
             && (!f.rerooted || (f.public_mode && f.new_root_signed))
     );
 }
+
+/// LAB-DIAL-K (`v0.5.4` NEW-5, `docs/LAB_MODE.md`): `Open` allows every dial; under `Fixed`, a
+/// dial is allowed iff some entry has the address's `(ip, port, transport)` and every PeerId
+/// given (the dial's and the address's `/p2p/`) is that entry's; a peer-only check needs the peer
+/// to be some entry's. Bounds: at most 2 entries, and `PEER_KEY_MAX` is 4 under Kani (every
+/// length from 1 to 4), so the byte compares stay small. The address is checked as parsed parts;
+/// the shape parser has unit tests.
+#[kani::proof]
+#[kani::unwind(6)]
+fn proof_lab_dial_only_within_fixed_set() {
+    use crate::lab_dial::{lab_dial_decision, DialAddr, DialEntry, DialSet, PeerKey};
+    let fixed: bool = kani::any();
+    let mut entries: Vec<DialEntry> = Vec::new();
+    if kani::any() {
+        entries.push(kani::any());
+        if kani::any() {
+            entries.push(kani::any());
+        }
+    }
+    let set = if fixed {
+        DialSet::Fixed(entries.clone())
+    } else {
+        DialSet::Open
+    };
+    let addr: Option<DialAddr> = if kani::any() { Some(kani::any()) } else { None };
+    let peer: Option<PeerKey> = if kani::any() { Some(kani::any()) } else { None };
+    let d = lab_dial_decision(addr.as_ref(), peer.as_ref(), &set);
+    kani::cover!(
+        d.is_ok() && fixed && addr.is_some(),
+        "fixed set dial allowed"
+    );
+    kani::cover!(
+        d.is_err() && fixed && addr.is_some(),
+        "fixed set dial refused"
+    );
+    if !fixed {
+        assert!(d.is_ok());
+        return;
+    }
+    let expected = match addr {
+        None => peer.is_some_and(|p| entries.iter().any(|e| e.peer == p)),
+        Some(a) => entries.iter().any(|e| {
+            e.ip == a.ip
+                && e.port == a.port
+                && e.transport == a.transport
+                && a.peer.is_none_or(|p| p == e.peer)
+                && peer.is_none_or(|p| p == e.peer)
+        }),
+    };
+    assert_eq!(d.is_ok(), expected);
+}
+
+/// DUMP-K (`v0.5.4` NEW-5): for any class and presence, a secret (`Secret`, `SecretPath`) is
+/// rendered set-only (no value field; a key file shows only its path in `source`), a URL loses
+/// its userinfo, a plain value is a value, and a control flag is never rendered.
+#[kani::proof]
+fn proof_dump_secret_never_yields_value() {
+    use crate::config_dump::{dump_field_repr, DumpRepr, FieldClass};
+    let class: FieldClass = kani::any();
+    let present: bool = kani::any();
+    let r = dump_field_repr(class, present);
+    kani::cover!(r == DumpRepr::SetOnly && present, "secret set");
+    match class {
+        FieldClass::Secret | FieldClass::SecretPath => assert!(r == DumpRepr::SetOnly),
+        FieldClass::PlainUrl => assert!(r == DumpRepr::ValueWithoutUserinfo),
+        FieldClass::Plain => assert!(r == DumpRepr::Value),
+        FieldClass::Control => assert!(r == DumpRepr::Omitted),
+    }
+}

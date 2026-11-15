@@ -88,6 +88,7 @@ impl PartialEq for LabIp {
 impl Eq for LabIp {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 pub enum DialTransport {
     Tcp,
     Quic,
@@ -201,6 +202,52 @@ pub fn lab_dial_decision(
         Err("reject.lab_dial_peer_mismatch")
     } else {
         Err("reject.lab_dial_outside_set")
+    }
+}
+
+#[cfg(kani)]
+impl kani::Arbitrary for PeerKey {
+    fn any() -> Self {
+        let len: u8 = kani::any();
+        kani::assume(len >= 1 && (len as usize) <= PEER_KEY_MAX);
+        Self {
+            len,
+            bytes: kani::any(),
+        }
+    }
+}
+
+#[cfg(kani)]
+impl kani::Arbitrary for LabIp {
+    fn any() -> Self {
+        Self {
+            v6: kani::any(),
+            octets: kani::any(),
+        }
+    }
+}
+
+#[cfg(kani)]
+impl kani::Arbitrary for DialEntry {
+    fn any() -> Self {
+        Self {
+            ip: kani::any(),
+            port: kani::any(),
+            transport: kani::any(),
+            peer: kani::any(),
+        }
+    }
+}
+
+#[cfg(kani)]
+impl kani::Arbitrary for DialAddr {
+    fn any() -> Self {
+        Self {
+            ip: kani::any(),
+            port: kani::any(),
+            transport: kani::any(),
+            peer: if kani::any() { Some(kani::any()) } else { None },
+        }
     }
 }
 
