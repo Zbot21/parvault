@@ -46,6 +46,13 @@ owner_of() {
     ls -ld "$1" | awk '{print $3}'
 }
 
+# The first path under $1 (itself included) not owned by user $2, empty when all are. The walk
+# reads metadata only and stops at the first hit (head closes the pipe); busybox find has no
+# -quit. It runs at every start and reload, so a fully owned store is walked once per start.
+not_owned_by() {
+    find "$1" ! -user "$2" | head -n 1
+}
+
 # First-run step: the service user and its data directory, on the mounted NAS disk only. The
 # daemon writes its keys there on first start, as the service user (B-53). Supported
 # filesystems keep POSIX owners and modes: ext4, f2fs, btrfs, xfs. vfat, exfat and NTFS do not,
@@ -62,10 +69,11 @@ init_service_user() {
     group_exists "$SVC_USER" || group_add "$SVC_USER" "$SVC_UID"
     user_exists "$SVC_USER" || user_add "$SVC_USER" "$SVC_UID" "$SVC_UID" "$SVC_USER" /var/empty
     [ -d "$DATA" ] || mkdir -m 0700 "$DATA" || { fail "cannot create $DATA"; return 1; }
-    # Chown only when the owner differs: a new directory, or one a root-run release left
-    # behind, whose contents move with it once. A started service never walks the store.
-    if [ "$(owner_of "$DATA")" != "$SVC_USER" ]; then
+    # Chown when any entry is not the service user's: a new directory, one a root-run release
+    # left behind, root-owned files from a root CLI run, or an interrupted first chown -R.
+    if [ -n "$(not_owned_by "$DATA" "$SVC_USER")" ]; then
         chown -R "$SVC_USER:$SVC_USER" "$DATA" || { fail "cannot chown $DATA"; return 1; }
+        [ -z "$(not_owned_by "$DATA" "$SVC_USER")" ] || { fail "$DATA has entries chown could not change"; return 1; }
     fi
     chmod 0700 "$DATA"
 }
