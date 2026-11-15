@@ -54,11 +54,10 @@ fi
 for b in parvault parvault-seed; do
     bash scripts/stage_artifact.sh --bin "$b" --profile release ${STAGE_TRIPLE:+--target "$STAGE_TRIPLE"} --dest "$BUILD_CTX/$b"
 done
-STATUS_TARGET="${STAGE_TRIPLE:+--target $STAGE_TRIPLE}"
-# The sidecar with its own feature set (no tokio, no libp2p), as releases build it.
-# shellcheck disable=SC2086
-bash scripts/build_bins.sh --profile release $STATUS_TARGET --out "$BUILD_CTX/sidecar" parvault-status
-cp "$BUILD_CTX"/sidecar/parvault-status* "$BUILD_CTX/parvault-status"
+# The sidecar with its own feature set (no tokio, no libp2p), as releases build it
+# (scripts/build_bins.sh features_for parvault-status).
+bash scripts/stage_artifact.sh --bin parvault-status --profile release --no-default-features --features status-ui \
+    ${STAGE_TRIPLE:+--target "$STAGE_TRIPLE"} --dest "$BUILD_CTX/parvault-status"
 chmod +x "$BUILD_CTX/parvault" "$BUILD_CTX/parvault-seed" "$BUILD_CTX/parvault-status"
 
 cat > "$BUILD_CTX/Dockerfile" <<EOF
@@ -703,8 +702,12 @@ mkdir -p "$VFS_CTX"
 VFS_TEST_BIN="$(cargo test --release --test vfs_mp4_seek_gate --no-run --message-format=json 2>/dev/null \
     | sed -n 's/.*"executable":"\([^"]*vfs_mp4_seek_gate[^"]*\)".*/\1/p' | tail -1)"
 [ -x "$VFS_TEST_BIN" ] || { echo "ERROR: stage 12c: no vfs_mp4_seek_gate test binary"; exit 1; }
+# The test binary is not staged through stage_artifact.sh: the helper stages `--bin` targets
+# only (no `--test`). It is the gate's own harness, not a shipped artifact (A-DOCKER, B-47).
 cp "$VFS_TEST_BIN" "$VFS_CTX/vfs_mp4_seek_gate"
-bash scripts/stage_artifact.sh --bin parvault-fuse --profile release --dest "$VFS_CTX/parvault-fuse"
+# parvault-fuse with its release feature set (scripts/build_bins.sh features_for parvault-fuse).
+bash scripts/stage_artifact.sh --bin parvault-fuse --profile release --no-default-features --features vfs \
+    --dest "$VFS_CTX/parvault-fuse"
 cat > "$VFS_CTX/Dockerfile" <<'EOF'
 FROM ubuntu:24.04
 RUN apt-get update -o Acquire::Retries=3 \

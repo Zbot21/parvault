@@ -9,8 +9,10 @@
 #
 #   GATE-ARTIFACT bin=<bin> sha256=<staged hex> src_sha256=<built hex>
 #                 commit=<sha>[-dirty] pinned=<crate|none> srcdir=<source>
-#                 strip=<tool|none> cache=<hit|miss|off> src=<exe> dest=<dest>
+#                 strip=<tool|none> cache=<hit|miss|off> features=<list|none>
+#                 default_features=<yes|no> src=<exe> dest=<dest>
 # Each value is percent-encoded: '%' %25, space %20, tab %09, CR %0D, LF %0A.
+# features is the sorted, de-duplicated --features list joined with commas.
 # Hashes read stdin: sha256sum escapes a file name holding a backslash, LF or CR.
 #
 # srcdir is a directory (working tree), git:<url> (cargo install at the pin)
@@ -44,6 +46,8 @@ GIT_REV=""
 CACHE=""
 BUILD_DIR=""
 STRIP=0
+FEATURES_RAW=()
+DEFAULT_FEATURES="yes"
 
 usage() {
   cat <<'EOF'
@@ -63,6 +67,10 @@ Options:
                         archive tree, the install root and the cargo target.
                         Created if missing; only the helper's own temporary
                         subdirectories are removed, never the directory itself.
+  --features <list>     cargo --features <list> (comma- or space-separated;
+                        repeatable). Recorded sorted and de-duplicated.
+  --no-default-features cargo --no-default-features. Recorded as
+                        default_features=no.
   --strip               Strip the staged copy before recording its sha256.
                         STRIP_TOOL (default: strip) must be a command name on
                         PATH named strip or <prefix>-strip, outside the repo.
@@ -77,7 +85,7 @@ die() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --bin|--dest|--package|--profile|--target|--src|--lock|--lock-crate|--git|--rev|--cache|--build-dir)
+    --bin|--dest|--package|--profile|--target|--src|--lock|--lock-crate|--git|--rev|--cache|--build-dir|--features)
       [[ $# -ge 2 ]] || die "$1 requires an argument."
       case "$1" in
         --bin) BIN="$2" ;;
@@ -92,10 +100,12 @@ while [[ $# -gt 0 ]]; do
         --rev) GIT_REV="$2" ;;
         --cache) CACHE="$2" ;;
         --build-dir) BUILD_DIR="$2" ;;
+        --features) FEATURES_RAW+=("$2") ;;
       esac
       shift 2
       ;;
     --strip) STRIP=1; shift ;;
+    --no-default-features) DEFAULT_FEATURES="no"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "Unknown argument: $1" ;;
   esac
@@ -109,6 +119,32 @@ done
 [[ -z "$CACHE" || -n "$GIT_REV" ]] || die "--cache is only for pinned builds (--rev)."
 [[ -n "$GIT_URL" || -d "$SRC" ]] || die "--src is not a directory: $SRC"
 command -v python3 >/dev/null 2>&1 || die "python3 is required."
+# Features: split on commas and spaces, each a cargo feature name (optionally
+# <crate>/<feature>); sorted and de-duplicated so the record is canonical.
+FEATURES="none"
+if [[ ${#FEATURES_RAW[@]} -gt 0 ]]; then
+  FEATURES="$(python3 - "${FEATURES_RAW[@]}" <<'PY2'
+import re
+import sys
+
+names = set()
+for arg in sys.argv[1:]:
+    for f in re.split(r"[ ,]+", arg):
+        if not f:
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_+.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_+.-]*)?", f):
+            sys.exit(f"invalid feature name '{f}'")
+        names.add(f)
+if not names:
+    sys.exit("--features was given an empty list")
+print(",".join(sorted(names)))
+PY2
+)" || die "bad --features value"
+fi
+# feature_args: cargo options for the requested feature set.
+FEATURE_ARGS=()
+[[ "$DEFAULT_FEATURES" == yes ]] || FEATURE_ARGS+=(--no-default-features)
+[[ "$FEATURES" == none ]] || FEATURE_ARGS+=(--features "$FEATURES")
 command -v cargo >/dev/null 2>&1 || die "cargo is required (not on PATH)."
 
 WORKDIR="$(mktemp -d)" || die "mktemp failed."
@@ -164,6 +200,7 @@ cargo_build() {
   [[ -z "$PACKAGE" ]] || args+=(-p "$PACKAGE")
   [[ -z "$PROFILE" ]] || args+=(--profile "$PROFILE")
   [[ -z "$TARGET" ]] || args+=(--target "$TARGET")
+  args+=(${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"})
   (cd "$1" && if [[ -n "${EXT_TARGET:-}" ]]; then export CARGO_TARGET_DIR="$EXT_TARGET"; fi \
     && cargo "${args[@]}") > "$WORKDIR/build.json" || die "cargo ${args[*]} failed in $1"
   EXE="$(python3 - "$WORKDIR/build.json" "$BIN" <<'PY'
@@ -216,7 +253,7 @@ fi
 
 # Optional cache for pinned builds, keyed by crate, full commit, target,
 # profile and a hash of the build configuration (rustc and cargo versions,
-# --package, and RUSTFLAGS / CARGO_ENCODED_RUSTFLAGS / RUSTC* / CARGO_BUILD_* /
+# --package, the feature set, and RUSTFLAGS / CARGO_ENCODED_RUSTFLAGS / RUSTC* / CARGO_BUILD_* /
 # CARGO_PROFILE_* / CARGO_TARGET_<triple>_* variables). A cached file is used
 # only when its recorded hash still matches.
 if [[ -n "$CACHE" ]]; then
@@ -226,7 +263,8 @@ if [[ -n "$CACHE" ]]; then
   # grep finds nothing when no such variable is set; that is an empty set.
   ENV_CFG="$(env | LC_ALL=C grep -E '^(RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|RUSTC[A-Z_]*|CARGO_BUILD_[A-Z_]*|CARGO_PROFILE_[A-Z_]*|CARGO_TARGET_[A-Z0-9_]+_[A-Z_]+)=' \
     | LC_ALL=C grep -v '^CARGO_TARGET_DIR=' | LC_ALL=C sort)" || ENV_CFG=""
-  CFG="$(printf '%s\n%s\npackage=%s\n%s\n' "$RUSTC_V" "$CARGO_V" "$PACKAGE" "$ENV_CFG" | sha256sum | cut -c1-16)"
+  CFG="$(printf '%s\n%s\npackage=%s\nfeatures=%s\ndefault_features=%s\n%s\n' "$RUSTC_V" "$CARGO_V" "$PACKAGE" \
+    "$FEATURES" "$DEFAULT_FEATURES" "$ENV_CFG" | sha256sum | cut -c1-16)"
   KEYDIR="$CACHE/$LOCK_CRATE@$COMMIT+${TARGET:-host}+${PROFILE:-default}+$CFG"
   if [[ -f "$KEYDIR/$BIN" && -f "$KEYDIR/$BIN.sha256" ]] \
       && [[ "$(sha256sum < "$KEYDIR/$BIN" | cut -d' ' -f1)" == "$(cat "$KEYDIR/$BIN.sha256")" ]]; then
@@ -255,6 +293,7 @@ if [[ -z "$EXE" ]]; then
     ARGS=(install --locked --git "$GIT_URL" --rev "$GIT_REV" --root "$EXT_BASE/root" --bin "$BIN" "$LOCK_CRATE")
     [[ -z "$PROFILE" ]] || ARGS+=(--profile "$PROFILE")
     [[ -z "$TARGET" ]] || ARGS+=(--target "$TARGET")
+    ARGS+=(${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"})
     ( if [[ -n "$EXT_TARGET" ]]; then export CARGO_TARGET_DIR="$EXT_TARGET"; fi; cargo "${ARGS[@]}" ) >&2 \
       || die "cargo ${ARGS[*]} failed"
     EXE="$EXT_BASE/root/bin/$BIN"
@@ -300,7 +339,7 @@ pct() {
   v="${v// /%20}"; v="${v//$'\t'/%09}"; v="${v//$'\r'/%0D}"; v="${v//$'\n'/%0A}"
   printf '%s' "$v"
 }
-LINE="GATE-ARTIFACT bin=$(pct "$BIN") sha256=$SUM src_sha256=$SRC_SUM commit=$(pct "$COMMIT") pinned=$(pct "${LOCK_CRATE:-none}") srcdir=$(pct "$SRCDIR") strip=$(pct "$STRIP_BIN") cache=$CACHE_STATE src=$(pct "$EXE") dest=$(pct "$DEST")"
+LINE="GATE-ARTIFACT bin=$(pct "$BIN") sha256=$SUM src_sha256=$SRC_SUM commit=$(pct "$COMMIT") pinned=$(pct "${LOCK_CRATE:-none}") srcdir=$(pct "$SRCDIR") strip=$(pct "$STRIP_BIN") cache=$CACHE_STATE features=$(pct "$FEATURES") default_features=$DEFAULT_FEATURES src=$(pct "$EXE") dest=$(pct "$DEST")"
 if [[ -n "${GATES_SENTINEL_DIR:-}" ]]; then
   printf '%s\n' "$LINE" >> "$GATES_SENTINEL_DIR/artifacts" || die "cannot record to $GATES_SENTINEL_DIR/artifacts"
 fi
