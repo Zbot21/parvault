@@ -18,6 +18,10 @@ use parvault::network::server_events::ServerSwarmEvents;
 use parvault::network::wire_handler::{
     extract_ip_from_multiaddr, handle_seed_wire_request, SeedWireHandlerCtx,
 };
+use parvault::por::auditor::{
+    run_audit_job, AuditJobCtx, AuditSource, AuditorConfig, AuditorState,
+};
+use parvault::por::lite_index::LiteAuditIndex;
 use parvault::{
     admin_rpc::{
         spawn_admin_rpc_listener, SeedAdminRequest, SeedAdminResponse, SeedTelemetrySnapshot,
@@ -155,6 +159,18 @@ enum SeedCommand {
         /// Optional read-only file (raw 32-byte seed or 64-char hex) for deterministic identity in `--no-fs` mode
         #[arg(long, value_name = "PATH")]
         identity_file: Option<PathBuf>,
+
+        /// Turn off chunk audits of the lite stripes this seed fanned out (F-06, B-59)
+        #[arg(long, default_value_t = false)]
+        no_audit: bool,
+
+        /// Seconds between chunk audits of one mesh host (F-06; at most 30 audits per hour in all)
+        #[arg(long, value_name = "SECS", default_value_t = parvault::por::auditor::DEFAULT_AUDIT_INTERVAL_SECS)]
+        audit_interval_secs: u64,
+
+        /// Round-trip bound in milliseconds for an audit answer to count (later answers are unanswered)
+        #[arg(long, value_name = "MS", default_value_t = parvault::por::auditor::DEFAULT_AUDIT_RTT_MS)]
+        audit_rtt_ms: u64,
     },
 
     /// Display or initialize the persistent seed server NodeIdentity and Post-Quantum Owner Key
@@ -424,6 +440,9 @@ async fn main() -> anyhow::Result<()> {
             in_memory_mb,
             identity_env,
             identity_file,
+            no_audit,
+            audit_interval_secs,
+            audit_rtt_ms,
         } => {
             let mut explicit_admin_pks = Vec::new();
             for raw_hex in &admin_rpc_pubkey {
@@ -577,6 +596,23 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
 
+            // F-06 seed half (B-59 change 9): the seed audits the lite stripes it fanned out.
+            let lite_index = std::sync::Arc::new(std::sync::Mutex::new(if in_memory_mode {
+                LiteAuditIndex::in_memory()
+            } else {
+                LiteAuditIndex::load(&data_dir)
+            }));
+            let server = server.with_lite_audit_index(std::sync::Arc::clone(&lite_index));
+            let auditor = seed_audit_ctx(SeedAuditOpts {
+                no_audit,
+                interval_secs: audit_interval_secs,
+                rtt_ms: audit_rtt_ms,
+                block_store: &block_store,
+                node_identity: &node_identity,
+                index: lite_index,
+                data_dir: (!in_memory_mode).then(|| data_dir.clone()),
+            });
+
             let report = server.status_report(1);
             let display_dir = if in_memory_mode {
                 Path::new("in-memory (--no-fs)")
@@ -600,6 +636,7 @@ async fn main() -> anyhow::Result<()> {
                 admin_rpc_listen,
                 explicit_admin_pks,
                 effective_peers,
+                auditor,
             })
             .await?;
         }
@@ -1678,6 +1715,56 @@ struct SeedListenerConfig {
     admin_rpc_listen: Option<SocketAddr>,
     explicit_admin_pks: Vec<[u8; 32]>,
     effective_peers: Vec<String>,
+    auditor: Option<AuditJobCtx>,
+}
+
+struct SeedAuditOpts<'a> {
+    no_audit: bool,
+    interval_secs: u64,
+    rtt_ms: u64,
+    block_store: &'a BlockStore,
+    node_identity: &'a NodeIdentity,
+    index: std::sync::Arc<std::sync::Mutex<LiteAuditIndex>>,
+    data_dir: Option<PathBuf>,
+}
+
+/// F-06 seed half: the auditor's context, or `None` (logged) with `--no-audit` or no network
+/// client. It sends as the seed identity, the storer of every shard of its lite fan-out, and
+/// samples the lite audit index. Results stay on the seed (L-29); under `--no-fs` nothing is
+/// written.
+fn seed_audit_ctx(o: SeedAuditOpts<'_>) -> Option<AuditJobCtx> {
+    if o.no_audit {
+        info!("audits: off (--no-audit)");
+        return None;
+    }
+    let Some(client) = o.block_store.mesh_client() else {
+        info!("audits: off (no network client)");
+        return None;
+    };
+    let cfg = AuditorConfig {
+        interval_ms: o.interval_secs.max(1).saturating_mul(1_000),
+        rtt_bound_ms: o.rtt_ms.max(1),
+        width: parvault::por::DEFAULT_CHUNK_AUDIT_WIDTH,
+        max_per_hour: parvault::por::auditor::DEFAULT_MAX_AUDITS_PER_HOUR,
+    };
+    info!(
+        interval_ms = cfg.interval_ms,
+        rtt_bound_ms = cfg.rtt_bound_ms,
+        "audits: on (lite fan-out)"
+    );
+    let state = match &o.data_dir {
+        Some(d) => AuditorState::load(d),
+        None => AuditorState::fresh(),
+    };
+    Some(AuditJobCtx {
+        block_store: o.block_store.clone(),
+        source: AuditSource::LiteIndex(o.index),
+        client: client.clone(),
+        self_device_ids: vec![o.node_identity.device_peer_id()],
+        cfg,
+        state: std::sync::Arc::new(std::sync::Mutex::new(state)),
+        data_dir: o.data_dir,
+    })
 }
 
 async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
@@ -1692,6 +1779,7 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
         admin_rpc_listen,
         explicit_admin_pks,
         effective_peers,
+        auditor,
     } = cfg;
     let start_instant = Instant::now();
     let in_memory_mode = block_store.is_in_memory();
@@ -1908,6 +1996,15 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
 
     let mut gc_interval = tokio::time::interval(Duration::from_secs(60));
     gc_interval.tick().await;
+    // F-06 seed half: one audit job at most in flight, on the blocking pool.
+    let audit_tick_ms = auditor.as_ref().map_or(60_000, |c| c.cfg.tick_ms());
+    let audit_first_ms = auditor.as_ref().map_or(60_000, |c| c.cfg.first_delay_ms());
+    let mut audit_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_millis(audit_first_ms),
+        Duration::from_millis(audit_tick_ms),
+    );
+    audit_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let audit_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     info!(
         %local_peer_id,
@@ -1966,6 +2063,17 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
                         if let Some((bound_port, bound_ip)) = extract_listen_port_and_ip(&address) {
                             beacon.update_listen_endpoint(bound_port, bound_ip);
                         }
+                    }
+                }
+            }
+            _ = audit_interval.tick(), if auditor.is_some() => {
+                if let Some(ctx) = auditor.clone() {
+                    if !audit_busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        let busy = std::sync::Arc::clone(&audit_busy);
+                        tokio::task::spawn_blocking(move || {
+                            let _ = run_audit_job(&ctx);
+                            busy.store(false, std::sync::atomic::Ordering::SeqCst);
+                        });
                     }
                 }
             }

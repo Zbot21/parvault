@@ -1079,6 +1079,11 @@ pub struct LiteIngest {
     pub stripe_index: u64,
     pub stripe_merkle_root: Hash32,
     pub shard_ids: Vec<ShardId>,
+    /// The lite client's device id (its share of the seed's audit index, change 9).
+    pub client_device_id: String,
+    /// Bytes per shard, and each shard's chunk-Merkle root, computed at ingest (F-06 seed half).
+    pub shard_len: u64,
+    pub shard_chunk_roots: Vec<Hash32>,
 }
 
 impl LiteIngest {
@@ -1103,7 +1108,12 @@ pub struct LiteFanOutPlan {
     block_store: BlockStore,
     repair_grant: Option<crate::por::RepairGrant>,
     session_key: [u8; 32],
+    audit_index: Option<LiteAuditIndexHandle>,
 }
+
+/// The seed's shared lite audit index.
+pub type LiteAuditIndexHandle =
+    std::sync::Arc<std::sync::Mutex<crate::por::lite_index::LiteAuditIndex>>;
 
 /// Runs a lite fan-out (blocking; call off the swarm task, without the seed's lock). Shards go
 /// out `parallel` at a time, keeping the replica rule (3 replicas when peers < shards, else 1);
@@ -1178,11 +1188,43 @@ pub fn run_lite_fan_out(
     });
     let primary = primary.into_inner().unwrap_or_else(|p| p.into_inner());
     let populated = primary.iter().filter(|p| p.is_some()).count();
+    if let Some(index) = &plan.audit_index {
+        record_lite_audit(index, &plan.ingest, &primary);
+    }
     let syndicated_peers = primary
         .into_iter()
         .map(|p| p.unwrap_or_else(|| plan.server_peer_id.clone()))
         .collect();
     (plan.ingest.receipt(populated), syndicated_peers)
+}
+
+/// F-06 seed half (change 9): appends the shards that a mesh host acknowledged to the seed's
+/// audit index. Shards no host took stay on the seed only and are not audited.
+fn record_lite_audit(
+    index: &LiteAuditIndexHandle,
+    ingest: &LiteIngest,
+    primary: &[Option<String>],
+) {
+    use crate::por::lite_index::{LiteAuditRecord, LiteAuditShard};
+    let shards: Vec<LiteAuditShard> = primary
+        .iter()
+        .enumerate()
+        .filter_map(|(i, host)| {
+            Some(LiteAuditShard {
+                shard_index: ingest.shard_ids.get(i)?.shard_index,
+                shard_hash: ingest.shard_ids.get(i)?.shard_hash,
+                chunk_root: *ingest.shard_chunk_roots.get(i)?,
+                host_addr: host.clone()?,
+            })
+        })
+        .collect();
+    let mut idx = index.lock().unwrap_or_else(|p| p.into_inner());
+    idx.insert(LiteAuditRecord {
+        client: ingest.client_device_id.clone(),
+        stripe_merkle_root: ingest.stripe_merkle_root,
+        shard_len: ingest.shard_len,
+        shards,
+    });
 }
 
 /// Route used by a Lite Client when selectively restoring files or byte ranges (`ADR-20`).
@@ -1211,9 +1253,17 @@ pub struct ZeroTrustSeedServer {
     server_credit_account: PeerCreditAccount,
     reachable_organic_peers: usize,
     reachable_seed_anchors: usize,
+    /// The index the seed's auditor samples (F-06 seed half); `None` records nothing.
+    lite_audit_index: Option<LiteAuditIndexHandle>,
 }
 
 impl ZeroTrustSeedServer {
+    /// Records every lite fan-out into `index` for the seed's auditor (F-06 seed half).
+    pub fn with_lite_audit_index(mut self, index: LiteAuditIndexHandle) -> Self {
+        self.lite_audit_index = Some(index);
+        self
+    }
+
     /// Initializes a `ZeroTrustSeedServer` in `HomelabRedundancyVault` mode bound to the
     /// homelab owner's composite post-quantum public key (`Ed25519 + ML-DSA-65`).
     pub fn new_homelab_vault(
@@ -1239,6 +1289,7 @@ impl ZeroTrustSeedServer {
             server_credit_account: PeerCreditAccount::default(),
             reachable_organic_peers: 0,
             reachable_seed_anchors: 0,
+            lite_audit_index: None,
         }
     }
 
@@ -1265,6 +1316,7 @@ impl ZeroTrustSeedServer {
             server_credit_account: PeerCreditAccount::default(),
             reachable_organic_peers: 0,
             reachable_seed_anchors: 1,
+            lite_audit_index: None,
         }
     }
 
@@ -1432,6 +1484,9 @@ impl ZeroTrustSeedServer {
             stripe_index: bundle.stripe_index,
             stripe_merkle_root: shard_set.stripe_merkle_root,
             shard_ids,
+            client_device_id: cert.device_peer_id.clone(),
+            shard_len: shard_set.shards.first().map_or(0, |b| b.len() as u64),
+            shard_chunk_roots: crate::por::chunk_merkle::stripe_chunk_roots(&shard_set.shards),
         })
     }
 
@@ -1467,6 +1522,7 @@ impl ZeroTrustSeedServer {
             block_store: self.block_store.clone(),
             repair_grant,
             session_key,
+            audit_index: self.lite_audit_index.clone(),
         })
     }
 

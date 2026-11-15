@@ -832,12 +832,12 @@ fn audit_job_ctx(
     Some(parvault::por::auditor::AuditJobCtx {
         block_store: block_store.clone(),
         client: client.with_identity(owner.clone()),
-        master_key: mk,
+        source: parvault::por::auditor::AuditSource::OwnerManifests(mk),
         self_device_ids: vec![owner.device_peer_id(), node_identity.device_peer_id()],
         cfg: auditor_cfg,
         state: Arc::new(std::sync::Mutex::new(
             parvault::por::auditor::AuditorState::load(&cfg.data_dir),
         )),
-        data_dir: cfg.data_dir.clone(),
+        data_dir: Some(cfg.data_dir.clone()),
     })
 }

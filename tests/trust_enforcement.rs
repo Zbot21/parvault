@@ -7868,3 +7868,104 @@ fn f06_slow_host_counted_unanswered_not_failed() {
     assert!(!owner.log_text().contains("reject.por_chunk_proof_invalid"));
     gate_ran("trust_enforcement::f06_slow_host_counted_unanswered_not_failed");
 }
+
+/// A seed with `--peers` that audits each mesh host every second (F-06 seed half).
+fn spawn_auditing_seed(label: &str, peers: &[&str]) -> Node {
+    let (root, dir, reg, log) = prepare(label);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault-seed"));
+    cmd.arg("--peers").arg(peers.join(","));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .args([
+            "start",
+            "--mode",
+            "homelab-vault",
+            "--no-lan-discovery",
+            "--listen",
+            common::LOOPBACK_EPHEMERAL,
+            "--audit-interval-secs",
+            "1",
+            "--audit-rtt-ms",
+            "10000",
+            "--data-dir",
+        ])
+        .arg(&dir);
+    spawn(cmd, root, dir, log)
+}
+
+/// A device syndicates one lite stripe through `seed` to its mesh host; every shard lands.
+fn seed_fan_out(seed: &Node, host: &Node, fill: u8) {
+    let device = key(fill);
+    let (req, _root) = bseed_synd(seed, &device, fill);
+    let resp = send_with(
+        client(&device).with_timeout(Duration::from_secs(30)),
+        seed,
+        req,
+    );
+    match resp {
+        MeshWireResponse::SyndicateLiteStripeAck {
+            receipt: Some(r), ..
+        } => assert!(
+            r.mesh_peers_populated > 0,
+            "no shard reached the host: {}",
+            host.log_text()
+        ),
+        other => panic!("{other:?}\nseed log:\n{}", seed.log_text()),
+    }
+}
+
+fn seed_audit_state(seed: &Node) -> Option<serde_json::Value> {
+    let s = std::fs::read_to_string(seed.dir.join("por_audit_state.json")).ok()?;
+    serde_json::from_str(&s).ok()
+}
+
+/// F-06-SEED accept (B-59 change 9): the seed indexes the lite stripe it fanned out and audits
+/// the mesh host over the real wire as the storer; the honest host passes. The index and the
+/// counts are on the seed only (L-29).
+#[test]
+fn f06_seed_lite_audit_passes() {
+    let host = spawn_daemon("f06-seed-a-host");
+    let seed = spawn_auditing_seed("f06-seed-a", &[&host.addr]);
+    seed_fan_out(&seed, &host, 0xA6);
+    assert!(seed.dir.join("lite_audit_index.bin").exists());
+    assert_audit_logged(&seed, "pass");
+    assert!(eventually(|| {
+        seed_audit_state(&seed).is_some_and(|v| v["passed"].as_u64().unwrap_or(0) >= 1)
+    }));
+    assert!(!seed.log_text().contains("reject.por_chunk_proof_invalid"));
+    assert!(
+        !host.log_text().contains("reject.por_not_storer"),
+        "{}",
+        host.log_text()
+    );
+    gate_ran("trust_enforcement::f06_seed_lite_audit_passes");
+}
+
+/// F-06-SEED reject: after the fan-out, the host's shard files get one byte flipped in every
+/// chunk, so the seed's audit fails the proof: `reject.por_chunk_proof_invalid`, a failed count
+/// and the shard degraded on the seed. The host is not quarantined.
+#[test]
+fn f06_seed_tampered_host_fails() {
+    let host = spawn_daemon("f06-seed-r-host");
+    let seed = spawn_auditing_seed("f06-seed-r", &[&host.addr]);
+    seed_fan_out(&seed, &host, 0xA7);
+    let mut flipped = 0;
+    for p in files_under(&host.dir.join("shards")) {
+        let mut b = std::fs::read(&p).unwrap();
+        for off in (0..b.len()).step_by(4096) {
+            b[off] ^= 0xFF;
+        }
+        std::fs::write(&p, b).unwrap();
+        flipped += 1;
+    }
+    assert!(flipped > 0, "no shard files on the host");
+    assert_audit_logged(&seed, "reject.por_chunk_proof_invalid");
+    assert!(
+        eventually(|| seed_audit_state(&seed).is_some_and(|v| {
+            v["failed"].as_u64().unwrap_or(0) >= 1
+                && !v["degraded"].as_array().is_none_or(Vec::is_empty)
+        })),
+        "no failed proof recorded on the seed"
+    );
+    assert!(!seed.log_text().contains("quarantin"));
+    gate_ran("trust_enforcement::f06_seed_tampered_host_fails");
+}

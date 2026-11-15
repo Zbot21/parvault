@@ -3,6 +3,7 @@ pub mod audit;
 pub mod auditor;
 pub mod challenger;
 pub mod chunk_merkle;
+pub mod lite_index;
 #[cfg(feature = "daemon-runtime")]
 pub mod verifier;
 
