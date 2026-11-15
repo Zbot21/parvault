@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **`max_connections` is documented as not applied (B-64).** No production path reads it in v0.5.x (no swarm connection limit yet); the status page and WebDAV use fixed caps of 32 and 64.
 
 ### Fixed
+- **The container and LXC status page is reachable again (B-54 follow-up).** Since B-54 the bundled `router.toml` binds `127.0.0.1:4080`, which in a container is its own loopback, so the exposed port 4080 reached nothing. `deploy/Dockerfile.router-soc` CMD and `deploy/prplos-lxc-manifest.json` args pass `--status-http 0.0.0.0:4080`, the container's own interface in its netns, not the router's WAN; the host's port publishing decides what reaches it. A bare-metal install keeps the loopback bind. The Docker gate's stage 12 passes the same flag.
 - **WAN DDNS heartbeats heal only pinned peers (F-58, B-91).** `lookup_wan_ddns_cards` pinned every card it opened, and the DDNS slot keys derive from public values, so anyone could get pinned into `known_peers.json` and listed by `discover --wan`. A card is now accepted only if its `PeerId` is already pinned and its address pins that `PeerId` (`reject.wan_ddns_peer_unknown`, `reject.wan_card_addr_peer_mismatch`). Cards are signed by the key behind their `PeerId`, so only that peer can move its address. `discover --wan` no longer introduces new devices through DDNS; pair them first. The public-tracker lookup is unchanged (B-94).
 
 ---

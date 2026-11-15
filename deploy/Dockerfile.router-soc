@@ -45,4 +45,8 @@ VOLUME ["/mnt/nas", "/var/lib/parvault"]
 EXPOSE 4001/tcp 4002/tcp 4009/udp 4080/tcp
 
 ENTRYPOINT ["/parvault"]
-CMD ["up", "--profile", "router-soc", "--config", "/etc/parvault/router.toml"]
+# The bundled router.toml binds the status page to 127.0.0.1:4080 (B-54), which inside a container is
+# the container's own loopback, so EXPOSE 4080 would reach nothing. The container has its own netns,
+# so 0.0.0.0 here is the container's interface, not the router's WAN: the host decides what reaches it
+# by publishing (or not) port 4080. A bare-metal install keeps the toml's loopback bind.
+CMD ["up", "--profile", "router-soc", "--config", "/etc/parvault/router.toml", "--status-http", "0.0.0.0:4080"]

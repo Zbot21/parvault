@@ -532,13 +532,17 @@ echo "Total parvault:router-soc (FROM scratch) image size : ${ROUTER_SOC_IMAGE_S
 
 # Start a live `parvault:router-soc` appliance container constrained to --memory=48m --memory-swap=48m
 # Item 3: the status page needs a read-only token; give the appliance a known gateway root key.
+# router.toml binds the status page to 127.0.0.1:4080 (B-54), the container's own loopback; as in the
+# image's CMD, pass --status-http 0.0.0.0:4080 (the container's interface, not a router WAN) so the
+# client container can reach it at 172.28.0.60:4080.
 SOC_STATUS_KEY="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
 docker run -d --name parvault-router-soc \
     -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     --network parvault-acceptance-net --ip 172.28.0.60 \
     --memory=48m --memory-swap=48m \
     parvault:router-soc \
-    up --profile router-soc --config /etc/parvault/router.toml --macaroon-root-key-hex "$SOC_STATUS_KEY"
+    up --profile router-soc --config /etc/parvault/router.toml --macaroon-root-key-hex "$SOC_STATUS_KEY" \
+    --status-http 0.0.0.0:4080
 sleep 2
 mint_status_token() {
     docker run --rm parvault:acceptance /usr/local/bin/parvault --data-dir /tmp/mint \

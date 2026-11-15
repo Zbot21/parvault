@@ -16,8 +16,11 @@
       "--profile",
       "router-soc",
       "--config",
-      "/etc/parvault/router.toml"
+      "/etc/parvault/router.toml",
+      "--status-http",
+      "0.0.0.0:4080"
     ],
+    "args_comment": "router.toml binds the status page to 127.0.0.1:4080 (B-54), the LXC's own loopback. The LXC runs in its own bridged netns, so 0.0.0.0 is the container's interface, not the router's WAN; the router's port forwarding decides what reaches 4080. A bare-metal install keeps the loopback bind.",
     "restart_policy": "always",
     "restart_backoff_sec": 5
   },
