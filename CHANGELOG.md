@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Changed
+- **The shipped router config binds the status page to loopback (B-54).** `deploy/router-soc/parvault-router.toml` sets `status_http_bind = "127.0.0.1:4080"`; `0.0.0.0` includes the WAN. Pass `--status-http <LAN-IP>:4080` for the LAN and `--listen /ip4/<LAN-IP>/tcp/4001` for P2P. Router examples in the docs use the LAN address. Desktop and homelab defaults are unchanged.
 - **`vfs`: `VfsStubNode` is now `VfsLazyNode`, `register_stub_file` is now `register_lazy_file` (public API rename).** Names only; the serialized fields, the FUSE ABI and the WebDAV wire are unchanged.
 - **CI runs on every PR and pins its tools (B-67).** `pull_request` no longer filters on `main`, so stacked PRs get CI. Kani is pinned to `0.68.0`. `tla2tools.jar` (v1.8.0) is fetched into `$RUNNER_TEMP`, checked against a pinned sha256 and exported as `TLA2TOOLS_JAR`.
 

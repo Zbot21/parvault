@@ -228,7 +228,7 @@ pub enum Commands {
         #[arg(long, default_value_t = 5)]
         interval_secs: u64,
 
-        /// Bind address for the embedded zero-dependency Router Cloud-NAS HTTP dashboard & JSON API (e.g. `0.0.0.0:4080` or `127.0.0.1:0`).
+        /// Bind address for the embedded zero-dependency Router Cloud-NAS HTTP dashboard & JSON API (e.g. `127.0.0.1:4080` or `<LAN-IP>:4080`; never `0.0.0.0` on a router, B-54).
         #[arg(long, value_name = "ADDR")]
         status_http: Option<String>,
 
@@ -590,7 +590,7 @@ pub enum DaemonAction {
         #[arg(long, default_value_t = false)]
         enable_quic: bool,
 
-        /// Optional bind address for the embedded Router Cloud-NAS HTTP dashboard & JSON API (e.g. `0.0.0.0:4080`).
+        /// Optional bind address for the embedded Router Cloud-NAS HTTP dashboard & JSON API (e.g. `127.0.0.1:4080` or `<LAN-IP>:4080`).
         #[arg(long, value_name = "ADDR")]
         status_http: Option<String>,
 
@@ -742,7 +742,7 @@ pub struct NodeConfig {
     /// Optional human-readable node label advertised on LAN/WAN discovery & status dashboard.
     #[serde(default, alias = "label")]
     pub node_label: Option<String>,
-    /// Optional bind address for the embedded Router Cloud-NAS status HTTP server (e.g. `"0.0.0.0:4080"`).
+    /// Optional bind address for the embedded Router Cloud-NAS status HTTP server (e.g. `"127.0.0.1:4080"`).
     #[serde(default, alias = "status_http")]
     pub status_http_bind: Option<String>,
     /// Optional default folder watched in `parvault up` turnkey appliance mode.
@@ -1198,6 +1198,24 @@ mod tests {
         assert_eq!(
             parsed_router.status_http_bind.as_deref(),
             Some("0.0.0.0:4080")
+        );
+    }
+
+    /// B-54: the shipped router config keeps the status page off the WAN: it binds loopback.
+    #[test]
+    fn shipped_router_toml_status_bind_is_loopback() {
+        let shipped = include_str!("../deploy/router-soc/parvault-router.toml");
+        let cfg = NodeConfig::from_toml_str(shipped).expect("parse shipped router config");
+        assert_eq!(cfg.hardware_profile, HardwareProfile::RouterSoc);
+        let bind: std::net::SocketAddr = cfg
+            .status_http_bind
+            .as_deref()
+            .expect("router config sets status_http_bind")
+            .parse()
+            .expect("status_http_bind is an IP:port");
+        assert!(
+            bind.ip().is_loopback(),
+            "status bind {bind} is not loopback"
         );
     }
 
