@@ -150,12 +150,10 @@ claim      F-25-DHT  sym=src/network/wire_handler.rs::admission_decision accept=
 # Each 2b fix adds its claim line (a differential pair rewritten from its reproduction in
 # tests/trust_enforcement.rs) in the same commit. A claim cannot be declared before its check
 # function exists (an unknown sym is an error even under expect=claim-missing).
-# Findings with no line yet (no check function exists to name): F-07, F-12
-#   (2c); F-22, F-26 (2c); F-24 issuer policy (2c).
+# Findings with no line yet (no check function exists to name): F-12.
 
 claim      F-36      sym=src/por/verifier.rs::shard_delete_decision accept=trust_enforcement::f36_storer_deletes_its_shard reject=trust_enforcement::f36_other_key_cannot_delete_shard code=reject.delete_not_shard_owner bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::DeleteShard
 claim      F-54      sym=src/network/discovery.rs::wan_card_pairing_decision accept=trust_enforcement::b45_wan_card_of_code_identity_joined reject=trust_enforcement::b45_wan_card_of_other_identity_refused code=reject.wan_card_code_mismatch bin=parvault ref=docs/security/TRUST_FINDINGS.md   # B-45: raises the forging cost to about 2^44 offline hashes; PAKE pairing (v0.5.7) is the fix (B-92)
-# --- Deferred to 2c: declared claims whose pairs do not exist yet (expect=claim-missing) ------------
 claim      F-22      sym=src/network/wan_rendezvous.rs::rendezvous_register_decision accept=trust_enforcement::f22_rendezvous_within_quota_stored reject=trust_enforcement::f22_rendezvous_over_quota_refused code=reject.rendezvous_quota bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-23-online-wan-rendezvous-and-stun-over-noise.md covers=MeshWireRequest::RegisterWanRendezvous
 claim      F-23      sym=src/network/wire_handler.rs::renew_decision accept=trust_enforcement::f23_capability_holder_renews reject=trust_enforcement::f23_stranger_renew_refused code=reject.renew_capability_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::RenewBlindedLease,MeshWireRequest::RenewBlindedLeaseSigned
 claim      F-33      sym=src/network/wire_handler.rs::admission_decision accept=trust_enforcement::f33_admitted_originator_relayed reject=trust_enforcement::f33_unadmitted_originator_refused code=reject.peer_not_admitted bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::RelayPqOnionEnvelope
