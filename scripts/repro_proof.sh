@@ -3,7 +3,7 @@
 # different target dirs and CARGO_HOMEs, and compares every output byte for byte. On a mismatch it
 # runs diffoscope (if installed) and fails.
 # Usage: scripts/repro_proof.sh --target <triple> --work <dir> [--image <docker-image>] [--bundle]
-#                               [--keep] [bin...]
+#                               [--image-archive] [--keep] [bin...]
 # With --image, both builds run in that image (deploy/Dockerfile.build), as release.yml does.
 # The matching outputs stay in <work>/a/out.
 set -euo pipefail
@@ -14,6 +14,7 @@ while [[ $# -gt 0 ]]; do
     --work) WORK=$2; shift 2 ;;
     --image) IMAGE=$2; shift 2 ;;
     --bundle) EXTRA+=(--bundle); shift ;;
+    --image-archive) EXTRA+=(--image); shift ;;
     --keep) KEEP=1; shift ;;
     -*) echo "repro_proof.sh: unknown flag $1" >&2; exit 2 ;;
     *) BINS+=("$1"); shift ;;

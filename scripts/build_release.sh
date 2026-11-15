@@ -5,17 +5,19 @@
 # (deploy/Dockerfile.build); scripts/repro_proof.sh runs it twice in two directories and compares.
 #
 # Usage: scripts/build_release.sh --target <x86_64|aarch64>-unknown-linux-musl --out <dir>
-#                                 [--kind dev] [--bundle] [bin...]
-# Outputs <out>/<bin>-<target>-<kind> and, with --bundle, <out>/parvault-router-soc-bundle-<kind>.tar.gz.
+#                                 [--kind dev] [--bundle] [--image] [bin...]
+# Outputs <out>/<bin>-<target>-<kind>; with --bundle, <out>/parvault-router-soc-bundle-<kind>.tar.gz;
+# with --image (all five binaries), the container archive <out>/parvault-image-<amd64|arm64>-<kind>.tar (B-131).
 # Every v0.5.x artifact is a dev build (L-113); there is no release kind yet.
 set -euo pipefail
-TARGET=""; OUT=""; KIND=dev; BUNDLE=0; BINS=()
+TARGET=""; OUT=""; KIND=dev; BUNDLE=0; IMAGE=0; BINS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target) TARGET=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
     --kind) KIND=$2; shift 2 ;;
     --bundle) BUNDLE=1; shift ;;
+    --image) IMAGE=1; shift ;;
     -*) echo "build_release.sh: unknown flag $1" >&2; exit 2 ;;
     *) BINS+=("$1"); shift ;;
   esac
@@ -71,6 +73,11 @@ for b in "${BINS[@]}"; do
   install -m 0755 "$STAGE/$b-$TARGET" "$OUT/$b-$TARGET-$KIND"; built+=("$OUT/$b-$TARGET-$KIND")
 done
 bash "$ROOT/scripts/check_scalar_erasure_coding.sh" "${built[@]}"   # L-102
+if [[ $IMAGE -eq 1 ]]; then
+  case "$TARGET" in x86_64-*) arch=amd64 ;; aarch64-*) arch=arm64 ;; esac
+  bash "$ROOT/scripts/make_dev_image.sh" --arch "$arch" --bins "$OUT" --target "$TARGET" \
+    --out "$OUT/parvault-image-$arch-$KIND.tar"
+fi
 if [[ $BUNDLE -eq 1 ]]; then bash "$ROOT/scripts/make_bundle.sh" "$OUT/parvault-router-soc-bundle-$KIND.tar.gz"; fi
 echo "build_release.sh: $TARGET ($KIND, SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH):"
 (cd "$OUT" && sha256sum -- *-"$KIND"*)
