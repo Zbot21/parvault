@@ -75,6 +75,7 @@ pub(crate) async fn status(env: CliEnv, command: Commands) -> anyhow::Result<()>
         "Bandwidth Rate Limits : upload={} Mbps, download={} Mbps (0 = unlimited)",
         cfg.max_upload_mbps, cfg.max_download_mbps
     );
+    print_audit_status(&cfg);
     println!("\nStanding tiers (planned; standing is self-reported and does not change erasure coding yet):");
     println!(
         "  SoloPersonalVault -> PersonalDeviceRing -> BuddyMicroCluster -> ProbationaryConsumerPool -> EarnedVerifiedMixedPool -> EarnedHomelabAnchorPool"
@@ -230,4 +231,40 @@ pub(crate) async fn verify_device_cert(env: CliEnv, command: Commands) -> anyhow
     println!("Owner PQ Fingerprint    : {}", owner_pk.fingerprint_hex());
     println!("Verification Status     : VALID (Ed25519 + FIPS 204 ML-DSA-65 verified)");
     Ok(())
+}
+
+/// B-59: the `audits` section of `parvault status`, from the owner daemon's audit state file.
+/// The counts are this node's own view (L-29); nothing here is shared.
+fn print_audit_status(cfg: &NodeConfig) {
+    use parvault::por::auditor::{AuditorConfig, AuditorState, AUDIT_STATE_FILE};
+    println!("\nAudits (chunk-Merkle PoR, this node's own view):");
+    if !cfg.por_audit_enabled {
+        println!("  audits: off (--no-audit / por_audit_enabled = false)");
+        return;
+    }
+    if !cfg.data_dir.join("master_key.sealed").exists() {
+        println!("  audits: off (no master key)");
+        return;
+    }
+    let a = AuditorConfig::from_node_config(cfg);
+    println!(
+        "  interval per host   : {} s, pass bound {} ms, at most {} per hour",
+        a.interval_ms / 1000,
+        a.rtt_bound_ms,
+        a.max_per_hour
+    );
+    if !cfg.data_dir.join(AUDIT_STATE_FILE).exists() {
+        println!("  no audit has run yet");
+        return;
+    }
+    let st = AuditorState::load(&cfg.data_dir);
+    println!("  last run (unix ms)  : {}", st.last_run_unix_ms);
+    println!(
+        "  passed {}, failed {}, unanswered {} (of which late {}), unauditable {}, self-named {}",
+        st.passed, st.failed, st.unanswered, st.timed_out, st.unauditable, st.self_refused
+    );
+    println!("  degraded shards     : {}", st.degraded.len());
+    println!(
+        "  a given shard is challenged about once per S x interval (S = shards that host holds for you)"
+    );
 }

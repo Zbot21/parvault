@@ -7614,6 +7614,12 @@ fn f07_peer_audit_pass_credited() {
             "host ledger changed for {id}"
         );
     }
+    // The owner's `parvault status` shows its own audit counts.
+    let status = parvault_cli(&owner.dir, true, &["status"]);
+    let text = out_text(&status);
+    assert!(status.status.success(), "{text}");
+    assert!(text.contains("Audits (chunk-Merkle PoR"), "{text}");
+    assert!(!text.contains("passed 0,"), "{text}");
     gate_ran("trust_enforcement::f07_peer_audit_pass_credited");
 }
 
