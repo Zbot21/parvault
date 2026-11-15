@@ -5,6 +5,9 @@
 > [!WARNING]
 > **Pre-release.** `v0.5.1` is a GitHub pre-release, not marked Latest. Install the binaries first with the pinned-version installer (Linux `x86_64` or `aarch64`; it checks `SHA256SUMS` and installs to `/usr/local/bin`, or `PARVAULT_INSTALL_DIR`): `curl --proto '=https' --tlsv1.2 -fsSL https://github.com/Zbot21/parvault/releases/download/v0.5.1/install.sh | sh`. Or build from source (`cargo build --release`, then put `target/release/parvault` and `target/release/parvault-seed` on your `PATH`). Multi-machine setups have been tested only in Docker and on one host, not on real router hardware. The limits are listed in the [README](README.md#known-limits-v052).
 
+> [!NOTE]
+> **Docker images run as non-root.** `deploy/Dockerfile.musl` and `deploy/Dockerfile.router-soc` run `parvault` as user `parvault` (uid/gid `65532`) with no added capability. A host directory you bind-mount for data (`/var/lib/parvault`) or the NAS (`/mnt/nas`) must be owned by uid `65532` (`sudo chown -R 65532:65532 <dir>`); a named Docker volume gets that owner automatically. Put the gateway socket in `/run/parvault`.
+
 ---
 
 ## 1. What Is This? (The 60-Second Plain-English Version)
