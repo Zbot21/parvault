@@ -159,7 +159,7 @@ docker build -t "$IMG_ACCEPT" "$BUILD_CTX"
 # assumed (waiver_errors): the image, the user, the exact added capability, not privileged, no
 # host namespace, and the exact devices and network.
 #   FUSE_WAIVED: the stage 12c FUSE harness (vfs_mp4_seek_gate plus parvault-fuse, not a shipped
-#     image) runs as uid 0, adds only SYS_ADMIN, and gets only /dev/fuse.
+#     image) runs as uid 0, adds only SYS_ADMIN, has no-new-privileges, and gets only /dev/fuse.
 #   NETEM_TC_WAIVED: the stage 12c one-shot tc sidecar runs as uid 0 with CapDrop ALL plus only
 #     NET_ADMIN, in the netem test container's network namespace, and nothing else.
 FUSE_WAIVED="parvault-vfs-fuse-${RUN_ID}"
@@ -203,7 +203,7 @@ waiver_errors() {
     local tid
     case "$1" in
         "$FUSE_WAIVED")
-            policy_errors "$1" "$IMG_VFS" "0:0" '["SYS_ADMIN"]' - - "/dev/fuse:/dev/fuse;" - ;;
+            policy_errors "$1" "$IMG_VFS" "0:0" '["SYS_ADMIN"]' - yes "/dev/fuse:/dev/fuse;" - ;;
         "$NETEM_TC_WAIVED")
             # Docker keeps container:<name> or resolves it to container:<id>; accept either.
             tid="$(docker inspect -f '{{.Id}}' "$NETEM_TC_TARGET" 2>/dev/null || echo none)"
@@ -986,7 +986,7 @@ if [ -c /dev/fuse ] && docker run --rm --label "$RUN_LABEL" --device /dev/fuse \
         --security-opt apparmor:unconfined --entrypoint test "$IMG_VFS" -c /dev/fuse; then
     docker rm -f "$FUSE_WAIVED" >/dev/null 2>&1 || true
     docker create --label "$RUN_LABEL" --name "$FUSE_WAIVED" --user 0:0 --device /dev/fuse --cap-add SYS_ADMIN \
-        --security-opt apparmor:unconfined -e GATES_REQUIRE_REAL=1 "$IMG_VFS" \
+        --security-opt no-new-privileges --security-opt apparmor:unconfined -e GATES_REQUIRE_REAL=1 "$IMG_VFS" \
         fuse_mount_mp4_probe_and_random_seek parvault_fuse_plugin_mount_rss_under_16_mib >/dev/null
     assert_nonroot "$FUSE_WAIVED"
     docker start "$FUSE_WAIVED" >/dev/null
@@ -1022,6 +1022,8 @@ docker run -d --name "$VFS_NETEM" --label "$RUN_LABEL" "${CONFINE[@]}" -e GATES_
     'i=0; while [ ! -e /tmp/netem.ready ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done
      [ -e /tmp/netem.ready ] || { echo "netem was never applied"; exit 97; }
      exec /usr/local/bin/vfs_mp4_seek_gate --test-threads=1 --nocapture webdav_206_mp4_probe_and_random_seek' >/dev/null
+# The full policy (not privileged, no capability, no-new-privileges, ids) before the sidecar joins it.
+assert_nonroot "$VFS_NETEM"
 docker create --label "$RUN_LABEL" --name "$NETEM_TC_WAIVED" --network "container:$VFS_NETEM" --user 0:0 \
     "${CONFINE[@]}" --cap-add NET_ADMIN --entrypoint tc \
     "$IMG_VFS" qdisc add dev lo root netem delay 15ms loss 2% >/dev/null
@@ -1031,11 +1033,7 @@ docker start -a "$NETEM_TC_WAIVED" \
 docker rm -f "$NETEM_TC_WAIVED" >/dev/null
 VFS_NETEM_QDISC="$(docker exec "$VFS_NETEM" tc qdisc show dev lo)"
 grep -q "netem" <<<"$VFS_NETEM_QDISC" || { echo "ERROR: stage 12c: no netem qdisc on lo: $VFS_NETEM_QDISC"; exit 1; }
-VFS_NETEM_CAPS="$(docker inspect -f '{{json .HostConfig.CapAdd}}' "$VFS_NETEM")"
-[ "$VFS_NETEM_CAPS" = "null" ] || [ "$VFS_NETEM_CAPS" = "[]" ] \
-    || { echo "ERROR: B-106: the netem test container has added capabilities: $VFS_NETEM_CAPS"; exit 1; }
 docker exec "$VFS_NETEM" touch /tmp/netem.ready
-assert_nonroot "$VFS_NETEM"
 VFS_NETEM_RC="$(timeout --kill-after=30 600 docker wait "$VFS_NETEM")" || VFS_NETEM_RC="timeout"
 docker logs "$VFS_NETEM" 2>&1 || true
 docker rm -f "$VFS_NETEM" >/dev/null 2>&1 || true
