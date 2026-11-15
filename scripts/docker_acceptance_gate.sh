@@ -269,6 +269,23 @@ assert_nonroot() {
 }
 # The run flags of every container assert_nonroot checks (and of the SoC one-shots).
 CONFINE=(--cap-drop ALL --security-opt no-new-privileges)
+# assert_oneshot_confined <created container> <image>: for a foreground one-shot that
+# assert_nonroot cannot see running. Checked after `docker create`, before `docker start`: the
+# image's user is parvault:parvault, and the container keeps it and gains no privilege.
+assert_oneshot_confined() {
+    local c="$1" img="$2" iuser errs
+    iuser="$(docker inspect -f '{{.Config.User}}' "$img" 2>&1)" \
+        || { echo "ERROR: B-106: cannot inspect image $img: $iuser"; exit 1; }
+    [ "$iuser" = "parvault:parvault" ] \
+        || { echo "ERROR: B-106: image $img runs as '$iuser', not parvault:parvault"; exit 1; }
+    errs="$(policy_errors "$c" "$img" "parvault:parvault" none '["ALL"]' yes "" -)"
+    if [ -n "$errs" ]; then
+        echo "ERROR: B-106: one-shot $c is not confined:"
+        echo "$errs"
+        exit 1
+    fi
+    echo "B-106: one-shot confined (image user parvault:parvault, no capability): $c"
+}
 # --- B-106 container policy (end) ---
 
 echo "=== [2/12] Creating isolated Docker bridge network (per-run 172.28.X.0/24) ==="
@@ -804,7 +821,7 @@ SOC_EXPECTED_SHA256="$(docker run --rm --label "$RUN_LABEL" -v "$SOC_VOL_NAME:/m
 ')"
 
 SOC_KEY="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
-SOC_STORE_OUT="$(docker run --name parvault-soc-store-${RUN_ID} \
+docker create --name parvault-soc-store-${RUN_ID} "${CONFINE[@]}" \
     -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     --network "$NET_NAME" \
     --memory=48m --memory-swap=48m \
@@ -812,7 +829,9 @@ SOC_STORE_OUT="$(docker run --name parvault-soc-store-${RUN_ID} \
     "$IMG_SOC" \
     --profile router-soc \
     --data-dir /mnt/nas/store-data \
-    file store --path /mnt/nas/router_soc_5mib.bin --key-hex "$SOC_KEY")"
+    file store --path /mnt/nas/router_soc_5mib.bin --key-hex "$SOC_KEY" >/dev/null
+assert_oneshot_confined "parvault-soc-store-${RUN_ID}" "$IMG_SOC"
+SOC_STORE_OUT="$(docker start -a parvault-soc-store-${RUN_ID})"
 echo "$SOC_STORE_OUT"
 
 SOC_STORE_OOM="$(docker inspect -f '{{.State.OOMKilled}}' parvault-soc-store-${RUN_ID})"
@@ -829,7 +848,7 @@ SOC_ROOT="$(echo "$SOC_STORE_OUT" | awk '/File Merkle Root/ {print $5}')"
 # Wipe local store-data so restore pulls all 5 stripes over libp2p inside another 48 MiB cgroup container!
 docker run --rm --label "$RUN_LABEL" -v "$SOC_VOL_NAME:/mnt/nas" "$IMG_ACCEPT" rm -rf /mnt/nas/store-data
 
-SOC_RESTORE_OUT="$(docker run --name parvault-soc-restore-${RUN_ID} \
+docker create --name parvault-soc-restore-${RUN_ID} "${CONFINE[@]}" \
     -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     --network "$NET_NAME" \
     --memory=48m --memory-swap=48m \
@@ -837,7 +856,9 @@ SOC_RESTORE_OUT="$(docker run --name parvault-soc-restore-${RUN_ID} \
     "$IMG_SOC" \
     --profile router-soc \
     --data-dir /mnt/nas/restore-data \
-    file restore "$SOC_ROOT" --output /mnt/nas/restored_5mib.bin --key-hex "$SOC_KEY")"
+    file restore "$SOC_ROOT" --output /mnt/nas/restored_5mib.bin --key-hex "$SOC_KEY" >/dev/null
+assert_oneshot_confined "parvault-soc-restore-${RUN_ID}" "$IMG_SOC"
+SOC_RESTORE_OUT="$(docker start -a parvault-soc-restore-${RUN_ID})"
 echo "$SOC_RESTORE_OUT"
 
 SOC_RESTORE_OOM="$(docker inspect -f '{{.State.OOMKilled}}' parvault-soc-restore-${RUN_ID})"
