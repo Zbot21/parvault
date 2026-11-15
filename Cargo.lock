@@ -2299,6 +2299,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "if-addrs",
  "libc",
  "libp2p",
  "rand 0.8.8",

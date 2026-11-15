@@ -51,12 +51,16 @@ status-ui = ["ipc-client"]
 # Debug-only (v0.5.4, docs/METRICS.md): the unauthenticated `--lab-insecure-metrics` listener.
 # Not in `default`; a release build with it is a compile error, and shipped artifacts are
 # checked for it (scripts/check_no_insecure_metrics.sh).
-lab-insecure-metrics = ["daemon-runtime"]
+lab-insecure-metrics = ["daemon-runtime", "dep:if-addrs"]
 
 [package.metadata.kani]
 flags = { lib = true }
 
 [dependencies]
+# Interface address lookup for the debug-only `--lab-insecure-metrics` listener (os_sys::interface_has_ip),
+# replacing a hand-written getifaddrs walk (CodeQL #59). Pinned to the version already in Cargo.lock
+# (libp2p's if-watch); `link-local` keeps fe80:: addresses, which the listener accepts with a scope id.
+if-addrs = { version = "=0.15.0", optional = true, features = ["link-local"] }
 tokio = { version = "1.40", optional = true, features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal"] }
 # The transport error shape libp2p-core 0.42 builds (Either); named to classify dial errors (v0.5.4).
 either = { version = "1.13", optional = true }

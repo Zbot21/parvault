@@ -587,59 +587,16 @@ pub fn dup_fd_cloexec(raw_fd: RawFd) -> io::Result<OwnedFd> {
     }
 }
 
-/// Whether `ip` is assigned to interface `iface` right now (`getifaddrs`). Only the debug-only
-/// `--lab-insecure-metrics` listener uses it (`v0.5.4`, `docs/METRICS.md`), so it is compiled only
-/// with that feature: a shipped build gains no unsafe block.
+/// Whether `ip` is assigned to interface `iface` right now (`getifaddrs`, through `if-addrs`). Only
+/// the debug-only `--lab-insecure-metrics` listener uses it (`v0.5.4`, `docs/METRICS.md`), so it is
+/// compiled only with that feature. No unsafe code here: `if-addrs` owns the list walk (CodeQL #59).
+/// IPv4 and IPv6 addresses match, link-local (`fe80::`) included; the scope id is not compared.
+/// The interface name must match exactly (a non-UTF-8 kernel name is compared in its lossy form).
 #[cfg(feature = "lab-insecure-metrics")]
-#[allow(unsafe_code)]
 pub fn interface_has_ip(iface: &str, ip: std::net::IpAddr) -> io::Result<bool> {
-    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: `getifaddrs` writes a heap-allocated linked list into `head` on success (return 0)
-    // and leaves it untouched on failure; `head` is a valid, stack-allocated out-pointer.
-    if unsafe { libc::getifaddrs(&mut head) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut found = false;
-    let mut cur = head;
-    while !cur.is_null() {
-        // SAFETY: `cur` is a non-null node of the list `getifaddrs` returned, which stays valid
-        // until `freeifaddrs(head)` below; we only read its fields. `ifa_name` is a NUL-terminated
-        // C string owned by the list. `ifa_addr` may be null; when it is not, `sa_family` says
-        // which `sockaddr_*` it points to, and we read it as exactly that type.
-        let (name_ok, addr_ip, next) = unsafe {
-            let node = &*cur;
-            let name_ok = !node.ifa_name.is_null()
-                && std::ffi::CStr::from_ptr(node.ifa_name).to_bytes() == iface.as_bytes();
-            let mut addr_ip = None;
-            if !node.ifa_addr.is_null() {
-                match i32::from((*node.ifa_addr).sa_family) {
-                    libc::AF_INET => {
-                        let sin = &*(node.ifa_addr as *const libc::sockaddr_in);
-                        addr_ip = Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
-                            u32::from_be(sin.sin_addr.s_addr),
-                        )));
-                    }
-                    libc::AF_INET6 => {
-                        let sin6 = &*(node.ifa_addr as *const libc::sockaddr_in6);
-                        addr_ip = Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
-                            sin6.sin6_addr.s6_addr,
-                        )));
-                    }
-                    _ => {}
-                }
-            }
-            (name_ok, addr_ip, node.ifa_next)
-        };
-        if name_ok && addr_ip == Some(ip) {
-            found = true;
-            break;
-        }
-        cur = next;
-    }
-    // SAFETY: `head` came from a successful `getifaddrs` and is freed exactly once; no reference
-    // into the list outlives this call.
-    unsafe { libc::freeifaddrs(head) };
-    Ok(found)
+    Ok(if_addrs::get_if_addrs()?
+        .iter()
+        .any(|i| i.name == iface && i.ip() == ip))
 }
 
 #[cfg(test)]
