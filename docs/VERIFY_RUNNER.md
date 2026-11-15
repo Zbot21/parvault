@@ -1,7 +1,8 @@
 # Parallel Verification Runner (`scripts/verify.sh`)
 
-`scripts/verify.sh` runs every TLA+ cfg and every Kani harness in parallel, with TLC state on
-`/dev/shm` so a run writes little to the SSD. It reproduces CI's `tla-model-check` and
+`scripts/verify.sh` runs every TLA+ cfg (one at a time, each TLC run on many workers) and
+every Kani harness (CBMC on `KANI_JOBS` threads), with TLC state on `/dev/shm` so a run
+writes little to the SSD. It reproduces CI's `tla-model-check` and
 `kani-bounded-model-check` jobs. It does not run the TLC guard-removal mutants: those are
 patches in `.enforcement.map` (`tla-mutant` lines), and the enforcement runner applies them
 and passes a mutant only when TLC reports the named invariant violated.
@@ -13,7 +14,7 @@ make verify-kani                     # every Kani harness, KANI_JOBS CBMC thread
 make verify-kani HARNESS=proof_webdav_auth_decision,proof_fuse_header_parser_no_panic
 make verify-all                      # both; all failures are listed at the end
 make verify-test TEST_ARGS='--lib' VERIFY_MOLD=1
-make test-verify-runner              # the runner's own test (fake java/cargo, about 40 s)
+make test-verify-runner              # the runner's own test (fake java/cargo, about 20 s)
 ```
 
 On the dev box, run them only under `pvjob`, as the last command of the job:
@@ -39,7 +40,8 @@ pvjob run --bg --cap cargo --who <me> --wt <wt> --timeout 20m -- make verify-kan
 
 | Variable | Default | Effect |
 | :--- | :--- | :--- |
-| `TLC_HEAP_PCT` | `70`; `30` under pvjob (Makefile) | `-Xms` = `-Xmx` = this % of physical RAM |
+| `TLC_HEAP_PCT` | `70`; `30` under pvjob (Makefile) | `-Xms` = `-Xmx` = this % of MemTotal, 1 to 75 |
+| `TLC_MEM_MARGIN_MB` | `2048` | TLC is refused unless heap + `TLC_SHM_MIN_MB` + this fits in MemAvailable at start |
 | `TLC_WORKERS` | `auto` | TLC `-workers` |
 | `TLC_SHM_MIN_MB` | `2048` | a cfg fails without starting if `/dev/shm` has less free |
 | `TLA2TOOLS_JAR` | `/opt/tla/tla2tools.jar`, then `~/.cache/tla/tla2tools.jar` | TLC jar |
@@ -49,11 +51,19 @@ pvjob run --bg --cap cargo --who <me> --wt <wt> --timeout 20m -- make verify-kan
 | `SPEC`, `HARNESS` | all | filters; `HARNESS` takes a comma-separated list |
 | `FAIL_FAST` | `0` | `1`: stop at the first failure (`--fail-fast` in jobs mode) |
 | `VERIFY_MOLD` | `0` | `1`: the `test` step links with mold in `$CARGO_TARGET_DIR-mold` |
-| `VERIFY_LOG_DIR` | `$CARGO_TARGET_DIR/verify-logs/<stamp>` | per-cfg and per-harness logs, `kani/times.tsv` |
+| `VERIFY_LOG_DIR` | `$CARGO_TARGET_DIR/verify-logs` | each run logs to `<dir>/<stamp>/`: per-cfg and per-harness logs, `kani/times.tsv` |
 
 Each TLC run gets `-XX:+UseParallelGC`, `-workers`, `-cleanup`, `-noGenerateSpecTE`, and a
-`-metadir` and `java.io.tmpdir` in `/dev/shm/tlc-<cfg>-<pid>`. A trap removes these dirs on
-EXIT, INT and TERM and kills TLC's process group, so `/dev/shm` does not leak. pvjob starts
+`-metadir` and `java.io.tmpdir` in `/dev/shm/tlc-<cfg>-<pid>`. `/dev/shm` is tmpfs, in the
+same RAM as the heap, so the heap must fit in MemAvailable beside it (see `TLC_MEM_MARGIN_MB`).
+
+Each TLC or Kani child leads its own process group, which a group kill of the runner does not
+reach. On exit, and on INT, TERM and HUP, the runner removes its `/dev/shm/tlc-*` dirs, TERMs
+every child group, waits at most about 2 s, KILLs any group still alive, then exits; this fits
+inside pvjob's cancel (group TERM, then KILL 3 s later). So a normal exit, INT, TERM, HUP or a
+pvjob cancel leaves no child and no `/dev/shm/tlc-*` dir of the run. A SIGKILL of the runner
+itself (or a power loss) skips the trap: then a dir can remain, and a child, which keeps
+running. pvjob starts
 jobs with SIGINT ignored, which a bash script cannot trap; the runner then re-execs itself
 once with SIGINT reset, so `timeout -s INT` stops it at once there too.
 
