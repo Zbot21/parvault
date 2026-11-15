@@ -1,0 +1,4 @@
+# DEV/TEST signing key only (L-110). Never trust this principal for releases.
+# Private key: desktop ~/.ssh/parvault_dev_signing_ed25519 (no passphrase, by owner decision 2026-11-15).
+# Fingerprint SHA256:w3YrtCVqvG0hUxHHdnrlxuxg/X8LkeuUaZudDswGQ+A
+parvault-dev namespaces="parvault-dev-build" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICiFelo+GbGOK+cTOrayrTjMsc+FNPw7TkGyYJxj6RiS
