@@ -7969,3 +7969,70 @@ fn f06_seed_tampered_host_fails() {
     assert!(!seed.log_text().contains("quarantin"));
     gate_ran("trust_enforcement::f06_seed_tampered_host_fails");
 }
+
+/// D1 (qa-por): the in-flight cap is checked before `admit_chunk_challenge`, so a busy host's
+/// refusal spends neither the challenge's nonce nor a slot of the owner's 6-per-10-min stripe
+/// budget. Six distinct challenges of a 16 MiB shard go out at once to a host that proves at
+/// most 2 at a time; every one refused as busy is sent again unchanged (same nonce) and is
+/// answered, and the six answers fit the budget exactly.
+#[test]
+fn f06_busy_refusal_spends_no_nonce_or_budget() {
+    let owner = key(0xB3);
+    let node = spawn_daemon("f06-busy");
+    let (sid, bytes) = shard(0x3C, 16 * 1024 * 1024);
+    assert!(stored(&send_with(
+        client(&owner).with_timeout(Duration::from_secs(30)),
+        &node,
+        put_shard("", sid, bytes, None)
+    )));
+    let challenges: Vec<_> = (0..6)
+        .map(|_| parvault::por::generate_chunk_challenge(&[0x5E; 32], sid, 4096, 8, now_ms()))
+        .collect();
+    let addr = node.addr.clone();
+    let handles: Vec<_> = challenges
+        .iter()
+        .cloned()
+        .map(|ch| {
+            let (owner, addr) = (owner.clone(), addr.clone());
+            std::thread::spawn(move || {
+                client(&owner)
+                    .with_timeout(Duration::from_secs(20))
+                    .send_request(&addr, MeshWireRequest::ChunkAudit(ch))
+                    .map_err(|e| e.to_string())
+            })
+        })
+        .collect();
+    let mut refused = Vec::new();
+    for (ch, h) in challenges.iter().zip(handles) {
+        match h.join().unwrap() {
+            Ok(MeshWireResponse::ChunkAuditResult(Some(_))) => {}
+            Ok(MeshWireResponse::ChunkAuditResult(None)) => refused.push(ch.clone()),
+            other => panic!("{other:?}\n{}", node.log_text()),
+        }
+    }
+    assert!(
+        !refused.is_empty() && node.log_text().contains("reject.por_prover_busy"),
+        "no busy refusal in the burst; the test proves nothing:\n{}",
+        node.log_text()
+    );
+    assert!(!node.log_text().contains("reject.por_rate_limited"));
+    for ch in refused {
+        let resp = send_with(
+            client(&owner).with_timeout(Duration::from_secs(20)),
+            &node,
+            MeshWireRequest::ChunkAudit(ch),
+        );
+        assert!(
+            matches!(resp, MeshWireResponse::ChunkAuditResult(Some(_))),
+            "a challenge refused as busy was not answered later: {resp:?}\n{}",
+            node.log_text()
+        );
+    }
+    // The six answers used the whole budget: a seventh is refused.
+    let resp = send(&owner, &node, chunk_audit(sid));
+    assert!(
+        matches!(resp, MeshWireResponse::ChunkAuditResult(None)),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.por_rate_limited");
+}

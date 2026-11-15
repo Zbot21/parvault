@@ -597,20 +597,38 @@ async fn main() -> anyhow::Result<()> {
             };
 
             // F-06 seed half (B-59 change 9): the seed audits the lite stripes it fanned out.
-            let lite_index = std::sync::Arc::new(std::sync::Mutex::new(if in_memory_mode {
-                LiteAuditIndex::in_memory()
+            // A lite audit index file that exists but does not load is refused, never treated
+            // as empty: lite audits stay off and the file is left for the operator (B-52 rule).
+            let loaded = if in_memory_mode {
+                Ok(LiteAuditIndex::in_memory())
             } else {
                 LiteAuditIndex::load(&data_dir)
-            }));
-            let server = server.with_lite_audit_index(std::sync::Arc::clone(&lite_index));
-            let auditor = seed_audit_ctx(SeedAuditOpts {
-                no_audit,
-                interval_secs: audit_interval_secs,
-                rtt_ms: audit_rtt_ms,
-                block_store: &block_store,
-                node_identity: &node_identity,
-                index: lite_index,
-                data_dir: (!in_memory_mode).then(|| data_dir.clone()),
+            };
+            let lite_index = match loaded {
+                Ok(i) => Some(std::sync::Arc::new(std::sync::Mutex::new(i))),
+                Err(code) => {
+                    warn!(
+                        code,
+                        file = %data_dir.join(parvault::por::lite_index::LITE_AUDIT_INDEX_FILE).display(),
+                        "audits: off (lite audit index refused; move the file away to start a new index)"
+                    );
+                    None
+                }
+            };
+            let server = match &lite_index {
+                Some(i) => server.with_lite_audit_index(std::sync::Arc::clone(i)),
+                None => server,
+            };
+            let auditor = lite_index.and_then(|index| {
+                seed_audit_ctx(SeedAuditOpts {
+                    no_audit,
+                    interval_secs: audit_interval_secs,
+                    rtt_ms: audit_rtt_ms,
+                    block_store: &block_store,
+                    node_identity: &node_identity,
+                    index,
+                    data_dir: (!in_memory_mode).then(|| data_dir.clone()),
+                })
             });
 
             let report = server.status_report(1);

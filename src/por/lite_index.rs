@@ -12,8 +12,9 @@
 //!   [`LiteAuditIndex::dropped`] counts them.
 //! - Under `--no-fs` it lives in RAM only (ADR-30 creates no files). Otherwise it is written
 //!   atomically with a version header (ADR-19) to [`LITE_AUDIT_INDEX_FILE`] in the data dir.
-//!   A missing, unreadable or other-version file starts an empty index (logged): the cost is
-//!   audit coverage of older stripes, never a wrong verdict.
+//!   A missing file starts an empty index. A file that exists but cannot be read, decoded or
+//!   carries another version is refused, never treated as empty (B-52 rule): the seed then
+//!   runs without lite audits and leaves the file untouched for the operator.
 //!
 //! The seed's audit results stay on the seed (L-29).
 use crate::por::auditor::AuditTarget;
@@ -107,29 +108,29 @@ impl LiteAuditIndex {
         }
     }
 
-    /// Loads the index from `data_dir`, or starts empty (logged) when the file is missing,
-    /// unreadable or another version. Later inserts are written there.
-    pub fn load(data_dir: &Path) -> Self {
+    /// Loads the index from `data_dir` (empty when the file is missing). Later inserts are
+    /// written there. A file that exists but does not read, decode, or carry this version is
+    /// refused with its reject code and left as it is.
+    pub fn load(data_dir: &Path) -> Result<Self, &'static str> {
         let path = data_dir.join(LITE_AUDIT_INDEX_FILE);
         let mut idx = Self::in_memory();
         match std::fs::read(&path) {
-            Ok(raw) => match bincode::deserialize::<OnDisk>(&raw) {
-                Ok(d) if d.version == LITE_AUDIT_INDEX_VERSION => {
-                    idx.dropped = d.dropped;
-                    for r in d.records {
-                        idx.push(r);
-                    }
+            Ok(raw) => {
+                let d = bincode::deserialize::<OnDisk>(&raw)
+                    .map_err(|_| "reject.lite_audit_index_corrupt")?;
+                if d.version != LITE_AUDIT_INDEX_VERSION {
+                    return Err("reject.lite_audit_index_version");
                 }
-                _ => warn!(
-                    file = %path.display(),
-                    "lite audit index unreadable or another version; starting empty (older lite stripes are not audited)"
-                ),
-            },
+                idx.dropped = d.dropped;
+                for r in d.records {
+                    idx.push(r);
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => warn!(error = %e, "lite audit index unreadable; starting empty"),
+            Err(_) => return Err("reject.lite_audit_index_unreadable"),
         }
         idx.path = Some(path);
-        idx
+        Ok(idx)
     }
 
     /// Stripes indexed.
@@ -259,11 +260,11 @@ mod tests {
     #[test]
     fn round_trips_through_the_file_and_refuses_other_versions() {
         let dir = tempfile::tempdir().unwrap();
-        let mut idx = LiteAuditIndex::load(dir.path());
+        let mut idx = LiteAuditIndex::load(dir.path()).unwrap();
         idx.insert(rec("a", 1, 3));
         idx.insert(rec("a", 1, 2)); // re-syndication replaces
         idx.insert(rec("b", 2, 1));
-        let again = LiteAuditIndex::load(dir.path());
+        let again = LiteAuditIndex::load(dir.path()).unwrap();
         assert_eq!(again.len(), 2);
         assert_eq!(again.bytes(), idx.bytes());
         assert_eq!(again.sample_targets(10).len(), 3);
@@ -273,8 +274,22 @@ mod tests {
             records: vec![rec("a", 1, 1)],
         })
         .unwrap();
-        std::fs::write(dir.path().join(LITE_AUDIT_INDEX_FILE), bad).unwrap();
-        assert!(LiteAuditIndex::load(dir.path()).is_empty());
+        let file = dir.path().join(LITE_AUDIT_INDEX_FILE);
+        std::fs::write(&file, &bad).unwrap();
+        assert_eq!(
+            LiteAuditIndex::load(dir.path()).err(),
+            Some("reject.lite_audit_index_version")
+        );
+        std::fs::write(&file, b"\x01").unwrap();
+        assert_eq!(
+            LiteAuditIndex::load(dir.path()).err(),
+            Some("reject.lite_audit_index_corrupt")
+        );
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"\x01",
+            "the refused file is kept"
+        );
     }
 
     #[test]
