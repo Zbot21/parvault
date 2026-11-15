@@ -11,7 +11,11 @@
 //!   auditing. A dropped record is dropped from auditing only (this is not a security cache);
 //!   [`LiteAuditIndex::dropped`] counts them.
 //! - Under `--no-fs` it lives in RAM only (ADR-30 creates no files). Otherwise it is written
-//!   atomically with a version header (ADR-19) to [`LITE_AUDIT_INDEX_FILE`] in the data dir.
+//!   atomically with a version header (ADR-19) to [`LITE_AUDIT_INDEX_FILE`] in the data dir, not
+//!   on every insert: an insert marks the index dirty and [`flush`] writes it, encoding under
+//!   the lock and writing (with its fsync) after the lock is released. The seed flushes every
+//!   minute and on shutdown, so a crash loses at most a minute of index entries (audit coverage,
+//!   never a verdict). [`load`](LiteAuditIndex::load) reads at most [`LITE_AUDIT_INDEX_MAX_FILE`].
 //!   A missing file starts an empty index. A file that exists but cannot be read, decoded or
 //!   carries another version is refused, never treated as empty (B-52 rule): the seed then
 //!   runs without lite audits and leaves the file untouched for the operator.
@@ -30,6 +34,9 @@ pub const LITE_AUDIT_INDEX_FILE: &str = "lite_audit_index.bin";
 /// The byte bound (estimated record sizes, see [`LiteAuditRecord::cost`]).
 pub const LITE_AUDIT_INDEX_MAX_BYTES: usize = 8 * 1024 * 1024;
 const LITE_AUDIT_INDEX_VERSION: u32 = 1;
+/// The largest index file `load` reads (the encoding is below the charged cost; twice the byte
+/// bound leaves room for the header).
+pub const LITE_AUDIT_INDEX_MAX_FILE: u64 = 2 * LITE_AUDIT_INDEX_MAX_BYTES as u64;
 
 /// One shard of a lite stripe on one mesh host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +99,10 @@ pub struct LiteAuditIndex {
     /// Records dropped from auditing by the byte bound.
     pub dropped: u64,
     path: Option<PathBuf>,
+    /// Changed since the last write.
+    dirty: bool,
+    /// Files written (P2: bounded by flushes, not by inserts).
+    pub writes: u64,
 }
 
 impl LiteAuditIndex {
@@ -114,8 +125,9 @@ impl LiteAuditIndex {
     pub fn load(data_dir: &Path) -> Result<Self, &'static str> {
         let path = data_dir.join(LITE_AUDIT_INDEX_FILE);
         let mut idx = Self::in_memory();
-        match std::fs::read(&path) {
-            Ok(raw) => {
+        match read_bounded(&path, LITE_AUDIT_INDEX_MAX_FILE) {
+            Ok(None) => return Err("reject.lite_audit_index_oversized"),
+            Ok(Some(raw)) => {
                 let d = bincode::deserialize::<OnDisk>(&raw)
                     .map_err(|_| "reject.lite_audit_index_corrupt")?;
                 if d.version != LITE_AUDIT_INDEX_VERSION {
@@ -203,13 +215,16 @@ impl LiteAuditIndex {
             }
         }
         self.push(r);
-        self.save();
+        self.dirty = true;
     }
 
-    fn save(&self) {
-        let Some(path) = &self.path else {
-            return;
-        };
+    /// The encoded index and its path when it has a file and changed since the last write;
+    /// clears the dirty mark (a failed write sets it again, see [`flush`]).
+    fn take_snapshot(&mut self) -> Option<(PathBuf, Vec<u8>)> {
+        if !self.dirty {
+            return None;
+        }
+        let path = self.path.clone()?;
         let d = OnDisk {
             version: LITE_AUDIT_INDEX_VERSION,
             dropped: self.dropped,
@@ -217,11 +232,14 @@ impl LiteAuditIndex {
         };
         match bincode::serialize(&d) {
             Ok(bytes) => {
-                if let Err(e) = crate::storage::fsio::atomic_write_file(path, &bytes) {
-                    warn!(error = %e, "could not write the lite audit index");
-                }
+                self.dirty = false;
+                self.writes = self.writes.saturating_add(1);
+                Some((path, bytes))
             }
-            Err(e) => warn!(error = %e, "could not encode the lite audit index"),
+            Err(e) => {
+                warn!(error = %e, "could not encode the lite audit index");
+                None
+            }
         }
     }
 
@@ -235,6 +253,33 @@ impl LiteAuditIndex {
             .flat_map(LiteAuditRecord::targets)
             .collect()
     }
+}
+
+/// P2: writes the index if it changed, atomically. The lock is held only to encode; the write
+/// and its fsync run after it is released, so audits and fan-outs never wait on the disk.
+/// Blocking: call off the async runtime.
+pub fn flush(index: &std::sync::Mutex<LiteAuditIndex>) {
+    let snap = index
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take_snapshot();
+    let Some((path, bytes)) = snap else {
+        return;
+    };
+    if let Err(e) = crate::storage::fsio::atomic_write_file(&path, &bytes) {
+        warn!(error = %e, "could not write the lite audit index; retrying at the next flush");
+        index.lock().unwrap_or_else(|p| p.into_inner()).dirty = true;
+    }
+}
+
+/// The file's bytes, `None` when it is longer than `max`, without reading past `max + 1`.
+fn read_bounded(path: &Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::fs::File::open(path)?
+        .take(max.saturating_add(1))
+        .read_to_end(&mut buf)?;
+    Ok((buf.len() as u64 <= max).then_some(buf))
 }
 
 #[cfg(test)]
@@ -260,10 +305,12 @@ mod tests {
     #[test]
     fn round_trips_through_the_file_and_refuses_other_versions() {
         let dir = tempfile::tempdir().unwrap();
-        let mut idx = LiteAuditIndex::load(dir.path()).unwrap();
-        idx.insert(rec("a", 1, 3));
-        idx.insert(rec("a", 1, 2)); // re-syndication replaces
-        idx.insert(rec("b", 2, 1));
+        let idx = std::sync::Mutex::new(LiteAuditIndex::load(dir.path()).unwrap());
+        idx.lock().unwrap().insert(rec("a", 1, 3));
+        idx.lock().unwrap().insert(rec("a", 1, 2)); // re-syndication replaces
+        idx.lock().unwrap().insert(rec("b", 2, 1));
+        flush(&idx);
+        let idx = idx.into_inner().unwrap();
         let again = LiteAuditIndex::load(dir.path()).unwrap();
         assert_eq!(again.len(), 2);
         assert_eq!(again.bytes(), idx.bytes());
@@ -292,12 +339,43 @@ mod tests {
         );
     }
 
+    /// P2: a burst of inserts writes nothing until a flush, and a flush writes once; a flush
+    /// with nothing new writes nothing.
+    #[test]
+    fn a_burst_of_inserts_does_bounded_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = std::sync::Mutex::new(LiteAuditIndex::load(dir.path()).unwrap());
+        for r in 0..200u8 {
+            idx.lock().unwrap().insert(rec("a", r, 4));
+        }
+        let file = dir.path().join(LITE_AUDIT_INDEX_FILE);
+        assert!(!file.exists(), "an insert wrote the file");
+        flush(&idx);
+        flush(&idx);
+        assert_eq!(idx.lock().unwrap().writes, 1);
+        assert_eq!(LiteAuditIndex::load(dir.path()).unwrap().len(), 200);
+    }
+
+    #[test]
+    fn oversized_file_is_refused_unread() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(LITE_AUDIT_INDEX_FILE);
+        std::fs::write(&file, vec![0u8; LITE_AUDIT_INDEX_MAX_FILE as usize + 1]).unwrap();
+        assert_eq!(
+            LiteAuditIndex::load(dir.path()).err(),
+            Some("reject.lite_audit_index_oversized")
+        );
+        assert!(file.exists(), "the refused file is kept");
+    }
+
     #[test]
     fn in_memory_index_writes_no_file() {
         let dir = tempfile::tempdir().unwrap();
-        let mut idx = LiteAuditIndex::in_memory();
-        idx.insert(rec("a", 1, 3));
+        let idx = std::sync::Mutex::new(LiteAuditIndex::in_memory());
+        idx.lock().unwrap().insert(rec("a", 1, 3));
+        flush(&idx);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let idx = idx.into_inner().unwrap();
         assert_eq!(idx.len(), 1);
     }
 

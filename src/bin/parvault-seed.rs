@@ -619,6 +619,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(i) => server.with_lite_audit_index(std::sync::Arc::clone(i)),
                 None => server,
             };
+            let lite_index_flush = lite_index.clone();
             let auditor = lite_index.and_then(|index| {
                 seed_audit_ctx(SeedAuditOpts {
                     no_audit,
@@ -655,6 +656,7 @@ async fn main() -> anyhow::Result<()> {
                 explicit_admin_pks,
                 effective_peers,
                 auditor,
+                lite_index: lite_index_flush,
             })
             .await?;
         }
@@ -1734,6 +1736,7 @@ struct SeedListenerConfig {
     explicit_admin_pks: Vec<[u8; 32]>,
     effective_peers: Vec<String>,
     auditor: Option<AuditJobCtx>,
+    lite_index: Option<std::sync::Arc<std::sync::Mutex<LiteAuditIndex>>>,
 }
 
 struct SeedAuditOpts<'a> {
@@ -1798,6 +1801,7 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
         explicit_admin_pks,
         effective_peers,
         auditor,
+        lite_index,
     } = cfg;
     let start_instant = Instant::now();
     let in_memory_mode = block_store.is_in_memory();
@@ -2096,6 +2100,11 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
                 }
             }
             _ = gc_interval.tick() => {
+                // P2: the lite audit index is written once a minute if it changed, off the
+                // runtime (an 8 MiB atomic write with an fsync).
+                if let Some(index) = lite_index.clone() {
+                    tokio::task::spawn_blocking(move || parvault::por::lite_index::flush(&index));
+                }
                 let mut avail_opt = None;
                 {
                     let mut st = shared
@@ -2131,6 +2140,12 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .wot
                     .flush();
+                if let Some(index) = lite_index.clone() {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        parvault::por::lite_index::flush(&index)
+                    })
+                    .await;
+                }
                 break;
             }
         }

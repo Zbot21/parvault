@@ -105,15 +105,18 @@ pub struct PorRateFacts {
     pub owner_last_minute: usize,
     /// This owner's share of the host cap ([`owner_minute_share`]).
     pub owner_per_minute_cap: usize,
+    /// P1: this owner had no audit proved here in the last session window (10 min). Only a
+    /// quiet owner may take the host's last slot of the minute.
+    pub owner_quiet: bool,
     /// The key is new and the map already holds `MAX_CHUNK_RATE_KEYS` live keys.
     pub map_full_for_new_key: bool,
 }
 
 /// D2 (fairness): an owner's share of the per-host minute cap when `other_owners` other owners
-/// had audits proved in the last minute. The cap is split across the active owners plus one
-/// free share, with a floor of 1, so while shares are above the floor the active owners together
-/// never fill the host cap and a new owner always finds room: one owner cannot starve another's
-/// audits of this host.
+/// had audits proved in the last minute: the cap split across the active owners plus one free
+/// share, with a floor of 1. The floor alone does not protect a quiet owner once the active
+/// owners number the cap, so [`por_rate_decision`] also keeps the host's last slot of each
+/// minute for an owner with no audit here in the last 10 minutes (P1).
 pub fn owner_minute_share(host_cap: usize, other_owners: usize) -> usize {
     (host_cap / other_owners.saturating_add(2)).max(1)
 }
@@ -125,6 +128,7 @@ pub fn por_rate_decision(f: &PorRateFacts) -> Result<(), &'static str> {
     if f.map_full_for_new_key
         || f.session_in_window >= CHUNK_AUDITS_PER_SESSION_WINDOW
         || f.host_last_minute >= f.host_per_minute_cap
+        || (!f.owner_quiet && f.host_last_minute.saturating_add(1) >= f.host_per_minute_cap)
         || f.owner_last_minute >= f.owner_per_minute_cap
     {
         return Err("reject.por_rate_limited");
@@ -138,6 +142,9 @@ struct ChunkRateState {
     per_session: HashMap<[u8; 32], VecDeque<u64>>,
     /// Proved audits in the last minute and their owner (bounded by the host cap).
     host_minute: VecDeque<(u64, String)>,
+    /// P1: owner -> time of its last proved audit, for the last session window. Bounded by
+    /// `MAX_CHUNK_RATE_KEYS`; an owner not in a full map counts as not quiet.
+    owner_last_proved: HashMap<String, u64>,
     host_per_minute_cap: Option<usize>,
 }
 
@@ -150,6 +157,8 @@ impl ChunkRateState {
         {
             self.host_minute.pop_front();
         }
+        self.owner_last_proved
+            .retain(|_, t| now.saturating_sub(*t) < CHUNK_AUDIT_SESSION_WINDOW_MS);
         self.per_session.retain(|_, q| {
             while q
                 .front()
@@ -178,6 +187,8 @@ impl ChunkRateState {
             host_per_minute_cap: host_cap,
             owner_last_minute: self.host_minute.iter().filter(|(_, o)| o == owner).count(),
             owner_per_minute_cap: owner_minute_share(host_cap, others.len()),
+            owner_quiet: !self.owner_last_proved.contains_key(owner)
+                && self.owner_last_proved.len() < MAX_CHUNK_RATE_KEYS,
             map_full_for_new_key: session.is_none()
                 && self.per_session.len() >= MAX_CHUNK_RATE_KEYS,
         }
@@ -186,6 +197,11 @@ impl ChunkRateState {
     fn record(&mut self, key: [u8; 32], owner: &str, now: u64) {
         self.per_session.entry(key).or_default().push_back(now);
         self.host_minute.push_back((now, owner.to_string()));
+        if self.owner_last_proved.contains_key(owner)
+            || self.owner_last_proved.len() < MAX_CHUNK_RATE_KEYS
+        {
+            self.owner_last_proved.insert(owner.to_string(), now);
+        }
     }
 }
 
@@ -1488,13 +1504,22 @@ mod chunk_admit_tests {
     fn rate_decision_rules() {
         let ok = PorRateFacts {
             session_in_window: 5,
-            host_last_minute: 59,
+            host_last_minute: 58,
             host_per_minute_cap: 60,
             owner_last_minute: 29,
             owner_per_minute_cap: 30,
+            owner_quiet: false,
             map_full_for_new_key: false,
         };
         assert_eq!(por_rate_decision(&ok), Ok(()));
+        // A quiet owner may take the last slot.
+        let quiet_last = PorRateFacts {
+            host_last_minute: 59,
+            owner_last_minute: 0,
+            owner_quiet: true,
+            ..ok
+        };
+        assert_eq!(por_rate_decision(&quiet_last), Ok(()));
         for bad in [
             PorRateFacts {
                 session_in_window: 6,
@@ -1510,6 +1535,12 @@ mod chunk_admit_tests {
             },
             PorRateFacts {
                 owner_last_minute: 30,
+                ..ok
+            },
+            // P1: the last slot is only for a quiet owner.
+            PorRateFacts {
+                host_last_minute: 59,
+                owner_quiet: false,
                 ..ok
             },
         ] {
@@ -1550,6 +1581,51 @@ mod chunk_admit_tests {
                 Err("reject.por_rate_limited")
             );
             assert!(r.host_minute.len() <= cap);
+        }
+    }
+
+    /// P1: cap-many Sybil owners saturating a router host minute after minute never starve a
+    /// quiet owner A: from the minute after their first burst they are no longer quiet, so the
+    /// host's last slot of every minute stays for A.
+    #[test]
+    fn cap_many_sybils_cannot_starve_a_quiet_owner() {
+        let cap = CHUNK_AUDITS_PER_MINUTE_ROUTER;
+        let mut r = ChunkRateState {
+            host_per_minute_cap: Some(cap),
+            ..ChunkRateState::default()
+        };
+        let sybils: Vec<String> = (0..cap).map(|i| format!("sybil-{i}")).collect();
+        let mut key_n = 0u32;
+        let mut fresh_key = || {
+            key_n += 1;
+            let mut k = [0u8; 32];
+            k[..4].copy_from_slice(&key_n.to_be_bytes());
+            k
+        };
+        for minute in 0..8u64 {
+            let t = NOW + minute * 60_000;
+            r.prune(t);
+            // Every Sybil asks until refused, with fresh stripe keys.
+            for _ in 0..4 {
+                for s in &sybils {
+                    let k = fresh_key();
+                    if por_rate_decision(&r.facts(&k, s)).is_ok() {
+                        r.record(k, s, t);
+                    }
+                }
+            }
+            assert!(r.host_minute.len() <= cap);
+            if minute == 0 {
+                continue; // the first burst: every Sybil was quiet too
+            }
+            let owner_a = format!("owner-a-{minute}");
+            let k = fresh_key();
+            assert_eq!(
+                por_rate_decision(&r.facts(&k, &owner_a)),
+                Ok(()),
+                "minute {minute}: the quiet owner is starved"
+            );
+            r.record(k, &owner_a, t);
         }
     }
 

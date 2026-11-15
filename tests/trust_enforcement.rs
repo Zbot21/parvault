@@ -7926,7 +7926,6 @@ fn f06_seed_lite_audit_passes() {
     let host = spawn_daemon("f06-seed-a-host");
     let seed = spawn_auditing_seed("f06-seed-a", &[&host.addr]);
     seed_fan_out(&seed, &host, 0xA6);
-    assert!(seed.dir.join("lite_audit_index.bin").exists());
     assert_audit_logged(&seed, "pass");
     assert!(eventually(|| {
         seed_audit_state(&seed).is_some_and(|v| v["passed"].as_u64().unwrap_or(0) >= 1)
