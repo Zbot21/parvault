@@ -20,18 +20,36 @@ use libp2p::{mdns, Multiaddr, Swarm};
 use std::collections::HashMap;
 use tracing::{info, warn};
 
-/// Onion relay forwards in flight on this node, across all peers (F-18, F-33).
+/// Onion relay forwards in flight on this node, across all peers (F-18, F-33). The default; see
+/// [`max_inflight_relays`] for the per-profile cap.
 pub const MAX_INFLIGHT_RELAYS: usize = 64;
+/// The total relay cap on `router-soc`. Each forward holds a blocking-pool thread for its dial
+/// and RPC, so the cap plus [`MAX_SYNDICATIONS_IN_FLIGHT`] stays below that profile's blocking
+/// pool and leaves threads for the owner's gateway, admin RPC, status and sync work (B-53).
+pub const ROUTER_SOC_MAX_INFLIGHT_RELAYS: usize = 4;
+
+/// The total relay cap for `profile`: [`ROUTER_SOC_MAX_INFLIGHT_RELAYS`] on `router-soc`, else
+/// [`MAX_INFLIGHT_RELAYS`].
+pub const fn max_inflight_relays(profile: crate::config::HardwareProfile) -> usize {
+    match profile {
+        crate::config::HardwareProfile::RouterSoc => ROUTER_SOC_MAX_INFLIGHT_RELAYS,
+        crate::config::HardwareProfile::Desktop | crate::config::HardwareProfile::HomelabNas => {
+            MAX_INFLIGHT_RELAYS
+        }
+    }
+}
 /// Onion relay forwards in flight for one sending peer (F-33).
 pub const MAX_INFLIGHT_RELAYS_PER_PEER: usize = 4;
 
-/// Admits one more deferred onion forward only under both in-flight caps. Removing the blocking
-/// forward removed the only back-pressure on relaying; these caps replace it (F-33).
+/// Admits one more deferred onion forward only under both in-flight caps (`total_cap` from
+/// [`max_inflight_relays`]). Removing the blocking forward removed the only back-pressure on
+/// relaying; these caps replace it (F-33).
 pub fn relay_forward_decision(
     in_flight_total: usize,
     in_flight_peer: usize,
+    total_cap: usize,
 ) -> Result<(), &'static str> {
-    if in_flight_total >= MAX_INFLIGHT_RELAYS || in_flight_peer >= MAX_INFLIGHT_RELAYS_PER_PEER {
+    if in_flight_total >= total_cap || in_flight_peer >= MAX_INFLIGHT_RELAYS_PER_PEER {
         Err("reject.relay_budget")
     } else {
         Ok(())
@@ -173,6 +191,8 @@ pub struct ServerSwarmEvents {
     /// Deferred onion forwards; their responses go out from [`Self::next_deferred`].
     deferred: FuturesUnordered<BoxFuture<'static, DeferredResponse>>,
     relays_per_peer: HashMap<String, usize>,
+    /// Total relay cap ([`max_inflight_relays`]).
+    relay_cap: usize,
     /// B-SEED-SYND: lite syndication fan-outs in flight (total and per sender).
     syndications_total: usize,
     syndications_per_peer: HashMap<String, usize>,
@@ -180,13 +200,15 @@ pub struct ServerSwarmEvents {
 
 impl ServerSwarmEvents {
     /// `log_mdns_discoveries` keeps the daemon's per-peer mDNS log line (the seed has none).
-    pub fn new(log_mdns_discoveries: bool) -> Self {
+    /// `relay_cap` is the total relay cap, from [`max_inflight_relays`].
+    pub fn new(log_mdns_discoveries: bool, relay_cap: usize) -> Self {
         Self {
             peer_remote_addrs: HashMap::new(),
             log_mdns_discoveries,
             admitted_peers: std::collections::HashSet::new(),
             deferred: FuturesUnordered::new(),
             relays_per_peer: HashMap::new(),
+            relay_cap,
             syndications_total: 0,
             syndications_per_peer: HashMap::new(),
         }
@@ -375,7 +397,7 @@ impl ServerSwarmEvents {
                         let in_flight_peer =
                             self.relays_per_peer.get(&peer_str).copied().unwrap_or(0);
                         let relays_total: usize = self.relays_per_peer.values().sum();
-                        match relay_forward_decision(relays_total, in_flight_peer) {
+                        match relay_forward_decision(relays_total, in_flight_peer, self.relay_cap) {
                             Ok(()) => {
                                 *self.relays_per_peer.entry(peer_str.clone()).or_insert(0) += 1;
                                 self.deferred.push(Box::pin(async move {
@@ -416,19 +438,44 @@ mod tests {
 
     #[test]
     fn relay_budget_caps_total_and_per_peer() {
-        assert_eq!(relay_forward_decision(0, 0), Ok(()));
+        let cap = MAX_INFLIGHT_RELAYS;
+        assert_eq!(relay_forward_decision(0, 0, cap), Ok(()));
         assert_eq!(
-            relay_forward_decision(MAX_INFLIGHT_RELAYS - 1, MAX_INFLIGHT_RELAYS_PER_PEER - 1),
+            relay_forward_decision(cap - 1, MAX_INFLIGHT_RELAYS_PER_PEER - 1, cap),
             Ok(())
         );
         assert_eq!(
-            relay_forward_decision(MAX_INFLIGHT_RELAYS, 0),
+            relay_forward_decision(cap, 0, cap),
             Err("reject.relay_budget")
         );
         assert_eq!(
-            relay_forward_decision(0, MAX_INFLIGHT_RELAYS_PER_PEER),
+            relay_forward_decision(0, MAX_INFLIGHT_RELAYS_PER_PEER, cap),
             Err("reject.relay_budget")
         );
+    }
+
+    /// B-53: on `router-soc` the relay cap plus the syndication cap stays below the blocking
+    /// pool, so relays cannot hold every blocking thread; the other profiles keep the default.
+    #[test]
+    fn router_relay_cap_leaves_blocking_threads_for_owner_work() {
+        use crate::config::HardwareProfile;
+        let router = HardwareProfile::RouterSoc;
+        let pool = router
+            .runtime_max_blocking_threads()
+            .expect("router pool bound");
+        assert_eq!(max_inflight_relays(router), ROUTER_SOC_MAX_INFLIGHT_RELAYS);
+        assert!(max_inflight_relays(router) + MAX_SYNDICATIONS_IN_FLIGHT < pool);
+        assert_eq!(
+            relay_forward_decision(
+                ROUTER_SOC_MAX_INFLIGHT_RELAYS,
+                0,
+                max_inflight_relays(router)
+            ),
+            Err("reject.relay_budget")
+        );
+        for p in [HardwareProfile::Desktop, HardwareProfile::HomelabNas] {
+            assert_eq!(max_inflight_relays(p), MAX_INFLIGHT_RELAYS);
+        }
     }
 
     #[test]

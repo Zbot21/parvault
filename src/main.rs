@@ -265,23 +265,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let cfg = NodeConfig::load_for_cli(cli.config.as_ref(), cli.data_dir.as_deref(), cli.profile)?;
-    build_runtime(cfg.hardware_profile)?.block_on(run(cli, cfg))
-}
-
-/// The tokio runtime for `profile`: multi-thread, with the profile's worker and blocking-pool
-/// bounds when it sets them.
-fn build_runtime(
-    profile: parvault::config::HardwareProfile,
-) -> std::io::Result<tokio::runtime::Runtime> {
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder.enable_all();
-    if let Some(workers) = profile.runtime_worker_threads() {
-        builder.worker_threads(workers);
-    }
-    if let Some(blocking) = profile.runtime_max_blocking_threads() {
-        builder.max_blocking_threads(blocking);
-    }
-    builder.build()
+    parvault::runtime::build_runtime(cfg.hardware_profile)?.block_on(run(cli, cfg))
 }
 
 async fn run(cli: Cli, cfg: NodeConfig) -> anyhow::Result<()> {
