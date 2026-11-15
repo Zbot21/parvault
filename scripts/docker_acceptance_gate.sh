@@ -93,6 +93,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# B-106: assert_nonroot reads host uids (docker top) as the container's uids. That holds only
+# without a uid remap, so a rootless or userns-remapped Docker fails the gate (as the suite gate does).
+DOCKER_SECOPTS="$(docker info --format '{{json .SecurityOptions}}' 2>&1)" \
+    || { echo "ERROR: docker info: $DOCKER_SECOPTS"; exit 1; }
+if [[ "$DOCKER_SECOPTS" =~ rootless|userns ]]; then
+    echo "ERROR: B-106: Docker runs rootless or with userns remap ($DOCKER_SECOPTS); the host uid checks would be wrong"
+    exit 1
+fi
+
 echo "=== [1/12] Building ParVault binaries & "$IMG_ACCEPT" container image ==="
 BUILD_CTX="$STAGE_DIR/acceptance-image"
 rm -rf "$BUILD_CTX"
