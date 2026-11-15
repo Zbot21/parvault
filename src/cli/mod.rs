@@ -9,6 +9,7 @@ pub(crate) mod file;
 pub(crate) mod folder;
 pub(crate) mod identity;
 pub(crate) mod maintenance;
+pub(crate) mod net;
 pub(crate) mod onboarding;
 pub(crate) mod wot;
 

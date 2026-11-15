@@ -33,6 +33,7 @@ pub mod network;
 #[cfg(unix)]
 pub mod os_sys;
 pub mod por;
+pub mod probe;
 pub mod profile;
 #[cfg(all(unix, feature = "status-ui"))]
 pub mod router_nas;

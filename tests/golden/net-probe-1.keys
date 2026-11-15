@@ -1,0 +1,18 @@
+# parvault.net-probe/1 key set (rpc_error appears only when an RPC fails): tests/net_probe.rs probe_schema_golden
+addr
+local
+local.nat_status
+mode
+path
+peer_id
+reason
+relay
+result
+schema
+started_unix_ms
+timings_us
+timings_us.established
+timings_us.first_response
+timings_us.ping_rtt
+transport
+version

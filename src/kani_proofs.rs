@@ -1652,3 +1652,25 @@ fn proof_reason_index_in_bounds() {
     assert!(refused_index(sr1) < N_REFUSED);
     assert!((refused_index(sr1) == refused_index(sr2)) == (sr1 == sr2));
 }
+
+/// PROBE-K (`v0.5.4` NEW-4, `docs/LAB_MODE.md`): the probe target is allowed iff a mode is given
+/// (`--force-direct`), it resolves to exactly one address that names its PeerId, that address is
+/// not a relay address under `--force-direct`, and in lab mode it is neither a bare PeerId nor a
+/// non-IP-literal address.
+#[kani::proof]
+fn proof_probe_target_requires_peer_id_and_direct() {
+    use crate::probe::{probe_target_decision, ProbeMode, ProbeTargetFacts};
+    let f: ProbeTargetFacts = kani::any();
+    let d = probe_target_decision(&f);
+    kani::cover!(d.is_ok(), "probe target allowed");
+    kani::cover!(
+        d.is_err() && f.deterministic && f.bare_peer_id,
+        "lab bare peer refused"
+    );
+    let expected = f.mode == ProbeMode::ForceDirect
+        && f.has_p2p
+        && f.addr_count == 1
+        && !(f.mode == ProbeMode::ForceDirect && f.has_circuit)
+        && (!f.deterministic || (!f.bare_peer_id && f.is_ip_literal));
+    assert_eq!(d.is_ok(), expected);
+}

@@ -143,6 +143,7 @@ fn command_needs_network_discovery(cmd: &Commands) -> bool {
             | Commands::Council { .. }
             | Commands::Gateway { .. }
             | Commands::Config { .. }
+            | Commands::Net { .. }
     )
 }
 
@@ -326,6 +327,25 @@ fn main() -> anyhow::Result<()> {
         eprintln!("{code}: {detail}");
         std::process::exit(3);
     }
+    // NEW-4: the probe runs before any identity, key or data-dir work (docs/LAB_MODE.md).
+    if let Commands::Net {
+        action:
+            parvault::config::NetAction::Probe {
+                peer,
+                force_direct,
+                timeout_ms,
+                no_rpc,
+            },
+    } = &cli.command
+    {
+        std::process::exit(cli::net::run_probe(
+            &eff,
+            peer,
+            *force_direct,
+            *timeout_ms,
+            *no_rpc,
+        ));
+    }
     // The digest of the dump this command would print, taken before any file is created.
     let config_digest = hex::encode(parvault::config_dump::config_digest(
         &parvault::config_dump::render_dump(&eff),
@@ -479,7 +499,8 @@ async fn run(
         | Commands::Wot { .. }
         | Commands::Council { .. }
         | Commands::Gateway { .. }
-        | Commands::Config { .. } => {
+        | Commands::Config { .. }
+        | Commands::Net { .. } => {
             unreachable!("handled above")
         }
 

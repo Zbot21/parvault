@@ -163,6 +163,29 @@ pub struct Cli {
     pub command: Commands,
 }
 
+/// `parvault net` subcommands (`docs/LAB_MODE.md`).
+#[derive(Debug, Clone, Subcommand)]
+pub enum NetAction {
+    /// One connection attempt to a named peer, with a JSON result on stdout
+    /// (`parvault.net-probe/1`). Exit 0 connected, 1 failed, 4 connected but the RPC failed,
+    /// 3 error (no attempt made).
+    Probe {
+        /// A multiaddr ending in `/p2p/<id>`, or (outside lab mode) a bare PeerId resolved from
+        /// `known_peers.json`.
+        #[arg(long, value_name = "MULTIADDR/p2p/ID | PEER_ID")]
+        peer: String,
+        /// Dial directly (required in v0.5.4).
+        #[arg(long, default_value_t = false)]
+        force_direct: bool,
+        /// Timeout for dial, upgrade and the RPC, in milliseconds (100..=60000).
+        #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u64).range(100..=60_000))]
+        timeout_ms: u64,
+        /// Skip the `QueryNodeStatus` round trip.
+        #[arg(long, default_value_t = false)]
+        no_rpc: bool,
+    },
+}
+
 /// `parvault config` subcommands.
 #[derive(Debug, Clone, Subcommand)]
 pub enum ConfigAction {
@@ -604,6 +627,11 @@ pub enum Commands {
     Token {
         #[command(subcommand)]
         action: crate::gateway::TokenAction,
+    },
+    /// Network tests (`probe`; `docs/LAB_MODE.md`).
+    Net {
+        #[command(subcommand)]
+        action: NetAction,
     },
     /// The effective configuration (`dump`; `docs/LAB_MODE.md`).
     Config {

@@ -253,8 +253,8 @@ impl EffectiveConfig {
                             if let Some(lab) = v.as_table() {
                                 for (lk, _) in lab {
                                     let full = format!("lab.{lk}");
-                                    if key_sources.contains_key(&full) {
-                                        key_sources.insert(full, Source::File);
+                                    if let Some(src) = key_sources.get_mut(&full) {
+                                        *src = Source::File;
                                     } else {
                                         unknown_file_keys += 1;
                                     }
@@ -269,8 +269,8 @@ impl EffectiveConfig {
                             .find(|(alias, _)| alias == k)
                             .map(|(_, c)| *c)
                             .unwrap_or(k.as_str());
-                        if key_sources.contains_key(canonical) {
-                            key_sources.insert(canonical.to_string(), Source::File);
+                        if let Some(src) = key_sources.get_mut(canonical) {
+                            *src = Source::File;
                         } else {
                             unknown_file_keys += 1;
                         }

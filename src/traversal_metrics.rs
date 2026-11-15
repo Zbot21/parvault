@@ -500,11 +500,10 @@ impl TraversalCounters {
                     cumulative = cumulative.saturating_add(
                         self.hist_buckets[hist_index(p, t, b)].load(Ordering::Relaxed),
                     );
-                    let le = if b < BUCKETS_SECS.len() {
-                        format!("{}", BUCKETS_SECS[b])
-                    } else {
-                        "+Inf".to_string()
-                    };
+                    let le = BUCKETS_SECS
+                        .get(b)
+                        .map(|v| format!("{v}"))
+                        .unwrap_or_else(|| "+Inf".to_string());
                     let _ = writeln!(
                         out,
                         "parvault_traversal_connect_seconds_bucket{{path=\"{}\",transport=\"{}\",le=\"{le}\"}} {cumulative}",

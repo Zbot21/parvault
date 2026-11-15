@@ -324,4 +324,11 @@ suite      S-METRICS-CARD test=traversal_metrics::metrics_series_count_is_consta
 # kind is warranted, v0.5.4 plan section 2.7).
 suite      S-NOINSECURE test=static_build_checks::shipped_binaries_lack_insecure_metrics needs=cmd:sh
 
+# --- v0.5.4 NEW-4: net probe --force-direct (docs/LAB_MODE.md) -------------------------------------
+claim      PROBE-PID sym=src/probe.rs::probe_target_decision accept=net_probe::probe_force_direct_connects reject=net_probe::probe_requires_peer_id code=reject.probe_peer_id_required bin=parvault ref=docs/LAB_MODE.md
+claim      PROBE-DIRECT sym=src/probe.rs::probe_target_decision accept=net_probe::probe_force_direct_connects reject=net_probe::probe_refuses_circuit_addr code=reject.probe_relay_addr_forced_direct bin=parvault ref=docs/LAB_MODE.md
+claim      PROBE-LAB sym=src/probe.rs::probe_target_decision accept=net_probe::probe_force_direct_connects reject=net_probe::probe_lab_refuses_bare_peer_id code=reject.probe_bare_peer_id_lab bin=parvault ref=docs/LAB_MODE.md
+kani       PROBE-K   sym=src/probe.rs::probe_target_decision harness=proof_probe_target_requires_peer_id_and_direct cover=probe target allowed
+reach      PROBE-REACH sym=src/probe.rs::probe_target_decision from=src/cli/net.rs::run_probe
+
 ratchet    R         open=2 waive=32

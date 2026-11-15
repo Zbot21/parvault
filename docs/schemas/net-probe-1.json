@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "parvault.net-probe/1",
+  "title": "parvault net probe",
+  "description": "Output of `parvault net probe --force-direct` (docs/LAB_MODE.md): one JSON document on stdout. Exit 0 connected, 1 failed, 4 connected but the RPC failed, 3 error.",
+  "type": "object",
+  "required": ["schema", "version", "mode", "peer_id", "addr", "transport", "result", "path", "reason", "timings_us", "local", "relay", "started_unix_ms"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "parvault.net-probe/1"},
+    "version": {"type": "string"},
+    "mode": {"const": "force-direct"},
+    "peer_id": {"type": ["string", "null"]},
+    "addr": {"type": ["string", "null"]},
+    "transport": {"enum": ["tcp", "quic", "none", null]},
+    "result": {"enum": ["connected", "failed", "error"]},
+    "path": {"enum": ["direct", null]},
+    "reason": {"type": "string", "description": "A traversal reason (ok, timeout, refused, unreachable, noise_failed, peer_id_mismatch, transport_unsupported, denied, aborted, other) for connected/failed; a reject.* code for error"},
+    "timings_us": {
+      "type": "object",
+      "required": ["established", "ping_rtt", "first_response"],
+      "additionalProperties": false,
+      "properties": {
+        "established": {"type": ["integer", "null"], "minimum": 0},
+        "ping_rtt": {"type": ["integer", "null"], "minimum": 0},
+        "first_response": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "local": {"type": "object", "required": ["nat_status"], "properties": {"nat_status": {"const": "unknown"}}, "additionalProperties": false},
+    "relay": {"type": "null"},
+    "started_unix_ms": {"type": "integer", "minimum": 0},
+    "rpc_error": {"type": "string"}
+  }
+}
