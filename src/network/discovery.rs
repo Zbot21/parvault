@@ -1066,6 +1066,17 @@ pub fn known_peers_load_decision(
     }
 }
 
+/// B-123: a tracker-admin key is pinned on first use (TOFU), and an in-memory pin is written to
+/// `pinned_tracker_admins.json`, only while `known_peers.json` loads. A damaged store shows no
+/// pins, so TOFU would take whatever key the next tracker (or a MITM) advertises, and the legacy
+/// pin file would carry it into the council scope root. Refused with `reject.known_peers_damaged`
+/// (the load's own code is logged by the caller); a missing file loads as empty and is accepted.
+pub fn tracker_pin_decision(
+    loaded: anyhow::Result<KnownPeersStore>,
+) -> Result<KnownPeersStore, &'static str> {
+    loaded.map_err(|_| "reject.known_peers_damaged")
+}
+
 /// DHCP-resilient persistent peer store at `<data_dir>/known_peers.json`.
 ///
 /// Keyed by cryptographic `libp2p_peer_id`: when a home router's DHCP server or ISP assigns a
@@ -1084,13 +1095,14 @@ impl KnownPeersStore {
     pub const FILE_NAME: &'static str = "known_peers.json";
 
     /// Read-only view of the store: a missing file is empty, and so (logged with its reason code)
-    /// is one that exists but does not load. An empty view has no pins, so it refuses no key: a
-    /// tracker-admin key is pinned on first use (TOFU) whenever no pin for that tracker is in
-    /// memory, and after a damaged file the next key a tracker advertises is pinned for that
-    /// process. Once a key is pinned, a different key for the same tracker is refused
-    /// (`or_insert`, never overwritten). The damaged file itself is never replaced (`save`
-    /// refuses), so that pin is not persisted. Never `save` a store obtained here; writers use
-    /// [`Self::try_load`] (B-52).
+    /// is one that exists but does not load. An empty view has no pins, so it must never feed
+    /// trust-on-first-use: `MeshClient` pins a tracker-admin key on first use only after
+    /// [`Self::try_load`] succeeds, and pins nothing while the file is damaged
+    /// ([`tracker_pin_decision`], `reject.known_peers_damaged`, B-123). Otherwise the next key a
+    /// tracker advertised would be pinned in memory, and the `--public` run would write it to
+    /// `pinned_tracker_admins.json`, where the council scope root reads it. Once a key is pinned,
+    /// a different key for the same tracker is refused (`or_insert`, never overwritten). Never
+    /// `save` a store obtained here; writers use [`Self::try_load`] (B-52).
     pub fn load(data_dir: &Path) -> Self {
         Self::try_load(data_dir).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "known_peers.json does not load; using no pins");

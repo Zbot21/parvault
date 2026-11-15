@@ -2028,6 +2028,119 @@ fn b52_corrupt_tracker_pins_run_refused() {
     gate_ran("trust_enforcement::b52_corrupt_tracker_pins_run_refused");
 }
 
+// --- B-123: no tracker-admin TOFU pin, no legacy pin, no council root while known_peers.json is damaged
+
+/// Runs `parvault --public --tracker <tracker> status` from a fresh data dir whose
+/// `known_peers.json` is `known` (`None`: no file). The run announces to the tracker, which
+/// advertises its admin key, and then writes the persistable pins to `pinned_tracker_admins.json`.
+fn b123_public_run(
+    label: &str,
+    tracker: &str,
+    known: Option<&[u8]>,
+) -> (std::process::Output, PathBuf, TempDir) {
+    let (root, dir, reg, _log) = prepare(label);
+    if let Some(bytes) = known {
+        std::fs::write(dir.join("known_peers.json"), bytes).unwrap();
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env_remove("PARVAULT_GENESIS_SEED_HEX")
+        .env_remove("PARVAULT_PEERS")
+        .env_remove("PARVAULT_TRACKERS")
+        .env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .env("RUST_LOG", "warn")
+        .env("NO_COLOR", "1")
+        .arg("--data-dir")
+        .arg(&dir)
+        .args([
+            "--no-lan-discovery",
+            "--public",
+            "--tracker",
+            tracker,
+            "status",
+        ])
+        .output()
+        .expect("run parvault --public status");
+    (out, dir, root)
+}
+
+/// An epoch 1 council rooted on (and signed by) `root`.
+fn b123_epoch1(root: &NodeIdentity) -> String {
+    let m = c1_manifest(root, 1, &[&key(0xB5), &key(0xB6), &key(0xB7)], 2, &[root]);
+    hex::encode(m.to_bytes())
+}
+
+/// B-123 accept (`bin=parvault`): with a `known_peers.json` that loads (here: none yet), the key a
+/// tracker advertises is pinned on first use in both on-disk stores, and an epoch 1 it signed
+/// installs as the council.
+#[test]
+fn b123_tracker_admin_pinned_and_persisted() {
+    let k = key(0xB1);
+    let (seed, _admin) = f53_seed("b123-a-seed", Some(&k), None, |_| {});
+    assert_eq!(f53_advertised_admin(&seed), Some(k.public_key_bytes()));
+    let (out, dir, _root) = b123_public_run("b123-a", &seed.addr, None);
+    let text = combined(&out);
+    assert!(!text.contains("reject.known_peers"), "{text}");
+    let (known, legacy) = f53_pins(&dir);
+    assert_eq!(known, vec![k.public_key_bytes()], "{text}");
+    let legacy: Vec<String> = serde_json::from_str(&legacy).unwrap();
+    assert_eq!(legacy, vec![hex::encode(k.public_key_bytes())], "{text}");
+    let out = f53_council_cli(&dir, true, &["install", "--manifest", &b123_epoch1(&k)]);
+    assert!(out.status.success(), "{}", combined(&out));
+    assert!(dir.join("council_manifest.bin").exists());
+    gate_ran("trust_enforcement::b123_tracker_admin_pinned_and_persisted");
+}
+
+/// B-123 reject (`bin=parvault`, QA pre-tag MEDIUM): with a damaged `known_peers.json` the key a
+/// tracker (or a MITM) advertises is not pinned: the run logs `reject.known_peers_damaged`,
+/// writes nothing to `pinned_tracker_admins.json`, keeps the damaged file, and that key's epoch 1
+/// is not installed as the council afterwards (the scope root is refused).
+#[test]
+fn b123_damaged_known_peers_tracker_admin_not_pinned() {
+    let k = key(0xB2);
+    let (seed, _admin) = f53_seed("b123-r-seed", Some(&k), None, |_| {});
+    assert_eq!(f53_advertised_admin(&seed), Some(k.public_key_bytes()));
+    let damaged = b"{\"peers\":";
+    let (out, dir, _root) = b123_public_run("b123-r", &seed.addr, Some(damaged));
+    let text = combined(&out);
+    assert!(text.contains("reject.known_peers_damaged"), "{text}");
+    assert!(
+        !dir.join("pinned_tracker_admins.json").exists(),
+        "pin persisted:\n{text}"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("known_peers.json")).unwrap(),
+        damaged
+    );
+    let out = f53_council_cli(&dir, true, &["install", "--manifest", &b123_epoch1(&k)]);
+    let text = combined(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("reject.known_peers_corrupt"), "{text}");
+    assert!(!dir.join("council_manifest.bin").exists());
+    gate_ran("trust_enforcement::b123_damaged_known_peers_tracker_admin_not_pinned");
+}
+
+/// B-123 (c) reject (`bin=parvault`): a key already in `pinned_tracker_admins.json` (for example
+/// one a pre-fix run pinned while `known_peers.json` was damaged) is not used as the council
+/// scope root while `known_peers.json` stays damaged: `council install` of its epoch 1 is
+/// refused with the store's code. Accept side: `b123_tracker_admin_pinned_and_persisted`.
+#[test]
+fn b123_damaged_known_peers_council_root_refused() {
+    let k = key(0xB3);
+    let (_root, dir, _reg, _log) = prepare("b123-cr");
+    std::fs::write(dir.join("known_peers.json"), b"{\"peers\":").unwrap();
+    std::fs::write(
+        dir.join("pinned_tracker_admins.json"),
+        format!("[\"{}\"]", hex::encode(k.public_key_bytes())),
+    )
+    .unwrap();
+    let out = f53_council_cli(&dir, true, &["install", "--manifest", &b123_epoch1(&k)]);
+    let text = combined(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("reject.known_peers_corrupt"), "{text}");
+    assert!(!dir.join("council_manifest.bin").exists());
+    gate_ran("trust_enforcement::b123_damaged_known_peers_council_root_refused");
+}
+
 // --- F-25: syndication cert not bound to the sender; self-signed DHT records from strangers -------------
 
 fn syndicate(seed: &Node, cert_device: &NodeIdentity) -> MeshWireRequest {

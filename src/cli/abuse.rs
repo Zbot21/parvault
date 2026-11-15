@@ -269,9 +269,7 @@ pub(crate) async fn report_abuse(env: CliEnv, command: Commands) -> anyhow::Resu
 
     let (ack_report_id, ack_sha) =
         mesh_client.submit_abuse_takedown_report_detailed(&target_tracker, report)?;
-    for pk in mesh_client.pinned_tracker_admin_pubkeys() {
-        cfg.persist_pinned_tracker_admin(pk)?;
-    }
+    mesh_client.persist_tracker_admin_pins(&cfg)?;
     let verified_sha = ack_sha.unwrap_or(local_proof.verified_plaintext_sha256);
 
     println!("=== ParVault Verifiable Abuse Report Submitted (ADR-26) ===");

@@ -767,7 +767,9 @@ fn disk_pins(data_dir: &Path) -> Result<DiskPins, &'static str> {
 }
 
 /// The first pinned tracker admin key: `known_peers.json`'s order, else the legacy file. A pin
-/// store that does not load is an error, never "no pin" (B-52).
+/// store that does not load is an error, never "no pin" (B-52). In particular a damaged
+/// `known_peers.json` never falls back to the legacy pins (B-123): those could hold a key that
+/// trust-on-first-use took while the damaged store showed no pins.
 pub fn pinned_admin_root(data_dir: &Path) -> Result<Option<[u8; 32]>, &'static str> {
     let (known, legacy) = disk_pins(data_dir)?;
     Ok(known.first().or(legacy.first()).copied())
@@ -1508,8 +1510,9 @@ mod tests {
             Err("reject.tracker_pins_unreadable".to_string())
         );
         assert_eq!(std::fs::read(&legacy).unwrap(), b"{not json");
-        // A corrupt known_peers.json fails closed the same way, even with a good legacy file.
-        std::fs::remove_file(&legacy).unwrap();
+        // A corrupt known_peers.json fails closed the same way, even with a good legacy file
+        // (B-123: never a fall-back to the legacy pins).
+        std::fs::write(&legacy, format!("[\"{}\"]", hex::encode([3u8; 32]))).unwrap();
         std::fs::write(&known, b"{\"peers\":").unwrap();
         assert_eq!(council_scope_root(dir.path(), None, true, &[[2; 32]]), None);
         assert_eq!(

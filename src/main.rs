@@ -341,9 +341,7 @@ async fn main() -> anyhow::Result<()> {
         for tracker in &public_trackers {
             let _ = mesh_client.announce_and_discover_public_tracker(tracker, None);
         }
-        for pk in mesh_client.pinned_tracker_admin_pubkeys() {
-            cfg.persist_pinned_tracker_admin(pk)?;
-        }
+        mesh_client.persist_tracker_admin_pins(&cfg)?;
     }
 
     let mut quota = QuotaManager::new(cfg.max_storage_bytes, cfg.bootstrap_grace_bytes);
