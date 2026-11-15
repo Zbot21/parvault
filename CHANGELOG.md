@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Security
+
+- Container images run the daemon as non-root uid/gid `65532` (B-106). `deploy/Dockerfile.musl` (alpine), `deploy/Dockerfile.router-soc` (scratch, with a prepared `/etc/passwd` and `/etc/group`) and the acceptance gate images own their data, NAS and socket dirs (`/run/parvault`). `deploy/docker-compose.10node.yml` drops `NET_ADMIN` from the nodes and applies netem from one-shot sidecars in each node's network namespace, as the gate's stage 12c netem leg now does. `scripts/docker_acceptance_gate.sh` fails if any daemon container runs a process as root.
+
 ---
 
 ## [`0.5.1`] - 2026-11-14

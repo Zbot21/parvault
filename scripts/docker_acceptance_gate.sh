@@ -14,6 +14,7 @@ CONTAINERS=(
     parvault-invitee
     parvault-outsider
     parvault-status-sidecar
+    parvault-vfs-netem
 )
 for i in $(seq 1 11); do
     CONTAINERS+=("parvault-node-$i")
@@ -66,10 +67,40 @@ RUN if command -v apt-get >/dev/null 2>&1; then (apt-get update -o Acquire::Retr
 COPY parvault /usr/local/bin/parvault
 COPY parvault-seed /usr/local/bin/parvault-seed
 COPY parvault-status /usr/local/bin/parvault-status
+# Non-root (B-106): uid/gid 65532 owns every dir the gate writes outside /tmp.
+RUN printf 'parvault:x:65532:65532:parvault:/var/lib/parvault:/sbin/nologin\n' >> /etc/passwd && printf 'parvault:x:65532:\n' >> /etc/group && mkdir -p /var/lib/parvault /var/lib/parvault-seed /var/lib/invitee /var/lib/outsider /run/pv /mnt/nas /workspace && chown 65532:65532 /var/lib/parvault /var/lib/parvault-seed /var/lib/invitee /var/lib/outsider /run/pv /mnt/nas /workspace
+USER 65532:65532
+WORKDIR /var/lib/parvault
 EXPOSE 4001/tcp 4002/tcp 4009/udp 4080/tcp
 EOF
 
 docker build -t parvault:acceptance "$BUILD_CTX"
+
+# B-106: no process in these containers runs as root (real or effective uid 0, read on the host
+# with `docker top`, which is also the host uid: Docker here has no userns remap). With --daemon,
+# each container must also run a parvault process, so an exited daemon cannot pass.
+assert_nonroot() {
+    local need_daemon=0 c top root_rows
+    if [ "${1:-}" = "--daemon" ]; then need_daemon=1; shift; fi
+    for c in "$@"; do
+        if ! top="$(docker top "$c" -eo pid,ruid,euid,comm 2>&1)"; then
+            echo "ERROR: B-106: cannot list the processes of $c: $top"
+            exit 1
+        fi
+        root_rows="$(awk 'NR > 1 && ($2 == 0 || $3 == 0)' <<<"$top")"
+        if [ -n "$root_rows" ]; then
+            echo "ERROR: B-106: $c runs process(es) as root (pid ruid euid comm):"
+            echo "$root_rows"
+            exit 1
+        fi
+        if [ "$need_daemon" = 1 ] && ! awk 'NR > 1 && $4 ~ /^parvault/ {found=1} END {exit !found}' <<<"$top"; then
+            echo "ERROR: B-106: $c runs no parvault process, so its uid cannot be checked:"
+            echo "$top"
+            exit 1
+        fi
+    done
+    echo "B-106: non-root verified in: $*"
+}
 
 echo "=== [2/12] Creating isolated Docker bridge network (172.28.0.0/24) ==="
 docker rm -f "${CONTAINERS[@]}" >/dev/null 2>&1 || true
@@ -153,6 +184,10 @@ docker exec parvault-client sh -cex '
     /usr/local/bin/parvault --data-dir /tmp/ring-check/data --no-lan-discovery \
         --peers /ip4/172.28.0.40/tcp/4001 file store --path /tmp/ring-check/doc.txt
 '
+NODE_CONTAINERS=()
+for i in $(seq 1 11); do NODE_CONTAINERS+=("parvault-node-$i"); done
+assert_nonroot --daemon parvault-seed-0 "${NODE_CONTAINERS[@]}" parvault-invitee
+assert_nonroot parvault-client
 # The outsider runs its own ring: its credential does not admit it to this ring.
 docker run -d --name parvault-outsider \
     --network parvault-acceptance-net --ip 172.28.0.41 \
@@ -559,6 +594,7 @@ status_get() {
     ' sh "$1" "${2:-}" "${3:-}" || true
 }
 
+assert_nonroot --daemon parvault-router-soc
 SOC_DAEMON_OOM="$(docker inspect -f '{{.State.OOMKilled}}' parvault-router-soc)"
 SOC_DAEMON_RUNNING="$(docker inspect -f '{{.State.Running}}' parvault-router-soc)"
 if [ "$SOC_DAEMON_OOM" != "false" ] || [ "$SOC_DAEMON_RUNNING" != "true" ]; then
@@ -669,6 +705,8 @@ if [ "$SIDE_UP" != "1" ]; then
     docker exec parvault-status-sidecar cat /tmp/daemon.log || true
     exit 1
 fi
+assert_nonroot --daemon parvault-status-sidecar
+assert_nonroot parvault-outsider
 SIDE_OK="$(status_get http://172.28.0.61:4081/api/v1/health "$SIDE_TOKEN")"
 SIDE_NONE="$(status_get http://172.28.0.61:4081/api/v1/health | head -1)"
 SIDE_DNS="$(status_get http://172.28.0.61:4081/api/v1/health "$SIDE_TOKEN" rebind.example:4081 | head -1)"
@@ -716,14 +754,23 @@ RUN apt-get update -o Acquire::Retries=3 \
 COPY vfs_mp4_seek_gate /usr/local/bin/vfs_mp4_seek_gate
 COPY parvault-fuse /usr/local/bin/parvault-fuse
 ENV PARVAULT_FUSE_BIN=/usr/local/bin/parvault-fuse TMPDIR=/var/tmp
+# Non-root (B-106) for the WebDAV legs; the FUSE leg runs as root (see below).
+RUN printf 'parvault:x:65532:65532:parvault:/var/lib/parvault:/usr/sbin/nologin\n' >> /etc/passwd \
+    && printf 'parvault:x:65532:\n' >> /etc/group \
+    && mkdir -p /var/lib/parvault && chown 65532:65532 /var/lib/parvault
+USER 65532:65532
+WORKDIR /var/lib/parvault
 ENTRYPOINT ["/usr/local/bin/vfs_mp4_seek_gate", "--test-threads=1", "--nocapture"]
 EOF
 docker build -t parvault:acceptance-vfs "$VFS_CTX"
 
 VFS_FUSE_RESULT="SKIPPED (no /dev/fuse)"
-if [ -c /dev/fuse ] && docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
+# The FUSE leg alone runs as root with SYS_ADMIN: mount(2) of /dev/fuse needs CAP_SYS_ADMIN, and
+# the image has no setuid fusermount3 path for an unprivileged mount. It is the gate's harness
+# (test binary plus plugin), not a daemon image.
+if [ -c /dev/fuse ] && docker run --rm --user 0:0 --device /dev/fuse --cap-add SYS_ADMIN \
         --security-opt apparmor:unconfined --entrypoint test parvault:acceptance-vfs -c /dev/fuse; then
-    docker run --rm --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined \
+    docker run --rm --user 0:0 --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined \
         -e GATES_REQUIRE_REAL=1 parvault:acceptance-vfs \
         fuse_mount_mp4_probe_and_random_seek parvault_fuse_plugin_mount_rss_under_16_mib \
         || { echo "ERROR: stage 12c: the FUSE leg failed"; exit 1; }
@@ -744,11 +791,30 @@ docker run --rm -e GATES_REQUIRE_REAL=1 parvault:acceptance-vfs webdav_206_mp4_p
 # logged, not asserted: under latency an abandoned `Range: bytes=N-` can hydrate up to about one
 # TCP window of extra blocks (B-23, v0.6.0).
 # Bounded (B-56): a hang (seen once as ~590 s, a lost shutdown wake SYN) fails the gate loudly.
-timeout --kill-after=30 600 docker run --rm --cap-add NET_ADMIN -e GATES_REQUIRE_REAL=1 -e PARVAULT_VFS_TTFB_BUDGET_MS=100 \
+# B-106: the test container runs as uid 65532 with no capability. A one-shot sidecar joins its
+# network namespace with NET_ADMIN and adds netem on lo; the test waits for that, then runs.
+docker rm -f parvault-vfs-netem >/dev/null 2>&1 || true
+docker run -d --name parvault-vfs-netem -e GATES_REQUIRE_REAL=1 -e PARVAULT_VFS_TTFB_BUDGET_MS=100 \
     -e PARVAULT_VFS_GATE_LATENCY=1 \
     --entrypoint sh parvault:acceptance-vfs -c \
-    'tc qdisc add dev lo root netem delay 15ms loss 2% && exec /usr/local/bin/vfs_mp4_seek_gate --test-threads=1 --nocapture webdav_206_mp4_probe_and_random_seek' \
-    || { echo "ERROR: stage 12c: the WebDAV leg under netem 15ms/2% failed or exceeded 600 s"; exit 1; }
+    'i=0; while [ ! -e /var/tmp/netem.ready ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done
+     [ -e /var/tmp/netem.ready ] || { echo "netem was never applied"; exit 97; }
+     exec /usr/local/bin/vfs_mp4_seek_gate --test-threads=1 --nocapture webdav_206_mp4_probe_and_random_seek' >/dev/null
+docker run --rm --network container:parvault-vfs-netem --user 0:0 --cap-add NET_ADMIN --entrypoint tc \
+    parvault:acceptance-vfs qdisc add dev lo root netem delay 15ms loss 2% \
+    || { echo "ERROR: stage 12c: the netem sidecar could not add netem on lo"; exit 1; }
+VFS_NETEM_QDISC="$(docker exec parvault-vfs-netem tc qdisc show dev lo)"
+grep -q "netem" <<<"$VFS_NETEM_QDISC" || { echo "ERROR: stage 12c: no netem qdisc on lo: $VFS_NETEM_QDISC"; exit 1; }
+VFS_NETEM_CAPS="$(docker inspect -f '{{json .HostConfig.CapAdd}}' parvault-vfs-netem)"
+[ "$VFS_NETEM_CAPS" = "null" ] || [ "$VFS_NETEM_CAPS" = "[]" ] \
+    || { echo "ERROR: B-106: the netem test container has added capabilities: $VFS_NETEM_CAPS"; exit 1; }
+docker exec parvault-vfs-netem touch /var/tmp/netem.ready
+assert_nonroot parvault-vfs-netem
+VFS_NETEM_RC="$(timeout --kill-after=30 600 docker wait parvault-vfs-netem)" || VFS_NETEM_RC="timeout"
+docker logs parvault-vfs-netem 2>&1 || true
+docker rm -f parvault-vfs-netem >/dev/null 2>&1 || true
+[ "$VFS_NETEM_RC" = "0" ] \
+    || { echo "ERROR: stage 12c: the WebDAV leg under netem 15ms/2% failed or exceeded 600 s (exit $VFS_NETEM_RC)"; exit 1; }
 echo "Mounted MP4 gate verified: FUSE ${VFS_FUSE_RESULT}; WebDAV 206 PASS (plain and under netem)."
 
 echo "================================================================================"
@@ -773,5 +839,6 @@ echo " 48 MiB Cgroup SoC Gate : PASS (5 x 1 MiB stripes store+restore, 0 OOM kil
 echo " Status page (item 3)   : PASS (router-soc: no token 401, read-only token 200)"
 echo " parvault-status sidecar: PASS (200 / 401 / DNS Host 403 / ?token= 401; no files; ${SIDE_BIN_BYTES} B)"
 echo " Mounted MP4 (item 5)   : FUSE ${VFS_FUSE_RESULT}; WebDAV 206 PASS (plain + netem 15ms/2%, < 100 ms)"
+echo " Non-root (B-106)       : PASS (uid 65532 in every daemon container; netem from a sidecar, no NET_ADMIN)"
 echo "================================================================================"
 echo "=== ACCEPTANCE GATE PASSED ==="

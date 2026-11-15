@@ -26,7 +26,9 @@ RUN cargo build --profile soc --target ${TARGET_ARCH} --bin parvault \
     && cp target/${TARGET_ARCH}/soc/parvault-seed /build/parvault-seed-static \
     && strip /build/parvault-static /build/parvault-seed-static
 
-# Runtime container (includes iproute2 for 10-node tc netem validation runs)
+# Runtime container. iproute2 is for tc netem in validation runs; netem is applied from a
+# sidecar that shares the container's network namespace (deploy/docker-compose.10node.yml),
+# so this container needs no NET_ADMIN.
 FROM alpine:3.20
 
 RUN apk add --no-cache \
@@ -37,8 +39,19 @@ RUN apk add --no-cache \
 COPY --from=builder /build/parvault-static /usr/local/bin/parvault
 COPY --from=builder /build/parvault-seed-static /usr/local/bin/parvault-seed
 
+# Non-root (B-106): fixed uid/gid 65532. The data dirs, the socket dir and /mnt/nas exist
+# and are owned by it before VOLUME, so new volumes inherit the owner. Every listening port
+# is above 1023: the daemon needs no capability. Socket: --ipc-socket /run/parvault/parvault.sock.
+RUN addgroup -S -g 65532 parvault \
+    && adduser -S -D -H -u 65532 -G parvault -h /var/lib/parvault -s /sbin/nologin parvault \
+    && mkdir -p /var/lib/parvault /var/lib/parvault-seed /run/parvault /mnt/nas \
+    && chown 65532:65532 /var/lib/parvault /var/lib/parvault-seed /run/parvault /mnt/nas \
+    && chmod 0750 /var/lib/parvault /var/lib/parvault-seed /run/parvault
+
 VOLUME ["/var/lib/parvault"]
 EXPOSE 4001/tcp 4002/tcp 4009/udp 4080/tcp 4001/udp 5353/udp
 
+USER 65532:65532
+WORKDIR /var/lib/parvault
 ENTRYPOINT ["/usr/local/bin/parvault"]
 CMD ["daemon", "start", "--listen", "/ip4/0.0.0.0/tcp/4001"]
