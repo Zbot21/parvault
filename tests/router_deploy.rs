@@ -1,5 +1,4 @@
-//! B-53 / B-54: static checks on the shipped OpenWrt procd service and router config. The KVM
-//! canary (`scripts/openwrt_kvm_canary.sh`) runs them on a real OpenWrt image.
+//! B-53 / B-54: static checks on the shipped OpenWrt procd service and the OpenWrt install path.
 
 const PROCD: &str = include_str!("../deploy/router-soc/parvault-nas.procd");
 const INSTALL: &str = include_str!("../scripts/install.sh");
@@ -13,10 +12,10 @@ fn code_lines(src: &str) -> impl Iterator<Item = &str> {
 /// `limits as=` counts every thread's reserved stack, so a tokio daemon fails to start under it.
 #[test]
 fn procd_sets_no_address_space_limit() {
-    for line in code_lines(PROCD).filter(|l| l.contains("procd_set_param limits")) {
-        assert!(!line.contains(" as="), "address-space limit in: {line}");
-        assert!(line.contains("nofile=1024"), "nofile limit missing: {line}");
-    }
+    let limits: Vec<&str> = code_lines(PROCD)
+        .filter(|l| l.starts_with("procd_set_param limits"))
+        .collect();
+    assert_eq!(limits, ["procd_set_param limits nofile=1024"]);
 }
 
 /// procd needs all three respawn values (threshold, timeout, retry).
@@ -35,7 +34,8 @@ fn procd_respawn_has_three_values() {
 fn procd_runs_as_service_user() {
     assert!(code_lines(PROCD).any(|l| l == "procd_set_param user \"$SVC_USER\""));
     assert!(code_lines(PROCD).any(|l| l == "SVC_USER=parvault"));
-    assert!(code_lines(PROCD).any(|l| l.starts_with("init_service_user")));
+    // The call in start_service, not the `init_service_user() {` definition.
+    assert!(code_lines(PROCD).any(|l| l == "init_service_user || return 1"));
 }
 
 /// Stop is procd's own TERM to its instance; `killall` would also kill CLI runs of `parvault`.
@@ -52,4 +52,29 @@ fn procd_prog_matches_openwrt_install_dir() {
     assert!(code_lines(PROCD).any(|l| l == "PROG=/usr/bin/parvault"));
     assert!(INSTALL.contains("DEFAULT_INSTALL_DIR=/usr/bin"));
     assert!(INSTALL.contains("/etc/openwrt_release"));
+}
+
+/// The data directory is set up only on a mounted NAS disk with POSIX owners, and chown runs
+/// only when the owner differs, so a started service never walks the chunk store.
+#[test]
+fn procd_requires_mounted_posix_disk_and_chowns_only_on_owner_change() {
+    let lines: Vec<&str> = code_lines(PROCD).collect();
+    assert!(lines.contains(&"NAS=/mnt/nas"));
+    assert!(lines.contains(&"DATA=$NAS/.parvault-data"));
+    assert!(lines.iter().any(|l| l.contains("/proc/mounts")));
+    assert!(lines.iter().any(|l| l.contains("is not a mountpoint")));
+    assert!(lines
+        .iter()
+        .any(|l| l.starts_with("vfat|msdos|exfat|ntfs|ntfs3|fuseblk)")));
+    assert!(!lines.iter().any(|l| l.contains("mkdir -p")));
+    let chown = lines
+        .iter()
+        .position(|l| l.starts_with("chown "))
+        .expect("chown line");
+    assert_eq!(lines.iter().filter(|l| l.starts_with("chown ")).count(), 1);
+    assert!(
+        lines[chown - 1].starts_with("if [ \"$(owner_of \"$DATA\")\" != \"$SVC_USER\" ]"),
+        "chown is not guarded by an owner check: {}",
+        lines[chown - 1]
+    );
 }

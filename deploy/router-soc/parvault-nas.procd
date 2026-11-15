@@ -9,27 +9,57 @@ USE_PROCD=1
 
 PROG=/usr/bin/parvault
 CONF=/etc/parvault/router.toml
-# Must match data_dir in $CONF.
-DATA=/mnt/nas/.parvault-data
+# The NAS disk mountpoint; the data directory lives on it and must match data_dir in $CONF.
+NAS=/mnt/nas
+DATA=$NAS/.parvault-data
 SVC_USER=parvault
 SVC_UID=4001
 
-# First-run step: the service user and its data directory. The daemon writes its keys there on
-# first start, as the service user (B-53).
+fail() {
+    logger -t parvault-nas -p daemon.err "$*"
+    echo "parvault-nas: $*" >&2
+    return 1
+}
+
+# The filesystem type mounted at $NAS, empty when nothing is mounted there.
+nas_fstype() {
+    awk -v m="$NAS" '$2 == m { t = $3 } END { print t }' /proc/mounts
+}
+
+owner_of() {
+    ls -ld "$1" | awk '{print $3}'
+}
+
+# First-run step: the service user and its data directory, on the mounted NAS disk only. The
+# daemon writes its keys there on first start, as the service user (B-53). Supported
+# filesystems keep POSIX owners and modes: ext4, f2fs, btrfs, xfs. vfat, exfat and NTFS do not,
+# so the service refuses them rather than run with keys it cannot protect.
 init_service_user() {
+    local fstype
+    fstype="$(nas_fstype)"
+    [ -n "$fstype" ] || { fail "$NAS is not a mountpoint; mount the NAS disk first"; return 1; }
+    case "$fstype" in
+        vfat|msdos|exfat|ntfs|ntfs3|fuseblk)
+            fail "$NAS is $fstype, which has no POSIX owners; use ext4, f2fs, btrfs or xfs"
+            return 1 ;;
+    esac
     group_exists "$SVC_USER" || group_add "$SVC_USER" "$SVC_UID"
     user_exists "$SVC_USER" || user_add "$SVC_USER" "$SVC_UID" "$SVC_UID" "$SVC_USER" /var/empty
-    [ -d "$DATA" ] || mkdir -p "$DATA"
-    chown -R "$SVC_USER:$SVC_USER" "$DATA"
+    [ -d "$DATA" ] || mkdir -m 0700 "$DATA" || { fail "cannot create $DATA"; return 1; }
+    # Chown only when the owner differs: a new directory, or one a root-run release left
+    # behind, whose contents move with it once. A started service never walks the store.
+    if [ "$(owner_of "$DATA")" != "$SVC_USER" ]; then
+        chown -R "$SVC_USER:$SVC_USER" "$DATA" || { fail "cannot chown $DATA"; return 1; }
+    fi
     chmod 0700 "$DATA"
 }
 
 start_service() {
-    init_service_user
-    # Refuse to start on a data directory the service user does not own (for example an old
-    # root-owned one that chown could not change on a read-only mount).
-    if [ "$(ls -ld "$DATA" | awk '{print $3}')" != "$SVC_USER" ]; then
-        echo "parvault-nas: $DATA is not owned by $SVC_USER; refusing to start" >&2
+    init_service_user || return 1
+    # Refuse to start on a data directory the service user does not own (for example one on a
+    # read-only mount that chown could not change).
+    if [ "$(owner_of "$DATA")" != "$SVC_USER" ]; then
+        fail "$DATA is not owned by $SVC_USER; refusing to start"
         return 1
     fi
 
@@ -43,8 +73,10 @@ start_service() {
     procd_set_param term_timeout 10
 
     # No address-space (`as`) limit: it counts every thread's reserved stack and the mapped
-    # binary, so a tokio daemon fails to start under it. Memory is bounded by the router runtime
-    # (2 workers, 8 blocking threads; src/profile.rs). File descriptors: 1024.
+    # binary, so a tokio daemon fails to start under it. The router runtime caps tokio's own
+    # threads (2 workers, 8 blocking; src/profile.rs), but the daemon also runs std threads
+    # outside it, so this is not a memory bound; see docs/metrics.txt for measured RSS.
+    # File descriptors: 1024.
     procd_set_param limits nofile=1024
 
     # Forward stdout and stderr to logd / syslog

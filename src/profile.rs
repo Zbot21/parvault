@@ -145,7 +145,7 @@ impl HardwareProfile {
     }
 
     /// Tokio blocking-pool ceiling: `Some(8)` on `router-soc` (L-96, B-53), else `None` (tokio's
-    /// default, 512). Stack size stays at the 2 MiB default until the KVM canary measures it.
+    /// default, 512). Stack size stays at the 2 MiB default.
     pub const fn runtime_max_blocking_threads(self) -> Option<usize> {
         match self {
             Self::RouterSoc => Some(8),
