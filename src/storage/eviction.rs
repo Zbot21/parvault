@@ -235,7 +235,6 @@ impl SignedBadActorEvictionOrder {
     /// admin RPC signer): sign [`Self::canonical_sign_bytes`] and attach it with
     /// [`Self::with_signature`]. `reason` is truncated to 256 bytes at a UTF-8 boundary. Use
     /// this instead of a struct literal; fields may be appended.
-    #[allow(clippy::too_many_arguments)]
     pub fn unsigned(
         order_id: [u8; 32],
         target: EvictionTarget,
