@@ -3902,6 +3902,28 @@ fn f55_corrupt_ledger_voucher_refused() {
     let resp = send(&sender, &node, blinded_put(&b, &sender));
     assert!(format!("{resp:?}").contains("stored: false"), "{resp:?}");
     assert_logged(&node, "reject.voucher_ledger_corrupt");
+    drop(node);
+    // A torn or truncated two-entry ledger (88 bytes) at the lengths where the pre-F-35 fallback
+    // used to load it empty (72..88), plus the count-only and one-entry-short lengths; the
+    // unit test `unloadable_ledger_refuses_vouchers` sweeps every truncation length.
+    let entries: Vec<([u8; 32], u64)> = vec![
+        ([0x11; 32], 1_800_000_000_000),
+        ([0x22; 32], 1_800_000_000_001),
+    ];
+    let full = bincode::serialize(&entries).unwrap();
+    for len in [8usize, 40, 48, 72, 73, 80, 87] {
+        let node = spawn_daemon_with_state_file(
+            &format!("f55-lt{len}"),
+            "voucher_nullifiers.bin",
+            Some(&full[..len]),
+        );
+        let resp = send(&sender, &node, blinded_put(&b, &sender));
+        assert!(
+            format!("{resp:?}").contains("stored: false"),
+            "{len}: {resp:?}"
+        );
+        assert_logged(&node, "reject.voucher_ledger_corrupt");
+    }
     gate_ran("trust_enforcement::f55_corrupt_ledger_voucher_refused");
 }
 

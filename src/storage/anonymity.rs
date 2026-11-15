@@ -489,6 +489,13 @@ pub struct VoucherNullifierLedger {
 /// Loads the persisted spends (B-42 QA): an absent file is an empty ledger; a pre-F-35 file
 /// (nonces only) is empty too, because those vouchers no longer verify. Any other read or decode
 /// failure is refused, since starting empty would let every recorded voucher be redeemed again.
+///
+/// Both formats must fill the file exactly (an 8-byte count `n`, then `n` entries), so a torn
+/// or truncated ledger never decodes. A truncated F-35 file can still be exactly `8 + 32n` bytes,
+/// the size of a pre-F-35 file; it is told apart by the first expiry slot (bytes 46..48), the top
+/// two bytes of a millisecond expiry, which are zero for every redeemable voucher (at most 90 days
+/// ahead, below 2^48 ms). A pre-F-35 file loads empty only when those bytes are non-zero, so a
+/// one-nonce pre-F-35 file (or one whose second nonce has them zero) is refused as corrupt.
 pub fn nullifier_load_decision(
     read: std::io::Result<Option<Vec<u8>>>,
 ) -> Result<HashMap<[u8; 32], u64>, &'static str> {
@@ -498,12 +505,23 @@ pub fn nullifier_load_decision(
         Err(_) => return Err("reject.voucher_ledger_unreadable"),
     };
     if let Ok(v) = deserialize_bounded::<Vec<([u8; 32], u64)>>(&raw, MAX_NULLIFIER_LEDGER_BYTES) {
-        return Ok(v.into_iter().collect());
+        if exact_ledger_len(v.len(), 40) == Some(raw.len()) {
+            return Ok(v.into_iter().collect());
+        }
+        return Err("reject.voucher_ledger_corrupt");
     }
-    if deserialize_bounded::<Vec<[u8; 32]>>(&raw, MAX_NULLIFIER_LEDGER_BYTES).is_ok() {
-        return Ok(HashMap::new());
+    if let Ok(v) = deserialize_bounded::<Vec<[u8; 32]>>(&raw, MAX_NULLIFIER_LEDGER_BYTES) {
+        let exact = exact_ledger_len(v.len(), 32) == Some(raw.len());
+        if exact && v.len() >= 2 && raw[46..48] != [0, 0] {
+            return Ok(HashMap::new());
+        }
     }
     Err("reject.voucher_ledger_corrupt")
+}
+
+/// Byte length of a bincode fixint `Vec` of `n` entries of `entry` bytes each.
+fn exact_ledger_len(n: usize, entry: usize) -> Option<usize> {
+    n.checked_mul(entry)?.checked_add(8)
 }
 
 impl VoucherNullifierLedger {
@@ -762,7 +780,7 @@ mod tests {
         assert!(ok.redeem_voucher(&v, 1024).is_ok());
 
         let legacy_dir = tempfile::tempdir().unwrap();
-        let legacy: Vec<[u8; 32]> = vec![[7u8; 32]];
+        let legacy: Vec<[u8; 32]> = vec![[7u8; 32], [9u8; 32]];
         std::fs::write(
             legacy_dir.path().join("voucher_nullifiers.bin"),
             bincode::serialize(&legacy).unwrap(),
@@ -772,6 +790,41 @@ mod tests {
         assert!(
             old.redeem_voucher(&v, 1024).is_ok(),
             "a pre-F-35 file loads empty"
+        );
+
+        // A torn or truncated F-35 ledger never loads empty: every truncation length is refused.
+        let full: Vec<([u8; 32], u64)> = (0..10u8)
+            .map(|i| {
+                (
+                    [i.wrapping_mul(37).wrapping_add(1); 32],
+                    1_800_000_000_000 + u64::from(i),
+                )
+            })
+            .collect();
+        let full = bincode::serialize(&full).unwrap();
+        assert_eq!(full.len(), 408);
+        for len in 0..full.len() {
+            assert_eq!(
+                nullifier_load_decision(Ok(Some(full[..len].to_vec()))),
+                Err("reject.voucher_ledger_corrupt"),
+                "truncated to {len} bytes"
+            );
+        }
+        let mut trailing = full.clone();
+        trailing.push(0);
+        assert_eq!(
+            nullifier_load_decision(Ok(Some(trailing))),
+            Err("reject.voucher_ledger_corrupt")
+        );
+        assert_eq!(
+            nullifier_load_decision(Ok(Some(full))).map(|m| m.len()),
+            Ok(10)
+        );
+        // A one-nonce pre-F-35 file has the size of a truncated one-entry ledger: refused.
+        let one: Vec<[u8; 32]> = vec![[7u8; 32]];
+        assert_eq!(
+            nullifier_load_decision(Ok(Some(bincode::serialize(&one).unwrap()))),
+            Err("reject.voucher_ledger_corrupt")
         );
 
         for (bytes, code) in [
