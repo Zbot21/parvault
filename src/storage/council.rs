@@ -1422,6 +1422,42 @@ mod tests {
         assert_eq!(repair_council_pins(&short), Ok(None));
     }
 
+    /// Repair moves every old root (F-53 QA D2): after A -> B -> C, with A pinned in
+    /// `known_peers.json` and B in the legacy file, one start-up repair leaves only C pinned.
+    #[test]
+    fn repair_moves_every_old_root_of_the_chain() {
+        let b = id(0x42);
+        let bk = b.public_key_bytes();
+        let c = id(0x43);
+        let ck = c.public_key_bytes();
+        let (m1, r) = reroot(&b, &[5, 6, 7], &[2, 3], true);
+        let a = m1.scope_root;
+        let mut r2 = CouncilManifest::new(ck, 3, r.members.clone(), 2, 3_000);
+        for s in [5u8, 6] {
+            r2.sign_reroot(&id(s), &bk);
+        }
+        r2.sign_reroot(&c, &bk);
+        let dir = tempfile::tempdir().unwrap();
+        // Installed as a seed, so no install re-pins and the pins stay as planted.
+        install_council_manifest(dir.path(), &m1, a, CouncilInstallRole::PublicSeed).unwrap();
+        install_council_manifest(dir.path(), &r, bk, CouncilInstallRole::PublicSeed).unwrap();
+        install_council_manifest(dir.path(), &r2, ck, CouncilInstallRole::PublicSeed).unwrap();
+        assert_eq!(chain_roots(dir.path(), &r2), vec![ck, bk, a]);
+        pin_known_peer(dir.path(), "/ip4/10.0.0.1/tcp/4002", a);
+        std::fs::write(
+            dir.path().join("pinned_tracker_admins.json"),
+            format!("[\"{}\"]", hex::encode(bk)),
+        )
+        .unwrap();
+        assert!(repair_council_pins(dir.path()).unwrap().is_some());
+        assert_eq!(
+            crate::network::KnownPeersStore::load(dir.path()).pinned_tracker_admin_pubkeys(),
+            vec![ck]
+        );
+        assert_eq!(legacy_pinned_admins(dir.path()), Ok(vec![ck]));
+        assert_eq!(repair_council_pins(dir.path()), Ok(None));
+    }
+
     /// A write-ahead re-pin record that does not decode fails closed and is kept.
     #[test]
     fn corrupt_repin_intent_fails_closed() {
