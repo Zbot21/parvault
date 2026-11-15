@@ -479,13 +479,23 @@ mod unix_vfs {
                         std::thread::sleep(Duration::from_millis(10));
                     }
                 }
-                let _ = jh.join();
+                if jh.is_finished() {
+                    let _ = jh.join();
+                } else {
+                    // Bounded (B-68 QA): a thread still blocked after every wake is detached, not
+                    // joined; it exits at its next accept, since `shutdown_flag` is set.
+                    tracing::warn!(
+                        addr = %self.local_addr,
+                        attempts = WAKE_ATTEMPTS,
+                        "WebDAV accept thread did not exit after every wake connect; detaching it"
+                    );
+                }
             }
         }
     }
 
-    /// Wake connects tried by [`VfsWebdavServerHandle::shutdown`] (about 0.5 s each) before it
-    /// joins the accept thread regardless.
+    /// Wake connects tried by [`VfsWebdavServerHandle::shutdown`] (about 0.5 s each, so about
+    /// 20 s in all); an accept thread that has still not exited is then detached, not joined.
     const WAKE_ATTEMPTS: usize = 40;
 
     impl Drop for VfsWebdavServerHandle {
