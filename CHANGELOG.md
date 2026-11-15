@@ -25,6 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 - **The shipped router config binds the status page to loopback (B-54).** `deploy/router-soc/parvault-router.toml` sets `status_http_bind = "127.0.0.1:4080"`; `0.0.0.0` includes the WAN. Pass `--status-http <LAN-IP>:4080` for the LAN and `--listen /ip4/<LAN-IP>/tcp/4001` for P2P. Router examples in the docs use the LAN address. Desktop and homelab defaults are unchanged.
 - **`max_connections` is documented as not applied (B-64).** No production path reads it in v0.5.x (no swarm connection limit yet); the status page and WebDAV use fixed caps of 32 and 64.
+- **Production random buffers are drawn with `OsRng.gen()` (CodeQL 55, B-135).** Nonces, keys, salts and temp-file nonces were zeroed and then filled with `fill_bytes`; they are now initialised with `OsRng.gen()`. Same OS source and sizes; no behaviour change.
 
 ### Fixed
 - **The container and LXC status page is reachable again (B-54 follow-up).** Since B-54 the bundled `router.toml` binds `127.0.0.1:4080`, which in a container is its own loopback, so the exposed port 4080 reached nothing. `deploy/Dockerfile.router-soc` CMD and `deploy/prplos-lxc-manifest.json` args pass `--status-http 0.0.0.0:4080`, the container's own interface in its netns, not the router's WAN; the host's port publishing decides what reaches it. A bare-metal install keeps the loopback bind. The Docker gate's stage 12 passes the same flag.
@@ -33,6 +34,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **A node never credits itself for an audit (F-07).** Audit credit goes only to a prover that is not one of the auditor's identities, keyed by its Noise-authenticated device id.
 - **An offline host with no `/p2p/` id is counted unanswered (F-06).** It used to be counted unauditable and never retried; it is now retried once and credited nothing.
 - **The daemon's IPC gateway stores as the owner (B-59).** Stripes stored through the embedded gateway were sent, and their PoR keys derived, as the node identity, so the owner could not audit them. They now use the owner identity, like every other writer.
+- **Every `known_peers.json` writer goes through `KnownPeersStore::update` (B-134, B-52).** The four writers (`discover` pinning, LAN beacon pinning, and the tracker and DDNS card pins) now run `try_load`, then the change, then save, as one step. Before, a writer that read a damaged store as empty could overwrite pins restored before its write; writers now refuse a damaged store when they read it. (Serialising concurrent writers is B-121.) `parvault discover` and the tracker and DDNS lookups now fail with the load's `reject.known_peers_*` code on a damaged store, and keep the file (claims B-52-TK, B-52-TKU, B-52-DS).
 
 ### Security
 
