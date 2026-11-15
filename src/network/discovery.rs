@@ -1,7 +1,7 @@
 use crate::crypto::{NodeIdentity, BIP39_ENGLISH_WORDLIST};
 use hkdf::Hkdf;
 use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
-use rand::{rngs::OsRng, RngCore};
+use rand::{rngs::OsRng, Rng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -466,8 +466,7 @@ fn write_registry_beacon_atomic(dir: &Path, pkt: &LanBeaconPacket) -> anyhow::Re
     }
     std::fs::create_dir_all(dir)?;
     let bytes = pkt.to_wire_bytes()?;
-    let mut nonce = [0u8; 6];
-    OsRng.fill_bytes(&mut nonce);
+    let nonce: [u8; 6] = OsRng.gen();
     let final_path = dir.join(format!("{}.beacon", pkt.libp2p_peer_id));
     let tmp_path = dir.join(format!(
         ".tmp.{}.{}.beacon",
@@ -1141,8 +1140,7 @@ impl KnownPeersStore {
             tracing::warn!(code, path = %path.display(), "refused to overwrite known_peers.json");
             anyhow::bail!("{code}: {}", path.display());
         }
-        let mut nonce = [0u8; 6];
-        OsRng.fill_bytes(&mut nonce);
+        let nonce: [u8; 6] = OsRng.gen();
         let tmp_path = data_dir.join(format!(".tmp.known_peers.{}.json", hex::encode(nonce)));
         let serialized = serde_json::to_vec_pretty(self)?;
         let mut file = std::fs::File::create(&tmp_path)?;
@@ -1342,8 +1340,7 @@ impl std::fmt::Display for LanPairingCode {
 
 /// Generates a fresh 128-bit cryptographic nonce for `derive_4word_pairing_sas`.
 pub fn generate_random_pairing_nonce() -> [u8; 16] {
-    let mut nonce = [0u8; 16];
-    OsRng.fill_bytes(&mut nonce);
+    let nonce: [u8; 16] = OsRng.gen();
     nonce
 }
 

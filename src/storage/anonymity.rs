@@ -8,7 +8,7 @@ use crate::storage::StorageError;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -394,8 +394,7 @@ impl AnonymousQuotaVoucher {
 
     /// Mints a voucher that expires at `expires_at_ms` (F-35).
     pub fn mint_expiring(issuer: &NodeIdentity, max_bytes: u64, expires_at_ms: u64) -> Self {
-        let mut voucher_nonce = [0u8; 32];
-        OsRng.fill_bytes(&mut voucher_nonce);
+        let voucher_nonce: [u8; 32] = OsRng.gen();
         let issuer_pubkey = issuer.public_key_bytes();
         let msg = Self::canonical_bytes(&voucher_nonce, max_bytes, &issuer_pubkey, expires_at_ms);
         let sig = issuer.sign(&msg);

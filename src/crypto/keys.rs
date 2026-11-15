@@ -3,7 +3,7 @@ use crate::crypto::bip39::{normalize_seed_phrase_nfkd, validate_bip39_mnemonic};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::Path;
@@ -58,8 +58,7 @@ pub fn write_secret_file_atomic_0600(path: &Path, data: &[u8]) -> Result<(), Cry
         }
     }
 
-    let mut nonce = [0u8; 8];
-    OsRng.fill_bytes(&mut nonce);
+    let nonce: [u8; 8] = OsRng.gen();
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -114,8 +113,7 @@ pub struct MasterKey([u8; KEY_LEN]);
 impl MasterKey {
     /// Generates a cryptographically random 256-bit master key from `OsRng`.
     pub fn generate() -> Self {
-        let mut bytes = [0u8; KEY_LEN];
-        OsRng.fill_bytes(&mut bytes);
+        let bytes: [u8; KEY_LEN] = OsRng.gen();
         Self(bytes)
     }
 
@@ -300,8 +298,7 @@ impl std::fmt::Debug for NodeIdentity {
 impl NodeIdentity {
     /// Generates a fresh node identity using OS CSPRNG (`OsRng`).
     pub fn generate() -> Self {
-        let mut seed = [0u8; 32];
-        OsRng.fill_bytes(&mut seed);
+        let mut seed: [u8; 32] = OsRng.gen();
         let id = Self::from_seed(seed);
         seed.zeroize();
         id
@@ -366,8 +363,7 @@ impl NodeIdentity {
             seed.zeroize();
             Ok(id)
         } else {
-            let mut seed = [0u8; 32];
-            OsRng.fill_bytes(&mut seed);
+            let mut seed: [u8; 32] = OsRng.gen();
             write_secret_file_atomic_0600(&seed_path, &seed)?;
             let id = Self::from_seed(seed);
             seed.zeroize();
@@ -470,8 +466,7 @@ impl NodeIdentity {
         }
         std::fs::create_dir_all(data_dir)
             .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
-        let mut seed = [0u8; 32];
-        OsRng.fill_bytes(&mut seed);
+        let mut seed: [u8; 32] = OsRng.gen();
         write_secret_file_atomic_0600(&data_dir.join(RING_GENESIS_SEED_FILE), &seed)?;
         let id = Self::from_seed(seed);
         seed.zeroize();
@@ -679,8 +674,7 @@ impl LocalFileKeystore {
             seed.zeroize();
             Ok(store)
         } else {
-            let mut seed = [0u8; KEY_LEN];
-            OsRng.fill_bytes(&mut seed);
+            let mut seed: [u8; KEY_LEN] = OsRng.gen();
             write_secret_file_atomic_0600(&seed_path, &seed)?;
             let store = Self::new(seed);
             seed.zeroize();
