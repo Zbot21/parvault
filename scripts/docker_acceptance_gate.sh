@@ -43,22 +43,18 @@ mkdir -p "$BUILD_CTX"
 # Capture before grepping: with pipefail, `cmd | grep -q` fails when grep exits early and cmd
 # gets SIGPIPE.
 INSTALLED_TARGETS="$(rustup target list --installed 2>/dev/null || true)"
-TDIR="${CARGO_TARGET_DIR:-target}"
+# parvault and parvault-seed are staged through scripts/stage_artifact.sh (A-DOCKER, B-47): it
+# builds them, copies them into the image context and records their hashes for the enforcement gate.
+STAGE_TRIPLE=""
+BASE_IMAGE="ubuntu:24.04"
 if [ "${USE_GLIBC_IMAGE:-0}" != "1" ] && grep -q "x86_64-unknown-linux-musl" <<<"$INSTALLED_TARGETS"; then
-    cargo build --release --target x86_64-unknown-linux-musl --bin parvault --bin parvault-seed
-    cp "$TDIR/x86_64-unknown-linux-musl/release/parvault" "$BUILD_CTX/parvault"
-    cp "$TDIR/x86_64-unknown-linux-musl/release/parvault-seed" "$BUILD_CTX/parvault-seed"
+    STAGE_TRIPLE="x86_64-unknown-linux-musl"
     BASE_IMAGE="alpine:3.20"
-    STATUS_TARGET="--target x86_64-unknown-linux-musl"
-else
-    if [ ! -f "$TDIR/release/parvault" ] || [ ! -f "$TDIR/release/parvault-seed" ]; then
-        cargo build --release --bin parvault --bin parvault-seed
-    fi
-    cp "$TDIR/release/parvault" "$BUILD_CTX/parvault"
-    cp "$TDIR/release/parvault-seed" "$BUILD_CTX/parvault-seed"
-    BASE_IMAGE="ubuntu:24.04"
-    STATUS_TARGET=""
 fi
+for b in parvault parvault-seed; do
+    bash scripts/stage_artifact.sh --bin "$b" --profile release ${STAGE_TRIPLE:+--target "$STAGE_TRIPLE"} --dest "$BUILD_CTX/$b"
+done
+STATUS_TARGET="${STAGE_TRIPLE:+--target $STAGE_TRIPLE}"
 # The sidecar with its own feature set (no tokio, no libp2p), as releases build it.
 # shellcheck disable=SC2086
 bash scripts/build_bins.sh --profile release $STATUS_TARGET --out "$BUILD_CTX/sidecar" parvault-status
@@ -707,9 +703,8 @@ mkdir -p "$VFS_CTX"
 VFS_TEST_BIN="$(cargo test --release --test vfs_mp4_seek_gate --no-run --message-format=json 2>/dev/null \
     | sed -n 's/.*"executable":"\([^"]*vfs_mp4_seek_gate[^"]*\)".*/\1/p' | tail -1)"
 [ -x "$VFS_TEST_BIN" ] || { echo "ERROR: stage 12c: no vfs_mp4_seek_gate test binary"; exit 1; }
-cargo build --release --bin parvault-fuse
 cp "$VFS_TEST_BIN" "$VFS_CTX/vfs_mp4_seek_gate"
-cp "$TDIR/release/parvault-fuse" "$VFS_CTX/parvault-fuse"
+bash scripts/stage_artifact.sh --bin parvault-fuse --profile release --dest "$VFS_CTX/parvault-fuse"
 cat > "$VFS_CTX/Dockerfile" <<'EOF'
 FROM ubuntu:24.04
 RUN apt-get update -o Acquire::Retries=3 \
