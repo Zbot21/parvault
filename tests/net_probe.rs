@@ -217,9 +217,11 @@ fn probe_wrong_peer_id_fails() {
     let d = spawn_daemon("wrong");
     let t = empty_dir("wrong-c");
     let addr = format!("{}/p2p/{}", d.mesh, other_pid());
-    let (code, doc, _) = probe(t.path(), &[], &["--peer", &addr, "--force-direct"]);
+    let (code, doc, err) = probe(t.path(), &[], &["--peer", &addr, "--force-direct"]);
     assert_eq!(code, 1, "{doc}");
-    assert_eq!(doc["reason"], "peer_id_mismatch");
+    assert_eq!(doc["reason"], "peer_id_mismatch", "{err}");
+    // Logs (the gate's refusal line) go to stderr; stdout is the one JSON document.
+    assert!(err.contains("reject.dial_peer_id_mismatch"), "{err}");
     gate_ran("net_probe::probe_wrong_peer_id_fails");
 }
 

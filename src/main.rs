@@ -294,15 +294,19 @@ fn build_wan_card_with_stun_port(params: StunWanCardParams<'_>) -> anyhow::Resul
 /// profile asks for (B-53): the router profile gets a bounded pool (`HardwareProfile::
 /// runtime_worker_threads`, `runtime_max_blocking_threads`); other profiles keep tokio's defaults.
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("parvault=info,warn")),
-        )
-        .init();
-
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("parvault=info,warn"));
+    if matches!(cli.command, Commands::Net { .. }) {
+        // `net probe` prints exactly one JSON document on stdout: logs go to stderr.
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
     // Stores nothing and needs no data directory or configuration.
     if matches!(cli.command, Commands::NewSeedPhrase) {
         println!("{}", generate_bip39_mnemonic(24)?);
