@@ -8,6 +8,7 @@ pub use challenger::{
     compute_salted_commitment, generate_multi_segment_por_challenge, generate_por_challenge,
     ByteSegment, MultiSegmentPorChallenge, PorChallenge, PorResponse,
 };
+pub use chunk_merkle::{chunk_proof_decision, ChunkProof, ChunkProofFacts};
 #[cfg(feature = "daemon-runtime")]
 pub use verifier::{
     shard_bound_to_another_owner_code, shard_rebind_decision, AuditOutcome,
