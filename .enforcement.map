@@ -28,7 +28,7 @@ reach      F-05      sym=src/network/wot.rs::verify_and_admit_public_ticket from
 reach      F-06      sym=src/por/verifier.rs::verify_audit_response from=src/cli/daemon.rs::run_daemon ref=docs/security/TRUST_FINDINGS.md
 reach      VFS-FUSE-1 sym=src/vfs.rs::serve_fuse_fd_blocking from=src/bin/parvault-fuse.rs::main   # plan-5: the FUSE loop is reached from the plugin and the daemon
 reach      VFS-FUSE-2 sym=src/vfs.rs::serve_fuse_fd_blocking from=src/cli/daemon.rs::run_daemon   # plan-5: the FUSE loop is reached from the plugin and the daemon
-open       F-06      expect=reach by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+open       F-06      expect=reach by=v0.5.2 ref=docs/security/TRUST_FINDINGS.md   # L-100: PoR audit loop wiring and the ADR-03 chunk-proof redesign need a plan and architect review (plan-b59-por-audit-loop.md)
 
 # --- Blocking calls on handler paths --------------------------------------------------------------
 no-blocking F-18     path=src/network/wire_handler.rs
@@ -164,7 +164,7 @@ claim      F-33-BUDGET sym=src/network/server_events.rs::relay_forward_decision 
 # --- F-37 (2b) and 2c findings declared before their tests (architect 2b sign-off) ---
 claim      F-37      sym=src/network/wot.rs::ring_handshake_decision accept=trust_enforcement::f37_ring_node_admits_real_chain reject=trust_enforcement::f37_ticket_only_node_refuses_zero_rooted_chain code=reject.handshake_no_ring bin=parvault ref=docs/security/TRUST_FINDINGS.md
 claim      F-07      sym=src/bootstrap.rs::simulate_por_heartbeats accept=trust_enforcement::f07_peer_audit_pass_credited reject=trust_enforcement::f07_self_answered_audit_not_credited code=reject.por_self_credit bin=parvault ref=docs/security/TRUST_FINDINGS.md
-open       F-07      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+open       F-07      expect=claim-missing by=v0.5.2 ref=docs/security/TRUST_FINDINGS.md   # L-100: PoR audit loop wiring and the ADR-03 chunk-proof redesign need a plan and architect review (plan-b59-por-audit-loop.md)
 claim      F-08      sym=src/storage/council.rs::council_manifest_decision accept=trust_enforcement::f08_majority_council_order_applied reject=trust_enforcement::f08_below_majority_quorum_refused code=reject.council_quorum_below_majority bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-26-verifiable-abuse-and-council-quorum-governance.md
 # Item 6 C1 (F-45, core half): InstallCouncilManifest over admin RPC on a real parvault-seed.
 claim      F-45      sym=src/storage/council.rs::seed_council_install_decision accept=trust_enforcement::c1_epoch1_installed_and_repush_is_idempotent reject=trust_enforcement::c1_in_memory_seed_refuses_install code=reject.council_install_in_memory bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md
@@ -176,7 +176,7 @@ claim      F-09      sym=src/storage/eviction.rs::order_admission_decision accep
 kani       F-17      sym=src/capabilities.rs::gateway_statement_decision harness=proof_gateway_statement_pinned_and_bounded cover=statement unpinned or unbounded
 claim      F-24-ISSUER sym=src/network/wire_handler.rs::voucher_issuer_decision accept=trust_enforcement::f24_ring_issuer_voucher_redeemed reject=trust_enforcement::f24_stranger_issuer_voucher_refused code=reject.voucher_issuer_untrusted bin=parvault ref=docs/security/TRUST_FINDINGS.md
 claim      F-34      sym=src/por/verifier.rs::verify_audit_response accept=trust_enforcement::f34_chunk_proof_verified reject=trust_enforcement::f34_wrong_chunk_proof_refused code=reject.por_chunk_proof_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md
-open       F-34      expect=claim-missing by=v0.5.0 ref=docs/security/TRUST_FINDINGS.md
+open       F-34      expect=claim-missing by=v0.5.2 ref=docs/security/TRUST_FINDINGS.md   # L-100: PoR audit loop wiring and the ADR-03 chunk-proof redesign need a plan and architect review (plan-b59-por-audit-loop.md)
 claim      F-35      sym=src/storage/anonymity.rs::voucher_freshness_decision accept=trust_enforcement::f35_fresh_voucher_redeemed reject=trust_enforcement::f35_expired_voucher_refused code=reject.voucher_expired bin=parvault ref=docs/security/TRUST_FINDINGS.md
 claim      F-55      sym=src/storage/anonymity.rs::nullifier_persist_decision accept=trust_enforcement::f55_persisted_nullifier_voucher_redeemed reject=trust_enforcement::f55_unpersisted_nullifier_voucher_refused code=reject.voucher_nullifier_not_persisted bin=parvault ref=docs/security/TRUST_FINDINGS.md
 
