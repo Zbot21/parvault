@@ -29,7 +29,6 @@ use libp2p::{
     futures::StreamExt,
     identify,
     kad::{self, store::RecordStore},
-    mdns,
     multiaddr::Protocol,
     ping,
     request_response::{self, Message, OutboundRequestId},
@@ -864,17 +863,6 @@ fn spawn_swarm_worker(
                                                 continue;
                                             }
                                         }
-                                        let base = strip_p2p_protocol(&addr);
-                                        swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
-                                        if let Ok(mut disc) = discovered_peers.lock() {
-                                            disc.insert(format!("{base}/p2p/{peer_id}"));
-                                        }
-                                    }
-                                }
-                                SwarmEvent::Behaviour(MeshNetworkBehaviourEvent::Mdns(
-                                    mdns::Event::Discovered(list),
-                                )) => {
-                                    for (peer_id, addr) in list {
                                         let base = strip_p2p_protocol(&addr);
                                         swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                                         if let Ok(mut disc) = discovered_peers.lock() {

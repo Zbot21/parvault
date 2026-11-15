@@ -141,3 +141,16 @@ fn construct_behaviour(
         req_resp,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B-41 / F-11: the client swarm never runs mDNS, so its event loop has no mDNS arm.
+    #[tokio::test]
+    async fn client_swarm_has_mdns_off() {
+        let swarm =
+            build_mesh_client_swarm(libp2p::identity::Keypair::generate_ed25519(), false).unwrap();
+        assert!(!swarm.behaviour().mdns.is_enabled());
+    }
+}
