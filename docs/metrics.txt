@@ -125,9 +125,6 @@ docker.unpacked = 20.6 MB
 docker.live_rss = 8.36 MiB
 router_soc.daemon_peak_vmhwm = 9.38 MiB
 router_soc.daemon_threads = 6
-# Docker acceptance Stage 12 (router-soc image, 48m cgroup, --profile router-soc store and
-# restore) peak VmHWM, as recorded in SECURITY_AND_CRYPTOGRAPHY.md; UNPROVENANCED, not re-measured.
-docker.router_soc_stage12_vmhwm = 15.8 MiB
 
 # --- TLA+ TLC state counts (BENCHMARKS.md section 5) ----------------------------
 # bash scripts/gen_metrics.sh --measured tlc (TLC -workers auto on every specs/*.tla)

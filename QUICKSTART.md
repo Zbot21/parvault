@@ -95,7 +95,7 @@ parvault up \
   --pair
 ```
 This automatically starts:
-1. The **P2P storage daemon** (1 MiB stripes; <!-- metric:docker.live_rss -->`8.36 MiB`<!-- /metric --> resident in the Docker gate's 48 MiB container),
+1. The **P2P storage daemon** (1 MiB stripes; <!-- metric:docker.live_rss -->`8.36 MiB`<!-- /metric --> resident in the Docker gate's 48 MiB container, idle on the ring: not an upper bound),
 2. The **Signed LAN Beacon Responder** on UDP `4009`,
 3. The **Embedded Status Dashboard** on `http://localhost:4080`,
 4. An active **4-word pairing code** (e.g. `shield-copper-alpine-matrix`).
