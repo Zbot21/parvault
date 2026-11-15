@@ -1,8 +1,12 @@
+pub mod audit;
 pub mod challenger;
 pub mod chunk_merkle;
 #[cfg(feature = "daemon-runtime")]
 pub mod verifier;
 
+pub use audit::{
+    audit_credit_decision, chunk_audit_decision, AuditCredit, AuditFacts, AuditVerdict,
+};
 pub use challenger::{
     compute_challenge_hmac, compute_chunk_challenge_hmac, compute_multi_challenge_hmac,
     compute_multi_salted_commitment, compute_salted_commitment, generate_chunk_challenge,
