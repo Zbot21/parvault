@@ -1568,6 +1568,12 @@ fn any_device_id() -> Option<&'static str> {
 /// all 32 bytes, whatever the device ids say: a sender that is neither is refused even when it
 /// is the accounted owner (no fall-through). A missing key with a grant is refused. With no
 /// grant, the rule is the accounted owner (F-34-STORER).
+///
+/// Bound: keys come from [`any_pool_key`] (3 constants: `A`, `A` with byte 31 changed, `B`) and
+/// witness sets hold at most 2. The decision only compares keys for equality, so its outcome
+/// depends only on which keys are equal; 3 keys with sets of 2 reach every equal/unequal
+/// pattern of sender, owner and witnesses, and the near miss forces a full 32-byte compare.
+/// The 8-witness bound itself is in `proof_grant_registration_witness_bound` and unit tests.
 #[kani::proof]
 #[kani::unwind(34)]
 fn proof_por_storer_decision() {
@@ -1593,6 +1599,18 @@ fn proof_por_storer_decision() {
         kani::cover!(decision.is_ok() && key == owner, "grant owner admitted");
         kani::cover!(decision.is_ok() && key != owner, "witness admitted");
         kani::cover!(
+            decision.is_err() && has_key && key != owner,
+            "non-witness refused under a grant"
+        );
+        kani::cover!(
+            decision.is_err() && has_key && key[31] != owner[31] && key[0] == owner[0],
+            "one-byte near miss of the owner refused"
+        );
+        kani::cover!(
+            decision.is_err() && !has_key,
+            "no key refused under a grant"
+        );
+        kani::cover!(
             decision.is_err()
                 && f.sender_device_id.is_some()
                 && f.sender_device_id == f.accounted_owner,
@@ -1602,6 +1620,7 @@ fn proof_por_storer_decision() {
         assert_eq!(decision.is_ok(), has_key && named);
     } else {
         kani::cover!(decision.is_ok(), "accounted owner admitted without a grant");
+        kani::cover!(decision.is_err(), "non-owner refused without a grant");
         let same = matches!((f.sender_device_id, f.accounted_owner), (Some(s), Some(o)) if s == o);
         // (c) today's rule.
         assert_eq!(decision.is_ok(), same);
@@ -1635,6 +1654,12 @@ fn proof_grant_registration_witness_bound() {
 
 /// A-113 C9: a same-owner grant replaces the registered one only if it names every registered
 /// witness (all 32 bytes), so a replayed older grant can never drop a witness.
+///
+/// Bound: keys come from [`any_pool_key`] (3 constants: `A`, `A` with byte 31 changed, `B`) and
+/// witness sets hold at most 2. The decision only compares keys for equality, so its outcome
+/// depends only on which keys are equal; 3 keys with sets of 2 reach every equal/unequal
+/// pattern of the registered and incoming witness sets, and the near miss forces a full 32-byte compare.
+/// The 8-witness bound itself is in `proof_grant_registration_witness_bound` and unit tests.
 #[kani::proof]
 #[kani::unwind(34)]
 fn proof_grant_replace_witness_superset() {
@@ -1649,6 +1674,11 @@ fn proof_grant_replace_witness_superset() {
         decision.is_ok() && has_old && n_old > 0,
         "superset replaces"
     );
+    kani::cover!(
+        decision.is_ok() && !has_old,
+        "no registered grant: replaced"
+    );
+    kani::cover!(decision.is_err() && n_new > 0, "partial overlap kept out");
     let superset = !has_old || (0..n_old).all(|i| named(&old[i]));
     assert_eq!(decision.is_ok(), superset);
 }

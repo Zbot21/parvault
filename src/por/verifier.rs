@@ -1625,6 +1625,41 @@ mod chunk_admit_tests {
 
     /// B59-WITNESS-BOUND and C9 (unit): nine witnesses register nothing; a same-owner grant
     /// with fewer witnesses keeps the registered one, a superset replaces it.
+    /// B59-WITNESS-BOUND at the full bound, on the real functions: 8 witnesses register, 9 are
+    /// refused and bind nothing; over 8 keys, a 7-key subset is a downgrade and the 8 replace 7.
+    #[test]
+    fn grant_witness_bound_at_eight() {
+        let owner = NodeIdentity::from_seed([0x41; 32]);
+        let keys: Vec<[u8; 32]> = (0..9u8)
+            .map(|i| NodeIdentity::from_seed([0x50 + i; 32]).public_key_bytes())
+            .collect();
+        let eight = keys[..MAX_GRANT_WITNESSES].to_vec();
+        let seven = keys[..MAX_GRANT_WITNESSES - 1].to_vec();
+        assert_eq!(MAX_GRANT_WITNESSES, 8);
+        let mut e = PorVerifierEngine::new(300);
+        let g9 = RepairGrant::issue(&owner, [1; 32], keys.clone(), ErasureTier::Consumer);
+        assert_eq!(
+            e.register_repair_grant_for_stored(g9, &[sid(0)]),
+            Err("reject.repair_grant_too_many_witnesses")
+        );
+        assert_eq!(e.shard_grant_owner(&sid(0)), None);
+        let g7 = RepairGrant::issue(&owner, [1; 32], seven.clone(), ErasureTier::Consumer);
+        assert_eq!(e.register_repair_grant_for_stored(g7, &[sid(0)]), Ok(()));
+        let g8 = RepairGrant::issue(&owner, [1; 32], eight.clone(), ErasureTier::Consumer);
+        assert_eq!(e.register_repair_grant_for_stored(g8, &[sid(1)]), Ok(()));
+        let (_, g) = e.get_shard_session_and_grant(&sid(0));
+        assert_eq!(g.unwrap().authorized_witness_pubkeys, eight, "8 replace 7");
+        assert_eq!(grant_replace_decision(Some(&seven), &eight), Ok(()));
+        assert_eq!(
+            grant_replace_decision(Some(&eight), &seven),
+            Err("reject.repair_grant_witness_downgrade")
+        );
+        let g7b = RepairGrant::issue(&owner, [1; 32], seven, ErasureTier::Consumer);
+        assert_eq!(e.register_repair_grant_for_stored(g7b, &[sid(2)]), Ok(()));
+        let (_, g) = e.get_shard_session_and_grant(&sid(2));
+        assert_eq!(g.unwrap().authorized_witness_pubkeys, eight, "7 kept out");
+    }
+
     #[test]
     fn grant_witness_bound_and_superset() {
         assert_eq!(
