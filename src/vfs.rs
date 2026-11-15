@@ -3,7 +3,7 @@
 //! Supports both `=y` built-in in-process mode (`GatewayBus::InProcess(Arc<GatewayEngine>)`,
 //! `--no-socket` zero `.sock` file on disk) and `=m` split-plugin mode
 //! (`GatewayBus::UnixSocket(GatewayIpcClient)` over `/var/run/parvault.sock`):
-//! 1. **Instant Lazy-Loaded Metadata Inodes (`VfsStubNode`)**: Mounts `10 GiB+` virtual vaults
+//! 1. **Instant Lazy-Loaded Metadata Inodes (`VfsLazyNode`)**: Mounts `10 GiB+` virtual vaults
 //!    instantaneously in RAM (`O(1)` POSIX inode registration with zero eager shard downloads,
 //!    backed at read time by `GatewayBus` Reed-Solomon streaming).
 //! 2. **Targeted On-Demand Range Retrieval (`< 50 ms` TTFB)**: Translates POSIX `(inode, offset, len)`
@@ -181,13 +181,13 @@ impl LruBlockCache {
 
 /// Lazy-loaded POSIX VFS metadata inode representing a virtual directory or on-demand vault file.
 ///
-/// Note on naming: `VfsStubNode` denotes a dehydrated cloud-filesystem metadata inode (holding
+/// Note on naming: `VfsLazyNode` denotes a dehydrated cloud-filesystem metadata inode (holding
 /// POSIX `ino`, `size_bytes`, `mode`, `mtime_unix_secs`, [`EphemeralShardManifest`], and optional
 /// [`CapabilityMacaroon`]) whose payload blocks are fetched lazily on demand over real
 /// [`GatewayIpcServer`](crate::gateway::ipc::GatewayIpcServer) + `memfd` `SCM_RIGHTS` IPC. It is a
-/// production lazy-mount data structure, never a test fake or mock.
+/// production lazy-mount data structure used by the shipped FUSE and WebDAV mounts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VfsStubNode {
+pub struct VfsLazyNode {
     pub ino: u64,
     pub parent_ino: u64,
     pub name: String,
@@ -510,7 +510,7 @@ mod unix_vfs {
         bus: GatewayBus,
         block_size: usize,
         default_macaroon: Option<CapabilityMacaroon>,
-        nodes: Arc<Mutex<BTreeMap<u64, VfsStubNode>>>,
+        nodes: Arc<Mutex<BTreeMap<u64, VfsLazyNode>>>,
         children: Arc<Mutex<HashMap<u64, BTreeMap<String, u64>>>>,
         next_ino: Arc<Mutex<u64>>,
         cache: Arc<Mutex<LruBlockCache>>,
@@ -570,7 +570,7 @@ mod unix_vfs {
             let mut nodes = BTreeMap::new();
             nodes.insert(
                 VFS_ROOT_INO,
-                VfsStubNode {
+                VfsLazyNode {
                     ino: VFS_ROOT_INO,
                     parent_ino: VFS_ROOT_INO,
                     name: "/".into(),
@@ -609,8 +609,8 @@ mod unix_vfs {
         }
 
         /// Registers a virtual file path (e.g. `"/movies/archive_10gb.bin"` or `"backup.tar"`)
-        /// instantaneously as an in-memory metadata stub without fetching any shard bytes.
-        pub fn register_stub_file(
+        /// instantaneously as an in-memory lazy metadata inode without fetching any shard bytes.
+        pub fn register_lazy_file(
             &self,
             virtual_path: &str,
             manifest: EphemeralShardManifest,
@@ -642,7 +642,7 @@ mod unix_vfs {
                     cur_parent = dir_ino;
                 } else {
                     let dir_ino = self.alloc_ino();
-                    let stub = VfsStubNode {
+                    let node = VfsLazyNode {
                         ino: dir_ino,
                         parent_ino: cur_parent,
                         name: (*dir_name).to_string(),
@@ -653,7 +653,7 @@ mod unix_vfs {
                         manifest: None,
                         macaroon: None,
                     };
-                    self.nodes.lock().unwrap().insert(dir_ino, stub);
+                    self.nodes.lock().unwrap().insert(dir_ino, node);
                     self.children
                         .lock()
                         .unwrap()
@@ -668,7 +668,7 @@ mod unix_vfs {
             let file_name = parts[parts.len() - 1].to_string();
             let ino = self.alloc_ino();
             let size_bytes = manifest.total_size;
-            let file_stub = VfsStubNode {
+            let file_node = VfsLazyNode {
                 ino,
                 parent_ino: cur_parent,
                 name: file_name.clone(),
@@ -679,7 +679,7 @@ mod unix_vfs {
                 manifest: Some(manifest),
                 macaroon,
             };
-            self.nodes.lock().unwrap().insert(ino, file_stub);
+            self.nodes.lock().unwrap().insert(ino, file_node);
             self.children
                 .lock()
                 .unwrap()
@@ -696,11 +696,11 @@ mod unix_vfs {
             id
         }
 
-        pub fn getattr(&self, ino: u64) -> Option<VfsStubNode> {
+        pub fn getattr(&self, ino: u64) -> Option<VfsLazyNode> {
             self.nodes.lock().unwrap().get(&ino).cloned()
         }
 
-        pub fn lookup(&self, parent_ino: u64, name: &str) -> Option<VfsStubNode> {
+        pub fn lookup(&self, parent_ino: u64, name: &str) -> Option<VfsLazyNode> {
             let child_ino = self
                 .children
                 .lock()
@@ -711,7 +711,7 @@ mod unix_vfs {
             self.getattr(child_ino)
         }
 
-        pub fn lookup_path(&self, virtual_path: &str) -> Option<VfsStubNode> {
+        pub fn lookup_path(&self, virtual_path: &str) -> Option<VfsLazyNode> {
             let parts: Vec<&str> = virtual_path
                 .trim_matches('/')
                 .split('/')
@@ -728,7 +728,7 @@ mod unix_vfs {
             self.getattr(cur)
         }
 
-        pub fn readdir(&self, dir_ino: u64) -> Vec<VfsStubNode> {
+        pub fn readdir(&self, dir_ino: u64) -> Vec<VfsLazyNode> {
             let child_inos: Vec<u64> = self
                 .children
                 .lock()
@@ -765,20 +765,20 @@ mod unix_vfs {
             length: u64,
         ) -> io::Result<(Vec<u8>, Duration)> {
             let t0 = Instant::now();
-            let stub = self.getattr(ino).ok_or_else(|| {
+            let node = self.getattr(ino).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("inode {ino} not found"))
             })?;
-            if stub.is_dir {
+            if node.is_dir {
                 return Err(io::Error::new(
                     io::ErrorKind::IsADirectory,
                     "cannot read bytes from directory inode",
                 ));
             }
-            let Some(manifest) = stub.manifest else {
+            let Some(manifest) = node.manifest else {
                 return Ok((Vec::new(), t0.elapsed()));
             };
             let Some((end_offset, first_blk, last_blk)) =
-                compute_vfs_block_window(stub.size_bytes, offset, length, self.block_size)
+                compute_vfs_block_window(node.size_bytes, offset, length, self.block_size)
             else {
                 return Ok((Vec::new(), t0.elapsed()));
             };
@@ -790,7 +790,7 @@ mod unix_vfs {
 
             for blk_idx in first_blk..=last_blk {
                 let blk_start = blk_idx.saturating_mul(bsz);
-                let blk_len = stub.size_bytes.saturating_sub(blk_start).min(bsz);
+                let blk_len = node.size_bytes.saturating_sub(blk_start).min(bsz);
 
                 // F-43 (L-44 item 4): a cache hit is served without a gateway `FetchRange`, so for
                 // WebDAV the edge `webdav_auth_decision` (for the plugin host: `is_attenuation_of`
@@ -799,7 +799,7 @@ mod unix_vfs {
                 let blk_bytes = match cached {
                     Some(hit_bytes) => hit_bytes,
                     None => {
-                        let effective_mac = stub
+                        let effective_mac = node
                             .macaroon
                             .clone()
                             .or_else(|| self.default_macaroon.clone());
@@ -835,7 +835,7 @@ mod unix_vfs {
         }
 
         /// Synchronizes all non-ignored regular files in `local_dir` into `parvault` via sealed
-        /// `memfd` (`store_sealed_memfd_sync`) and mounts them as lazy VFS stubs, honoring
+        /// `memfd` (`store_sealed_memfd_sync`) and mounts them as lazy VFS inodes, honoring
         /// [`crate::sync::ParvaultIgnore::from_folder`].
         pub fn ingest_local_directory(&self, local_dir: &Path) -> io::Result<usize> {
             let ignore = crate::sync::ParvaultIgnore::from_folder(local_dir);
@@ -882,7 +882,7 @@ mod unix_vfs {
                         copied,
                         RetentionPolicy::Persistent,
                     )?;
-                    self.register_stub_file(&rel, manifest, None)?;
+                    self.register_lazy_file(&rel, manifest, None)?;
                     *count += 1;
                 }
             }
@@ -1000,7 +1000,7 @@ mod unix_vfs {
     /// file, never a collection or a missing path (no existence oracle).
     fn webdav_scope_ok(
         token: &CapabilityMacaroon,
-        node: Option<&VfsStubNode>,
+        node: Option<&VfsLazyNode>,
         get_range: Option<(u64, u64)>,
     ) -> bool {
         use crate::capabilities::{AccessRequestContext, Caveat};
@@ -1404,7 +1404,7 @@ mod unix_vfs {
         }
     }
 
-    fn stub_to_fuse_attr(node: &VfsStubNode) -> FuseAttr {
+    fn lazy_to_fuse_attr(node: &VfsLazyNode) -> FuseAttr {
         FuseAttr {
             ino: node.ino,
             size: node.size_bytes,
@@ -1492,7 +1492,7 @@ mod unix_vfs {
                             attr_valid: 60,
                             attr_valid_nsec: 0,
                             dummy: 0,
-                            attr: stub_to_fuse_attr(&node),
+                            attr: lazy_to_fuse_attr(&node),
                         };
                         write_fuse_reply(&mut dev, in_hdr.unique, 0, &out.to_ne_bytes())?;
                     } else {
@@ -1513,7 +1513,7 @@ mod unix_vfs {
                             attr_valid: 60,
                             entry_valid_nsec: 0,
                             attr_valid_nsec: 0,
-                            attr: stub_to_fuse_attr(&node),
+                            attr: lazy_to_fuse_attr(&node),
                         };
                         write_fuse_reply(&mut dev, in_hdr.unique, 0, &out.to_ne_bytes())?;
                     } else {

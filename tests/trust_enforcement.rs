@@ -5970,7 +5970,7 @@ fn f43_per_ip_connection_cap() {
 
 // --- QA 2c D1: a peer demanding excessive ticket PoW cannot hang a public client --------------------
 
-/// A fake public peer: answers every request with a refused `AdmitPublicTicketAck` demanding
+/// A hostile public peer: answers every request with a refused `AdmitPublicTicketAck` demanding
 /// `bits` of PoW. Returns its `/p2p/` address; the swarm runs on its own thread.
 fn spawn_pow_demanding_peer(bits: u8) -> String {
     use libp2p::request_response::{self, ProtocolSupport};
@@ -6032,7 +6032,7 @@ fn spawn_pow_demanding_peer(bits: u8) -> String {
         });
     });
     rx.recv_timeout(Duration::from_secs(10))
-        .expect("fake peer listening")
+        .expect("hostile peer listening")
 }
 
 /// D1: a public-commons client facing a peer that demands 255 bits of PoW refuses the demand

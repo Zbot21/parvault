@@ -56,7 +56,7 @@ enum FuseCommand {
         /// Open `/dev/fuse` file descriptor number (e.g. passed by `fusermount3` or container init).
         #[arg(long)]
         fuse_fd: i32,
-        /// Optional local seed directory to ingest & expose as metadata stubs on startup.
+        /// Optional local seed directory to ingest & expose as lazy metadata inodes on startup.
         #[arg(long)]
         seed_dir: Option<PathBuf>,
     },
@@ -207,7 +207,7 @@ fn main() -> anyhow::Result<()> {
                 // Cap cache at 2 MiB and read 4 MiB across blocks to verify LRU eviction + <50ms TTFB.
                 let vfs = VirtualVaultFs::new(&cli.socket, tmp_dir.join("cache"), 2 * 1024 * 1024)?
                     .with_default_macaroon(default_macaroon);
-                let ino = vfs.register_stub_file("/vault/test.bin", manifest, None)?;
+                let ino = vfs.register_lazy_file("/vault/test.bin", manifest, None)?;
                 let (slice, ttfb) =
                     vfs.read_range_with_ttfb(ino, 1024 * 1024 + 17, 2 * 1024 * 1024)?;
                 anyhow::ensure!(

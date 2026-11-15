@@ -22,7 +22,7 @@ Every compilation root in `parvault` enforces a strict compiler-level `unsafe_co
 - **Compact `PARVAULT-MAC-V1:` Binary Token Codec & `AllowedPeerUid` Caveat (`src/capabilities.rs`)**: Implemented in 100% safe, zero-heap-allocation stack encoding (`encode_stack`), formally verified by Kani (`proof_macaroon_peer_uid_and_compact_roundtrip`).
 - **Pure-Rust Linux FUSE `ABI 7.31` Wire Parser (`src/vfs.rs`)**: All three former `std::ptr::read_unaligned` pointer casts were replaced with safe fixed-array `u32::from_ne_bytes` / `u64::from_ne_bytes` parsers (`parse_fuse_in_header`, `parse_fuse_read_in`), proven panic-free across arbitrary byte lengths by Kani (`proof_fuse_header_parser_no_panic`).
 - **Zero-`unsafe` Relative Path Sanitizer & Zero-Key `GatewayFolderSync` (`src/sync.rs`)**: `sanitize_sync_relative_path` (`sanitize_sync_relative_path_into`) validates and normalizes relative sync paths in a single flat pass (`0` `unsafe`, `0` heap `Vec` growth), formally verified panic-free, traversal-free, and idempotent across symbolic byte slices by Kani (`proof_sanitize_sync_relative_path_no_traversal`).
-- **Zero-Mock Policy**: `0` `todo!()`, `0` `unimplemented!()`, and `0` mock/fake transport or storage shims exist anywhere in `src/`, `tests/`, or `benches/`. VFS `VfsStubNode` represents lazy-hydrated POSIX metadata inodes backed by a live `GatewayEngine` / `GatewayIpcServer` + kernel `memfd` pipeline.
+- **Zero-Mock Policy**: `0` `todo!()`, `0` `unimplemented!()`, and `0` mock/fake transport or storage shims exist anywhere in `src/`, `tests/`, or `benches/`. VFS `VfsLazyNode` represents lazy-hydrated POSIX metadata inodes backed by a live `GatewayEngine` / `GatewayIpcServer` + kernel `memfd` pipeline.
 
 ---
 

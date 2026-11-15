@@ -1,7 +1,7 @@
 //! Task Gate 4 (`parvault::vfs` + `parvault-fuse`):
 //! `test_vfs_lazy_fetch_latency`:
 //! 1. Mounts a virtual **`10 GiB` (`10,737,418,240` bytes)** vault fixture as instant metadata
-//!    stubs over `/var/run/parvault.sock` (`GatewayIpcServer` + `VirtualVaultFs`) with zero eager
+//!    inodes over `/var/run/parvault.sock` (`GatewayIpcServer` + `VirtualVaultFs`) with zero eager
 //!    full-file shard downloads.
 //! 2. Requests a **`5 MiB`** slice at **`4.5 GiB` (`4,831,838,208`)** offset and asserts:
 //!    - Exact bit-for-bit AES-256-GCM + Reed-Solomon (`10-of-20`) decrypted plaintext bytes.
@@ -150,14 +150,14 @@ fn test_vfs_lazy_fetch_latency() {
     let vfs =
         VirtualVaultFs::new(&sock_path, &cache_dir, cache_cap_bytes).expect("init VirtualVaultFs");
     let ino = vfs
-        .register_stub_file(
+        .register_lazy_file(
             "/vault/dataset_10gib.bin",
             EphemeralShardManifest::from_file_manifest(&manifest_10gib),
             None,
         )
-        .expect("register 10 GiB stub file");
+        .expect("register 10 GiB lazy file");
 
-    // Metadata stub must report 10 GiB instantly with ZERO cached blocks fetched yet:
+    // Lazy metadata inode must report 10 GiB instantly with ZERO cached blocks fetched yet:
     let attr = vfs.getattr(ino).expect("getattr");
     assert_eq!(attr.size_bytes, TEN_GIB);
     assert_eq!(vfs.cache_stats().used_bytes, 0);
