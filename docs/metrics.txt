@@ -114,17 +114,16 @@ size.parvault-status.x86_64.bytes = 1,198,240 B
 size.vfs_builtin_overhead.aarch64 = +64 KiB
 # deploy/Dockerfile.router-soc image and the live router-soc daemon under a 48m cgroup.
 # Measured 2026-11-15 on evo-x2 (x86_64 musl, --profile soc) by scripts/docker_acceptance_gate.sh
-# stage 12 at 0585288 (pvjob 20261115-075325-author-router): docker.unpacked is the
-# `docker images` disk usage it printed; docker.compressed the content size, printed by that run
-# as `docker.unpacked.bytes = 6477205` (mislabelled there; the gate now prints it as
-# docker.compressed.bytes). live_rss is the daemon's VmRSS after start and its health check
-# (8832 kB); peak_vmhwm its VmHWM
-# after the stage-12 store and restore on the ring (10224 kB); threads its thread count at both
-# samples (6). The daemon was idle on the ring, not serving a heavy load: not an upper bound.
+# stage 12 at dcc0fbe (pvjob 20261115-092335-author-router, gate PASSED; its `metric` lines):
+# docker.unpacked is `docker images` disk usage (20.6MB); docker.compressed the content size
+# (6,478,584 B). live_rss is the daemon's VmRSS after start and its health check (8556 kB);
+# peak_vmhwm its VmHWM after the stage-12 store and restore on the ring (9600 kB); threads its
+# thread count at both samples (6). An earlier run at 0585288 measured 8832 kB / 10224 kB / 6.
+# The daemon was idle on the ring, not serving a heavy load: not an upper bound.
 docker.compressed = 6.48 MB
 docker.unpacked = 20.6 MB
-docker.live_rss = 8.63 MiB
-router_soc.daemon_peak_vmhwm = 9.98 MiB
+docker.live_rss = 8.36 MiB
+router_soc.daemon_peak_vmhwm = 9.38 MiB
 router_soc.daemon_threads = 6
 # Docker acceptance Stage 12 (router-soc image, 48m cgroup, --profile router-soc store and
 # restore) peak VmHWM, as recorded in SECURITY_AND_CRYPTOGRAPHY.md; UNPROVENANCED, not re-measured.
