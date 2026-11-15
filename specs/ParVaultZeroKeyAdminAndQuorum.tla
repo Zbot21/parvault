@@ -259,13 +259,15 @@ ClientFollowSeed ==
 \* The adversary submits, to the seed or the client, any manifest it can sign: any root, either
 \* domain (a re-root bound to any old root), any epoch, any members, a bad shape, signed by every
 \* key it controls (Byzantine and stranger keys, the rogue root, stolen disk secrets such as A's
-\* key when RootOnDisk); or replays one already installed.
+\* key when RootOnDisk); or replays one already installed. A rotation never reads `from`, so it is
+\* fixed to the manifest's own root (no loss of adversary power).
 AttackerSignerIds == { s \in AllSigners \cup RootKeys : PrivKey(s) \in attackerKeys }
 AdversaryManifests ==
-    { [scope |-> sc, epoch |-> e, members |-> mem, kind |-> k, from |-> fr,
-       signers |-> AttackerSignerIds, shapeOk |-> ok, legacy |-> FALSE] :
-        sc \in Roots, e \in 1..MaxCouncilEpoch, mem \in (SUBSET AllSigners) \ {{}},
-        k \in {"rotate", "reroot"}, fr \in Roots, ok \in BOOLEAN }
+    { m \in { [scope |-> sc, epoch |-> e, members |-> mem, kind |-> k, from |-> fr,
+                signers |-> AttackerSignerIds, shapeOk |-> ok, legacy |-> FALSE] :
+                 sc \in Roots, e \in 1..MaxCouncilEpoch, mem \in (SUBSET AllSigners) \ {{}},
+                 k \in {"rotate", "reroot"}, fr \in Roots, ok \in BOOLEAN } :
+        m.kind = "reroot" \/ m.from = m.scope }
     \cup { councilLog[i] : i \in 1..Len(councilLog) }
 
 AdversaryInstallCouncil ==
