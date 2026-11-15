@@ -24,10 +24,9 @@ adr        D-ADR     path=docs/adr/*.md
 # --- Reach: checks that exist but are not called on the wire path ----------------------------------
 reach      F-03      sym=src/network/wire_handler.rs::admission_decision from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
 reach      F-05      sym=src/network/wot.rs::verify_and_admit_public_ticket from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
-reach      F-06      sym=src/por/verifier.rs::verify_audit_response from=src/cli/daemon.rs::run_daemon ref=docs/security/TRUST_FINDINGS.md
+reach      F-06      sym=src/por/audit.rs::chunk_audit_decision from=src/cli/daemon.rs::run_daemon ref=docs/security/TRUST_FINDINGS.md   # B-59: the owner daemon audit loop (por::auditor::run_audit_job)
 reach      VFS-FUSE-1 sym=src/vfs.rs::serve_fuse_fd_blocking from=src/bin/parvault-fuse.rs::main   # plan-5: the FUSE loop is reached from the plugin and the daemon
 reach      VFS-FUSE-2 sym=src/vfs.rs::serve_fuse_fd_blocking from=src/cli/daemon.rs::run_daemon   # plan-5: the FUSE loop is reached from the plugin and the daemon
-open       F-06      expect=reach by=v0.5.2 ref=docs/security/TRUST_FINDINGS.md   # PoR audit loop wiring and the ADR-03 chunk-proof redesign: plan-b59-por-audit-loop.md and its verdict (L-100, L-101)
 
 # --- Blocking calls on handler paths --------------------------------------------------------------
 no-blocking F-18     path=src/network/wire_handler.rs
@@ -150,7 +149,7 @@ claim      F-25-DHT  sym=src/network/wire_handler.rs::admission_decision accept=
 # Each 2b fix adds its claim line (a differential pair rewritten from its reproduction in
 # tests/trust_enforcement.rs) in the same commit. A claim cannot be declared before its check
 # function exists (an unknown sym is an error even under expect=claim-missing).
-# Findings with no line yet (no check function exists to name): F-07, F-12
+# Findings with no line yet (no check function exists to name): F-12
 #   (2c); F-22, F-26 (2c); F-24 issuer policy (2c).
 
 claim      F-36      sym=src/por/verifier.rs::shard_delete_decision accept=trust_enforcement::f36_storer_deletes_its_shard reject=trust_enforcement::f36_other_key_cannot_delete_shard code=reject.delete_not_shard_owner bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::DeleteShard
@@ -163,8 +162,7 @@ claim      F-33-BUDGET sym=src/network/server_events.rs::relay_forward_decision 
 
 # --- F-37 (2b) and 2c findings declared before their tests (architect 2b sign-off) ---
 claim      F-37      sym=src/network/wot.rs::ring_handshake_decision accept=trust_enforcement::f37_ring_node_admits_real_chain reject=trust_enforcement::f37_ticket_only_node_refuses_zero_rooted_chain code=reject.handshake_no_ring bin=parvault ref=docs/security/TRUST_FINDINGS.md
-claim      F-07      sym=src/bootstrap.rs::simulate_por_heartbeats accept=trust_enforcement::f07_peer_audit_pass_credited reject=trust_enforcement::f07_self_answered_audit_not_credited code=reject.por_self_credit bin=parvault ref=docs/security/TRUST_FINDINGS.md
-open       F-07      expect=claim-missing by=v0.5.2 ref=docs/security/TRUST_FINDINGS.md   # PoR audit loop wiring and the ADR-03 chunk-proof redesign: plan-b59-por-audit-loop.md and its verdict (L-100, L-101)
+claim      F-07      sym=src/por/audit.rs::audit_credit_decision accept=trust_enforcement::f07_peer_audit_pass_credited reject=trust_enforcement::f07_self_answered_audit_not_credited code=reject.por_self_credit bin=parvault ref=docs/security/TRUST_FINDINGS.md
 claim      F-08      sym=src/storage/council.rs::council_manifest_decision accept=trust_enforcement::f08_majority_council_order_applied reject=trust_enforcement::f08_below_majority_quorum_refused code=reject.council_quorum_below_majority bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-26-verifiable-abuse-and-council-quorum-governance.md
 # Item 6 C1 (F-45, core half): InstallCouncilManifest over admin RPC on a real parvault-seed.
 claim      F-45      sym=src/storage/council.rs::seed_council_install_decision accept=trust_enforcement::c1_epoch1_installed_and_repush_is_idempotent reject=trust_enforcement::c1_in_memory_seed_refuses_install code=reject.council_install_in_memory bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md
@@ -175,8 +173,7 @@ claim      F-09      sym=src/storage/eviction.rs::order_admission_decision accep
 # line on the decision, plus unit tests capabilities::tests::f17_* (accept and reject).
 kani       F-17      sym=src/capabilities.rs::gateway_statement_decision harness=proof_gateway_statement_pinned_and_bounded cover=statement unpinned or unbounded
 claim      F-24-ISSUER sym=src/network/wire_handler.rs::voucher_issuer_decision accept=trust_enforcement::f24_ring_issuer_voucher_redeemed reject=trust_enforcement::f24_stranger_issuer_voucher_refused code=reject.voucher_issuer_untrusted bin=parvault ref=docs/security/TRUST_FINDINGS.md
-claim      F-34      sym=src/por/verifier.rs::verify_audit_response accept=trust_enforcement::f34_chunk_proof_verified reject=trust_enforcement::f34_wrong_chunk_proof_refused code=reject.por_chunk_proof_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md
-open       F-34      expect=claim-missing by=v0.5.2 ref=docs/security/TRUST_FINDINGS.md   # PoR audit loop wiring and the ADR-03 chunk-proof redesign: plan-b59-por-audit-loop.md and its verdict (L-100, L-101)
+claim      F-34      sym=src/por/chunk_merkle.rs::chunk_proof_decision accept=trust_enforcement::f34_chunk_proof_verified reject=trust_enforcement::f34_wrong_chunk_proof_refused code=reject.por_chunk_proof_invalid bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::ChunkAudit
 claim      F-35      sym=src/storage/anonymity.rs::voucher_freshness_decision accept=trust_enforcement::f35_fresh_voucher_redeemed reject=trust_enforcement::f35_expired_voucher_refused code=reject.voucher_expired bin=parvault ref=docs/security/TRUST_FINDINGS.md
 claim      F-55      sym=src/storage/anonymity.rs::nullifier_persist_decision accept=trust_enforcement::f55_persisted_nullifier_voucher_redeemed reject=trust_enforcement::f55_unpersisted_nullifier_voucher_refused code=reject.voucher_nullifier_not_persisted bin=parvault ref=docs/security/TRUST_FINDINGS.md
 claim      F-55-LC   sym=src/storage/anonymity.rs::nullifier_load_decision accept=trust_enforcement::f55_loaded_ledger_voucher_redeemed reject=trust_enforcement::f55_corrupt_ledger_voucher_refused code=reject.voucher_ledger_corrupt bin=parvault ref=docs/security/TRUST_FINDINGS.md
@@ -255,4 +252,4 @@ kani       S-SANITIZE sym=src/sync/common.rs::sanitize_sync_relative_path_into h
 claim      B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision accept=trust_enforcement::bseed_second_sender_accepted_while_one_job_runs reject=trust_enforcement::bseed_third_job_refused_busy code=reject.syndication_busy bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe
 kani       B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision harness=proof_syndication_fanout_budget cover=syndication over budget
 
-ratchet    R         open=3 waive=31
+ratchet    R         open=0 waive=31

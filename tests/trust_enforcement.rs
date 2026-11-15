@@ -7461,3 +7461,192 @@ fn f06_rate_seventh_chunk_audit_refused() {
     assert_logged(&node, "reject.por_rate_limited");
     gate_ran("trust_enforcement::f06_rate_seventh_chunk_audit_refused");
 }
+
+// --- B-59: the owner daemon's audit loop (F-06 wiring, F-07, F-34) ------------------------------
+
+/// Stores one small file from the owner data dir `owner_dir` (a ring member) to `peers`.
+fn owner_store(owner_dir: &Path, cwd: &Path, peers: &str, bytes: &[u8]) {
+    let file = cwd.join("audited.bin");
+    std::fs::write(&file, bytes).unwrap();
+    let out = phrase_client(owner_dir, cwd, peers)
+        .args(["file", "store", "--path"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", out_text(&out));
+}
+
+/// Writes a config that audits each host every second (the first tick after one second).
+fn fast_audit_config(dir: &Path) {
+    std::fs::write(
+        dir.join("config.toml"),
+        "por_audit_interval_secs = 1\npor_audit_rtt_ms = 10000\n",
+    )
+    .unwrap();
+}
+
+/// The owner daemon on `dir`, auditing every second.
+fn spawn_owner_daemon(root: TempDir, dir: PathBuf) -> Node {
+    fast_audit_config(&dir);
+    let reg = root.path().join("lan-registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    let log = root.path().join("owner.log");
+    spawn(daemon_command(&dir, &reg), root, dir, log)
+}
+
+/// Waits until a `por.audit` line in the node log contains `needle`.
+fn assert_audit_logged(node: &Node, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if node
+            .log_text()
+            .lines()
+            .any(|l| l.contains("por.audit") && l.contains(needle))
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("no por.audit line with {needle}:\n{}", node.log_text());
+}
+
+/// The owner's own ledger entry for `peer` (read from its persisted quota state).
+fn owner_ledger(owner: &Node, peer: &str) -> Option<parvault::storage::PeerCreditAccount> {
+    let raw = std::fs::read(owner.dir.join("quota_state.bin")).ok()?;
+    let q: parvault::storage::QuotaManager = bincode::deserialize(&raw).ok()?;
+    q.peer_account(peer).cloned()
+}
+
+fn device_id_of(dir: &Path) -> String {
+    NodeIdentity::load_or_generate_in_dir(dir)
+        .unwrap()
+        .device_peer_id()
+}
+
+/// A host daemon and an owner data dir that stored one file on it.
+fn stored_on_host(label: &str, bytes: &[u8]) -> (Node, TempDir, PathBuf) {
+    let host = spawn_daemon(&format!("{label}-host"));
+    let root = temp_root(&format!("{label}-owner"));
+    let dir = root.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    owner_store(&dir, root.path(), &host.addr, bytes);
+    (host, root, dir)
+}
+
+/// Polls `f` for up to 10 s.
+fn eventually(mut f: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// F-34 accept: the owner daemon audits an honest host over the real wire, the proof verifies
+/// against the manifest's chunk root, and the pass is in the owner's log.
+#[test]
+fn f34_chunk_proof_verified() {
+    let (host, root, dir) = stored_on_host("f34-a", &[0x5Au8; 9_000]);
+    let owner = spawn_owner_daemon(root, dir);
+    assert_audit_logged(&owner, "pass");
+    assert!(!owner.log_text().contains("reject.por_chunk_proof_invalid"));
+    drop(host);
+    gate_ran("trust_enforcement::f34_chunk_proof_verified");
+}
+
+/// F-34 reject (verdict change 4): the host's shard files have one byte flipped in every chunk,
+/// so whichever chunk is challenged, the proof fails: `reject.por_chunk_proof_invalid`, a fail
+/// in the owner's ledger and the shard marked degraded. The host is not quarantined.
+#[test]
+fn f34_wrong_chunk_proof_refused() {
+    let (host, root, dir) = stored_on_host("f34-r", &[0x5Au8; 9_000]);
+    let shards = host.dir.join("shards");
+    let mut flipped = 0;
+    for p in files_under(&shards) {
+        let mut b = std::fs::read(&p).unwrap();
+        for off in (0..b.len()).step_by(4096) {
+            b[off] ^= 0xFF;
+        }
+        std::fs::write(&p, b).unwrap();
+        flipped += 1;
+    }
+    assert!(flipped > 0, "no shard files on the host");
+    let owner = spawn_owner_daemon(root, dir);
+    assert_audit_logged(&owner, "reject.por_chunk_proof_invalid");
+    let host_id = device_id_of(&host.dir);
+    assert!(
+        eventually(|| owner_ledger(&owner, &host_id).is_some_and(|a| a.por_failures >= 1)),
+        "no fail recorded for {host_id}"
+    );
+    let state = std::fs::read_to_string(owner.dir.join("por_audit_state.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&state).unwrap();
+    assert!(
+        !v["degraded"].as_array().unwrap().is_empty(),
+        "shard not degraded: {state}"
+    );
+    assert!(!owner.log_text().contains("quarantin"));
+    gate_ran("trust_enforcement::f34_wrong_chunk_proof_refused");
+}
+
+/// F-07 accept: the owner stores to host B, its daemon audits B, and the owner's own ledger
+/// credits B with a pass. Answering credits nothing on B.
+#[test]
+fn f07_peer_audit_pass_credited() {
+    let (host, root, dir) = stored_on_host("f07-a", &[0x6Bu8; 5_000]);
+    let owner = spawn_owner_daemon(root, dir);
+    assert_audit_logged(&owner, "pass");
+    let host_id = device_id_of(&host.dir);
+    assert!(
+        eventually(|| owner_ledger(&owner, &host_id).is_some_and(|a| a.por_passes >= 1)),
+        "no pass credited to {host_id}"
+    );
+    // Answering a challenge changes nothing in the host's own ledger.
+    let host_q: parvault::storage::QuotaManager =
+        bincode::deserialize(&std::fs::read(host.dir.join("quota_state.bin")).unwrap()).unwrap();
+    for id in [host_id.as_str(), &device_id_of(&owner.dir)] {
+        assert!(
+            host_q
+                .peer_account(id)
+                .is_none_or(|a| a.por_passes == 0 && a.por_failures == 0),
+            "host ledger changed for {id}"
+        );
+    }
+    gate_ran("trust_enforcement::f07_peer_audit_pass_credited");
+}
+
+/// F-07 reject (verdict change 11): an owner whose manifest names its own daemon as the host
+/// gets no credit: the sampler refuses with `reject.por_self_credit` before any network call.
+#[test]
+fn f07_self_answered_audit_not_credited() {
+    let root = temp_root("f07-r-owner");
+    let dir = root.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    NodeIdentity::load_or_generate_in_dir(&dir).unwrap();
+    // A master key before the daemon starts, so its audit loop is on.
+    let init = parvault_cli(&dir, false, &["init"]);
+    assert!(init.status.success(), "{}", out_text(&init));
+    let cwd = temp_root("f07-r-cli");
+    let owner = spawn_owner_daemon(root, dir.clone());
+    // The owner's daemon is the only peer, so the manifest names the owner's own node.
+    owner_store(&dir, cwd.path(), &owner.addr, &[0x7Cu8; 5_000]);
+    assert_logged(&owner, "reject.por_self_credit");
+    let node_id = device_id_of(&owner.dir);
+    assert!(
+        owner_ledger(&owner, &node_id).is_none_or(|a| a.por_passes == 0),
+        "self credited"
+    );
+    let audit_lines: Vec<String> = owner
+        .log_text()
+        .lines()
+        .filter(|l| l.contains("por.audit"))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        !audit_lines.iter().any(|l| l.contains("pass")),
+        "{audit_lines:#?}"
+    );
+    gate_ran("trust_enforcement::f07_self_answered_audit_not_credited");
+}
