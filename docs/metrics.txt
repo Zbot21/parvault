@@ -118,6 +118,9 @@ size.vfs_builtin_overhead.aarch64 = +64 KiB
 docker.compressed = 6.13 MB
 docker.unpacked = 19.6 MB
 docker.live_rss = 8.63 MiB
+# Docker acceptance Stage 12 (router-soc image, 48m cgroup, --profile router-soc store and
+# restore) peak VmHWM, as recorded in SECURITY_AND_CRYPTOGRAPHY.md; UNPROVENANCED, not re-measured.
+docker.router_soc_stage12_vmhwm = 15.8 MiB
 
 # --- TLA+ TLC state counts (BENCHMARKS.md section 5) ----------------------------
 # bash scripts/gen_metrics.sh --measured tlc (TLC -workers auto on every specs/*.tla)
