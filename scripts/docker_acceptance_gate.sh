@@ -715,7 +715,10 @@ RUN apt-get update -o Acquire::Retries=3 \
     && rm -rf /var/lib/apt/lists/*
 COPY vfs_mp4_seek_gate /usr/local/bin/vfs_mp4_seek_gate
 COPY parvault-fuse /usr/local/bin/parvault-fuse
-ENV PARVAULT_FUSE_BIN=/usr/local/bin/parvault-fuse TMPDIR=/var/tmp
+# TMPDIR=/tmp: on an Ubuntu 24.04+ host the AppArmor fusermount3 profile attaches by path even
+# inside the container (apparmor:unconfined does not stop it) and denies mount points outside
+# $HOME, /mnt, /media, /run/user/<uid> and /tmp ("failed mntpnt match" under /var/tmp).
+ENV PARVAULT_FUSE_BIN=/usr/local/bin/parvault-fuse TMPDIR=/tmp
 ENTRYPOINT ["/usr/local/bin/vfs_mp4_seek_gate", "--test-threads=1", "--nocapture"]
 EOF
 docker build -t parvault:acceptance-vfs "$VFS_CTX"
