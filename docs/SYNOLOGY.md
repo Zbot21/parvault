@@ -80,23 +80,29 @@ Once the node has joined, you can delete its `invite-*` service on the first nod
 - **No volume in the UI.** Data lives in the named volume `parvault-data`, which starts owned by `65532:65532`. Container Manager does not list named volumes, but it is there and survives rebuilds.
 - **Deleting a project can delete its data.** Deleting a project in Container Manager can remove its volume, and with it the node's keys and ring membership. To change a project, stop it, edit `compose.yaml`, and build. Never delete the first node's project: its volume holds the ring genesis, which every invite needs.
 
-**Back up the first node's volume (UI only).** `parvault-data` holds the node's keys and, on the first node, the ring genesis secret, which every invite needs. Without a copy, losing it ends the ring. Make one once, and again after any change of ring:
+**Back up the first node's volume (UI only).** `parvault-data` holds the node's keys and, on the first node, the ring genesis secret, which every invite needs. Without a copy, losing it ends the ring. Make one once, and again after any change of ring. The copy is one tar file; a restore is a second project.
+
+Both projects use `busybox`, because the ParVault image has no shell and no `tar`. It is a one-time manual pull, by digest so the project never fetches anything else: in Container Manager > Registry, search `busybox`, download the tag `1.37.0`, then check in Image that it is the one pinned below (digest `sha256:a7dbc319...`, shown in the image details). If you pull a different version, put that image's digest in both `image:` lines. `pull_policy: never` stops Compose from fetching on its own.
+
+*Export*
 
 1. Control Panel > Shared Folder > Create a folder, for example `parvault-backup`. Give only your own account Read/Write and everyone else No access; leave "Hide this shared folder in My Network Places" on. Do not enable a recycle bin or a share to other users.
-2. Pull `busybox` (Container Manager > Registry), then make a second project (folder `docker/parvault-export`) from this `compose.yaml`, and build it:
+2. **Stop the `parvault` project** (Project > Action > Stop), so the store database is not being written while it is copied.
+3. Make a second project (folder `docker/parvault-export`) from this `compose.yaml`, and build it:
 
 ```yaml
 name: parvault-export
 services:
   export:
-    image: busybox:latest
+    image: busybox@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec   # busybox 1.37.0
     pull_policy: never
     network_mode: none
     restart: "no"
+    read_only: true
     cap_drop: [ALL]
-    cap_add: [DAC_OVERRIDE]    # to read files owned by 65532 and write the copy
+    cap_add: [DAC_OVERRIDE]    # to read files owned by 65532
     security_opt: ["no-new-privileges:true"]
-    command: ["sh", "-c", "umask 077 && cp -R /data/. /backup/ && echo exported"]
+    command: ["sh", "-c", "umask 077 && tar -cf /backup/parvault-data.tar -C /data . && echo exported"]
     volumes:
       - parvault-data:/data:ro
       - /volume1/parvault-backup:/backup
@@ -106,7 +112,39 @@ volumes:
     name: parvault-data
 ```
 
-It prints `exported` and exits 0; the copy is in the share, readable only by root and you (DSM administrators can always read it). Set the share's path in place of `/volume1/parvault-backup` if the share is on another volume. Then stop and delete the `parvault-export` project, which touches no data (its volume is `external`).
+It prints `exported` and exits 0. Set the share's path in place of `/volume1/parvault-backup` if the share is on another volume. Then stop and delete the `parvault-export` project, which touches no data (its volume is `external`), and **start the `parvault` project again**.
+
+The tar keeps the files' owner (65532) and modes. The tar itself is owned by `root` with mode `0600` (from `umask 077`). The share's own permissions decide who can reach it: on DSM, an administrator can open the share in File Station and download `parvault-data.tar`, and a share permission may not be enough for a non-admin to read a root-owned `0600` file (we have not tested this on DSM). If you need another account to read it, copy it out as an administrator instead of loosening the file's mode.
+
+*Restore (import).* This **overwrites** files in `parvault-data` with the same names from the tar. Use it to bring back a lost or damaged node, never on a node that is working. The volume must exist (the project declares it `external`): if it is gone, build and start the `parvault` project once to create it, then continue.
+
+1. **Stop the `parvault` project.**
+2. Make a project (folder `docker/parvault-import`) from this `compose.yaml`, and build it. It extracts `/backup/parvault-data.tar` into the volume, keeping owners (65532) and modes:
+
+```yaml
+name: parvault-import
+services:
+  import:
+    image: busybox@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec   # busybox 1.37.0
+    pull_policy: never
+    network_mode: none
+    restart: "no"
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE]   # to keep owners and modes, and write into the volume
+    security_opt: ["no-new-privileges:true"]
+    command: ["sh", "-c", "tar -xpf /backup/parvault-data.tar -C /data && echo imported"]
+    volumes:
+      - parvault-data:/data
+      - /volume1/parvault-backup:/backup:ro
+volumes:
+  parvault-data:
+    external: true
+    name: parvault-data
+```
+
+3. It prints `imported` and exits 0. **Stop and delete the `parvault-import` project** (its volume is `external`, so the data stays).
+4. **Start the `parvault` project.** It turns healthy with the same ring; `init` exits 1 (`already in the ring`), as on any later start.
 
 **Keep it private: anyone with that copy can admit nodes to your ring.** Do not put it in a shared folder others can read, a cloud sync folder, or a backup job that uploads it unencrypted. If you also back up the share with Hyper Backup, encrypt that task (Hyper Backup > Backup Settings > Enable client-side encryption). Backing up the Docker volume path directly (`/volume1/@docker/volumes/parvault-data`) in Hyper Backup is not documented by Synology, so this guide does not rely on it.
 

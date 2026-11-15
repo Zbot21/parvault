@@ -8,10 +8,13 @@
 #                                      the joiner stores a file and restores it byte-identical
 #   deploy/docker/compose.yaml         join from a Docker host on a non-default --listen port,
 #                                      healthy through the image's own HEALTHCHECK
+#   docs/SYNOLOGY.md export + import  the documented backup projects: stop a ring's daemon, export its
+#                                      volume to one tar, import it into a NEW volume, start a daemon
+#                                      there: healthy, the same genesis key, `wot invite` works
 # Each run uses its own project and volume names (pvct-<pid>-<n>) and loopback ports, adds
 # --no-lan-discovery so it never meets a real ring, and removes everything with `down -v`.
 # Usage: scripts/test_compose_projects.sh [image tag]   (default parvault:<Cargo.toml version>-dev,
-#        already loaded). PORT_BASE (default 4101) picks the mesh ports PORT_BASE..PORT_BASE+4.
+#        already loaded). PORT_BASE (default 4101) picks the mesh ports PORT_BASE..PORT_BASE+5.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
@@ -20,11 +23,16 @@ PB=${PORT_BASE:-4101}
 ID="pvct-$$"
 WORK=$(mktemp -d)
 cleanup() {
+  # the export tar is root-owned 0600: remove it from inside a container
+  [[ -d "$WORK/bak" ]] && docker run --rm -v "$WORK/bak:/b" --entrypoint rm "$BB" -rf /b/parvault-data.tar >/dev/null 2>&1 || true
   for f in "$WORK"/p*.yaml; do
     [[ -e "$f" ]] && { docker compose -f "$f" down -v --remove-orphans >/dev/null 2>&1 || true; }
   done
+  docker volume rm "$ID-6-data" "$ID-7-data" >/dev/null 2>&1 || true   # the backup test's volumes
   rm -rf "$WORK"
 }
+BB=$(sed -n 's#^ *image: \(busybox@sha256:[0-9a-f]*\).*#\1#p' docs/SYNOLOGY.md | head -1)
+[[ -n "$BB" ]] || { echo "test_compose_projects: FAIL: no pinned busybox in docs/SYNOLOGY.md" >&2; exit 1; }
 trap cleanup EXIT
 fail() { echo "test_compose_projects: FAIL: $*" >&2; exit 1; }
 ok() { echo "ok: $*"; }
@@ -152,4 +160,43 @@ wait_healthy "$D"
 docker logs "$(docker compose -f "$D" ps -q parvault)" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -q "listen_tcp=/ip4/0.0.0.0/tcp/$((PB + 4))" \
   || fail "docker node is not on --listen port $((PB + 4))"
 ok "docker-host node joined on tcp/$((PB + 4)), healthy through the image HEALTHCHECK"
+
+# 5. The documented backup: export one tar, import it into a NEW volume, same ring.
+doc_project() { # <project name> <out file> <volume> <backup dir>: the yaml block of that project in docs/SYNOLOGY.md
+  python3 -I - "$1" docs/SYNOLOGY.md "$3" "$4" > "$2" <<'EOF2'
+import re, sys
+name, doc, vol, bak = sys.argv[1:]
+m = re.search(r'```yaml\n(name: %s\n.*?)```' % re.escape(name), open(doc).read(), re.S)
+if not m: sys.exit("no yaml block for " + name)
+print(m.group(1).replace("name: parvault-data", "name: " + vol).replace("/volume1/parvault-backup", bak), end="")
+EOF2
+}
+docker image inspect "$BB" >/dev/null 2>&1 || fail "pinned busybox $BB is not pulled (docker pull busybox:1.37.0)"
+mkdir "$WORK/bak"
+B=$(variant deploy/synology/compose.yaml 6 $((PB + 5)))
+up "$B" || fail "backup ring first start: $(tail -3 "$WORK/up.log")"
+wait_healthy "$B"
+GB=$(genesis_of "$B"); [[ ${#GB} == 64 ]] || fail "backup ring printed no genesis key"
+docker compose -f "$B" stop parvault >/dev/null 2>&1   # the doc says: Stop the project first
+doc_project parvault-export "$WORK/pexp.yaml" "$ID-6-data" "$WORK/bak"
+up "$WORK/pexp.yaml" || fail "export project: $(tail -3 "$WORK/up.log")"
+logs "$WORK/pexp.yaml" export | grep -qx exported || fail "export said: $(logs "$WORK/pexp.yaml" export)"
+[[ "$(state "$WORK/pexp.yaml" export)" == "exited 0" ]] || fail "export state: $(state "$WORK/pexp.yaml" export)"
+[[ "$(docker run --rm -v "$WORK/bak:/b:ro" --entrypoint stat "$BB" -c '%U %a' /b/parvault-data.tar)" == "root 600" ]] \
+  || fail "tar is not root 0600"
+docker run --rm -v "$WORK/bak:/b:ro" --entrypoint tar "$BB" -tvf /b/parvault-data.tar | grep -q '65532' \
+  || fail "tar does not keep the 65532 owner"
+ok "export: one tar, root 0600, files owned by 65532 inside"
+docker volume create "$ID-7-data" >/dev/null
+doc_project parvault-import "$WORK/pimp.yaml" "$ID-7-data" "$WORK/bak"
+up "$WORK/pimp.yaml" || fail "import project: $(tail -3 "$WORK/up.log")"
+logs "$WORK/pimp.yaml" import | grep -qx imported || fail "import said: $(logs "$WORK/pimp.yaml" import)"
+M=$(variant deploy/synology/compose.yaml 7 $((PB + 5)))
+docker compose -f "$B" down >/dev/null 2>&1     # frees the port; its volume stays for the compare below
+up "$M" || fail "daemon on the restored volume: $(tail -3 "$WORK/up.log")"
+wait_healthy "$M"
+logs "$M" init | grep -q "this node is already in the ring $GB" || fail "restored volume is not ring $GB: $(logs "$M" init)"
+INV=$(client 7 wot invite --peer "$K" | tr -d ' \n')
+[[ "$INV" == "$GB"* ]] || fail "wot invite on the restored volume gave: ${INV:0:80}"
+ok "import into a NEW volume: daemon healthy with the same genesis $GB; wot invite works"
 echo "test_compose_projects: PASS ($TAG)"
