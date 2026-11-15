@@ -268,7 +268,7 @@ AttackerSignerIds == { s \in AllSigners \cup RootKeys : PrivKey(s) \in attackerK
 \* it: the new root's holder may not have signed or may have declined. Only the new-root guard
 \* keeps such a file from installing. The intended new root is B.
 PartialReroots(log) ==
-    IF log = <<>> THEN {}
+    IF log = <<>> \/ Len(log) >= MaxCouncilEpoch THEN {}
     ELSE { [scope |-> NewRoot, epoch |-> Len(log) + 1, members |-> mem, kind |-> "reroot",
             from |-> Last(log).scope,
             signers |-> ((Last(log).members \cap HonestCouncil) \cup AttackerSignerIds) \ {NewRootKey},
