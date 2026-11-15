@@ -130,7 +130,65 @@ fn procd_not_owned_by_walks_the_tree() {
     assert_eq!(theirs.trim(), path);
 }
 
-/// P2P listens on the LAN address from uci, never `0.0.0.0` on the WAN; loopback when unset.
+/// D3: the listen address is the first IPv4 address in uci's value; IPv6-only, malformed,
+/// wildcard or empty values fall back to loopback with a log line naming the cause.
+#[test]
+fn procd_listen_addr_takes_ipv4_only() {
+    let call = "listen_addr_for \"$1\" \"$2\"";
+    for (raw, want) in [
+        ("192.168.1.1/24", "/ip4/192.168.1.1/tcp/4001"),
+        ("192.168.1.1", "/ip4/192.168.1.1/tcp/4001"),
+        ("fd00::1/64 10.0.0.1/24", "/ip4/10.0.0.1/tcp/4001"),
+        ("192.168.1.1 192.168.2.1", "/ip4/192.168.1.1/tcp/4001"),
+    ] {
+        let (out, err) = run_procd_fn(call, &[raw, "static"]);
+        assert_eq!(out.trim(), want, "{raw}");
+        assert!(!err.contains("127.0.0.1"), "{raw}: {err}");
+    }
+    for raw in [
+        "fd00::1/64",
+        "0.0.0.0",
+        "0.0.0.0/0",
+        "256.1.1.1",
+        "1.2.3",
+        "1.2.3.4.5",
+        "1..2.3",
+        "a.b.c.d",
+    ] {
+        let (out, err) = run_procd_fn(call, &[raw, "static"]);
+        assert_eq!(out.trim(), "/ip4/127.0.0.1/tcp/4001", "{raw}");
+        assert!(
+            err.contains(&format!("network.lan.ipaddr ({raw}) has no IPv4 address")),
+            "{raw}: {err}"
+        );
+    }
+    let (out, err) = run_procd_fn(call, &["", "dhcp"]);
+    assert_eq!(out.trim(), "/ip4/127.0.0.1/tcp/4001");
+    assert!(err.contains("LAN is a DHCP client (dumb AP"), "{err}");
+    let (out, err) = run_procd_fn(call, &["", "static"]);
+    assert_eq!(out.trim(), "/ip4/127.0.0.1/tcp/4001");
+    assert!(err.contains("network.lan.ipaddr is unset"), "{err}");
+}
+
+/// D2, D3: procd restarts the service when the NAS disk mounts and reloads it when the
+/// network config changes.
+#[test]
+fn procd_has_mount_and_network_triggers() {
+    let lines: Vec<&str> = code_lines(PROCD).collect();
+    let start = lines
+        .iter()
+        .position(|l| *l == "service_triggers() {")
+        .expect("service_triggers");
+    let body: Vec<&str> = lines[start..]
+        .iter()
+        .take_while(|l| **l != "}")
+        .copied()
+        .collect();
+    assert!(body.contains(&"procd_add_restart_mount_trigger \"$NAS\""));
+    assert!(body.contains(&"procd_add_reload_trigger network"));
+}
+
+/// P2P TCP listens on the LAN address from uci, never `0.0.0.0` on the WAN.
 #[test]
 fn procd_passes_lan_listen_addr() {
     let lines: Vec<&str> = code_lines(PROCD).collect();
@@ -140,8 +198,8 @@ fn procd_passes_lan_listen_addr() {
         .expect("command line");
     assert!(lines[cmd].ends_with('\\'), "{}", lines[cmd]);
     assert_eq!(lines[cmd + 1], "--listen \"$(lan_listen_addr)\"");
-    assert!(lines.contains(&"ip=\"$(uci -q get network.lan.ipaddr)\""));
-    assert!(lines.contains(&"ip=127.0.0.1"));
-    assert!(lines.contains(&"echo \"/ip4/$ip/tcp/4001\""));
+    assert!(lines.contains(
+        &"listen_addr_for \"$(uci -q get network.lan.ipaddr)\" \"$(uci -q get network.lan.proto)\""
+    ));
     assert!(!lines.iter().any(|l| l.contains("0.0.0.0")));
 }

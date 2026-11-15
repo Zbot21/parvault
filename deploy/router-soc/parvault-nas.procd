@@ -26,20 +26,57 @@ nas_fstype() {
     awk -v m="$NAS" '$2 == m { t = $3 } END { print t }' /proc/mounts
 }
 
-# The P2P TCP listen multiaddr: the LAN address from uci, so the daemon never binds the WAN
-# (L-96, plan R3). uci may hold a list or CIDR form (192.168.1.1/24); the first address is used.
-# With no LAN address it binds loopback and logs why. Port 4001 matches listen_tcp in $CONF.
-lan_listen_addr() {
-    local ip
-    ip="$(uci -q get network.lan.ipaddr)"
-    set -- $ip
-    ip="${1%%/*}"
-    if [ -z "$ip" ]; then
-        logger -t parvault-nas -p daemon.warn "network.lan.ipaddr is unset; P2P listens on 127.0.0.1 only"
-        echo "parvault-nas: network.lan.ipaddr is unset; P2P listens on 127.0.0.1 only" >&2
-        ip=127.0.0.1
+warn() {
+    logger -t parvault-nas -p daemon.warn "$*"
+    echo "parvault-nas: $*" >&2
+}
+
+# Succeeds when $1 is a dotted-quad IPv4 address that a listener can bind (not 0.x.x.x).
+is_ip4() {
+    local IFS=. o
+    case "$1" in
+        ""|*[!0-9.]*|.*|*.|*..*|0.*) return 1 ;;
+    esac
+    set -- $1
+    [ $# -eq 4 ] || return 1
+    for o; do
+        [ ${#o} -le 3 ] && [ "$o" -le 255 ] || return 1
+    done
+}
+
+# The first IPv4 address in a uci ipaddr value: a list, CIDR form allowed (192.168.1.1/24).
+# Fails when there is none, for example an IPv6-only value such as fd00::1/64.
+first_ip4() {
+    local a
+    for a in $1; do
+        a="${a%%/*}"
+        is_ip4 "$a" && { echo "$a"; return 0; }
+    done
+    return 1
+}
+
+# The P2P TCP listen multiaddr for a uci network.lan.ipaddr value ($1) and network.lan.proto
+# ($2): the LAN IPv4 address, so P2P TCP never binds the WAN (L-96, plan R3). With no usable
+# IPv4 address it binds loopback and logs why. Port 4001 matches listen_tcp in $CONF.
+listen_addr_for() {
+    local ip why
+    if ip="$(first_ip4 "$1")"; then
+        echo "/ip4/$ip/tcp/4001"
+        return 0
     fi
-    echo "/ip4/$ip/tcp/4001"
+    if [ -n "$1" ]; then
+        why="network.lan.ipaddr ($1) has no IPv4 address"
+    elif [ "$2" = dhcp ]; then
+        why="LAN is a DHCP client (dumb AP: network.lan.proto=dhcp, no static network.lan.ipaddr)"
+    else
+        why="network.lan.ipaddr is unset"
+    fi
+    warn "$why; P2P listens on 127.0.0.1 only"
+    echo "/ip4/127.0.0.1/tcp/4001"
+}
+
+lan_listen_addr() {
+    listen_addr_for "$(uci -q get network.lan.ipaddr)" "$(uci -q get network.lan.proto)"
 }
 
 owner_of() {
@@ -76,6 +113,17 @@ init_service_user() {
         [ -z "$(not_owned_by "$DATA" "$SVC_USER")" ] || { fail "$DATA has entries chown could not change"; return 1; }
     fi
     chmod 0700 "$DATA"
+}
+
+# Restart when the NAS disk mounts after boot (a USB disk that hotplug mounts late), and reload
+# when the network config changes, so the listen address follows network.lan.ipaddr. The mount
+# trigger needs block-mount and a `config mount` entry with target /mnt/nas in /etc/config/fstab:
+# procd only watches mountpoints listed there.
+service_triggers() {
+    [ -n "$(procd_get_mountpoints "$NAS")" ] ||
+        warn "no fstab mount entry covers $NAS; a disk mounted after boot will not start the service"
+    procd_add_restart_mount_trigger "$NAS"
+    procd_add_reload_trigger network
 }
 
 start_service() {
