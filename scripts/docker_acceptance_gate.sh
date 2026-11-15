@@ -132,50 +132,143 @@ EOF
 
 docker build -t "$IMG_ACCEPT" "$BUILD_CTX"
 
-# B-106: no process in these containers runs as root (real or effective uid 0, read on the host
-# with `docker top`, which is also the host uid: Docker here has no userns remap). With --daemon,
-# each container must also run a parvault process, so an exited daemon cannot pass.
-# One container is waived, by name: FUSE_WAIVED, the stage 12c FUSE harness (vfs_mp4_seek_gate
-# plus parvault-fuse, not a shipped image). mount(2) of /dev/fuse needs CAP_SYS_ADMIN and the
-# image has no setuid fusermount3, so it runs as uid 0 with SYS_ADMIN. The waiver is checked, not
-# assumed: the container must use the VFS harness image, add exactly SYS_ADMIN and nothing else.
+# --- B-106 container policy (begin) ---
+# B-106: no process in a checked container runs as root, and the container gains no privilege.
+# assert_nonroot checks, per container:
+#   - docker inspect: user parvault:parvault, not privileged, CapAdd empty, CapDrop ["ALL"],
+#     no-new-privileges, no device, no device cgroup rule, no host or shared PID/IPC/UTS/network
+#     namespace (the gate network only);
+#   - docker top (host view): ruid euid suid fsuid rgid egid sgid fsgid of every process are
+#     non-zero (the host uid is the container uid: the gate refuses rootless and userns-remapped
+#     Docker, see the check before stage 1);
+#   - /proc/<pid>/status of every process, read from a helper that joins the container's PID
+#     namespace (works for the FROM scratch image too): Uid and Gid non-zero, CapEff empty,
+#     NoNewPrivs 1;
+#   - with --daemon, a parvault process runs, so an exited daemon cannot pass.
+# Two containers are waived, by name, with the reason printed. Their waiver is checked, not
+# assumed (waiver_errors): the image, the user, the exact added capability, not privileged, no
+# host namespace, and the exact devices and network.
+#   FUSE_WAIVED: the stage 12c FUSE harness (vfs_mp4_seek_gate plus parvault-fuse, not a shipped
+#     image) runs as uid 0, adds only SYS_ADMIN, and gets only /dev/fuse.
+#   NETEM_TC_WAIVED: the stage 12c one-shot tc sidecar runs as uid 0 with CapDrop ALL plus only
+#     NET_ADMIN, in the netem test container's network namespace, and nothing else.
 FUSE_WAIVED="parvault-vfs-fuse-${RUN_ID}"
 FUSE_WAIVER_REASON="stage 12c FUSE harness: mount(2) of /dev/fuse needs CAP_SYS_ADMIN (gate harness, not a shipped image)"
+NETEM_TC_WAIVED="parvault-vfs-netem-tc-${RUN_ID}"
+NETEM_TC_WAIVER_REASON="stage 12c one-shot tc sidecar: tc qdisc on the netem test container's lo needs CAP_NET_ADMIN (gate harness, not a shipped image)"
+NETEM_TC_TARGET="parvault-vfs-netem-${RUN_ID}"
+POLICY_FMT='{{.Config.Image}}|{{.Config.User}}|{{.HostConfig.Privileged}}|{{json .HostConfig.CapAdd}}|{{json .HostConfig.CapDrop}}|{{json .HostConfig.SecurityOpt}}|{{.HostConfig.PidMode}}|{{.HostConfig.IpcMode}}|{{.HostConfig.UTSMode}}|{{.HostConfig.NetworkMode}}|{{range .HostConfig.Devices}}{{.PathOnHost}}:{{.PathInContainer}};{{end}}|{{json .HostConfig.DeviceCgroupRules}}'
+# policy_errors <container> <image|-> <user> <capadd> <capdrop|-> <nnp yes|-> <devices> <network|->:
+# prints one line per violation of the container's docker inspect policy. <capadd> is a JSON list
+# without CAP_ prefixes, or none; <devices> is "host:container;" per device, or empty; <network>
+# '-' means any network but host or another container's.
+policy_errors() {
+    local c="$1" want_img="$2" want_user="$3" want_cap="$4" want_drop="$5" want_nnp="$6" want_dev="$7" want_net="$8"
+    local out img user priv capadd capdrop secopt pidm ipcm utsm netm dev devrules m
+    out="$(docker inspect -f "$POLICY_FMT" "$c" 2>&1)" || { echo "cannot inspect: $out"; return 0; }
+    IFS='|' read -r img user priv capadd capdrop secopt pidm ipcm utsm netm dev devrules <<<"$out"
+    # Docker may report a capability with or without its CAP_ prefix.
+    capadd="${capadd//\"CAP_/\"}"
+    capdrop="${capdrop//\"CAP_/\"}"
+    case "$capadd" in null|'[]') capadd=none ;; esac
+    [ "$want_img" = - ] || [ "$img" = "$want_img" ] || echo "image $img, not $want_img"
+    [ "$user" = "$want_user" ] || echo "user '$user', not '$want_user'"
+    [ "$priv" = false ] || echo "privileged ($priv)"
+    [ "$capadd" = "$want_cap" ] || echo "CapAdd $capadd, not $want_cap"
+    [ "$want_drop" = - ] || [ "$capdrop" = "$want_drop" ] || echo "CapDrop $capdrop, not $want_drop"
+    [ "$want_nnp" = - ] || [[ "$secopt" =~ \"no-new-privileges(:true)?\" ]] || echo "no no-new-privileges (SecurityOpt $secopt)"
+    for m in "PidMode=$pidm" "IpcMode=$ipcm" "UTSMode=$utsm"; do
+        case "${m#*=}" in host|container:*) echo "$m" ;; esac
+    done
+    if [ "$want_net" = - ]; then
+        case "$netm" in host|container:*|none) echo "NetworkMode $netm" ;; esac
+    elif [ "$netm" != "$want_net" ]; then
+        echo "NetworkMode $netm, not $want_net"
+    fi
+    [ "$dev" = "$want_dev" ] || echo "devices '$dev', not '$want_dev'"
+    case "$devrules" in null|'[]') ;; *) echo "DeviceCgroupRules $devrules" ;; esac
+}
+# waiver_errors <waived container>: the checked waiver, or one line per violation.
+waiver_errors() {
+    local tid
+    case "$1" in
+        "$FUSE_WAIVED")
+            policy_errors "$1" "$IMG_VFS" "0:0" '["SYS_ADMIN"]' - - "/dev/fuse:/dev/fuse;" - ;;
+        "$NETEM_TC_WAIVED")
+            # Docker keeps container:<name> or resolves it to container:<id>; accept either.
+            tid="$(docker inspect -f '{{.Id}}' "$NETEM_TC_TARGET" 2>/dev/null || echo none)"
+            policy_errors "$1" "$IMG_VFS" "0:0" '["NET_ADMIN"]' '["ALL"]' yes "" "container:$NETEM_TC_TARGET" \
+                | { grep -vx "NetworkMode container:$tid, not container:$NETEM_TC_TARGET" || true; } ;;
+        *) echo "not a waived container" ;;
+    esac
+}
+waiver_reason() {
+    case "$1" in
+        "$FUSE_WAIVED") echo "$FUSE_WAIVER_REASON" ;;
+        "$NETEM_TC_WAIVED") echo "$NETEM_TC_WAIVER_REASON" ;;
+    esac
+}
+# Runs in IMG_ACCEPT, in the checked container's PID namespace: pid name ruid euid suid fsuid rgid
+# egid sgid fsgid CapEff NoNewPrivs, one line per process. Its own sh and awk are listed too and
+# pass (uid 65532, CapDrop ALL, no-new-privileges).
+PROC_SCAN='for s in /proc/[0-9]*/status; do
+    awk "/^Name:/ {n=\$2} /^Pid:/ {p=\$2} /^Uid:/ {u=\$2\" \"\$3\" \"\$4\" \"\$5} /^Gid:/ {g=\$2\" \"\$3\" \"\$4\" \"\$5}
+         /^CapEff:/ {c=\$2} /^NoNewPrivs:/ {x=\$2} END {if (p != \"\") print p, n, u, g, c, x}" "$s" 2>/dev/null || true
+done'
 assert_nonroot() {
-    local need_daemon=0 c top root_rows img caps checked=()
+    local need_daemon=0 c top bad errs scan checked=()
     if [ "${1:-}" = "--daemon" ]; then need_daemon=1; shift; fi
     for c in "$@"; do
-        if [ "$c" = "$FUSE_WAIVED" ]; then
-            img="$(docker inspect -f '{{.Config.Image}}' "$c" 2>&1)" \
-                || { echo "ERROR: B-106: cannot inspect the waived container $c: $img"; exit 1; }
-            caps="$(docker inspect -f '{{json .HostConfig.CapAdd}}' "$c")"
-            # Docker may report the capability with or without its CAP_ prefix.
-            if [ "$img" != "$IMG_VFS" ] || { [ "$caps" != '["SYS_ADMIN"]' ] && [ "$caps" != '["CAP_SYS_ADMIN"]' ]; }; then
-                echo "ERROR: B-106: waived container $c is not the FUSE harness (image $img, CapAdd $caps)"
+        if [ "$c" = "$FUSE_WAIVED" ] || [ "$c" = "$NETEM_TC_WAIVED" ]; then
+            errs="$(waiver_errors "$c")"
+            if [ -n "$errs" ]; then
+                echo "ERROR: B-106: waived container $c breaks its waiver ($(waiver_reason "$c")):"
+                echo "$errs"
                 exit 1
             fi
-            echo "B-106: WAIVED (runs as root): $c: ${FUSE_WAIVER_REASON}"
+            echo "B-106: WAIVED (runs as root): $c: $(waiver_reason "$c")"
             continue
         fi
-        if ! top="$(docker top "$c" -eo pid,ruid,euid,comm 2>&1)"; then
+        errs="$(policy_errors "$c" - "parvault:parvault" none '["ALL"]' yes "" -)"
+        if [ -n "$errs" ]; then
+            echo "ERROR: B-106: $c is not confined:"
+            echo "$errs"
+            exit 1
+        fi
+        if ! top="$(docker top "$c" -eo pid,ruid,euid,suid,fsuid,rgid,egid,sgid,fsgid,comm 2>&1)"; then
             echo "ERROR: B-106: cannot list the processes of $c: $top"
             exit 1
         fi
-        root_rows="$(awk 'NR > 1 && ($2 == 0 || $3 == 0)' <<<"$top")"
-        if [ -n "$root_rows" ]; then
-            echo "ERROR: B-106: $c runs process(es) as root (pid ruid euid comm):"
-            echo "$root_rows"
+        bad="$(awk 'NR > 1 { for (i = 2; i <= 9; i++) if ($i == 0) { print; next } }' <<<"$top")"
+        if [ -n "$bad" ]; then
+            echo "ERROR: B-106: $c runs process(es) with a root uid or gid (pid ruid euid suid fsuid rgid egid sgid fsgid comm):"
+            echo "$bad"
             exit 1
         fi
-        if [ "$need_daemon" = 1 ] && ! awk 'NR > 1 && $4 ~ /^parvault/ {found=1} END {exit !found}' <<<"$top"; then
+        if [ "$need_daemon" = 1 ] && ! awk 'NR > 1 && $10 ~ /^parvault/ {found=1} END {exit !found}' <<<"$top"; then
             echo "ERROR: B-106: $c runs no parvault process, so its uid cannot be checked:"
             echo "$top"
             exit 1
         fi
+        if ! scan="$(docker run --rm --label "$RUN_LABEL" --pid "container:$c" --network none --cap-drop ALL \
+                --security-opt no-new-privileges "$IMG_ACCEPT" sh -c "$PROC_SCAN" 2>&1)" || [ -z "$scan" ]; then
+            echo "ERROR: B-106: cannot read /proc/<pid>/status in $c: $scan"
+            exit 1
+        fi
+        bad="$(awk '{ for (i = 3; i <= 10; i++) if ($i == 0) { print; next } }
+                    $11 !~ /^0+$/ || $12 != 1 { print }' <<<"$scan")"
+        if [ -n "$bad" ]; then
+            echo "ERROR: B-106: $c has a process with a root id, a capability or new privileges allowed (pid name ruid euid suid fsuid rgid egid sgid fsgid CapEff NoNewPrivs):"
+            echo "$bad"
+            exit 1
+        fi
         checked+=("$c")
     done
-    [ "${#checked[@]}" -eq 0 ] || echo "B-106: non-root verified in: ${checked[*]}"
+    [ "${#checked[@]}" -eq 0 ] || echo "B-106: non-root, CapEff empty, no-new-privileges verified in: ${checked[*]}"
 }
+# The run flags of every container assert_nonroot checks (and of the SoC one-shots).
+CONFINE=(--cap-drop ALL --security-opt no-new-privileges)
+# --- B-106 container policy (end) ---
 
 echo "=== [2/12] Creating isolated Docker bridge network (per-run 172.28.X.0/24) ==="
 docker rm -f "${CONTAINERS[@]}" >/dev/null 2>&1 || true
@@ -204,7 +297,7 @@ SEED_MULTIADDR="/ip4/${NET_PREFIX}.10/tcp/4002"
 NODE11_MULTIADDR="/ip4/${NET_PREFIX}.21/tcp/4001"
 
 echo "=== [3/12] Starting parvault-seed-0-${RUN_ID} + 11 parvault daemon containers + 1 isolated client container ==="
-docker run -d --name parvault-seed-0-${RUN_ID} \
+docker run -d --name parvault-seed-0-${RUN_ID} "${CONFINE[@]}" \
     -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     --network "$NET_NAME" --ip ${NET_PREFIX}.10 \
     "$IMG_ACCEPT" \
@@ -217,7 +310,7 @@ docker run -d --name parvault-seed-0-${RUN_ID} \
 
 for i in $(seq 1 11); do
     IP="${NET_PREFIX}.$((10 + i))"
-    docker run -d --name "parvault-node-$i-${RUN_ID}" \
+    docker run -d --name "parvault-node-$i-${RUN_ID}" "${CONFINE[@]}" \
         -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
         --network "$NET_NAME" --ip "$IP" \
         -w /var/lib/parvault \
@@ -229,7 +322,7 @@ for i in $(seq 1 11); do
 done
 
 # Start isolated client container with ZERO volume mounts
-docker run -d --name parvault-client-${RUN_ID} \
+docker run -d --name parvault-client-${RUN_ID} "${CONFINE[@]}" \
     -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     --network "$NET_NAME" --ip ${NET_PREFIX}.50 \
     "$IMG_ACCEPT" \
@@ -248,7 +341,7 @@ fi
 echo "=== [3b/12] Ring membership: an invited node serves the ring; a non-member is refused ==="
 # The invitee never holds the ring secret: it joins with 'wot invite' (on a ring member) and
 # 'wot install-chain', then runs a daemon that stores a ring member's file.
-docker run -d --name parvault-invitee-${RUN_ID} \
+docker run -d --name parvault-invitee-${RUN_ID} "${CONFINE[@]}" \
     --network "$NET_NAME" --ip ${NET_PREFIX}.40 \
     "$IMG_ACCEPT" \
     sleep 3600
@@ -276,7 +369,7 @@ for i in $(seq 1 11); do NODE_CONTAINERS+=("parvault-node-$i-${RUN_ID}"); done
 assert_nonroot --daemon "parvault-seed-0-${RUN_ID}" "${NODE_CONTAINERS[@]}" "parvault-invitee-${RUN_ID}"
 assert_nonroot "parvault-client-${RUN_ID}"
 # The outsider runs its own ring: its credential does not admit it to this ring.
-docker run -d --name parvault-outsider-${RUN_ID} \
+docker run -d --name parvault-outsider-${RUN_ID} "${CONFINE[@]}" \
     --network "$NET_NAME" --ip ${NET_PREFIX}.41 \
     "$IMG_ACCEPT" \
     sleep 3600
@@ -655,7 +748,7 @@ echo "Total "$IMG_SOC" (FROM scratch) image size : ${ROUTER_SOC_IMAGE_SIZE}"
 # Start a live `"$IMG_SOC"` appliance container constrained to --memory=48m --memory-swap=48m
 # Item 3: the status page needs a read-only token; give the appliance a known gateway root key.
 SOC_STATUS_KEY="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
-docker run -d --name parvault-router-soc-${RUN_ID} \
+docker run -d --name parvault-router-soc-${RUN_ID} "${CONFINE[@]}" \
     -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     --network "$NET_NAME" --ip ${NET_PREFIX}.60 \
     --memory=48m --memory-swap=48m \
@@ -769,7 +862,7 @@ fi
 echo "=== [12b/12] parvault-status sidecar: no key, token-gated status over the gateway socket ==="
 SIDE_KEY="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
 SIDE_TOKEN="$(mint_status_token "$SIDE_KEY")"
-docker run -d --name parvault-status-sidecar-${RUN_ID} \
+docker run -d --name parvault-status-sidecar-${RUN_ID} "${CONFINE[@]}" \
     -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     -e SIDE_KEY="$SIDE_KEY" -e SIDE_TOKEN="$SIDE_TOKEN" \
     --network "$NET_NAME" --ip ${NET_PREFIX}.61 \
@@ -855,16 +948,17 @@ EOF
 docker build -t "$IMG_VFS" "$VFS_CTX"
 
 VFS_FUSE_RESULT="SKIPPED (no /dev/fuse)"
-# The FUSE leg alone runs as root with SYS_ADMIN, in the one container assert_nonroot waives
-# (FUSE_WAIVED, see assert_nonroot for the reason). The /dev/fuse probe needs no privilege and
-# runs as uid 65532.
+# The FUSE leg runs as root with SYS_ADMIN, in a container assert_nonroot waives (FUSE_WAIVED,
+# see assert_nonroot for the reason). It is created, its waiver checked, and only then started.
+# The /dev/fuse probe needs no privilege and runs as uid 65532.
 if [ -c /dev/fuse ] && docker run --rm --label "$RUN_LABEL" --device /dev/fuse \
         --security-opt apparmor:unconfined --entrypoint test "$IMG_VFS" -c /dev/fuse; then
     docker rm -f "$FUSE_WAIVED" >/dev/null 2>&1 || true
-    docker run -d --label "$RUN_LABEL" --name "$FUSE_WAIVED" --user 0:0 --device /dev/fuse --cap-add SYS_ADMIN \
+    docker create --label "$RUN_LABEL" --name "$FUSE_WAIVED" --user 0:0 --device /dev/fuse --cap-add SYS_ADMIN \
         --security-opt apparmor:unconfined -e GATES_REQUIRE_REAL=1 "$IMG_VFS" \
         fuse_mount_mp4_probe_and_random_seek parvault_fuse_plugin_mount_rss_under_16_mib >/dev/null
     assert_nonroot "$FUSE_WAIVED"
+    docker start "$FUSE_WAIVED" >/dev/null
     VFS_FUSE_RC="$(timeout --kill-after=30 600 docker wait "$FUSE_WAIVED")" || VFS_FUSE_RC="timeout"
     docker logs "$FUSE_WAIVED" 2>&1 || true
     docker rm -f "$FUSE_WAIVED" >/dev/null 2>&1 || true
@@ -890,7 +984,7 @@ VFS_NETEM="parvault-vfs-netem-${RUN_ID}"
 # B-106: the test container runs as uid 65532 with no capability. A one-shot sidecar joins its
 # network namespace with NET_ADMIN and adds netem on lo; the test waits for that, then runs.
 docker rm -f "$VFS_NETEM" >/dev/null 2>&1 || true
-docker run -d --name "$VFS_NETEM" --label "$RUN_LABEL" -e GATES_REQUIRE_REAL=1 -e PARVAULT_VFS_TTFB_BUDGET_MS=100 \
+docker run -d --name "$VFS_NETEM" --label "$RUN_LABEL" "${CONFINE[@]}" -e GATES_REQUIRE_REAL=1 -e PARVAULT_VFS_TTFB_BUDGET_MS=100 \
     -e PARVAULT_VFS_GATE_LATENCY=1 \
     --entrypoint sh "$IMG_VFS" -c \
     'i=0; while [ ! -e /tmp/netem.ready ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done
