@@ -1255,6 +1255,11 @@ impl KnownPeersStore {
         moved
     }
 
+    /// The admin key pinned for `tracker_key` (trimmed), if any.
+    pub fn tracker_admin_pubkey(&self, tracker_key: &str) -> Option<[u8; 32]> {
+        self.tracker_admin_pubkeys.get(tracker_key.trim()).copied()
+    }
+
     /// Replaces the pin of `tracker_key` with `admin_pubkey` (the operator's manual re-pin,
     /// `parvault council repin`). Returns the key it replaced.
     pub fn set_tracker_admin_pubkey(

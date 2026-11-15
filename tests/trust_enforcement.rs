@@ -8071,3 +8071,133 @@ fn f53_council_repin_corrupt_legacy_leaves_both_unchanged() {
     );
     gate_ran("trust_enforcement::f53_council_repin_corrupt_legacy_leaves_both_unchanged");
 }
+
+/// Crash-safe re-pin (F-53 QA, `bin=parvault`): a re-pin from A to B cut short after
+/// `known_peers.json` (known = B, legacy = A, the write-ahead intent on disk, no manifest)
+/// finishes at the next start. Both stores then hold B, and with `known_peers.json` gone the
+/// root still resolves to B: an epoch 1 signed by A is refused, one signed by B installs.
+#[test]
+fn f53_interrupted_repin_converges_on_restart() {
+    let (a, b) = (key(0xF0), key(0xF4));
+    let tracker = "/ip4/127.0.0.1/tcp/4002";
+    let (_root, dir) = f53_client("f53-repin-crash");
+    std::fs::remove_file(dir.join("council_manifest.bin")).unwrap();
+    let _ = std::fs::remove_file(dir.join("council_history.bin"));
+    let mut store = parvault::network::KnownPeersStore::load(&dir);
+    store.set_tracker_admin_pubkey(tracker, b.public_key_bytes());
+    store.save(&dir).unwrap();
+    let intent = parvault::storage::council::RepinIntent {
+        tracker: Some(tracker.to_string()),
+        prev: Some(a.public_key_bytes()),
+        new: b.public_key_bytes(),
+    };
+    let intent_path = dir.join(parvault::storage::council::COUNCIL_REPIN_INTENT_FILE);
+    std::fs::write(&intent_path, serde_json::to_vec(&intent).unwrap()).unwrap();
+    // The restart: any public `parvault` start runs the pin repair first.
+    let out = f53_council_cli(&dir, true, &["show"]);
+    let text = combined(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("finished an interrupted tracker re-pin"),
+        "{text}"
+    );
+    let (known, legacy) = f53_pins(&dir);
+    assert_eq!(known, vec![b.public_key_bytes()]);
+    assert_eq!(
+        legacy.matches(&hex::encode(b.public_key_bytes())).count(),
+        1,
+        "{legacy}"
+    );
+    assert!(
+        !legacy.contains(&hex::encode(a.public_key_bytes())),
+        "{legacy}"
+    );
+    assert!(!intent_path.exists());
+    // A never roots again, even once known_peers.json is gone (the legacy fallback).
+    std::fs::remove_file(dir.join("known_peers.json")).unwrap();
+    let m_a = hex::encode(f53_legacy_epoch1().to_bytes());
+    let out = f53_council_cli(&dir, true, &["install", "--manifest", &m_a]);
+    let text = combined(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(!dir.join("council_manifest.bin").exists(), "{text}");
+    let m_b = c1_manifest(&b, 1, &[&key(0xF5), &key(0xF6), &key(0xF7)], 2, &[&b]);
+    let out = f53_council_cli(
+        &dir,
+        true,
+        &["install", "--manifest", &hex::encode(m_b.to_bytes())],
+    );
+    let text = combined(&out);
+    assert!(out.status.success(), "{text}");
+    assert_eq!(
+        parvault::storage::council::load_council_manifest(&dir).map(|m| m.scope_root),
+        Some(b.public_key_bytes())
+    );
+    gate_ran("trust_enforcement::f53_interrupted_repin_converges_on_restart");
+}
+
+/// Reject side of the write-ahead re-pin record (`bin=parvault`): one that does not decode stops
+/// a public start with its reason code, and both pin stores and the record stay as they were.
+#[test]
+fn f53_corrupt_repin_intent_refused() {
+    let (_root, dir) = f53_client("f53-repin-intent-corrupt");
+    let intent_path = dir.join(parvault::storage::council::COUNCIL_REPIN_INTENT_FILE);
+    std::fs::write(&intent_path, b"{").unwrap();
+    let before = f53_pins(&dir);
+    let out = f53_council_cli(&dir, true, &["show"]);
+    let text = combined(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("reject.council_repin_intent_corrupt"),
+        "{text}"
+    );
+    assert_eq!(f53_pins(&dir), before);
+    assert_eq!(std::fs::read(&intent_path).unwrap(), b"{");
+    gate_ran("trust_enforcement::f53_corrupt_repin_intent_refused");
+}
+
+/// The same crash in a client re-root written by a binary before the write-ahead intent
+/// (`bin=parvault`): manifest under B, known = B, legacy = A, no intent. The start-up repair
+/// no longer stops because B is pinned in one store; the legacy file moves to B.
+#[test]
+fn f53_reroot_repair_finishes_legacy_pin() {
+    let (a, b) = (key(0xF0), key(0xF4));
+    let (_root, dir) = f53_client("f53-reroot-crash");
+    let new_members = [key(0xF5), key(0xF6), key(0xF7)];
+    let nm: Vec<&NodeIdentity> = new_members.iter().collect();
+    let reroot = f53_reroot(
+        &f53_legacy_epoch1(),
+        &b,
+        &nm,
+        &[&key(0xF1), &key(0xF2)],
+        true,
+    );
+    let out = f53_council_cli(
+        &dir,
+        true,
+        &["install", "--manifest", &hex::encode(reroot.to_bytes())],
+    );
+    assert!(out.status.success(), "{}", combined(&out));
+    std::fs::write(
+        dir.join("pinned_tracker_admins.json"),
+        format!("[\"{}\"]", hex::encode(a.public_key_bytes())),
+    )
+    .unwrap();
+    let out = f53_council_cli(&dir, true, &["show"]);
+    let text = combined(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("finished an interrupted council re-pin"),
+        "{text}"
+    );
+    let (known, legacy) = f53_pins(&dir);
+    assert_eq!(known, vec![b.public_key_bytes()]);
+    assert!(
+        legacy.contains(&hex::encode(b.public_key_bytes())),
+        "{legacy}"
+    );
+    assert!(
+        !legacy.contains(&hex::encode(a.public_key_bytes())),
+        "{legacy}"
+    );
+    gate_ran("trust_enforcement::f53_reroot_repair_finishes_legacy_pin");
+}

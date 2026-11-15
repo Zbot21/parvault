@@ -390,63 +390,80 @@ pub fn install_council_manifest(
     Ok(())
 }
 
-/// Replaces the pinned tracker admin key `old` with `new` in both on-disk pin stores
-/// (`known_peers.json` and the legacy `pinned_tracker_admins.json`). The in-memory map of a
-/// running client is updated by its caller (`MeshClient::repin_tracker_admin_pubkey`).
-pub fn repin_tracker_admin(data_dir: &Path, old: [u8; 32], new: [u8; 32]) -> Result<(), String> {
-    // Both stores load before either is written (B-52): a corrupt one fails the re-pin whole.
-    let legacy = legacy_pinned_admins(data_dir).map_err(str::to_string)?;
-    let mut store =
-        crate::network::KnownPeersStore::try_load(data_dir).map_err(|e| e.to_string())?;
-    if store.repin_tracker_admin_pubkey(old, new) > 0 {
-        store.save(data_dir).map_err(|e| e.to_string())?;
-    }
-    if legacy.contains(&old) {
-        let mut out: Vec<String> = Vec::new();
-        for pk in legacy {
-            let h = hex::encode(if pk == old { new } else { pk });
-            if !out.contains(&h) {
-                out.push(h);
-            }
-        }
-        let json = serde_json::to_vec_pretty(&out).map_err(|e| e.to_string())?;
-        crate::storage::fsio::atomic_write_file(
-            &data_dir.join("pinned_tracker_admins.json"),
-            &json,
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    Ok(())
+/// Write-ahead record of a re-pin in progress (`council_repin_intent.json`). It is written before
+/// either pin store and removed after both, so a crash between the two store writes leaves it on
+/// disk and [`repair_council_pins`] replays it at the next start, with or without a manifest.
+pub const COUNCIL_REPIN_INTENT_FILE: &str = "council_repin_intent.json";
+
+/// A re-pin onto `new`: of `tracker` (`council repin`), whose pin before the re-pin was `prev`,
+/// or (no tracker) of every pin of `prev` (a client's re-root). Replaying it is idempotent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepinIntent {
+    /// The tracker re-pinned by `council repin`; `None` for a re-root's re-pin.
+    pub tracker: Option<String>,
+    /// The key re-pinned away from (the tracker's pin before the re-pin), if any.
+    pub prev: Option<[u8; 32]>,
+    /// The key re-pinned to.
+    pub new: [u8; 32],
 }
 
-/// `parvault council repin`: pins `tracker` to `new` in `known_peers.json`; every pin of its
-/// previous key moves too (both stores, as in [`repin_tracker_admin`]), and a tracker with no pin
-/// adds `new` to the legacy list. Both stores load before either is written (B-52), so a store that
-/// does not load leaves both files unchanged. Returns the tracker's previous pin.
-pub fn repin_tracker(
-    data_dir: &Path,
-    tracker: &str,
-    new: [u8; 32],
-) -> Result<Option<[u8; 32]>, String> {
+/// Reads the write-ahead re-pin record: absent is `None`; one that exists but cannot be read or
+/// decoded fails closed (`reject.council_repin_intent_unreadable`,
+/// `reject.council_repin_intent_corrupt`), since dropping it could leave an old root pinned.
+pub fn repin_intent_load_decision(
+    read: std::io::Result<Option<Vec<u8>>>,
+) -> Result<Option<RepinIntent>, &'static str> {
+    match read {
+        Ok(None) => Ok(None),
+        Ok(Some(bytes)) => serde_json::from_slice::<RepinIntent>(&bytes)
+            .map(Some)
+            .map_err(|_| "reject.council_repin_intent_corrupt"),
+        Err(_) => Err("reject.council_repin_intent_unreadable"),
+    }
+}
+
+fn load_repin_intent(data_dir: &Path) -> Result<Option<RepinIntent>, &'static str> {
+    repin_intent_load_decision(read_pin_file(&data_dir.join(COUNCIL_REPIN_INTENT_FILE)))
+}
+
+/// Applies `intent` to both pin stores. Both load before anything is written (B-52); then, when
+/// `log_intent`, the intent is written ahead; then `known_peers.json`, then the legacy file; then
+/// the intent is removed. Every crash point converges on the next start: before the intent write
+/// neither store changed, after it [`repair_council_pins`] replays the intent.
+fn apply_repin(data_dir: &Path, intent: &RepinIntent, log_intent: bool) -> Result<(), String> {
     let legacy = legacy_pinned_admins(data_dir).map_err(str::to_string)?;
     let mut store =
         crate::network::KnownPeersStore::try_load(data_dir).map_err(|e| e.to_string())?;
-    let old = store.set_tracker_admin_pubkey(tracker, new);
-    let moved = old.filter(|o| *o != new);
-    if let Some(o) = moved {
-        store.repin_tracker_admin_pubkey(o, new);
+    let new = intent.new;
+    let moved = intent.prev.filter(|o| *o != new);
+    let intent_path = data_dir.join(COUNCIL_REPIN_INTENT_FILE);
+    if log_intent {
+        let bytes = serde_json::to_vec(intent).map_err(|e| e.to_string())?;
+        crate::storage::fsio::atomic_write_file(&intent_path, &bytes)
+            .map_err(|e| format!("reject.tracker_pin_not_persisted: {e}"))?;
     }
-    let legacy_out: Option<Vec<[u8; 32]>> = match (old, moved) {
-        (_, Some(o)) if legacy.contains(&o) => Some(
+    let mut changed = false;
+    if let Some(t) = intent.tracker.as_deref() {
+        changed |= store.set_tracker_admin_pubkey(t, new) != Some(new);
+    }
+    if let Some(o) = moved {
+        changed |= store.repin_tracker_admin_pubkey(o, new) > 0;
+    }
+    if changed || intent.tracker.is_some() {
+        store.save(data_dir).map_err(|e| e.to_string())?;
+    }
+    let legacy_out: Option<Vec<[u8; 32]>> = match moved {
+        Some(o) if legacy.contains(&o) => Some(
             legacy
                 .iter()
                 .map(|pk| if *pk == o { new } else { *pk })
                 .collect(),
         ),
-        (None, _) if !legacy.contains(&new) => Some(legacy.iter().copied().chain([new]).collect()),
+        None if intent.tracker.is_some() && intent.prev.is_none() && !legacy.contains(&new) => {
+            Some(legacy.iter().copied().chain([new]).collect())
+        }
         _ => None,
     };
-    store.save(data_dir).map_err(|e| e.to_string())?;
     if let Some(keys) = legacy_out {
         let mut out: Vec<String> = Vec::new();
         for pk in keys {
@@ -462,37 +479,93 @@ pub fn repin_tracker(
         )
         .map_err(|e| format!("reject.tracker_pin_not_persisted: {e}"))?;
     }
-    Ok(old)
+    match std::fs::remove_file(&intent_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("reject.tracker_pin_not_persisted: {e}")),
+    }
+}
+
+/// Replaces the pinned tracker admin key `old` with `new` in both on-disk pin stores
+/// (`known_peers.json` and the legacy `pinned_tracker_admins.json`), crash-safe through the
+/// write-ahead [`RepinIntent`]. The in-memory map of a running client is updated by its caller
+/// (`MeshClient::repin_tracker_admin_pubkey`).
+pub fn repin_tracker_admin(data_dir: &Path, old: [u8; 32], new: [u8; 32]) -> Result<(), String> {
+    let intent = RepinIntent {
+        tracker: None,
+        prev: Some(old),
+        new,
+    };
+    apply_repin(data_dir, &intent, true)
+}
+
+/// `parvault council repin`: pins `tracker` to `new` in `known_peers.json`; every pin of its
+/// previous key moves too (both stores, as in [`repin_tracker_admin`]), and a tracker with no pin
+/// adds `new` to the legacy list. Both stores load before either is written (B-52), so a store that
+/// does not load leaves both files unchanged; the write-ahead [`RepinIntent`] makes a crash
+/// between the two store writes finish at the next start. Returns the tracker's previous pin.
+pub fn repin_tracker(
+    data_dir: &Path,
+    tracker: &str,
+    new: [u8; 32],
+) -> Result<Option<[u8; 32]>, String> {
+    // A re-pin cut short earlier finishes first, so its old key is not lost (B-66 addendum).
+    replay_repin_intent(data_dir)?;
+    legacy_pinned_admins(data_dir).map_err(str::to_string)?;
+    let prev = crate::network::KnownPeersStore::try_load(data_dir)
+        .map_err(|e| e.to_string())?
+        .tracker_admin_pubkey(tracker);
+    let intent = RepinIntent {
+        tracker: Some(tracker.to_string()),
+        prev,
+        new,
+    };
+    apply_repin(data_dir, &intent, true)?;
+    Ok(prev)
+}
+
+/// Replays a write-ahead re-pin left by a crash, if any. Returns it.
+fn replay_repin_intent(data_dir: &Path) -> Result<Option<RepinIntent>, String> {
+    let Some(intent) = load_repin_intent(data_dir).map_err(str::to_string)? else {
+        return Ok(None);
+    };
+    apply_repin(data_dir, &intent, false)?;
+    tracing::info!(
+        new = %hex::encode(intent.new),
+        "finished an interrupted tracker re-pin"
+    );
+    Ok(Some(intent))
 }
 
 /// A re-pin from the first root onto the second.
 pub type RePin = ([u8; 32], [u8; 32]);
 
-/// Finishes a client re-pin cut short by a crash (verdict change 7): when the installed
-/// manifest's root is pinned nowhere on disk but an earlier root of its chain is, that root is
-/// re-pinned to the installed one. Returns the `(old, new)` pair re-pinned, if any.
+/// Finishes a client re-pin cut short by a crash (verdict change 7), run at every public start
+/// before the pins load: first replays a write-ahead [`RepinIntent`] (this needs no manifest);
+/// then, while any earlier root of the installed chain is still pinned in either store (even
+/// when the installed root is pinned too), re-pins it to the installed root. Returns the last
+/// `(old, new)` pair re-pinned, if any.
 pub fn repair_council_pins(data_dir: &Path) -> Result<Option<RePin>, String> {
+    let mut done = replay_repin_intent(data_dir)?
+        .and_then(|i| i.prev.filter(|p| *p != i.new).map(|p| (p, i.new)));
     let Some(m) = load_council_manifest(data_dir) else {
-        return Ok(None);
+        return Ok(done);
     };
     let (mut pins, legacy) = disk_pins(data_dir).map_err(str::to_string)?;
     pins.extend(legacy);
-    if pins.contains(&m.scope_root) {
-        return Ok(None);
-    }
-    let Some(old) = chain_roots(data_dir, &m)
+    for old in chain_roots(data_dir, &m)
         .into_iter()
-        .find(|r| *r != m.scope_root && pins.contains(r))
-    else {
-        return Ok(None);
-    };
-    repin_tracker_admin(data_dir, old, m.scope_root)?;
-    tracing::info!(
-        old = %hex::encode(old),
-        new = %hex::encode(m.scope_root),
-        "finished an interrupted council re-pin"
-    );
-    Ok(Some((old, m.scope_root)))
+        .filter(|r| *r != m.scope_root && pins.contains(r))
+    {
+        repin_tracker_admin(data_dir, old, m.scope_root)?;
+        tracing::info!(
+            old = %hex::encode(old),
+            new = %hex::encode(m.scope_root),
+            "finished an interrupted council re-pin"
+        );
+        done = Some((old, m.scope_root));
+    }
+    Ok(done)
 }
 
 /// The scope roots of the installed chain, newest first: the installed manifest's, then each
@@ -1207,6 +1280,95 @@ mod tests {
             vec![bk]
         );
         assert_eq!(repair_council_pins(client.path()), Ok(None));
+    }
+
+    /// Crash-safe re-pin (F-53 QA): every state a crash between the two pin-store writes can leave
+    /// converges on B at the next start, and A never resolves as the root afterwards.
+    #[test]
+    fn interrupted_repin_converges_on_new_root() {
+        let a = id(0x41).public_key_bytes();
+        let bk = id(0x42).public_key_bytes();
+        let legacy_a = format!("[\"{}\"]", hex::encode(a));
+        // Write-ahead intent, no manifest: known = B, legacy = A, intent A -> B.
+        let dir = tempfile::tempdir().unwrap();
+        pin_known_peer(dir.path(), "/ip4/10.0.0.1/tcp/4002", bk);
+        std::fs::write(dir.path().join("pinned_tracker_admins.json"), &legacy_a).unwrap();
+        let intent = RepinIntent {
+            tracker: None,
+            prev: Some(a),
+            new: bk,
+        };
+        std::fs::write(
+            dir.path().join(COUNCIL_REPIN_INTENT_FILE),
+            serde_json::to_vec(&intent).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(repair_council_pins(dir.path()), Ok(Some((a, bk))));
+        assert_eq!(legacy_pinned_admins(dir.path()), Ok(vec![bk]));
+        assert!(!dir.path().join(COUNCIL_REPIN_INTENT_FILE).exists());
+        std::fs::remove_file(dir.path().join(crate::network::KnownPeersStore::FILE_NAME)).unwrap();
+        assert_eq!(council_scope_root(dir.path(), None, true, &[]), Some(bk));
+        assert_eq!(repair_council_pins(dir.path()), Ok(None));
+
+        // No intent (written by a binary before the fix), manifest under B: B pinned in
+        // known_peers.json no longer stops the repair of the legacy A pin.
+        let b = id(0x42);
+        let (m1, r) = reroot(&b, &[5, 6, 7], &[2, 3], true);
+        let a = m1.scope_root;
+        let client = tempfile::tempdir().unwrap();
+        pin_known_peer(client.path(), "/ip4/10.0.0.1/tcp/4002", a);
+        let legacy_a = format!("[\"{}\"]", hex::encode(a));
+        std::fs::write(client.path().join("pinned_tracker_admins.json"), &legacy_a).unwrap();
+        install_council_manifest(client.path(), &m1, a, CouncilInstallRole::PublicClient).unwrap();
+        install_council_manifest(client.path(), &r, a, CouncilInstallRole::PublicClient).unwrap();
+        std::fs::write(client.path().join("pinned_tracker_admins.json"), &legacy_a).unwrap();
+        assert_eq!(repair_council_pins(client.path()), Ok(Some((a, bk))));
+        assert_eq!(legacy_pinned_admins(client.path()), Ok(vec![bk]));
+        assert_eq!(repair_council_pins(client.path()), Ok(None));
+
+        // `council repin` cut short after known_peers.json: rerunning it finishes the legacy file
+        // (it used to see B as the previous pin and leave A there).
+        let dir = tempfile::tempdir().unwrap();
+        let t = "/ip4/10.0.0.1/tcp/4002";
+        pin_known_peer(dir.path(), t, bk);
+        std::fs::write(dir.path().join("pinned_tracker_admins.json"), &legacy_a).unwrap();
+        let intent = RepinIntent {
+            tracker: Some(t.to_string()),
+            prev: Some(a),
+            new: bk,
+        };
+        std::fs::write(
+            dir.path().join(COUNCIL_REPIN_INTENT_FILE),
+            serde_json::to_vec(&intent).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(repin_tracker(dir.path(), t, bk), Ok(Some(bk)));
+        assert_eq!(legacy_pinned_admins(dir.path()), Ok(vec![bk]));
+        assert!(!dir.path().join(COUNCIL_REPIN_INTENT_FILE).exists());
+    }
+
+    /// A write-ahead re-pin record that does not decode fails closed and is kept.
+    #[test]
+    fn corrupt_repin_intent_fails_closed() {
+        assert_eq!(repin_intent_load_decision(Ok(None)), Ok(None));
+        assert_eq!(
+            repin_intent_load_decision(Ok(Some(b"{".to_vec()))),
+            Err("reject.council_repin_intent_corrupt")
+        );
+        assert_eq!(
+            repin_intent_load_decision(Err(std::io::Error::other("eio"))),
+            Err("reject.council_repin_intent_unreadable")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(COUNCIL_REPIN_INTENT_FILE), b"{").unwrap();
+        assert_eq!(
+            repair_council_pins(dir.path()),
+            Err("reject.council_repin_intent_corrupt".to_string())
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(COUNCIL_REPIN_INTENT_FILE)).unwrap(),
+            b"{"
+        );
     }
 
     /// QA MED (B-52): a pin store that exists but does not load resolves no public scope root
