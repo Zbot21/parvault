@@ -194,10 +194,14 @@ jobs:
         run: cargo test --release --lib --no-default-features --features ipc-client
       - name: Check minimal headless build (--no-default-features, VFS excluded)
         run: cargo check --no-default-features --features daemon-runtime --bin parvault --bin parvault-seed --bin parvault-sync
+      - name: Release build environment cannot turn debug assertions on (v0.5.4, docs/METRICS.md)
+        run: bash scripts/check_release_build_env.sh .
       - name: Build binaries (parvault, parvault-seed, parvault-fuse, parvault-sync)
         run: bash scripts/build_bins.sh --profile release --out dist
       - name: Scalar-only erasure coding in the shipped binaries (L-102)
         run: bash scripts/check_scalar_erasure_coding.sh dist/*
+      - name: No insecure metrics listener in the release binaries (v0.5.4)
+        run: bash scripts/check_no_insecure_metrics.sh dist/parvault dist/parvault-seed
       - name: Run all integration, formal (Stateright + TLA+ TLC), UDS zero-copy IPC & VFS test suites
         run: cargo test --release
       - name: Run binary self-tests (parvault-seed, parvault gateway, parvault-fuse, parvault-sync)
@@ -248,6 +252,38 @@ jobs:
           if bash scripts/check_scalar_erasure_coding.sh target/release/parvault-bench; then
             echo "::error::the gate passed a SIMD build"; exit 1
           fi
+
+  insecure-metrics-guard:
+    # v0.5.4 (docs/METRICS.md): the release guard against the debug-only unauthenticated metrics
+    # listener, with both negative controls. Control 2 is the exact bypass in the shipped build
+    # shape (soc profile, static musl, stripped), caught by the marker alone.
+    name: Insecure metrics release guard (negative controls)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl tools
+        run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y -o Acquire::Retries=5 musl-tools
+      - name: Negative control 1, a dev build with the feature is flagged
+        run: |
+          cargo build --profile dev --features lab-insecure-metrics --bin parvault
+          cp target/debug/parvault "$RUNNER_TEMP/nc1-parvault"
+          rc=0; bash scripts/check_no_insecure_metrics.sh "$RUNNER_TEMP/nc1-parvault" || rc=$?
+          [ "$rc" -eq 1 ] || { echo "::error::control 1: expected exit 1, got $rc"; exit 1; }
+      - name: Negative control 2, the soc musl build with debug assertions forced on is flagged
+        env:
+          CARGO_PROFILE_SOC_DEBUG_ASSERTIONS: "true"
+        run: |
+          rc=0; bash scripts/check_release_build_env.sh . || rc=$?
+          [ "$rc" -eq 1 ] || { echo "::error::control 2: build-env check expected exit 1, got $rc"; exit 1; }
+          cargo build --profile soc --target x86_64-unknown-linux-musl --features lab-insecure-metrics -p parvault --bin parvault
+          cp target/x86_64-unknown-linux-musl/soc/parvault "$RUNNER_TEMP/nc2-parvault"
+          strip "$RUNNER_TEMP/nc2-parvault"
+          rc=0; bash scripts/check_no_insecure_metrics.sh --marker-only "$RUNNER_TEMP/nc2-parvault" || rc=$?
+          [ "$rc" -eq 1 ] || { echo "::error::control 2: marker scan expected exit 1, got $rc"; exit 1; }
 
   docs-commands:
     # L-34 (plan-7 section 3): every command block in README.md and QUICKSTART.md runs against

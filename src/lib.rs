@@ -24,6 +24,8 @@ pub mod crypto;
 pub mod effective_config;
 pub mod gateway;
 pub mod http_edge;
+#[cfg(all(unix, feature = "lab-insecure-metrics"))]
+pub mod insecure_metrics;
 pub mod lab_dial;
 #[cfg(feature = "daemon-runtime")]
 pub mod network;

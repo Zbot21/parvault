@@ -92,6 +92,8 @@ pub(crate) async fn up(env: CliEnv, command: Commands) -> anyhow::Result<()> {
         trust_mode,
         eff,
         config_digest,
+        #[cfg(feature = "lab-insecure-metrics")]
+        lab_insecure_metrics: None,
     };
     run_daemon(cfg, block_store, opts).await?;
     Ok(())
@@ -132,6 +134,8 @@ pub(crate) async fn daemon(env: CliEnv, command: Commands) -> anyhow::Result<()>
             vfs_seed_dir,
             vfs_cache_mib,
             dump_config: _,
+            #[cfg(feature = "lab-insecure-metrics")]
+            lab_insecure_metrics,
         } => {
             validate_builtin_vfs_flags(
                 vfs_webdav_listen.as_deref(),
@@ -176,6 +180,8 @@ pub(crate) async fn daemon(env: CliEnv, command: Commands) -> anyhow::Result<()>
                 trust_mode,
                 eff,
                 config_digest,
+                #[cfg(feature = "lab-insecure-metrics")]
+                lab_insecure_metrics,
             };
             run_daemon(cfg, block_store, opts).await?;
         }

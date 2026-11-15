@@ -9194,3 +9194,152 @@ fn f06_busy_refusal_spends_no_nonce_or_budget() {
     );
     assert_logged(&node, "reject.por_rate_limited");
 }
+
+// --- v0.5.4 NEW-3: `/metrics` on the status listener, behind status_auth_decision ---------------
+
+fn metrics_req(
+    addr: std::net::SocketAddr,
+    method: &str,
+    host: &str,
+    auth: Option<String>,
+) -> Vec<u8> {
+    let mut req = format!("{method} /metrics HTTP/1.1\r\nHost: {host}\r\n");
+    if let Some(a) = auth {
+        req.push_str(&format!("Authorization: {a}\r\n"));
+    }
+    req.push_str("\r\n");
+    http_raw(addr, &[req.as_bytes()])
+}
+
+fn http_code(raw: &[u8]) -> u16 {
+    String::from_utf8_lossy(raw)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The metric families of schema 1 (`docs/schemas/traversal-metrics-1.txt`).
+fn metric_families() -> Vec<String> {
+    include_str!("../docs/schemas/traversal-metrics-1.txt")
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.starts_with("reserved ") && !l.trim().is_empty())
+        .map(|l| l.split_whitespace().next().unwrap().to_string())
+        .collect()
+}
+
+/// METRICS-AUTH, -SCOPED, -HOST accept: a ReadOnly, unscoped Bearer token scrapes `/metrics`.
+#[test]
+fn metrics_http_readonly_bearer_served() {
+    let (_node, addr) = status_up("mx-ok", Some(GW_KEY));
+    let raw = metrics_req(
+        addr,
+        "GET",
+        &host_of(addr),
+        Some(format!("Bearer {}", ro_token())),
+    );
+    let text = String::from_utf8_lossy(&raw);
+    assert_eq!(http_code(&raw), 200, "{text}");
+    assert!(
+        text.contains("Content-Type: text/plain; version=0.0.4\r\n"),
+        "{text}"
+    );
+    assert!(!text.contains("X-Parvault-Insecure-Metrics"), "{text}");
+    for family in metric_families() {
+        assert!(
+            text.contains(&format!("# TYPE {family} ")),
+            "{family} missing:\n{text}"
+        );
+    }
+    assert!(text.contains("parvault_build_info{version=\""), "{text}");
+    gate_ran("trust_enforcement::metrics_http_readonly_bearer_served");
+}
+
+/// METRICS-AUTH reject: no token, the same byte-identical 401 as `/`.
+#[test]
+fn metrics_http_no_token_unauthorized() {
+    let (node, addr) = status_up("mx-none", Some(GW_KEY));
+    let raw = metrics_req(addr, "GET", &host_of(addr), None);
+    assert_eq!(raw, parvault::http_edge::STATUS_401);
+    let (_, root) = status_get(addr, &host_of(addr), None);
+    assert_eq!(raw, root);
+    assert_logged(&node, "reject.status_token_missing");
+    gate_ran("trust_enforcement::metrics_http_no_token_unauthorized");
+}
+
+/// METRICS-SCOPED reject: a token scoped to a byte range is refused 403.
+#[test]
+fn metrics_http_scoped_token_forbidden() {
+    let (node, addr) = status_up("mx-scoped", Some(GW_KEY));
+    let scoped = status_token(vec![
+        parvault::capabilities::Caveat::ReadOnly,
+        parvault::capabilities::Caveat::ByteRange {
+            offset: 0,
+            length: 4096,
+        },
+    ]);
+    let raw = metrics_req(
+        addr,
+        "GET",
+        &host_of(addr),
+        Some(format!("Bearer {scoped}")),
+    );
+    assert_eq!(http_code(&raw), 403);
+    assert_logged(&node, "reject.status_token_scoped");
+    gate_ran("trust_enforcement::metrics_http_scoped_token_forbidden");
+}
+
+/// METRICS-HOST reject: a DNS Host (rebinding) is refused 403.
+#[test]
+fn metrics_http_dns_host_refused() {
+    let (node, addr) = status_up("mx-host", Some(GW_KEY));
+    let host = format!("rebind.example:{}", addr.port());
+    let raw = metrics_req(addr, "GET", &host, Some(format!("Bearer {}", ro_token())));
+    assert_eq!(http_code(&raw), 403);
+    assert_logged(&node, "reject.status_host_mismatch");
+    gate_ran("trust_enforcement::metrics_http_dns_host_refused");
+}
+
+/// A non-GET without a token is the 401: method handling comes after auth.
+#[test]
+fn metrics_http_post_unauthenticated_is_401() {
+    let (_node, addr) = status_up("mx-post-anon", Some(GW_KEY));
+    let raw = metrics_req(addr, "POST", &host_of(addr), None);
+    assert_eq!(raw, parvault::http_edge::STATUS_401);
+    gate_ran("trust_enforcement::metrics_http_post_unauthenticated_is_401");
+}
+
+/// A non-GET with a valid token is 405.
+#[test]
+fn metrics_http_post_authenticated_is_405() {
+    let (_node, addr) = status_up("mx-post", Some(GW_KEY));
+    let raw = metrics_req(
+        addr,
+        "POST",
+        &host_of(addr),
+        Some(format!("Bearer {}", ro_token())),
+    );
+    assert_eq!(http_code(&raw), 405);
+    gate_ran("trust_enforcement::metrics_http_post_authenticated_is_405");
+}
+
+/// Refusals are counted by code, and a scrape shows them.
+#[test]
+fn metrics_http_counts_status_refusals() {
+    let (_node, addr) = status_up("mx-refused", Some(GW_KEY));
+    for _ in 0..3 {
+        let _ = metrics_req(addr, "GET", &host_of(addr), None);
+    }
+    let raw = metrics_req(
+        addr,
+        "GET",
+        &host_of(addr),
+        Some(format!("Bearer {}", ro_token())),
+    );
+    let text = String::from_utf8_lossy(&raw);
+    assert!(
+        text.contains("parvault_status_refused_total{code=\"status_token_missing\"} 3\n"),
+        "{text}"
+    );
+    gate_ran("trust_enforcement::metrics_http_counts_status_refusals");
+}

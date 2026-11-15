@@ -50,6 +50,8 @@ jobs:
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
           fi
+          # v0.5.4 (docs/METRICS.md): nothing may turn debug assertions on in a shipped build.
+          bash scripts/check_release_build_env.sh .
           # Each binary is built with its own feature set (plan-3 ruling change 9).
           bash scripts/build_bins.sh --profile soc --target ${{ matrix.target }} --out release-dist \
             parvault parvault-seed parvault-fuse parvault-sync parvault-status
@@ -57,6 +59,7 @@ jobs:
             ${{ matrix.strip }} "release-dist/${bin}-${{ matrix.target }}"
           done
           bash scripts/check_scalar_erasure_coding.sh release-dist/*   # L-102
+          bash scripts/check_no_insecure_metrics.sh release-dist/*     # v0.5.4
           echo "### Binary sizes for ${{ matrix.target }} (--profile soc, stripped static musl):"
           ls -lh release-dist/
       - uses: actions/upload-artifact@v4
@@ -82,6 +85,18 @@ jobs:
             exit 1
           fi
           cp scripts/install.sh artifacts/install.sh
+      # v0.5.4 (docs/METRICS.md): the exact files that are published and checksummed, checked
+      # right before SHA256SUMS (this branch has no signing job yet; with one, this step moves to
+      # just before `ssh-keygen -Y sign` on the signed files). A non-zero exit stops the job.
+      - name: No insecure metrics listener in the published binaries
+        run: |
+          chmod +x artifacts/parvault-*-unknown-linux-musl
+          bash scripts/check_no_insecure_metrics.sh \
+            artifacts/parvault-x86_64-unknown-linux-musl artifacts/parvault-aarch64-unknown-linux-musl \
+            artifacts/parvault-seed-x86_64-unknown-linux-musl artifacts/parvault-seed-aarch64-unknown-linux-musl \
+            artifacts/parvault-fuse-x86_64-unknown-linux-musl artifacts/parvault-fuse-aarch64-unknown-linux-musl \
+            artifacts/parvault-sync-x86_64-unknown-linux-musl artifacts/parvault-sync-aarch64-unknown-linux-musl \
+            artifacts/parvault-status-x86_64-unknown-linux-musl artifacts/parvault-status-aarch64-unknown-linux-musl
       - name: Bundle Router-SoC configuration and generate checksums
         run: |
           tar -czvf artifacts/parvault-router-soc-bundle.tar.gz -C deploy/router-soc parvault-router.toml parvault-nas.procd -C ../ prplos-lxc-manifest.json

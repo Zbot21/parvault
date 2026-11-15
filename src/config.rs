@@ -100,6 +100,7 @@ const fn default_lan_discovery_port() -> u16 {
 #[command(
     name = "parvault",
     version,
+    long_version = crate::traversal_metrics::long_version(),
     about = "ParVault — Zero-IP post-quantum erasure-coded backup, Home LAN/WAN Cloud-NAS & P2P storage utility"
 )]
 pub struct Cli {
@@ -683,6 +684,12 @@ pub enum DaemonAction {
         /// 0 without binding, creating, reading or writing any file but the config file.
         #[arg(long, default_value_t = false)]
         dump_config: bool,
+
+        /// DEBUG BUILDS ONLY: an unauthenticated `GET /metrics` listener on `<IFACE>=<IP:PORT>`
+        /// (the IP must be on that interface; `docs/METRICS.md`). Absent from release builds.
+        #[cfg(feature = "lab-insecure-metrics")]
+        #[arg(long, value_name = "IFACE=IP:PORT")]
+        lab_insecure_metrics: Option<String>,
     },
 }
 

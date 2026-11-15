@@ -29,6 +29,9 @@ pub(crate) struct DaemonLaunchOptions {
     pub(crate) eff: Arc<parvault::config::EffectiveConfig>,
     /// Hex SHA-256 of the `parvault.config-dump/1` of this command.
     pub(crate) config_digest: String,
+    /// `--lab-insecure-metrics <IFACE>=<IP:PORT>` (debug feature builds only).
+    #[cfg(feature = "lab-insecure-metrics")]
+    pub(crate) lab_insecure_metrics: Option<String>,
 }
 
 pub(crate) async fn run_daemon(
@@ -344,6 +347,14 @@ pub(crate) async fn run_daemon(
         }
     }
 
+    // Debug lab builds only (docs/METRICS.md): the unauthenticated listener, refused unless the
+    // build, the bind and the interface all allow it.
+    #[cfg(all(unix, feature = "lab-insecure-metrics"))]
+    let _insecure_metrics = match (&opts.lab_insecure_metrics, &counters) {
+        (Some(spec), Some(c)) => Some(parvault::insecure_metrics::spawn(spec, Arc::clone(c))?),
+        _ => None,
+    };
+
     spawn_folder_sync(&opts, &cfg, &block_store);
 
     // No gossip topic is subscribed: slashing evidence is not applied from gossip until it is
@@ -352,7 +363,15 @@ pub(crate) async fn run_daemon(
     if let Some(client) = block_store.mesh_client() {
         for peer_str in client.all_network_endpoints() {
             if let Ok(addr) = parvault::network::parse_peer_multiaddr(&peer_str) {
-                let _ = swarm.dial(addr);
+                // An address that names its PeerId is dialled for that peer, so the swarm
+                // refuses a connection that authenticates as another (WrongPeerId).
+                let opts = match parvault::network::client::extract_expected_peer_id(&addr) {
+                    Some(pid) => libp2p::swarm::dial_opts::DialOpts::peer_id(pid)
+                        .addresses(vec![parvault::network::client::strip_p2p_protocol(&addr)])
+                        .build(),
+                    None => libp2p::swarm::dial_opts::DialOpts::from(addr),
+                };
+                let _ = swarm.dial(opts);
             }
         }
     }

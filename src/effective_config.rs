@@ -693,8 +693,18 @@ impl EffectiveConfig {
                         vfs_seed_dir,
                         vfs_cache_mib,
                         dump_config: _,
+                        #[cfg(feature = "lab-insecure-metrics")]
+                        lab_insecure_metrics,
                     },
             } => {
+                #[cfg(feature = "lab-insecure-metrics")]
+                {
+                    listeners.insecure_metrics = lab_insecure_metrics.clone();
+                    set_args(vec![(
+                        "lab_insecure_metrics",
+                        serde_json::json!(lab_insecure_metrics),
+                    )]);
+                }
                 if key_from_flag(&mut key_sources, "listen_tcp", "listen")
                     || key_sources.get("listen_tcp") == Some(&Source::Default)
                 {

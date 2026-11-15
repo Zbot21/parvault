@@ -1,0 +1,14 @@
+# parvault traversal metrics, schema 1 (v0.5.4, docs/METRICS.md). One metric family per line:
+# name, type. tests/traversal_metrics.rs and trust_enforcement::metrics_http_readonly_bearer_served
+# check that a scrape has exactly these families. Reserved names are not emitted until their
+# release, and no other name may be added without a new schema.
+parvault_traversal_attempts_total counter
+parvault_traversal_outcomes_total counter
+parvault_traversal_inbound_total counter
+parvault_traversal_connect_seconds histogram
+parvault_traversal_connections gauge
+parvault_traversal_timing_overflow_total counter
+parvault_status_refused_total counter
+parvault_build_info gauge
+reserved parvault_relay_reservations gauge v0.5.8
+reserved parvault_autonat_status gauge v0.5.9
