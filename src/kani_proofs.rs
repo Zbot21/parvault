@@ -1602,12 +1602,31 @@ fn proof_por_storer_decision() {
         kani::cover!(!o.ok && !o.has_key, "no key refused under a grant");
         kani::cover!(
             !o.ok && o.sender_is_accounted,
-            "accounted owner refused under a grant"
+            "accounted owner, no witness, refused"
         );
     } else {
         kani::cover!(o.ok, "accounted owner admitted without a grant");
         kani::cover!(!o.ok, "non-owner refused without a grant");
     }
+    // The map's cited cover on a direct call (one witness): the sender is the accounted owner
+    // and a grant is registered; only the grant's keys decide.
+    use crate::por::{por_storer_decision, GrantStorers, PorStorerFacts};
+    let w: [[u8; 32]; 1] = pool_keys();
+    let (owner, key, id) = (any_pool_key(), any_pool_key(), any_device_id());
+    let r = por_storer_decision(&PorStorerFacts {
+        sender_device_id: id,
+        sender_key: Some(key),
+        accounted_owner: id,
+        grant: Some(GrantStorers {
+            owner,
+            witnesses: &w,
+        }),
+    });
+    assert_eq!(r.is_ok(), key == owner || key == w[0]);
+    kani::cover!(
+        r.is_err() && id.is_some(),
+        "accounted owner refused under a grant"
+    );
 }
 
 /// What one storer check saw, for the harness's covers.
@@ -1710,6 +1729,12 @@ fn proof_grant_replace_witness_superset() {
         (_, 1) => check_grant_replace::<2, 1>(),
         (_, _) => check_grant_replace::<2, 2>(),
     };
+    // The map's cited cover on a direct call: two registered witnesses, one incoming.
+    use crate::por::grant_replace_decision;
+    let (reg, inc): ([[u8; 32]; 2], [[u8; 32]; 1]) = (pool_keys(), pool_keys());
+    let r = grant_replace_decision(Some(&reg), &inc);
+    assert_eq!(r.is_ok(), reg[0] == inc[0] && reg[1] == inc[0]);
+    kani::cover!(r.is_err(), "witness downgrade kept out");
     kani::cover!(!ok && n_new == 0, "witness downgrade to none kept out");
     kani::cover!(!ok && n_new > 0, "partial overlap kept out");
     kani::cover!(ok && has_old && n_old > 0, "superset replaces");
