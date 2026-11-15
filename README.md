@@ -53,10 +53,11 @@ parvault wot init
 parvault up \
   --profile router-soc \
   --folder /mnt/usb-nas/shared \
-  --status-http 0.0.0.0:4080 \
+  --status-http 127.0.0.1:4080 \
   --pair
 #    The status page needs a read-only token: `parvault token mint --read-only`, then enter it
-#    as the password at http://<node-ip>:4080 (IP address or localhost only).
+#    as the password at http://127.0.0.1:4080. For the LAN, bind `--status-http <LAN-IP>:4080`, never
+#    `0.0.0.0` on a router (it includes the WAN).
 
 # 4. On your laptop: discover home LAN storage (no IP addresses to type) and pair with the code
 parvault discover

@@ -54,7 +54,7 @@ Global options (available on all subcommands):
 | `parvault discover` | `--timeout-ms <MS>` *(default: `500`)*<br>`--port <PORT>` *(default: `4009`)*<br>`--json` *(optional)* | Scans the local network over UDP port `4009` and multicast `239.255.80.86`, verifies signed `LanBeaconPacket`s, upserts verified multiaddrs in `<data_dir>/known_peers.json`, and prints a human-readable table or structured JSON — **zero IP addresses required!** |
 | `parvault pair` | `--port <PORT>` *(default: `4009`)*<br>`--duration-secs <SECS>` *(default: `120`)*<br>`--once` *(optional)*<br>`--wan` *(optional)* | Derives a human-friendly 4-word BIP-39 SAS pairing code (e.g. `shield-copper-alpine-matrix`), broadcasts the commitment via `LanBeaconResponder` (or registers an encrypted WAN rendezvous slot on `--seed-addr`), and stays active for joining peers. |
 | `parvault join` | `--code <CODE_OR_TOKEN>` *(required)*<br>`--timeout-ms <MS>` *(default: `1500`)*<br>`--port <PORT>` *(default: `4009`)*<br>`--wan` *(optional)* | Probes the LAN (or looks up WAN rendezvous) for the peer broadcasting the matching 4-word code, verifies signature and SAS commitment, and pins `/p2p/<PeerId>` in `known_peers.json`. |
-| `parvault up` | `--profile <router-soc\|homelab-nas\|desktop>` *(default: `desktop`)*<br>`--folder <DIR>` *(optional continuous watch directory)*<br>`--interval-secs <SECS>` *(default: `5`)*<br>`--status-http <ADDR>` *(e.g. `0.0.0.0:4080`)*<br>`--pair` *(optional; outputs 4-word code)*<br>`--public` *(optional; zero-pairing public swarm)*<br>`--tracker <MULTIADDR>` *(optional public tracker)* | **Turnkey Single-Command Appliance Mode:** Starts the P2P storage daemon, signed UDP LAN beacon responder, embedded `RouterNasStatusServer` HTTP dashboard/API, and background incremental folder watcher. |
+| `parvault up` | `--profile <router-soc\|homelab-nas\|desktop>` *(default: `desktop`)*<br>`--folder <DIR>` *(optional continuous watch directory)*<br>`--interval-secs <SECS>` *(default: `5`)*<br>`--status-http <ADDR>` *(e.g. `127.0.0.1:4080` or `<LAN-IP>:4080`)*<br>`--pair` *(optional; outputs 4-word code)*<br>`--public` *(optional; zero-pairing public swarm)*<br>`--tracker <MULTIADDR>` *(optional public tracker)* | **Turnkey Single-Command Appliance Mode:** Starts the P2P storage daemon, signed UDP LAN beacon responder, embedded `RouterNasStatusServer` HTTP dashboard/API, and background incremental folder watcher. |
 
 ### 2.2 Identity & Personal Device Certificates
 | Command | Flags & Arguments | Description |
@@ -136,7 +136,7 @@ Start the ring once (`parvault wot init`; a private-mode daemon outside any ring
 parvault up \
   --profile router-soc \
   --folder /mnt/usb-nas/shared \
-  --status-http 0.0.0.0:4080 \
+  --status-http 127.0.0.1:4080 \
   --pair
 ```
 This prints a **4-word BIP-39 SAS pairing code** (e.g. `shield-copper-alpine-matrix`), launches the P2P daemon, responds to signed LAN discovery beacons on UDP `4009`, and serves the live web dashboard on port `4080`.

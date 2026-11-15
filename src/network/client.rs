@@ -7,8 +7,8 @@ use crate::network::behaviour::{
     PlacementEngine, SignedWanRendezvousEntry,
 };
 use crate::network::discovery::{
-    discover_lan_peers, node_identity_libp2p_peer_id, tracker_pin_decision, KnownPeersStore,
-    DEFAULT_LAN_DISCOVERY_PORT,
+    discover_lan_peers, node_identity_libp2p_peer_id, tracker_pin_decision, wan_ddns_card_decision,
+    KnownPeersStore, DEFAULT_LAN_DISCOVERY_PORT,
 };
 use crate::network::transport::build_mesh_client_swarm;
 use crate::network::wan_rendezvous::{
@@ -1894,18 +1894,8 @@ impl MeshClient {
         if local_pid_str.as_deref() == Some(card.libp2p_peer_id.as_str()) {
             return;
         }
-        let Some(first_raw) = card
-            .wan_multiaddrs
-            .iter()
-            .map(|s| s.trim())
-            .find(|s| !s.is_empty())
-        else {
+        let Some(pinned_maddr) = card.pinned_multiaddr() else {
             return;
-        };
-        let pinned_maddr = if first_raw.contains("/p2p/") {
-            first_raw.to_string()
-        } else {
-            format!("{first_raw}/p2p/{}", card.libp2p_peer_id)
         };
 
         if let Ok(pid) = card.libp2p_peer_id.parse::<PeerId>() {
@@ -2071,8 +2061,11 @@ impl MeshClient {
         Ok(ack_obs.or(pre_observed))
     }
 
-    /// Resolves encrypted Dynamic-IP DDNS heartbeats under `fingerprint_or_secret` from `anchor_addr`,
-    /// automatically healing `KnownPeersStore` and `MeshClient` `PeerId` mappings across ISP IP changes.
+    /// Resolves encrypted Dynamic-IP DDNS heartbeats under `fingerprint_or_secret` from `anchor_addr`
+    /// and heals the `KnownPeersStore` and `MeshClient` addresses of peers already pinned, across
+    /// ISP IP changes. A card for a `PeerId` not pinned in `<data_dir>/known_peers.json` is refused
+    /// (`wan_ddns_card_decision`, B-91) and neither pinned nor returned; with no data dir nothing
+    /// is pinned, so every card is refused.
     pub fn lookup_wan_ddns_cards(
         &self,
         anchor_addr: &str,
@@ -2080,15 +2073,32 @@ impl MeshClient {
     ) -> anyhow::Result<Vec<WanPeerCard>> {
         let slot_key = derive_peer_ddns_slot_key(fingerprint_or_secret);
         let (entries, _) = self.lookup_wan_rendezvous(anchor_addr, slot_key)?;
+        let known = self
+            .discovery_data_dir
+            .as_deref()
+            .map(KnownPeersStore::load)
+            .unwrap_or_default();
+        let local_pid = node_identity_libp2p_peer_id(&self.identity)
+            .ok()
+            .map(|p| p.to_string());
         let now = wan_now_ms();
         let mut out = Vec::new();
         for entry in &entries {
-            if let Ok(card) = open_ddns_heartbeat(fingerprint_or_secret, entry) {
-                if !card.is_expired(now) {
-                    self.ingest_verified_wan_card(&card);
-                    out.push(card);
-                }
+            let Ok(card) = open_ddns_heartbeat(fingerprint_or_secret, entry) else {
+                continue;
+            };
+            if card.is_expired(now) || local_pid.as_deref() == Some(card.libp2p_peer_id.as_str()) {
+                continue;
             }
+            let Some(pinned) = card.pinned_multiaddr() else {
+                continue;
+            };
+            if let Err(code) = wan_ddns_card_decision(&card.libp2p_peer_id, &pinned, &known) {
+                tracing::warn!(code, peer = %card.libp2p_peer_id, "refused a WAN DDNS card");
+                continue;
+            }
+            self.ingest_verified_wan_card(&card);
+            out.push(card);
         }
         Ok(out)
     }

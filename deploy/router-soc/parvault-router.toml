@@ -6,7 +6,8 @@ hardware_profile = "router-soc"
 # Local persistent data directory (stored on attached USB drive, NVMe mount, or persistent overlay)
 data_dir = "/mnt/nas/.parvault-data"
 
-# P2P Listeners
+# P2P Listeners. `0.0.0.0` is only the fallback for a box with no uci: it includes the WAN, so
+# fw4 must drop WAN input on 4001. Pass `--listen /ip4/<LAN-IP>/tcp/4001` to bind the LAN only (B-54).
 listen_tcp = "/ip4/0.0.0.0/tcp/4001"
 enable_quic = false
 listen_quic = "/ip4/0.0.0.0/udp/4001/quic-v1"
@@ -24,7 +25,9 @@ lan_discovery_enabled = true
 lan_discovery_port = 4009
 
 # Embedded Router NAS HTTP Status & Telemetry Dashboard (ADR-18)
-status_http_bind = "0.0.0.0:4080"
+# Loopback by default (B-54): `0.0.0.0` would include the WAN. For the LAN, pass
+# `--status-http <LAN-IP>:4080`; the LuCI proxy connects to 127.0.0.1:4080.
+status_http_bind = "127.0.0.1:4080"
 
 # Node Identification
 node_label = "OpenWrt-Router-NAS"
@@ -34,4 +37,4 @@ por_timeout_ms = 300
 local_rtt_threshold_ms = 5
 intra_asn_ratio = 0.70
 bootstrap_grace_bytes = 1073741824 # 1 GiB bootstrap grace
-max_connections = 24
+max_connections = 24 # not applied in v0.5.x: no swarm connection limit yet (B-64); status page caps at 32, WebDAV at 64

@@ -196,6 +196,8 @@ jobs:
         run: cargo check --no-default-features --features daemon-runtime --bin parvault --bin parvault-seed --bin parvault-sync
       - name: Build binaries (parvault, parvault-seed, parvault-fuse, parvault-sync)
         run: bash scripts/build_bins.sh --profile release --out dist
+      - name: Scalar-only erasure coding in the shipped binaries (L-102)
+        run: bash scripts/check_scalar_erasure_coding.sh dist/*
       - name: Run all integration, formal (Stateright + TLA+ TLC), UDS zero-copy IPC & VFS test suites
         run: cargo test --release
       - name: Run binary self-tests (parvault-seed, parvault gateway, parvault-fuse, parvault-sync)
@@ -209,6 +211,43 @@ jobs:
           PARVAULT_PLUGIN_BIN_DIR="$PWD/dist" cargo test --release --test trust_enforcement -- f43_plugin r3_sync_push status_sidecar
       - name: Run 13-Container Docker P2P Regression & Disaster Recovery Gate
         run: USE_GLIBC_IMAGE=1 bash scripts/docker_acceptance_gate.sh
+
+  scalar-erasure-coding:
+    # L-102: scalar-only erasure coding, enforced in CI. The shipped binaries are stripped, so the
+    # rust-tests job checks only table content; this job builds unstripped so the symbol and
+    # scoped-instruction checks run, and proves both checks flag a deliberately SIMD-enabled build.
+    name: Scalar-only erasure coding (symbols and non-vacuity)
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_RELEASE_STRIP: "none"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: No simd-accel anywhere in the feature graph
+        run: |
+          if cargo tree -e features -i reed-solomon-erasure --all-features | grep -q 'simd-accel'; then
+            echo "::error::reed-solomon-erasure/simd-accel is enabled"; exit 1
+          fi
+      - name: Cargo.lock holds no erasure-coding or GF crate but reed-solomon-erasure
+        # The binary checks know only reed-solomon-erasure's kernel; this catches a SIMD kernel from
+        # any other crate (reed-solomon-simd, reed-solomon-novelpoly, a renamed or git fork).
+        run: bash scripts/check_scalar_erasure_coding.sh --cargo-lock Cargo.lock
+      - name: Unstripped scalar build passes the symbol and instruction checks
+        run: |
+          cargo build --release --bin parvault-bench
+          cp target/release/parvault-bench "$RUNNER_TEMP/scalar-bench"
+          bash scripts/check_scalar_erasure_coding.sh --require-symbols "$RUNNER_TEMP/scalar-bench"
+      - name: Non-vacuity, a SIMD-enabled build is flagged by every check
+        run: |
+          cargo build --release --bin parvault-bench --features reed-solomon-erasure/simd-accel
+          bash scripts/check_scalar_erasure_coding.sh --expect-simd --require-symbols target/release/parvault-bench
+          # The symbol-name check answers first on reedsolomon_gal_mul, so run the scoped
+          # instruction scan alone too: it must flag the SIMD build by itself.
+          bash scripts/check_scalar_erasure_coding.sh --expect-simd --insn-only target/release/parvault-bench
+          if bash scripts/check_scalar_erasure_coding.sh target/release/parvault-bench; then
+            echo "::error::the gate passed a SIMD build"; exit 1
+          fi
 
   docs-commands:
     # L-34 (plan-7 section 3): every command block in README.md and QUICKSTART.md runs against

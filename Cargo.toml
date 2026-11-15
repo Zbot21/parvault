@@ -48,7 +48,6 @@ ipc-client = []
 vfs = ["ipc-client"]
 # The status page (router_nas) on the shared HTTP edge; the daemon and parvault-status link it.
 status-ui = ["ipc-client"]
-simd-accel = ["reed-solomon-erasure/simd-accel"]
 
 [package.metadata.kani]
 flags = { lib = true }
@@ -70,7 +69,9 @@ libp2p = { version = "0.54", optional = true, features = [
     "macros",
     "ed25519",
 ] }
-reed-solomon-erasure = "6.0"
+# Scalar-only erasure coding, enforced in CI (scripts/check_scalar_erasure_coding.sh): no
+# `simd-accel`, so no C SIMD GF(2^8) kernel or nibble tables are built (L-102).
+reed-solomon-erasure = { version = "6.0", default-features = false, features = ["std"] }
 aes-gcm = "0.10"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"

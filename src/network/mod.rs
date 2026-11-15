@@ -22,9 +22,9 @@ pub use discovery::{
     derive_libp2p_peer_id_from_ed25519_pubkey, detect_primary_lan_ipv4, discover_lan_peers,
     extract_listen_port_and_ip, generate_random_pairing_nonce, node_identity_libp2p_peer_id,
     normalize_4word_sas_code, resolve_zero_config_peers, resolve_zero_config_peers_with_wan,
-    verify_lan_pairing_code, wan_card_pairing_decision, DiscoveredLanPeer, KnownPeerRecord,
-    KnownPeersStore, LanBeaconConfig, LanBeaconHandle, LanBeaconPacket, LanBeaconResponder,
-    LanPairingCode, DEFAULT_LAN_DISCOVERY_PORT, DEFAULT_LAN_PAIRING_NONCE,
+    verify_lan_pairing_code, wan_card_pairing_decision, wan_ddns_card_decision, DiscoveredLanPeer,
+    KnownPeerRecord, KnownPeersStore, LanBeaconConfig, LanBeaconHandle, LanBeaconPacket,
+    LanBeaconResponder, LanPairingCode, DEFAULT_LAN_DISCOVERY_PORT, DEFAULT_LAN_PAIRING_NONCE,
     LAN_BEACON_SIGNING_DOMAIN, LAN_DISCOVER_PROBE_MAGIC, LAN_MULTICAST_ADDR_STR,
     LAN_MULTICAST_GROUP, LAN_REGISTRY_ENV_VAR, MAX_LAN_BEACON_AGE_MS,
 };

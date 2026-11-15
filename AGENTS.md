@@ -98,7 +98,7 @@ Every code change or PR **must** preserve these 7 invariants:
 | `status-ui` (`ipc-client`) | status page (`router_nas`) on the shared HTTP edge | `parvault-status` |
 | `daemon-runtime` (`ipc-client`, `status-ui`, tokio, libp2p) | the daemon: ring, storage engine, gateway server | `parvault`, `parvault-seed`, `parvault-bench` |
 
-`default = ["daemon-runtime", "vfs", "status-ui"]`. Build release binaries with `scripts/build_bins.sh`, which gives each binary only its own features; `scripts/check_no_runtime_deps.sh` fails if tokio, libp2p, mio or quinn reach a plugin feature set. A local-only daemon without tokio is not offered: the storage engine needs the ring client.
+`default = ["daemon-runtime", "vfs", "status-ui"]`. Build release binaries with `scripts/build_bins.sh`, which gives each binary only its own features; `scripts/check_no_runtime_deps.sh` fails if tokio, libp2p, mio or quinn reach a plugin feature set. Erasure coding is scalar-only: there is no `simd-accel` feature, and `scripts/check_scalar_erasure_coding.sh` (CI, L-102) fails on the SIMD GF(2^8) kernel in a binary. A local-only daemon without tokio is not offered: the storage engine needs the ring client.
 
 ### Rust Unit, Integration, Mathematical & Red-Team Suites
 ```bash

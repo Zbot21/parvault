@@ -25,7 +25,7 @@ However, embedding modern distributed storage on consumer and enterprise router 
 ```mermaid
 flowchart TD
     subgraph RouterSoC["Router SoC Appliance (OpenWrt / prplOS LXC / Embedded Linux)"]
-        UP["parvault up --profile router-soc\n--folder /mnt/usb-nas/shared\n--status-http 0.0.0.0:4080"]
+        UP["parvault up --profile router-soc\n--folder /mnt/usb-nas/shared\n--status-http 192.168.1.1:4080"]
         UP --> CORE["P2P Storage Daemon\n(1 MiB RS Stripes, < 16 MiB VmHWM)"]
         UP --> BCN["Signed UDP LAN Responder\n(Port 4009 / Multicast 239.255.80.86)"]
         UP --> WEB["Embedded Status HTTP API\n(:4080 GET /api/v1/health & GET /)"]
@@ -95,7 +95,7 @@ sequenceDiagram
     participant Laptop as Client Laptop (parvault join)
     
     Note over Router: 1. Router boots with USB drive mounted at /mnt/usb-nas
-    Router->>Router: parvault up --profile router-soc --folder /mnt/usb-nas/shared --status-http 0.0.0.0:4080 --pair
+    Router->>Router: parvault up --profile router-soc --folder /mnt/usb-nas/shared --status-http 192.168.1.1:4080 --pair
     Note over Router: Generates 4-word pairing code: "shield-copper-alpine-matrix"
     Note over Router: Listens on UDP 4009 & joins multicast 239.255.80.86
     
@@ -120,7 +120,7 @@ On the router (via OpenWrt terminal, SSH, or init script):
 parvault up \
   --profile router-soc \
   --folder /mnt/usb-nas/shared \
-  --status-http 0.0.0.0:4080 \
+  --status-http 192.168.1.1:4080 \
   --pair
 ```
 Output:
@@ -129,7 +129,7 @@ Output:
 [parvault] Node Identity: 12D3KooWSDu... (Ed25519 verified)
 [parvault] Watching folder: /mnt/usb-nas/shared (continuous sync)
 [parvault] LAN Beacon Responder active on UDP port 4009 (multicast: 239.255.80.86)
-[parvault] Embedded Status Server listening on http://0.0.0.0:4080
+[parvault] Embedded Status Server listening on http://192.168.1.1:4080
 [parvault] ========================================================
 [parvault] Home LAN Pairing Code: shield-copper-alpine-matrix
 [parvault] Run on client: parvault join --code shield-copper-alpine-matrix
@@ -231,7 +231,7 @@ For users and router operators who do not wish to manage private join codes, dev
 parvault up \
   --profile router-soc \
   --folder /mnt/usb-nas/shared \
-  --status-http 0.0.0.0:4080 \
+  --status-http 192.168.1.1:4080 \
   --public \
   --tracker /dns4/tracker.neighborhoodcloud.org/tcp/4002/p2p/12D3KooW...
 ```
@@ -289,7 +289,7 @@ lan_discovery_enabled = true
 lan_discovery_port = 4009
 
 # Embedded Router NAS HTTP Status & Telemetry Dashboard (ADR-21)
-status_http_bind = "0.0.0.0:4080"
+status_http_bind = "127.0.0.1:4080"   # loopback; pass --status-http <LAN-IP>:4080 for the LAN
 
 # Node Identification
 node_label = "OpenWrt-Router-NAS"
@@ -299,7 +299,7 @@ por_timeout_ms = 300
 local_rtt_threshold_ms = 5
 intra_asn_ratio = 0.70
 bootstrap_grace_bytes = 1073741824 # 1 GiB bootstrap grace
-max_connections = 24
+max_connections = 24 # not applied in v0.5.x: no swarm connection limit yet (B-64); status page caps at 32, WebDAV at 64
 ```
 
 ### Procd Service Script (`/etc/init.d/parvault-nas`)
@@ -388,7 +388,7 @@ For carrier and broadband gateway environments running `prplOS`, deploy `parvaul
       "up",
       "--profile", "router-soc",
       "--folder", "/mnt/nas-storage/shared",
-      "--status-http", "0.0.0.0:4080",
+      "--status-http", "192.168.1.1:4080",
       "--data-dir", "/var/lib/parvault"
     ],
     "restart_policy": "always",
@@ -542,7 +542,7 @@ Run `/etc/init.d/rpcd restart`, then add a menu entry for `parvault/status` in `
    - Always point `--data-dir` and `--folder` to an attached USB drive or NVMe SSD, **never** to the router's internal SPI NOR/NAND flash (`/overlay` or rootfs). Internal router flash typically has limited write cycles and small block sizes.
    - ParVault enforces an internal `4x` write amplification cap and LRU quota release to prevent storage wear griefing (`ADR-07` / `ADR-19`).
 3. **Firewall & Routing Policy:**
-   - The status server binds exactly the address you give it. `0.0.0.0:4080`, as in these examples, is every interface, WAN included, so block WAN access to port `4080` in `/etc/config/firewall`. Keep a wildcard or loopback bind for the LuCI proxy above, which connects to `127.0.0.1:4080`. LAN auto-discovery (`UDP 4009`) answers only signed beacons.
+   - The status server binds exactly the address you give it. These examples use the router's LAN address (`192.168.1.1`; use yours), and the shipped config uses `127.0.0.1:4080`. Never bind `0.0.0.0:4080` on a router: that is every interface, WAN included (B-54). The LuCI proxy above connects to `127.0.0.1:4080`, so use the loopback bind with it. LAN auto-discovery (`UDP 4009`) answers only signed beacons.
      ```text
      config rule
          option name 'Block-ParVault-Status-WAN'

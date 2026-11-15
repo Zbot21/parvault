@@ -91,7 +91,7 @@ On your router, closet NAS, or Raspberry Pi, launch everything with one command:
 parvault up \
   --profile router-soc \
   --folder /mnt/usb-nas/shared \
-  --status-http 0.0.0.0:4080 \
+  --status-http 127.0.0.1:4080 \
   --pair
 ```
 This automatically starts:
