@@ -41,6 +41,9 @@ const CACHE_BYTES: u64 = 3 * MIB;
 const SEEK_SECS: &str = "12";
 /// Cold WebDAV TTFB samples per run; the budget applies to their median (B-56).
 const TTFB_SAMPLES: usize = 5;
+/// The max of the cold WebDAV TTFB samples must stay under this many budgets (B-56 QA).
+const TTFB_MAX_FACTOR: u32 = 5;
+
 /// The VFS block size (`DEFAULT_VFS_BLOCK_BYTES`).
 const BLOCK_BYTES: u64 = parvault::vfs::DEFAULT_VFS_BLOCK_BYTES as u64;
 
@@ -578,15 +581,22 @@ fn webdav_206_mp4_probe_and_random_seek() {
     );
     samples.sort_unstable();
     let median = samples[TTFB_SAMPLES / 2];
-    // The max is logged, not asserted, so a tail regression stays visible in the gate output.
-    eprintln!(
-        "B3 cold WebDAV TTFB median {median:?} max {:?} over {TTFB_SAMPLES} samples",
-        samples[TTFB_SAMPLES - 1]
-    );
+    let max = samples[TTFB_SAMPLES - 1];
+    eprintln!("B3 cold WebDAV TTFB median {median:?} max {max:?} over {TTFB_SAMPLES} samples");
     assert_budget(
         "cold WebDAV TTFB within budget (median)",
         median < ttfb_budget(),
         format!("median {median:?} of {samples:?}"),
+    );
+    // The max is bounded too (B-56 QA), at `TTFB_MAX_FACTOR` x the budget. Measured reason: 200
+    // netem samples (40 B-68 runs x 5, `delay 15ms loss 2%`, 100 ms budget) had p50 43 ms, p95
+    // 69 ms and two one-RTO samples of 278 and 314 ms, so 3x (300 ms) would fail about 1 run in
+    // 40. 5x passes one retransmit (200 ms minimum RTO plus the RTT) and fails a second one on
+    // the same request (the backed-off RTO alone is 400 ms) or a stall.
+    assert_budget(
+        "cold WebDAV TTFB within budget (max)",
+        max < ttfb_budget() * TTFB_MAX_FACTOR,
+        format!("max {max:?} of {samples:?}, limit {TTFB_MAX_FACTOR}x budget"),
     );
 
     // B2: random seek over HTTP Range.
