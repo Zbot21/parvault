@@ -129,7 +129,10 @@ chmod +x "$BUILD_CTX/parvault" "$BUILD_CTX/parvault-seed" "$BUILD_CTX/parvault-s
 
 cat > "$BUILD_CTX/Dockerfile" <<EOF
 FROM ${BASE_IMAGE}
-RUN if command -v apt-get >/dev/null 2>&1; then (apt-get update -o Acquire::Retries=3 && apt-get install -y --no-install-recommends wget netcat-openbsd ca-certificates && rm -rf /var/lib/apt/lists/*) || true; fi
+# Distro packages the gate's shell checks use (HTTP client, netcat). Nothing is downloaded into
+# the image but these packages; every ParVault binary comes from stage_artifact.sh (A-DOCKER).
+ARG GATE_TOOLS="wget netcat-openbsd ca-certificates"
+RUN if command -v apt-get >/dev/null 2>&1; then (apt-get update -o Acquire::Retries=3 && apt-get install -y --no-install-recommends \${GATE_TOOLS} && rm -rf /var/lib/apt/lists/*) || true; fi
 COPY parvault /usr/local/bin/parvault
 COPY parvault-seed /usr/local/bin/parvault-seed
 COPY parvault-status /usr/local/bin/parvault-status
