@@ -1,0 +1,41 @@
+# Release build image (L-17): every release and rebuild job builds inside this image, so rustc,
+# gcc, binutils, tar and gzip are the same for both builds. The base is pinned by digest and apt
+# reads a fixed snapshot.debian.org date, so building this file twice gives the same tools.
+# Change the base digest or the snapshot only in a commit of its own, then re-run repro-check.
+# The Rust version must equal rust-toolchain.toml (the RUN below fails otherwise). python3 is for
+# scripts/check_scalar_erasure_coding.sh (L-102), which runs on every built binary.
+FROM docker.io/library/rust:1.100.0-slim-trixie@sha256:e9d95b74296f7126a83ae3d041aeaba1ff4c478f13abc5cc034fcf7c131c3d4a
+
+ARG SNAPSHOT=20261101T000000Z
+RUN set -eux; \
+    rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*; \
+    printf '%s\n' \
+      'Types: deb' \
+      "URIs: http://snapshot.debian.org/archive/debian/${SNAPSHOT}" \
+      'Suites: trixie trixie-updates' \
+      'Components: main' \
+      'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
+      '' \
+      'Types: deb' \
+      "URIs: http://snapshot.debian.org/archive/debian-security/${SNAPSHOT}" \
+      'Suites: trixie-security' \
+      'Components: main' \
+      'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
+      > /etc/apt/sources.list.d/snapshot.sources; \
+    apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 update; \
+    apt-get install -y --no-install-recommends \
+      musl-tools gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu \
+      python3; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY rust-toolchain.toml /opt/parvault-toolchain/rust-toolchain.toml
+RUN set -eux; \
+    cd /opt/parvault-toolchain; \
+    rustup toolchain install; \
+    test "$(rustc -V | cut -d' ' -f2)" = "$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"; \
+    rustup target list --installed | grep -qx x86_64-unknown-linux-musl; \
+    rustup target list --installed | grep -qx aarch64-unknown-linux-musl; \
+    chmod -R a+rX "$RUSTUP_HOME" "$CARGO_HOME"
+# Builds run as the calling user with their own CARGO_HOME (scripts/repro_proof.sh, release.yml);
+# the toolchain stays read-only in RUSTUP_HOME.
+ENV PATH=/usr/local/cargo/bin:$PATH

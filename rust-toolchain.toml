@@ -1,0 +1,7 @@
+# Pinned toolchain for reproducible builds (L-17). Every workflow and build reads this file;
+# change the version only in a commit of its own, then re-run the repro-check job.
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+profile = "minimal"
