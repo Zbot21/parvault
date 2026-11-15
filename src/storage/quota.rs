@@ -159,9 +159,13 @@ const QUOTA_WRITE_EPOCH_MS: u64 = QUOTA_WRITE_EPOCH_SECS * 1000;
 pub const INFO_QUOTA_WRITE_EPOCH_ROLLED: &str = "info.quota_write_epoch_rolled";
 
 /// B-162: a new write-ceiling epoch starts once `elapsed_ms` since the current one started
-/// reaches `epoch_len_ms`.
+/// reaches `epoch_len_ms`, that is once a whole epoch has elapsed. A zero length (never
+/// configured: [`QuotaManager::write_epoch_ms`] maps 0 to the default) always rolls over.
 pub const fn epoch_rollover_decision(elapsed_ms: u64, epoch_len_ms: u64) -> bool {
-    elapsed_ms >= epoch_len_ms
+    if epoch_len_ms == 0 {
+        return true;
+    }
+    elapsed_ms / epoch_len_ms >= 1
 }
 
 /// Loads `quota_state.bin` (B-52 QA): an absent file is a fresh state; any other read or decode
