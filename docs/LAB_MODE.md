@@ -128,3 +128,24 @@ Output: one JSON document on stdout (`docs/schemas/net-probe-1.json`, schema `pa
 Exit codes: `0` connected (RPC ok or skipped), `1` failed, `4` connected but the RPC failed, `3` error, `2` usage error (no JSON).
 
 Refusal codes (`probe::probe_target_decision`, Kani `proof_probe_target_requires_peer_id_and_direct`): `reject.probe_mode_required`, `reject.probe_peer_id_required` (Noise must authenticate a named peer), `reject.probe_relay_addr_forced_direct`, `reject.probe_peer_unknown`, `reject.probe_ambiguous_peer`, `reject.probe_bare_peer_id_lab`, and in lab mode `reject.lab_dns_addr`.
+
+## 6. Enforcement
+
+`.enforcement.map` rows for this page (`docs/security/TRUST_FINDINGS.md` lists them):
+
+| Id | Kind | What it pins |
+| :-- | :-- | :-- |
+| LAB-CONFLICT | claim | an explicit side-channel setting is refused (`reject.lab_config_conflict`) |
+| LAB-PORT | claim | port 0 is refused (`reject.lab_ephemeral_port`) |
+| LAB-DNS | claim | a name in the dial set is refused (`reject.lab_dns_addr`) |
+| LAB-SIDE | claim | `discover` exits 3 in lab mode (`reject.lab_side_channel`) |
+| LAB-DIAL | claim | a learned address is never dialled (`reject.lab_dial_outside_set`) |
+| LAB-DIAL-K | kani | `proof_lab_dial_only_within_fixed_set` |
+| LAB-DIAL-TX, LAB-DIAL-BHV | reach | the transport and the behaviour call `lab_dial_decision` |
+| LAB-REACH | reach | `run_daemon` runs the lab startup rule |
+| S-DUMP-SECRET, S-DUMP-CLASS, S-DUMP-NOFX | suite | no secret in the dump; every input classified; no side effects |
+| DUMP-K, DUMP-REACH | kani, reach | `dump_field_repr` never renders a secret, and `render_dump` uses it |
+| PROBE-PID | claim | a probe target without `/p2p/` is refused (`reject.probe_peer_id_required`) |
+| PROBE-DIRECT | claim | a relay address under `--force-direct` is refused (`reject.probe_relay_addr_forced_direct`) |
+| PROBE-LAB | claim | a bare PeerId is refused in lab mode (`reject.probe_bare_peer_id_lab`) |
+| PROBE-K, PROBE-REACH | kani, reach | `proof_probe_target_requires_peer_id_and_direct`; `run_probe` calls the decision |
