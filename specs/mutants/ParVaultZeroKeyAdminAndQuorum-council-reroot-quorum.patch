@@ -1,0 +1,12 @@
+diff --git a/specs/ParVaultZeroKeyAdminAndQuorum.tla b/specs/ParVaultZeroKeyAdminAndQuorum.tla
+--- a/specs/ParVaultZeroKeyAdminAndQuorum.tla
++++ b/specs/ParVaultZeroKeyAdminAndQuorum.tla
+@@ -192,7 +192,7 @@
+             THEN m.kind = "rotate" /\ QuorumOf(m, log)   \* @guard council-manifest sym=src/storage/council.rs::council_manifest_decision
+             ELSE /\ m.kind = "reroot"
+                  /\ m.from = Last(log).scope
+-                 /\ QuorumOf(m, log)   \* @guard council-reroot-quorum sym=src/storage/council.rs::council_manifest_decision
++                 /\ TRUE
+                  /\ RootKeyOf(m.scope) \in m.signers   \* @guard council-reroot-new-root sym=src/storage/council.rs::council_manifest_decision
+ 
+ \* `seed_council_install_decision`: no install while the configured root's key is on the disk and

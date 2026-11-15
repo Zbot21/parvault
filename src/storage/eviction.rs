@@ -56,6 +56,36 @@ const EVICT_PEERID_DOMAIN: &[u8] = b"parvault-evict-peerid-v1:";
 const ZERO_SHRED_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_TARGET_STRING_BYTES: usize = 1024;
 
+/// Loads the Public Tracker Admin `NodeIdentity` at `<data_dir>/tracker_admin.seed` if the file
+/// exists, never creating it (F-53: `admin show-authority` must not write a key the next start
+/// would root on).
+pub fn load_tracker_admin_identity(
+    data_dir: impl AsRef<Path>,
+) -> Result<Option<NodeIdentity>, StorageError> {
+    let seed_path = data_dir.as_ref().join("tracker_admin.seed");
+    if !seed_path.exists() {
+        return Ok(None);
+    }
+    read_tracker_admin_seed(&seed_path).map(Some)
+}
+
+fn read_tracker_admin_seed(seed_path: &Path) -> Result<NodeIdentity, StorageError> {
+    let mut raw = fs::read(seed_path)?;
+    if raw.len() != 32 {
+        let actual = raw.len();
+        raw.zeroize();
+        return Err(StorageError::Crypto(CryptoError::InvalidKeyMaterial(
+            format!("expected 32-byte tracker_admin.seed, got {actual} bytes"),
+        )));
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&raw);
+    raw.zeroize();
+    let id = NodeIdentity::from_seed(seed);
+    seed.zeroize();
+    Ok(id)
+}
+
 /// Loads or atomically generates (`0600`) the Public Tracker Admin `NodeIdentity` at
 /// `<data_dir>/tracker_admin.seed` (`ADR-26`).
 pub fn load_or_generate_tracker_admin_identity(
@@ -65,20 +95,7 @@ pub fn load_or_generate_tracker_admin_identity(
     fs::create_dir_all(data_dir)?;
     let seed_path = data_dir.join("tracker_admin.seed");
     if seed_path.exists() {
-        let mut raw = fs::read(&seed_path)?;
-        if raw.len() != 32 {
-            let actual = raw.len();
-            raw.zeroize();
-            return Err(StorageError::Crypto(CryptoError::InvalidKeyMaterial(
-                format!("expected 32-byte tracker_admin.seed, got {actual} bytes"),
-            )));
-        }
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&raw);
-        raw.zeroize();
-        let id = NodeIdentity::from_seed(seed);
-        seed.zeroize();
-        Ok(id)
+        read_tracker_admin_seed(&seed_path)
     } else {
         let mut seed = [0u8; 32];
         OsRng.fill_bytes(&mut seed);

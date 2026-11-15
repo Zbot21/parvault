@@ -41,10 +41,11 @@ use parvault::{
     router_nas::read_linux_process_memory_kib,
     sharding::merkle::hash_shard_leaf,
     storage::{
-        load_or_generate_tracker_admin_identity, AnonymousQuotaVoucher, BlindedShardCapability,
-        BlindedShardId, BlockStore, EvictionPurgeReport, EvictionTarget,
-        PrivacyPreservingEvictionEngine, PublicTrackerTakedownQueue, QuotaManager, ShardId,
-        SignedBadActorEvictionOrder, TakedownReviewStatus, TrustLevel, VoucherNullifierLedger,
+        load_or_generate_tracker_admin_identity, load_tracker_admin_identity,
+        AnonymousQuotaVoucher, BlindedShardCapability, BlindedShardId, BlockStore,
+        EvictionPurgeReport, EvictionTarget, PrivacyPreservingEvictionEngine,
+        PublicTrackerTakedownQueue, QuotaManager, ShardId, SignedBadActorEvictionOrder,
+        TakedownReviewStatus, TrustLevel, VoucherNullifierLedger,
     },
 };
 use std::collections::HashSet;
@@ -992,18 +993,22 @@ async fn main() -> anyhow::Result<()> {
 
         SeedCommand::Admin { action } => match action {
             SeedAdminAction::ShowAuthority { data_dir } => {
-                let admin_id = load_or_generate_tracker_admin_identity(&data_dir)?;
+                // F-53: read only; this command never creates `tracker_admin.seed`.
+                let admin_id = load_tracker_admin_identity(&data_dir)?;
                 let node_id = NodeIdentity::load_or_generate_in_dir(&data_dir)?;
                 println!("=== ParVault Public Tracker Admin Authority (ADR-26) ===");
                 println!("Data Directory              : {}", data_dir.display());
-                println!(
-                    "Tracker Admin Pubkey (hex)  : {}",
-                    hex::encode(admin_id.public_key_bytes())
-                );
+                match admin_id {
+                    Some(admin_id) => {
+                        println!(
+                            "Tracker Admin Pubkey (hex)  : {}",
+                            hex::encode(admin_id.public_key_bytes())
+                        );
+                        println!("Council                     : {ROOT_ON_DISK_WARNING}");
+                    }
+                    None => println!("Tracker Admin Pubkey (hex)  : no on-disk authority"),
+                }
                 println!("Node Transport Peer ID      : {}", node_id.device_peer_id());
-                println!(
-                    "Council                     : this key roots the public-mode eviction council; signing its manifests comes with parvault-control (item 6)"
-                );
             }
             SeedAdminAction::ListTakedowns { data_dir } => {
                 let queue = PublicTrackerTakedownQueue::load_or_init(&data_dir)?;
@@ -1710,11 +1715,22 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
     };
     let local_tracker_admin_pk = local_tracker_admin.as_ref().map(|id| id.public_key_bytes());
 
+    // F-53 rule 1: the flag wins over an existing `tracker_admin.seed`.
     let advertised_admin_pk = if server.mode() == SeedServerMode::PublicNetworkBootstrapper {
-        local_tracker_admin_pk.or_else(|| explicit_admin_pks.first().copied())
+        explicit_admin_pks
+            .first()
+            .copied()
+            .or(local_tracker_admin_pk)
     } else {
         None
     };
+    // The council root's secret is on this seed's disk (or in its memory): no council can be
+    // rooted on it (F-53 rule 2, `reject.council_root_on_disk`).
+    let root_on_disk =
+        local_tracker_admin_pk.is_some() && advertised_admin_pk == local_tracker_admin_pk;
+    if server.mode() == SeedServerMode::PublicNetworkBootstrapper {
+        log_council_root_state(&data_dir, advertised_admin_pk, root_on_disk);
+    }
 
     let keypair = node_identity.to_libp2p_keypair()?;
     let local_peer_id = keypair.public().to_peer_id();
@@ -1819,7 +1835,10 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
                 allowed_pks.push(pk);
             }
         }
-        if let Some(local_admin_pk) = local_tracker_admin_pk {
+        // F-53 Decision 3: with `--admin-rpc-pubkey` given, the on-disk key is not an operator.
+        if let Some(local_admin_pk) =
+            local_tracker_admin_pk.filter(|_| explicit_admin_pks.is_empty())
+        {
             if !allowed_pks.contains(&local_admin_pk) {
                 allowed_pks.push(local_admin_pk);
             }
@@ -1852,6 +1871,7 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
                             SeedServerMode::PublicNetworkBootstrapper => advertised_admin_pk,
                             SeedServerMode::HomelabRedundancyVault => genesis_pubkey,
                         },
+                        root_on_disk,
                         effective_peers: &rpc_effective_peers,
                         start_instant,
                     },
@@ -2013,6 +2033,35 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// F-53: what a public seed whose council root is its own on-disk key prints and logs.
+const ROOT_ON_DISK_WARNING: &str = "this key is on this seed's disk, so no council can be rooted on it (reject.council_root_on_disk); restart with --admin-rpc-pubkey <off-disk key> to install one";
+
+/// Logs a public seed's council root state once at start (F-53, verdict change 8).
+fn log_council_root_state(data_dir: &Path, root: Option<[u8; 32]>, root_on_disk: bool) {
+    use parvault::storage::council;
+    let installed = council::load_council_manifest(data_dir);
+    let under_root = council::installed_council_epoch_under(data_dir, root);
+    match (installed, under_root) {
+        (_, Some(epoch)) if root_on_disk => warn!(
+            code = "council.root_on_disk",
+            epoch,
+            "the council root is this seed's on-disk tracker_admin.seed; later epochs install, but restart with --admin-rpc-pubkey and install a re-root to move it off disk"
+        ),
+        (_, Some(epoch)) => info!(epoch, "council installed under the configured root"),
+        (Some(m), None) => warn!(
+            code = "council.reroot_needed",
+            installed_root = %hex::encode(m.scope_root),
+            epoch = m.epoch,
+            configured_root = %root.map(hex::encode).unwrap_or_default(),
+            "the installed council is under another root: eviction orders are refused until a re-root (epoch {}) signed by a quorum of epoch {} and the configured root is installed",
+            m.epoch + 1,
+            m.epoch
+        ),
+        (None, None) if root_on_disk => warn!(code = "council.root_on_disk", "{ROOT_ON_DISK_WARNING}"),
+        (None, None) => info!("no council installed; install epoch 1 signed by the configured root"),
+    }
+}
+
 struct SeedAdminRpcCtx<'a> {
     shared: &'a Arc<Mutex<SeedSharedState>>,
     block_store: &'a BlockStore,
@@ -2022,6 +2071,8 @@ struct SeedAdminRpcCtx<'a> {
     seed_mode: SeedServerMode,
     /// Scope root of this seed's council: its ring genesis, else its own tracker admin key.
     council_root: Option<[u8; 32]>,
+    /// The public council root's secret is on this seed's disk (F-53).
+    root_on_disk: bool,
     effective_peers: &'a [String],
     start_instant: Instant,
 }
@@ -2038,6 +2089,7 @@ fn handle_seed_admin_rpc_request(
         local_peer_id_str,
         seed_mode,
         council_root,
+        root_on_disk,
         effective_peers,
         start_instant,
     } = ctx;
@@ -2142,6 +2194,8 @@ fn handle_seed_admin_rpc_request(
                 seed_mode == SeedServerMode::PublicNetworkBootstrapper,
                 block_store.is_in_memory(),
                 council_root,
+                root_on_disk,
+                council::installed_council_epoch_under(data_dir, council_root),
             ) {
                 Ok(root) => root,
                 Err(code) => {
@@ -2154,7 +2208,13 @@ fn handle_seed_admin_rpc_request(
             };
             let code = match council::CouncilManifest::from_bytes(&manifest_bytes) {
                 None => Some("reject.council_manifest_decode".to_string()),
-                Some(m) => council::install_council_manifest(data_dir, &m, root).err(),
+                Some(m) => council::install_council_manifest(
+                    data_dir,
+                    &m,
+                    root,
+                    council::CouncilInstallRole::PublicSeed,
+                )
+                .err(),
             };
             SeedAdminResponse::CouncilManifestResult {
                 code,

@@ -1238,6 +1238,43 @@ impl KnownPeersStore {
             .or_insert(admin_pubkey);
     }
 
+    /// Re-pins every tracker pinned to `old` onto `new` (a client following a council re-root,
+    /// F-53). The only caller is the council install path; rendezvous never re-pins. Returns
+    /// how many entries moved.
+    pub fn repin_tracker_admin_pubkey(&mut self, old: [u8; 32], new: [u8; 32]) -> usize {
+        if new == [0u8; 32] {
+            return 0;
+        }
+        let mut moved = 0;
+        for pk in self.tracker_admin_pubkeys.values_mut() {
+            if *pk == old {
+                *pk = new;
+                moved += 1;
+            }
+        }
+        moved
+    }
+
+    /// The admin key pinned for `tracker_key` (trimmed), if any.
+    pub fn tracker_admin_pubkey(&self, tracker_key: &str) -> Option<[u8; 32]> {
+        self.tracker_admin_pubkeys.get(tracker_key.trim()).copied()
+    }
+
+    /// Replaces the pin of `tracker_key` with `admin_pubkey` (the operator's manual re-pin,
+    /// `parvault council repin`). Returns the key it replaced.
+    pub fn set_tracker_admin_pubkey(
+        &mut self,
+        tracker_key: &str,
+        admin_pubkey: [u8; 32],
+    ) -> Option<[u8; 32]> {
+        let key = tracker_key.trim();
+        if key.is_empty() || admin_pubkey == [0u8; 32] {
+            return None;
+        }
+        self.tracker_admin_pubkeys
+            .insert(key.to_string(), admin_pubkey)
+    }
+
     /// Returns all unique TOFU-pinned `tracker_admin_pubkey` values across configured public trackers.
     pub fn pinned_tracker_admin_pubkeys(&self) -> Vec<[u8; 32]> {
         let mut out = Vec::new();

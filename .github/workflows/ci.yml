@@ -303,8 +303,17 @@ jobs:
               exit 1
             fi
           done
+          # A variant cfg <Spec>.<Variant>.cfg runs too (for example RootOnDisk = FALSE, F-53 C3).
+          for cfg in *.*.cfg; do
+            if [ ! -f "${cfg%%.*}.tla" ]; then
+              echo "::error::specs/${cfg} has no specs/${cfg%%.*}.tla" >&2
+              exit 1
+            fi
+          done
           for file in "${tla[@]}"; do
             spec="${file%.tla}"
-            echo "===> Model checking ${spec}.tla ..."
-            java -XX:+UseParallelGC -cp "$TLA2TOOLS_JAR" tlc2.TLC -workers auto -cleanup -config "${spec}.cfg" "${spec}.tla"
+            for cfg in "${spec}.cfg" "${spec}".*.cfg; do
+              echo "===> Model checking ${spec}.tla with ${cfg} ..."
+              java -XX:+UseParallelGC -cp "$TLA2TOOLS_JAR" tlc2.TLC -workers auto -cleanup -config "${cfg}" "${spec}.tla"
+            done
           done

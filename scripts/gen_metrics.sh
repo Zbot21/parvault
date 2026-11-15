@@ -22,7 +22,8 @@
 #       targets, then `stat` -> size.<bin>.<arch>.bytes
 #       (aarch64 needs CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER)
 #     - TLC on every specs/*.tla (needs TLA2TOOLS_JAR) ->
-#       tlc.generated.<Spec>, tlc.distinct.<Spec>, tlc.depth.<Spec> (store
+#       tlc.generated.<Spec>, tlc.distinct.<Spec>, tlc.depth.<Spec>, and the same for each
+#       variant cfg specs/<Spec>.<Variant>.cfg as <Spec>.<Variant> (store
 #       only the depth keys a doc uses)
 #   Benchmark, RSS and latency keys are min-max ranges over repeated runs of
 #   parvault-bench and the self-tests, so they are re-measured by hand (see
@@ -57,17 +58,22 @@ if [[ "${1:-}" == "--measured" ]]; then
     meta="$(mktemp -d)"; trap 'rm -rf "$meta"' EXIT
     for spec in specs/*.tla; do
       [[ -f "$spec" ]] || fail "no specs/*.tla"
-      name="$(basename "$spec" .tla)"
-      log="$(cd specs && java -XX:+UseParallelGC -cp "$TLA2TOOLS_JAR" tlc2.TLC -workers auto -cleanup \
-        -metadir "$meta/$name" -config "$name.cfg" "$name.tla")" || fail "TLC failed on $name"
-      line="$(grep -E '[0-9,]+ states generated, [0-9,]+ distinct states found' <<<"$log" | tail -1 || true)"
-      [[ -n "$line" ]] || fail "no state counts in TLC output for $name"
-      gen="$(sed -E 's/^([0-9,]+) states generated.*/\1/' <<<"$line" | tr -d ,)"
-      dist="$(sed -E 's/.*generated, ([0-9,]+) distinct.*/\1/' <<<"$line" | tr -d ,)"
-      depth="$(sed -nE 's/.*depth of the complete state graph search is ([0-9]+).*/\1/p' <<<"$log" | tail -1)"
-      [[ -n "$depth" ]] || fail "no search depth in TLC output for $name"
-      out+="tlc.generated.$name = $(group "$gen")"$'\n'"tlc.distinct.$name = $(group "$dist")"$'\n'
-      out+="tlc.depth.$name = $depth"$'\n'
+      base="$(basename "$spec" .tla)"
+      # <Spec>.cfg, then each variant <Spec>.<Variant>.cfg, keyed <Spec>.<Variant>.
+      for cfg in "specs/$base.cfg" specs/"$base".*.cfg; do
+        [[ -f "$cfg" ]] || continue
+        name="$(basename "$cfg" .cfg)"
+        log="$(cd specs && java -XX:+UseParallelGC -cp "$TLA2TOOLS_JAR" tlc2.TLC -workers auto -cleanup \
+          -metadir "$meta/$name" -config "$name.cfg" "$base.tla")" || fail "TLC failed on $name"
+        line="$(grep -E '[0-9,]+ states generated, [0-9,]+ distinct states found' <<<"$log" | tail -1 || true)"
+        [[ -n "$line" ]] || fail "no state counts in TLC output for $name"
+        gen="$(sed -E 's/^([0-9,]+) states generated.*/\1/' <<<"$line" | tr -d ,)"
+        dist="$(sed -E 's/.*generated, ([0-9,]+) distinct.*/\1/' <<<"$line" | tr -d ,)"
+        depth="$(sed -nE 's/.*depth of the complete state graph search is ([0-9]+).*/\1/p' <<<"$log" | tail -1)"
+        [[ -n "$depth" ]] || fail "no search depth in TLC output for $name"
+        out+="tlc.generated.$name = $(group "$gen")"$'\n'"tlc.distinct.$name = $(group "$dist")"$'\n'
+        out+="tlc.depth.$name = $depth"$'\n'
+      done
     done
   fi
   printf '%s' "$out"

@@ -1,0 +1,12 @@
+diff --git a/specs/ParVaultZeroKeyAdminAndQuorum.tla b/specs/ParVaultZeroKeyAdminAndQuorum.tla
+--- a/specs/ParVaultZeroKeyAdminAndQuorum.tla
++++ b/specs/ParVaultZeroKeyAdminAndQuorum.tla
+@@ -193,7 +193,7 @@
+             ELSE /\ m.kind = "reroot"
+                  /\ m.from = Last(log).scope
+                  /\ QuorumOf(m, log)   \* @guard council-reroot-quorum sym=src/storage/council.rs::council_manifest_decision
+-                 /\ RootKeyOf(m.scope) \in m.signers   \* @guard council-reroot-new-root sym=src/storage/council.rs::council_manifest_decision
++                 /\ TRUE
+ 
+ \* `seed_council_install_decision`: no install while the configured root's key is on the disk and
+ \* nothing is installed under that root (the epoch under the configured root, not any file).
