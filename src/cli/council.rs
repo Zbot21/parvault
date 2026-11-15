@@ -3,7 +3,8 @@
 use parvault::config::{CouncilAction, NodeConfig};
 use parvault::crypto::NodeIdentity;
 use parvault::storage::council::{
-    council_scope_root, install_council_manifest, load_council_manifest, CouncilManifest,
+    council_scope_root, install_council_manifest, load_council_manifest, repair_council_pins,
+    repin_tracker, CouncilInstallRole, CouncilManifest,
 };
 
 fn now_ms() -> u64 {
@@ -25,6 +26,14 @@ pub(crate) fn run(
     public_mode: bool,
 ) -> anyhow::Result<()> {
     let data_dir = &cfg.data_dir;
+    if public_mode {
+        repair_council_pins(data_dir).map_err(|e| anyhow::anyhow!("council re-pin repair: {e}"))?;
+    }
+    let role = if public_mode {
+        CouncilInstallRole::PublicClient
+    } else {
+        CouncilInstallRole::Private
+    };
     let genesis = parvault::network::admission::server_ring_genesis(
         data_dir,
         cfg.genesis_root_pubkey_hex.as_deref(),
@@ -52,7 +61,7 @@ pub(crate) fn run(
             let mut manifest =
                 CouncilManifest::new(genesis.public_key_bytes(), 1, members, quorum, now_ms());
             manifest.sign(&genesis);
-            install_council_manifest(data_dir, &manifest, genesis.public_key_bytes())
+            install_council_manifest(data_dir, &manifest, genesis.public_key_bytes(), role)
                 .map_err(|code| anyhow::anyhow!("council manifest refused: {code}"))?;
             println!(
                 "Installed council epoch 1 ({} members, quorum {}).",
@@ -71,9 +80,37 @@ pub(crate) fn run(
                      pinned tracker admin key"
                 )
             })?;
-            install_council_manifest(data_dir, &manifest, root)
+            install_council_manifest(data_dir, &manifest, root, role)
                 .map_err(|code| anyhow::anyhow!("council manifest refused: {code}"))?;
             println!("Installed council epoch {}.", manifest.epoch);
+            if manifest.scope_root != root {
+                println!(
+                    "Council re-rooted: now pinned to tracker admin key {}.",
+                    hex::encode(manifest.scope_root)
+                );
+            }
+        }
+        CouncilAction::Repin {
+            tracker,
+            admin_pubkey,
+        } => {
+            anyhow::ensure!(public_mode, "council repin is for --public mode only");
+            let new = parse_key(&admin_pubkey)?;
+            anyhow::ensure!(new != [0u8; 32], "the admin key must not be all zero");
+            // Loads both pin stores before writing either (B-52).
+            repin_tracker(data_dir, &tracker, new)
+                .map_err(|e| anyhow::anyhow!("re-pin not persisted: {e}"))?;
+            println!(
+                "Pinned {} to tracker admin key {}.",
+                tracker.trim(),
+                hex::encode(new)
+            );
+            if load_council_manifest(data_dir).is_some_and(|m| m.scope_root != new) {
+                println!(
+                    "The installed council is under another root: delete council_manifest.bin and \
+                     install the new tracker's manifest with `parvault council install`."
+                );
+            }
         }
         CouncilAction::Show => match load_council_manifest(data_dir) {
             Some(m) => {

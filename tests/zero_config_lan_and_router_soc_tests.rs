@@ -1726,6 +1726,7 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
             d,
             &admin_council,
             tracker_admin_id.public_key_bytes(),
+            parvault::storage::council::CouncilInstallRole::PublicClient,
         )
         .expect("install the tracker admin's council");
     }
@@ -2216,6 +2217,7 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
         &council_daemon_dir,
         &council_manifest,
         op1_id.public_key_bytes(),
+        parvault::storage::council::CouncilInstallRole::PublicClient,
     )
     .expect("install the 2-of-3 council manifest");
     // op1 stamps its orders with the council epoch it holds.
@@ -2223,6 +2225,7 @@ fn test_7_zero_plaintext_ip_bad_actor_eviction_burden_of_proof_and_council_quoru
         &op1_dir,
         &council_manifest,
         op1_id.public_key_bytes(),
+        parvault::storage::council::CouncilInstallRole::PublicClient,
     )
     .expect("install the council on op1");
     council_cfg.min_free_disk_bytes = 64 * 1024 * 1024;

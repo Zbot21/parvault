@@ -1919,6 +1919,48 @@ fn b52_unreadable_known_peers_join_refused() {
     gate_ran("trust_enforcement::b52_unreadable_known_peers_join_refused");
 }
 
+/// B-52 (QA, M1): the `try_load` guard on its own. No `save` runs here, so the `save` guard cannot
+/// stand in for it: a writer that loads a damaged `known_peers.json` must get the reason code
+/// before it holds any store to change, and the file must be as it was. Real files, no mocks.
+#[test]
+fn b52_try_load_refuses_damaged_known_peers_without_save() {
+    use parvault::network::KnownPeersStore;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let path = dir.join(KnownPeersStore::FILE_NAME);
+    for bytes in [
+        &b"{\"peers\": {\"truncat"[..],
+        &[0xFF, 0xFE, 0x00, 0x01][..],
+    ] {
+        std::fs::write(&path, bytes).unwrap();
+        let err = KnownPeersStore::try_load(dir).expect_err("damaged file must not load as empty");
+        assert!(
+            err.to_string().starts_with("reject.known_peers_corrupt"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let err = KnownPeersStore::try_load(dir).expect_err("unreadable file must not load as empty");
+    assert!(
+        err.to_string().starts_with("reject.known_peers_unreadable"),
+        "{err}"
+    );
+    assert!(path.is_dir());
+    std::fs::remove_dir(&path).unwrap();
+    // Accept: a missing file is an empty store, and a saved store loads back.
+    assert_eq!(
+        KnownPeersStore::try_load(dir).unwrap(),
+        KnownPeersStore::default()
+    );
+    let mut pinned = KnownPeersStore::default();
+    pinned.pin_tracker_admin_pubkey("tracker.example:4001", [0xA7; 32]);
+    pinned.save(dir).unwrap();
+    assert_eq!(KnownPeersStore::try_load(dir).unwrap(), pinned);
+    gate_ran("trust_enforcement::b52_try_load_refuses_damaged_known_peers_without_save");
+}
+
 /// Runs `parvault --public status` from a data dir whose `known_peers.json` holds one tracker-admin
 /// pin (so the run persists it to `pinned_tracker_admins.json`) and whose
 /// `pinned_tracker_admins.json` is `pins`.
@@ -1984,6 +2026,119 @@ fn b52_corrupt_tracker_pins_run_refused() {
         corrupt
     );
     gate_ran("trust_enforcement::b52_corrupt_tracker_pins_run_refused");
+}
+
+// --- B-123: no tracker-admin TOFU pin, no legacy pin, no council root while known_peers.json is damaged
+
+/// Runs `parvault --public --tracker <tracker> status` from a fresh data dir whose
+/// `known_peers.json` is `known` (`None`: no file). The run announces to the tracker, which
+/// advertises its admin key, and then writes the persistable pins to `pinned_tracker_admins.json`.
+fn b123_public_run(
+    label: &str,
+    tracker: &str,
+    known: Option<&[u8]>,
+) -> (std::process::Output, PathBuf, TempDir) {
+    let (root, dir, reg, _log) = prepare(label);
+    if let Some(bytes) = known {
+        std::fs::write(dir.join("known_peers.json"), bytes).unwrap();
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env_remove("PARVAULT_GENESIS_SEED_HEX")
+        .env_remove("PARVAULT_PEERS")
+        .env_remove("PARVAULT_TRACKERS")
+        .env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .env("RUST_LOG", "warn")
+        .env("NO_COLOR", "1")
+        .arg("--data-dir")
+        .arg(&dir)
+        .args([
+            "--no-lan-discovery",
+            "--public",
+            "--tracker",
+            tracker,
+            "status",
+        ])
+        .output()
+        .expect("run parvault --public status");
+    (out, dir, root)
+}
+
+/// An epoch 1 council rooted on (and signed by) `root`.
+fn b123_epoch1(root: &NodeIdentity) -> String {
+    let m = c1_manifest(root, 1, &[&key(0xB5), &key(0xB6), &key(0xB7)], 2, &[root]);
+    hex::encode(m.to_bytes())
+}
+
+/// B-123 accept (`bin=parvault`): with a `known_peers.json` that loads (here: none yet), the key a
+/// tracker advertises is pinned on first use in both on-disk stores, and an epoch 1 it signed
+/// installs as the council.
+#[test]
+fn b123_tracker_admin_pinned_and_persisted() {
+    let k = key(0xB1);
+    let (seed, _admin) = f53_seed("b123-a-seed", Some(&k), None, |_| {});
+    assert_eq!(f53_advertised_admin(&seed), Some(k.public_key_bytes()));
+    let (out, dir, _root) = b123_public_run("b123-a", &seed.addr, None);
+    let text = combined(&out);
+    assert!(!text.contains("reject.known_peers"), "{text}");
+    let (known, legacy) = f53_pins(&dir);
+    assert_eq!(known, vec![k.public_key_bytes()], "{text}");
+    let legacy: Vec<String> = serde_json::from_str(&legacy).unwrap();
+    assert_eq!(legacy, vec![hex::encode(k.public_key_bytes())], "{text}");
+    let out = f53_council_cli(&dir, true, &["install", "--manifest", &b123_epoch1(&k)]);
+    assert!(out.status.success(), "{}", combined(&out));
+    assert!(dir.join("council_manifest.bin").exists());
+    gate_ran("trust_enforcement::b123_tracker_admin_pinned_and_persisted");
+}
+
+/// B-123 reject (`bin=parvault`, QA pre-tag MEDIUM): with a damaged `known_peers.json` the key a
+/// tracker (or a MITM) advertises is not pinned: the run logs `reject.known_peers_damaged`,
+/// writes nothing to `pinned_tracker_admins.json`, keeps the damaged file, and that key's epoch 1
+/// is not installed as the council afterwards (the scope root is refused).
+#[test]
+fn b123_damaged_known_peers_tracker_admin_not_pinned() {
+    let k = key(0xB2);
+    let (seed, _admin) = f53_seed("b123-r-seed", Some(&k), None, |_| {});
+    assert_eq!(f53_advertised_admin(&seed), Some(k.public_key_bytes()));
+    let damaged = b"{\"peers\":";
+    let (out, dir, _root) = b123_public_run("b123-r", &seed.addr, Some(damaged));
+    let text = combined(&out);
+    assert!(text.contains("reject.known_peers_damaged"), "{text}");
+    assert!(
+        !dir.join("pinned_tracker_admins.json").exists(),
+        "pin persisted:\n{text}"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("known_peers.json")).unwrap(),
+        damaged
+    );
+    let out = f53_council_cli(&dir, true, &["install", "--manifest", &b123_epoch1(&k)]);
+    let text = combined(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("reject.known_peers_corrupt"), "{text}");
+    assert!(!dir.join("council_manifest.bin").exists());
+    gate_ran("trust_enforcement::b123_damaged_known_peers_tracker_admin_not_pinned");
+}
+
+/// B-123 (c) reject (`bin=parvault`): a key already in `pinned_tracker_admins.json` (for example
+/// one a pre-fix run pinned while `known_peers.json` was damaged) is not used as the council
+/// scope root while `known_peers.json` stays damaged: `council install` of its epoch 1 is
+/// refused with the store's code. Accept side: `b123_tracker_admin_pinned_and_persisted`.
+#[test]
+fn b123_damaged_known_peers_council_root_refused() {
+    let k = key(0xB3);
+    let (_root, dir, _reg, _log) = prepare("b123-cr");
+    std::fs::write(dir.join("known_peers.json"), b"{\"peers\":").unwrap();
+    std::fs::write(
+        dir.join("pinned_tracker_admins.json"),
+        format!("[\"{}\"]", hex::encode(k.public_key_bytes())),
+    )
+    .unwrap();
+    let out = f53_council_cli(&dir, true, &["install", "--manifest", &b123_epoch1(&k)]);
+    let text = combined(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("reject.known_peers_corrupt"), "{text}");
+    assert!(!dir.join("council_manifest.bin").exists());
+    gate_ran("trust_enforcement::b123_damaged_known_peers_council_root_refused");
 }
 
 // --- F-25: syndication cert not bound to the sender; self-signed DHT records from strangers -------------
@@ -6596,7 +6751,9 @@ fn bseed_silent_peer_gets_one_put_per_job() {
 /// root is ignored; the order is refused and nothing is installed.
 #[test]
 fn council_public_first_epoch_not_auto_installed() {
-    use parvault::storage::council::{install_council_manifest, CouncilManifest};
+    use parvault::storage::council::{
+        install_council_manifest, CouncilInstallRole, CouncilManifest,
+    };
     let tracker = key(0x7A);
     let members = [key(0x81)];
     let mut m = CouncilManifest::new(
@@ -6609,7 +6766,13 @@ fn council_public_first_epoch_not_auto_installed() {
     m.sign(&tracker);
     // The serving peer holds the manifest (it reads it per request).
     let ahead = spawn_daemon("cpub-ahead");
-    install_council_manifest(&ahead.dir, &m, tracker.public_key_bytes()).unwrap();
+    install_council_manifest(
+        &ahead.dir,
+        &m,
+        tracker.public_key_bytes(),
+        CouncilInstallRole::PublicClient,
+    )
+    .unwrap();
     // The public node pins the tracker key and has `ahead` as its peer.
     let (root_dir, dir, reg, log) = prepare("cpub-behind");
     std::fs::write(
@@ -7510,4 +7673,686 @@ fn status_http_security_headers() {
         );
         assert!(head.contains("x-content-type-options: nosniff"));
     }
+}
+
+// ---- B-26 / F-53: council root never on the seed's disk; re-root (L-98) --------------------
+
+/// A public-bootstrap seed with the admin RPC on. `flag` is `--admin-rpc-pubkey`; `disk` is the
+/// seed byte written to `tracker_admin.seed` before start (`key(disk)` is its identity); `pre`
+/// runs on the data directory before start (a `v0.5.0` state, for example).
+fn f53_seed(
+    label: &str,
+    flag: Option<&NodeIdentity>,
+    disk: Option<u8>,
+    pre: impl FnOnce(&Path),
+) -> (Node, String) {
+    let (root, dir, reg, log) = prepare(label);
+    if let Some(b) = disk {
+        std::fs::write(dir.join("tracker_admin.seed"), [b; 32]).unwrap();
+    }
+    pre(&dir);
+    let admin_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let admin_addr = format!("127.0.0.1:{admin_port}");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault-seed"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg).args([
+        "start",
+        "--mode",
+        "public-bootstrap",
+        "--no-lan-discovery",
+        "--listen",
+        common::LOOPBACK_EPHEMERAL,
+        "--admin-rpc-listen",
+        &admin_addr,
+    ]);
+    if let Some(f) = flag {
+        cmd.args(["--admin-rpc-pubkey", &hex::encode(f.public_key_bytes())]);
+    }
+    cmd.arg("--data-dir").arg(&dir);
+    (spawn(cmd, root, dir, log), admin_addr)
+}
+
+/// The tracker admin key a public seed advertises on rendezvous.
+fn f53_advertised_admin(seed: &Node) -> Option<[u8; 32]> {
+    let c = MeshClient::new(key(0x5E), Vec::new(), None).with_admission(
+        AdmissionSource::default().with_public_tickets(DEFAULT_PUBLIC_WOT_POW_BITS),
+    );
+    match c
+        .send_request(
+            &seed.addr,
+            MeshWireRequest::LookupWanRendezvous {
+                slot_key: [0x5E; 32],
+            },
+        )
+        .expect("rendezvous lookup")
+    {
+        MeshWireResponse::LookupWanRendezvousResult {
+            tracker_admin_pubkey,
+            ..
+        } => tracker_admin_pubkey,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// A re-root of `from` onto `new_root` at `from.epoch + 1`, signed under the re-root domain by
+/// `quorum` and (if `new_root_signs`) by `new_root`.
+fn f53_reroot(
+    from: &parvault::storage::council::CouncilManifest,
+    new_root: &NodeIdentity,
+    members: &[&NodeIdentity],
+    quorum_signers: &[&NodeIdentity],
+    new_root_signs: bool,
+) -> parvault::storage::council::CouncilManifest {
+    let mut m = parvault::storage::council::CouncilManifest::new(
+        new_root.public_key_bytes(),
+        from.epoch + 1,
+        members.iter().map(|k| k.public_key_bytes()).collect(),
+        members.len() as u32 / 2 + 1,
+        1_700_000_100_000,
+    );
+    for s in quorum_signers {
+        m.sign_reroot(s, &from.scope_root);
+    }
+    if new_root_signs {
+        m.sign_reroot(new_root, &from.scope_root);
+    }
+    m
+}
+
+/// F-53 reject (seed): a seed whose root is its own on-disk key (no flag) refuses an epoch 1
+/// signed by that key, and logs why at start.
+#[test]
+fn c1_on_disk_root_refuses_epoch1() {
+    let a = key(0xE1);
+    let (seed, addr) = f53_seed("f53-disk", None, Some(0xE1), |_| {});
+    assert_eq!(f53_advertised_admin(&seed), Some(a.public_key_bytes()));
+    assert_logged(&seed, "council.root_on_disk");
+    let m1 = c1_manifest(&a, 1, &[&key(0xE2), &key(0xE3), &key(0xE4)], 2, &[&a]);
+    assert_eq!(
+        c1_install(&addr, &a, &m1),
+        c1_result(Some("reject.council_root_on_disk"), None)
+    );
+    assert!(!seed.dir.join("council_manifest.bin").exists());
+    gate_ran("trust_enforcement::c1_on_disk_root_refuses_epoch1");
+}
+
+/// F-53 rule 1: with `tracker_admin.seed` (A) on disk and `--admin-rpc-pubkey B`, the seed
+/// advertises B; an epoch 1 signed by A is refused with the scope code, one signed by B installs.
+#[test]
+fn c1_flag_wins_over_existing_seed_file() {
+    let (a, b) = (key(0xE5), key(0xE6));
+    let (seed, addr) = f53_seed("f53-flag", Some(&b), Some(0xE5), |_| {});
+    assert_eq!(f53_advertised_admin(&seed), Some(b.public_key_bytes()));
+    let members = [&key(0xE7), &key(0xE8), &key(0xE9)];
+    let by_a = c1_manifest(&a, 1, &members, 2, &[&a]);
+    assert_eq!(
+        c1_install(&addr, &b, &by_a),
+        c1_result(Some("reject.council_epoch_chain"), None)
+    );
+    let by_b = c1_manifest(&b, 1, &members, 2, &[&b]);
+    assert_eq!(c1_install(&addr, &b, &by_b), c1_result(None, Some(1)));
+    gate_ran("trust_enforcement::c1_flag_wins_over_existing_seed_file");
+}
+
+/// F-53 Decision 3: with the flag given, the on-disk key is not an admin-RPC operator.
+#[test]
+fn c1_admin_rpc_refuses_on_disk_key_when_flag_given() {
+    let (a, b) = (key(0xEA), key(0xEB));
+    let (_seed, addr) = f53_seed("f53-rpc", Some(&b), Some(0xEA), |_| {});
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let as_a = rt.block_on(parvault::admin_rpc::send_admin_rpc_with_identity(
+        &addr,
+        None,
+        &a,
+        &parvault::admin_rpc::SeedAdminRequest::GetSeedTelemetry,
+    ));
+    assert!(
+        matches!(
+            &as_a,
+            Ok((parvault::admin_rpc::SeedAdminResponse::Error { message }, _))
+                if message.contains("unauthorized admin_pubkey")
+        ),
+        "the on-disk key was accepted: {as_a:?}"
+    );
+    let as_b = rt.block_on(parvault::admin_rpc::send_admin_rpc_with_identity(
+        &addr,
+        None,
+        &b,
+        &parvault::admin_rpc::SeedAdminRequest::GetSeedTelemetry,
+    ));
+    assert!(
+        matches!(
+            &as_b,
+            Ok((parvault::admin_rpc::SeedAdminResponse::Telemetry(_), _))
+        ),
+        "{as_b:?}"
+    );
+    gate_ran("trust_enforcement::c1_admin_rpc_refuses_on_disk_key_when_flag_given");
+}
+
+/// Verdict change 5: `--admin-rpc-pubkey` set to the on-disk key's own public key is still an
+/// on-disk root.
+#[test]
+fn c1_flag_equal_to_on_disk_key_still_refused() {
+    let a = key(0xEC);
+    let (_seed, addr) = f53_seed("f53-same", Some(&a), Some(0xEC), |_| {});
+    let m1 = c1_manifest(&a, 1, &[&key(0xED)], 1, &[&a]);
+    assert_eq!(
+        c1_install(&addr, &a, &m1),
+        c1_result(Some("reject.council_root_on_disk"), None)
+    );
+    gate_ran("trust_enforcement::c1_flag_equal_to_on_disk_key_still_refused");
+}
+
+/// F-53: `parvault-seed admin show-authority` never creates `tracker_admin.seed`.
+#[test]
+fn c1_show_authority_creates_no_key_file() {
+    let (_root, dir, _reg, _log) = prepare("f53-show");
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault-seed"))
+        .args(["admin", "show-authority", "--data-dir"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    let text = combined(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("no on-disk authority"), "{text}");
+    assert!(!dir.join("tracker_admin.seed").exists());
+    gate_ran("trust_enforcement::c1_show_authority_creates_no_key_file");
+}
+
+/// The `v0.5.0` state of a flag + file seed: epoch 1 under its on-disk key A (`key(0xF0)`),
+/// members `key(0xF1..=0xF3)`, 2-of-3.
+fn f53_legacy_epoch1() -> parvault::storage::council::CouncilManifest {
+    let a = key(0xF0);
+    c1_manifest(&a, 1, &[&key(0xF1), &key(0xF2), &key(0xF3)], 2, &[&a])
+}
+
+/// F-53 verdict change 8, the upgrade row walked on the real seed: a flag + file + epoch 1
+/// seed refuses orders at start (and logs why), refuses a re-root without B or below quorum,
+/// installs the re-root signed by the epoch 1 quorum and B, then accepts the new council's
+/// orders. A-signed epoch 2 never installs after it.
+#[test]
+fn c1_reroot_with_quorum_and_new_root_installs() {
+    use parvault::storage::council::{install_council_manifest, CouncilInstallRole};
+    let (a, b) = (key(0xF0), key(0xF4));
+    let m1 = f53_legacy_epoch1();
+    let (seed, addr) = f53_seed("f53-walk", Some(&b), Some(0xF0), |dir| {
+        install_council_manifest(
+            dir,
+            &m1,
+            a.public_key_bytes(),
+            CouncilInstallRole::PublicSeed,
+        )
+        .unwrap();
+    });
+    assert_logged(&seed, "council.reroot_needed");
+    let old_members = [key(0xF1), key(0xF2), key(0xF3)];
+    let stranger = key(0xF9);
+    let order = council_order(&[&old_members[0], &old_members[1]], ban_ip(61), 1);
+    let r = send_as_stranger(
+        &stranger,
+        &seed,
+        MeshWireRequest::BroadcastEvictionOrder(order),
+    );
+    assert!(!order_accepted(&r), "{r:?}");
+    assert_logged(&seed, "reject.order_no_council");
+
+    let new_members = [key(0xF5), key(0xF6), key(0xF7)];
+    let nm: Vec<&NodeIdentity> = new_members.iter().collect();
+    let unsigned = f53_reroot(&m1, &b, &nm, &[&old_members[0], &old_members[1]], false);
+    assert_eq!(
+        c1_install(&addr, &b, &unsigned),
+        c1_result(Some("reject.council_reroot_unsigned"), Some(1))
+    );
+    let low = f53_reroot(&m1, &b, &nm, &[&old_members[0]], true);
+    assert_eq!(
+        c1_install(&addr, &b, &low),
+        c1_result(Some("reject.council_epoch_chain"), Some(1))
+    );
+    let reroot = f53_reroot(&m1, &b, &nm, &[&old_members[0], &old_members[1]], true);
+    assert_eq!(c1_install(&addr, &b, &reroot), c1_result(None, Some(2)));
+
+    let order = council_order(&[&new_members[0], &new_members[1]], ban_ip(62), 2);
+    let r = send_as_stranger(
+        &stranger,
+        &seed,
+        MeshWireRequest::BroadcastEvictionOrder(order),
+    );
+    assert!(order_accepted(&r), "{r:?}\n{}", seed.log_text());
+    // The old root and old members cannot sign the next epoch.
+    let a2 = c1_manifest(
+        &a,
+        3,
+        &[&key(0xF8)],
+        1,
+        &[&a, &old_members[0], &old_members[1]],
+    );
+    assert_eq!(
+        c1_install(&addr, &b, &a2),
+        c1_result(Some("reject.council_epoch_chain"), Some(2))
+    );
+    gate_ran("trust_enforcement::c1_reroot_with_quorum_and_new_root_installs");
+}
+
+/// F-53 reject (seed): a re-root without the new root's signature is refused.
+#[test]
+fn c1_reroot_without_new_root_signature_refused() {
+    use parvault::storage::council::{install_council_manifest, CouncilInstallRole};
+    let (a, b) = (key(0xF0), key(0xFA));
+    let m1 = f53_legacy_epoch1();
+    let (_seed, addr) = f53_seed("f53-unsigned", Some(&b), Some(0xF0), |dir| {
+        install_council_manifest(
+            dir,
+            &m1,
+            a.public_key_bytes(),
+            CouncilInstallRole::PublicSeed,
+        )
+        .unwrap();
+    });
+    let (m1a, m1b) = (key(0xF1), key(0xF2));
+    let r = f53_reroot(&m1, &b, &[&key(0xFB)], &[&m1a, &m1b], false);
+    assert_eq!(
+        c1_install(&addr, &b, &r),
+        c1_result(Some("reject.council_reroot_unsigned"), Some(1))
+    );
+    gate_ran("trust_enforcement::c1_reroot_without_new_root_signature_refused");
+}
+
+/// `parvault [--public] council <args>` on `dir` (no daemon needed).
+fn f53_council_cli(dir: &Path, public: bool, args: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+        .env("RUST_LOG", "info")
+        .env("NO_COLOR", "1")
+        .arg("--data-dir")
+        .arg(dir)
+        .arg("--no-lan-discovery");
+    if public {
+        cmd.arg("--public");
+    }
+    cmd.arg("council")
+        .args(args)
+        .output()
+        .expect("run parvault council")
+}
+
+/// A public client pinned to A (`key(0xF0)`) in both on-disk pin stores, holding epoch 1
+/// under A installed with the real binary.
+fn f53_client(label: &str) -> (TempDir, PathBuf) {
+    let (root, dir, _reg, _log) = prepare(label);
+    let a = key(0xF0).public_key_bytes();
+    let mut store = parvault::network::KnownPeersStore::load(&dir);
+    store.set_tracker_admin_pubkey("/ip4/127.0.0.1/tcp/4002", a);
+    store.save(&dir).unwrap();
+    std::fs::write(
+        dir.join("pinned_tracker_admins.json"),
+        format!("[\"{}\"]", hex::encode(a)),
+    )
+    .unwrap();
+    let m1 = hex::encode(f53_legacy_epoch1().to_bytes());
+    let out = f53_council_cli(&dir, true, &["install", "--manifest", &m1]);
+    assert!(out.status.success(), "{}", combined(&out));
+    (root, dir)
+}
+
+fn f53_pins(dir: &Path) -> (Vec<[u8; 32]>, String) {
+    (
+        parvault::network::KnownPeersStore::load(dir).pinned_tracker_admin_pubkeys(),
+        std::fs::read_to_string(dir.join("pinned_tracker_admins.json")).unwrap(),
+    )
+}
+
+/// F-53 accept (client, `bin=parvault`): a client pinned to A follows a valid re-root, ends
+/// pinned to B in both on-disk stores, and installs B's next epoch.
+#[test]
+fn f53_client_follows_reroot_and_repins() {
+    let b = key(0xF4);
+    let (_root, dir) = f53_client("f53-client");
+    let new_members = [key(0xF5), key(0xF6), key(0xF7)];
+    let nm: Vec<&NodeIdentity> = new_members.iter().collect();
+    let reroot = f53_reroot(
+        &f53_legacy_epoch1(),
+        &b,
+        &nm,
+        &[&key(0xF1), &key(0xF2)],
+        true,
+    );
+    let out = f53_council_cli(
+        &dir,
+        true,
+        &["install", "--manifest", &hex::encode(reroot.to_bytes())],
+    );
+    let text = combined(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("Council re-rooted"), "{text}");
+    let (known, legacy) = f53_pins(&dir);
+    assert_eq!(known, vec![b.public_key_bytes()]);
+    assert_eq!(
+        legacy.matches(&hex::encode(b.public_key_bytes())).count(),
+        1,
+        "{legacy}"
+    );
+    assert!(
+        !legacy.contains(&hex::encode(key(0xF0).public_key_bytes())),
+        "{legacy}"
+    );
+    let mut m3 = parvault::storage::council::CouncilManifest::new(
+        b.public_key_bytes(),
+        3,
+        vec![key(0xFC).public_key_bytes()],
+        1,
+        1_700_000_200_000,
+    );
+    m3.sign(&new_members[0]);
+    m3.sign(&new_members[1]);
+    let out = f53_council_cli(
+        &dir,
+        true,
+        &["install", "--manifest", &hex::encode(m3.to_bytes())],
+    );
+    assert!(out.status.success(), "{}", combined(&out));
+    gate_ran("trust_enforcement::f53_client_follows_reroot_and_repins");
+}
+
+/// F-53 reject (client, `bin=parvault`): a re-root below quorum, or without B, is refused and
+/// the pins stay on A.
+#[test]
+fn f53_client_refuses_reroot_below_quorum_or_without_new_root() {
+    let b = key(0xF4);
+    let (_root, dir) = f53_client("f53-client-r");
+    let nm = [&key(0xF5)];
+    let low = f53_reroot(&f53_legacy_epoch1(), &b, &nm, &[&key(0xF1)], true);
+    let out = f53_council_cli(
+        &dir,
+        true,
+        &["install", "--manifest", &hex::encode(low.to_bytes())],
+    );
+    let text = combined(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("reject.council_epoch_chain"), "{text}");
+    let unsigned = f53_reroot(
+        &f53_legacy_epoch1(),
+        &b,
+        &nm,
+        &[&key(0xF1), &key(0xF2)],
+        false,
+    );
+    let out = f53_council_cli(
+        &dir,
+        true,
+        &["install", "--manifest", &hex::encode(unsigned.to_bytes())],
+    );
+    let text = combined(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("reject.council_reroot_unsigned"), "{text}");
+    let (known, _) = f53_pins(&dir);
+    assert_eq!(known, vec![key(0xF0).public_key_bytes()]);
+    gate_ran("trust_enforcement::f53_client_refuses_reroot_below_quorum_or_without_new_root");
+}
+
+/// Verdict change 2 (`bin=parvault`): in private mode the root is the ring genesis; a re-root
+/// signed by the ring council's quorum and a new root is refused.
+#[test]
+fn f53_private_reroot_refused() {
+    let (_root, dir, _reg, _log) = prepare("f53-private");
+    let members = [
+        "--member",
+        &hex::encode(key(0x81).public_key_bytes()),
+        "--member",
+        &hex::encode(key(0x82).public_key_bytes()),
+        "--member",
+        &hex::encode(key(0x83).public_key_bytes()),
+    ];
+    let mut args = vec!["init"];
+    args.extend_from_slice(&members);
+    args.extend_from_slice(&["--quorum", "2"]);
+    let out = f53_council_cli(&dir, false, &args);
+    assert!(out.status.success(), "{}", combined(&out));
+    let m1 = parvault::storage::council::load_council_manifest(&dir).unwrap();
+    let r = f53_reroot(
+        &m1,
+        &key(0xF4),
+        &[&key(0xF5)],
+        &[&key(0x81), &key(0x82)],
+        true,
+    );
+    let out = f53_council_cli(
+        &dir,
+        false,
+        &["install", "--manifest", &hex::encode(r.to_bytes())],
+    );
+    let text = combined(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("reject.council_reroot_private"), "{text}");
+    assert_eq!(
+        parvault::storage::council::load_council_manifest(&dir)
+            .unwrap()
+            .epoch,
+        1
+    );
+    gate_ran("trust_enforcement::f53_private_reroot_refused");
+}
+
+/// QA MED (B-52, F-53 legacy pin store): a corrupt `pinned_tracker_admins.json` resolves no
+/// council scope root, so `parvault --public council install` is refused with the pin store's
+/// reason code instead of rooting on another key. Accept side: `f53_client` installs epoch 1
+/// with the same file readable.
+#[test]
+fn b52_corrupt_tracker_pins_council_install_refused() {
+    let (_root, dir, _reg, _log) = prepare("b52-council-pins");
+    std::fs::write(dir.join("pinned_tracker_admins.json"), b"{not json").unwrap();
+    let m1 = hex::encode(f53_legacy_epoch1().to_bytes());
+    let out = f53_council_cli(&dir, true, &["install", "--manifest", &m1]);
+    let text = combined(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("reject.tracker_pins_unreadable"), "{text}");
+    assert!(!dir.join("council_manifest.bin").exists());
+    assert_eq!(
+        std::fs::read(dir.join("pinned_tracker_admins.json")).unwrap(),
+        b"{not json"
+    );
+    gate_ran("trust_enforcement::b52_corrupt_tracker_pins_council_install_refused");
+}
+
+/// C5 (verdict change 7, `bin=parvault`): `parvault --public council repin` moves the tracker's
+/// pin from A to B in both on-disk stores, and says the installed council (under A) must be
+/// replaced.
+#[test]
+fn f53_council_repin_moves_both_stores() {
+    let b = key(0xF4).public_key_bytes();
+    let (_root, dir) = f53_client("f53-repin");
+    let out = f53_council_cli(
+        &dir,
+        true,
+        &[
+            "repin",
+            "--tracker",
+            "/ip4/127.0.0.1/tcp/4002",
+            "--admin-pubkey",
+            &hex::encode(b),
+        ],
+    );
+    let text = combined(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("The installed council is under another root"),
+        "{text}"
+    );
+    let (known, legacy) = f53_pins(&dir);
+    assert_eq!(known, vec![b]);
+    assert_eq!(legacy.matches(&hex::encode(b)).count(), 1, "{legacy}");
+    assert!(
+        !legacy.contains(&hex::encode(key(0xF0).public_key_bytes())),
+        "{legacy}"
+    );
+    gate_ran("trust_enforcement::f53_council_repin_moves_both_stores");
+}
+
+/// Write order (B-52): with a corrupt `pinned_tracker_admins.json`, `council repin` is refused
+/// before it writes, so `known_peers.json` keeps the pin to A and the legacy file is unchanged
+/// (no half-done re-pin). No manifest is installed, so the start-up pin repair (which also reads
+/// both stores) does not run and the re-pin's own load order is what is tested.
+#[test]
+fn f53_council_repin_corrupt_legacy_leaves_both_unchanged() {
+    let b = key(0xF4).public_key_bytes();
+    let (_root, dir) = f53_client("f53-repin-corrupt");
+    std::fs::remove_file(dir.join("council_manifest.bin")).unwrap();
+    std::fs::write(dir.join("pinned_tracker_admins.json"), b"{not json").unwrap();
+    let known_before = std::fs::read(dir.join("known_peers.json")).unwrap();
+    let out = f53_council_cli(
+        &dir,
+        true,
+        &[
+            "repin",
+            "--tracker",
+            "/ip4/127.0.0.1/tcp/4002",
+            "--admin-pubkey",
+            &hex::encode(b),
+        ],
+    );
+    let text = combined(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("reject.tracker_pins_unreadable"), "{text}");
+    assert_eq!(
+        std::fs::read(dir.join("known_peers.json")).unwrap(),
+        known_before
+    );
+    assert_eq!(
+        std::fs::read(dir.join("pinned_tracker_admins.json")).unwrap(),
+        b"{not json"
+    );
+    gate_ran("trust_enforcement::f53_council_repin_corrupt_legacy_leaves_both_unchanged");
+}
+
+/// Crash-safe re-pin (F-53 QA, `bin=parvault`): a re-pin from A to B cut short after
+/// `known_peers.json` (known = B, legacy = A, the write-ahead intent on disk, no manifest)
+/// finishes at the next start. Both stores then hold B, and with `known_peers.json` gone the
+/// root still resolves to B: an epoch 1 signed by A is refused, one signed by B installs.
+#[test]
+fn f53_interrupted_repin_converges_on_restart() {
+    let (a, b) = (key(0xF0), key(0xF4));
+    let tracker = "/ip4/127.0.0.1/tcp/4002";
+    let (_root, dir) = f53_client("f53-repin-crash");
+    std::fs::remove_file(dir.join("council_manifest.bin")).unwrap();
+    let _ = std::fs::remove_file(dir.join("council_history.bin"));
+    let mut store = parvault::network::KnownPeersStore::load(&dir);
+    store.set_tracker_admin_pubkey(tracker, b.public_key_bytes());
+    store.save(&dir).unwrap();
+    let intent = parvault::storage::council::RepinIntent {
+        tracker: Some(tracker.to_string()),
+        prev: Some(a.public_key_bytes()),
+        new: b.public_key_bytes(),
+    };
+    let intent_path = dir.join(parvault::storage::council::COUNCIL_REPIN_INTENT_FILE);
+    std::fs::write(&intent_path, serde_json::to_vec(&intent).unwrap()).unwrap();
+    // The restart: any public `parvault` start runs the pin repair first.
+    let out = f53_council_cli(&dir, true, &["show"]);
+    let text = combined(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("finished an interrupted tracker re-pin"),
+        "{text}"
+    );
+    let (known, legacy) = f53_pins(&dir);
+    assert_eq!(known, vec![b.public_key_bytes()]);
+    assert_eq!(
+        legacy.matches(&hex::encode(b.public_key_bytes())).count(),
+        1,
+        "{legacy}"
+    );
+    assert!(
+        !legacy.contains(&hex::encode(a.public_key_bytes())),
+        "{legacy}"
+    );
+    assert!(!intent_path.exists());
+    // A never roots again, even once known_peers.json is gone (the legacy fallback).
+    std::fs::remove_file(dir.join("known_peers.json")).unwrap();
+    let m_a = hex::encode(f53_legacy_epoch1().to_bytes());
+    let out = f53_council_cli(&dir, true, &["install", "--manifest", &m_a]);
+    let text = combined(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(!dir.join("council_manifest.bin").exists(), "{text}");
+    let m_b = c1_manifest(&b, 1, &[&key(0xF5), &key(0xF6), &key(0xF7)], 2, &[&b]);
+    let out = f53_council_cli(
+        &dir,
+        true,
+        &["install", "--manifest", &hex::encode(m_b.to_bytes())],
+    );
+    let text = combined(&out);
+    assert!(out.status.success(), "{text}");
+    assert_eq!(
+        parvault::storage::council::load_council_manifest(&dir).map(|m| m.scope_root),
+        Some(b.public_key_bytes())
+    );
+    gate_ran("trust_enforcement::f53_interrupted_repin_converges_on_restart");
+}
+
+/// Reject side of the write-ahead re-pin record (`bin=parvault`): one that does not decode stops
+/// a public start with its reason code, and both pin stores and the record stay as they were.
+#[test]
+fn f53_corrupt_repin_intent_refused() {
+    let (_root, dir) = f53_client("f53-repin-intent-corrupt");
+    let intent_path = dir.join(parvault::storage::council::COUNCIL_REPIN_INTENT_FILE);
+    std::fs::write(&intent_path, b"{").unwrap();
+    let before = f53_pins(&dir);
+    let out = f53_council_cli(&dir, true, &["show"]);
+    let text = combined(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("reject.council_repin_intent_corrupt"),
+        "{text}"
+    );
+    assert_eq!(f53_pins(&dir), before);
+    assert_eq!(std::fs::read(&intent_path).unwrap(), b"{");
+    gate_ran("trust_enforcement::f53_corrupt_repin_intent_refused");
+}
+
+/// The same crash in a client re-root written by a binary before the write-ahead intent
+/// (`bin=parvault`): manifest under B, known = B, legacy = A, no intent. The start-up repair
+/// no longer stops because B is pinned in one store; the legacy file moves to B.
+#[test]
+fn f53_reroot_repair_finishes_legacy_pin() {
+    let (a, b) = (key(0xF0), key(0xF4));
+    let (_root, dir) = f53_client("f53-reroot-crash");
+    let new_members = [key(0xF5), key(0xF6), key(0xF7)];
+    let nm: Vec<&NodeIdentity> = new_members.iter().collect();
+    let reroot = f53_reroot(
+        &f53_legacy_epoch1(),
+        &b,
+        &nm,
+        &[&key(0xF1), &key(0xF2)],
+        true,
+    );
+    let out = f53_council_cli(
+        &dir,
+        true,
+        &["install", "--manifest", &hex::encode(reroot.to_bytes())],
+    );
+    assert!(out.status.success(), "{}", combined(&out));
+    std::fs::write(
+        dir.join("pinned_tracker_admins.json"),
+        format!("[\"{}\"]", hex::encode(a.public_key_bytes())),
+    )
+    .unwrap();
+    let out = f53_council_cli(&dir, true, &["show"]);
+    let text = combined(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("finished an interrupted council re-pin"),
+        "{text}"
+    );
+    let (known, legacy) = f53_pins(&dir);
+    assert_eq!(known, vec![b.public_key_bytes()]);
+    assert!(
+        legacy.contains(&hex::encode(b.public_key_bytes())),
+        "{legacy}"
+    );
+    assert!(
+        !legacy.contains(&hex::encode(a.public_key_bytes())),
+        "{legacy}"
+    );
+    gate_ran("trust_enforcement::f53_reroot_repair_finishes_legacy_pin");
 }

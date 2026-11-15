@@ -2263,6 +2263,7 @@ fn broadcast_eviction_order() {
             &fx.dir,
             &m,
             keys.genesis.public_key_bytes(),
+            parvault::storage::council::CouncilInstallRole::Private,
         )
         .unwrap();
     });

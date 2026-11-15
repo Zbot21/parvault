@@ -7,7 +7,8 @@ use crate::network::behaviour::{
     PlacementEngine, SignedWanRendezvousEntry,
 };
 use crate::network::discovery::{
-    discover_lan_peers, node_identity_libp2p_peer_id, KnownPeersStore, DEFAULT_LAN_DISCOVERY_PORT,
+    discover_lan_peers, node_identity_libp2p_peer_id, tracker_pin_decision, KnownPeersStore,
+    DEFAULT_LAN_DISCOVERY_PORT,
 };
 use crate::network::transport::build_mesh_client_swarm;
 use crate::network::wan_rendezvous::{
@@ -38,6 +39,7 @@ use libp2p::{
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
@@ -1031,6 +1033,8 @@ pub struct MeshClient {
     lan_discovery_enabled: bool,
     healed_peer_addrs: Arc<Mutex<HashMap<PeerId, String>>>,
     tracker_admin_pubkeys: Arc<Mutex<HashMap<String, [u8; 32]>>>,
+    /// B-123: set once the refusal to pin while `known_peers.json` is damaged has been logged.
+    known_peers_damaged_logged: Arc<AtomicBool>,
     dead_peers: Arc<Mutex<HashSet<String>>>,
     pinned_peers: Arc<Mutex<HashMap<String, PeerId>>>,
     peer_rtt_ms: Arc<Mutex<HashMap<String, f64>>>,
@@ -1078,6 +1082,7 @@ impl MeshClient {
             lan_discovery_enabled: true,
             healed_peer_addrs: Arc::new(Mutex::new(initial_healed)),
             tracker_admin_pubkeys: Arc::new(Mutex::new(HashMap::new())),
+            known_peers_damaged_logged: Arc::new(AtomicBool::new(false)),
             dead_peers: Arc::new(Mutex::new(HashSet::new())),
             pinned_peers: Arc::new(Mutex::new(HashMap::new())),
             peer_rtt_ms: Arc::new(Mutex::new(HashMap::new())),
@@ -1695,8 +1700,40 @@ impl MeshClient {
         }
     }
 
+    /// B-123: the on-disk pin store a tracker-admin pin may be added to, or the refusal while
+    /// `known_peers.json` is damaged (logged once per client, with the load's own reason code).
+    /// `Ok(None)` is a client with no data dir (in-memory pins only).
+    fn tracker_pin_store(&self) -> Result<Option<KnownPeersStore>, &'static str> {
+        let Some(ref dir) = self.discovery_data_dir else {
+            return Ok(None);
+        };
+        let loaded = KnownPeersStore::try_load(dir);
+        let load_error = loaded.as_ref().err().map(|e| e.to_string());
+        match tracker_pin_decision(loaded) {
+            Ok(store) => Ok(Some(store)),
+            Err(code) => {
+                if !self
+                    .known_peers_damaged_logged
+                    .swap(true, Ordering::Relaxed)
+                {
+                    warn!(
+                        code,
+                        load_error = load_error.as_deref().unwrap_or_default(),
+                        "known_peers.json is damaged: no tracker-admin key is pinned or persisted \
+                         until the operator restores it"
+                    );
+                }
+                Err(code)
+            }
+        }
+    }
+
     fn record_tracker_admin_pubkey(&self, peer_addr: &str, admin_pk: Option<[u8; 32]>) {
         let Some(pk) = admin_pk.filter(|k| *k != [0u8; 32]) else {
+            return;
+        };
+        // B-123: no trust-on-first-use while the pin store is damaged (it shows no pins).
+        let Ok(store) = self.tracker_pin_store() else {
             return;
         };
         let key = peer_addr.trim().to_string();
@@ -1711,10 +1748,50 @@ impl MeshClient {
                 }
             }
         }
-        if let Some(ref dir) = self.discovery_data_dir {
-            let mut store = KnownPeersStore::load(dir);
+        if let (Some(dir), Some(mut store)) = (self.discovery_data_dir.as_ref(), store) {
             store.pin_tracker_admin_pubkey(&key, pk);
             let _ = store.save(dir);
+        }
+    }
+
+    /// B-123: the in-memory tracker-admin pins that may be written to `pinned_tracker_admins.json`
+    /// (the legacy store the council scope root also reads). Refused while `known_peers.json` is
+    /// damaged (`reject.known_peers_damaged`), so no pin reaches the legacy store in that state.
+    pub fn persistable_tracker_admin_pubkeys(&self) -> Result<Vec<[u8; 32]>, &'static str> {
+        self.tracker_pin_store()?;
+        Ok(self.pinned_tracker_admin_pubkeys())
+    }
+
+    /// Writes the persistable in-memory tracker-admin pins to `pinned_tracker_admins.json`
+    /// (`--public` network commands and `report-abuse`). While `known_peers.json` is damaged
+    /// nothing is written (B-123; logged by [`Self::tracker_pin_store`]); council operations then
+    /// fail closed on the damaged store until the operator restores it. A pin file that does not
+    /// load, or a failed write, is an error (B-52).
+    pub fn persist_tracker_admin_pins(
+        &self,
+        cfg: &crate::config::NodeConfig,
+    ) -> anyhow::Result<()> {
+        let Ok(pins) = self.persistable_tracker_admin_pubkeys() else {
+            return Ok(());
+        };
+        for pk in pins {
+            cfg.persist_pinned_tracker_admin(pk)?;
+        }
+        Ok(())
+    }
+
+    /// Re-pins the in-memory map from `old` onto `new` (the third pin store; the two on-disk
+    /// ones move in `council::repin_tracker_admin`). Called only after a council re-root.
+    pub fn repin_tracker_admin_pubkey(&self, old: [u8; 32], new: [u8; 32]) {
+        if new == [0u8; 32] {
+            return;
+        }
+        if let Ok(mut guard) = self.tracker_admin_pubkeys.lock() {
+            for pk in guard.values_mut() {
+                if *pk == old {
+                    *pk = new;
+                }
+            }
         }
     }
 
@@ -3321,5 +3398,67 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// B-123 (a): with a damaged `known_peers.json` no advertised tracker-admin key is pinned,
+    /// in memory or on disk, and the file is left as it was. Real files, no mocks.
+    #[test]
+    fn b123_damaged_known_peers_pins_no_tracker_admin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let known = dir.join(KnownPeersStore::FILE_NAME);
+        std::fs::write(&known, b"{\"peers\":").unwrap();
+        let client = MeshClient::new(NodeIdentity::generate(), Vec::new(), None)
+            .with_data_dir_discovery(dir.clone(), DEFAULT_LAN_DISCOVERY_PORT);
+        let tracker = "/ip4/198.51.100.10/tcp/4010";
+        client.record_tracker_admin_pubkey(tracker, Some([0xC3; 32]));
+        assert!(client.pinned_tracker_admin_pubkeys().is_empty());
+        assert_eq!(client.tracker_admin_pubkey_for(tracker), None);
+        assert_eq!(
+            client.persistable_tracker_admin_pubkeys(),
+            Err("reject.known_peers_damaged")
+        );
+        assert_eq!(std::fs::read(&known).unwrap(), b"{\"peers\":");
+        // Accept side: once the operator removes the damaged file, the key is pinned and saved.
+        std::fs::remove_file(&known).unwrap();
+        client.record_tracker_admin_pubkey(tracker, Some([0xC3; 32]));
+        assert_eq!(client.pinned_tracker_admin_pubkeys(), vec![[0xC3; 32]]);
+        assert_eq!(
+            KnownPeersStore::try_load(&dir)
+                .unwrap()
+                .pinned_tracker_admin_pubkeys(),
+            vec![[0xC3; 32]]
+        );
+    }
+
+    /// B-123 (b): an in-memory pin is never written to `pinned_tracker_admins.json` while
+    /// `known_peers.json` is damaged, even one learned before the damage; once the store loads
+    /// again it is written. Real files, no mocks.
+    #[test]
+    fn b123_damaged_known_peers_persists_no_legacy_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let known = dir.join(KnownPeersStore::FILE_NAME);
+        let legacy = dir.join("pinned_tracker_admins.json");
+        let cfg = crate::config::NodeConfig {
+            data_dir: dir.clone(),
+            ..Default::default()
+        };
+        let client = MeshClient::new(NodeIdentity::generate(), Vec::new(), None)
+            .with_data_dir_discovery(dir.clone(), DEFAULT_LAN_DISCOVERY_PORT);
+        client.record_tracker_admin_pubkey("/ip4/198.51.100.11/tcp/4010", Some([0xC4; 32]));
+        assert_eq!(client.pinned_tracker_admin_pubkeys(), vec![[0xC4; 32]]);
+        let healthy = std::fs::read(&known).unwrap();
+        std::fs::write(&known, b"{\"tracker_admin_pubkeys\":").unwrap();
+        client.persist_tracker_admin_pins(&cfg).unwrap();
+        assert!(
+            !legacy.exists(),
+            "pin written while known_peers.json is damaged"
+        );
+        // Accept side: the store restored, the same call writes the pin.
+        std::fs::write(&known, healthy).unwrap();
+        client.persist_tracker_admin_pins(&cfg).unwrap();
+        let pins: Vec<String> = serde_json::from_slice(&std::fs::read(&legacy).unwrap()).unwrap();
+        assert_eq!(pins, vec![hex::encode([0xC4; 32])]);
     }
 }

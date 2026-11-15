@@ -328,6 +328,11 @@ async fn main() -> anyhow::Result<()> {
         Vec::new()
     };
 
+    if public_mode {
+        // F-53: finish a council re-pin a crash cut short, before the pins load into memory.
+        parvault::storage::council::repair_council_pins(&cfg.data_dir)
+            .map_err(|e| anyhow::anyhow!("council re-pin repair: {e}"))?;
+    }
     let mesh_client = MeshClient::new(node_identity.clone(), resolved_peers, effective_seed)
         .with_data_dir_discovery(cfg.data_dir.clone(), lan_port)
         .with_lan_discovery(lan_enabled);
@@ -336,9 +341,7 @@ async fn main() -> anyhow::Result<()> {
         for tracker in &public_trackers {
             let _ = mesh_client.announce_and_discover_public_tracker(tracker, None);
         }
-        for pk in mesh_client.pinned_tracker_admin_pubkeys() {
-            cfg.persist_pinned_tracker_admin(pk)?;
-        }
+        mesh_client.persist_tracker_admin_pins(&cfg)?;
     }
 
     let mut quota = QuotaManager::new(cfg.max_storage_bytes, cfg.bootstrap_grace_bytes);

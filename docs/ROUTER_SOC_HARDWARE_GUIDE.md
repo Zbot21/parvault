@@ -61,6 +61,7 @@ flowchart TD
   - `parvault-fuse`: **<!-- metric:size.parvault-fuse.aarch64 -->`1.13 MiB`<!-- /metric -->** (<!-- metric:size.parvault-fuse.aarch64.bytes -->`1,185,456 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-fuse.x86_64 -->`1.24 MiB`<!-- /metric -->** (<!-- metric:size.parvault-fuse.x86_64.bytes -->`1,300,672 B`<!-- /metric --> `x86_64`)
   - `parvault-sync`: **<!-- metric:size.parvault-sync.aarch64 -->`0.69 MiB`<!-- /metric -->** (<!-- metric:size.parvault-sync.aarch64.bytes -->`725,264 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-sync.x86_64 -->`0.77 MiB`<!-- /metric -->** (<!-- metric:size.parvault-sync.x86_64.bytes -->`811,824 B`<!-- /metric --> `x86_64`) — zero-key incremental folder sync plugin (`GatewayFolderSync`)
 - **OCI / Docker `FROM scratch` container image (`parvault:router-soc`):** **<!-- metric:docker.unpacked -->`19.6 MB`<!-- /metric -->** total uncompressed disk usage (**<!-- metric:docker.compressed -->`6.13 MB`<!-- /metric -->** compressed content size, stripped binaries + `router.toml` configuration, 0 OS overhead).
+  - **Runs as non-root:** both images (`deploy/Dockerfile.router-soc`, `deploy/Dockerfile.musl`) run the daemon as user `parvault` (uid/gid `65532`) with no added capability; every port is above `1023`. The image owns `/var/lib/parvault`, `/mnt/nas` and the socket dir `/run/parvault` (use `--ipc-socket /run/parvault/parvault.sock`). A host bind mount must be owned by uid `65532`. Do not add `NET_ADMIN`; apply `tc netem` from a sidecar that joins the container's network namespace.
 - **Minimum Free Disk Reserve (`min_free_disk_bytes`):**
   - `--profile router-soc`: `64 MiB` (`67,108,864` bytes), allowing deployment on small USB flash drives or flash partitions.
   - `--profile homelab-nas`: `1 GiB` (`1,073,741,824` bytes).
@@ -263,7 +264,7 @@ mkdir -p /etc/parvault /mnt/nas/.parvault-data /mnt/nas/shared
 ### Configuration File (`/etc/parvault/router.toml`)
 Copy `deploy/router-soc/parvault-router.toml`:
 ```toml
-# ParVault v0.5.0 Turnkey Router Cloud-NAS Configuration (ADR-21)
+# ParVault v0.5.1 Turnkey Router Cloud-NAS Configuration (ADR-21)
 # Designed for OpenWrt / prplOS / ARM64 & x86_64 Gateway SoCs (<= 32-48 MiB cgroup RAM)
 
 hardware_profile = "router-soc"
@@ -375,7 +376,7 @@ For carrier and broadband gateway environments running `prplOS`, deploy `parvaul
   "schema_version": "1.0",
   "container_name": "parvault-router-nas",
   "vendor": "Neighborhood Cloud / Project ParVault",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "license": "AGPL-3.0-only",
   "target_platforms": [
     "aarch64-unknown-linux-musl",
@@ -450,7 +451,7 @@ Every request must present a read-only token (`parvault token mint --read-only`)
   ```
   ```json
   {
-    "version": "0.5.0",
+    "version": "0.5.1",
     "node_label": "OpenWrt-CloudNAS",
     "hardware_profile": "router-soc",
     "device_peer_id": "12D3KooWSDu7w4v...",

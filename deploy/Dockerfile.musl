@@ -51,7 +51,7 @@ RUN addgroup -S -g 65532 parvault \
 VOLUME ["/var/lib/parvault"]
 EXPOSE 4001/tcp 4002/tcp 4009/udp 4080/tcp 4001/udp 5353/udp
 
-USER 65532:65532
+USER parvault:parvault
 WORKDIR /var/lib/parvault
 ENTRYPOINT ["/usr/local/bin/parvault"]
 CMD ["daemon", "start", "--listen", "/ip4/0.0.0.0/tcp/4001"]

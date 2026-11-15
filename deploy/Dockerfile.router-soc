@@ -57,8 +57,10 @@ VOLUME ["/mnt/nas", "/var/lib/parvault"]
 # 4080/tcp - Router NAS Web status dashboard & JSON telemetry (ADR-18)
 EXPOSE 4001/tcp 4002/tcp 4009/udp 4080/tcp
 
-# Every port is above 1023: the daemon needs no capability.
-USER 65532:65532
+# Every port is above 1023: the daemon needs no capability. The user is named: scratch has no
+# user database of its own, but the /etc/passwd and /etc/group copied above resolve
+# parvault:parvault to 65532:65532 (without them only a numeric uid would work here).
+USER parvault:parvault
 WORKDIR /var/lib/parvault
 ENTRYPOINT ["/parvault"]
 CMD ["up", "--profile", "router-soc", "--config", "/etc/parvault/router.toml"]
