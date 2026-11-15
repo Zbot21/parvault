@@ -693,3 +693,49 @@ fn dump_unresolvable_config_exits_3() {
     assert_eq!(doc["schema"], "parvault.config-dump/1");
     gate_ran("config_dump::dump_unresolvable_config_exits_3");
 }
+
+/// Fixed in v0.5.4: `daemon start` without `--listen` / `--enable-quic` binds what the config
+/// file says (a clap default used to replace it with `/ip4/0.0.0.0/tcp/4001` and no QUIC).
+#[test]
+fn daemon_start_honours_config_file_listen() {
+    let t = temp("listen");
+    let dir = t.path().join("d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = t.path().join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        "listen_tcp = \"/ip4/127.0.0.1/tcp/0\"\nenable_quic = true\nlisten_quic = \"/ip4/127.0.0.1/udp/0/quic-v1\"\n",
+    )
+    .unwrap();
+    let log = t.path().join("daemon.log");
+    let f = std::fs::File::create(&log).unwrap();
+    let mut child = parvault()
+        .env("PARVAULT_LAN_REGISTRY_DIR", t.path().join("reg"))
+        .env("PARVAULT_GENESIS_SEED_HEX", hex::encode([0x47u8; 32]))
+        .env("RUST_LOG", "info")
+        .arg("--data-dir")
+        .arg(&dir)
+        .arg("--config")
+        .arg(&cfg)
+        .args(["--no-lan-discovery", "daemon", "start", "--no-socket"])
+        .stdout(Stdio::from(f.try_clone().unwrap()))
+        .stderr(Stdio::from(f))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let text = loop {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text.contains("/ip4/127.0.0.1/tcp/") && text.contains("/quic-v1") {
+            break text;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("the config file's listeners were not bound:\n{text}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(!text.contains("/ip4/0.0.0.0/tcp/4001"), "{text}");
+    gate_ran("config_dump::daemon_start_honours_config_file_listen");
+}

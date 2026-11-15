@@ -618,3 +618,39 @@ fn insecure_listener_iface_mismatch_refused() {
     );
     gate_ran("traversal_metrics::insecure_listener_iface_mismatch_refused");
 }
+
+/// B-142 accept: a bootstrap address naming the right PeerId connects (`ok`), with no refusal.
+#[test]
+fn b142_bootstrap_peer_id_matches_and_connects() {
+    let b = spawn_daemon("b142-b", &[], false);
+    let a = spawn_daemon("b142-a", &[b.addr()], true);
+    assert!(eventually(Duration::from_secs(15), || outcome(
+        &a.scrape(),
+        "daemon",
+        "tcp",
+        "ok"
+    ) == 1));
+    assert!(!a.log_text().contains("reject.dial_peer_id_mismatch"));
+    gate_ran("traversal_metrics::b142_bootstrap_peer_id_matches_and_connects");
+}
+
+/// B-142 reject: a real daemon dials a bootstrap address whose `/p2p/` names another peer than
+/// the daemon listening there; the connection is refused (`reject.dial_peer_id_mismatch`,
+/// `peer_id_mismatch`), never established.
+#[test]
+fn b142_bootstrap_peer_id_mismatch_refused() {
+    let b = spawn_daemon("b142r-b", &[], false);
+    let other = node_identity_libp2p_peer_id(&NodeIdentity::generate()).unwrap();
+    let a = spawn_daemon("b142r-a", &[format!("{}/p2p/{other}", b.mesh)], true);
+    assert!(
+        eventually(Duration::from_secs(15), || a
+            .log_text()
+            .contains("reject.dial_peer_id_mismatch")),
+        "{}",
+        a.log_text()
+    );
+    let s = a.scrape();
+    assert_eq!(outcome(&s, "daemon", "tcp", "ok"), 0, "{s}");
+    assert_eq!(outcome(&s, "daemon", "tcp", "peer_id_mismatch"), 1, "{s}");
+    gate_ran("traversal_metrics::b142_bootstrap_peer_id_mismatch_refused");
+}

@@ -331,4 +331,7 @@ claim      PROBE-LAB sym=src/probe.rs::probe_target_decision accept=net_probe::p
 kani       PROBE-K   sym=src/probe.rs::probe_target_decision harness=proof_probe_target_requires_peer_id_and_direct cover=probe target allowed
 reach      PROBE-REACH sym=src/probe.rs::probe_target_decision from=src/cli/net.rs::run_probe
 
+# --- B-142 (v0.5.4): a bootstrap address's /p2p/ PeerId is enforced on the daemon's startup dial ---
+claim      B-142     sym=src/network/traversal_gate.rs::dial_peer_id_decision accept=traversal_metrics::b142_bootstrap_peer_id_matches_and_connects reject=traversal_metrics::b142_bootstrap_peer_id_mismatch_refused code=reject.dial_peer_id_mismatch bin=parvault ref=docs/security/TRUST_FINDINGS.md
+
 ratchet    R         open=2 waive=32

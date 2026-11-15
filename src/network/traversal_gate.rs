@@ -108,6 +108,20 @@ pub fn gate_addr_decision(
     lab_dial_decision(Some(&parsed), key.as_ref(), set)
 }
 
+/// B-142: a dial made for a PeerId (a bootstrap address ending in `/p2p/<id>`, the probe target)
+/// must end at that peer. The swarm refuses a connection that authenticates as another peer
+/// (`DialError::WrongPeerId`) because the dial named the expected PeerId; this decision names
+/// that refusal, and `TraversalGate` logs it on every swarm.
+pub fn dial_peer_id_decision(
+    expected: Option<&PeerId>,
+    obtained: &PeerId,
+) -> Result<(), &'static str> {
+    match expected {
+        Some(e) if e != obtained => Err("reject.dial_peer_id_mismatch"),
+        _ => Ok(()),
+    }
+}
+
 /// The error a refused dial carries (in `TransportError::Other` and in `ConnectionDenied`);
 /// NEW-3 classifies it as `denied`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,6 +325,16 @@ impl NetworkBehaviour for TraversalGate {
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm) {
+        if let FromSwarm::DialFailure(f) = &event {
+            if let libp2p::swarm::DialError::WrongPeerId { obtained, .. } = f.error {
+                if let Err(code) = dial_peer_id_decision(f.peer_id.as_ref(), obtained) {
+                    tracing::warn!(
+                        code,
+                        "refused a connection that authenticated as another peer than the one dialled"
+                    );
+                }
+            }
+        }
         let Some(c) = self.counters.clone() else {
             return;
         };
