@@ -28,7 +28,7 @@ Container Manager > Image > Add > Import from file, and pick `parvault-image-amd
 The daemon refuses to start until the node is in a ring. Over SSH on the NAS, create the data volume and do one of these with the same tag (the volume starts owned by `65532:65532`):
 
 ```sh
-IMG=parvault:0.5.3-dev   # the tag you imported
+IMG=parvault:0.5.4-dev   # the tag you imported
 # This NAS starts a new ring (the first node):
 sudo docker run --rm -v parvault-data:/var/lib/parvault "$IMG" --data-dir /var/lib/parvault wot init
 # Or it joins an existing ring: print its key, get a token from a member, install it.
