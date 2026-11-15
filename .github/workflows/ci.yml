@@ -192,8 +192,10 @@ jobs:
         run: bash scripts/check_no_runtime_deps.sh .
       - name: Client-side unit tests and golden IPC wire bytes under ipc-client alone
         run: cargo test --release --lib --no-default-features --features ipc-client
+      - name: Manifest selection is compile time only; no --all-features on a compiling command (L-16)
+        run: bash scripts/check_manifest_cfg.sh .
       - name: Check minimal headless build (--no-default-features, VFS excluded)
-        run: cargo check --no-default-features --features daemon-runtime --bin parvault --bin parvault-seed --bin parvault-sync
+        run: cargo check --no-default-features --features daemon-runtime,manifest-household-ring-v1 --bin parvault --bin parvault-seed --bin parvault-sync
       - name: Build binaries (parvault, parvault-seed, parvault-fuse, parvault-sync)
         run: bash scripts/build_bins.sh --profile release --out dist
       - name: Scalar-only erasure coding in the shipped binaries (L-102)

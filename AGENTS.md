@@ -44,6 +44,7 @@ This document is the authoritative architectural, security, and verification man
 | `src/router_nas.rs` | `RouterNasStatusServer`, `RouterNasLiveSnapshot`, `RouterNasPeerEntry`, `read_linux_process_memory_kib` (`VmRSS`/`VmHWM`). Zero-dependency embedded HTTP server serving `/api/v1/health`, `/api/v1/peers`, and responsive `< 6 KiB` HTML dashboard. | `ADR-21` |
 | `src/network/behaviour.rs` | `MeshNetworkBehaviour` (`Kademlia`, `Gossipsub`, `Toggle<mDNS>`, `Identify`, `Ping`, `RequestResponse`), <!-- metric:wire_request_variants -->24<!-- /metric -->-variant `MeshWireRequest` / `MeshWireResponse` (`RegisterWanRendezvous`, `LookupWanRendezvous`, `QueryNodeStatus`, and the storage, PoR, DHT, relay and governance RPCs), `BincodeWireCodec` (bounded `MAX_WIRE_FRAME_BYTES = 32 MiB`, 64 KiB initial reservation, `with_limit` pre-auth framing); re-exports `PlacementEngine` and `TokenBucketRateLimiter` from their own modules. | `ADR-06`, `ADR-08`, `ADR-23` |
 | `src/network/placement.rs` / `src/network/rate_limit.rs` | `PeerTopologyMetrics`, `ShardPlacementPlan`, `PlacementEngine` (70% Intra-ASN / 30% Cross-Region split); `TokenBucketRateLimiter`. | `ADR-06` |
+| `src/manifest/` | The compiled-in manifest (L-16 seam, `v0.5.5`): `trait Manifest` (`NAME`, `ID`, `type Admission`), `AdmissionPolicy` (`variant_enabled`, `is_admitted`, `admit`), `pub type Active` (exactly one `manifest-*` feature, else `compile_error!`), `manifest_variant_decision` (`reject.variant_disabled_by_manifest`), `WireKind`. `household_ring_v1.rs` (shipped; the `HandshakeWoT` and `AdmitPublicTicket` arms), `test_restricted.rs` (CI only). Compiled only under `daemon-runtime`; the name is printed by `--version` and local status, never sent on the wire. | `ADR-05`, `ADR-08` |
 | `src/network/wire_handler.rs` | `handle_mesh_wire_request`: every inbound `MeshWireRequest` for both the daemon and `parvault-seed`. Role differences are the `WireRolePolicy` hooks (`DaemonWirePolicy`, `SeedWirePolicy`); `admission_class` / `admit` and `shard_owner` are the single admission and shard-owner seams. Entry points `handle_daemon_wire_request` / `handle_seed_wire_request`. | `ADR-08` |
 | `src/network/server_events.rs` | `ServerSwarmEvents`: swarm event arms shared by the daemon and seed loops (connection bookkeeping, mDNS, request dispatch). | `ADR-08` |
 | `src/network/client.rs` | `MeshClient`, `parse_peer_multiaddr`, `is_network_peer_addr`, `resolve_zero_config_peers`, `register_wan_rendezvous`, `lookup_wan_rendezvous`. Maintains a persistent background `Swarm` worker connection pool, enforces `/p2p/<PeerId>` verification & TOFU `PeerId` pinning, dual Kademlia DHT + `ZeroTrustDhtStore` replication, live RTT & `QueryPeerStatus` telemetry in `PlacementEngine`, and 2-layer PQ onion relay routing. | `ADR-06`, `ADR-08`, `ADR-19`, `ADR-17`, `ADR-23`, `ADR-24` |
@@ -97,15 +98,17 @@ Every code change or PR **must** preserve these 7 invariants:
 | `vfs` (`ipc-client`) | lazy VFS, pure-Rust FUSE, WebDAV | `parvault-fuse` |
 | `status-ui` (`ipc-client`) | status page (`router_nas`) on the shared HTTP edge | `parvault-status` |
 | `daemon-runtime` (`ipc-client`, `status-ui`, tokio, libp2p) | the daemon: ring, storage engine, gateway server | `parvault`, `parvault-seed`, `parvault-bench` |
+| `manifest-household-ring-v1` | the compiled-in manifest (`src/manifest/`, L-16); exactly one `manifest-*` feature with `daemon-runtime`, else `compile_error!` | daemon-runtime binaries |
+| `manifest-test-restricted` | CI-only manifest that serves no credential arm; `scripts/build_bins.sh` refuses to ship it | CI job `manifest-test-restricted` |
 
-`default = ["daemon-runtime", "vfs", "status-ui"]`. Build release binaries with `scripts/build_bins.sh`, which gives each binary only its own features; `scripts/check_no_runtime_deps.sh` fails if tokio, libp2p, mio or quinn reach a plugin feature set. Erasure coding is scalar-only: there is no `simd-accel` feature, and `scripts/check_scalar_erasure_coding.sh` (CI, L-102) fails on the SIMD GF(2^8) kernel in a binary. A local-only daemon without tokio is not offered: the storage engine needs the ring client.
+`default = ["daemon-runtime", "vfs", "status-ui", "manifest-household-ring-v1"]`. `--all-features` enables two manifests and fails by design; no compiling command may use it (`cargo tree` may; `scripts/check_manifest_cfg.sh`, which also fails any `feature = "manifest-…"` cfg outside `src/manifest/mod.rs`). Build release binaries with `scripts/build_bins.sh`, which gives each binary only its own features; `scripts/check_no_runtime_deps.sh` fails if tokio, libp2p, mio or quinn reach a plugin feature set. Erasure coding is scalar-only: there is no `simd-accel` feature, and `scripts/check_scalar_erasure_coding.sh` (CI, L-102) fails on the SIMD GF(2^8) kernel in a binary. A local-only daemon without tokio is not offered: the storage engine needs the ring client.
 
 ### Rust Unit, Integration, Mathematical & Red-Team Suites
 ```bash
 # Check formatting, lints, and --no-default-features compilation
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo check --no-default-features --features daemon-runtime --bin parvault --bin parvault-seed --bin parvault-sync
+cargo check --no-default-features --features daemon-runtime,manifest-household-ring-v1 --bin parvault --bin parvault-seed --bin parvault-sync
 
 # Run all unit, integration, Stateright, TLA+ TLC, GatewayBus, VFS, GatewayFolderSync, and live localhost TCP P2P tests
 TLA2TOOLS_JAR=/root/tla2tools.jar cargo test --release
