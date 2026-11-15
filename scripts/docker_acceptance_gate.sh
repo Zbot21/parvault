@@ -753,7 +753,8 @@ docker run --rm --cap-add NET_ADMIN -e GATES_REQUIRE_REAL=1 -e PARVAULT_VFS_TTFB
 echo "Mounted MP4 gate verified: FUSE ${VFS_FUSE_RESULT}; WebDAV 206 PASS (plain and under netem)."
 
 echo "================================================================================"
-echo " PARVAULT v0.3.0 MULTI-CONTAINER & ROUTER-SOC DOCKER ACCEPTANCE SUMMARY"
+PARVAULT_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+echo " PARVAULT v${PARVAULT_VERSION} MULTI-CONTAINER & ROUTER-SOC DOCKER ACCEPTANCE SUMMARY"
 echo "================================================================================"
 echo " Base Image             : ${BASE_IMAGE}"
 echo " Containers Deployed    : 16 (1 parvault-seed + 11 daemon + 1 router-soc + 1 client + 1 invitee + 1 outsider)"
