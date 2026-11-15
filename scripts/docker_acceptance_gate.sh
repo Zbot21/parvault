@@ -149,7 +149,8 @@ assert_nonroot() {
             img="$(docker inspect -f '{{.Config.Image}}' "$c" 2>&1)" \
                 || { echo "ERROR: B-106: cannot inspect the waived container $c: $img"; exit 1; }
             caps="$(docker inspect -f '{{json .HostConfig.CapAdd}}' "$c")"
-            if [ "$img" != "$IMG_VFS" ] || [ "$caps" != '["SYS_ADMIN"]' ]; then
+            # Docker may report the capability with or without its CAP_ prefix.
+            if [ "$img" != "$IMG_VFS" ] || { [ "$caps" != '["SYS_ADMIN"]' ] && [ "$caps" != '["CAP_SYS_ADMIN"]' ]; }; then
                 echo "ERROR: B-106: waived container $c is not the FUSE harness (image $img, CapAdd $caps)"
                 exit 1
             fi
