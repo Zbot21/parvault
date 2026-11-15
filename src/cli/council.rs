@@ -97,7 +97,7 @@ pub(crate) fn run(
             anyhow::ensure!(public_mode, "council repin is for --public mode only");
             let new = parse_key(&admin_pubkey)?;
             anyhow::ensure!(new != [0u8; 32], "the admin key must not be all zero");
-            let mut store = parvault::network::KnownPeersStore::load(data_dir);
+            let mut store = parvault::network::KnownPeersStore::try_load(data_dir)?;
             let old = store.set_tracker_admin_pubkey(&tracker, new);
             store.save(data_dir)?;
             match old {

@@ -394,11 +394,13 @@ pub fn install_council_manifest(
 /// (`known_peers.json` and the legacy `pinned_tracker_admins.json`). The in-memory map of a
 /// running client is updated by its caller (`MeshClient::repin_tracker_admin_pubkey`).
 pub fn repin_tracker_admin(data_dir: &Path, old: [u8; 32], new: [u8; 32]) -> Result<(), String> {
-    let mut store = crate::network::KnownPeersStore::load(data_dir);
+    // Both stores load before either is written (B-52): a corrupt one fails the re-pin whole.
+    let legacy = legacy_pinned_admins(data_dir).map_err(str::to_string)?;
+    let mut store =
+        crate::network::KnownPeersStore::try_load(data_dir).map_err(|e| e.to_string())?;
     if store.repin_tracker_admin_pubkey(old, new) > 0 {
         store.save(data_dir).map_err(|e| e.to_string())?;
     }
-    let legacy = legacy_pinned_admins(data_dir);
     if legacy.contains(&old) {
         let mut out: Vec<String> = Vec::new();
         for pk in legacy {
@@ -427,12 +429,8 @@ pub fn repair_council_pins(data_dir: &Path) -> Result<Option<RePin>, String> {
     let Some(m) = load_council_manifest(data_dir) else {
         return Ok(None);
     };
-    let disk_pins = |d: &Path| {
-        let mut v = crate::network::KnownPeersStore::load(d).pinned_tracker_admin_pubkeys();
-        v.extend(legacy_pinned_admins(d));
-        v
-    };
-    let pins = disk_pins(data_dir);
+    let (mut pins, legacy) = disk_pins(data_dir).map_err(str::to_string)?;
+    pins.extend(legacy);
     if pins.contains(&m.scope_root) {
         return Ok(None);
     }
@@ -581,9 +579,19 @@ pub fn council_scope_root(
     if !public_mode {
         return genesis_pubkey;
     }
+    // B-52: a pin store that does not load resolves no root (no council, orders refused), never
+    // a fall-through to `extra_pinned` or another stored key.
+    let (pinned, legacy) = match disk_pins(data_dir) {
+        Ok(p) => p,
+        Err(code) => {
+            tracing::warn!(
+                code,
+                "no council scope root: a tracker pin store does not load"
+            );
+            return None;
+        }
+    };
     if let Some(m) = load_council_manifest(data_dir) {
-        let pinned = crate::network::KnownPeersStore::load(data_dir).pinned_tracker_admin_pubkeys();
-        let legacy = legacy_pinned_admins(data_dir);
         // A root of the installed chain still pinned (the installed one, or the one it was
         // re-rooted from while a crash-interrupted re-pin is pending; verdict change 7).
         if chain_roots(data_dir, &m)
@@ -593,28 +601,57 @@ pub fn council_scope_root(
             return Some(m.scope_root);
         }
     }
-    pinned_admin_root(data_dir).or_else(|| extra_pinned.first().copied())
+    pinned
+        .first()
+        .or(legacy.first())
+        .or(extra_pinned.first())
+        .copied()
 }
 
-fn legacy_pinned_admins(data_dir: &Path) -> Vec<[u8; 32]> {
-    std::fs::read_to_string(data_dir.join("pinned_tracker_admins.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
-        .unwrap_or_default()
+fn read_pin_file(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The legacy `pinned_tracker_admins.json` pins, failing closed (B-52): a file that exists but
+/// cannot be read or decoded is its reason code (`reject.tracker_pins_unreadable`), never an
+/// empty list that would let the scope root fall through to another key.
+fn legacy_pinned_admins(data_dir: &Path) -> Result<Vec<[u8; 32]>, &'static str> {
+    let list = crate::config::tracker_pins_load_decision(read_pin_file(
+        &data_dir.join("pinned_tracker_admins.json"),
+    ))?;
+    Ok(list
         .iter()
         .filter_map(|h| {
             let b = hex::decode(h.trim()).ok()?;
             <[u8; 32]>::try_from(b.as_slice()).ok()
         })
-        .collect()
+        .collect())
 }
 
-pub fn pinned_admin_root(data_dir: &Path) -> Option<[u8; 32]> {
-    crate::network::KnownPeersStore::load(data_dir)
-        .pinned_tracker_admin_pubkeys()
-        .first()
-        .copied()
-        .or_else(|| legacy_pinned_admins(data_dir).first().copied())
+/// Pins of `known_peers.json`, then of the legacy file.
+type DiskPins = (Vec<[u8; 32]>, Vec<[u8; 32]>);
+
+/// The pins of both on-disk stores (`known_peers.json` first, then the legacy file), failing
+/// closed on either with its reason code (`reject.known_peers_corrupt`,
+/// `reject.known_peers_unreadable`, `reject.tracker_pins_unreadable`).
+fn disk_pins(data_dir: &Path) -> Result<DiskPins, &'static str> {
+    let known = crate::network::discovery::known_peers_load_decision(read_pin_file(
+        &data_dir.join(crate::network::KnownPeersStore::FILE_NAME),
+    ))?
+    .unwrap_or_default()
+    .pinned_tracker_admin_pubkeys();
+    Ok((known, legacy_pinned_admins(data_dir)?))
+}
+
+/// The first pinned tracker admin key: `known_peers.json`'s order, else the legacy file. A pin
+/// store that does not load is an error, never "no pin" (B-52).
+pub fn pinned_admin_root(data_dir: &Path) -> Result<Option<[u8; 32]>, &'static str> {
+    let (known, legacy) = disk_pins(data_dir)?;
+    Ok(known.first().or(legacy.first()).copied())
 }
 
 #[cfg(test)]
@@ -1071,7 +1108,7 @@ mod tests {
             crate::network::KnownPeersStore::load(client.path()).pinned_tracker_admin_pubkeys(),
             vec![bk]
         );
-        assert_eq!(legacy_pinned_admins(client.path()), vec![bk]);
+        assert_eq!(legacy_pinned_admins(client.path()), Ok(vec![bk]));
         assert_eq!(council_scope_root(client.path(), None, true, &[]), Some(bk));
         // After the re-root, an A-signed epoch 4 never installs.
         let (root_a, _) = genesis_signed(&[2, 3, 4], 2);
@@ -1118,12 +1155,54 @@ mod tests {
         .unwrap();
         assert_eq!(council_scope_root(client.path(), None, true, &[]), Some(bk));
         assert_eq!(repair_council_pins(client.path()), Ok(Some((a, bk))));
-        assert_eq!(legacy_pinned_admins(client.path()), vec![bk]);
+        assert_eq!(legacy_pinned_admins(client.path()), Ok(vec![bk]));
         assert_eq!(
             crate::network::KnownPeersStore::load(client.path()).pinned_tracker_admin_pubkeys(),
             vec![bk]
         );
         assert_eq!(repair_council_pins(client.path()), Ok(None));
+    }
+
+    /// QA MED (B-52): a pin store that exists but does not load resolves no public scope root
+    /// (never a fall-through to `extra_pinned`), and a re-pin over it fails without writing.
+    #[test]
+    fn corrupt_pin_store_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("pinned_tracker_admins.json");
+        let known = dir.path().join(crate::network::KnownPeersStore::FILE_NAME);
+        // Accept side: a readable legacy file resolves its key ahead of `extra_pinned`.
+        std::fs::write(&legacy, format!("[\"{}\"]", hex::encode([3u8; 32]))).unwrap();
+        assert_eq!(
+            council_scope_root(dir.path(), None, true, &[[2; 32]]),
+            Some([3; 32])
+        );
+        assert_eq!(pinned_admin_root(dir.path()), Ok(Some([3; 32])));
+        // Reject side: the same file corrupt resolves nothing (it used to give [2; 32]).
+        std::fs::write(&legacy, b"{not json").unwrap();
+        assert_eq!(council_scope_root(dir.path(), None, true, &[[2; 32]]), None);
+        assert_eq!(
+            pinned_admin_root(dir.path()),
+            Err("reject.tracker_pins_unreadable")
+        );
+        assert_eq!(
+            repin_tracker_admin(dir.path(), [3; 32], [4; 32]),
+            Err("reject.tracker_pins_unreadable".to_string())
+        );
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"{not json");
+        // A corrupt known_peers.json fails closed the same way, even with a good legacy file.
+        std::fs::remove_file(&legacy).unwrap();
+        std::fs::write(&known, b"{\"peers\":").unwrap();
+        assert_eq!(council_scope_root(dir.path(), None, true, &[[2; 32]]), None);
+        assert_eq!(
+            pinned_admin_root(dir.path()),
+            Err("reject.known_peers_corrupt")
+        );
+        assert!(repair_council_pins(dir.path()).is_ok());
+        // Private mode reads no pin store.
+        assert_eq!(
+            council_scope_root(dir.path(), Some([1; 32]), false, &[]),
+            Some([1; 32])
+        );
     }
 
     // Cross-checked outside Rust (Python `cryptography`: HKDF-SHA256 seed derivation, Ed25519),

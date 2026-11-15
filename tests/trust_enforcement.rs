@@ -7980,3 +7980,24 @@ fn f53_private_reroot_refused() {
     );
     gate_ran("trust_enforcement::f53_private_reroot_refused");
 }
+
+/// QA MED (B-52, F-53 legacy pin store): a corrupt `pinned_tracker_admins.json` resolves no
+/// council scope root, so `parvault --public council install` is refused with the pin store's
+/// reason code instead of rooting on another key. Accept side: `f53_client` installs epoch 1
+/// with the same file readable.
+#[test]
+fn b52_corrupt_tracker_pins_council_install_refused() {
+    let (_root, dir, _reg, _log) = prepare("b52-council-pins");
+    std::fs::write(dir.join("pinned_tracker_admins.json"), b"{not json").unwrap();
+    let m1 = hex::encode(f53_legacy_epoch1().to_bytes());
+    let out = f53_council_cli(&dir, true, &["install", "--manifest", &m1]);
+    let text = combined(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("reject.tracker_pins_unreadable"), "{text}");
+    assert!(!dir.join("council_manifest.bin").exists());
+    assert_eq!(
+        std::fs::read(dir.join("pinned_tracker_admins.json")).unwrap(),
+        b"{not json"
+    );
+    gate_ran("trust_enforcement::b52_corrupt_tracker_pins_council_install_refused");
+}
