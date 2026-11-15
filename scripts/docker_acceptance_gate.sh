@@ -529,9 +529,10 @@ SOC_BIN_BYTES="$(stat -c%s /tmp/parvault-soc-bin)"
 SOC_BIN_MIB="$(awk "BEGIN {printf \"%.2f MiB\", ${SOC_BIN_BYTES}/1048576}")"
 echo "Stripped parvault (--profile soc, musl) binary size: ${SOC_BIN_MIB} (${SOC_BIN_BYTES} bytes)"
 echo "Total parvault:router-soc (FROM scratch) image size : ${ROUTER_SOC_IMAGE_SIZE}"
-# Metrics of record (docs/metrics.txt docker.*): exact unpacked bytes, and `docker save | gzip`.
-echo "metric docker.unpacked.bytes = $(docker image inspect -f '{{.Size}}' parvault:router-soc)"
-echo "metric docker.compressed.bytes = $(docker save parvault:router-soc | gzip -c | wc -c)"
+# Metrics of record (docs/metrics.txt docker.*): `docker images` disk usage (unpacked), and the
+# image's content size (compressed layers; `docker image inspect .Size` on the containerd store).
+echo "metric docker.unpacked = ${ROUTER_SOC_IMAGE_SIZE}"
+echo "metric docker.compressed.bytes = $(docker image inspect -f '{{.Size}}' parvault:router-soc)"
 
 # Start a live `parvault:router-soc` appliance container constrained to --memory=48m --memory-swap=48m
 # Item 3: the status page needs a read-only token; give the appliance a known gateway root key.
