@@ -573,7 +573,10 @@ fn spawn_swarm_worker(
                 let Ok(mut swarm) = build_mesh_client_swarm_gated(
                     keypair,
                     false,
-                    GateParams::for_set(Arc::clone(&gate.set)),
+                    GateParams::for_set(Arc::clone(&gate.set)).with_counters(
+                        crate::traversal_metrics::process_counters(),
+                        crate::traversal_metrics::Origin::Client,
+                    ),
                 ) else {
                     return;
                 };

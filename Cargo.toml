@@ -48,6 +48,10 @@ ipc-client = []
 vfs = ["ipc-client"]
 # The status page (router_nas) on the shared HTTP edge; the daemon and parvault-status link it.
 status-ui = ["ipc-client"]
+# Debug-only (v0.5.4, docs/METRICS.md): the unauthenticated `--lab-insecure-metrics` listener.
+# Not in `default`; a release build with it is a compile error, and shipped artifacts are
+# checked for it (scripts/check_no_insecure_metrics.sh).
+lab-insecure-metrics = ["daemon-runtime"]
 
 [package.metadata.kani]
 flags = { lib = true }

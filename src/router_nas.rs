@@ -16,6 +16,7 @@ use crate::http_edge::{
     status_host_allowed, EdgeSlots, EdgeVerifier, PresentedToken, StatusAuthFacts, StatusTransport,
     RESP_403, RESP_502, RESP_503, STATUS_401,
 };
+use crate::traversal_metrics::TraversalCounters;
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,6 +63,11 @@ fn parse_kib_field(s: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// The metrics route (`docs/METRICS.md`).
+pub const METRICS_PATH: &str = "/metrics";
+/// Prometheus text format 0.0.4.
+pub const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4";
+
 /// Most status connections served at once (item 3: the 33rd is dropped unanswered).
 pub const STATUS_MAX_CONNECTIONS: usize = 32;
 
@@ -106,6 +112,7 @@ impl RouterNasStatusServer {
         bind_addr: SocketAddr,
         bus: GatewayBus,
         verifier: EdgeVerifier,
+        counters: Option<Arc<TraversalCounters>>,
     ) -> io::Result<(SocketAddr, RouterNasServerHandle)> {
         let listener = TcpListener::bind(bind_addr)?;
         listener.set_nonblocking(true)?;
@@ -122,9 +129,16 @@ impl RouterNasStatusServer {
                             if stream.set_nonblocking(false).is_err() {
                                 continue;
                             }
-                            let (bus, verifier) = (bus.clone(), verifier.clone());
+                            let (bus, verifier, counters) =
+                                (bus.clone(), verifier.clone(), counters.clone());
                             spawn_edge_conn(stream, &slots, "parvault-status-http", move |s| {
-                                let _ = handle_status_conn(s, &bus, &verifier, local_addr);
+                                let _ = handle_status_conn(
+                                    s,
+                                    &bus,
+                                    &verifier,
+                                    local_addr,
+                                    counters.as_deref(),
+                                );
                             });
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -174,6 +188,7 @@ fn handle_status_conn(
     bus: &GatewayBus,
     verifier: &EdgeVerifier,
     bound: SocketAddr,
+    counters: Option<&TraversalCounters>,
 ) -> io::Result<()> {
     let Some(head) = read_request_head(stream)? else {
         return Ok(());
@@ -220,6 +235,9 @@ fn handle_status_conn(
         .unwrap_or_default();
     if let Err(code) = status_auth_decision(&facts) {
         tracing::warn!(code, peer = %peer, "refused a status request");
+        if let Some(c) = counters {
+            c.record_status_refused(code);
+        }
         stream.write_all(status_refusal(&facts))?;
         return stream.flush();
     }
@@ -230,6 +248,27 @@ fn handle_status_conn(
             "application/json",
             b"{\"error\":\"method not allowed\"}\n",
         );
+    }
+    // v0.5.4 NEW-3 (docs/METRICS.md): `/metrics` is served on the edge decision above alone. It
+    // skips `bus.query_status_sync`, so it does not get the gateway engine's second
+    // `status_auth_decision`: the counters are in this process, there is no snapshot to fetch
+    // and no engine to ask, and they carry less than `/api/v1/peers`. The sidecar has no
+    // counters and answers 404, after auth like every path.
+    if path == "/metrics" {
+        return match counters {
+            Some(c) => send_response(
+                stream,
+                "200 OK",
+                METRICS_CONTENT_TYPE,
+                c.render_prometheus().as_bytes(),
+            ),
+            None => send_response(
+                stream,
+                "404 Not Found",
+                "application/json",
+                b"{\"error\":\"not found\"}\n",
+            ),
+        };
     }
     let snap = match bus.query_status_sync(token.cloned()) {
         Ok(s) => s,

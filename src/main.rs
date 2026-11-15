@@ -348,6 +348,23 @@ async fn run(
     let trust_mode = eff.trust_mode;
     let public_mode = trust_mode.allows_public_commons();
     let deterministic = eff.deterministic();
+    if matches!(
+        cli.command,
+        Commands::Up { .. }
+            | Commands::Daemon {
+                action: DaemonAction::Start { .. }
+            }
+    ) {
+        // NEW-3: before any MeshClient exists, so every swarm of the daemon records into them.
+        parvault::traversal_metrics::install_process_counters(Arc::new(
+            parvault::traversal_metrics::TraversalCounters::new(
+                parvault::traversal_metrics::BuildInfo {
+                    profile: cfg.hardware_profile.as_str(),
+                    deterministic,
+                },
+            ),
+        ));
+    }
     if deterministic {
         // Before any MeshClient exists: every client in this process is gated.
         parvault::network::client::install_process_dial_set(

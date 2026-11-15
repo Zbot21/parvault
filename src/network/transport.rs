@@ -13,6 +13,9 @@ use std::time::Duration;
 pub struct GateParams {
     pub set: std::sync::Arc<crate::lab_dial::DialSet>,
     pub identify_cache: usize,
+    /// The NEW-3 counters this swarm records into, and which swarm it is.
+    pub counters: Option<std::sync::Arc<crate::traversal_metrics::TraversalCounters>>,
+    pub origin: crate::traversal_metrics::Origin,
 }
 
 impl GateParams {
@@ -21,6 +24,8 @@ impl GateParams {
         Self {
             set: std::sync::Arc::new(crate::lab_dial::DialSet::Open),
             identify_cache: IDENTIFY_DEFAULT_CACHE,
+            counters: None,
+            origin: crate::traversal_metrics::Origin::Daemon,
         }
     }
 
@@ -34,7 +39,20 @@ impl GateParams {
         Self {
             set,
             identify_cache,
+            counters: None,
+            origin: crate::traversal_metrics::Origin::Daemon,
         }
+    }
+
+    /// Records into `counters` as `origin`.
+    pub fn with_counters(
+        mut self,
+        counters: Option<std::sync::Arc<crate::traversal_metrics::TraversalCounters>>,
+        origin: crate::traversal_metrics::Origin,
+    ) -> Self {
+        self.counters = counters;
+        self.origin = origin;
+        self
     }
 }
 
@@ -199,7 +217,11 @@ fn construct_behaviour(
     );
 
     Ok(MeshNetworkBehaviour {
-        gate: crate::network::traversal_gate::TraversalGate::new(std::sync::Arc::clone(&gate.set)),
+        gate: crate::network::traversal_gate::TraversalGate::with_counters(
+            std::sync::Arc::clone(&gate.set),
+            gate.counters.clone(),
+            gate.origin,
+        ),
         kademlia,
         gossipsub,
         mdns,

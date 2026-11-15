@@ -107,11 +107,17 @@ pub(crate) async fn run_daemon(
     }
 
     server_events.set_dial_set(Arc::clone(&dial_set));
+    // NEW-3: main installed the counters before any client existed; the server swarm records as
+    // `daemon`, every MeshClient worker as `client`.
+    let counters = parvault::traversal_metrics::process_counters();
     let mut swarm = parvault::network::build_mesh_server_swarm_gated(
         keypair,
         cfg.enable_quic,
         opts.lan_discovery_enabled && !deterministic,
-        parvault::network::GateParams::for_set(Arc::clone(&dial_set)),
+        parvault::network::GateParams::for_set(Arc::clone(&dial_set)).with_counters(
+            counters.clone(),
+            parvault::traversal_metrics::Origin::Daemon,
+        ),
     )?;
     let tcp_addr: Multiaddr = cfg.listen_tcp.parse()?;
     swarm.listen_on(tcp_addr.clone())?;
@@ -194,6 +200,7 @@ pub(crate) async fn run_daemon(
                 sock_addr,
                 parvault::gateway::ipc::GatewayBus::in_process(Arc::clone(eng)),
                 parvault::http_edge::EdgeVerifier::RootKey(root_key),
+                parvault::traversal_metrics::process_counters(),
             )?;
             println!(
                 "[parvault] Embedded Status Server listening on http://{}",

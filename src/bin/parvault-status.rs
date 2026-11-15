@@ -70,6 +70,8 @@ fn main() -> anyhow::Result<()> {
         cli.listen,
         parvault::gateway::ipc::GatewayBus::unix_socket(&cli.socket),
         parvault::http_edge::EdgeVerifier::PinnedParent(pinned),
+        // The sidecar has no traversal counters: `/metrics` is 404 after auth.
+        None,
     )?;
     println!(
         "[parvault-status] Status Server listening on http://{bound} (gateway={})",

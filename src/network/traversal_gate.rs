@@ -10,9 +10,20 @@
 //!
 //! Both call the one pure decision, `lab_dial::lab_dial_decision`. Inbound connections are not
 //! restricted. Each refusal logs `warn!` once with its code and no address.
+//!
+//! `TraversalGate` also drives the NEW-3 counters (`docs/METRICS.md`): an attempt is one
+//! `handle_pending_outbound_connection` call, and its one outcome is labelled when the swarm
+//! reports `ConnectionEstablished` (dialer) or `DialFailure`. The connect-time histogram needs
+//! the attempt's start, which `FromSwarm::ConnectionEstablished` does not carry, so the gate
+//! keeps a `ConnectionId → Instant` map capped at `MAX_TIMED_DIALS`; a dial over the cap is
+//! counted in `parvault_traversal_timing_overflow_total` and not timed.
 
 use crate::lab_dial::{
     dial_addr_from_parts, lab_dial_decision, AddrPart, DialAddr, DialEntry, DialSet, LabIp, PeerKey,
+};
+use crate::traversal_metrics::{
+    ConnTransport, Direction, Origin, TransportKind, TraversalCounters, TraversalReason,
+    MAX_TIMED_DIALS,
 };
 use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::core::transport::{
@@ -25,9 +36,14 @@ use libp2p::swarm::{
     THandlerOutEvent, ToSwarm,
 };
 use libp2p::{Multiaddr, PeerId};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
+
+/// The peer-mismatch code of `lab_dial_decision` (NEW-3 maps it to `peer_id_mismatch`).
+pub const LAB_PEER_MISMATCH: &str = "reject.lab_dial_peer_mismatch";
 
 /// The components of `maddr`, as the shape check sees them.
 pub fn multiaddr_parts(maddr: &Multiaddr) -> Vec<AddrPart> {
@@ -175,11 +191,52 @@ pub type MeshTransport = libp2p::core::transport::Boxed<(PeerId, StreamMuxerBox)
 /// The swarm side of the gate (the first field of `MeshNetworkBehaviour`).
 pub struct TraversalGate {
     set: Arc<DialSet>,
+    counters: Option<Arc<TraversalCounters>>,
+    origin: Origin,
+    /// When each counted attempt started (A1), at most `MAX_TIMED_DIALS` entries.
+    pending: HashMap<ConnectionId, Instant>,
+}
+
+fn conn_transport(t: TransportKind) -> ConnTransport {
+    match t {
+        TransportKind::Quic => ConnTransport::Quic,
+        _ => ConnTransport::Tcp,
+    }
 }
 
 impl TraversalGate {
     pub fn new(set: Arc<DialSet>) -> Self {
-        Self { set }
+        Self::with_counters(set, None, Origin::Daemon)
+    }
+
+    pub fn with_counters(
+        set: Arc<DialSet>,
+        counters: Option<Arc<TraversalCounters>>,
+        origin: Origin,
+    ) -> Self {
+        Self {
+            set,
+            counters,
+            origin,
+            pending: HashMap::new(),
+        }
+    }
+
+    /// Dials currently timed (bounded by `MAX_TIMED_DIALS`).
+    pub fn timed_dials(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn record_attempt(&mut self, id: ConnectionId) {
+        let Some(c) = &self.counters else {
+            return;
+        };
+        c.record_attempt(self.origin);
+        if self.pending.len() < MAX_TIMED_DIALS {
+            self.pending.insert(id, Instant::now());
+        } else {
+            c.record_timing_overflow();
+        }
     }
 
     pub fn dial_set(&self) -> &DialSet {
@@ -209,6 +266,7 @@ impl NetworkBehaviour for TraversalGate {
         addresses: &[Multiaddr],
         _effective_role: Endpoint,
     ) -> Result<Vec<Multiaddr>, ConnectionDenied> {
+        self.record_attempt(_connection_id);
         if self.set.is_fixed() {
             if let Some(peer) = maybe_peer {
                 let key = peer_key(&peer);
@@ -252,7 +310,52 @@ impl NetworkBehaviour for TraversalGate {
         Ok(dummy::ConnectionHandler)
     }
 
-    fn on_swarm_event(&mut self, _event: FromSwarm) {}
+    fn on_swarm_event(&mut self, event: FromSwarm) {
+        let Some(c) = self.counters.clone() else {
+            return;
+        };
+        match event {
+            FromSwarm::ConnectionEstablished(e) => {
+                let (path, transport) = crate::network::traversal_classify::classify_addr(
+                    e.endpoint.get_remote_address(),
+                );
+                let ct = conn_transport(transport);
+                if e.endpoint.is_dialer() {
+                    // Only a counted attempt gets an outcome (a dial of another swarm task
+                    // never reaches this gate).
+                    let started = self.pending.remove(&e.connection_id);
+                    c.record_outcome(self.origin, path, transport, TraversalReason::Ok);
+                    if let Some(t0) = started {
+                        c.record_connect_time(path, ct, t0.elapsed());
+                    }
+                    c.conn_open(Direction::Outbound, path, ct);
+                } else {
+                    c.record_inbound(path, ct);
+                    c.conn_open(Direction::Inbound, path, ct);
+                }
+            }
+            FromSwarm::ConnectionClosed(e) => {
+                let (path, transport) = crate::network::traversal_classify::classify_addr(
+                    e.endpoint.get_remote_address(),
+                );
+                let dir = if e.endpoint.is_dialer() {
+                    Direction::Outbound
+                } else {
+                    Direction::Inbound
+                };
+                c.conn_close(dir, path, conn_transport(transport));
+            }
+            FromSwarm::DialFailure(f) => {
+                if let Some((path, transport, reason)) =
+                    crate::network::traversal_classify::classify_dial_error(f.error)
+                {
+                    self.pending.remove(&f.connection_id);
+                    c.record_outcome(self.origin, path, transport, reason);
+                }
+            }
+            _ => {}
+        }
+    }
 
     fn on_connection_handler_event(
         &mut self,

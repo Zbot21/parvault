@@ -7,6 +7,7 @@ pub mod placement;
 pub mod rate_limit;
 pub mod server_events;
 pub mod transport;
+pub mod traversal_classify;
 pub mod traversal_gate;
 pub mod wan_rendezvous;
 pub mod wire_handler;
