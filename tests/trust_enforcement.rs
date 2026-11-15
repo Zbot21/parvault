@@ -3753,6 +3753,107 @@ fn f55_unpersisted_nullifier_voucher_refused() {
     gate_ran("trust_enforcement::f55_unpersisted_nullifier_voucher_refused");
 }
 
+/// B-42 QA: a daemon started with `file` at `name` in its data directory (`None`: a directory
+/// there, so the file exists but cannot be read).
+fn spawn_daemon_with_state_file(label: &str, name: &str, file: Option<&[u8]>) -> Node {
+    let (root, dir, reg, log) = prepare(label);
+    match file {
+        Some(bytes) => std::fs::write(dir.join(name), bytes).unwrap(),
+        None => std::fs::create_dir_all(dir.join(name)).unwrap(),
+    }
+    spawn(daemon_command(&dir, &reg), root, dir, log)
+}
+
+fn valid_nullifier_ledger() -> Vec<u8> {
+    let entries: Vec<([u8; 32], u64)> = vec![([0x77; 32], now_ms() + 3_600_000)];
+    bincode::serialize(&entries).unwrap()
+}
+
+/// F-55 (B-42 QA) accept: a ledger file that loads keeps its spends and a new voucher is redeemed.
+#[test]
+fn f55_loaded_ledger_voucher_redeemed() {
+    let ledger = valid_nullifier_ledger();
+    let node = spawn_daemon_with_state_file("f55-la", "voucher_nullifiers.bin", Some(&ledger));
+    let sender = key(0xB5);
+    let b = blinded(0x5B, 512);
+    let resp = send(&sender, &node, blinded_put(&b, &sender));
+    assert!(format!("{resp:?}").contains("stored: true"), "{resp:?}");
+    gate_ran("trust_enforcement::f55_loaded_ledger_voucher_redeemed");
+}
+
+/// F-55 (B-42 QA) reject: the same put when the ledger file does not decode is refused; starting
+/// empty would make every recorded voucher redeemable again.
+#[test]
+fn f55_corrupt_ledger_voucher_refused() {
+    let node = spawn_daemon_with_state_file("f55-lc", "voucher_nullifiers.bin", Some(&[0xFF; 5]));
+    let sender = key(0xB5);
+    let b = blinded(0x5B, 512);
+    let resp = send(&sender, &node, blinded_put(&b, &sender));
+    assert!(format!("{resp:?}").contains("stored: false"), "{resp:?}");
+    assert_logged(&node, "reject.voucher_ledger_corrupt");
+    gate_ran("trust_enforcement::f55_corrupt_ledger_voucher_refused");
+}
+
+/// F-55 (B-42 QA) reject: the same put when the ledger file exists but cannot be read.
+#[test]
+fn f55_unreadable_ledger_voucher_refused() {
+    let node = spawn_daemon_with_state_file("f55-lu", "voucher_nullifiers.bin", None);
+    let sender = key(0xB5);
+    let b = blinded(0x5B, 512);
+    let resp = send(&sender, &node, blinded_put(&b, &sender));
+    assert!(format!("{resp:?}").contains("stored: false"), "{resp:?}");
+    assert_logged(&node, "reject.voucher_ledger_unreadable");
+    gate_ran("trust_enforcement::f55_unreadable_ledger_voucher_refused");
+}
+
+fn valid_quota_state() -> Vec<u8> {
+    let tmp = tempfile::tempdir().unwrap();
+    let q = parvault::storage::QuotaManager::with_persistence_dir(1 << 30, 1 << 20, tmp.path());
+    q.flush_persistence();
+    std::fs::read(tmp.path().join("quota_state.bin")).unwrap()
+}
+
+/// B-52 (QA) accept: a quota state file that loads; a peer's shard is stored.
+#[test]
+fn b52_loaded_quota_state_shard_stored() {
+    let state = valid_quota_state();
+    let node = spawn_daemon_with_state_file("b52-la", "quota_state.bin", Some(&state));
+    let (sid, bytes) = shard(0x41, 3000);
+    assert!(stored(&send(
+        &key(0xD3),
+        &node,
+        put_shard("", sid, bytes, None)
+    )));
+    gate_ran("trust_enforcement::b52_loaded_quota_state_shard_stored");
+}
+
+/// B-52 (QA) reject: the same shard when the quota state file does not decode is refused;
+/// starting empty would forget every peer's used quota.
+#[test]
+fn b52_corrupt_quota_state_shard_refused() {
+    let node = spawn_daemon_with_state_file("b52-lc", "quota_state.bin", Some(&[0xFF; 3]));
+    let (sid, bytes) = shard(0x41, 3000);
+    let resp = send(&key(0xD3), &node, put_shard("", sid, bytes, None));
+    assert!(!stored(&resp), "{resp:?}");
+    assert_logged(&node, "reject.quota_state_corrupt");
+    assert_eq!(
+        std::fs::read(node.dir.join("quota_state.bin")).unwrap(),
+        vec![0xFF; 3]
+    );
+    gate_ran("trust_enforcement::b52_corrupt_quota_state_shard_refused");
+}
+
+/// B-52 (QA) reject: the same shard when the quota state file exists but cannot be read.
+#[test]
+fn b52_unreadable_quota_state_shard_refused() {
+    let node = spawn_daemon_with_state_file("b52-lu", "quota_state.bin", None);
+    let (sid, bytes) = shard(0x41, 3000);
+    let resp = send(&key(0xD3), &node, put_shard("", sid, bytes, None));
+    assert!(!stored(&resp), "{resp:?}");
+    assert_logged(&node, "reject.quota_state_unreadable");
+    gate_ran("trust_enforcement::b52_unreadable_quota_state_shard_refused");
+}
+
 /// `evict --propagate` refuses when this node is not a member of its installed council (it has
 /// none here); the local eviction still applies.
 #[test]
