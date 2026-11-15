@@ -3,7 +3,7 @@
 > **No CS or math degree required.** If you know how to run a command in a terminal (or spin up a Docker container / Raspberry Pi), this guide will get your files backed up with **zero monthly cloud bills** and **zero trust** in anyone else's computer.
 
 > [!WARNING]
-> **Pre-release.** `v0.5.1` is a GitHub pre-release, not marked Latest. Install the binaries first with the pinned-version installer (Linux `x86_64` or `aarch64`; it checks `SHA256SUMS` and installs to `/usr/local/bin`, or `PARVAULT_INSTALL_DIR`): `curl --proto '=https' --tlsv1.2 -fsSL https://github.com/Zbot21/parvault/releases/download/v0.5.1/install.sh | sh`. Or build from source (`cargo build --release`, then put `target/release/parvault` and `target/release/parvault-seed` on your `PATH`). Multi-machine setups have been tested only in Docker and on one host, not on real router hardware. The limits are listed in the [README](README.md#known-limits-v050).
+> **Pre-release.** `v0.5.1` is a GitHub pre-release, not marked Latest. Install the binaries first with the pinned-version installer (Linux `x86_64` or `aarch64`; it checks `SHA256SUMS` and installs to `/usr/local/bin`, or `PARVAULT_INSTALL_DIR`): `curl --proto '=https' --tlsv1.2 -fsSL https://github.com/Zbot21/parvault/releases/download/v0.5.1/install.sh | sh`. Or build from source (`cargo build --release`, then put `target/release/parvault` and `target/release/parvault-seed` on your `PATH`). Multi-machine setups have been tested only in Docker and on one host, not on real router hardware. The limits are listed in the [README](README.md#known-limits-v052).
 
 ---
 
@@ -61,7 +61,7 @@ Neighborhood Cloud builds five binaries; this guide uses these two:
 
 ## 3. Zero-IP Home Network Quickstart (No IP Addresses Needed!)
 
-In `v0.5.0`, you **never have to look up or type IP addresses** on one home LAN. Nodes auto-discover each other on your home network via cryptographically signed beacons, pair in seconds with a 4-word code, and auto-heal if your router assigns a new DHCP address.
+In `v0.5.2`, you **never have to look up or type IP addresses** on one home LAN. Nodes auto-discover each other on your home network via cryptographically signed beacons, pair in seconds with a 4-word code, and auto-heal if your router assigns a new DHCP address.
 
 ```mermaid
 flowchart LR
@@ -100,7 +100,7 @@ This automatically starts:
 3. The **Embedded Status Dashboard** on `http://localhost:4080`,
 4. An active **4-word pairing code** (e.g. `shield-copper-alpine-matrix`).
 
-The status page needs a read-only token on every request (v0.5.0): run `parvault token mint --read-only` on the node, open `http://<node-ip>:4080`, and enter the token as the password (any user name), or send `Authorization: Bearer <token>` to `/api/v1/health`. The token goes only in that header, never in the URL: `?token=` is ignored and refused. Use an IP address or `localhost`, not a host name: DNS names are refused (DNS rebinding). Without `--status-http` there is no status listener.
+The status page needs a read-only token on every request (since v0.5.0): run `parvault token mint --read-only` on the node, open `http://<node-ip>:4080`, and enter the token as the password (any user name), or send `Authorization: Bearer <token>` to `/api/v1/health`. The token goes only in that header, never in the URL: `?token=` is ignored and refused. Use an IP address or `localhost`, not a host name: DNS names are refused (DNS rebinding). Without `--status-http` there is no status listener.
 
 ---
 
@@ -327,7 +327,7 @@ curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
 Clients that cannot send a Bearer token (Finder, davfs2, Windows) use any user name and the token as the password.
 
 > [!WARNING]
-> There is no TLS in `v0.5.0`. On loopback (`127.0.0.1`) nothing leaves the machine, but over a LAN the token travels **in clear** and anyone who sees it can read your vault until it expires. Keep `--ttl-secs` short. Built-in TLS is planned for `v0.6.0`.
+> There is no TLS in `v0.5.2`. On loopback (`127.0.0.1`) nothing leaves the machine, but over a LAN the token travels **in clear** and anyone who sees it can read your vault until it expires. Keep `--ttl-secs` short. Built-in TLS is planned for `v0.6.0`.
 
 **Windows:** its WebDAV client sends Basic auth over plain HTTP only after you allow it. In an administrator prompt run `reg add HKLM\SYSTEM\CurrentControlSet\Services\WebClient\Parameters /v BasicAuthLevel /t REG_DWORD /d 2 /f`, then restart the `WebClient` service (`net stop webclient && net start webclient`).
 
