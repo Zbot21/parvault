@@ -247,8 +247,10 @@ fn build_wan_card_with_stun_port(params: StunWanCardParams<'_>) -> anyhow::Resul
     )
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Parses the CLI and the config without a runtime, then builds the tokio runtime the hardware
+/// profile asks for (B-53): the router profile gets a bounded pool (`HardwareProfile::
+/// runtime_worker_threads`, `runtime_max_blocking_threads`); other profiles keep tokio's defaults.
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -263,7 +265,10 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let cfg = NodeConfig::load_for_cli(cli.config.as_ref(), cli.data_dir.as_deref(), cli.profile)?;
+    parvault::runtime::build_runtime(cfg.hardware_profile)?.block_on(run(cli, cfg))
+}
 
+async fn run(cli: Cli, cfg: NodeConfig) -> anyhow::Result<()> {
     let lan_port = cfg.effective_lan_discovery_port(cli.lan_discovery_port);
     let lan_enabled = cfg.effective_lan_discovery_enabled(cli.no_lan_discovery);
     let trust_mode = cfg.effective_trust_mode(cli.public, &cli.trackers);

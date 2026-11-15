@@ -6,8 +6,11 @@ hardware_profile = "router-soc"
 # Local persistent data directory (stored on attached USB drive, NVMe mount, or persistent overlay)
 data_dir = "/mnt/nas/.parvault-data"
 
-# P2P Listeners. `0.0.0.0` is only the fallback for a box with no uci: it includes the WAN, so
-# fw4 must drop WAN input on 4001. Pass `--listen /ip4/<LAN-IP>/tcp/4001` to bind the LAN only (B-54).
+# P2P Listeners (P2P TCP only). The procd service overrides this with `--listen` on the uci LAN
+# address (L-96). `0.0.0.0` is only the fallback for runs without uci: it includes the WAN, so
+# fw4 must drop WAN input on 4001; elsewhere pass `--listen /ip4/<LAN-IP>/tcp/4001` (B-54).
+# LAN discovery (UDP 4009) and libp2p mDNS (UDP 5353) listen on every interface; the status
+# page binds loopback (`status_http_bind` below).
 listen_tcp = "/ip4/0.0.0.0/tcp/4001"
 enable_quic = false
 listen_quic = "/ip4/0.0.0.0/udp/4001/quic-v1"

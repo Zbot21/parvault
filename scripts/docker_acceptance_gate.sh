@@ -595,7 +595,11 @@ docker rm -f parvault-soc-extract-${RUN_ID} >/dev/null
 SOC_BIN_BYTES="$(stat -c%s "$RUN_TMP/soc-bin")"
 SOC_BIN_MIB="$(awk "BEGIN {printf \"%.2f MiB\", ${SOC_BIN_BYTES}/1048576}")"
 echo "Stripped parvault (--profile soc, musl) binary size: ${SOC_BIN_MIB} (${SOC_BIN_BYTES} bytes)"
-echo "Total "$IMG_SOC" (FROM scratch) image size : ${ROUTER_SOC_IMAGE_SIZE}"
+echo "Total ${IMG_SOC} (FROM scratch) image size : ${ROUTER_SOC_IMAGE_SIZE}"
+# Metrics of record (docs/metrics.txt docker.*): `docker images` disk usage (unpacked), and the
+# image's content size (compressed layers; `docker image inspect .Size` on the containerd store).
+echo "metric docker.unpacked = ${ROUTER_SOC_IMAGE_SIZE}"
+echo "metric docker.compressed.bytes = $(docker image inspect -f '{{.Size}}' "$IMG_SOC")"
 
 # Start a live `"$IMG_SOC"` appliance container constrained to --memory=48m --memory-swap=48m
 # Item 3: the status page needs a read-only token; give the appliance a known gateway root key.
@@ -630,6 +634,15 @@ status_get() {
     ' sh "$1" "${2:-}" "${3:-}" || true
 }
 
+# soc_proc <tag>: the router daemon's VmRSS, VmHWM and thread count, read from the host's
+# /proc (the scratch image has no shell). Metrics of record for docs/metrics.txt.
+soc_proc() {
+    soc_pid="$(docker inspect -f '{{.State.Pid}}' parvault-router-soc-${RUN_ID})"
+    awk -v tag="$1" '/^(VmRSS|VmHWM|Threads):/ {
+        k = $1; sub(":", "", k); print "metric router_soc." tag "." k " = " $2 ($3 ? " " $3 : "")
+    }' "/proc/$soc_pid/status"
+}
+
 SOC_DAEMON_OOM="$(docker inspect -f '{{.State.OOMKilled}}' parvault-router-soc-${RUN_ID})"
 SOC_DAEMON_RUNNING="$(docker inspect -f '{{.State.Running}}' parvault-router-soc-${RUN_ID})"
 if [ "$SOC_DAEMON_OOM" != "false" ] || [ "$SOC_DAEMON_RUNNING" != "true" ]; then
@@ -647,6 +660,7 @@ fi
 SOC_HEALTH_JSON="$(status_get http://${NET_PREFIX}.60:4080/api/v1/health "$SOC_STATUS_TOKEN")"
 echo "parvault-router-soc-${RUN_ID} /api/v1/health: $SOC_HEALTH_JSON"
 echo "$SOC_HEALTH_JSON" | grep -Eq '"hardware_profile"[[:space:]]*:[[:space:]]*"router-soc"'
+soc_proc idle
 
 # Store and restore a multi-stripe (5 MiB = 5 x 1 MiB stripes) payload inside a 48 MiB cgroup container!
 docker volume rm -f "$SOC_VOL_NAME" >/dev/null 2>&1 || true
@@ -713,6 +727,7 @@ if [ "$SOC_DAEMON_OOM_AFTER" != "false" ]; then
     echo "ERROR: parvault-router-soc-${RUN_ID} daemon OOMKilled during multi-stripe transfer!"
     exit 1
 fi
+soc_proc after_transfer
 
 echo "=== [12b/12] parvault-status sidecar: no key, token-gated status over the gateway socket ==="
 SIDE_KEY="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"

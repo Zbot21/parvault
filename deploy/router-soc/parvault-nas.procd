@@ -9,36 +9,152 @@ USE_PROCD=1
 
 PROG=/usr/bin/parvault
 CONF=/etc/parvault/router.toml
+# The NAS disk mountpoint; the data directory lives on it and must match data_dir in $CONF.
+NAS=/mnt/nas
+DATA=$NAS/.parvault-data
+SVC_USER=parvault
+SVC_UID=4001
+
+fail() {
+    logger -t parvault-nas -p daemon.err "$*"
+    echo "parvault-nas: $*" >&2
+    return 1
+}
+
+# The filesystem type mounted at $NAS, empty when nothing is mounted there.
+nas_fstype() {
+    awk -v m="$NAS" '$2 == m { t = $3 } END { print t }' /proc/mounts
+}
+
+warn() {
+    logger -t parvault-nas -p daemon.warn "$*"
+    echo "parvault-nas: $*" >&2
+}
+
+# Succeeds when $1 is a dotted-quad IPv4 address that a listener can bind (not 0.x.x.x).
+is_ip4() {
+    local IFS=. o
+    case "$1" in
+        ""|*[!0-9.]*|.*|*.|*..*|0.*) return 1 ;;
+    esac
+    set -- $1
+    [ $# -eq 4 ] || return 1
+    for o; do
+        [ ${#o} -le 3 ] && [ "$o" -le 255 ] || return 1
+    done
+}
+
+# The first IPv4 address in a uci ipaddr value: a list, CIDR form allowed (192.168.1.1/24).
+# Fails when there is none, for example an IPv6-only value such as fd00::1/64.
+first_ip4() {
+    local a
+    for a in $1; do
+        a="${a%%/*}"
+        is_ip4 "$a" && { echo "$a"; return 0; }
+    done
+    return 1
+}
+
+# The P2P TCP listen multiaddr for a uci network.lan.ipaddr value ($1) and network.lan.proto
+# ($2): the LAN IPv4 address, so P2P TCP never binds the WAN (L-96, plan R3). With no usable
+# IPv4 address it binds loopback and logs why. Port 4001 matches listen_tcp in $CONF.
+listen_addr_for() {
+    local ip why
+    if ip="$(first_ip4 "$1")"; then
+        echo "/ip4/$ip/tcp/4001"
+        return 0
+    fi
+    if [ -n "$1" ]; then
+        why="network.lan.ipaddr ($1) has no IPv4 address"
+    elif [ "$2" = dhcp ]; then
+        why="LAN is a DHCP client (dumb AP: network.lan.proto=dhcp, no static network.lan.ipaddr)"
+    else
+        why="network.lan.ipaddr is unset"
+    fi
+    warn "$why; P2P listens on 127.0.0.1 only"
+    echo "/ip4/127.0.0.1/tcp/4001"
+}
+
+lan_listen_addr() {
+    listen_addr_for "$(uci -q get network.lan.ipaddr)" "$(uci -q get network.lan.proto)"
+}
+
+owner_of() {
+    ls -ld "$1" | awk '{print $3}'
+}
+
+# The first path under $1 (itself included) not owned by user $2, empty when all are. The walk
+# reads metadata only and stops at the first hit (head closes the pipe); busybox find has no
+# -quit. It runs at every start and reload, so a fully owned store is walked once per start.
+not_owned_by() {
+    find "$1" ! -user "$2" | head -n 1
+}
+
+# First-run step: the service user and its data directory, on the mounted NAS disk only. The
+# daemon writes its keys there on first start, as the service user (B-53). Supported
+# filesystems keep POSIX owners and modes: ext4, f2fs, btrfs, xfs. vfat, exfat and NTFS do not,
+# so the service refuses them rather than run with keys it cannot protect.
+init_service_user() {
+    local fstype
+    fstype="$(nas_fstype)"
+    [ -n "$fstype" ] || { fail "$NAS is not a mountpoint; mount the NAS disk first"; return 1; }
+    case "$fstype" in
+        vfat|msdos|exfat|ntfs|ntfs3|fuseblk)
+            fail "$NAS is $fstype, which has no POSIX owners; use ext4, f2fs, btrfs or xfs"
+            return 1 ;;
+    esac
+    group_exists "$SVC_USER" || group_add "$SVC_USER" "$SVC_UID"
+    user_exists "$SVC_USER" || user_add "$SVC_USER" "$SVC_UID" "$SVC_UID" "$SVC_USER" /var/empty
+    [ -d "$DATA" ] || mkdir -m 0700 "$DATA" || { fail "cannot create $DATA"; return 1; }
+    # Chown when any entry is not the service user's: a new directory, one a root-run release
+    # left behind, root-owned files from a root CLI run, or an interrupted first chown -R.
+    if [ -n "$(not_owned_by "$DATA" "$SVC_USER")" ]; then
+        chown -R "$SVC_USER:$SVC_USER" "$DATA" || { fail "cannot chown $DATA"; return 1; }
+        [ -z "$(not_owned_by "$DATA" "$SVC_USER")" ] || { fail "$DATA has entries chown could not change"; return 1; }
+    fi
+    chmod 0700 "$DATA"
+}
+
+# Restart when the NAS disk mounts after boot (a USB disk that hotplug mounts late), and reload
+# when the network config changes, so the listen address follows network.lan.ipaddr. The mount
+# trigger needs block-mount and a `config mount` entry with target /mnt/nas in /etc/config/fstab:
+# procd only watches mountpoints listed there.
+service_triggers() {
+    [ -n "$(procd_get_mountpoints "$NAS")" ] ||
+        warn "no fstab mount entry covers $NAS; a disk mounted after boot will not start the service"
+    procd_add_restart_mount_trigger "$NAS"
+    procd_add_reload_trigger network
+}
 
 start_service() {
-    # Ensure USB / NVMe mount directory exists
-    if [ ! -d /mnt/nas ]; then
-        mkdir -p /mnt/nas
+    init_service_user || return 1
+    # Refuse to start on a data directory the service user does not own (for example one on a
+    # read-only mount that chown could not change).
+    if [ "$(owner_of "$DATA")" != "$SVC_USER" ]; then
+        fail "$DATA is not owned by $SVC_USER; refusing to start"
+        return 1
     fi
 
     procd_open_instance
-    procd_set_param command "$PROG" up --profile router-soc --config "$CONF"
-    
-    # Automatic respawn policy: threshold 3600s, timeout 5s, retry 5 times
+    procd_set_param command "$PROG" up --profile router-soc --config "$CONF" \
+        --listen "$(lan_listen_addr)"
+    procd_set_param user "$SVC_USER"
+
+    # Respawn: threshold 3600 s, 5 s delay, 5 retries (procd needs all three values).
     procd_set_param respawn 3600 5 5
-    
-    # Process limits tuned for tiny router SoCs:
-    # Memory ceiling: 48 MiB address space (as) limit to prevent OOM panic on 128 MiB/256 MiB routers
-    # File descriptors: 1024
-    procd_set_param limits as=50331648 nofile=1024
-    
+    # procd sends TERM to this instance on stop, then KILL after term_timeout seconds.
+    procd_set_param term_timeout 10
+
+    # No address-space (`as`) limit: it counts every thread's reserved stack and the mapped
+    # binary, so a tokio daemon fails to start under it. The router runtime caps tokio's own
+    # threads (2 workers, 8 blocking; src/profile.rs), but the daemon also runs std threads
+    # outside it, so this is not a memory bound; see docs/metrics.txt for measured RSS.
+    # File descriptors: 1024.
+    procd_set_param limits nofile=1024
+
     # Forward stdout and stderr to logd / syslog
     procd_set_param stdout 1
     procd_set_param stderr 1
-    
+
     procd_close_instance
-}
-
-stop_service() {
-    killall -TERM parvault 2>/dev/null
-}
-
-reload_service() {
-    stop
-    start
 }

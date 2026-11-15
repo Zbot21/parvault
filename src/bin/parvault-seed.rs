@@ -1807,7 +1807,8 @@ async fn run_seed_listener_loop(cfg: SeedListenerConfig) -> anyhow::Result<()> {
     } else {
         PublicTrackerTakedownQueue::load_or_init(&data_dir)?
     };
-    let mut server_events = ServerSwarmEvents::new(false);
+    let mut server_events =
+        ServerSwarmEvents::new(false, parvault::network::server_events::MAX_INFLIGHT_RELAYS);
 
     let mut swarm =
         build_mesh_server_swarm(keypair, false, resolve_seed_lan_enabled(no_lan_discovery))?;

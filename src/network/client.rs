@@ -527,6 +527,20 @@ fn record_rtt_sample(
     }
 }
 
+/// Blocking-pool ceiling for the swarm worker's runtime, on every profile (B-53, D5). Its only
+/// blocking work is `lookup_host` in `resolve_peer_multiaddr_async`, which the worker awaits
+/// inline, one lookup at a time, so tokio's default of 512 threads is never needed; on
+/// `router-soc` it would sit outside the main runtime's cap (`src/profile.rs`).
+pub(crate) const SWARM_MAX_BLOCKING_THREADS: usize = 2;
+
+/// The swarm worker's runtime: current-thread, with its blocking pool capped.
+fn build_swarm_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(SWARM_MAX_BLOCKING_THREADS)
+        .build()
+}
+
 fn spawn_swarm_worker(
     identity: NodeIdentity,
     pinned_peers: Arc<Mutex<HashMap<String, PeerId>>>,
@@ -540,10 +554,7 @@ fn spawn_swarm_worker(
     std::thread::Builder::new()
         .name("parvault-mesh-client-swarm".to_string())
         .spawn(move || {
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
+            let Ok(rt) = build_swarm_runtime() else {
                 return;
             };
 
@@ -3282,6 +3293,39 @@ impl IpLocalityExt for IpAddr {
 
 #[cfg(test)]
 mod tests {
+    /// D5: the swarm runtime's blocking pool holds `SWARM_MAX_BLOCKING_THREADS` threads; one
+    /// more blocking task waits for a free thread instead of starting a new one.
+    #[test]
+    fn swarm_runtime_caps_blocking_pool() {
+        use std::sync::{Arc, Barrier};
+        let rt = super::build_swarm_runtime().expect("runtime");
+        rt.block_on(async {
+            let n = super::SWARM_MAX_BLOCKING_THREADS;
+            let release = Arc::new(Barrier::new(n + 1));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let held: Vec<_> = (0..n)
+                .map(|_| {
+                    let (tx, r) = (tx.clone(), release.clone());
+                    tokio::task::spawn_blocking(move || {
+                        let _ = tx.send(());
+                        r.wait();
+                    })
+                })
+                .collect();
+            for _ in 0..n {
+                rx.recv().await.expect("blocking task started");
+            }
+            let extra = tokio::task::spawn_blocking(|| 7u8);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(!extra.is_finished(), "a blocking task ran past the cap");
+            release.wait();
+            for h in held {
+                h.await.expect("join");
+            }
+            assert_eq!(extra.await.expect("join"), 7);
+        });
+    }
+
     use super::*;
 
     /// PQ-DHT: an owner that cannot be bound is refused; the F-10a binding is unchanged.

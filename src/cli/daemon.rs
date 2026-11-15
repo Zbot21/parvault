@@ -81,7 +81,10 @@ pub(crate) async fn run_daemon(
         WanRendezvousRegistry::load_or_new(Some(&cfg.data_dir.join("wan_rendezvous.bin")));
     let mut eviction = PrivacyPreservingEvictionEngine::load_or_init(&cfg.data_dir)?;
     let mut takedown_queue = PublicTrackerTakedownQueue::load_or_init(&cfg.data_dir)?;
-    let mut server_events = ServerSwarmEvents::new(true);
+    let mut server_events = ServerSwarmEvents::new(
+        true,
+        parvault::network::server_events::max_inflight_relays(cfg.hardware_profile),
+    );
 
     let mut swarm = build_mesh_server_swarm(keypair, cfg.enable_quic, opts.lan_discovery_enabled)?;
     let tcp_addr: Multiaddr = cfg.listen_tcp.parse()?;

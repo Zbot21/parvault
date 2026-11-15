@@ -60,7 +60,7 @@ flowchart TD
   - `parvault-seed`: **<!-- metric:size.parvault-seed.aarch64 -->`4.27 MiB`<!-- /metric -->** (<!-- metric:size.parvault-seed.aarch64.bytes -->`4,472,240 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-seed.x86_64 -->`5.48 MiB`<!-- /metric -->** (<!-- metric:size.parvault-seed.x86_64.bytes -->`5,750,760 B`<!-- /metric --> `x86_64`)
   - `parvault-fuse`: **<!-- metric:size.parvault-fuse.aarch64 -->`1.13 MiB`<!-- /metric -->** (<!-- metric:size.parvault-fuse.aarch64.bytes -->`1,185,456 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-fuse.x86_64 -->`1.24 MiB`<!-- /metric -->** (<!-- metric:size.parvault-fuse.x86_64.bytes -->`1,300,672 B`<!-- /metric --> `x86_64`)
   - `parvault-sync`: **<!-- metric:size.parvault-sync.aarch64 -->`0.69 MiB`<!-- /metric -->** (<!-- metric:size.parvault-sync.aarch64.bytes -->`725,264 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-sync.x86_64 -->`0.77 MiB`<!-- /metric -->** (<!-- metric:size.parvault-sync.x86_64.bytes -->`811,824 B`<!-- /metric --> `x86_64`) — zero-key incremental folder sync plugin (`GatewayFolderSync`)
-- **OCI / Docker `FROM scratch` container image (`parvault:router-soc`):** **<!-- metric:docker.unpacked -->`19.6 MB`<!-- /metric -->** total uncompressed disk usage (**<!-- metric:docker.compressed -->`6.13 MB`<!-- /metric -->** compressed content size, stripped binaries + `router.toml` configuration, 0 OS overhead).
+- **OCI / Docker `FROM scratch` container image (`parvault:router-soc`):** **<!-- metric:docker.unpacked -->`20.6 MB`<!-- /metric -->** total uncompressed disk usage (**<!-- metric:docker.compressed -->`6.48 MB`<!-- /metric -->** compressed content size, stripped binaries + `router.toml` configuration, 0 OS overhead).
 - **Minimum Free Disk Reserve (`min_free_disk_bytes`):**
   - `--profile router-soc`: `64 MiB` (`67,108,864` bytes), allowing deployment on small USB flash drives or flash partitions.
   - `--profile homelab-nas`: `1 GiB` (`1,073,741,824` bytes).
@@ -303,54 +303,17 @@ max_connections = 24 # not applied in v0.5.x: no swarm connection limit yet (B-6
 ```
 
 ### Procd Service Script (`/etc/init.d/parvault-nas`)
-Copy `deploy/router-soc/parvault-nas.procd` to `/etc/init.d/parvault-nas` and make it executable (`chmod +x /etc/init.d/parvault-nas`):
+Copy `deploy/router-soc/parvault-nas.procd` to `/etc/init.d/parvault-nas` and make it executable (`chmod +x /etc/init.d/parvault-nas`). The script:
 
-```sh
-#!/bin/sh /etc/rc.common
-# /etc/init.d/parvault-nas — ParVault Router Cloud-NAS procd service
-# START=95 starts after network, storage mounts (/mnt/nas), and firewall
-# STOP=10
+- refuses to start, with a `logread` line, unless `/mnt/nas` is a mountpoint (so the data directory is never written to flash) on a filesystem with POSIX owners: ext4, f2fs, btrfs or xfs. vfat, exfat and NTFS are not supported; format the NAS disk as ext4;
+- creates the `parvault` user and group (uid and gid `4001`) on first start, creates `/mnt/nas/.parvault-data` (`0700`), and chowns it to that user when any entry in it is not that user's (a new directory, one a root-run release left behind, root-owned files from a root CLI run, or an interrupted first chown). The check walks the store's metadata at every start and stops at the first such entry. It refuses to start if chown leaves any entry behind;
+- runs `parvault up --profile router-soc --config /etc/parvault/router.toml --listen /ip4/<LAN-IP>/tcp/4001` as `parvault`, not root. `<LAN-IP>` is the first IPv4 address in uci `network.lan.ipaddr`, so P2P TCP never listens on the WAN. If there is none (unset, IPv6 only such as `fd00::1/64`, or a dumb AP with `proto dhcp` and no static address) the daemon listens on `127.0.0.1` and the script logs why. Only P2P TCP is scoped this way: LAN discovery on UDP `4009` (`INADDR_ANY`) and libp2p mDNS (UDP `5353`) still listen on every interface, the WAN included, so block them on the WAN zone in the firewall. The status page binds loopback (`status_http_bind = "127.0.0.1:4080"` in `router.toml`, B-54); to reach it from the LAN, pass `--status-http <LAN-IP>:4080` (see the status-page rule below). The `0.0.0.0` in `listen_tcp` in `router.toml` is only the fallback for runs without uci (ports `4001`, `4009` and `4080` need no root); the daemon writes its keys on first start, so no separate `parvault init` is needed;
+- restarts when the NAS disk mounts (`procd_add_restart_mount_trigger /mnt/nas`), so a USB disk that hotplug-mounts after boot starts the service, and reloads when the network config changes (`procd_add_reload_trigger network`), so the listen address follows `network.lan.ipaddr`. procd watches only mountpoints listed in `/etc/config/fstab` (package `block-mount`): add a `config mount` section with `option target '/mnt/nas'`. Without one the script logs that a late disk will not start the service;
+- sets `respawn 3600 5 5` (threshold, delay, retries; procd needs all three) and `term_timeout 10`;
+- sets only `limits nofile=1024`. There is no address-space (`as`) limit: it counts every thread's reserved stack and the mapped binary, so a tokio daemon cannot start under 48 MiB of it. The router profile caps tokio's threads: 2 workers and at most 8 blocking threads (`HardwareProfile::runtime_worker_threads`, `runtime_max_blocking_threads` in `src/profile.rs`), with at most 4 relay forwards in flight so relays leave blocking threads for owner work. The mesh client runs its own current-thread tokio runtime, whose blocking pool (it serves only `lookup_host`, one lookup at a time) is capped at 2 threads on every profile (`SWARM_MAX_BLOCKING_THREADS` in `src/network/client.rs`). This is not a memory bound: the daemon also runs threads outside tokio (gateway lanes, the mesh client's swarm thread, the HTTP edge, the status page, discovery). In the Docker gate's 48 MiB container the router daemon, idle on the ring and so not an upper bound, measured <!-- metric:docker.live_rss -->`8.36 MiB`<!-- /metric --> RSS, <!-- metric:router_soc.daemon_peak_vmhwm -->`9.38 MiB`<!-- /metric --> peak, and <!-- metric:router_soc.daemon_threads -->`6`<!-- /metric --> threads (provenance in `docs/metrics.txt`; a loaded daemon runs more threads);
+- has no `stop_service`: procd sends `TERM` to its own instance, so a CLI `parvault` run on the box is not killed.
 
-START=95
-STOP=10
-USE_PROCD=1
-
-PROG=/usr/bin/parvault
-CONF=/etc/parvault/router.toml
-
-start_service() {
-    # Ensure USB / NVMe mount directory exists
-    if [ ! -d /mnt/nas ]; then
-        mkdir -p /mnt/nas
-    fi
-
-    procd_open_instance
-    procd_set_param command "$PROG" up --profile router-soc --config "$CONF"
-    
-    # Automatic respawn policy: threshold 3600s, timeout 5s, retry 5 times
-    procd_set_param respawn 3600 5 5
-    
-    # Process limits tuned for tiny router SoCs:
-    # Memory ceiling: 48 MiB address space (as) limit to prevent OOM panic
-    # File descriptors: 1024
-    procd_set_param limits as=50331648 nofile=1024
-    
-    # Forward stdout and stderr to logd / syslog
-    procd_set_param stdout 1
-    procd_set_param stderr 1
-    
-    procd_close_instance
-}
-
-stop_service() {
-    killall -TERM parvault 2>/dev/null
-}
-
-reload_service() {
-    stop
-    start
-}
-```
+`scripts/install.sh` installs to `/usr/bin` when `/etc/openwrt_release` exists, which is where the script runs the binary.
 
 Enable and start the service:
 ```bash
@@ -361,7 +324,7 @@ Enable and start the service:
 Check service status and memory:
 ```bash
 /etc/init.d/parvault-nas status
-cat /proc/$(pgrep parvault)/status | grep -E "VmRSS|VmHWM"
+cat /proc/$(pgrep -u parvault parvault)/status | grep -E "VmRSS|VmHWM|Threads"
 ```
 
 ---
