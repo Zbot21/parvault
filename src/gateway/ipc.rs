@@ -5,9 +5,8 @@
 //! `parvault-isp-agent`) over `/var/run/parvault.sock` using `Serde-Bincode` control frames and
 //! kernel `memfd_create(2)` file descriptors passed via `SCM_RIGHTS` ancillary messages.
 //!
-//! Modelled in `specs/ParVaultGatewayPluginBus.tla`: every `IpcCommand` variant is an action there
-//! (enforcement line `E-IPC` checks it). Not a `Formal model:` line, which the gate reserves for
-//! files holding a guard.
+//! Formal model: `specs/ParVaultGatewayPluginBus.tla` (every `IpcCommand` variant is an action
+//! there; enforcement line `E-IPC` checks it).
 //!
 //! ### Memory & Safety Invariants
 //! - **Zero `unsafe` in `gateway`**: All `memfd_create` / `SCM_RIGHTS` syscalls delegate to minimal

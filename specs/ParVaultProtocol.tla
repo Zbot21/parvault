@@ -39,7 +39,7 @@ Leaf == "leaf"
 Witnesses == {"w1", "w2"}
 AdvKeys == {"adv1", "adv2"}
 \* `MIN_WITNESS_SIGNATURES_FOR_REPAIR` in `src/por/verifier.rs`.
-ASSUME AdvKeys \cap ({Owner, Genesis, Self} \cup Witnesses) = {}   \* @assume adversary-holds-no-honest-key
+ASSUME AdvKeys \cap ({Owner, Genesis, Self} \cup Witnesses) = {}   \* @assume adversary-holds-no-honest-key: threat model; the adversary holds no owner, genesis, self or witness signing key (forging one is outside the model)
 
 \* The guards: each compares a presented credential with honest state, and is used by both the
 \* adversary's attempts (it fails) and the honest access (it passes).

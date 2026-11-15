@@ -1,6 +1,8 @@
 //! Gateway IPC server: the socket listener, per-connection loop and command dispatch onto
 //! `GatewayEngine` (`daemon-runtime`). Split from `gateway::ipc` in item 3; `gateway::ipc`
 //! re-exports `GatewayIpcServer` and `GatewayIpcServerHandle`.
+//!
+//! Formal model: `specs/ParVaultGatewayPluginBus.tla` (the dispatch actions it maps here).
 
 use crate::crypto::MasterKey;
 use crate::gateway::engine::GatewayEngine;

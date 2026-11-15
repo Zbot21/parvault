@@ -52,7 +52,7 @@ ASSUME
     /\ HonestCouncil \cap ByzantineCouncil = {}
     /\ StrangerSigners \cap Council = {}
     /\ HomelabOwner \notin AllSigners
-    /\ Cardinality(ByzantineCouncil) <= QuorumM - 1   \* @assume byzantine-below-quorum (which of them are corrupt is chosen in Init)
+    /\ Cardinality(ByzantineCouncil) <= QuorumM - 1   \* @assume byzantine-below-quorum: threat model; fewer than QuorumM council members are Byzantine (which of them is chosen in Init)
     /\ Cardinality(HonestCouncil) >= QuorumM
     /\ MaxNonces >= 2
     /\ MaxCouncilEpoch >= 2
@@ -209,8 +209,8 @@ CouncilStep ==
 Init ==
     \* Zero-Private-Key-On-VPS: VPS disk holds transport & per-node HMAC keys ONLY;
     \* ZERO Council private keys (`PrivKey(c)`) exist on the VPS filesystem.
-    \* @structural no-admin-key-persist: a seed given `--admin-rpc-pubkey` writes no admin key to its disk
-    \* @structural no-admin-key-persist: holds by construction; traced to test trust_enforcement::admin_key_never_persisted_on_seed
+    \* @structural no-admin-key-persist: a seed given `--admin-rpc-pubkey` writes no admin key to its disk;
+    \* holds by construction; traced to test trust_enforcement::admin_key_never_persisted_on_seed
     \* That test covers the explicit-key case only. A persistent seed started WITHOUT
     \* `--admin-rpc-pubkey` generates `tracker_admin.seed` on its disk (parvault-seed.rs,
     \* load_or_generate_tracker_admin_identity) and roots its council on that key: F-53, outside
