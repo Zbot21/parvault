@@ -340,7 +340,7 @@ pub(crate) async fn run_daemon(
 
     // B-59 (F-06): the chunk-audit loop, off without a master key or with `--no-audit`. Each
     // audit runs on the blocking pool, at most one in flight.
-    let auditor = audit_job_ctx(&cfg, &block_store, &node_identity);
+    let auditor = audit_job_ctx(&cfg, &block_store, &node_identity, opts.trust_mode);
     let audit_cfg = parvault::por::auditor::AuditorConfig::from_node_config(&cfg);
     let mut audit_interval = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_millis(audit_cfg.first_delay_ms()),
@@ -800,6 +800,7 @@ fn audit_job_ctx(
     cfg: &NodeConfig,
     block_store: &BlockStore,
     node_identity: &NodeIdentity,
+    trust_mode: TrustPoolMode,
 ) -> Option<parvault::por::auditor::AuditJobCtx> {
     if !cfg.por_audit_enabled {
         info!("audits: off (--no-audit)");
@@ -841,5 +842,18 @@ fn audit_job_ctx(
             parvault::por::auditor::AuditorState::load(&cfg.data_dir),
         )),
         data_dir: Some(cfg.data_dir.clone()),
+        // B-113 (D-45 Q4): relocation probes in private-ring mode only.
+        relocate: (trust_mode == TrustPoolMode::PrivateRing).then(|| {
+            parvault::por::auditor::RelocationView {
+                data_dir: cfg.data_dir.clone(),
+                genesis: parvault::network::admission::server_ring_genesis(
+                    &cfg.data_dir,
+                    cfg.genesis_root_pubkey_hex.as_deref(),
+                    false,
+                )
+                .ok()
+                .flatten(),
+            }
+        }),
     })
 }

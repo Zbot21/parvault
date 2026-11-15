@@ -1633,3 +1633,28 @@ fn proof_grant_replace_witness_superset() {
     let superset = !has_old || (0..n_old).all(|i| named(&old[i]));
     assert_eq!(decision.is_ok(), superset);
 }
+
+/// B59-RELOCATE (A-113 C5): a probe answer is recorded as a relocation only when every fact
+/// holds: a verified proof, from another node that is an admitted member, inside the RTT
+/// bound, with room in the map.
+#[kani::proof]
+fn proof_relocation_accept_decision() {
+    use crate::por::auditor::{relocation_accept_decision, RelocationFacts};
+    let f = RelocationFacts {
+        proof_verified: kani::any(),
+        prover_is_self: kani::any(),
+        prover_admitted: kani::any(),
+        rtt_ok: kani::any(),
+        map_full: kani::any(),
+    };
+    let decision = relocation_accept_decision(&f);
+    kani::cover!(
+        decision.is_err() && f.proof_verified && !f.prover_admitted,
+        "verified proof from a non-member refused"
+    );
+    kani::cover!(decision.is_ok(), "relocation accepted");
+    assert_eq!(
+        decision.is_ok(),
+        f.proof_verified && !f.prover_is_self && f.prover_admitted && f.rtt_ok && !f.map_full
+    );
+}

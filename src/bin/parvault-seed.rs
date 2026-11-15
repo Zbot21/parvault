@@ -621,6 +621,7 @@ async fn main() -> anyhow::Result<()> {
                 None => server,
             };
             let lite_index_flush = lite_index.clone();
+            let private_ring = server.mode() == SeedServerMode::HomelabRedundancyVault;
             let auditor = lite_index.and_then(|index| {
                 seed_audit_ctx(SeedAuditOpts {
                     no_audit,
@@ -630,6 +631,7 @@ async fn main() -> anyhow::Result<()> {
                     node_identity: &node_identity,
                     index,
                     data_dir: (!in_memory_mode).then(|| data_dir.clone()),
+                    private_ring,
                 })
             });
 
@@ -1760,6 +1762,9 @@ struct SeedAuditOpts<'a> {
     node_identity: &'a NodeIdentity,
     index: std::sync::Arc<std::sync::Mutex<LiteAuditIndex>>,
     data_dir: Option<PathBuf>,
+    /// B-113 (D-45 Q4, A-113 C10): `homelab-vault` serves a private ring; relocation probes
+    /// run only then.
+    private_ring: bool,
 }
 
 /// F-06 seed half: the auditor's context, or `None` (logged) with `--no-audit` or no network
@@ -1797,6 +1802,15 @@ fn seed_audit_ctx(o: SeedAuditOpts<'_>) -> Option<AuditJobCtx> {
         self_device_ids: vec![o.node_identity.device_peer_id()],
         cfg,
         state: std::sync::Arc::new(std::sync::Mutex::new(state)),
+        relocate: match (&o.data_dir, o.private_ring) {
+            (Some(d), true) => Some(parvault::por::auditor::RelocationView {
+                data_dir: d.clone(),
+                genesis: parvault::network::admission::server_ring_genesis(d, None, false)
+                    .ok()
+                    .flatten(),
+            }),
+            _ => None,
+        },
         data_dir: o.data_dir,
     })
 }

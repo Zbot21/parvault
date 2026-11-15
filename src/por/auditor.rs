@@ -46,6 +46,16 @@ pub const MANIFESTS_PER_TICK: usize = 4;
 pub const MAX_AUDIT_STATE_ENTRIES: usize = 4_096;
 /// Delay before an unanswered audit is retried once.
 pub const AUDIT_RETRY_DELAY_MS: u64 = 60_000;
+/// B-113 relocation (A-113 C5): ring endpoints one probe round tries at most.
+pub const MAX_RELOCATE_CANDIDATES: usize = 16;
+/// Probe rounds per shard, in all (persisted; a dropped relocation keeps the count, C11).
+pub const MAX_RELOCATE_ROUNDS: u32 = 3;
+/// The backoff between rounds doubles from one audit interval up to this many.
+pub const MAX_RELOCATE_BACKOFF_INTERVALS: u32 = 8;
+/// Consecutive unanswered audits of a host before its shards are probed for elsewhere.
+pub const RELOCATE_AFTER_UNANSWERED: u32 = 2;
+/// Consecutive unanswered audits after which a relocation entry is dropped.
+pub const RELOCATION_DROP_AFTER_UNANSWERED: u32 = 3;
 /// The auditor's state file in the data dir (JSON with a version header, written atomically).
 pub const AUDIT_STATE_FILE: &str = "por_audit_state.json";
 const AUDIT_STATE_VERSION: u32 = 1;
@@ -126,6 +136,100 @@ pub struct AuditorState {
     /// from the lite index at each scan; a separate count from unauditable and unanswered).
     #[serde(default)]
     pub unwitnessed: u64,
+    /// B-113: consecutive unanswered audits per host address (bounded).
+    #[serde(default)]
+    pub host_misses: BTreeMap<String, u32>,
+    /// B-113: shard file key -> the host a verified probe found it on (bounded). Preferred over
+    /// the manifest's or the lite index's host.
+    #[serde(default)]
+    pub relocations: BTreeMap<String, Relocation>,
+    /// B-113: shard file key -> its probe state (rounds and backoff survive a dropped
+    /// relocation, C11; bounded).
+    #[serde(default)]
+    pub probes: BTreeMap<String, RelocateProbe>,
+    /// The last scan's stripe -> assigned hosts (RAM only).
+    #[serde(skip)]
+    last_assigned: BTreeMap<[u8; 32], Vec<String>>,
+}
+
+/// Where a handed-off shard was found (A-113 C5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Relocation {
+    pub host_addr: String,
+    /// The Noise-authenticated device id that proved it; later audits count only its answers.
+    pub device_id: String,
+    pub accepted_ms: u64,
+    /// Consecutive unanswered audits at this host.
+    pub unanswered: u32,
+}
+
+/// The relocation probe of one shard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelocateProbe {
+    /// The shard, with the host it was assigned to.
+    pub target: AuditTarget,
+    /// The stripe's assigned hosts (never probed).
+    pub exclude: Vec<String>,
+    /// Rounds finished.
+    pub rounds: u32,
+    /// Next candidate in the current round.
+    pub cursor: u32,
+    /// Audit intervals to wait after the next round (1, 2, 4, 8).
+    pub backoff: u32,
+    pub next_due_ms: u64,
+}
+
+/// What [`relocation_accept_decision`] knows about one probe answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelocationFacts {
+    /// The chunk proof verified against the owner's chunk root (fresh OS-RNG challenge).
+    pub proof_verified: bool,
+    /// The prover is this node.
+    pub prover_is_self: bool,
+    /// The prover is an admitted ring member here (this node's ring registry or a paired peer).
+    pub prover_admitted: bool,
+    /// The answer came back inside the audit's RTT bound.
+    pub rtt_ok: bool,
+    /// The relocation map is full.
+    pub map_full: bool,
+}
+
+/// B59-RELOCATE (A-113 C5): a probe answer moves a shard's audits to a new host only if it is
+/// a verified chunk proof, from another node, an admitted ring member, inside the RTT bound,
+/// with room in the map.
+pub fn relocation_accept_decision(f: &RelocationFacts) -> Result<(), &'static str> {
+    if f.proof_verified && !f.prover_is_self && f.prover_admitted && f.rtt_ok && !f.map_full {
+        Ok(())
+    } else {
+        Err("reject.relocation_unproven")
+    }
+}
+
+/// Ring membership as this node sees it, read from its data dir at accept time (rare): the
+/// persisted ring registry (`wot_state.bin`) or a paired peer (`known_peers.json`). Present
+/// only in private-ring mode (D-45 Q4, A-113 C10), so it is also the mode gate.
+#[derive(Debug, Clone)]
+pub struct RelocationView {
+    pub data_dir: PathBuf,
+    pub genesis: Option<[u8; 32]>,
+}
+
+impl RelocationView {
+    /// Whether the libp2p peer id `peer_id` is an admitted member.
+    pub fn is_member(&self, peer_id: &str) -> bool {
+        let paired = crate::network::discovery::KnownPeersStore::load(&self.data_dir)
+            .multiaddr_for_peer_id(peer_id)
+            .is_some();
+        paired
+            || NodeConfig::extract_ed25519_pubkey_from_peer_str(peer_id).is_some_and(|pk| {
+                crate::network::wot::WebOfTrustRegistry::with_persistence_dir(
+                    self.genesis,
+                    crate::network::wot::DEFAULT_SUBTREE_SLASH_LIMIT,
+                    &self.data_dir,
+                )
+                .is_peer_trusted(&pk)
+            })
+    }
 }
 
 impl AuditorState {
@@ -193,6 +297,8 @@ pub struct AuditJobCtx {
     pub state: Arc<Mutex<AuditorState>>,
     /// Where the state file goes; `None` keeps it in RAM (`parvault-seed --no-fs`).
     pub data_dir: Option<PathBuf>,
+    /// B-113: relocation probing, on only in private-ring mode (both audit sources, C10).
+    pub relocate: Option<RelocationView>,
 }
 
 /// What one job did.
@@ -339,8 +445,22 @@ fn pick_target(ctx: &AuditJobCtx, now: u64) -> Option<AuditTarget> {
             return None;
         }
     }
-    let (targets, unauditable, unwitnessed) = scan_targets(ctx);
+    let (mut targets, unauditable, unwitnessed) = scan_targets(ctx);
     let mut st = ctx.state.lock().ok()?;
+    // B-113: the stripe's assigned hosts, before relocations replace them (never probed).
+    let mut assigned: BTreeMap<[u8; 32], Vec<String>> = BTreeMap::new();
+    for t in &targets {
+        assigned
+            .entry(t.shard_id.stripe_merkle_root)
+            .or_default()
+            .push(t.host_addr.clone());
+    }
+    for t in &mut targets {
+        if let Some(r) = st.relocations.get(&t.shard_id.file_key()) {
+            t.host_addr = r.host_addr.clone();
+        }
+    }
+    st.last_assigned = assigned;
     st.unauditable = st.unauditable.saturating_add(unauditable);
     if let Some(n) = unwitnessed {
         if st.unwitnessed != n {
@@ -366,10 +486,204 @@ fn pick_target(ctx: &AuditJobCtx, now: u64) -> Option<AuditTarget> {
     Some((*same[OsRng.gen_range(0..same.len())]).clone())
 }
 
+/// B-113: books one audit of `target` for relocation: a relocated shard's entry counts its
+/// unanswered audits and is dropped after [`RELOCATION_DROP_AFTER_UNANSWERED`]; otherwise the
+/// host's consecutive misses are counted, and after [`RELOCATE_AFTER_UNANSWERED`] the shard gets
+/// a probe (private-ring mode only, C10).
+fn note_relocation_outcome(
+    ctx: &AuditJobCtx,
+    st: &mut AuditorState,
+    target: &AuditTarget,
+    answered: bool,
+    now: u64,
+) {
+    let key = target.shard_id.file_key();
+    if let Some(r) = st
+        .relocations
+        .get_mut(&key)
+        .filter(|r| r.host_addr == target.host_addr)
+    {
+        if answered {
+            r.unanswered = 0;
+        } else {
+            r.unanswered = r.unanswered.saturating_add(1);
+            if r.unanswered >= RELOCATION_DROP_AFTER_UNANSWERED {
+                st.relocations.remove(&key);
+                warn!(code = "relocation.dropped", host = %target.host_addr, "por.audit");
+            }
+        }
+        return;
+    }
+    let misses = if answered {
+        st.host_misses.remove(&target.host_addr);
+        0
+    } else if st.host_misses.contains_key(&target.host_addr)
+        || st.host_misses.len() < MAX_AUDIT_STATE_ENTRIES
+    {
+        let m = st.host_misses.entry(target.host_addr.clone()).or_insert(0);
+        *m = m.saturating_add(1);
+        *m
+    } else {
+        0
+    };
+    if ctx.relocate.is_some()
+        && misses >= RELOCATE_AFTER_UNANSWERED
+        && !st.probes.contains_key(&key)
+        && st.probes.len() < MAX_AUDIT_STATE_ENTRIES
+    {
+        let exclude = st
+            .last_assigned
+            .get(&target.shard_id.stripe_merkle_root)
+            .cloned()
+            .unwrap_or_else(|| vec![target.host_addr.clone()]);
+        st.probes.insert(
+            key,
+            RelocateProbe {
+                target: target.clone(),
+                exclude,
+                rounds: 0,
+                cursor: 0,
+                backoff: 1,
+                next_due_ms: now,
+            },
+        );
+    }
+}
+
+/// B-113 (A-113 C5): one relocation probe, if one is due: a shard whose host missed
+/// [`RELOCATE_AFTER_UNANSWERED`] audits in a row and that has no live relocation. One candidate
+/// per tick, at most [`MAX_RELOCATE_CANDIDATES`] per round and [`MAX_RELOCATE_ROUNDS`] rounds,
+/// backing off between rounds; a fresh OS-RNG challenge each. Only
+/// [`relocation_accept_decision`] records a relocation (and credits the pass).
+fn run_due_probe(ctx: &AuditJobCtx, now: u64) -> Option<AuditJobOutcome> {
+    let view = ctx.relocate.as_ref()?;
+    let (key, probe) = {
+        let mut st = ctx.state.lock().ok()?;
+        st.recent.retain(|t| now.saturating_sub(*t) < 3_600_000);
+        if st.recent.len() >= ctx.cfg.max_per_hour {
+            return None;
+        }
+        let due = st.probes.iter().find(|(k, p)| {
+            !st.relocations.contains_key(*k)
+                && p.rounds < MAX_RELOCATE_ROUNDS
+                && p.next_due_ms <= now
+                && st
+                    .host_misses
+                    .get(&p.target.host_addr)
+                    .copied()
+                    .unwrap_or(0)
+                    >= RELOCATE_AFTER_UNANSWERED
+        });
+        let (k, p) = due?;
+        (k.clone(), p.clone())
+    };
+    let mut candidates: Vec<String> = ctx
+        .client
+        .all_network_endpoints()
+        .into_iter()
+        .filter(|a| *a != probe.target.host_addr && !probe.exclude.contains(a))
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    candidates.truncate(MAX_RELOCATE_CANDIDATES);
+    let short = &key[..16.min(key.len())];
+    let finish_round = |st: &mut AuditorState| {
+        if let Some(p) = st.probes.get_mut(&key) {
+            p.rounds = p.rounds.saturating_add(1);
+            p.cursor = 0;
+            p.next_due_ms =
+                now.saturating_add(ctx.cfg.interval_ms.saturating_mul(p.backoff as u64));
+            p.backoff = (p.backoff.saturating_mul(2)).min(MAX_RELOCATE_BACKOFF_INTERVALS);
+        }
+    };
+    if candidates.is_empty() {
+        let mut st = ctx.state.lock().ok()?;
+        finish_round(&mut st);
+        st.save(ctx.data_dir.as_deref());
+        return Some(AuditJobOutcome::Idle);
+    }
+    let cand = candidates[probe.cursor as usize % candidates.len()].clone();
+    let self_ids: Vec<&str> = ctx.self_device_ids.iter().map(String::as_str).collect();
+    let session_key = ctx
+        .client
+        .identity()
+        .derive_stripe_por_session_key(&probe.target.shard_id.stripe_merkle_root);
+    let n = chunk_count_u64(probe.target.shard_len);
+    let challenge =
+        generate_chunk_challenge(&session_key, probe.target.shard_id, n, ctx.cfg.width, now);
+    let t0 = Instant::now();
+    let answer = usable_answer(ctx.client.chunk_audit(&cand, challenge.clone()));
+    let rtt_ms = t0.elapsed().as_millis() as u64;
+    let prover_pid = ctx.client.pinned_peer_id(&cand).map(|p| p.to_string());
+    let prover = host_device_id(&ctx.client, &cand);
+    let verdict = chunk_audit_decision(&AuditFacts {
+        challenge: &challenge,
+        root: &probe.target.chunk_root,
+        shard_len: probe.target.shard_len,
+        response: answer.as_ref(),
+        rtt_ms,
+        rtt_bound_ms: ctx.cfg.rtt_bound_ms,
+    });
+    let mut st = ctx.state.lock().ok()?;
+    let facts = RelocationFacts {
+        proof_verified: verdict == AuditVerdict::Pass,
+        prover_is_self: prover.as_deref().is_none_or(|p| self_ids.contains(&p)),
+        prover_admitted: prover_pid.as_deref().is_some_and(|p| view.is_member(p)),
+        rtt_ok: rtt_ms <= ctx.cfg.rtt_bound_ms,
+        map_full: st.relocations.len() >= MAX_AUDIT_STATE_ENTRIES,
+    };
+    st.last_run_unix_ms = now;
+    st.recent.push(now);
+    let outcome = match (relocation_accept_decision(&facts), prover) {
+        (Ok(()), Some(prover)) => {
+            info!(code = "pass", prover = %prover, shard = %short, rtt_ms, "por.audit");
+            info!(code = "relocation.accepted", host = %cand, prover = %prover, shard = %short, "por.audit");
+            st.relocations.insert(
+                key.clone(),
+                Relocation {
+                    host_addr: cand.clone(),
+                    device_id: prover.clone(),
+                    accepted_ms: now,
+                    unanswered: 0,
+                },
+            );
+            st.passed = st.passed.saturating_add(1);
+            st.note_host(&cand, now);
+            if let Ok(mut q) = ctx.block_store.quota().lock() {
+                q.record_por_outcome(&prover, true);
+            }
+            // An accepted move ends the round; a later drop resumes with this backoff (C11).
+            finish_round(&mut st);
+            AuditJobOutcome::Judged {
+                prover,
+                verdict: AuditVerdict::Pass,
+            }
+        }
+        (r, prover) => {
+            let code = r.err().unwrap_or("reject.relocation_unproven");
+            warn!(code, host = %cand, prover = ?prover, shard = %short, "por.audit");
+            let next_cursor = probe.cursor.saturating_add(1);
+            if next_cursor as usize >= candidates.len() {
+                finish_round(&mut st);
+            } else if let Some(p) = st.probes.get_mut(&key) {
+                p.cursor = next_cursor;
+                p.next_due_ms = now;
+            }
+            AuditJobOutcome::Unanswered(code)
+        }
+    };
+    st.save(ctx.data_dir.as_deref());
+    Some(outcome)
+}
+
 /// F-06: runs one audit (blocking: one request with the client's timeout). Called from the
-/// daemon loop on the blocking pool, at most one in flight.
+/// daemon loop on the blocking pool, at most one in flight. A due relocation probe (B-113)
+/// takes the tick instead.
 pub fn run_audit_job(ctx: &AuditJobCtx) -> AuditJobOutcome {
     let now = now_ms();
+    if let Some(outcome) = run_due_probe(ctx, now) {
+        return outcome;
+    }
     let Some(target) = pick_target(ctx, now) else {
         return AuditJobOutcome::Idle;
     };
@@ -414,6 +728,7 @@ pub fn run_audit_job(ctx: &AuditJobCtx) -> AuditJobOutcome {
             st.recent.push(now);
             st.unanswered = st.unanswered.saturating_add(1);
             st.note_host(&target.host_addr, now);
+            note_relocation_outcome(ctx, &mut st, &target, false, now);
             if st.retry.is_none() {
                 st.retry = Some((target, now + AUDIT_RETRY_DELAY_MS));
             }
@@ -424,7 +739,7 @@ pub fn run_audit_job(ctx: &AuditJobCtx) -> AuditJobOutcome {
     if let Err(code) = audit_credit_decision(&self_ids, &prover, AuditVerdict::Pass) {
         return self_refused(code, &prover);
     }
-    let verdict = chunk_audit_decision(&AuditFacts {
+    let mut verdict = chunk_audit_decision(&AuditFacts {
         challenge: &challenge,
         root: &target.chunk_root,
         shard_len: target.shard_len,
@@ -432,6 +747,15 @@ pub fn run_audit_job(ctx: &AuditJobCtx) -> AuditJobOutcome {
         rtt_ms,
         rtt_bound_ms: ctx.cfg.rtt_bound_ms,
     });
+    // B-113 (C5): a relocated shard's audits count only from the device that proved it.
+    let moved_away = ctx.state.lock().ok().is_some_and(|st| {
+        st.relocations
+            .get(&file_key)
+            .is_some_and(|r| r.host_addr == target.host_addr && r.device_id != prover)
+    });
+    if moved_away {
+        verdict = AuditVerdict::Unanswered("reject.relocation_device_mismatch");
+    }
     let code = match verdict {
         AuditVerdict::Pass => "pass",
         AuditVerdict::ProofInvalid(c) | AuditVerdict::Unanswered(c) => c,
@@ -445,6 +769,8 @@ pub fn run_audit_job(ctx: &AuditJobCtx) -> AuditJobOutcome {
     st.last_run_unix_ms = now;
     st.recent.push(now);
     st.note_host(&target.host_addr, now);
+    let answered = !matches!(credit, Ok(AuditCredit::Unanswered));
+    note_relocation_outcome(ctx, &mut st, &target, answered, now);
     match credit {
         Ok(AuditCredit::Pass) => {
             st.passed = st.passed.saturating_add(1);
@@ -579,6 +905,7 @@ mod tests {
             },
             state: Arc::new(Mutex::new(AuditorState::default())),
             data_dir: Some(dir.path().to_path_buf()),
+            relocate: None,
         };
         assert_eq!(run_audit_job(&ctx), AuditJobOutcome::Idle);
         let st = ctx.state.lock().unwrap();
@@ -640,6 +967,7 @@ mod tests {
             },
             state: Arc::new(Mutex::new(AuditorState::default())),
             data_dir: None,
+            relocate: None,
         }
     }
 
@@ -734,6 +1062,100 @@ mod tests {
         assert_eq!(next_scan_after_idle(&cfg, 1_000, None), 1_000 + 900_000);
         assert_eq!(next_scan_after_idle(&cfg, 1_000, Some(500)), 1_000 + 60_000);
         assert_eq!(next_scan_after_idle(&cfg, 1_000, Some(301_000)), 301_000);
+    }
+
+    #[test]
+    fn relocation_accept_needs_every_fact() {
+        let ok = RelocationFacts {
+            proof_verified: true,
+            prover_is_self: false,
+            prover_admitted: true,
+            rtt_ok: true,
+            map_full: false,
+        };
+        assert_eq!(relocation_accept_decision(&ok), Ok(()));
+        for bad in [
+            RelocationFacts {
+                proof_verified: false,
+                ..ok
+            },
+            RelocationFacts {
+                prover_is_self: true,
+                ..ok
+            },
+            RelocationFacts {
+                prover_admitted: false,
+                ..ok
+            },
+            RelocationFacts {
+                rtt_ok: false,
+                ..ok
+            },
+            RelocationFacts {
+                map_full: true,
+                ..ok
+            },
+        ] {
+            assert_eq!(
+                relocation_accept_decision(&bad),
+                Err("reject.relocation_unproven")
+            );
+        }
+    }
+
+    /// A-113 C5 and C11: two misses in a row open a probe (private ring only); a relocated
+    /// entry is dropped after three unanswered audits and the probe keeps its rounds and
+    /// backoff; public mode opens no probe.
+    #[test]
+    fn misses_open_a_probe_and_a_drop_keeps_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = lite_ctx(dir.path(), LiteAuditIndex::in_memory(), 1_000);
+        let t = one_host_index("/ip4/127.0.0.1/tcp/1")
+            .sample_targets(1)
+            .remove(0);
+        let mut st = AuditorState::fresh();
+        note_relocation_outcome(&ctx, &mut st, &t, false, 5);
+        note_relocation_outcome(&ctx, &mut st, &t, false, 6);
+        assert!(st.probes.is_empty(), "public or hybrid: no probe (Q4)");
+        ctx.relocate = Some(RelocationView {
+            data_dir: dir.path().to_path_buf(),
+            genesis: None,
+        });
+        let mut st = AuditorState::fresh();
+        note_relocation_outcome(&ctx, &mut st, &t, false, 5);
+        assert!(st.probes.is_empty(), "one miss is not enough");
+        note_relocation_outcome(&ctx, &mut st, &t, false, 6);
+        let key = t.shard_id.file_key();
+        assert_eq!(st.probes[&key].next_due_ms, 6);
+        // An accepted move after round one, then three misses at the new host.
+        st.probes.get_mut(&key).unwrap().rounds = 1;
+        st.probes.get_mut(&key).unwrap().backoff = 2;
+        st.relocations.insert(
+            key.clone(),
+            Relocation {
+                host_addr: "/ip4/127.0.0.1/tcp/2".into(),
+                device_id: "d".into(),
+                accepted_ms: 7,
+                unanswered: 0,
+            },
+        );
+        let moved = AuditTarget {
+            host_addr: "/ip4/127.0.0.1/tcp/2".into(),
+            ..t.clone()
+        };
+        for _ in 0..RELOCATION_DROP_AFTER_UNANSWERED {
+            note_relocation_outcome(&ctx, &mut st, &moved, false, 8);
+        }
+        assert!(st.relocations.is_empty(), "dropped after three misses");
+        let p = &st.probes[&key];
+        assert_eq!(
+            (p.rounds, p.backoff),
+            (1, 2),
+            "C11: rounds and backoff kept"
+        );
+        // The state file round-trips the new fields.
+        st.save(Some(dir.path()));
+        assert_eq!(AuditorState::load(dir.path()).probes, st.probes);
     }
 
     #[test]
