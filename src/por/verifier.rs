@@ -57,12 +57,30 @@ pub fn grant_replace_decision(
     registered: Option<&[[u8; 32]]>,
     incoming: &[[u8; 32]],
 ) -> Result<(), &'static str> {
-    match registered {
-        Some(old) if !old.iter().all(|w| incoming.contains(w)) => {
-            Err("reject.repair_grant_witness_downgrade")
+    let Some(old) = registered else {
+        return Ok(());
+    };
+    let mut i = 0;
+    while i < old.len() {
+        if !names_key(incoming, &old[i]) {
+            return Err("reject.repair_grant_witness_downgrade");
         }
-        _ => Ok(()),
+        i += 1;
     }
+    Ok(())
+}
+
+/// Whether `keys` holds `key` (all 32 bytes). An index loop over `len()`, not a slice
+/// iterator, so Kani's symbolic execution bounds it by the slice's length (B-113 harnesses).
+fn names_key(keys: &[[u8; 32]], key: &[u8; 32]) -> bool {
+    let mut i = 0;
+    while i < keys.len() {
+        if keys[i] == *key {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// What the PoR pre-screen knows about a challenge, all from RAM.
@@ -124,7 +142,7 @@ pub struct PorStorerFacts<'a> {
 /// the rate check and any read.
 pub fn por_storer_decision(f: &PorStorerFacts<'_>) -> Result<(), &'static str> {
     match (&f.grant, f.sender_key) {
-        (Some(g), Some(k)) if k == g.owner || g.witnesses.contains(&k) => Ok(()),
+        (Some(g), Some(k)) if k == g.owner || names_key(g.witnesses, &k) => Ok(()),
         (Some(_), _) => Err("reject.por_not_storer"),
         (None, _) => match (f.sender_device_id, f.accounted_owner) {
             (Some(s), Some(o)) if s == o => Ok(()),

@@ -1642,8 +1642,10 @@ fn check_por_storer_decision<const N: usize>() -> StorerOutcome {
         f.sender_device_id.is_some() && f.sender_device_id == f.accounted_owner;
     if has_grant {
         let mut named = key == owner;
-        for w in &witnesses {
-            named |= key == *w;
+        let mut i = 0;
+        while i < N {
+            named |= key == witnesses[i];
+            i += 1;
         }
         // (a) no fall-through and (b) no key, no audit.
         assert_eq!(ok, has_key && named);
@@ -1727,12 +1729,16 @@ fn check_grant_replace<const OLD: usize, const NEW: usize>() -> (bool, bool, usi
     let has_old: bool = kani::any();
     let ok = grant_replace_decision(has_old.then_some(&old[..]), &new).is_ok();
     let mut superset = true;
-    for w in &old {
+    let mut i = 0;
+    while i < OLD {
         let mut named = false;
-        for v in &new {
-            named |= *w == *v;
+        let mut j = 0;
+        while j < NEW {
+            named |= old[i] == new[j];
+            j += 1;
         }
         superset &= named;
+        i += 1;
     }
     assert_eq!(ok, !has_old || superset);
     (ok, has_old, OLD, NEW)
