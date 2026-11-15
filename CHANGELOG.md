@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Security
+- **A full node no longer evicts other members' shards (B-161).** In every released `v0.5.x`, a file-backed node that was full evicted the least recently used shards of any owner to admit a put, so a member within its own allowance could push other members' live shards off the node. It now refuses with `reject.node_capacity` and evicts nothing. Puts to a full node that used to succeed by evicting now fail with `reject.node_capacity`. The in-memory `--no-fs` store is unchanged (ADR-30; B-164).
+
 ---
 
 ## [`0.5.3`] - 2026-11-15
