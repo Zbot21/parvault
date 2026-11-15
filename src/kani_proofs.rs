@@ -1547,12 +1547,18 @@ fn any_pool_key() -> [u8; 32] {
     }
 }
 
-/// A set of at most two keys from [`any_pool_key`].
-fn any_keys_upto2() -> ([[u8; 32]; 2], usize) {
-    let keys: [[u8; 32]; 2] = [any_pool_key(), any_pool_key()];
-    let n: usize = kani::any();
+/// `N` keys from [`any_pool_key`]. The length is a constant on each path, so CBMC unrolls the
+/// decision's slice loops `N` times; a symbolic length made it unroll every loop to the
+/// harness's unwind bound (34), nested over the 32-byte compares, and the run did not finish.
+fn pool_keys<const N: usize>() -> [[u8; 32]; N] {
+    core::array::from_fn(|_| any_pool_key())
+}
+
+/// One of 0, 1 or 2, symbolic.
+fn any_len_upto2() -> u8 {
+    let n: u8 = kani::any();
     kani::assume(n <= 2);
-    (keys, n)
+    n
 }
 
 /// A device id chosen from a small set (equal and unequal pairs both reachable).
@@ -1577,8 +1583,47 @@ fn any_device_id() -> Option<&'static str> {
 #[kani::proof]
 #[kani::unwind(34)]
 fn proof_por_storer_decision() {
+    let o = match any_len_upto2() {
+        0 => check_por_storer_decision::<0>(),
+        1 => check_por_storer_decision::<1>(),
+        _ => check_por_storer_decision::<2>(),
+    };
+    if o.has_grant {
+        kani::cover!(o.ok && o.key_is_owner, "grant owner admitted");
+        kani::cover!(o.ok && !o.key_is_owner, "witness admitted");
+        kani::cover!(
+            !o.ok && o.has_key && !o.key_is_owner,
+            "non-witness refused under a grant"
+        );
+        kani::cover!(
+            !o.ok && o.near_miss,
+            "one-byte near miss of the owner refused"
+        );
+        kani::cover!(!o.ok && !o.has_key, "no key refused under a grant");
+        kani::cover!(
+            !o.ok && o.sender_is_accounted,
+            "accounted owner refused under a grant"
+        );
+    } else {
+        kani::cover!(o.ok, "accounted owner admitted without a grant");
+        kani::cover!(!o.ok, "non-owner refused without a grant");
+    }
+}
+
+/// What one storer check saw, for the harness's covers.
+struct StorerOutcome {
+    ok: bool,
+    has_grant: bool,
+    has_key: bool,
+    key_is_owner: bool,
+    near_miss: bool,
+    sender_is_accounted: bool,
+}
+
+/// The storer decision with `N` witnesses; asserts the rule and returns what it saw.
+fn check_por_storer_decision<const N: usize>() -> StorerOutcome {
     use crate::por::{por_storer_decision, GrantStorers, PorStorerFacts};
-    let (witnesses, n) = any_keys_upto2();
+    let witnesses: [[u8; 32]; N] = pool_keys();
     let owner = any_pool_key();
     let has_grant: bool = kani::any();
     let has_key: bool = kani::any();
@@ -1589,41 +1634,30 @@ fn proof_por_storer_decision() {
         accounted_owner: any_device_id(),
         grant: has_grant.then_some(GrantStorers {
             owner,
-            witnesses: &witnesses[..n],
+            witnesses: &witnesses,
         }),
     };
-    let decision = por_storer_decision(&f);
+    let ok = por_storer_decision(&f).is_ok();
+    let sender_is_accounted =
+        f.sender_device_id.is_some() && f.sender_device_id == f.accounted_owner;
     if has_grant {
-        let named =
-            key == owner || (n > 0 && key == witnesses[0]) || (n > 1 && key == witnesses[1]);
-        kani::cover!(decision.is_ok() && key == owner, "grant owner admitted");
-        kani::cover!(decision.is_ok() && key != owner, "witness admitted");
-        kani::cover!(
-            decision.is_err() && has_key && key != owner,
-            "non-witness refused under a grant"
-        );
-        kani::cover!(
-            decision.is_err() && has_key && key[31] != owner[31] && key[0] == owner[0],
-            "one-byte near miss of the owner refused"
-        );
-        kani::cover!(
-            decision.is_err() && !has_key,
-            "no key refused under a grant"
-        );
-        kani::cover!(
-            decision.is_err()
-                && f.sender_device_id.is_some()
-                && f.sender_device_id == f.accounted_owner,
-            "accounted owner refused under a grant"
-        );
+        let mut named = key == owner;
+        for w in &witnesses {
+            named |= key == *w;
+        }
         // (a) no fall-through and (b) no key, no audit.
-        assert_eq!(decision.is_ok(), has_key && named);
+        assert_eq!(ok, has_key && named);
     } else {
-        kani::cover!(decision.is_ok(), "accounted owner admitted without a grant");
-        kani::cover!(decision.is_err(), "non-owner refused without a grant");
-        let same = matches!((f.sender_device_id, f.accounted_owner), (Some(s), Some(o)) if s == o);
         // (c) today's rule.
-        assert_eq!(decision.is_ok(), same);
+        assert_eq!(ok, sender_is_accounted);
+    }
+    StorerOutcome {
+        ok,
+        has_grant,
+        has_key,
+        key_is_owner: key == owner,
+        near_miss: has_key && key[31] != owner[31] && key[..31] == owner[..31],
+        sender_is_accounted,
     }
 }
 
@@ -1663,24 +1697,45 @@ fn proof_grant_registration_witness_bound() {
 #[kani::proof]
 #[kani::unwind(34)]
 fn proof_grant_replace_witness_superset() {
+    let (ok, has_old, n_old, n_new) = match (any_len_upto2(), any_len_upto2()) {
+        (0, 0) => check_grant_replace::<0, 0>(),
+        (0, 1) => check_grant_replace::<0, 1>(),
+        (0, _) => check_grant_replace::<0, 2>(),
+        (1, 0) => check_grant_replace::<1, 0>(),
+        (1, 1) => check_grant_replace::<1, 1>(),
+        (1, _) => check_grant_replace::<1, 2>(),
+        (_, 0) => check_grant_replace::<2, 0>(),
+        (_, 1) => check_grant_replace::<2, 1>(),
+        (_, _) => check_grant_replace::<2, 2>(),
+    };
+    kani::cover!(!ok && n_new == 0, "witness downgrade to none kept out");
+    kani::cover!(!ok && n_new > 0, "partial overlap kept out");
+    kani::cover!(ok && has_old && n_old > 0, "superset replaces");
+    kani::cover!(
+        ok && has_old && n_old == 0,
+        "grant with no witnesses replaced"
+    );
+    kani::cover!(ok && !has_old, "no registered grant: replaced");
+}
+
+/// The replace decision with `OLD` registered and `NEW` incoming witnesses; asserts the
+/// superset rule and returns (accepted, has_old, OLD, NEW) for the harness's covers.
+fn check_grant_replace<const OLD: usize, const NEW: usize>() -> (bool, bool, usize, usize) {
     use crate::por::grant_replace_decision;
-    let (old, n_old) = any_keys_upto2();
-    let (new, n_new) = any_keys_upto2();
+    let old: [[u8; 32]; OLD] = pool_keys();
+    let new: [[u8; 32]; NEW] = pool_keys();
     let has_old: bool = kani::any();
-    let decision = grant_replace_decision(has_old.then_some(&old[..n_old]), &new[..n_new]);
-    let named = |w: &[u8; 32]| (n_new > 0 && *w == new[0]) || (n_new > 1 && *w == new[1]);
-    kani::cover!(decision.is_err(), "witness downgrade kept out");
-    kani::cover!(
-        decision.is_ok() && has_old && n_old > 0,
-        "superset replaces"
-    );
-    kani::cover!(
-        decision.is_ok() && !has_old,
-        "no registered grant: replaced"
-    );
-    kani::cover!(decision.is_err() && n_new > 0, "partial overlap kept out");
-    let superset = !has_old || (0..n_old).all(|i| named(&old[i]));
-    assert_eq!(decision.is_ok(), superset);
+    let ok = grant_replace_decision(has_old.then_some(&old[..]), &new).is_ok();
+    let mut superset = true;
+    for w in &old {
+        let mut named = false;
+        for v in &new {
+            named |= *w == *v;
+        }
+        superset &= named;
+    }
+    assert_eq!(ok, !has_old || superset);
+    (ok, has_old, OLD, NEW)
 }
 
 /// B59-RELOCATE (A-113 C5): a probe answer is recorded as a relocation only when every fact
