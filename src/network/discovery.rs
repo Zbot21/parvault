@@ -1084,9 +1084,13 @@ impl KnownPeersStore {
     pub const FILE_NAME: &'static str = "known_peers.json";
 
     /// Read-only view of the store: a missing file is empty, and so (logged with its reason code)
-    /// is one that exists but does not load. Pins are allow-lists, so an empty view trusts fewer
-    /// keys, never more. Never `save` a store obtained here; writers use [`Self::try_load`], and
-    /// `save` refuses to replace an unloadable file anyway (B-52).
+    /// is one that exists but does not load. An empty view has no pins, so it refuses no key: a
+    /// tracker-admin key is pinned on first use (TOFU) whenever no pin for that tracker is in
+    /// memory, and after a damaged file the next key a tracker advertises is pinned for that
+    /// process. Once a key is pinned, a different key for the same tracker is refused
+    /// (`or_insert`, never overwritten). The damaged file itself is never replaced (`save`
+    /// refuses), so that pin is not persisted. Never `save` a store obtained here; writers use
+    /// [`Self::try_load`] (B-52).
     pub fn load(data_dir: &Path) -> Self {
         Self::try_load(data_dir).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "known_peers.json does not load; using no pins");
