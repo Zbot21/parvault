@@ -8911,11 +8911,19 @@ fn f34_wrong_chunk_proof_refused() {
         eventually(|| owner_ledger(&owner, &host_id).is_some_and(|a| a.por_failures >= 1)),
         "no fail recorded for {host_id}"
     );
-    let state = std::fs::read_to_string(owner.dir.join("por_audit_state.json")).unwrap();
-    let v: serde_json::Value = serde_json::from_str(&state).unwrap();
+    // The auditor credits the ledger, then saves por_audit_state.json: wait for the state file
+    // instead of reading it the moment the ledger shows the fail.
+    let state_path = owner.dir.join("por_audit_state.json");
+    let degraded = || {
+        std::fs::read_to_string(&state_path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .is_some_and(|v| v["degraded"].as_array().is_some_and(|a| !a.is_empty()))
+    };
     assert!(
-        !v["degraded"].as_array().unwrap().is_empty(),
-        "shard not degraded: {state}"
+        eventually(degraded),
+        "shard not degraded: {:?}",
+        std::fs::read_to_string(&state_path)
     );
     assert!(!owner.log_text().contains("quarantin"));
     gate_ran("trust_enforcement::f34_wrong_chunk_proof_refused");
