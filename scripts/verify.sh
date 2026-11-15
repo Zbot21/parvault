@@ -6,7 +6,8 @@
 #
 #   tlc        TLC on every specs/<Spec>.cfg and specs/<Spec>.<Variant>.cfg (as CI's
 #              tla-model-check job), one cfg per run, each with its -metadir in /dev/shm.
-#   kani       every #[kani::proof] / #[kani::proof_for_contract] harness, sharded.
+#   kani       every #[kani::proof] / #[kani::proof_for_contract] harness: one
+#              `cargo kani -j KANI_JOBS` (KANI_MODE=jobs, default) or KANI_MODE=shard.
 #   all        tlc, then kani; failures are summed and reported at the end.
 #   test       cargo test --locked [args] (the only step VERIFY_MOLD applies to).
 #   list-tlc   print the discovered cfgs (specs/-relative), one per line.
@@ -15,7 +16,9 @@
 # Environment (all optional):
 #   SPEC=<name>        only cfgs whose spec or cfg basename is <name>
 #                      (ParVaultProtocol, or ParVaultZeroKeyAdminAndQuorum.RootOffDisk)
-#   TLC_HEAP_PCT=70    -Xms = -Xmx = this % of physical RAM (use 30 under pvjob)
+#   TLC_HEAP_PCT=70    -Xms = -Xmx = this % of MemTotal, 1..75 (30 under pvjob); refused
+#                      unless heap + TLC_SHM_MIN_MB + TLC_MEM_MARGIN_MB <= MemAvailable
+#   TLC_MEM_MARGIN_MB=2048  RAM left free beside the heap and /dev/shm
 #   TLC_WORKERS=auto   TLC -workers
 #   TLC_SHM_MIN_MB=2048  refuse to start TLC with less free space in /dev/shm
 #   TLA2TOOLS_JAR      else /opt/tla/tla2tools.jar, else ~/.cache/tla/tla2tools.jar
@@ -26,7 +29,7 @@
 #   KANI_SHARD_TARGETS=1  shard mode: per-worker CARGO_TARGET_DIR (default 1)
 #   FAIL_FAST=1        stop at the first failing cfg or harness
 #   VERIFY_MOLD=1      link the `test` step with mold, in its own target dir
-#   VERIFY_LOG_DIR     per-run logs (default $CARGO_TARGET_DIR/verify-logs/<stamp>)
+#   VERIFY_LOG_DIR     each run logs to <dir>/<stamp>/ (default $CARGO_TARGET_DIR/verify-logs)
 #   VERIFY_DRY_RUN=1   print each command and its relevant env instead of running it
 set -euo pipefail
 
@@ -55,27 +58,65 @@ DRY="${VERIFY_DRY_RUN:-0}"
 FAIL_FAST="${FAIL_FAST:-0}"
 BASE_TARGET="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-LOG_DIR="${VERIFY_LOG_DIR:-$BASE_TARGET/verify-logs/$STAMP}"
+# A per-run subdir, so a reused VERIFY_LOG_DIR never mixes in an earlier run's results.
+LOG_DIR="${VERIFY_LOG_DIR:-$BASE_TARGET/verify-logs}/$STAMP"
 FAILURES=()
 
 # ---------------------------------------------------------------------------
-# Cleanup: every /dev/shm dir and child this run makes is removed on EXIT, INT and TERM.
+# Cleanup, on EXIT and on INT, TERM and HUP: remove every /dev/shm dir this run made, TERM
+# every child process group, wait at most about 2 s, then KILL any group still alive. Children
+# lead their own process groups (set -m), so a group kill aimed at this shell (pvjob's TERM,
+# then KILL 3 s later) does not reach them; this must finish inside that 3 s.
 # ---------------------------------------------------------------------------
 SHM_DIRS=()
 CHILDREN=()
-cleanup() {
-  local p d
-  for p in "${CHILDREN[@]+"${CHILDREN[@]}"}"; do
-    kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null || true
-  done
-  for p in "${CHILDREN[@]+"${CHILDREN[@]}"}"; do wait "$p" 2>/dev/null || true; done
+rm_shm() {
+  local d
   for d in "${SHM_DIRS[@]+"${SHM_DIRS[@]}"}"; do
     [[ "$d" == /dev/shm/tlc-* ]] && rm -rf -- "$d"
   done
+  return 0
+}
+group_alive() { kill -0 -- "-$1" 2>/dev/null || kill -0 "$1" 2>/dev/null; }
+cleanup() {
+  local rc=$? p i live
+  trap '' INT TERM HUP
+  rm_shm
+  for p in "${CHILDREN[@]+"${CHILDREN[@]}"}"; do
+    kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null || true
+  done
+  for (( i = 0; i < 20; i++ )); do
+    live=0
+    for p in "${CHILDREN[@]+"${CHILDREN[@]}"}"; do group_alive "$p" && live=1; done
+    (( live )) || break
+    sleep 0.1
+  done
+  for p in "${CHILDREN[@]+"${CHILDREN[@]}"}"; do
+    kill -KILL -- "-$p" 2>/dev/null || kill -KILL "$p" 2>/dev/null || true
+  done
+  rm_shm  # a child may have written there between the first pass and its death
+  exit "$rc"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+# Removes one pid from CHILDREN (an element, not a substring of every element).
+drop_child() {
+  local keep=() c
+  for c in "${CHILDREN[@]+"${CHILDREN[@]}"}"; do [[ "$c" == "$1" ]] || keep+=("$c"); done
+  CHILDREN=("${keep[@]+"${keep[@]}"}")
+}
+
+# mapfile with empty lines dropped: `mapfile <<< ""` gives one empty element, not none.
+lines_to_array() {
+  local -n _arr="$1"
+  local _l
+  _arr=()
+  while IFS= read -r _l; do [[ -n "$_l" ]] && _arr+=("$_l"); done <<< "$2"
+  return 0
+}
 
 # Runs "$@" in its own process group in the background and waits, so INT/TERM reach this
 # shell at once (bash defers traps while a foreground child runs) and cleanup can kill it.
@@ -88,7 +129,7 @@ run_child() {
   CHILDREN+=("$pid")
   local rc=0
   wait "$pid" || rc=$?
-  CHILDREN=("${CHILDREN[@]/$pid}")
+  drop_child "$pid"
   return "$rc"
 }
 
@@ -176,11 +217,22 @@ tla_jar() {
   die "tla2tools.jar not found (set TLA2TOOLS_JAR)"
 }
 
+# The heap is pinned (-Xms = -Xmx), and /dev/shm is tmpfs in the same RAM, so the heap plus
+# the /dev/shm room TLC is guaranteed (TLC_SHM_MIN_MB) plus a margin must fit in MemAvailable
+# now; otherwise refuse rather than push the box into swap or the OOM killer.
 tlc_heap_mb() {
-  local pct="${TLC_HEAP_PCT:-70}" kb
-  [[ "$pct" =~ ^[0-9]+$ && "$pct" -ge 1 && "$pct" -le 90 ]] || die "TLC_HEAP_PCT must be 1..90"
-  kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
-  echo $(( kb * pct / 100 / 1024 ))
+  local pct="${TLC_HEAP_PCT:-70}" shm="${TLC_SHM_MIN_MB:-2048}" margin="${TLC_MEM_MARGIN_MB:-2048}"
+  local mi="${VERIFY_MEMINFO:-/proc/meminfo}" total avail heap
+  [[ "$pct" =~ ^[0-9]+$ && "$pct" -ge 1 && "$pct" -le 75 ]] || die "TLC_HEAP_PCT must be 1..75"
+  [[ "$margin" =~ ^[0-9]+$ ]] || die "TLC_MEM_MARGIN_MB must be a number of MiB"
+  total="$(awk '/^MemTotal:/ {print int($2 / 1024)}' "$mi")"
+  avail="$(awk '/^MemAvailable:/ {print int($2 / 1024)}' "$mi")"
+  [[ -n "$total" && -n "$avail" ]] || die "no MemTotal/MemAvailable in $mi"
+  heap=$(( total * pct / 100 ))
+  if (( heap + shm + margin > avail )); then
+    die "TLC heap ${heap} MiB (TLC_HEAP_PCT=$pct of ${total} MiB) + /dev/shm ${shm} MiB (TLC_SHM_MIN_MB) + margin ${margin} MiB (TLC_MEM_MARGIN_MB) exceeds MemAvailable ${avail} MiB; lower TLC_HEAP_PCT or wait for memory"
+  fi
+  echo "$heap"
 }
 
 shm_free_mb() { df -Pm /dev/shm | awk 'NR==2 {print $4}'; }
@@ -188,7 +240,8 @@ shm_free_mb() { df -Pm /dev/shm | awk 'NR==2 {print $4}'; }
 run_tlc() {
   local cfgs=() c spec base list
   list="$(discover_cfgs)" || exit 2  # a process substitution would hide a discovery error
-  mapfile -t cfgs <<< "$list"
+  lines_to_array cfgs "$list"
+  [[ ${#cfgs[@]} -gt 0 ]] || die "no TLC cfg found in specs/"
   if [[ -n "${SPEC:-}" ]]; then
     local keep=()
     for c in "${cfgs[@]}"; do
@@ -244,7 +297,7 @@ run_tlc() {
 run_kani() {
   local hs=() h list
   list="$(discover_harnesses)" || exit 2
-  mapfile -t hs <<< "$list"
+  lines_to_array hs "$list"
   [[ ${#hs[@]} -gt 0 ]] || die "no Kani harness found"
   if [[ -n "${HARNESS:-}" ]]; then
     local keep=() want=() x
@@ -364,8 +417,7 @@ kani_shard() {
   done
   [[ "$DRY" == 1 ]] && return 0
   local p
-  for p in "${pids[@]}"; do wait "$p" || true; done
-  CHILDREN=()
+  for p in "${pids[@]}"; do wait "$p" || true; drop_child "$p"; done
 }
 
 kani_worker() {

@@ -3,7 +3,10 @@
 #   - discovery matches CI's cfg rules, docs/metrics.txt and every harness= in .enforcement.map
 #   - VERIFY_KANI_LIST=1 (needs cargo-kani; heavy, run under pvjob): discovery == `cargo kani list`
 #   - both scripts are committed executable (the tests themselves run them through bash)
-#   - /dev/shm/tlc-* is removed on success, failure, INT and TERM
+#   - /dev/shm/tlc-* is removed on success, failure, INT, TERM and HUP; a child that ignores
+#     TERM is KILLed about 2 s later, so nothing survives a cancel
+#   - the TLC heap is refused unless it fits in MemAvailable beside /dev/shm (fake meminfo)
+#   - an empty discovery stops the run; a reused VERIFY_LOG_DIR does not mix runs
 #   - failures are summed and the exit code is non-zero; FAIL_FAST stops early
 #   - VERIFY_MOLD reaches only the `test` step, never cargo kani
 set -euo pipefail
@@ -68,6 +71,12 @@ cp -r "$REPO_ROOT/scripts" "$REPO_ROOT/specs" "$WORK/" && mkdir -p "$WORK/repo" 
 touch "$WORK/repo/specs/Orphan.tla"
 rc=0; bash "$WORK/repo/scripts/verify.sh" tlc > "$WORK/out" 2>&1 || rc=$?
 check "a .tla without its .cfg stops the TLC run (rc $rc)" '[ $rc = 2 ] && grep -q "Orphan.tla has no" "$WORK/out" && ! grep -q "TLC:" "$WORK/out"'
+rm -f "$WORK/repo/specs/"*.tla "$WORK/repo/specs/"*.cfg
+rc=0; bash "$WORK/repo/scripts/verify.sh" tlc > "$WORK/out" 2>&1 || rc=$?
+check "no cfg at all stops the TLC run (rc $rc)" '[ $rc = 2 ] && grep -q "no TLC cfg found" "$WORK/out"'
+mkdir -p "$WORK/repo/src"  # no kani attribute anywhere
+rc=0; bash "$WORK/repo/scripts/verify.sh" kani > "$WORK/out" 2>&1 || rc=$?
+check "no harness at all stops the Kani run (rc $rc)" '[ $rc = 2 ] && grep -q "no Kani harness found" "$WORK/out"'
 rm -rf "$WORK/repo"
 
 # --- Fakes ------------------------------------------------------------------------------
@@ -82,6 +91,7 @@ case "${FAKE_TLC:-pass}" in
   pass) echo "Model checking completed. No error has been found."; echo "9 distinct states found";;
   fail) echo "Error: Invariant Foo is violated."; exit 12;;
   hang) sleep 30;;
+  stubborn) trap '' INT TERM HUP; sleep 3071;;  # ignores TERM; sleep inherits that
 esac
 EOF
 cat > "$WORK/bin/cargo" <<'EOF'
@@ -89,6 +99,7 @@ cat > "$WORK/bin/cargo" <<'EOF'
 # Fake cargo kani: fails the harness named in FAKE_KANI_FAIL; logs env for the mold check.
 # With -j it prints Kani's terse multi-thread format for every harness (or each --harness).
 echo "RUSTFLAGS=${RUSTFLAGS-<unset>} TARGET=$CARGO_TARGET_DIR ARGS=$*" >> "$FAKE_LOG"
+if [ -n "${FAKE_KANI_HANG:-}" ]; then trap '' INT TERM HUP; sleep 3072; exit 0; fi
 hs=() jobs=0 ff=0
 while [ $# -gt 0 ]; do
   case "$1" in --harness) hs+=("$2"); shift;; -j) jobs="$2"; shift;; --fail-fast) ff=1;; esac; shift
@@ -117,7 +128,8 @@ EOF
 printf '#!/bin/sh\nexit 0\n' > "$WORK/bin/mold"
 chmod +x "$WORK/bin/"*
 export FAKE_REPO="$REPO_ROOT" PATH="$WORK/bin:$PATH" TLA2TOOLS_JAR="$WORK/fake.jar" FAKE_LOG="$WORK/fake.log"
-export CARGO_TARGET_DIR="$WORK/target" TLC_HEAP_PCT=1 TLC_SHM_MIN_MB=1
+export CARGO_TARGET_DIR="$WORK/target" TLC_HEAP_PCT=1 TLC_SHM_MIN_MB=1 TLC_MEM_MARGIN_MB=1
+survivors() { { pgrep -f "sleep 307[12]|$WORK/bin/(java|cargo)" 2>/dev/null || true; } | wc -l; }
 : > "$WORK/fake.jar"
 
 # --- TLC: /dev/shm cleanup and result semantics -----------------------------------------
@@ -133,7 +145,7 @@ check "TLC violation on a positive cfg fails (rc $rc) with a summary" '[ $rc = 1
 check "TLC fail: /dev/shm cleaned" '[ "$(shm_left $p)" = 0 ]'
 
 # INT-ignored: started with SIGINT ignored, as a pvjob job is (the runner re-execs to reset it).
-for sig in INT TERM INT-ignored; do
+for sig in INT TERM HUP INT-ignored; do
   : > "$FAKE_LOG"
   t0=$SECONDS rc=0
   if [[ "$sig" == INT-ignored ]]; then
@@ -148,8 +160,38 @@ for sig in INT TERM INT-ignored; do
   check "TLC $sig: fake TLC child killed" '! pgrep -f "$WORK/bin/java" >/dev/null'
 done
 
-TLC_SHM_MIN_MB=999999999 SPEC=ParVaultProtocol bash "$V" tlc > "$WORK/out" 2>&1 && rc=0 || rc=$?
+# A fake meminfo with room for the heap, so the per-cfg /dev/shm check is what refuses.
+printf 'MemTotal: 1048576 kB\nMemAvailable: 99999999999999 kB\n' > "$WORK/meminfo-big"
+VERIFY_MEMINFO="$WORK/meminfo-big" TLC_SHM_MIN_MB=999999999 SPEC=ParVaultProtocol bash "$V" tlc > "$WORK/out" 2>&1 && rc=0 || rc=$?
 check "TLC refuses to start without room in /dev/shm" '[ $rc = 1 ] && grep -q "TLC_SHM_MIN_MB" "$WORK/out"'
+
+# A child that ignores TERM (as cargo-kani and cbmc did on a real cancel) is KILLed.
+for what in tlc kani; do
+  t0=$SECONDS rc=0
+  if [[ "$what" == tlc ]]; then
+    FAKE_TLC=stubborn SPEC=ParVaultProtocol timeout -s TERM 2 bash "$V" tlc > "$WORK/out" 2>&1 || rc=$?
+  else
+    FAKE_KANI_HANG=1 HARNESS=proof_webdav_auth_decision timeout -s TERM 2 bash "$V" kani > "$WORK/out" 2>&1 || rc=$?
+  fi
+  dt=$((SECONDS - t0)); sleep 0.3
+  n="$(survivors)"
+  check "$what, TERM-ignoring child: runner exits within the grace (rc $rc, ${dt}s), $n survivor(s)" \
+    '[ $rc = 124 ] && [ $dt -lt 7 ] && [ "$n" = 0 ] && [ -z "$(find /dev/shm -maxdepth 1 -name "tlc-*" -newer "$WORK/fake.jar" -user "$(id -u)" 2>/dev/null)" ]'
+  pkill -KILL -f "sleep 307[12]" 2>/dev/null || true
+done
+
+# TLC heap vs MemAvailable (fake meminfo: 100 GiB total, 50 GiB available).
+printf 'MemTotal: 104857600 kB\nMemAvailable: 52428800 kB\n' > "$WORK/meminfo"
+rc=0; VERIFY_MEMINFO="$WORK/meminfo" TLC_HEAP_PCT=70 TLC_SHM_MIN_MB=2048 TLC_MEM_MARGIN_MB=2048 VERIFY_DRY_RUN=1 \
+  SPEC=ParVaultProtocol bash "$V" tlc > "$WORK/out" 2>&1 || rc=$?
+check "TLC heap 70 % of 100 GiB does not fit 50 GiB available: refused (rc $rc)" \
+  '[ $rc = 2 ] && grep -q "exceeds MemAvailable 51200 MiB" "$WORK/out" && ! grep -q "^DRY tlc" "$WORK/out"'
+rc=0; VERIFY_MEMINFO="$WORK/meminfo" TLC_HEAP_PCT=40 TLC_SHM_MIN_MB=2048 TLC_MEM_MARGIN_MB=2048 VERIFY_DRY_RUN=1 \
+  SPEC=ParVaultProtocol bash "$V" tlc > "$WORK/out" 2>&1 || rc=$?
+check "TLC heap 40 % (40960 + 2048 + 2048 <= 51200 MiB) runs pinned at 40960 MiB (rc $rc)" \
+  '[ $rc = 0 ] && grep -q "^DRY tlc: .*-Xms40960m -Xmx40960m" "$WORK/out"'
+rc=0; VERIFY_MEMINFO="$WORK/meminfo-big" TLC_HEAP_PCT=80 VERIFY_DRY_RUN=1 SPEC=ParVaultProtocol bash "$V" tlc > "$WORK/out" 2>&1 || rc=$?
+check "TLC_HEAP_PCT above 75 is refused (rc $rc)" '[ $rc = 2 ] && grep -q "TLC_HEAP_PCT must be 1..75" "$WORK/out"'
 
 # --- Kani: jobs mode (default) and shard mode; failure summary, FAIL_FAST --------------
 : > "$FAKE_LOG"
@@ -182,6 +224,13 @@ check "HARNESS= with an unknown name fails (rc $rc)" '[ $rc = 2 ]'
 
 HARNESS=proof_webdav_auth_decision bash "$V" kani > "$WORK/out" 2>&1 && rc=0 || rc=$?
 check "Kani jobs, one harness (-j 1, no thread prefixes): rc 0, one PASS" '[ $rc = 0 ] && [ "$(grep -c "PASS kani" "$WORK/out")" = 1 ]'
+
+# A reused VERIFY_LOG_DIR: a failed run, then a passing one; the second sees only its own results.
+FAKE_KANI_FAIL=kani_proofs::proof_webdav_auth_decision VERIFY_LOG_DIR="$WORK/logs" KANI_JOBS=4 bash "$V" kani > /dev/null 2>&1 || true
+rc=0; VERIFY_LOG_DIR="$WORK/logs" KANI_JOBS=4 bash "$V" kani > "$WORK/out" 2>&1 || rc=$?
+d="$(sed -n "s#^verify: ALL PASSED (kani). Logs: ##p" "$WORK/out")"
+check "reused VERIFY_LOG_DIR: second run passes (rc $rc) in its own <dir>/<stamp>, times.tsv has $n_kani rows" \
+  '[ $rc = 0 ] && [[ "$d" == "$WORK/logs/"?* ]] && [ "$(wc -l < "$d/kani/times.tsv")" = "$n_kani" ] && [ "$(ls -d "$WORK/logs"/*/ | wc -l)" = 2 ]'
 
 # --- all: a TLC failure is summed with Kani's results -----------------------------------
 FAKE_TLC=fail SPEC=ParVaultProtocol HARNESS=proof_webdav_auth_decision bash "$V" all > "$WORK/out" 2>&1 && rc=0 || rc=$?
