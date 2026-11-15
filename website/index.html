@@ -401,11 +401,12 @@
         <pre class="term"><button class="copy-btn" onclick="copyCode(this)">copy</button><span class="c"># A. Initialize fresh keys &amp; 24-word BIP-39 mnemonic:</span>
 <span class="cmd">parvault init</span> <span class="flag">--profile</span> router-soc <span class="flag">--watch</span> /mnt/usb-nas/shared
 
-<span class="c"># B. Turnkey Router Cloud-NAS appliance mode:</span>
+<span class="c"># B. Turnkey Router Cloud-NAS appliance mode (status page on the router's LAN address;</span>
+<span class="c">#    0.0.0.0 would include the WAN):</span>
 <span class="cmd">parvault up</span> \
   <span class="flag">--profile</span> router-soc \
   <span class="flag">--folder</span> /mnt/usb-nas/shared \
-  <span class="flag">--status-http</span> 0.0.0.0:4080 \
+  <span class="flag">--status-http</span> 192.168.1.1:4080 \
   <span class="flag">--pair</span>
 
 <span class="c"># C. Auto-discover LAN nodes (Zero-IP!):</span>
