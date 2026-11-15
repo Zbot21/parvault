@@ -419,6 +419,23 @@ impl BlockStore {
         self.mesh_client = client;
     }
 
+    /// B-59 (verdict ruling 3): the store's network writes send as, and derive the per-stripe
+    /// PoR session key from, `owner`. The owner is then the accounted storer of every shard it
+    /// places, so its audits pass the host's storer binding and HMAC check.
+    pub fn with_owner_mesh_identity(mut self, owner: &crate::crypto::NodeIdentity) -> Self {
+        if let Some(c) = self.mesh_client.take() {
+            self.mesh_client = Some(c.with_identity(owner.clone()));
+        }
+        self
+    }
+
+    /// The identity this store's network writes send as (and derive PoR session keys from).
+    pub fn mesh_writer_pubkey(&self) -> Option<[u8; 32]> {
+        self.mesh_client
+            .as_ref()
+            .map(|c| c.identity().public_key_bytes())
+    }
+
     pub fn mesh_client(&self) -> Option<&crate::network::MeshClient> {
         self.mesh_client.as_ref()
     }
