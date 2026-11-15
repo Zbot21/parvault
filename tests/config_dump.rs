@@ -599,8 +599,11 @@ fn daemon_digest_matches_dump() {
     ];
     let mut dump_args: Vec<&str> = args.to_vec();
     dump_args.push("--dump-config");
+    // The daemon needs a ring; the dump sees the same environment (the secret shows as set).
+    let genesis = hex::encode([0x47u8; 32]);
     let mut cmd = parvault();
-    cmd.env("PARVAULT_LAN_REGISTRY_DIR", t.path().join("reg"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", t.path().join("reg"))
+        .env("PARVAULT_GENESIS_SEED_HEX", &genesis);
     cmd.arg("--data-dir").arg(&dir).args(&dump_args);
     let (code, dumped, err) = run(&mut cmd);
     assert_eq!(code, 0, "{err}");
@@ -609,6 +612,7 @@ fn daemon_digest_matches_dump() {
     let log = t.path().join("daemon.log");
     let mut cmd = parvault();
     cmd.env("PARVAULT_LAN_REGISTRY_DIR", t.path().join("reg"))
+        .env("PARVAULT_GENESIS_SEED_HEX", &genesis)
         .env("RUST_LOG", "info")
         .arg("--data-dir")
         .arg(&dir)
