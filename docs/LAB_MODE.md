@@ -19,7 +19,7 @@ Every refusal is a startup error: the command prints `<code>: <detail>` on stder
 
 | Rule | Effect | Code |
 | :-- | :-- | :-- |
-| Fixed ports | Every listener the `parvault` daemon binds has a nonzero port and an IP literal that is not unspecified: `listen_tcp`, `listen_quic` (if enabled), `status_http_bind`, `--vfs-webdav-listen`, and `--lab-insecure-metrics` (debug builds) | `reject.lab_ephemeral_port`, `reject.lab_unspecified_bind`, `reject.lab_bind_not_ip_literal` |
+| Fixed ports | Every listener the `parvault` daemon binds has a nonzero port and an IP literal that is not unspecified (`0.0.0.0`, `::`, or the v4-mapped `::ffff:0.0.0.0`): `listen_tcp`, `listen_quic` (if enabled), `status_http_bind`, `--vfs-webdav-listen`, and `--lab-insecure-metrics` (debug builds) | `reject.lab_ephemeral_port`, `reject.lab_unspecified_bind`, `reject.lab_bind_not_ip_literal` |
 | Fixed dial set | The dial set is `bootstrap_peers` ∪ `lite_seed_addr` ∪ `lab.relays`. Each entry is an IP-literal TCP (`/ip4\|ip6/<ip>/tcp/<port>`) or QUIC (`/udp/<port>/quic-v1`) multiaddr ending in `/p2p/<id>` | `reject.lab_addr_without_peer_id`, `reject.lab_dial_shape` |
 | IP literals only | A `/dns*` address or a `host:port` name in the dial set is refused, so no name is ever resolved | `reject.lab_dns_addr` |
 | Relay list | `[lab] relays` must be set | `reject.lab_relays_missing` |

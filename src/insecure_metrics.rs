@@ -61,7 +61,7 @@ pub fn spawn(
     let facts = InsecureMetricsFacts {
         feature: bf.insecure_metrics_feature,
         debug_assertions: bf.debug_assertions,
-        unspecified: addr.ip().is_unspecified(),
+        unspecified: addr.ip().to_canonical().is_unspecified(),
         iface_owns_ip: crate::os_sys::interface_has_ip(&iface, addr.ip())?,
     };
     if let Err(code) = insecure_metrics_listener_decision(&facts) {

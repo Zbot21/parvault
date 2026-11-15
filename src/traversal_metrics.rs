@@ -626,7 +626,7 @@ pub struct InsecureMetricsFacts {
     pub feature: bool,
     /// `build_facts().debug_assertions`.
     pub debug_assertions: bool,
-    /// The bind IP is unspecified (`0.0.0.0`, `::`).
+    /// The bind IP is unspecified (`0.0.0.0`, `::`, or the v4-mapped `::ffff:0.0.0.0`).
     pub unspecified: bool,
     /// The bind IP is assigned to the named interface (at bind time).
     pub iface_owns_ip: bool,

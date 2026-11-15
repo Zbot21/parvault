@@ -319,6 +319,60 @@ fn deterministic_refuses_unspecified_webdav_bind() {
     gate_ran("lab_deterministic::deterministic_refuses_unspecified_webdav_bind");
 }
 
+/// The unspecified-bind rule, v4-mapped: `[::ffff:0.0.0.0]` on a dual-stack socket is the IPv4
+/// wildcard, so the status listener refuses it like `0.0.0.0`.
+#[test]
+fn deterministic_refuses_v4_mapped_unspecified_status_bind() {
+    let (root, dir) = prepare("unspec-st-m");
+    let toml = lab_toml(root.path(), "");
+    let mut cmd = daemon_cmd(&dir, &toml, &lab_listen());
+    cmd.args(["--status-http", "[::ffff:0.0.0.0]:4080"]);
+    assert_startup_refused(cmd, "reject.lab_unspecified_bind");
+    gate_ran("lab_deterministic::deterministic_refuses_v4_mapped_unspecified_status_bind");
+}
+
+/// The unspecified-bind rule, v4-mapped, on the built-in WebDAV listener.
+#[test]
+fn deterministic_refuses_v4_mapped_unspecified_webdav_bind() {
+    let (root, dir) = prepare("unspec-dav-m");
+    let toml = lab_toml(root.path(), "");
+    let mut cmd = daemon_cmd(&dir, &toml, &lab_listen());
+    cmd.args([
+        "--no-socket",
+        "--vfs-webdav-listen",
+        "[::ffff:0.0.0.0]:4081",
+    ]);
+    assert_startup_refused(cmd, "reject.lab_unspecified_bind");
+    gate_ran("lab_deterministic::deterministic_refuses_v4_mapped_unspecified_webdav_bind");
+}
+
+/// The accept twin: a v4-mapped specific address (`[::ffff:127.a.b.c]`) is not unspecified, so
+/// the status listener starts there and answers on that IPv4 address.
+#[test]
+fn deterministic_accepts_v4_mapped_specific_status_bind() {
+    let (root, dir) = prepare("st-m-ok");
+    let toml = lab_toml(root.path(), "");
+    let listen = lab_listen();
+    let ip = lab_ip();
+    let port = lab_port();
+    let mut cmd = daemon_cmd(&dir, &toml, &listen);
+    cmd.args(["--status-http", &format!("[::ffff:{ip}]:{port}")]);
+    let mut node = spawn_logged(cmd, root, dir);
+    node.wait_for(&listen, Duration::from_secs(20));
+    let v4: std::net::SocketAddr = format!("{ip}:{port}").parse().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect_timeout(&v4, Duration::from_millis(500)).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "status listener not reachable on {v4}:\n{}",
+            node.log_text()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!node.log_text().contains("reject.lab_unspecified_bind"));
+    gate_ran("lab_deterministic::deterministic_accepts_v4_mapped_specific_status_bind");
+}
+
 /// LAB-CONFLICT reject: an explicit `lan_discovery_enabled = true` conflicts; the message names
 /// the key and its source.
 #[test]

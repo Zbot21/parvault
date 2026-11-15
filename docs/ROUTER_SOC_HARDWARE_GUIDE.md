@@ -250,11 +250,15 @@ parvault up \
 ## 7. OpenWrt `procd` Service Installation
 
 ### Binary Installation
-The command downloads the latest published release, <!-- metric:released_version_tag -->`v0.5.1`<!-- /metric -->.
+The command downloads the latest published release, <!-- metric:released_version_tag -->`v0.5.3`<!-- /metric -->. It is a dev build (`-dev` in each asset name): its `SHA256SUMS` is signed with the project's dev key, not a release key. OpenWrt's dropbear has no `ssh-keygen`, so verify `SHA256SUMS` against `SHA256SUMS.sig` on another machine first ([Verify a download](REPRODUCIBLE_BUILDS.md#verify-a-download)) and copy that verified `SHA256SUMS` to `/tmp` on the router; the router then checks the binary against it.
 
 ```bash
-# 1. Download static aarch64 or x86_64 musl binary
-wget -O /usr/bin/parvault https://github.com/Zbot21/parvault/releases/download/v0.5.1/parvault-aarch64-unknown-linux-musl
+# 1. Download the static aarch64 (or x86_64) musl binary and check it against the verified SHA256SUMS
+cd /tmp
+wget https://github.com/Zbot21/parvault/releases/download/v0.5.3/parvault-aarch64-unknown-linux-musl-dev
+head -n1 SHA256SUMS        # the verified copy; must be: # parvault v0.5.3 dev
+grep -v '^#' SHA256SUMS | grep ' parvault-aarch64-unknown-linux-musl-dev$' | sha256sum -c -
+mv parvault-aarch64-unknown-linux-musl-dev /usr/bin/parvault
 chmod +x /usr/bin/parvault
 
 # 2. Create runtime directories

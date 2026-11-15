@@ -1254,7 +1254,7 @@ pub fn lab_side_channel_decision(eff: &EffectiveConfig) -> Result<(), &'static s
 }
 
 /// Deterministic lab mode, the listener rule: a bind is an IP literal (Q2) that is not
-/// unspecified, with a nonzero port. `bind` is a multiaddr (`/ip4/<ip>/tcp/<port>`,
+/// unspecified (`0.0.0.0`, `::`, or the v4-mapped `::ffff:0.0.0.0`), with a nonzero port. `bind` is a multiaddr (`/ip4/<ip>/tcp/<port>`,
 /// `/ip6/<ip>/udp/<port>/quic-v1`) or an `IP:port` socket address.
 pub fn lab_bind_decision(bind: &str) -> Result<(), &'static str> {
     let b = bind.trim();
@@ -1283,7 +1283,9 @@ pub fn lab_bind_decision(bind: &str) -> Result<(), &'static str> {
     if port == 0 {
         return Err("reject.lab_ephemeral_port");
     }
-    if ip.is_unspecified() {
+    // `to_canonical`: `::ffff:0.0.0.0` is the IPv4 wildcard on a dual-stack socket (the std
+    // listeners do not set `IPV6_V6ONLY`), so it is unspecified too.
+    if ip.to_canonical().is_unspecified() {
         return Err("reject.lab_unspecified_bind");
     }
     Ok(())
