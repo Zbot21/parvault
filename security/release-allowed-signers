@@ -1,0 +1,5 @@
+# RELEASE signing key: not created yet (L-113). Release builds start with the owner's offline
+# hardware key (ed25519-sk); until then no release build exists and nothing here verifies.
+# When the key exists, add one line in this form (and the same line in scripts/install.sh):
+#   parvault-release namespaces="parvault-release-build" sk-ssh-ed25519@openssh.com AAAA...
+# The dev key (dev-allowed-signers) must never be listed here.
