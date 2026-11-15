@@ -61,6 +61,7 @@ flowchart TD
   - `parvault-fuse`: **<!-- metric:size.parvault-fuse.aarch64 -->`1.08 MiB`<!-- /metric -->** (<!-- metric:size.parvault-fuse.aarch64.bytes -->`1,128,048 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-fuse.x86_64 -->`1.24 MiB`<!-- /metric -->** (<!-- metric:size.parvault-fuse.x86_64.bytes -->`1,304,768 B`<!-- /metric --> `x86_64`)
   - `parvault-sync`: **<!-- metric:size.parvault-sync.aarch64 -->`0.67 MiB`<!-- /metric -->** (<!-- metric:size.parvault-sync.aarch64.bytes -->`700,608 B`<!-- /metric --> `aarch64`) / **<!-- metric:size.parvault-sync.x86_64 -->`0.78 MiB`<!-- /metric -->** (<!-- metric:size.parvault-sync.x86_64.bytes -->`815,920 B`<!-- /metric --> `x86_64`) — zero-key incremental folder sync plugin (`GatewayFolderSync`)
 - **OCI / Docker `FROM scratch` container image (`parvault:router-soc`):** **<!-- metric:docker.unpacked -->`20.6 MB`<!-- /metric -->** total uncompressed disk usage (**<!-- metric:docker.compressed -->`6.48 MB`<!-- /metric -->** compressed content size, stripped binaries + `router.toml` configuration, 0 OS overhead).
+  - **Runs as non-root:** both images (`deploy/Dockerfile.router-soc`, `deploy/Dockerfile.musl`) run the daemon as user `parvault` (uid/gid `65532`) with no added capability; every port is above `1023`. The image owns `/var/lib/parvault`, `/mnt/nas` and the socket dir `/run/parvault` (use `--ipc-socket /run/parvault/parvault.sock`). A host bind mount must be owned by uid `65532`. Do not add `NET_ADMIN`; apply `tc netem` from a sidecar that joins the container's network namespace.
 - **Minimum Free Disk Reserve (`min_free_disk_bytes`):**
   - `--profile router-soc`: `64 MiB` (`67,108,864` bytes), allowing deployment on small USB flash drives or flash partitions.
   - `--profile homelab-nas`: `1 GiB` (`1,073,741,824` bytes).
@@ -331,12 +332,15 @@ cat /proc/$(pgrep -u parvault parvault)/status | grep -E "VmRSS|VmHWM|Threads"
 
 ## 8. prplOS LXC Container Deployment
 
-For carrier and broadband gateway environments running `prplOS`, deploy `parvault` inside an isolated, unprivileged LXC container using `deploy/prplos-lxc-manifest.json`:
+> **Unverified: not yet tested on a real prplOS image (B-133).** `prplos-lxc-ctl` and this manifest schema are not confirmed to exist (prplOS ships LCM/uxc). Treat this section as a sketch.
+
+For carrier and broadband gateway environments running `prplOS`, deploy `parvault` inside an isolated, unprivileged LXC container using `deploy/prplos-lxc-manifest.json` (shown as shipped; edit `storage_mounts` for your NAS disk):
 
 ```json
 {
   "schema_version": "1.0",
-  "container_name": "parvault-router-nas",
+  "comment": "unverified: not yet tested on a real prplOS image (B-133). prplos-lxc-ctl and this manifest schema are not confirmed to exist; prplOS ships LCM/uxc.",
+  "container_name": "parvault-daemon",
   "vendor": "Neighborhood Cloud / Project ParVault",
   "version": "0.5.2",
   "license": "AGPL-3.0-only",
@@ -349,28 +353,26 @@ For carrier and broadband gateway environments running `prplOS`, deploy `parvaul
     "entrypoint": "/usr/local/bin/parvault",
     "args": [
       "up",
-      "--profile", "router-soc",
-      "--folder", "/mnt/nas-storage/shared",
-      "--status-http", "192.168.1.1:4080",
-      "--data-dir", "/var/lib/parvault"
+      "--profile",
+      "router-soc",
+      "--config",
+      "/etc/parvault/router.toml",
+      "--status-http",
+      "0.0.0.0:4080"
     ],
+    "args_comment": "router.toml binds the status page to 127.0.0.1:4080 (B-54), the LXC's own loopback. The LXC runs in its own bridged netns, so 0.0.0.0 is the container's interface, not the router's WAN; the router's port forwarding decides what reaches 4080. A bare-metal install keeps the loopback bind.",
     "restart_policy": "always",
     "restart_backoff_sec": 5
   },
   "resources": {
-    "memory_limit_mb": 48,
-    "memory_soft_limit_mb": 32,
+    "memory_limit_mb": 32,
+    "memory_soft_limit_mb": 24,
     "cpu_shares": 256,
-    "max_cpu_percent_por_audit": 5,
+    "max_cpu_percent_por_audit": 2,
     "storage_mounts": [
       {
-        "source": "/mnt/usb-drive/parvault-vault",
+        "source": "/mnt/nas/parvault-vault",
         "destination": "/var/lib/parvault",
-        "options": ["rw", "noatime", "nosuid", "nodev"]
-      },
-      {
-        "source": "/mnt/usb-drive/shared-nas",
-        "destination": "/mnt/nas-storage/shared",
         "options": ["rw", "noatime", "nosuid", "nodev"]
       }
     ]
@@ -378,15 +380,24 @@ For carrier and broadband gateway environments running `prplOS`, deploy `parvaul
   "network": {
     "mode": "bridge",
     "ports": [
-      { "protocol": "tcp", "port": 4001, "description": "libp2p TCP + Noise XX + Yamux P2P storage" },
-      { "protocol": "udp", "port": 4009, "description": "Zero-IP cryptographically signed LAN discovery beacon" },
-      { "protocol": "tcp", "port": 4080, "description": "Embedded Router Cloud-NAS status API and Web UI" }
-    ]
+      { "protocol": "tcp", "port": 4001, "description": "libp2p TCP + Noise XX + Yamux" },
+      { "protocol": "tcp", "port": 4002, "description": "Seed direct TCP transport" },
+      { "protocol": "udp", "port": 4009, "description": "Signed zero-IP LAN beacon discovery (ADR-22)" },
+      { "protocol": "tcp", "port": 4080, "description": "Router NAS Web status & REST API (ADR-21)" },
+      { "protocol": "udp", "port": 4001, "description": "Optional QUIC listener (ADR-08)" },
+      { "protocol": "udp", "port": 5353, "description": "mDNS zero-config LAN discovery" }
+    ],
+  "locality_policy": {
+      "intra_asn_ratio": 0.70,
+      "inter_asn_ratio": 0.30,
+      "target_rtt_ms": 5
+    }
   },
   "security": {
     "read_only_rootfs": true,
     "drop_capabilities": ["ALL"],
-    "keep_capabilities": ["NET_BIND_SERVICE"]
+    "keep_capabilities": ["NET_BIND_SERVICE"],
+    "tpm2_enclave_device": "/dev/tpmrm0"
   }
 }
 ```
@@ -394,8 +405,25 @@ For carrier and broadband gateway environments running `prplOS`, deploy `parvaul
 Deploy to the prplOS container manager:
 ```bash
 prplos-lxc-ctl import --manifest deploy/prplos-lxc-manifest.json
-prplos-lxc-ctl start parvault-router-nas
+prplos-lxc-ctl start parvault-daemon
 ```
+
+**Status page in bridge mode.** The manifest passes `--status-http 0.0.0.0:4080`. In the LXC's bridged netns, `0.0.0.0` is the container's own veth, not the router's interfaces. The router's LAN IP (for example `192.168.1.1`) does not exist inside the netns, so binding it fails with `EADDRNOTAVAIL`. Whatever reaches the veth decides who can open the page. Bridging the container to `br-lan` opens port 4080 to the whole LAN. Every request still needs a read-only token, but there is no TLS until `v0.6.0`, so the token crosses the LAN in clear. Never forward 4080 from the WAN zone.
+
+### Docker on the router (`deploy/Dockerfile.router-soc`)
+
+The image's CMD also binds the status page to `0.0.0.0:4080` inside its own network namespace. Publish the port only on the router's LAN address:
+
+<!-- doc-cmd: skip reason="needs Docker on the router and the built image" -->
+```bash
+docker run -d --name parvault-router-soc --memory=48m --memory-swap=48m \
+  --cap-drop ALL --security-opt no-new-privileges \
+  -p <LAN-IP>:4080:4080 -p <LAN-IP>:4001:4001 \
+  parvault:router-soc
+```
+
+- **Never use plain `-p 4080:4080`.** That listens on every host address. Docker's DNAT rules run before fw4's input rules, so on a router host the port is reachable from the WAN even when fw4 drops WAN input.
+- **Never use `--network host` with the image's CMD.** In the host's namespace, `0.0.0.0:4080` is every router interface, the WAN included (B-54). On the host network, drop the CMD's `--status-http` (the shipped `router.toml` binds `127.0.0.1:4080`) or pass `--status-http <LAN-IP>:4080`.
 
 ---
 

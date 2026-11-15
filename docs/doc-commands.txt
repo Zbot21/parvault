@@ -66,66 +66,66 @@ bash scripts/docker_acceptance_gate.sh
 bash scripts/build_bins.sh --profile soc --target x86_64-unknown-linux-musl --out dist
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc bash scripts/build_bins.sh --profile soc --target aarch64-unknown-linux-musl --out dist
 
-## QUICKSTART.md:76 node=router
+## QUICKSTART.md:79 node=router
 parvault init --profile router-soc --watch /mnt/usb-nas/shared --label "Home-NAS"
 parvault wot init
 
-## QUICKSTART.md:90 node=router background ready="Embedded Status Server listening" capture PAIRING_CODE="Home LAN Pairing Code: (\S+)"
+## QUICKSTART.md:93 node=router background ready="Embedded Status Server listening" capture PAIRING_CODE="Home LAN Pairing Code: (\S+)"
 parvault up --profile router-soc --folder /mnt/usb-nas/shared --status-http 127.0.0.1:4080 --pair
 
-## QUICKSTART.md:111 node=laptop
+## QUICKSTART.md:114 node=laptop
 parvault discover
 
-## QUICKSTART.md:127 node=laptop
+## QUICKSTART.md:130 node=laptop
 parvault join --code <PAIRING_CODE>
 
-## QUICKSTART.md:144 node=laptop capture LAPTOP_ED25519_KEY="Ed25519 Public Key \(hex\): ([0-9a-f]{64})"
+## QUICKSTART.md:147 node=laptop capture LAPTOP_ED25519_KEY="Ed25519 Public Key \(hex\): ([0-9a-f]{64})"
 parvault identity
 
-## QUICKSTART.md:152 node=router capture TOKEN="^([0-9a-f]{128,})"
+## QUICKSTART.md:155 node=router capture TOKEN="^([0-9a-f]{128,})"
 parvault wot invite --peer <LAPTOP_ED25519_KEY>
 
-## QUICKSTART.md:159 node=laptop
+## QUICKSTART.md:162 node=laptop
 parvault wot install-chain --token <TOKEN>
 
-## QUICKSTART.md:171 node=laptop
+## QUICKSTART.md:174 node=laptop
 mkdir -p ~/Documents && echo "example" > ~/Documents/tax-return.pdf   # a file to back up
 export PARVAULT_SEED_PHRASE="$(parvault new-seed-phrase)"; echo "$PARVAULT_SEED_PHRASE"
 parvault watch-folder --folder ~/Documents --vault-namespace documents --snapshot-out ./documents.manifest.bin --prune-deleted --once
 parvault restore-folder --snapshot ./documents.manifest.bin --vault-namespace documents --out-dir ./restored-docs --file "tax-return.pdf"
 
-## QUICKSTART.md:204 node=main skip="no public tracker is hosted (the docs say so)"
+## QUICKSTART.md:207 node=main skip="no public tracker is hosted (the docs say so)"
 parvault watch-folder --folder ~/Documents --public --tracker /ip4/<YOUR_SEED_IP>/tcp/4002/p2p/<SEED_PEER_ID> --once
 
-## QUICKSTART.md:224 node=laptop
+## QUICKSTART.md:227 node=laptop
 export PARVAULT_SEED_PHRASE="$(parvault new-seed-phrase)"; echo "$PARVAULT_SEED_PHRASE"
 parvault watch-folder --folder ~/Documents --vault-namespace documents --once
 
-## QUICKSTART.md:230 node=main skip="a new machine that reaches the ring; the Docker gate (stage 10) runs recover-from-seed"
+## QUICKSTART.md:233 node=main skip="a new machine that reaches the ring; the Docker gate (stage 10) runs recover-from-seed"
 export PARVAULT_SEED_PHRASE="<your 24 words>"
 parvault recover-from-seed --vault-namespace documents --out-dir ./recovered-after-fire
 
-## QUICKSTART.md:243 node=main skip="the certificate and the issuer's owner key come from two machines' output"
+## QUICKSTART.md:246 node=main skip="the certificate and the issuer's owner key come from two machines' output"
 parvault issue-device-cert --device-peer-id "parvault-peer-8f3a9c12e4b07d11" --device-label "Work-Laptop"
 parvault-seed verify-device-cert --data-dir /mnt/nas/parvault-seed --cert "PARVAULT-CERT-V1:<hex>" --owner-pq-pubkey-hex <ISSUER_OWNER_PQ_PUBLIC_KEY_HEX>
 
-## QUICKSTART.md:262 node=laptop
+## QUICKSTART.md:265 node=laptop
 parvault status
 parvault scrub
 
-## QUICKSTART.md:276 node=main skip="needs a stripe root from an abuse report; the Docker gate (stages 7b, 9) runs evict"
+## QUICKSTART.md:279 node=main skip="needs a stripe root from an abuse report; the Docker gate (stages 7b, 9) runs evict"
 parvault evict --ip 203.0.113.42 --reason "Spam flood"
 parvault evict --merkle-root <STRIPE_MERKLE_ROOT_HEX> --propagate
 
-## QUICKSTART.md:293 node=main skip="no public tracker is hosted (the docs say so)"
+## QUICKSTART.md:296 node=main skip="no public tracker is hosted (the docs say so)"
 parvault report-abuse --tracker /ip4/<YOUR_SEED_IP>/tcp/4002/p2p/<SEED_PEER_ID> --manifest ./contraband.manifest.bin --disclosed-key-hex <DISCLOSED_KEY_HEX> --allegation "CSAM / DMCA takedown violation"
 parvault-seed admin list-takedowns --data-dir /mnt/nas/parvault-seed
 parvault-seed admin approve-takedown --data-dir /mnt/nas/parvault-seed --report-id <REPORT_ID> --note "Confirmed violation" --propagate
 parvault-seed admin emergency-evict --data-dir /mnt/nas/parvault-seed --ip 203.0.113.66 --warrant-ref "WARRANT-1234" --propagate
 
-## QUICKSTART.md:317 node=laptop background ready="Built-in VFS WebDAV listening on http://127.0.0.1:8088"
+## QUICKSTART.md:320 node=laptop background ready="Built-in VFS WebDAV listening on http://127.0.0.1:8088"
 parvault up --no-socket --vfs-seed-dir ~/Documents --vfs-webdav-listen 127.0.0.1:8088
 
-## QUICKSTART.md:322 node=laptop
+## QUICKSTART.md:325 node=laptop
 TOKEN="$(parvault token mint --read-only --ttl-secs 86400)"
 curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/

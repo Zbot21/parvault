@@ -19,7 +19,7 @@ use chacha20poly1305::{
 };
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::net::SocketAddr;
@@ -690,8 +690,7 @@ async fn serve_single_admin_rpc_conn<H: SeedAdminRpcHandler>(
     // 1. Fresh ephemeral X25519 keypair + 32-byte CSPRNG challenge nonce per TCP connection.
     let server_secret = X25519StaticSecret::random_from_rng(OsRng);
     let server_public = X25519PublicKey::from(&server_secret);
-    let mut challenge_nonce = [0u8; 32];
-    OsRng.fill_bytes(&mut challenge_nonce);
+    let challenge_nonce: [u8; 32] = OsRng.gen();
 
     let hello = ServerHello::issue(&seed_identity, *server_public.as_bytes(), challenge_nonce);
     let hello_bytes = serialize_wire(&hello)?;

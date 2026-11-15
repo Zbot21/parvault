@@ -1,19 +1,40 @@
 # 10-Node + Seed Server Validation Mesh on 10.42.0.0/16 with simulated 5ms latency and 1% packet loss (tc netem)
+# Non-root (B-106): every daemon runs as uid 65532 with no added capability.
+# B-106 waiver, by name: the one-shot `netem01`..`netem10` sidecars run as root (uid 0). Reason:
+# `tc qdisc` on a node's eth0 needs CAP_NET_ADMIN, which the nodes do not get. Bounds: all
+# capabilities dropped but NET_ADMIN, no-new-privileges, not privileged, no device, and only the
+# network namespace of their own node (`network_mode: "service:<node>"`); they exit after tc.
+x-netem: &netem
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile.musl
+  user: "0:0"
+  cap_drop:
+    - ALL
+  cap_add:
+    - NET_ADMIN
+  security_opt:
+    - no-new-privileges
+  privileged: false
+  restart: "no"
+  entrypoint:
+    - /bin/sh
+    - -c
+    - tc qdisc replace dev eth0 root netem delay 5ms loss 1% && tc qdisc show dev eth0
+
 x-parvault-node: &parvault-node
   build:
     context: ..
     dockerfile: deploy/Dockerfile.musl
-  cap_add:
-    - NET_ADMIN
   environment:
     PARVAULT_SEED_ADDR: "/ip4/10.42.1.10/tcp/4002"
     PARVAULT_PEERS: "/ip4/10.42.1.11/tcp/4001,/ip4/10.42.1.12/tcp/4001,/ip4/10.42.1.13/tcp/4001,/ip4/10.42.1.14/tcp/4001,/ip4/10.42.1.15/tcp/4001,/ip4/10.42.1.16/tcp/4001,/ip4/10.42.1.17/tcp/4001,/ip4/10.42.2.18/tcp/4001,/ip4/10.42.2.19/tcp/4001,/ip4/10.42.2.20/tcp/4001"
   entrypoint:
-    - /bin/sh
-    - -c
-    - |
-      tc qdisc add dev eth0 root netem delay 5ms loss 1% || true
-      exec /usr/local/bin/parvault daemon start --listen /ip4/0.0.0.0/tcp/4001
+    - /usr/local/bin/parvault
+    - daemon
+    - start
+    - --listen
+    - /ip4/0.0.0.0/tcp/4001
 
 services:
   seed00:
@@ -84,6 +105,47 @@ services:
     networks:
       meshnet:
         ipv4_address: 10.42.2.20
+
+  netem01:
+    <<: *netem
+    network_mode: "service:node01"
+    depends_on: [node01]
+  netem02:
+    <<: *netem
+    network_mode: "service:node02"
+    depends_on: [node02]
+  netem03:
+    <<: *netem
+    network_mode: "service:node03"
+    depends_on: [node03]
+  netem04:
+    <<: *netem
+    network_mode: "service:node04"
+    depends_on: [node04]
+  netem05:
+    <<: *netem
+    network_mode: "service:node05"
+    depends_on: [node05]
+  netem06:
+    <<: *netem
+    network_mode: "service:node06"
+    depends_on: [node06]
+  netem07:
+    <<: *netem
+    network_mode: "service:node07"
+    depends_on: [node07]
+  netem08:
+    <<: *netem
+    network_mode: "service:node08"
+    depends_on: [node08]
+  netem09:
+    <<: *netem
+    network_mode: "service:node09"
+    depends_on: [node09]
+  netem10:
+    <<: *netem
+    network_mode: "service:node10"
+    depends_on: [node10]
 
 networks:
   meshnet:

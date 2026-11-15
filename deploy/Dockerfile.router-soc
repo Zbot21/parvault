@@ -28,12 +28,25 @@ RUN cargo build --locked --profile soc --target ${TARGET_ARCH} --bin parvault \
 
 COPY deploy/router-soc/parvault-router.toml /build/router.toml
 
+# Non-root (B-106): scratch has no adduser, so the builder prepares the passwd and group
+# entries for uid/gid 65532 and the dirs it owns (data, NAS mount, socket dir).
+RUN mkdir -p /rootfs/etc /owned/mnt/nas /owned/var/lib/parvault /owned/run/parvault \
+    && printf 'root:x:0:0:root:/:/sbin/nologin\nparvault:x:65532:65532:parvault:/var/lib/parvault:/sbin/nologin\n' > /rootfs/etc/passwd \
+    && printf 'root:x:0:\nparvault:x:65532:\n' > /rootfs/etc/group \
+    && chmod 0644 /rootfs/etc/passwd /rootfs/etc/group \
+    && chmod 0750 /owned/var/lib/parvault /owned/run/parvault
+
 # Ultra-minimal scratch runtime: 0 OS overhead, statically linked musl binary
 FROM scratch
 
 COPY --from=builder /build/parvault /parvault
 COPY --from=builder /build/parvault-seed /parvault-seed
 COPY --from=builder /build/router.toml /etc/parvault/router.toml
+COPY --from=builder /rootfs/etc/passwd /rootfs/etc/group /etc/
+# One COPY per owned dir, so the parents (/mnt, /var, /run) stay root-owned.
+COPY --from=builder --chown=65532:65532 /owned/mnt/nas /mnt/nas
+COPY --from=builder --chown=65532:65532 /owned/var/lib/parvault /var/lib/parvault
+COPY --from=builder --chown=65532:65532 /owned/run/parvault /run/parvault
 
 VOLUME ["/mnt/nas", "/var/lib/parvault"]
 
@@ -44,6 +57,11 @@ VOLUME ["/mnt/nas", "/var/lib/parvault"]
 # 4080/tcp - Router NAS Web status dashboard & JSON telemetry (ADR-18)
 EXPOSE 4001/tcp 4002/tcp 4009/udp 4080/tcp
 
+# Every port is above 1023: the daemon needs no capability. The user is named: scratch has no
+# user database of its own, but the /etc/passwd and /etc/group copied above resolve
+# parvault:parvault to 65532:65532 (without them only a numeric uid would work here).
+USER parvault:parvault
+WORKDIR /var/lib/parvault
 ENTRYPOINT ["/parvault"]
 # The bundled router.toml binds the status page to 127.0.0.1:4080 (B-54), which inside a container is
 # the container's own loopback, so EXPOSE 4080 would reach nothing. The container has its own netns,

@@ -1,6 +1,6 @@
 use crate::storage::ShardId;
 use hmac::{Hmac, Mac};
-use rand::{rngs::OsRng, Rng, RngCore};
+use rand::{rngs::OsRng, Rng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -73,8 +73,7 @@ pub fn generate_por_challenge(
     issued_at_unix_ms: u64,
 ) -> PorChallenge {
     let mut rng = OsRng;
-    let mut nonce = [0u8; 32];
-    rng.fill_bytes(&mut nonce);
+    let nonce: [u8; 32] = rng.gen();
 
     let max_window = shard_total_len.clamp(1, 4096);
     let length = if shard_total_len <= 64 {
@@ -184,8 +183,7 @@ pub fn generate_multi_segment_por_challenge(
     issued_at_unix_ms: u64,
 ) -> MultiSegmentPorChallenge {
     let mut rng = OsRng;
-    let mut nonce = [0u8; 32];
-    rng.fill_bytes(&mut nonce);
+    let nonce: [u8; 32] = rng.gen();
 
     let strata = num_strata.max(1).min(shard_total_len.max(1) as usize);
     let stride = (shard_total_len / strata as u64).max(1);
@@ -305,8 +303,7 @@ pub fn generate_chunk_challenge(
     width: u32,
     issued_at_unix_ms: u64,
 ) -> ChunkChallenge {
-    let mut nonce = [0u8; 32];
-    OsRng.fill_bytes(&mut nonce);
+    let nonce: [u8; 32] = OsRng.gen();
     let chunk_indices = random_chunk_indices(n, width);
     let hmac_token = compute_chunk_challenge_hmac(
         session_key,
