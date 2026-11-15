@@ -188,11 +188,20 @@ impl QuotaManager {
         q
     }
 
+    /// Binds `data_dir/quota_state.bin`. An empty manager loads it; a non-empty one keeps its
+    /// accounting and replaces a file that loads, but fails closed like [`Self::load_from`] on a
+    /// file that exists and does not load (B-52 QA): that file is kept, never overwritten.
     pub fn bind_persistence_dir(&mut self, data_dir: &std::path::Path) {
         let path = data_dir.join("quota_state.bin");
         if self.used_storage_bytes == 0 && self.peer_accounts.is_empty() {
             self.load_from(path);
         } else {
+            if let Err(code) =
+                quota_state_load_decision(crate::storage::fsio::read_state_file(&path))
+            {
+                tracing::warn!(code, path = %path.display(), "quota state not loaded; refusing new shards");
+                self.load_error = Some(code);
+            }
             self.persistence_path = Some(path);
         }
     }
@@ -465,6 +474,10 @@ mod tests {
         seed.record_shard_stored("peer", "a".into(), 1024);
         let ok = QuotaManager::with_persistence_dir(1 << 30, 1 << 20, ok_dir.path());
         assert!(ok.quota_decision("local", 1024).is_ok());
+        let mut busy = QuotaManager::new(1 << 30, 1 << 20);
+        busy.record_shard_stored("peer", "c".into(), 2048);
+        busy.bind_persistence_dir(ok_dir.path());
+        assert!(busy.quota_decision("local", 1024).is_ok());
         assert_eq!(
             ok.peer_accounts
                 .get("peer")
@@ -488,6 +501,13 @@ mod tests {
             let mut bound = QuotaManager::new(1 << 30, 1 << 20);
             bound.bind_persistence_dir(dir.path());
             assert_eq!(bound.quota_decision("local", 1024), Err(code));
+            // A non-empty manager bound to the same file fails closed too, and never writes it.
+            let mut busy = QuotaManager::new(1 << 30, 1 << 20);
+            busy.record_shard_stored("peer", "c".into(), 2048);
+            busy.bind_persistence_dir(dir.path());
+            assert_eq!(busy.quota_decision("local", 1024), Err(code));
+            busy.record_shard_stored("peer", "d".into(), 2048);
+            busy.flush_persistence();
             q.record_shard_stored("local", "b".into(), 1024);
             q.flush_persistence();
             if !bytes.is_empty() {
