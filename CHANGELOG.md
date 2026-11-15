@@ -8,11 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- **Storage audits (F-06, F-34, B-59).** The owner daemon now checks that its hosts still hold its shards. It sends a chunk-Merkle challenge (`ChunkAudit`, a new wire variant appended last) for `min(4, n)` random 4 KiB chunks and checks each chunk and its path against the manifest's per-shard root. A host answers only the peer that stored the shard (`reject.por_not_storer`), at most 6 times per stripe key per 10 min. An invalid proof is a failure in the owner's own ledger and marks the shard degraded. A timeout or refusal is counted as unanswered and is never a failure. New: `--no-audit`, `por_audit_interval_secs` and `por_audit_rtt_ms` (default 1 h and 2 s; 6 h and 5 s on `router-soc`), `por_audit_state.json`, and an audits section in `parvault status`. Hosts must run this release before an owner's audit results mean anything; an older host does not know the variant and is counted unanswered.
+
 ### Changed
 - **`vfs`: `VfsStubNode` is now `VfsLazyNode`, `register_stub_file` is now `register_lazy_file` (public API rename).** Names only; the serialized fields, the FUSE ABI and the WebDAV wire are unchanged.
 - **CI runs on every PR and pins its tools (B-67).** `pull_request` no longer filters on `main`, so stacked PRs get CI. Kani is pinned to `0.68.0`. `tla2tools.jar` (v1.8.0) is fetched into `$RUNNER_TEMP`, checked against a pinned sha256 and exported as `TLA2TOOLS_JAR`.
 
 ### Fixed
+- **A node never credits itself for an audit (F-07).** Audit credit goes only to a prover that is not one of the auditor's identities, keyed by its Noise-authenticated device id.
+- **The daemon's IPC gateway stores as the owner (B-59).** Stripes stored through the embedded gateway were sent, and their PoR keys derived, as the node identity, so the owner could not audit them. They now use the owner identity, like every other writer.
 - **A voucher whose nullifier cannot be saved is refused (F-55, B-42).** `VoucherNullifierLedger` used to accept the voucher and drop a failed write, so after a restart the same voucher could be redeemed again. It now removes the nullifier and refuses with `reject.voucher_nullifier_not_persisted`.
 - **Quota state and tracker pins fail closed on a failed write (B-52).** After a failed `quota_state.bin` write the node refuses new shards (`reject.quota_state_not_persisted`) until a write succeeds. `persist_pinned_tracker_admin` returns an error instead of dropping a failed write, and no longer replaces an unreadable pin file with a new list.
 - **WAN `join` checks the card against the code (F-54, B-45).** As on the LAN path, the typed code must re-derive from the card's `PeerId` and PQ fingerprint, and the card's address must pin that `PeerId` (`reject.wan_card_code_mismatch`, `reject.wan_card_addr_peer_mismatch`). The WAN pairing lookup no longer pins every card it opens, so a refused card is not written to `known_peers.json`; only the accepted card is pinned. This raises a rendezvous server's cost to forge a card for its own `PeerId` to about 2^44 offline hashes (it chooses the PQ fingerprint, and the nonce is a constant); it does not refuse a forged card. The card stays readable by the server. PAKE pairing (v0.5.7) is the fix.

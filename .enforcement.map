@@ -25,6 +25,8 @@ adr        D-ADR     path=docs/adr/*.md
 reach      F-03      sym=src/network/wire_handler.rs::admission_decision from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
 reach      F-05      sym=src/network/wot.rs::verify_and_admit_public_ticket from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
 reach      F-06      sym=src/por/audit.rs::chunk_audit_decision from=src/cli/daemon.rs::run_daemon ref=docs/security/TRUST_FINDINGS.md   # B-59: the owner daemon audit loop (por::auditor::run_audit_job)
+reach      F-06-SEED sym=src/por/audit.rs::chunk_audit_decision from=src/bin/parvault-seed.rs::main ref=docs/security/TRUST_FINDINGS.md   # B-59 plan commit 6: the seed audits the lite stripes it fanned out
+open       F-06-SEED expect=reach by=v0.5.2 ref=docs/security/TRUST_FINDINGS.md   # seed lite fan-out audits: v0.5.2 follow-up (Lead, 2026-11-15)
 reach      VFS-FUSE-1 sym=src/vfs.rs::serve_fuse_fd_blocking from=src/bin/parvault-fuse.rs::main   # plan-5: the FUSE loop is reached from the plugin and the daemon
 reach      VFS-FUSE-2 sym=src/vfs.rs::serve_fuse_fd_blocking from=src/cli/daemon.rs::run_daemon   # plan-5: the FUSE loop is reached from the plugin and the daemon
 
@@ -260,4 +262,4 @@ kani       S-SANITIZE sym=src/sync/common.rs::sanitize_sync_relative_path_into h
 claim      B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision accept=trust_enforcement::bseed_second_sender_accepted_while_one_job_runs reject=trust_enforcement::bseed_third_job_refused_busy code=reject.syndication_busy bin=parvault-seed ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::SyndicateLiteStripe
 kani       B-SEED-SYND sym=src/network/server_events.rs::syndication_fanout_decision harness=proof_syndication_fanout_budget cover=syndication over budget
 
-ratchet    R         open=1 waive=32
+ratchet    R         open=2 waive=32

@@ -23,8 +23,8 @@ EXTENDS Naturals, FiniteSets
 \*     unanswered audit. Counters saturate; there is no audit bound and no state constraint.
 \* Not modelled: SHA-256 (a proof is valid iff it names the challenged index and carries the
 \* stored content), the session-key HMAC and the rate limits (E-POR, F-06-RATE claims).
-\* Nothing in this model quarantines: `record_failure` has no caller (ParVaultProtocol,
-\* @assume leaf-quarantine-not-run).
+\* Nothing in this model quarantines: `record_failure` has no caller (the assumption
+\* leaf-quarantine-not-run is declared in ParVaultProtocol).
 
 Owner == "self"
 Hosts == {"self", "honest", "cheat"}
