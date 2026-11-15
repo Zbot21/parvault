@@ -1347,6 +1347,81 @@ mod tests {
         assert!(!dir.path().join(COUNCIL_REPIN_INTENT_FILE).exists());
     }
 
+    /// Write-ahead intent, driven (F-53 QA D1): a re-pin whose legacy-store write really fails
+    /// after `known_peers.json` was written leaves the intent on disk, and the next start
+    /// converges both stores on B. The failure is a real kernel limit that also binds root: the
+    /// data dir is sized so the legacy file's temp path (one byte longer than the intent's) hits
+    /// `PATH_MAX` (`ENAMETOOLONG`) while every other path the re-pin touches fits.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repin_legacy_write_failure_keeps_intent_and_converges() {
+        const PATH_MAX: usize = 4096;
+        // Length of `<dir>/` plus the `fsio::atomic_write_file` temp name `.<name>.tmp.<16 hex>`.
+        let tmp_len = |name: &str| 1 + 1 + name.len() + 5 + 16;
+        let legacy_name = "pinned_tracker_admins.json";
+        assert_eq!(
+            tmp_len(legacy_name),
+            tmp_len(COUNCIL_REPIN_INTENT_FILE) + 1,
+            "the test needs the legacy temp path to be the longest, by one byte"
+        );
+        let a = id(0x41).public_key_bytes();
+        let bk = id(0x42).public_key_bytes();
+        let root = tempfile::tempdir().unwrap();
+        // The longest dir whose intent temp path still fits (PATH_MAX counts the NUL).
+        let want = PATH_MAX - 1 - tmp_len(COUNCIL_REPIN_INTENT_FILE);
+        let mut dir = root.path().to_path_buf();
+        loop {
+            let remaining = want - dir.as_os_str().len();
+            if remaining == 0 {
+                break;
+            }
+            // Each component costs its length plus a separator; never leave a remainder of 1.
+            let n = match remaining {
+                r if r > 402 => 200,
+                r if r > 201 => r / 2 - 1,
+                r => r - 1,
+            };
+            dir.push("d".repeat(n));
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        pin_known_peer(&dir, "/ip4/10.0.0.1/tcp/4002", a);
+        std::fs::write(dir.join(legacy_name), format!("[\"{}\"]", hex::encode(a))).unwrap();
+
+        let err = repin_tracker_admin(&dir, a, bk).unwrap_err();
+        assert!(err.starts_with("reject.tracker_pin_not_persisted"), "{err}");
+        // known_peers.json was written, the legacy file was not, and the intent survives.
+        assert_eq!(
+            crate::network::KnownPeersStore::load(&dir).pinned_tracker_admin_pubkeys(),
+            vec![bk]
+        );
+        assert_eq!(legacy_pinned_admins(&dir), Ok(vec![a]));
+        let intent = std::fs::read(dir.join(COUNCIL_REPIN_INTENT_FILE))
+            .expect("the write-ahead intent must be on disk after the failed legacy write");
+        assert_eq!(
+            serde_json::from_slice::<RepinIntent>(&intent).unwrap(),
+            RepinIntent {
+                tracker: None,
+                prev: Some(a),
+                new: bk,
+            }
+        );
+
+        // The restart, once the dir is writable again (moved to a short path). No manifest is
+        // installed, so only the intent can finish the re-pin.
+        let short = root.path().join("restarted");
+        std::fs::rename(&dir, &short).unwrap();
+        assert_eq!(repair_council_pins(&short), Ok(Some((a, bk))));
+        assert_eq!(legacy_pinned_admins(&short), Ok(vec![bk]));
+        assert_eq!(
+            crate::network::KnownPeersStore::load(&short).pinned_tracker_admin_pubkeys(),
+            vec![bk]
+        );
+        assert!(!short.join(COUNCIL_REPIN_INTENT_FILE).exists());
+        std::fs::remove_file(short.join(crate::network::KnownPeersStore::FILE_NAME)).unwrap();
+        assert_eq!(council_scope_root(&short, None, true, &[]), Some(bk));
+        assert_eq!(repair_council_pins(&short), Ok(None));
+    }
+
     /// A write-ahead re-pin record that does not decode fails closed and is kept.
     #[test]
     fn corrupt_repin_intent_fails_closed() {
