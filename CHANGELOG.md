@@ -10,9 +10,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 - **Storage audits (F-06, F-34, B-59).** The owner daemon now checks that its hosts still hold its shards. It sends a chunk-Merkle challenge (`ChunkAudit`, a new wire variant appended last) for `min(4, n)` random 4 KiB chunks and checks each chunk and its path against the manifest's per-shard root. A host answers only the peer that stored the shard (`reject.por_not_storer`), at most 6 times per stripe key per 10 min. An invalid proof is a failure in the owner's own ledger and marks the shard degraded. A timeout or refusal is counted as unanswered and is never a failure. New: `--no-audit`, `por_audit_interval_secs` and `por_audit_rtt_ms` (default 1 h and 2 s; 6 h and 5 s on `router-soc`), `por_audit_state.json`, and an audits section in `parvault status`. Hosts must run this release before an owner's audit results mean anything; an older host does not know the variant and is counted unanswered.
+- **The seed audits the lite stripes it fans out (F-06, B-59, L-100).** `parvault-seed` keeps a bounded index of each lite stripe's hosts and chunk roots (8 MiB, a share per lite client; RAM only under `--no-fs`, else `lite_audit_index.bin`) and audits those hosts as the storer, with the same verdicts as the owner daemon. Results stay on the seed. New flags: `--no-audit`, `--audit-interval-secs`, `--audit-rtt-ms`.
+- **Audits scan only when something may be due.** After a scan that finds no host due, the auditor waits until the oldest scanned host falls due (at most a quarter interval) instead of decrypting up to 4 manifests every tick.
+- **Stripes the embedded gateway stored before this release stay unanswered until re-stored.** They were written as the node identity, so their hosts refuse the owner's audit (`reject.por_not_storer`); they are never counted failed.
 
 ### Fixed
 - **A node never credits itself for an audit (F-07).** Audit credit goes only to a prover that is not one of the auditor's identities, keyed by its Noise-authenticated device id.
+- **An offline host with no `/p2p/` id is counted unanswered (F-06).** It used to be counted unauditable and never retried; it is now retried once and credited nothing.
 - **The daemon's IPC gateway stores as the owner (B-59).** Stripes stored through the embedded gateway were sent, and their PoR keys derived, as the node identity, so the owner could not audit them. They now use the owner identity, like every other writer.
 
 ---

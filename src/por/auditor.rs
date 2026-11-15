@@ -4,7 +4,7 @@
 //! [`crate::por::ChunkChallenge`] as the owner identity, judges the answer with
 //! [`chunk_audit_decision`] and records only what [`audit_credit_decision`] allows.
 //!
-//! Detection only (L-27): a pass or a failed proof goes to the owner's own ledger
+//! Detection, with one latent local consequence (L-27, L-105): a pass or a failed proof goes to the owner's own ledger
 //! (`QuotaManager::record_por_outcome`) and a failed proof marks the shard degraded; an
 //! unanswered audit is counted here and never recorded as a failure. Nothing quarantines,
 //! repairs, gossips or leaves the node (L-29).
