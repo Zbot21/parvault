@@ -50,7 +50,7 @@ jobs:
           docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e SOURCE_DATE_EPOCH \
             -e CARGO_HOME="$MNT/cargo-home-$SIDE" -e CARGO_TARGET_DIR="$MNT/target-$SIDE" \
             -v "$GITHUB_WORKSPACE:$MNT" -w "$MNT/$SRC" parvault-build \
-            bash scripts/build_release.sh --target "$TARGET" --out "$MNT/out" $bundle
+            bash scripts/build_release.sh --target "$TARGET" --out "$MNT/out" --image $bundle
           ls -l out/
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -142,6 +142,6 @@ jobs:
           prerelease: true
           make_latest: false
           body: |
-            **DEV build** (L-113). Every `v0.5.x` artifact is a dev build: reproducible, and signed with the ParVault **dev/test key** (principal `parvault-dev`, namespace `parvault-dev-build`, fingerprint `SHA256:w3YrtCVqvG0hUxHHdnrlxuxg/X8LkeuUaZudDswGQ+A`), not a release key. No release builds exist yet. `install.sh` installs it only with `PARVAULT_ALLOW_DEV_BUILD=1`. Verify with `docs/REPRODUCIBLE_BUILDS.md`.
+            **DEV build** (L-113). Every `v0.5.x` artifact is a dev build: reproducible, and signed with the ParVault **dev/test key** (principal `parvault-dev`, namespace `parvault-dev-build`, fingerprint `SHA256:w3YrtCVqvG0hUxHHdnrlxuxg/X8LkeuUaZudDswGQ+A`), not a release key. No release builds exist yet. `install.sh` installs it only with `PARVAULT_ALLOW_DEV_BUILD=1`. Verify with `docs/REPRODUCIBLE_BUILDS.md`. The container image `parvault:<version>-dev` ships as `parvault-image-amd64-dev.tar` (and `-arm64-`), listed in the signed `SHA256SUMS`; Synology steps in `docs/SYNOLOGY.md`.
           files: artifacts/*
           generate_release_notes: true
