@@ -50,6 +50,8 @@ struct Node {
     reg: PathBuf,
     log: PathBuf,
     addr: String,
+    /// A command the daemon is started through (a cgroup scope), or empty.
+    wrap: Vec<String>,
     _root: TempDir,
 }
 
@@ -60,8 +62,15 @@ impl Drop for Node {
     }
 }
 
-fn daemon_command(dir: &Path, reg: &Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+fn daemon_command(dir: &Path, reg: &Path, wrap: &[String]) -> Command {
+    let mut cmd = match wrap.split_first() {
+        Some((prog, args)) => {
+            let mut c = Command::new(prog);
+            c.args(args).arg(env!("CARGO_BIN_EXE_parvault"));
+            c
+        }
+        None => Command::new(env!("CARGO_BIN_EXE_parvault")),
+    };
     cmd.env("PARVAULT_LAN_REGISTRY_DIR", reg)
         .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
         .env("RUST_LOG", "info")
@@ -82,6 +91,13 @@ fn daemon_command(dir: &Path, reg: &Path) -> Command {
 
 impl Node {
     fn spawn(label: &str) -> Self {
+        Self::spawn_with(label, None, &[])
+    }
+
+    /// A daemon with `config` as its `config.toml`, started through `wrap` (for example
+    /// `systemd-run --user --scope -p MemoryMax=64M --`) when given; `extra` CLI args go before
+    /// the subcommand.
+    fn spawn_with(label: &str, config: Option<&str>, wrap: &[&str]) -> Self {
         let root = tempfile::Builder::new()
             .prefix(&format!("pv-b1-{label}-"))
             .tempdir()
@@ -91,6 +107,9 @@ impl Node {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(&reg).unwrap();
         NodeIdentity::load_or_generate_in_dir(&dir).unwrap();
+        if let Some(cfg) = config {
+            std::fs::write(dir.join("config.toml"), cfg).unwrap();
+        }
         let log = root.path().join("node.log");
         std::fs::File::create(&log).unwrap();
         let mut node = Node {
@@ -99,6 +118,7 @@ impl Node {
             reg,
             log,
             addr: String::new(),
+            wrap: wrap.iter().map(|s| s.to_string()).collect(),
             _root: root,
         };
         let _ = node.child.wait();
@@ -112,7 +132,7 @@ impl Node {
             .append(true)
             .open(&self.log)
             .unwrap();
-        self.child = daemon_command(&self.dir, &self.reg)
+        self.child = daemon_command(&self.dir, &self.reg, &self.wrap)
             .stdout(Stdio::from(log_file.try_clone().unwrap()))
             .stderr(Stdio::from(log_file))
             .spawn()
@@ -701,4 +721,299 @@ fn b147_sigkill_between_writes_state_and_ledger_agree() {
     assert!(last.0 > 0 && last.1 > 0);
     eprintln!("b147: 20 kills, {replays} needed the journal; totals {last:?}");
     gate_ran("trust_enforcement_gc_host::b147_sigkill_between_writes_state_and_ledger_agree");
+}
+
+// --- B-152 (a): per-shard indexes return to their start; the held-shard bound ------------------
+
+/// A shard of stripe (`salt`, `i`), 256 bytes, distinct per pair.
+fn shard_n(salt: u8, i: u32) -> (ShardId, Vec<u8>) {
+    let mut bytes = vec![salt; 256];
+    bytes[..4].copy_from_slice(&i.to_le_bytes());
+    let mut root = [salt; 32];
+    root[..4].copy_from_slice(&i.to_be_bytes());
+    let h = parvault::sharding::merkle::hash_shard_leaf(0, &bytes);
+    (
+        ShardId {
+            stripe_merkle_root: root,
+            shard_index: 0,
+            shard_hash: h,
+        },
+        bytes,
+    )
+}
+
+/// A ring member's client with a 30 s request timeout: a 1,024-shard free or a 667-shard
+/// eviction purge outlasts the 1.2 s default (each purged file is shredded and fsynced); the
+/// test bounds and reports the time separately.
+fn member_client(ident: &NodeIdentity) -> MeshClient {
+    MeshClient::new(ident.clone(), Vec::new(), None)
+        .with_admission(AdmissionSource::from_genesis(genesis()))
+        .with_timeout(Duration::from_secs(30))
+}
+
+fn rss_anon_kb(pid: u32) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("RssAnon:"))
+                .and_then(|v| v.trim().strip_suffix("kB"))
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// Every per-shard index of a data dir, counted from disk: shard files, `shard_index.bin`,
+/// quota-held shards, eviction attribution records, PoR session keys, grant owners, repair grants.
+fn disk_counts(dir: &Path) -> [usize; 7] {
+    let files = std::fs::read_dir(dir.join("shards"))
+        .map(|d| {
+            d.flatten()
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".shard"))
+                .count()
+        })
+        .unwrap_or(0);
+    let index = std::fs::read(dir.join("shard_index.bin"))
+        .ok()
+        .and_then(|raw| bincode::deserialize::<HashMap<String, ShardId>>(&raw).ok())
+        .map_or(0, |m| m.len());
+    let held = QuotaManager::with_persistence_dir(1 << 40, 0, dir).held_shard_count();
+    let attribution =
+        parvault::storage::eviction::indexed_regular_shard_ids(dir).map_or(0, |v| v.len());
+    let (sessions, owners, grants) =
+        PorVerifierEngine::with_persistence_dir(300, dir).index_counts();
+    [files, index, held, attribution, sessions, owners, grants]
+}
+
+/// One cycle: 2,000 shards stored with grants by three keys, then freed through all three
+/// paths (`DeleteShard`, `FreeShards`, an eviction order). Returns (peak anon kB while holding,
+/// seconds the `FreeShards` orders took).
+fn b152_cycle(node: &Node, cycle: u8) -> (u64, f64) {
+    const N: u32 = 2_000;
+    let pid = node.child.id();
+    let (a, b, e) = (
+        key(0xD0 + cycle * 3),
+        key(0xD1 + cycle * 3),
+        key(0xD2 + cycle * 3),
+    );
+    let clients = [member_client(&a), member_client(&b), member_client(&e)];
+    let owners = [&a, &b, &e];
+    let mut ids: [Vec<ShardId>; 3] = Default::default();
+    let mut peak = 0;
+    for i in 0..N {
+        let who = (i % 3) as usize;
+        let (sid, bytes) = shard_n(0x40 + cycle, i);
+        let req = MeshWireRequest::PutShard {
+            owner_peer_id: String::new(),
+            shard_id: sid,
+            shard_bytes: bytes,
+            session_key_commit: [0x5E; 32],
+            repair_grant: Some(grant(owners[who], &sid)),
+        };
+        let r = clients[who].send_request(&node.addr, req).unwrap();
+        assert!(stored(&r), "put {i}: {r:?}");
+        ids[who].push(sid);
+        if i % 100 == 0 {
+            peak = peak.max(rss_anon_kb(pid));
+        }
+    }
+    peak = peak.max(rss_anon_kb(pid));
+    // 1. DeleteShard, one by one.
+    let t = Instant::now();
+    for sid in &ids[0] {
+        let r = clients[0]
+            .send_request(&node.addr, delete_at(&a, *sid, now_ms()))
+            .unwrap();
+        assert!(deleted(&r), "{r:?}");
+    }
+    let delete_secs = t.elapsed().as_secs_f64();
+    // 2. FreeShards, at most 1,024 per order (arch056c 1.7: one flush per order, bounded time).
+    let t = Instant::now();
+    for (n, chunk) in ids[1].chunks(1_024).enumerate() {
+        let o = order(
+            &b,
+            node.host_key(),
+            now_ms(),
+            now_ms() + n as u64,
+            chunk.to_vec(),
+        );
+        match clients[1]
+            .send_request(&node.addr, MeshWireRequest::FreeShards { order: o })
+            .unwrap()
+        {
+            MeshWireResponse::FreeShardsAck {
+                outcomes,
+                error: None,
+            } => {
+                assert!(outcomes.iter().all(|x| *x == FreeShardOutcome::Freed));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let free_secs = t.elapsed().as_secs_f64();
+    // 3. Eviction: a local-owner order (signed by the node's own key) for the third key.
+    let node_key = NodeIdentity::load_or_generate_in_dir(&node.dir).unwrap();
+    let t = Instant::now();
+    let ev = parvault::storage::SignedBadActorEvictionOrder::issue(
+        &node_key,
+        parvault::storage::EvictionTarget::PeerOrIssuerPubkey(e.public_key_bytes()),
+        "b152 cycle",
+        now_ms(),
+        now_ms() + 3_600_000,
+        0,
+    );
+    match clients[0]
+        .send_request(&node.addr, MeshWireRequest::BroadcastEvictionOrder(ev))
+        .unwrap()
+    {
+        MeshWireResponse::EvictionOrderAck {
+            accepted: true,
+            purged_regular_shards,
+            ..
+        } => {
+            assert_eq!(purged_regular_shards, ids[2].len());
+        }
+        other => panic!("{other:?}\n{}", node.log_text()),
+    }
+    eprintln!(
+        "b152 cycle {cycle}: {} deletes {delete_secs:.2} s, FreeShards of {} {free_secs:.2} s, \
+         eviction of {} {:.2} s",
+        ids[0].len(),
+        ids[1].len(),
+        ids[2].len(),
+        t.elapsed().as_secs_f64()
+    );
+    (peak, free_secs)
+}
+
+/// B-152 (a), arch056c 1.8: 2,000 shards stored and freed through all three paths
+/// (`DeleteShard`, `FreeShards`, eviction) leave every per-shard index at its start count, also
+/// recounted from disk after a restart; a second cycle peaks no higher than the first plus
+/// 1 MiB. Prints the per-shard anon bytes for `docs/BENCHMARKS.md`.
+#[test]
+fn b152_two_cycles_of_2000_shards() {
+    let mut node = Node::spawn("b152-cycles");
+    std::thread::sleep(Duration::from_secs(2));
+    let start = disk_counts(&node.dir);
+    assert_eq!(start, [0; 7], "a fresh node holds no shard");
+    let base = rss_anon_kb(node.child.id());
+    let (peak1, free1) = b152_cycle(&node, 0);
+    assert_eq!(
+        disk_counts(&node.dir),
+        start,
+        "cycle 1: every index back to its start"
+    );
+    node.restart();
+    assert_eq!(
+        disk_counts(&node.dir),
+        start,
+        "recounted from disk after a restart"
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let base2 = rss_anon_kb(node.child.id());
+    let (peak2, free2) = b152_cycle(&node, 1);
+    assert_eq!(
+        disk_counts(&node.dir),
+        start,
+        "cycle 2: every index back to its start"
+    );
+    let per_shard = (peak1.saturating_sub(base) * 1024) / 2_000;
+    eprintln!(
+        "b152: base {base} kB, peak {peak1} kB (cycle 1); base {base2} kB, peak {peak2} kB \
+         (cycle 2, after a restart); about {per_shard} anon bytes per held shard; FreeShards \
+         of 667 shards {free1:.2} s and {free2:.2} s"
+    );
+    assert!(free1 < 10.0 && free2 < 10.0, "the free is bounded in time");
+    assert!(
+        peak2.saturating_sub(base2) <= peak1.saturating_sub(base) + 1_024,
+        "cycle 2 grew more than cycle 1 plus 1 MiB"
+    );
+    gate_ran("trust_enforcement_gc_host::b152_two_cycles_of_2000_shards");
+}
+
+/// B152-COUNT accept: under the held-shard bound (`max_held_shards = 2` in `config.toml`) a
+/// node stores up to the bound.
+#[test]
+#[ignore = "needs integration glue G-15 (main.rs sets the held-shard bound); un-ignore at integration with the open lines"]
+fn b152_put_within_held_shard_bound_accepted() {
+    let node = Node::spawn_with("count-a", Some("max_held_shards = 2\n"), &[]);
+    node.assert_logged("info.held_shard_bound");
+    let owner = key(0xE1);
+    for i in 0..2 {
+        let (sid, bytes) = shard_n(0x71, i);
+        assert!(stored(&put(&owner, &node, sid, bytes, None)));
+    }
+    gate_ran("trust_enforcement_gc_host::b152_put_within_held_shard_bound_accepted");
+}
+
+/// B152-COUNT reject: at the bound a new shard is refused (`reject.node_shard_count`) and not
+/// written; a freed slot is usable again.
+#[test]
+#[ignore = "needs integration glue G-15 (main.rs sets the held-shard bound); un-ignore at integration with the open lines"]
+fn b152_put_over_held_shard_bound_refused() {
+    let node = Node::spawn_with("count-r", Some("max_held_shards = 2\n"), &[]);
+    let owner = key(0xE2);
+    let mut held = Vec::new();
+    for i in 0..2 {
+        let (sid, bytes) = shard_n(0x72, i);
+        assert!(stored(&put(&owner, &node, sid, bytes, None)));
+        held.push(sid);
+    }
+    let (sid, bytes) = shard_n(0x72, 9);
+    assert!(!stored(&put(&owner, &node, sid, bytes.clone(), None)));
+    assert!(!node.shard_file(&sid).exists());
+    node.assert_logged("reject.node_shard_count");
+    let r = send(&owner, &node, delete_at(&owner, held[0], now_ms()));
+    assert!(deleted(&r));
+    assert!(stored(&put(&owner, &node, sid, bytes, None)));
+    gate_ran("trust_enforcement_gc_host::b152_put_over_held_shard_bound_refused");
+}
+
+/// The bound and source the daemon logged at startup (`info.held_shard_bound`).
+fn logged_bound(node: &Node) -> (u64, String) {
+    node.assert_logged("info.held_shard_bound");
+    let text = node.log_text();
+    let line = text
+        .lines()
+        .find(|l| l.contains("info.held_shard_bound"))
+        .unwrap();
+    let field = |name: &str| -> String {
+        let at = line.find(&format!("{name}=")).unwrap() + name.len() + 1;
+        line[at..]
+            .trim_start_matches('"')
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect()
+    };
+    (field("max_held_shards").parse().unwrap(), field("source"))
+}
+
+/// L-130: a homelab-nas daemon under a 64 MiB and a 256 MiB cgroup limit (`systemd-run --scope
+/// -p MemoryMax`, the limit it actually runs under) derives bounds in that ratio from the
+/// cgroup; a config value wins under the same limit.
+#[test]
+#[ignore = "needs integration glue G-15 (main.rs sets the held-shard bound); un-ignore at integration with the open lines"]
+fn l130_bound_follows_the_cgroup_limit() {
+    let scope = |mem: &'static str| -> Vec<&'static str> {
+        vec![
+            "systemd-run",
+            "--user",
+            "--scope",
+            "--quiet",
+            "-p",
+            mem,
+            "--",
+        ]
+    };
+    let nas = "hardware_profile = \"homelab-nas\"\n";
+    let n64 = Node::spawn_with("l130-64", Some(nas), &scope("MemoryMax=64M"));
+    let n256 = Node::spawn_with("l130-256", Some(nas), &scope("MemoryMax=256M"));
+    let over = format!("{nas}max_held_shards = 7\n");
+    let n_over = Node::spawn_with("l130-cfg", Some(&over), &scope("MemoryMax=64M"));
+    let (b64, s64) = logged_bound(&n64);
+    let (b256, s256) = logged_bound(&n256);
+    assert_eq!((s64.as_str(), s256.as_str()), ("cgroup", "cgroup"));
+    assert!(b256.abs_diff(4 * b64) <= 4, "{b64} vs {b256}");
+    assert_eq!(logged_bound(&n_over), (7, "config".to_string()));
+    gate_ran("trust_enforcement_gc_host::l130_bound_follows_the_cgroup_limit");
 }

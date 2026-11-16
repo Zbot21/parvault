@@ -395,4 +395,14 @@ suite      S-C19     test=trust_enforcement_gc_host::c19_place_stripe_has_only_o
 suite      S-B147    test=trust_enforcement_gc_host::b147_sigkill_between_writes_state_and_ledger_agree needs=cmd:sh   # G5: 20 SIGKILLs, state and ledger agree
 kani       B147-JOURNAL sym=src/por/audit_journal.rs::audit_journal_apply_decision harness=proof_audit_journal_apply_decision cover=journal ignored
 
-ratchet    R         open=1 waive=32
+# --- v0.5.6 track B1 PR 2: B-152 (a) per-shard indexes (plan 3.8 a; arch056c 1.1-1.8, arch152b 3.2-3.5, L-130) ---
+claim      B152-COUNT sym=src/storage/quota.rs::held_shard_decision accept=trust_enforcement_gc_host::b152_put_within_held_shard_bound_accepted reject=trust_enforcement_gc_host::b152_put_over_held_shard_bound_refused code=reject.node_shard_count bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-07-tier-weighted-reciprocity-ledger.md covers=MeshWireRequest::PutShard   # arch152b 3.4: refuse, never evict, before any eviction (C31); bound from memory (L-130)
+reach      B152-COUNT-REACH sym=src/storage/quota.rs::held_shard_decision from=src/network/wire_handler.rs::handle_mesh_wire_request
+kani       B152-COUNT sym=src/storage/quota.rs::held_shard_decision harness=proof_held_shard_decision cover=shard over the bound refused
+kani       B152-BOUND sym=src/storage/quota.rs::held_shard_bound_from harness=proof_held_shard_bound_clamped_and_monotone cover=bound at the floor
+suite      S-L130    test=trust_enforcement_gc_host::l130_bound_follows_the_cgroup_limit needs=cmd:systemd-run   # L-130: 64 MiB and 256 MiB cgroup limits derive bounds 1:4; an override wins
+open       B152-COUNT expect=claim by=v0.5.6 ref=docs/security/TRUST_FINDINGS.md   # passes once integration glue G-15 (main.rs sets the bound from max_held_shards) lands; delete this line then
+open       S-L130    expect=suite by=v0.5.6 ref=docs/security/TRUST_FINDINGS.md   # passes once integration glue G-15 lands; delete this line then
+suite      S-B152-CYCLES test=trust_enforcement_gc_host::b152_two_cycles_of_2000_shards needs=cmd:sh   # arch056c 1.8: three paths, restart recount, second cycle no higher
+
+ratchet    R         open=3 waive=32

@@ -2114,15 +2114,19 @@ impl PrivacyPreservingEvictionEngine {
         self.persist_index()
     }
 
-    /// C18: forgets the attribution record of a regular shard removed outside eviction (an
-    /// owner's `DeleteShard` or `FreeShards`), and persists the index when one was removed.
-    /// Eviction's own purge removes its records itself and never calls this.
-    pub fn forget_regular_shard(&mut self, shard_id: &ShardId) -> Result<bool, StorageError> {
-        if self.index.regular_shards.remove(shard_id).is_none() {
-            return Ok(false);
+    /// C18, B-152 (a): forgets the attribution records of regular shards removed outside this
+    /// engine's purge (an owner's `DeleteShard` or `FreeShards`, an LRU eviction), writing the
+    /// index once for the batch. Eviction's own purge removes its records itself; this never
+    /// calls back into it. Returns how many records were removed.
+    pub fn forget_regular_shards(&mut self, shard_ids: &[ShardId]) -> Result<usize, StorageError> {
+        let removed = shard_ids
+            .iter()
+            .filter(|id| self.index.regular_shards.remove(id).is_some())
+            .count();
+        if removed > 0 {
+            self.persist_index()?;
         }
-        self.persist_index()?;
-        Ok(true)
+        Ok(removed)
     }
 
     /// Regular shards with an attribution record (B-152 (a) tests).
@@ -2913,21 +2917,28 @@ impl PrivacyPreservingEvictionEngine {
                 .shards_dir()
                 .join(format!("{}.shard", shard_id.file_key()));
             let wiped = Self::shred_and_unlink_file(&shard_path)?;
+            // B-152 (a): removed without the state writes; the quota state and the shard index
+            // are written once for the whole purge below (arch056c 1.7).
             let deleted_by_store = block_store
-                .delete_shard(&owner_peer_id, &shard_id)
+                .delete_shard_deferred(&owner_peer_id, &shard_id)
                 .unwrap_or(false);
             if wiped > 0 {
                 report.purged_regular_shards += 1;
                 report.zero_wiped_bytes = report.zero_wiped_bytes.saturating_add(wiped);
                 if !deleted_by_store {
                     if let Ok(mut q) = block_store.quota().lock() {
-                        q.record_shard_removed(&owner_peer_id, &shard_id.file_key(), wiped);
+                        q.record_shard_removed_deferred(
+                            &owner_peer_id,
+                            &shard_id.file_key(),
+                            wiped,
+                        );
                     }
                 }
             } else if deleted_by_store {
                 report.purged_regular_shards += 1;
             }
         }
+        block_store.flush_removals();
 
         for loc in matched_blinded_locators {
             self.index.blinded_shards.remove(&loc);
@@ -2981,6 +2992,25 @@ impl PrivacyPreservingEvictionEngine {
         let encoded = bounded_bincode_options().serialize(&self.index)?;
         BlockStore::atomic_write_file(&self.index_path, &encoded)
     }
+}
+
+/// B-152 (a), arch152b 3.5: the regular shard ids `eviction_index.bin` in `data_dir` attributes,
+/// the source an undecodable `shard_index.bin` is rebuilt from (the ids are plain; no seed is
+/// needed). `None` when the file is absent, oversized or does not decode.
+pub fn indexed_regular_shard_ids(data_dir: &Path) -> Option<Vec<ShardId>> {
+    let raw = fs::read(data_dir.join("eviction_index.bin")).ok()?;
+    if raw.len() as u64 > MAX_EVICTION_INDEX_BYTES {
+        return None;
+    }
+    let index: PersistedEvictionIndex =
+        match bounded_bincode_options().deserialize::<PersistedEvictionIndex>(&raw) {
+            Ok(index) => index,
+            Err(_) => bounded_bincode_options()
+                .deserialize::<PersistedEvictionIndexV1>(&raw)
+                .ok()?
+                .into(),
+        };
+    Some(index.regular_shards.into_keys().collect())
 }
 
 fn bounded_bincode_options() -> impl Options {

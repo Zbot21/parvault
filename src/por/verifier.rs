@@ -919,8 +919,11 @@ impl PorVerifierEngine {
                 repair_grants: self.repair_grants_ram.clone(),
                 shard_grant_owners: self.shard_grant_owners.clone(),
             };
+            // B-152 (a), arch056c 1.7: written atomically (was a plain write).
             if let Ok(encoded) = bincode::serialize(&state) {
-                let _ = std::fs::write(path, encoded);
+                if let Err(e) = crate::storage::fsio::atomic_write_file(path, &encoded) {
+                    tracing::warn!(error = %e, "could not write the PoR verifier state");
+                }
             }
         }
     }
@@ -1026,11 +1029,60 @@ impl PorVerifierEngine {
     /// fresh `Bind` of a shard no longer stored (e.g. LRU-evicted), so a stale owner keeps
     /// nothing over the new owner's shard (F-38-GRANT).
     pub fn clear_shard_binding(&mut self, shard_id: &ShardId) {
-        let key = shard_id.file_key();
-        let had_session = self.session_keys_ram.remove(&key).is_some();
-        if self.shard_grant_owners.remove(&key).is_some() || had_session {
+        self.forget_shards(std::slice::from_ref(shard_id));
+    }
+
+    /// B-152 (a), arch056c 1.3: forgets the PoR entries of removed shards (session key, grant
+    /// owner) and drops a repair grant once no held shard of its (root, owner) stays bound to it,
+    /// writing the state once for the batch.
+    ///
+    /// Bindings are keyed by `ShardId::file_key`, whose root part is 8 bytes; a grant is kept
+    /// while any bound shard of the same owner shares that prefix, so a prefix collision only
+    /// keeps a grant longer, never drops one in use.
+    pub fn forget_shards(&mut self, shard_ids: &[ShardId]) {
+        let mut changed = false;
+        let mut candidates: HashMap<String, Vec<(Hash32, [u8; 32])>> = HashMap::new();
+        for id in shard_ids {
+            let key = id.file_key();
+            changed |= self.session_keys_ram.remove(&key).is_some();
+            if let Some(owner) = self.shard_grant_owners.remove(&key) {
+                changed = true;
+                candidates
+                    .entry(hex::encode(&id.stripe_merkle_root[..8]))
+                    .or_default()
+                    .push((id.stripe_merkle_root, owner));
+            }
+        }
+        if !candidates.is_empty() {
+            let mut kept = HashSet::new();
+            for (key, owner) in &self.shard_grant_owners {
+                let prefix = key.split('_').next().unwrap_or_default();
+                if let Some(c) = candidates.get(prefix) {
+                    for (root, o) in c {
+                        if o == owner {
+                            kept.insert((*root, *o));
+                        }
+                    }
+                }
+            }
+            for (root, owner) in candidates.into_values().flatten() {
+                if !kept.contains(&(root, owner)) {
+                    changed |= self.repair_grants_ram.remove(&(root, owner)).is_some();
+                }
+            }
+        }
+        if changed {
             self.persist_state_if_configured();
         }
+    }
+
+    /// Entries per PoR index: session keys, shard grant owners, repair grants (B-152 (a)).
+    pub fn index_counts(&self) -> (usize, usize, usize) {
+        (
+            self.session_keys_ram.len(),
+            self.shard_grant_owners.len(),
+            self.repair_grants_ram.len(),
+        )
     }
 
     /// B-158, C12: the order-level checks of a `FreeShards` order for `host` (this node's

@@ -1108,6 +1108,106 @@ fn free_shards() {
     assert_identical(&o);
 }
 
+/// C17: a valid free order on a node with a lite audit index (a seed) removes the signer's own
+/// record of each named stripe and never another client's record of the same root; every role
+/// does the same.
+#[test]
+fn free_shards_removes_only_the_signers_lite_record() {
+    use parvault::por::lite_index::{LiteAuditIndex, LiteAuditRecord, LiteAuditShard};
+    let _g = env_guard();
+    let mut t = Trio::new("free-lite");
+    let peer = Peer::new(0x66, "198.51.100.7");
+    t.admit(&peer);
+    let host = NodeIdentity::from_seed([0x11; 32]).public_key_bytes();
+    let (sid, bytes) = shard(10, 1024);
+    t.run(&peer, &put_shard_req("", sid, bytes, [10; 32]));
+    let rec = |client: String| LiteAuditRecord {
+        client,
+        stripe_merkle_root: sid.stripe_merkle_root,
+        shard_len: 1024,
+        shards: vec![LiteAuditShard {
+            shard_index: 0,
+            shard_hash: sid.shard_hash,
+            chunk_root: [1; 32],
+            host_addr: "/ip4/127.0.0.1/tcp/4001".into(),
+        }],
+        unwitnessed: false,
+    };
+    let mut indexes = Vec::new();
+    for fx in &mut t.fx {
+        let idx = std::sync::Arc::new(std::sync::Mutex::new(LiteAuditIndex::in_memory()));
+        idx.lock().unwrap().insert(rec(peer.ident.device_peer_id()));
+        idx.lock().unwrap().insert(rec("another-client".into()));
+        let server = match fx.role {
+            Role::Daemon | Role::SeedHomelab => ZeroTrustSeedServer::new_homelab_vault(
+                "server-peer",
+                fx.store.clone(),
+                t.keys.owner_pq.public_key(),
+                2,
+            ),
+            Role::SeedPublic => ZeroTrustSeedServer::new_public_bootstrapper(
+                "server-peer",
+                fx.store.clone(),
+                t.keys.voucher_issuer.public_key_bytes(),
+                2,
+            ),
+        };
+        fx.server = server.with_lite_audit_index(std::sync::Arc::clone(&idx));
+        indexes.push(idx);
+    }
+    let order = parvault::por::verifier::sign_free_order(&peer.ident, host, now_ms(), 1, vec![sid]);
+    let o = t.run(&peer, &MeshWireRequest::FreeShards { order });
+    assert!(o[0].resp.contains("[Freed]"), "{}", o[0].resp);
+    assert_identical_removal(&o);
+    for idx in &indexes {
+        let idx = idx.lock().unwrap();
+        assert_eq!(idx.len(), 1, "only the signer's record left");
+        assert_eq!(
+            idx.sample_targets(4).len(),
+            1,
+            "another client's record of the same root stays"
+        );
+    }
+}
+
+// --- Held-shard bound (B-152 (a), identical) -------------------------------------------------------
+
+/// arch152b 3.4, L-130: at the held-shard bound both handlers refuse a new shard the same way
+/// (`reject.node_shard_count`, decided before any eviction) and store nothing.
+#[test]
+fn put_shard_over_held_shard_bound() {
+    let _g = env_guard();
+    let mut t = Trio::new("held");
+    let peer = Peer::new(0x65, "198.51.100.6");
+    t.admit(&peer);
+    let device = peer.ident.device_peer_id();
+    t.each(|fx, _| {
+        fx.store.quota().lock().unwrap().set_held_shard_bound(
+            parvault::storage::quota::HeldShardBound {
+                max: 1,
+                source: parvault::storage::quota::HeldShardBoundSource::Config,
+                memory_bytes: None,
+            },
+        );
+    });
+    let (sid, bytes) = shard(8, 1024);
+    let (sid2, bytes2) = shard(9, 1024);
+    let o = t.run(&peer, &put_shard_req("", sid, bytes, [8; 32]));
+    assert!(o[0].resp.contains("stored: true"), "{}", o[0].resp);
+    let o = t.run(&peer, &put_shard_req("", sid2, bytes2, [9; 32]));
+    assert!(o[0].resp.contains("stored: false"), "{}", o[0].resp);
+    assert!(
+        o[0].resp.contains("reject.node_shard_count"),
+        "{}",
+        o[0].resp
+    );
+    assert_identical(&o);
+    for fx in &t.fx {
+        assert!(!fx.store.has_shard(&sid2), "{:?}: refused", fx.role);
+        assert_eq!(fx.hosted(&device), 1024, "{:?}: quota unchanged", fx.role);
+    }
+}
+
 // --- 4 / 10. PoR audits (identical: answering earns no credit, F-07) -----------------------------
 
 #[test]

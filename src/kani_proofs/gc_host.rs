@@ -4,8 +4,9 @@
 //! slices, maps or strings, the smallest unwind, a `kani::cover!` per outcome; run a new harness
 //! alone first (`cargo kani --lib --harness kani_proofs::gc_host::<name> --exact`).
 
-/// B154-FREE (B-158, C12): an order is admitted only when every fact holds, and a refusal names
-/// the first failed fact in the check order (shape, host, freshness, signature, epoch).
+/// B154-FREE (B-158, C12): an order is admitted only when every fact holds. (The code per failed
+/// fact, in check order, is the unit test `free_order_decision_needs_every_fact_in_order`; string
+/// equality is kept out of the solver, `OPERATIONAL_LESSONS.md` 8.2.)
 #[kani::proof]
 fn proof_free_order_needs_every_fact() {
     let f = crate::por::verifier::FreeOrderFacts {
@@ -26,15 +27,6 @@ fn proof_free_order_needs_every_fact() {
         && f.epoch_state_ok
         && f.epoch_advances;
     assert_eq!(d.is_ok(), all);
-    if !f.shape_ok {
-        assert_eq!(d, Err("reject.free_order_malformed"));
-    } else if !f.host_matches {
-        assert_eq!(d, Err("reject.free_wrong_host"));
-    } else if !f.fresh {
-        assert_eq!(d, Err("reject.free_stale"));
-    } else if !f.signature_valid {
-        assert_eq!(d, Err("reject.free_bad_signature"));
-    }
 }
 
 /// B158-FRESH: a delete token is fresh exactly within 30 s either side of now, with no overflow
@@ -66,4 +58,46 @@ fn proof_audit_journal_apply_decision() {
     assert!(!crate::por::audit_journal::audit_journal_apply_decision(
         after, j
     ));
+}
+
+/// B152-COUNT (arch152b 3.4): a new shard is refused exactly at the held-shard bound.
+#[kani::proof]
+fn proof_held_shard_decision() {
+    let held: u64 = kani::any();
+    let max: u64 = kani::any();
+    let d = crate::storage::quota::held_shard_decision(held, max);
+    kani::cover!(d.is_ok(), "shard within the bound");
+    kani::cover!(d.is_err(), "shard over the bound refused");
+    assert_eq!(d.is_ok(), held < max);
+}
+
+/// B152-BOUND (L-130): for each profile's real share, floor and ceiling, a derived bound lies in
+/// [floor, ceiling], more memory never lowers it, and an override wins. Memory is the only
+/// symbolic quantity (KiB-granular up to 4 TiB); a symbolic share and bounds made the products
+/// nonlinear and the run passed 15 minutes (`OPERATIONAL_LESSONS.md` 8.1, 8.2).
+#[kani::proof]
+fn proof_held_shard_bound_clamped_and_monotone() {
+    use crate::profile::HardwareProfile;
+    let profile = match kani::any::<u8>() % 3 {
+        0 => HardwareProfile::RouterSoc,
+        1 => HardwareProfile::HomelabNas,
+        _ => HardwareProfile::Desktop,
+    };
+    let (share, floor, ceiling) = crate::storage::quota::held_shard_profile(profile);
+    let mem = u64::from(kani::any::<u32>()) << 10;
+    let more = mem + (u64::from(kani::any::<u32>()) << 10);
+    let q = crate::storage::quota::held_shard_bound_from;
+    let a = q(Some(mem), true, share, floor, ceiling, None);
+    let b = q(Some(more), true, share, floor, ceiling, None);
+    kani::cover!(a.max == floor, "bound at the floor");
+    kani::cover!(a.max == ceiling, "bound at the ceiling");
+    kani::cover!(
+        a.max > floor && a.max < ceiling,
+        "bound derived from memory"
+    );
+    assert!(a.max >= floor && a.max <= ceiling);
+    assert!(b.max >= a.max);
+    let o = u64::from(kani::any::<u32>());
+    kani::assume(o > 0);
+    assert_eq!(q(Some(mem), true, share, floor, ceiling, Some(o)).max, o);
 }

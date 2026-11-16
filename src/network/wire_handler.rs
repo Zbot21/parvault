@@ -996,16 +996,17 @@ fn relay_ack(result: Result<(), String>) -> MeshWireResponse {
 
 /// The one removal path for a held regular shard on the wire side (`v0.5.6` T0; arch056c 1.1,
 /// B-152 (a), B-178): `DeleteShard` and `FreeShards` both remove through here, where every
-/// per-shard index is reachable. Track B1 fills it in; the signature is fixed by T0.
+/// per-shard index is reachable. The signature is fixed by T0.
 ///
-/// Lock order (B1 keeps it): each step takes and releases its own lock before the next, and
-/// never holds two at once.
-/// 1. `block_store`: the shard file, then (inside it) the `quota` mutex and the shard index.
-/// 2. `eviction`: the eviction attribution record (`&mut`, no lock). Eviction's own removal
+/// Lock order: each step takes and releases its own lock before the next, and never holds two
+/// at once.
+/// 1. `block_store`: the shard file, then (inside it) the `quota` mutex and the shard index;
+///    the removed id is queued.
+/// 2. [`settle_removed_shards`]: `eviction`, the eviction attribution record (`&mut`, no lock),
+///    then `por_verifier`, the PoR session, grant-owner and repair-grant entries, which hold the
+///    owner binding, cleared only for a shard step 1 removed (C13, B-178). Eviction's own purge
 ///    (`eviction.rs`, under its `&mut self`) never comes here, and this path never calls back
-///    into eviction's removal, so neither re-enters the other.
-/// 3. `por_verifier`: PoR session, grant and repair-grant entries, then the owner binding,
-///    cleared only after step 1 removed the shard (C13, B-178).
+///    into eviction's purge, so neither re-enters the other.
 ///
 /// Returns whether a shard was removed (`false`: not held). An `Err` from step 1 leaves every
 /// index and the binding as they were (B-178: a failed delete can be retried by its owner).
@@ -1016,16 +1017,30 @@ pub(crate) fn remove_held_shard(
     owner: &str,
     shard_id: &crate::storage::ShardId,
 ) -> Result<bool, crate::storage::StorageError> {
-    // 1. The shard, its quota credit (to the accounted owner, C16) and its shard-index entry.
     let removed = block_store.delete_shard(owner, shard_id)?;
-    // 2. C18: the eviction attribution record. The shard is already gone, so a failed index
-    //    write is logged and the removal still stands.
-    if let Err(e) = eviction.forget_regular_shard(shard_id) {
+    settle_removed_shards(block_store, eviction, por_verifier);
+    Ok(removed)
+}
+
+/// B-152 (a): clears the eviction attribution (C18) and the PoR entries of every regular shard
+/// the block store removed since the last call (an owner's delete or free, an eviction purge,
+/// an LRU eviction on `--no-fs`, the scrubber), one write per index for the batch. Runs at the
+/// start of every request (removals made with no request in flight) and after each arm that
+/// removes, before anything registers a new binding.
+pub(crate) fn settle_removed_shards(
+    block_store: &BlockStore,
+    eviction: &mut PrivacyPreservingEvictionEngine,
+    por_verifier: &mut PorVerifierEngine,
+) {
+    let removed = block_store.take_removed_shards();
+    if removed.is_empty() {
+        return;
+    }
+    // The shards are already gone: a failed index write is logged and the removal stands.
+    if let Err(e) = eviction.forget_regular_shards(&removed) {
         warn!(error = %e, "eviction attribution not persisted after a shard removal");
     }
-    // 3. C13: the binding, only now that step 1 succeeded (a shard not held has none to keep).
-    por_verifier.clear_shard_binding(shard_id);
-    Ok(removed)
+    por_verifier.forget_shards(&removed);
 }
 
 /// The `FreeShards` arm (B-158, B-154 2.4): the order-level checks
@@ -1038,6 +1053,7 @@ pub(crate) fn remove_held_shard(
 fn free_shards(
     order: &crate::network::FreeShardsOrder,
     node_identity: &NodeIdentity,
+    server: &ZeroTrustSeedServer,
     block_store: &BlockStore,
     eviction: &mut PrivacyPreservingEvictionEngine,
     por_verifier: &mut PorVerifierEngine,
@@ -1076,7 +1092,8 @@ fn free_shards(
         }
         authorized_any = true;
         let owner = accounted_owner.as_deref().unwrap_or(signer_device.as_str());
-        match remove_held_shard(block_store, eviction, por_verifier, owner, shard_id) {
+        // arch056c 1.7: removed without the state writes; one flush and one settle per order.
+        match block_store.delete_shard_deferred(owner, shard_id) {
             Ok(true) => {
                 freed += 1;
                 outcomes.push(FreeShardOutcome::Freed);
@@ -1088,6 +1105,28 @@ fn free_shards(
                     "reject.free_remove_failed".to_string(),
                 ));
             }
+        }
+    }
+    block_store.flush_removals();
+    settle_removed_shards(block_store, eviction, por_verifier);
+    // C17: on a seed, the order's stripes leave the lite audit index, but only the records of
+    // the signer's own device (the key is root plus client), so nobody drops another client's.
+    if let Some(index) = server.lite_audit_index() {
+        let mut removed = 0usize;
+        if let Ok(mut idx) = index.lock() {
+            let mut roots: Vec<[u8; 32]> = order
+                .shard_ids
+                .iter()
+                .map(|s| s.stripe_merkle_root)
+                .collect();
+            roots.sort_unstable();
+            roots.dedup();
+            for root in &roots {
+                removed += usize::from(idx.remove_stripe(root, &signer_device));
+            }
+        }
+        if removed > 0 {
+            crate::por::lite_index::flush(index);
         }
     }
     if authorized_any {
@@ -1141,6 +1180,9 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
     let remote_addr = peer.addr;
     let remote_ip = peer.ip;
     let remote_pubkey = peer.pubkey;
+    // B-152 (a): removals made with no request in flight are cleared before this request can
+    // register a binding for the same shard.
+    settle_removed_shards(block_store, eviction, por_verifier);
 
     match request {
         MeshWireRequest::HandshakeWoT { chain, .. } => {
@@ -1265,7 +1307,11 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                     }
                 }
             }
-            match block_store.put_shard(effective_owner, &shard_id, &shard_bytes) {
+            let put = block_store.put_shard(effective_owner, &shard_id, &shard_bytes);
+            // B-152 (a): shards an in-memory store evicted to make room (never this one, which
+            // was not stored) are cleared before this shard's binding registers.
+            settle_removed_shards(block_store, eviction, por_verifier);
+            match put {
                 Ok(_) => {
                     // The PoR session commit, like the grant, registers only after the owner
                     // decision and a successful store (a refused put must not replace it).
@@ -1347,6 +1393,7 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
         MeshWireRequest::FreeShards { order } => free_shards(
             &order,
             node_identity,
+            server,
             block_store,
             eviction,
             por_verifier,
@@ -1979,7 +2026,10 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
             // B-SEED-SYND: only the local ingest runs here, under the lock; the mesh fan-out is
             // a deferred job without it.
             let t0 = std::time::Instant::now();
-            match server.ingest_lite_stripe(&cert, &bundle) {
+            let ingested = server.ingest_lite_stripe(&cert, &bundle);
+            // B-152 (a): shards an in-memory seed evicted for this stripe are cleared first.
+            settle_removed_shards(block_store, eviction, por_verifier);
+            match ingested {
                 Ok(ingest) => {
                     // F-02a: register only after the stripe was stored, for that stripe, and
                     // before the fan-out.
@@ -2247,6 +2297,8 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                 block_store,
             ) {
                 Ok(rep) => {
+                    // B-152 (a): the purged shards' PoR entries go too.
+                    settle_removed_shards(block_store, eviction, por_verifier);
                     info!(
                         order = %hex::encode(order.order_id),
                         epoch = order.council_epoch,

@@ -167,6 +167,74 @@ impl Drop for InMemoryShardBacking {
     }
 }
 
+/// Most removed shards queued for the wire handler's settle (B-152 (a)); the handler drains the
+/// queue on every request, so it fills only when removals happen with no wire traffic.
+pub const MAX_PENDING_REMOVED_SHARDS: usize = 65_536;
+
+/// B-152 (a), arch152b 3.5: loads `shard_index.bin` (untagged, the `5943dca` layout). A file that
+/// exists and does not read or decode never loads as empty, which would hide every held shard
+/// from listing and handoff: the index is rebuilt from the eviction index's shard ids for the
+/// `.shard` files present, and written back (`warn.shard_index_rebuilt`); if a shard file has no
+/// recoverable id the store refuses to open (`reject.shard_index_corrupt`).
+fn load_shard_index(
+    root_dir: &Path,
+    shards_dir: &Path,
+) -> Result<HashMap<String, ShardId>, StorageError> {
+    let path = root_dir.join("shard_index.bin");
+    let read = crate::storage::fsio::read_state_file(&path);
+    if let Ok(None) = read {
+        return Ok(HashMap::new());
+    }
+    if let Some(map) = read
+        .ok()
+        .flatten()
+        .and_then(|raw| bincode::deserialize::<HashMap<String, ShardId>>(&raw).ok())
+    {
+        return Ok(map);
+    }
+    let stems: std::collections::HashSet<String> = fs::read_dir(shards_dir)?
+        .flatten()
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|n| n.strip_suffix(".shard"))
+                .map(str::to_string)
+        })
+        .collect();
+    let map: HashMap<String, ShardId> =
+        crate::storage::eviction::indexed_regular_shard_ids(root_dir)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| (id.file_key(), id))
+            .filter(|(k, _)| stems.contains(k))
+            .collect();
+    let missing = stems.iter().filter(|k| !map.contains_key(*k)).count();
+    if missing > 0 {
+        tracing::error!(
+            code = "reject.shard_index_corrupt",
+            path = %path.display(),
+            missing,
+            "shard_index.bin does not decode and cannot be rebuilt; refusing to open the store"
+        );
+        return Err(StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "reject.shard_index_corrupt: {} does not decode and {missing} shard files have \
+                 no recoverable id",
+                path.display()
+            ),
+        )));
+    }
+    tracing::warn!(
+        code = "warn.shard_index_rebuilt",
+        shards = map.len(),
+        "shard_index.bin did not decode; rebuilt from the eviction index"
+    );
+    let raw = bincode::serialize(&map)?;
+    BlockStore::atomic_write_file(&path, &raw)?;
+    Ok(map)
+}
+
 /// Local NVMe / USB / bounded-RAM sharded block storage engine (`storage::block_store`).
 #[derive(Clone)]
 pub struct BlockStore {
@@ -178,6 +246,10 @@ pub struct BlockStore {
     blinded_leases: Arc<Mutex<BlindedShardLeaseManager>>,
     blinded_id_by_locator: Arc<Mutex<HashMap<[u8; 32], BlindedShardId>>>,
     shard_id_by_file_key: Arc<Mutex<HashMap<String, ShardId>>>,
+    /// B-152 (a): regular shards removed here whose eviction attribution and PoR entries are not
+    /// yet cleared; the wire handler drains it ([`Self::take_removed_shards`]), where those
+    /// indexes are reachable. Bounded by [`MAX_PENDING_REMOVED_SHARDS`].
+    removed_shards: Arc<Mutex<Vec<ShardId>>>,
     dht_store: Arc<Mutex<ZeroTrustDhtStore>>,
     mesh_client: Option<crate::network::MeshClient>,
     stripe_size_bytes: usize,
@@ -195,6 +267,8 @@ impl BlockStore {
         fs::create_dir_all(&shards_dir)?;
         fs::create_dir_all(&manifests_dir)?;
         quota.bind_persistence_dir(&root_dir);
+        // B-152 (a): a file-backed store never evicts (B-161), so it keeps no LRU order.
+        quota.disable_lru();
         if quota.used_storage_bytes() == 0 {
             if let Ok(entries) = fs::read_dir(&shards_dir) {
                 for entry in entries.flatten() {
@@ -226,15 +300,7 @@ impl BlockStore {
             (BlindedShardLeaseManager::new(max_bytes, 2), HashMap::new())
         };
 
-        let shard_index_file = root_dir.join("shard_index.bin");
-        let initial_shard_index = if shard_index_file.exists() {
-            fs::read(&shard_index_file)
-                .ok()
-                .and_then(|raw| bincode::deserialize::<HashMap<String, ShardId>>(&raw).ok())
-                .unwrap_or_default()
-        } else {
-            HashMap::new()
-        };
+        let initial_shard_index = load_shard_index(&root_dir, &shards_dir)?;
 
         let dht_store = ZeroTrustDhtStore::with_persistence_dir(&root_dir);
 
@@ -247,6 +313,7 @@ impl BlockStore {
             blinded_leases: Arc::new(Mutex::new(initial_leases)),
             blinded_id_by_locator: Arc::new(Mutex::new(initial_id_map)),
             shard_id_by_file_key: Arc::new(Mutex::new(initial_shard_index)),
+            removed_shards: Arc::new(Mutex::new(Vec::new())),
             dht_store: Arc::new(Mutex::new(dht_store)),
             mesh_client: None,
             stripe_size_bytes: DEFAULT_STRIPE_SIZE_BYTES,
@@ -269,6 +336,7 @@ impl BlockStore {
             blinded_leases: Arc::new(Mutex::new(BlindedShardLeaseManager::new(max_bytes, 2))),
             blinded_id_by_locator: Arc::new(Mutex::new(HashMap::new())),
             shard_id_by_file_key: Arc::new(Mutex::new(HashMap::new())),
+            removed_shards: Arc::new(Mutex::new(Vec::new())),
             dht_store: Arc::new(Mutex::new(ZeroTrustDhtStore::new())),
             mesh_client: None,
             stripe_size_bytes: SOC_ROUTER_STRIPE_SIZE_BYTES,
@@ -334,9 +402,7 @@ impl BlockStore {
                 .expect("in_memory mutex poisoned")
                 .regular_shards
                 .remove(&id.file_key());
-            if let Ok(mut idx_map) = self.shard_id_by_file_key.lock() {
-                idx_map.remove(&id.file_key());
-            }
+            self.forget_indexed(&id.file_key());
             if let Some(buf) = removed {
                 let wiped = InMemoryShardBacking::zero_wipe_vec(buf);
                 if let Ok(mut q) = self.quota.lock() {
@@ -352,8 +418,8 @@ impl BlockStore {
                 &path,
             )?;
         if wiped > 0 {
-            if let Ok(mut idx_map) = self.shard_id_by_file_key.lock() {
-                idx_map.remove(&id.file_key());
+            if self.forget_indexed(&id.file_key()) {
+                self.persist_shard_index();
             }
             if let Ok(mut q) = self.quota.lock() {
                 q.record_shard_removed(owner_peer_id, &id.file_key(), wiped);
@@ -615,6 +681,21 @@ impl BlockStore {
             let max_cap = {
                 let mut q = self.quota.lock().expect("quota mutex poisoned");
                 q.roll_epoch_if_due(std::time::Instant::now()); // B-162
+                                                                // B-152 (a), C31: the held-shard bound is decided before any eviction; a
+                                                                // full count refuses, it never evicts to make room.
+                if let Some((bound, held)) = q.held_shard_bound() {
+                    if let Err(code) = crate::storage::quota::held_shard_decision(held, bound.max) {
+                        tracing::warn!(
+                            code,
+                            owner = owner_peer_id,
+                            held,
+                            "refused a shard over the held-shard bound"
+                        );
+                        return Err(StorageError::QuotaExceeded(format!(
+                            "{code} ({owner_peer_id})"
+                        )));
+                    }
+                }
                 if !q.can_accept_shard(owner_peer_id, shard_size) {
                     let evicted = q.evict_lru_to_fit(shard_size);
                     {
@@ -624,7 +705,9 @@ impl BlockStore {
                             .lock()
                             .expect("shard_id_by_file_key mutex poisoned");
                         for evicted_key in evicted {
-                            idx_map.remove(&evicted_key);
+                            if let Some(id) = idx_map.remove(&evicted_key) {
+                                self.queue_removed(id);
+                            }
                             if let Some(buf) = m.regular_shards.remove(&evicted_key) {
                                 InMemoryShardBacking::zero_wipe_vec(buf);
                             }
@@ -843,32 +926,109 @@ impl BlockStore {
         Ok(proofs)
     }
 
-    /// Deletes a shard from local disk or bounded RAM storage.
+    /// Deletes a shard from local disk or bounded RAM storage, with its quota credit and its
+    /// shard-index entry, and queues it for the wire handler's settle (B-152 (a)).
     pub fn delete_shard(&self, owner_peer_id: &str, id: &ShardId) -> Result<bool, StorageError> {
+        let removed = self.delete_shard_deferred(owner_peer_id, id)?;
+        self.flush_removals();
+        Ok(removed)
+    }
+
+    /// [`Self::delete_shard`] without the state writes: call [`Self::flush_removals`] once after
+    /// a batch (a `FreeShards` order), so the quota state and the shard index are written once
+    /// per batch, not once per shard (arch056c 1.7).
+    pub fn delete_shard_deferred(
+        &self,
+        owner_peer_id: &str,
+        id: &ShardId,
+    ) -> Result<bool, StorageError> {
         if self.is_in_memory() {
             let wiped = self.zero_wipe_regular_shard(owner_peer_id, id)?;
             return Ok(wiped > 0);
         }
         let path = self.shard_path(id);
-        if path.exists() {
-            let len = fs::metadata(&path)?.len();
-            fs::remove_file(&path)?;
-            if let Ok(mut q) = self.quota.lock() {
-                q.record_shard_removed(owner_peer_id, &id.file_key(), len);
-            }
-            // B-152 (a), C19: a removed shard leaves the shard index too, so nothing that walks
-            // the index (handoff, listing) sees it again.
-            let removed = self
-                .shard_id_by_file_key
-                .lock()
-                .is_ok_and(|mut m| m.remove(&id.file_key()).is_some());
-            if removed {
-                self.persist_shard_index();
-            }
-            Ok(true)
-        } else {
-            Ok(false)
+        if !path.exists() {
+            // A stale index entry (the file went another way) leaves the index too.
+            self.forget_indexed(&id.file_key());
+            return Ok(false);
         }
+        let len = fs::metadata(&path)?.len();
+        fs::remove_file(&path)?;
+        if let Ok(mut q) = self.quota.lock() {
+            q.record_shard_removed_deferred(owner_peer_id, &id.file_key(), len);
+        }
+        // B-152 (a), C19: a removed shard leaves the shard index too, so nothing that walks
+        // the index (handoff, listing) sees it again.
+        self.forget_indexed(&id.file_key());
+        Ok(true)
+    }
+
+    /// Writes the quota state and the shard index once, after deferred removals.
+    pub fn flush_removals(&self) {
+        if let Ok(q) = self.quota.lock() {
+            q.flush_persistence();
+        }
+        self.persist_shard_index();
+    }
+
+    /// Removes `file_key` from the shard index and queues its id for the wire handler's settle.
+    /// Returns whether the index named it.
+    fn forget_indexed(&self, file_key: &str) -> bool {
+        let id = self
+            .shard_id_by_file_key
+            .lock()
+            .ok()
+            .and_then(|mut m| m.remove(file_key));
+        match id {
+            Some(id) => {
+                self.queue_removed(id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn queue_removed(&self, id: ShardId) {
+        if let Ok(mut q) = self.removed_shards.lock() {
+            if q.len() >= MAX_PENDING_REMOVED_SHARDS {
+                tracing::warn!(
+                    code = "warn.removed_shard_queue_full",
+                    "removal queue full; the oldest entry's eviction and PoR records stay"
+                );
+                q.remove(0);
+            }
+            q.push(id);
+        }
+    }
+
+    /// B-152 (a): the regular shards removed since the last call, for the wire handler to clear
+    /// their eviction attribution and PoR entries (`wire_handler::settle_removed_shards`).
+    pub fn take_removed_shards(&self) -> Vec<ShardId> {
+        self.removed_shards
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default()
+    }
+
+    /// Regular shards this node holds (B-148 live status; the count the held-shard bound
+    /// applies to).
+    pub fn shards_held(&self) -> u64 {
+        self.quota.lock().map_or(0, |q| q.held_shard_count() as u64)
+    }
+
+    /// The L-130 held-shard bound and its source (`"cgroup"`, `"ram"`, `"config"` or
+    /// `"profile-ceiling"`), or `None` when no bound is set (B-148 live status).
+    pub fn held_shard_bound(&self) -> Option<(u64, &'static str)> {
+        self.quota
+            .lock()
+            .ok()
+            .and_then(|q| q.held_shard_bound())
+            .map(|(b, _)| (b.max, b.source.as_str()))
+    }
+
+    /// Entries in the shard index (B-152 (a) tests).
+    pub fn shard_index_len(&self) -> usize {
+        self.shard_id_by_file_key.lock().map_or(0, |m| m.len())
     }
 
     pub fn has_shard(&self, id: &ShardId) -> bool {
@@ -982,7 +1142,9 @@ impl BlockStore {
                         .lock()
                         .expect("shard_id_by_file_key mutex poisoned");
                     for ek in evicted_reg {
-                        idx_map.remove(&ek);
+                        if let Some(id) = idx_map.remove(&ek) {
+                            self.queue_removed(id);
+                        }
                         if let Some(buf) = m.regular_shards.remove(&ek) {
                             InMemoryShardBacking::zero_wipe_vec(buf);
                         }
@@ -1349,6 +1511,7 @@ impl BlockStore {
                             {
                                 InMemoryShardBacking::zero_wipe_vec(buf);
                             }
+                            self.forget_indexed(&stem);
                             if let Ok(mut q) = self.quota.lock() {
                                 q.record_shard_removed("local", &stem, bytes.len() as u64);
                             }
@@ -1403,6 +1566,9 @@ impl BlockStore {
                                 report.verified_healthy_shards += 1;
                             } else {
                                 let _ = fs::remove_file(&path);
+                                if self.forget_indexed(stem) {
+                                    self.persist_shard_index();
+                                }
                                 if let Ok(mut q) = self.quota.lock() {
                                     q.record_shard_removed("local", stem, bytes.len() as u64);
                                 }
@@ -1637,6 +1803,9 @@ impl BlockStore {
             if remove_local_after_handoff {
                 let _ = fs::remove_file(path);
                 if let Some(stem) = fname.strip_suffix(".shard") {
+                    if self.forget_indexed(stem) {
+                        self.persist_shard_index();
+                    }
                     if let Ok(mut q) = self.quota.lock() {
                         q.record_shard_removed("local", stem, bytes.len() as u64);
                     }
@@ -2433,14 +2602,62 @@ impl SignedDhtManifestEnvelope {
     }
 }
 
-/// Track B1 tests of `BlockStore` refusals.
+/// Track B1 tests of the `BlockStore` shard index (B-152 (a)).
 #[cfg(test)]
-mod b1_refusal_tests {
+mod b152_tests {
     use super::*;
+
+    /// B-152 (a), arch152b 3.5: an undecodable `shard_index.bin` never loads as empty: it is
+    /// rebuilt from the eviction index for the shard files present; when a file has no
+    /// recoverable id the store refuses to open.
+    #[test]
+    fn b152_undecodable_shard_index_is_rebuilt_or_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ev =
+            crate::storage::eviction::PrivacyPreservingEvictionEngine::load_or_init(dir.path())
+                .unwrap();
+        let mut ids = Vec::new();
+        {
+            let store = BlockStore::new(dir.path(), QuotaManager::new(1 << 30, 1 << 30)).unwrap();
+            for i in 0..3u8 {
+                let bytes = vec![i; 300];
+                let id = ShardId {
+                    stripe_merkle_root: [i + 1; 32],
+                    shard_index: 0,
+                    shard_hash: hash_shard_leaf(0, &bytes),
+                };
+                store.put_shard("p", &id, &bytes).unwrap();
+                ev.record_regular_shard_ingress(None, None, None, "p", id)
+                    .unwrap();
+                ids.push(id);
+            }
+        }
+        std::fs::write(dir.path().join("shard_index.bin"), b"\xff\xff not an index").unwrap();
+        let store = BlockStore::new(dir.path(), QuotaManager::new(1 << 30, 1 << 30)).unwrap();
+        assert_eq!(store.shard_index_len(), 3, "rebuilt, not empty");
+        let listed: std::collections::HashSet<ShardId> = store
+            .list_stored_shards()
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(listed, ids.iter().copied().collect());
+        drop(store);
+        // A shard file the eviction index does not name: refused, never an empty index.
+        std::fs::write(dir.path().join("shard_index.bin"), b"garbage").unwrap();
+        ev.forget_regular_shards(&ids[..1]).unwrap();
+        let err = BlockStore::new(dir.path(), QuotaManager::new(1 << 30, 1 << 30))
+            .err()
+            .expect("refused");
+        assert!(
+            err.to_string().contains("reject.shard_index_corrupt"),
+            "{err}"
+        );
+    }
 
     /// B2 (C35, arch152 3.5): a put refusal carries its reason code in the error text, which
     /// the wire arm returns as `PutShardAck.error` (`e.to_string()`), so a client tells
-    /// `reject.peer_quota_exceeded` and `reject.node_capacity` apart.
+    /// `reject.peer_quota_exceeded`, `reject.node_capacity` and `reject.node_shard_count` apart.
     #[test]
     fn put_refusals_carry_their_reason_code() {
         let put = |q: QuotaManager, owner: &str, len: usize| -> String {
@@ -2458,6 +2675,66 @@ mod b1_refusal_tests {
         assert!(e.contains("reject.peer_quota_exceeded (peer)"), "{e}");
         let e = put(QuotaManager::new(100, 1 << 30), "peer", 200);
         assert!(e.contains("reject.node_capacity (peer)"), "{e}");
+        let mut q = QuotaManager::new(1 << 30, 1 << 30);
+        q.set_held_shard_bound(crate::storage::quota::HeldShardBound {
+            max: 0,
+            source: crate::storage::quota::HeldShardBoundSource::Config,
+            memory_bytes: None,
+        });
+        let e = put(q, "peer", 200);
+        assert!(e.contains("reject.node_shard_count (peer)"), "{e}");
+        // The in-memory path: the held-shard bound before any eviction.
+        let mut q = QuotaManager::new(1 << 30, 1 << 30);
+        q.set_held_shard_bound(crate::storage::quota::HeldShardBound {
+            max: 0,
+            source: crate::storage::quota::HeldShardBoundSource::Config,
+            memory_bytes: None,
+        });
+        let mem = BlockStore::new_in_memory(q);
+        let bytes = vec![7u8; 200];
+        let id = ShardId {
+            stripe_merkle_root: [4; 32],
+            shard_index: 0,
+            shard_hash: hash_shard_leaf(0, &bytes),
+        };
+        let e = mem.put_shard("peer", &id, &bytes).unwrap_err().to_string();
+        assert!(e.contains("reject.node_shard_count (peer)"), "{e}");
+    }
+
+    /// B-152 (a): a deferred removal batch writes the quota state and the index once, credits
+    /// the accounted owner, and queues every removed id for the wire handler's settle.
+    #[test]
+    fn b152_deferred_removals_flush_once_and_queue_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path(), QuotaManager::new(1 << 30, 1 << 30)).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..4u8 {
+            let bytes = vec![i; 100];
+            let id = ShardId {
+                stripe_merkle_root: [i + 9; 32],
+                shard_index: 1,
+                shard_hash: hash_shard_leaf(1, &bytes),
+            };
+            store.put_shard("owner", &id, &bytes).unwrap();
+            ids.push(id);
+        }
+        let _ = store.take_removed_shards();
+        let index_before = std::fs::read(dir.path().join("shard_index.bin")).unwrap();
+        for id in &ids[..3] {
+            assert!(store.delete_shard_deferred("sender", id).unwrap());
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("shard_index.bin")).unwrap(),
+            index_before,
+            "nothing written before the flush"
+        );
+        store.flush_removals();
+        assert_eq!(store.shard_index_len(), 1);
+        assert_eq!(store.take_removed_shards(), ids[..3].to_vec());
+        let q = store.quota();
+        let q = q.lock().unwrap();
+        assert_eq!(q.peer_account("owner").unwrap().bytes_hosted_for_peer, 100);
+        assert_eq!(q.held_shard_count(), 1);
     }
 }
 

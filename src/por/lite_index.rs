@@ -275,6 +275,25 @@ impl LiteAuditIndex {
         self.dirty = true;
     }
 
+    /// C17 (B-154): removes the record of `stripe_merkle_root` fanned out for `client` (the key
+    /// is root plus client, as [`Self::insert`]), when that client's owner frees the stripe on
+    /// the seed. Another client's record of the same root is never touched. Returns whether a
+    /// record was removed; the file is written on the next [`flush`].
+    pub fn remove_stripe(&mut self, stripe_merkle_root: &[u8; 32], client: &str) -> bool {
+        let Some(pos) = self
+            .records
+            .iter()
+            .position(|o| o.stripe_merkle_root == *stripe_merkle_root && o.client == client)
+        else {
+            return false;
+        };
+        if let Some(old) = self.records.remove(pos) {
+            self.uncharge(&old);
+        }
+        self.dirty = true;
+        true
+    }
+
     /// The encoded index and its path when it has a file and changed since the last write;
     /// clears the dirty mark (a failed write sets it again, see [`flush`]).
     fn take_snapshot(&mut self) -> Option<(PathBuf, Vec<u8>)> {
@@ -503,5 +522,20 @@ mod tests {
             .iter()
             .filter(|r| r.client == "heavy")
             .all(|r| r.stripe_merkle_root[0] >= 42));
+    }
+
+    /// C17: a free removes only the signer's own record of the root.
+    #[test]
+    fn remove_stripe_is_keyed_by_root_and_client() {
+        let mut idx = LiteAuditIndex::in_memory();
+        idx.insert(rec("alice", 1, 2));
+        idx.insert(rec("bob", 1, 2));
+        let before = idx.bytes();
+        assert!(!idx.remove_stripe(&[1; 32], "mallory"));
+        assert!(idx.remove_stripe(&[1; 32], "alice"));
+        assert!(!idx.remove_stripe(&[1; 32], "alice"));
+        assert_eq!(idx.len(), 1);
+        assert!(idx.bytes() < before);
+        assert_eq!(idx.records[0].client, "bob");
     }
 }
