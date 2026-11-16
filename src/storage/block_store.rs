@@ -852,6 +852,15 @@ impl BlockStore {
             if let Ok(mut q) = self.quota.lock() {
                 q.record_shard_removed(owner_peer_id, &id.file_key(), len);
             }
+            // B-152 (a), C19: a removed shard leaves the shard index too, so nothing that walks
+            // the index (handoff, listing) sees it again.
+            let removed = self
+                .shard_id_by_file_key
+                .lock()
+                .is_ok_and(|mut m| m.remove(&id.file_key()).is_some());
+            if removed {
+                self.persist_shard_index();
+            }
             Ok(true)
         } else {
             Ok(false)
