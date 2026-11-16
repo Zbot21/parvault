@@ -772,7 +772,11 @@ pub struct GcRun<'a> {
     pub settings: &'a GcSettings,
     store: &'a BlockStore,
     owner: &'a NodeIdentity,
+    /// The wall clock (ms) when the run started.
     now_ms: u64,
+    /// The monotonic clock at the same moment as `now_ms`: an order is stamped
+    /// `now_ms + started.elapsed()`, the wall time at its send (D12).
+    started: std::time::Instant,
     paths: GcPaths,
     versions: VersionStore,
     pub journal: GcJournal,
@@ -788,6 +792,18 @@ impl<'a> GcRun<'a> {
         owner: &'a NodeIdentity,
         now_ms: u64,
     ) -> Result<Self, GcError> {
+        Self::new_started(settings, store, owner, now_ms, std::time::Instant::now())
+    }
+
+    /// [`Self::new`] for a run whose wall time `now_ms` was read at the monotonic instant
+    /// `started` (a caller that read both clocks earlier, before work of its own).
+    pub fn new_started(
+        settings: &'a GcSettings,
+        store: &'a BlockStore,
+        owner: &'a NodeIdentity,
+        now_ms: u64,
+        started: std::time::Instant,
+    ) -> Result<Self, GcError> {
         let paths = GcPaths::for_snapshot(&settings.snapshot_out);
         let journal = GcJournal::load(&paths)?;
         Ok(Self {
@@ -795,6 +811,7 @@ impl<'a> GcRun<'a> {
             store,
             owner,
             now_ms,
+            started,
             versions: VersionStore::for_snapshot(&settings.snapshot_out),
             paths,
             journal,
@@ -1172,9 +1189,10 @@ impl<'a> GcRun<'a> {
                 }
                 let take = work.len().min(MAX_FREE_ORDER_SHARDS);
                 let chunk: Vec<(bool, usize, ShardId)> = work.drain(..take).collect();
-                // D12: stamped now, at send, not at the pass start: a slow host before this one
+                // D12: stamped with the wall time at send (the run's clock pair, read before
+                // step 1), not the pass start: slow steps 1-5 or a slow host before this one
                 // must not make the order stale on arrival (`reject.free_stale`).
-                let ts = now.saturating_add(spent_ms(started));
+                let ts = now.saturating_add(spent_ms(self.started));
                 let epoch = order_epoch(self.journal.last_epoch, ts);
                 self.journal.last_epoch = epoch;
                 self.journal.save(&self.paths)?;

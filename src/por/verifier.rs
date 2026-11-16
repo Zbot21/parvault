@@ -2535,7 +2535,7 @@ mod chunk_admit_tests {
             e.free_order_check(&big, &host, now),
             Err("reject.free_order_malformed")
         );
-        // The epoch: a mark set at 7 refuses 7 and 6, accepts 8; it expires after 60 s.
+        // The epoch: a mark set at 7 refuses 7 and 6, accepts 8; it expires after 61 s.
         e.advance_free_epoch(owner.public_key_bytes(), 7, now);
         assert_eq!(
             e.free_order_check(&signed(&owner, host, now, 7), &host, now),

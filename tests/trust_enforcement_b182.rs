@@ -341,11 +341,34 @@ const ENVELOPE_PUTS: &[&str] = &[
     ".put_dht_vault_catalog_envelope(",
     ".put_dht_envelope(",
     ".put_dht_envelope_report(",
+    // D23: the Kademlia copy of a put envelope (`store_mut().put`, `put_record`).
+    ".put(",
+    ".put_record(",
 ];
 
 /// The call sites of the envelope puts in `src/` (file, line, the statement up to the call),
 /// definitions and comments excluded.
 fn envelope_put_sites() -> Vec<(String, usize, String)> {
+    envelope_put_statements()
+        .into_iter()
+        .map(|(f, l, head, _)| (f, l, head))
+        .collect()
+}
+
+/// Whether a put statement (`head`: up to the call; `whole`: to its `;`) drops the result:
+/// `let _ =` / `let _:`, or an expression statement ending in `.ok()` or `.is_ok()`.
+fn put_discarded(head: &str, whole: &str) -> bool {
+    let bound = [
+        "let ", "if ", "match ", "return", "while ", "Some(", "Ok(", "Err(",
+    ];
+    head.starts_with("let _ =")
+        || head.starts_with("let _:")
+        || ((whole.ends_with(".ok()") || whole.ends_with(".is_ok()"))
+            && !bound.iter().any(|b| whole.starts_with(b)))
+}
+
+/// [`envelope_put_sites`] with each whole statement (to its `;`, or the end of its block).
+fn envelope_put_statements() -> Vec<(String, usize, String, String)> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
     rust_files(&root.join("src"), &mut files);
@@ -365,9 +388,14 @@ fn envelope_put_sites() -> Vec<(String, usize, String)> {
                     .split_whitespace()
                     .collect::<Vec<_>>()
                     .join(" ");
+                let end = src[at..].find([';', '}']).map_or(src.len(), |i| at + i);
+                let whole = src[stmt_start..end]
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 let line = src[..at].matches('\n').count() + 1;
                 let rel = f.strip_prefix(root).unwrap().display().to_string();
-                sites.push((rel, line, stmt));
+                sites.push((rel, line, stmt, whole));
             }
         }
     }
@@ -378,14 +406,15 @@ fn envelope_put_sites() -> Vec<(String, usize, String)> {
 /// result is discarded with `let _ =` (or `.ok();` / `.is_ok()` dropped on its own line).
 #[test]
 fn b182_envelope_puts_never_discarded() {
-    let sites = envelope_put_sites();
-    for (f, l, s) in &sites {
+    let all = envelope_put_statements();
+    for (f, l, s, _) in &all {
         eprintln!("b182 envelope put: {f}:{l}: {s}");
     }
-    let discarded: Vec<_> = sites
+    let discarded: Vec<_> = all
         .iter()
-        .filter(|(_, _, s)| s.starts_with("let _ =") || s.starts_with("let _:"))
+        .filter(|(_, _, head, whole)| put_discarded(head, whole))
         .collect();
+    let sites = envelope_put_sites();
     assert!(
         discarded.is_empty(),
         "envelope puts whose result is discarded: {discarded:#?}"
@@ -406,6 +435,38 @@ fn b182_envelope_puts_never_discarded() {
     let at = probe.find(".put_dht_manifest_envelope(").unwrap();
     let start = probe[..at].rfind([';', '{', '}']).unwrap() + 1;
     assert!(probe[start..at].trim_start().starts_with("let _ ="));
+    // D23: the Kademlia copy is covered, and the `.ok()` / `.is_ok()` forms bite too.
+    assert!(
+        all.iter()
+            .filter(|(f, _, _, _)| f == "src/network/client.rs")
+            .any(|(_, _, h, _)| h.ends_with(".put_record(")),
+        "{all:#?}"
+    );
+    for (head, whole, dropped) in [
+        (
+            "let _ = swarm.behaviour_mut().kademlia.put_record(",
+            "let _ = swarm.behaviour_mut().kademlia.put_record(r, q)",
+            true,
+        ),
+        ("store.put(", "store.put(record).ok()", true),
+        (
+            "c.put_dht_envelope_report(",
+            "c.put_dht_envelope_report(env).is_ok()",
+            true,
+        ),
+        (
+            "if let Err(e) = store.put(",
+            "if let Err(e) = store.put(record) {",
+            false,
+        ),
+        (
+            "let ok = c.put_dht_envelope_report(",
+            "let ok = c.put_dht_envelope_report(env).is_ok()",
+            false,
+        ),
+    ] {
+        assert_eq!(put_discarded(head, whole), dropped, "{whole}");
+    }
     gate_ran("trust_enforcement_b182::b182_envelope_puts_never_discarded");
 }
 

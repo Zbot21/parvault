@@ -543,3 +543,15 @@ suite      S-B182-T5 test=trust_enforcement_b182::b182_host_rules_unchanged need
 suite      S-B182-T6 test=trust_enforcement_b182::b182_legacy_store_over_cap_at_load needs=cmd:sh   # B182-8
 suite      S-B182-T6R test=trust_enforcement_b182::b182_store_under_cap_no_warning needs=cmd:sh   # B182-8: under the share, no warning
 suite      S-B182-T7 test=trust_enforcement_b182::b182_wire_golden_unchanged needs=cmd:sh   # no wire change
+
+# --- v0.5.6 QA fixes, qafix2056 (qa056 re-verification: D10, D12, D16) ---------------------------
+suite      S-D10-OUT-OF-RULE test=trust_enforcement_setup::d10_out_of_rule_vaultkey_resealed needs=cmd:sh   # D10 with D16: an existing .vaultkey of a refused namespace is resealed under the passphrase, not re-registered
+suite      S-D12-SLOW-STEP5 test=trust_enforcement_gc_owner::d12_orders_after_a_slow_step5_are_fresh needs=cmd:sh   # D12: orders after 31 s of steps 1-5 carry the wall time at send; none is free_stale
+suite      S-D12-STALL-BOUND test=trust_enforcement_gc_owner::d12_stall_inside_free_shards_is_bounded_and_carried needs=cmd:sh   # D12: a host that accepts an order and never answers costs at most its budget; deferred frees go next pass
+suite      S-D16-BACKUP-WARN test=trust_enforcement_restore::d16_backup_names_each_skipped_floor needs=cmd:sh   # D16: ring backup names each skipped floor and why (warn.ring_backup_floor_skipped)
+suite      S-D8-ALT-CAP test=trust_enforcement_gc_owner::d8_alias_alternatives_capped needs=cmd:sh   # D8: one failed alias request tries at most MAX_ALIAS_ALTERNATIVES (4) other addresses
+suite      S-D8-DEAD-SKIP test=trust_enforcement_gc_owner::d8_dead_alternative_skipped needs=cmd:sh   # D8: a dead-marked alternative is not dialed again
+suite      S-D21-NOGC test=trust_enforcement_gc_owner::d21_no_gc_no_change_pass_reseals_nothing needs=cmd:sh   # D21: no catalog sealed twice at one version under --no-gc; no false refusals
+suite      S-D21-LAG test=trust_enforcement_gc_owner::d21_unacknowledged_catalog_not_resealed needs=cmd:sh   # D21: an unacknowledged catalog is put again, not resealed at its version
+suite      S-D22-OVERSIZE test=trust_enforcement_gc_owner::d22_oversize_catalog_refused_visibly needs=cmd:sh   # D22: an oversize catalog is refused before sending (reject.catalog_too_large), seen in the pass line and folder-status
+suite      S-D24-NOGC-STATS test=trust_enforcement_gc_owner::d24_no_gc_refusals_in_folder_status needs=cmd:sh   # D24: refusal totals kept and shown under --no-gc

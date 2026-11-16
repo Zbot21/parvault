@@ -1067,6 +1067,15 @@ impl BlockStore {
             .refusals()
     }
 
+    /// D22: counts an owner-side envelope refusal decided before any put (an oversize
+    /// catalog), with the store's own refusals ([`Self::dht_envelope_refusals`]).
+    pub fn note_owner_envelope_refusal(&self) {
+        self.dht_store
+            .lock()
+            .expect("dht_store mutex poisoned")
+            .count_refusal();
+    }
+
     /// The envelope store's budget in force (after the environment knobs).
     pub fn dht_store_limits(&self) -> DhtStoreLimits {
         self.dht_store
@@ -2886,8 +2895,9 @@ pub struct DhtStoreLimits {
 impl DhtStoreLimits {
     /// Per profile: byte budgets router-soc 8 MiB, homelab-nas 32 MiB, desktop 256 MiB
     /// (arch152b 4). Key counts are one per 4 KiB of budget (2,048, 8,192, 65,536): every
-    /// changed file adds one manifest key per version and nothing removes envelopes until
-    /// B-182, so the key count is what version churn exhausts; the byte budget bounds memory.
+    /// changed file added one manifest key per version before B-182 (folder sync now publishes
+    /// only its vault catalog, replaced in place), and nothing removes envelopes, so the key
+    /// count is what churn of `file store` exhausts; the byte budget bounds memory.
     /// One owner may take three quarters of either, so one ring member cannot fill the store
     /// for the others.
     pub const fn for_profile(profile: crate::profile::HardwareProfile) -> Self {
@@ -3043,6 +3053,39 @@ fn note_envelope_refusal(kind: EnvelopeKind, scope: &str, reason: &str) {
     }
 }
 
+/// D22: the refusal code of a vault catalog whose wire size `size` is over `limit` (the
+/// smaller of the wire frame and the per-owner envelope share).
+pub const fn catalog_size_decision(size: u64, limit: u64) -> Result<(), &'static str> {
+    if size > limit {
+        Err("reject.catalog_too_large")
+    } else {
+        Ok(())
+    }
+}
+
+/// D22: reports a vault catalog refused before any put for its size: `warn.dht_envelope_refused`
+/// (`scope=local`) with the size and the limit, counted with the store's refusals, so the pass
+/// line and `folder-status` show it. The ring keeps the last catalog that fit.
+pub fn report_catalog_too_large(store: &BlockStore, code: &str, size: u64, limit: u64) {
+    store.note_owner_envelope_refusal();
+    note_envelope_refusal(
+        EnvelopeKind::Catalog,
+        "local",
+        &format!("{code} ({size} > {limit} bytes)"),
+    );
+    tracing::warn!(
+        code = "warn.dht_envelope_refused",
+        kind = EnvelopeKind::Catalog.as_str(),
+        scope = "local",
+        reason = code,
+        size_bytes = size,
+        limit_bytes = limit,
+        hosts_refused = 0u64,
+        hosts_stored = 0u64,
+        "the vault catalog is over the envelope limit and is not published; the ring keeps the last catalog that fit (back up fewer files per vault)"
+    );
+}
+
 /// B182-6: reports an owner-side put into this node's own envelope store. A refusal logs
 /// `warn.dht_envelope_refused` (`scope=local`); the store counts it
 /// ([`BlockStore::dht_envelope_refusals`]). Returns whether the envelope was stored.
@@ -3076,6 +3119,21 @@ pub fn report_ring_envelope_put(
 ) -> usize {
     match res {
         Ok(r) => {
+            if r.hosts_oversize > 0 {
+                let code = "reject.envelope_frame_too_large";
+                note_envelope_refusal(kind, "ring", code);
+                tracing::warn!(
+                    code = "warn.dht_envelope_refused",
+                    kind = kind.as_str(),
+                    scope = "ring",
+                    reason = code,
+                    size_bytes = r.request_bytes,
+                    limit_bytes = crate::network::behaviour::MAX_WIRE_FRAME_BYTES as u64,
+                    hosts_refused = r.hosts_oversize as u64,
+                    hosts_stored = 0u64,
+                    "an owner envelope is over the wire frame and was sent to no host"
+                );
+            }
             if r.hosts_refused > 0 {
                 note_envelope_refusal(kind, "ring", r.reason.as_deref().unwrap_or("unknown"));
                 tracing::warn!(
@@ -3087,11 +3145,12 @@ pub fn report_ring_envelope_put(
                     hosts_stored = r.hosts_stored as u64,
                     "ring hosts refused an owner envelope"
                 );
-            } else if r.hosts_stored == 0 {
+            } else if r.hosts_stored == 0 && r.hosts_oversize == 0 {
                 tracing::warn!(
                     code = "warn.dht_envelope_unacknowledged",
                     kind = kind.as_str(),
                     hosts_failed = r.hosts_failed as u64,
+                    hosts_timed_out = r.hosts_timed_out as u64,
                     error = %r.last_error.as_ref().map(|e| e.to_string()).unwrap_or_default(),
                     "no ring host acknowledged an owner envelope"
                 );
@@ -3374,6 +3433,10 @@ impl ZeroTrustDhtStore {
     }
 
     /// B182-6: puts this store refused since it was built (owner-side and host-side alike).
+    fn count_refusal(&mut self) {
+        self.refusals = self.refusals.saturating_add(1);
+    }
+
     pub fn refusals(&self) -> u64 {
         self.refusals
     }

@@ -289,6 +289,9 @@ pub struct FolderSyncEngine {
     last_pass: PassSummary,
     /// Version GC of this folder (B-154; `None`: the daemon's appliance folder defaults).
     gc: Option<super::gc_journal::GcSettings>,
+    /// D22: the per-owner envelope share of the active profile, a limit on the catalog's size
+    /// besides this store's own share and the wire frame.
+    catalog_owner_share: Option<u64>,
 }
 
 /// What one pass changed (B-154 3; the `FolderSyncDiff` counters).
@@ -374,6 +377,7 @@ impl FolderSyncEngine {
             last_envelope: None,
             last_pass: PassSummary::default(),
             gc: None,
+            catalog_owner_share: None,
         }
     }
 
@@ -385,6 +389,11 @@ impl FolderSyncEngine {
     /// Sets this folder's GC (B-154). The placement journal hook (C3) is installed on the
     /// engine's mesh client, so every stripe this engine places is recorded before its first
     /// shard is sent.
+    /// D22: limits the vault catalog to `bytes` (the active profile's per-owner envelope share).
+    pub fn set_catalog_owner_share(&mut self, bytes: u64) {
+        self.catalog_owner_share = Some(bytes);
+    }
+
     pub fn set_gc(&mut self, settings: super::gc_journal::GcSettings) {
         let paths = super::gc_journal::GcPaths::for_snapshot(&settings.snapshot_out);
         if let Some(client) = self.store.mesh_client().cloned() {
@@ -1330,13 +1339,48 @@ impl FolderSyncEngine {
             vault_namespace,
             snapshot,
         )?;
-        // B182-6: a refused local put or any refusing ring host is reported, never discarded.
-        let local_ok = crate::storage::block_store::report_local_envelope_put(
-            crate::storage::block_store::EnvelopeKind::Catalog,
-            &self.store.put_dht_vault_catalog_envelope(env.clone()),
+        let acked = self.put_vault_catalog(&env, client, true);
+        Ok((env, acked))
+    }
+
+    /// D21: puts an already sealed vault catalog (never sealed again at its version), into this
+    /// node's store too when `local`, and on the ring; returns whether it is acknowledged (a
+    /// ring host stored it, or with no ring, the local store did or already holds it).
+    /// D22: a catalog over the smallest limit known here (the wire frame, and this node's
+    /// per-owner envelope share) is refused before anything is sent
+    /// (`warn.dht_envelope_refused`, `reject.catalog_too_large`), so the owner sees it.
+    pub fn put_vault_catalog(
+        &self,
+        env: &EncryptedVaultCatalogEnvelope,
+        client: Option<&crate::network::MeshClient>,
+        local: bool,
+    ) -> bool {
+        use crate::storage::block_store::{
+            catalog_size_decision, report_catalog_too_large, report_local_envelope_put,
+            report_ring_envelope_put, EnvelopeKind,
+        };
+        let wire = crate::network::MeshWireRequest::PutDhtEnvelope(
+            crate::network::DhtWireEnvelope::VaultCatalog(env.clone()),
         );
+        let size = bincode::serialized_size(&wire).unwrap_or(u64::MAX);
+        let limit = (crate::network::behaviour::MAX_WIRE_FRAME_BYTES as u64)
+            .min(self.store.dht_store_limits().max_owner_bytes)
+            .min(self.catalog_owner_share.unwrap_or(u64::MAX));
+        if let Err(code) = catalog_size_decision(size, limit) {
+            report_catalog_too_large(&self.store, code, size, limit);
+            return false;
+        }
+        // B182-6: a refused local put or any refusing ring host is reported, never discarded.
+        let local_ok = if local {
+            report_local_envelope_put(
+                EnvelopeKind::Catalog,
+                &self.store.put_dht_vault_catalog_envelope(env.clone()),
+            )
+        } else {
+            true
+        };
         let client = client.or(self.store.mesh_client());
-        let acked = match client {
+        match client {
             Some(c) if !c.all_network_endpoints().is_empty() => {
                 let report = c.put_dht_envelope_report(
                     crate::network::DhtWireEnvelope::VaultCatalog(env.clone()),
@@ -1351,10 +1395,7 @@ impl FolderSyncEngine {
                         "vault catalog put on the ring"
                     );
                 }
-                let stored = crate::storage::block_store::report_ring_envelope_put(
-                    crate::storage::block_store::EnvelopeKind::Catalog,
-                    &report,
-                );
+                let stored = report_ring_envelope_put(EnvelopeKind::Catalog, &report);
                 if stored == 0 {
                     tracing::warn!(
                         code = "warn.catalog_publish_failed",
@@ -1364,8 +1405,7 @@ impl FolderSyncEngine {
                 stored > 0
             }
             _ => local_ok,
-        };
-        Ok((env, acked))
+        }
     }
 
     /// Zero-Local-State "House Fire" Disaster Recovery (`ADR-18`):

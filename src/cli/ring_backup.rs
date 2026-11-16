@@ -225,6 +225,16 @@ fn is_floor_name(name: &str) -> bool {
         .is_some_and(parvault::sync::catalog_resume::vault_namespace_ok)
 }
 
+/// D16: the namespace of a `vaults/<ns>.floor` entry the backup skips (its namespace fails
+/// the shared rule), if `name` is one.
+fn skipped_floor_namespace(name: &str) -> Option<&str> {
+    let ns = name
+        .strip_prefix(VAULTS_DIR)?
+        .strip_prefix('/')?
+        .strip_suffix(".floor")?;
+    (!is_floor_name(name)).then_some(ns)
+}
+
 /// The subdirectory a bundle entry lives in, if any.
 fn sub_dir_of(name: &str) -> Option<&'static str> {
     if is_chain_name(name) {
@@ -268,6 +278,18 @@ fn backup(
             // Only chains and version floors; never `vaults/*.vaultkey` (archC1 condition 5).
             if sub_dir_of(&name) == Some(dir) {
                 names.push(name);
+            } else if let Some(ns) = skipped_floor_namespace(&name) {
+                // D16: a floor an earlier build wrote under a namespace the rule now refuses
+                // is not carried; say which, never silently.
+                let code = "warn.ring_backup_floor_skipped";
+                tracing::warn!(code, vault = %ns, "version floor not in the backup");
+                eprintln!(
+                    "Warning ({code}): the version floor of vault {ns:?} is not in this backup: \
+                     its namespace is outside the current rule (1 to 128 printable ASCII \
+                     characters, no '/' or '\\', not '.' or '..'); after a restore that vault \
+                     has no rollback floor until its next catalog. Move it to a supported \
+                     namespace."
+                );
             }
         }
         names.sort();

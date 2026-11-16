@@ -519,16 +519,36 @@ fn dispatch_rpc_on_established_peer(
         };
         match bincode::serialize(env) {
             Ok(bytes) => {
+                // B182-6, D23: the Kademlia copy is best effort (a catalog over the 2 MiB
+                // record limit, about 477 files, is not stored there; restore reads it over
+                // the wire), but a failed put is logged, never discarded.
+                let len = bytes.len() as u64;
                 let record = envelope_kad_record(&dht_key, bytes, *swarm.local_peer_id());
-                let _ = swarm
+                if let Err(e) = swarm
                     .behaviour_mut()
                     .kademlia
                     .store_mut()
-                    .put(record.clone());
-                let _ = swarm
+                    .put(record.clone())
+                {
+                    tracing::info!(
+                        code = "info.dht_kad_record_not_stored",
+                        bytes = len,
+                        error = %e,
+                        "envelope not kept in the local Kademlia store; the wire copy is unaffected"
+                    );
+                }
+                if let Err(e) = swarm
                     .behaviour_mut()
                     .kademlia
-                    .put_record(record, kad::Quorum::One);
+                    .put_record(record, kad::Quorum::One)
+                {
+                    tracing::info!(
+                        code = "info.dht_kad_record_not_stored",
+                        bytes = len,
+                        error = %e,
+                        "envelope not put as a Kademlia record; the wire copy is unaffected"
+                    );
+                }
             }
             Err(e) => {
                 let _ = reply_tx.send(Err(MeshClientError::ProtocolError(format!(
@@ -1170,6 +1190,13 @@ pub struct DhtPutReport {
     pub hosts_stored: usize,
     pub hosts_refused: usize,
     pub hosts_failed: usize,
+    /// D24: hosts whose request timed out (counted in `hosts_failed` too).
+    pub hosts_timed_out: usize,
+    /// D24: hosts not sent the envelope because its request is over the wire frame
+    /// (`reject.envelope_frame_too_large`; counted as envelope refusals).
+    pub hosts_oversize: usize,
+    /// The request's wire size.
+    pub request_bytes: u64,
     /// The first refusing host's `reject.*` code (or its error text when it has none).
     pub reason: Option<String>,
     /// The last error, for a put no host stored.
@@ -1206,7 +1233,21 @@ impl MeshClient {
         if endpoints.is_empty() {
             anyhow::bail!("no network peers configured for PutDhtEnvelope");
         }
-        let mut r = DhtPutReport::default();
+        let mut r = DhtPutReport {
+            request_bytes: bincode::serialized_size(&MeshWireRequest::PutDhtEnvelope(
+                envelope.clone(),
+            ))
+            .unwrap_or(u64::MAX),
+            ..DhtPutReport::default()
+        };
+        // D24: a request over the wire frame fails at every host; it is a refusal the owner
+        // sees, not a transport failure.
+        if r.request_bytes > crate::network::behaviour::MAX_WIRE_FRAME_BYTES as u64 {
+            r.hosts_oversize = endpoints.len();
+            self.envelope_refusals
+                .fetch_add(endpoints.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            return Ok(r);
+        }
         for ep in &endpoints {
             match self.send_request(ep, MeshWireRequest::PutDhtEnvelope(envelope.clone())) {
                 Ok(MeshWireResponse::PutDhtEnvelopeAck { stored: true, .. }) => {
@@ -1240,6 +1281,12 @@ impl MeshClient {
                 }
                 Err(e) => {
                     r.hosts_failed += 1;
+                    if matches!(
+                        e.downcast_ref::<MeshClientError>(),
+                        Some(MeshClientError::RequestTimedOut { .. })
+                    ) {
+                        r.hosts_timed_out += 1;
+                    }
                     r.last_error = Some(e);
                 }
             }

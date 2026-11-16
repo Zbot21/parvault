@@ -599,6 +599,30 @@ fn ring_pass_peers(f: &LocalFolder, peers: &str) -> Output {
 /// A ring pass with `extra` watch-folder flags, within `limit`.
 fn ring_pass_args(f: &LocalFolder, peers: &str, extra: &[&str], limit: Duration) -> Output {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_parvault"));
+    ring_pass_run(&mut cmd, f, peers, extra, limit)
+}
+
+/// [`ring_pass_args`] with `env` set on the owner process.
+fn ring_pass_env(
+    f: &LocalFolder,
+    peers: &str,
+    extra: &[&str],
+    env: &[(&str, &str)],
+    limit: Duration,
+) -> Output {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.envs(env.iter().copied());
+    ring_pass_run(&mut cmd, f, peers, extra, limit)
+}
+
+/// Runs `cmd` (the real binary) as a ring pass of `f` with `extra` watch-folder flags.
+fn ring_pass_run(
+    cmd: &mut std::process::Command,
+    f: &LocalFolder,
+    peers: &str,
+    extra: &[&str],
+    limit: Duration,
+) -> Output {
     cmd.env("PARVAULT_LAN_REGISTRY_DIR", f.node.join("lan-registry"))
         .env("PARVAULT_GENESIS_SEED_HEX", GENESIS_SEED_HEX)
         .env("PARVAULT_SEED_PHRASE", PHRASE)
@@ -619,7 +643,7 @@ fn ring_pass_args(f: &LocalFolder, peers: &str, extra: &[&str], limit: Duration)
             "--once",
         ])
         .args(extra);
-    output_within(&mut cmd, limit)
+    output_within(cmd, limit)
 }
 
 /// A ring pass with a raw `--key-hex` and no vault phrase, as the Docker gate's stage 13 runs
@@ -1537,11 +1561,104 @@ fn d8_down_given_peer_probed_once() {
     let elapsed = t0.elapsed();
     let dials = accepted.load(std::sync::atomic::Ordering::SeqCst);
     assert!(dials <= 1, "the down given peer was dialed {dials} times");
+    assert_eq!(client.given_probe_dials(), 1, "one peer-id probe in all");
     assert!(
         elapsed < timeout * 3,
         "{n} failing requests took {elapsed:?} (one probe is {timeout:?})"
     );
     gate_ran("trust_enforcement_gc_owner::d8_down_given_peer_probed_once");
+}
+
+/// `n` given addresses that accept and hang every dial, each pinned to the peer id of
+/// `/p2p/X` (`X` from `seed`), and a client that knows them; returns the client, a dead alias
+/// of `X`, and each address's accept counter.
+fn pinned_blackholes(
+    n: usize,
+    seed: u8,
+) -> (
+    parvault::network::MeshClient,
+    String,
+    Vec<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+) {
+    let x = parvault::network::node_identity_libp2p_peer_id(
+        &parvault::crypto::NodeIdentity::from_seed([seed; 32]),
+    )
+    .unwrap();
+    let (addrs, counts): (Vec<String>, Vec<_>) = (0..n).map(|_| blackhole()).unzip();
+    let client = parvault::network::MeshClient::new(
+        parvault::crypto::NodeIdentity::from_seed([seed ^ 0xFF; 32]),
+        addrs.clone(),
+        None,
+    )
+    .with_lan_discovery(false)
+    .with_timeout(Duration::from_secs(1));
+    for a in &addrs {
+        client.pin_peer_id(a, x);
+    }
+    let alias = format!("/ip4/127.0.0.1/tcp/{}/p2p/{x}", closed_port());
+    (client, alias, counts)
+}
+
+fn dials_of(counts: &[std::sync::Arc<std::sync::atomic::AtomicUsize>]) -> Vec<usize> {
+    counts
+        .iter()
+        .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+        .collect()
+}
+
+/// D8 (qa056 coverage): one failed request to a dead `/p2p/X` alias tries at most
+/// `MAX_ALIAS_ALTERNATIVES` (4) of X's other addresses, here 4 of 6, each dialed once; no
+/// peer-id probe is dialed for pinned given addresses.
+#[test]
+fn d8_alias_alternatives_capped() {
+    use parvault::network::client::MAX_ALIAS_ALTERNATIVES;
+    use parvault::network::MeshWireRequest;
+    assert_eq!(MAX_ALIAS_ALTERNATIVES, 4);
+    let (client, alias, counts) = pinned_blackholes(6, 0xC8);
+    assert_eq!(client.other_addresses_of_peer(&alias).len(), 6);
+    assert!(client
+        .send_request(&alias, MeshWireRequest::QueryNodeStatus)
+        .is_err());
+    // A dial that the hole accepts after the client gave up still counts: wait for stragglers.
+    std::thread::sleep(Duration::from_millis(500));
+    let dials = dials_of(&counts);
+    assert_eq!(
+        dials.iter().sum::<usize>(),
+        MAX_ALIAS_ALTERNATIVES,
+        "alternatives dialed: {dials:?}"
+    );
+    assert!(dials.iter().all(|&d| d <= 1), "{dials:?}");
+    assert_eq!(client.given_probe_dials(), 0);
+    gate_ran("trust_enforcement_gc_owner::d8_alias_alternatives_capped");
+}
+
+/// D8 (qa056 coverage): an alternative that failed is marked dead and left out of X's other
+/// addresses, so the next failed request to the alias does not dial it again.
+#[test]
+fn d8_dead_alternative_skipped() {
+    use parvault::network::MeshWireRequest;
+    let (client, alias, counts) = pinned_blackholes(2, 0xC9);
+    assert!(client
+        .send_request(&alias, MeshWireRequest::QueryNodeStatus)
+        .is_err());
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(dials_of(&counts), vec![1, 1]);
+    assert!(
+        client.other_addresses_of_peer(&alias).is_empty(),
+        "dead alternatives still listed: {:?}",
+        client.other_addresses_of_peer(&alias)
+    );
+    assert!(client
+        .send_request(&alias, MeshWireRequest::QueryNodeStatus)
+        .is_err());
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        dials_of(&counts),
+        vec![1, 1],
+        "a dead alternative was dialed again"
+    );
+    assert_eq!(client.given_probe_dials(), 0);
+    gate_ran("trust_enforcement_gc_owner::d8_dead_alternative_skipped");
 }
 
 /// D9: in a cold process (no pins), a plain `--peers` address and a discovered `/p2p/X` of the
@@ -1753,4 +1870,420 @@ fn b154_stalled_host_does_not_starve_the_others() {
     assert!(!t.contains("free_stale"), "{t}");
     assert!(t.contains("Pending Frees      : 1 "), "{t}");
     gate_ran("trust_enforcement_gc_owner::b154_stalled_host_does_not_starve_the_others");
+}
+
+/// An in-process GC run of one owner: its block store, journal and settings in a scratch dir,
+/// frees through `client`.
+struct OwnerRun {
+    _tmp: tempfile::TempDir,
+    store: parvault::storage::BlockStore,
+    owner: parvault::crypto::NodeIdentity,
+    settings: parvault::sync::gc_journal::GcSettings,
+}
+
+impl OwnerRun {
+    fn new(seed: u8, client: parvault::network::MeshClient) -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = parvault::storage::BlockStore::new(
+            tmp.path().join("store"),
+            parvault::storage::QuotaManager::new(1 << 30, 1 << 20),
+        )
+        .unwrap();
+        let settings = parvault::sync::gc_journal::GcSettings {
+            snapshot_out: tmp.path().join("s.manifest.bin"),
+            policy: Default::default(),
+            data_dir: tmp.path().to_path_buf(),
+            client: Some(client),
+            fetched_catalog: None,
+        };
+        Self {
+            _tmp: tmp,
+            store,
+            owner: parvault::crypto::NodeIdentity::from_seed([seed; 32]),
+            settings,
+        }
+    }
+
+    fn paths(&self) -> parvault::sync::gc_journal::GcPaths {
+        parvault::sync::gc_journal::GcPaths::for_snapshot(&self.settings.snapshot_out)
+    }
+
+    /// Journals `ids` as due frees on `host`.
+    fn seed(&self, ids: &[parvault::storage::ShardId], host: &str) {
+        let mut j = parvault::sync::gc_journal::GcJournal::load(&self.paths()).unwrap();
+        for id in ids {
+            j.pending.push(parvault::sync::gc_journal::PendingFree {
+                shard_id: *id,
+                shard_len: 4096,
+                host: host.to_string(),
+                attempts: 0,
+                first_attempt_ms: now_ms(),
+                next_pass: 0,
+                skew_refusals: 0,
+            });
+        }
+        j.save(&self.paths()).unwrap();
+    }
+
+    fn pending(&self) -> Vec<parvault::storage::ShardId> {
+        parvault::sync::gc_journal::GcJournal::load(&self.paths())
+            .unwrap()
+            .pending
+            .iter()
+            .map(|p| p.shard_id)
+            .collect()
+    }
+}
+
+/// D12 (qa056 re-verification): steps 1 to 5 of a run took 31 s (about 4,000 local frees),
+/// longer than a host's 30 s skew. The run's clock pair is read at its start, before that
+/// work; the orders of step 6 are stamped with the wall time at their send, so the host
+/// applies them (`info.free_order_applied`) and none is refused `reject.free_stale`.
+#[test]
+fn d12_orders_after_a_slow_step5_are_fresh() {
+    let host = spawn_host();
+    let client = parvault::network::MeshClient::new(
+        parvault::crypto::NodeIdentity::from_seed([0xE1; 32]),
+        Vec::new(),
+        None,
+    )
+    .with_lan_discovery(false)
+    .with_admission(parvault::network::admission::AdmissionSource::from_genesis(
+        parvault::crypto::NodeIdentity::from_seed([0x47; 32]),
+    ));
+    let r = OwnerRun::new(0xE1, client);
+    r.seed(&[absent_shard(0x61), absent_shard(0x62)], &host.addr);
+    let slow = Duration::from_secs(31);
+    let started = std::time::Instant::now()
+        .checked_sub(slow)
+        .expect("uptime over 31 s");
+    let mut run = parvault::sync::gc_journal::GcRun::new_started(
+        &r.settings,
+        &r.store,
+        &r.owner,
+        now_ms() - slow.as_millis() as u64,
+        started,
+    )
+    .unwrap();
+    run.step6_send_orders().unwrap();
+    let report = run.finish();
+    assert_eq!(report.clock_skew_refusals, 0, "{report:?}");
+    assert_eq!(report.orders_sent, 1, "{report:?}");
+    assert_eq!(report.shards_not_held, 2, "{report:?}");
+    assert!(r.pending().is_empty(), "{:?}", r.pending());
+    assert_eq!(applied_orders(&host), vec!["2".to_string()]);
+    let log = std::fs::read_to_string(&host.log).unwrap_or_default();
+    assert!(!log.contains("free_stale"), "{log}");
+    gate_ran("trust_enforcement_gc_owner::d12_orders_after_a_slow_step5_are_fresh");
+}
+
+/// The shard ids of each `FreeShards` order a peer saw.
+type SeenOrders = std::sync::Arc<std::sync::Mutex<Vec<Vec<parvault::storage::ShardId>>>>;
+
+/// A wire peer that accepts every connection and status request but never answers its first
+/// `FreeShards` order nor any `DeleteShard` (it holds each response open past the owner's
+/// timeout); later `FreeShards` orders are answered `NotHeld` for every shard. Returns its
+/// `/p2p/` address and the shard ids of each `FreeShards` order it saw.
+fn spawn_stalling_free_peer() -> (String, SeenOrders) {
+    use libp2p::futures::StreamExt;
+    use libp2p::request_response::{self, ProtocolSupport};
+    use libp2p::swarm::SwarmEvent;
+    use parvault::network::behaviour::{BincodeWireCodec, FreeShardOutcome};
+    use parvault::network::wire_handler::{reject_response, NOT_ADMITTED_TEXT};
+    use parvault::network::{MeshWireRequest, MeshWireResponse};
+    let seen: SeenOrders = Default::default();
+    let log = std::sync::Arc::clone(&seen);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let ident = parvault::crypto::NodeIdentity::from_seed([0xD5; 32]);
+            let mut swarm =
+                libp2p::SwarmBuilder::with_existing_identity(ident.to_libp2p_keypair().unwrap())
+                    .with_tokio()
+                    .with_tcp(
+                        libp2p::tcp::Config::default(),
+                        libp2p::noise::Config::new,
+                        libp2p::yamux::Config::default,
+                    )
+                    .unwrap()
+                    .with_behaviour(|_| {
+                        request_response::Behaviour::with_codec(
+                            BincodeWireCodec::default(),
+                            [(
+                                libp2p::StreamProtocol::new("/parvault/wire/1.0.0"),
+                                ProtocolSupport::Full,
+                            )],
+                            // Held responses outlive the owner's 30 s order timeout.
+                            request_response::Config::default()
+                                .with_request_timeout(Duration::from_secs(600)),
+                        )
+                    })
+                    .unwrap()
+                    .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(600)))
+                    .build();
+            swarm
+                .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+                .unwrap();
+            let pid = *swarm.local_peer_id();
+            let mut held = Vec::new();
+            loop {
+                match swarm.select_next_some().await {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        let _ = tx.send(format!("{address}/p2p/{pid}"));
+                    }
+                    SwarmEvent::Behaviour(request_response::Event::Message {
+                        message:
+                            request_response::Message::Request {
+                                request, channel, ..
+                            },
+                        ..
+                    }) => {
+                        let resp = match request {
+                            MeshWireRequest::HandshakeWoT { .. } => {
+                                MeshWireResponse::HandshakeAck {
+                                    accepted: true,
+                                    reason: None,
+                                }
+                            }
+                            MeshWireRequest::FreeShards { order } => {
+                                let first = {
+                                    let mut l = log.lock().unwrap();
+                                    l.push(order.shard_ids.clone());
+                                    l.len() == 1
+                                };
+                                if first {
+                                    held.push(channel);
+                                    continue;
+                                }
+                                MeshWireResponse::FreeShardsAck {
+                                    outcomes: vec![
+                                        FreeShardOutcome::NotHeld;
+                                        order.shard_ids.len()
+                                    ],
+                                    error: None,
+                                }
+                            }
+                            MeshWireRequest::DeleteShard { .. } => {
+                                held.push(channel);
+                                continue;
+                            }
+                            other => reject_response(&other, NOT_ADMITTED_TEXT.to_string()),
+                        };
+                        let _ = swarm.behaviour_mut().send_response(channel, resp);
+                    }
+                    _ => {}
+                }
+            }
+        });
+    });
+    let addr = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("stalling peer listening");
+    (addr, seen)
+}
+
+/// D12 (qa056 re-verification): a host that accepts the `FreeShards` order and never answers
+/// (nor the per-shard `DeleteShard` fallback) costs the pass at most its host budget plus the
+/// order in flight; the shards not tried are deferred, stay journalled, and the next pass sends
+/// them (that host answers this time), which empties them from the journal.
+#[test]
+fn d12_stall_inside_free_shards_is_bounded_and_carried() {
+    use parvault::sync::gc_journal::{GcRun, FREE_HOST_BUDGET_MS, FREE_ORDER_TIMEOUT};
+    let (peer, seen) = spawn_stalling_free_peer();
+    let client = parvault::network::MeshClient::new(
+        parvault::crypto::NodeIdentity::from_seed([0xE2; 32]),
+        Vec::new(),
+        None,
+    )
+    .with_lan_discovery(false);
+    let r = OwnerRun::new(0xE2, client);
+    let ids = [absent_shard(0x71), absent_shard(0x72), absent_shard(0x73)];
+    r.seed(&ids, &peer);
+
+    let t0 = std::time::Instant::now();
+    let mut run = GcRun::new(&r.settings, &r.store, &r.owner, now_ms()).unwrap();
+    run.step6_send_orders().unwrap();
+    let report = run.finish();
+    let spent = t0.elapsed();
+    let bound = Duration::from_millis(FREE_HOST_BUDGET_MS) + FREE_ORDER_TIMEOUT;
+    assert!(
+        spent >= FREE_ORDER_TIMEOUT,
+        "the order did not stall: {spent:?}"
+    );
+    assert!(spent < bound, "the stall cost {spent:?}, over {bound:?}");
+    assert_eq!(report.frees_deferred, 2, "{report:?}");
+    assert_eq!(
+        report.shards_freed + report.shards_not_held,
+        0,
+        "{report:?}"
+    );
+    assert_eq!(r.pending().len(), 3, "every shard stays journalled");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    // The next pass: the deferred shards are due and sent; the host answers and they leave the
+    // journal.
+    let mut run = GcRun::new(&r.settings, &r.store, &r.owner, now_ms()).unwrap();
+    run.step6_send_orders().unwrap();
+    let report = run.finish();
+    let orders = seen.lock().unwrap().clone();
+    assert_eq!(orders.len(), 2, "{orders:?}");
+    for id in &ids[1..] {
+        assert!(
+            orders[1].contains(id),
+            "deferred {id:?} not sent: {orders:?}"
+        );
+    }
+    assert!(report.shards_not_held >= 2, "{report:?}");
+    let left = r.pending();
+    assert!(
+        ids[1..].iter().all(|id| !left.contains(id)),
+        "deferred shards still journalled: {left:?}"
+    );
+    gate_ran("trust_enforcement_gc_owner::d12_stall_inside_free_shards_is_bounded_and_carried");
+}
+
+/// D21 (qa056, B-182 review): under `--no-gc`, a no-change pass seals no second catalog at the
+/// same version (this node's store and every host would refuse it as a rollback): no
+/// `warn.dht_envelope_refused`, no refusal pass line.
+#[test]
+fn d21_no_gc_no_change_pass_reseals_nothing() {
+    let hosts = [spawn_host(), spawn_host()];
+    let peers = format!("{},{}", hosts[0].addr, hosts[1].addr);
+    let f = LocalFolder::new();
+    f.write("one");
+    let limit = Duration::from_secs(120);
+    let out = ring_pass_args(&f, &peers, &["--no-gc"], limit);
+    assert!(out.status.success(), "{}", text(&out));
+    let out = ring_pass_args(&f, &peers, &["--no-gc"], limit);
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(!t.contains("warn.dht_envelope_refused"), "{t}");
+    assert!(!t.contains("envelope refusal(s) this pass"), "{t}");
+    gate_ran("trust_enforcement_gc_owner::d21_no_gc_no_change_pass_reseals_nothing");
+}
+
+/// D21 with GC on: version 2's catalog reached no host (the host is down), so it lags; the
+/// next no-change pass puts that same envelope again instead of sealing a second one at
+/// version 2, which this node's store would refuse as a rollback.
+#[test]
+fn d21_unacknowledged_catalog_not_resealed() {
+    let mut host = spawn_host();
+    let peers = host.addr.clone();
+    let f = LocalFolder::new();
+    f.write("one");
+    let limit = Duration::from_secs(120);
+    let out = ring_pass_args(&f, &peers, &[], limit);
+    assert!(out.status.success(), "{}", text(&out));
+    f.write("two, changed");
+    host.stop();
+    let out = ring_pass_args(&f, &peers, &[], limit);
+    let t2 = text(&out);
+    assert!(t2.contains("warn.catalog_publish_failed"), "{t2}");
+    let out = ring_pass_args(&f, &peers, &[], limit);
+    let t = text(&out);
+    assert!(
+        !t.contains("warn.dht_envelope_refused"),
+        "{t2}\n--- pass 3 ---\n{t}"
+    );
+    assert!(!t.contains("envelope refusal(s) this pass"), "{t}");
+    gate_ran("trust_enforcement_gc_owner::d21_unacknowledged_catalog_not_resealed");
+}
+
+/// Writes `n` small files (one stripe each) into `f`.
+fn many_files(f: &LocalFolder, n: usize) {
+    for i in 0..n {
+        std::fs::write(f.folder.join(format!("f{i:03}.txt")), format!("file {i}")).unwrap();
+    }
+}
+
+/// The envelope budget the D22 tests give the owner process: an owner share of 12,288 bytes,
+/// under the catalog of 8 files.
+const SMALL_DHT_BUDGET: (&str, &str) = ("PARVAULT_DHT_STORE_MAX_BYTES", "16384");
+
+/// D22 (qa056, B-182 review): a catalog over the smallest limit the owner knows (here its
+/// per-owner envelope share) is a refusal the owner sees before anything is sent:
+/// `warn.dht_envelope_refused reason=reject.catalog_too_large` with the size and limit, the
+/// refusal pass line, and `folder-status`; no host is sent it.
+#[test]
+fn d22_oversize_catalog_refused_visibly() {
+    let host = spawn_host();
+    let f = LocalFolder::new();
+    many_files(&f, 8);
+    let out = ring_pass_env(
+        &f,
+        &host.addr,
+        &[],
+        &[SMALL_DHT_BUDGET],
+        Duration::from_secs(120),
+    );
+    let t = strip_ansi(&text(&out));
+    let warn = t
+        .lines()
+        .find(|l| l.contains("warn.dht_envelope_refused") && l.contains("reject.catalog_too_large"))
+        .unwrap_or_else(|| panic!("no catalog_too_large refusal:\n{t}"));
+    assert!(warn.contains("limit_bytes=12288"), "{warn}");
+    assert!(warn.contains("size_bytes="), "{warn}");
+    assert!(
+        t.contains("envelope refusal(s) this pass (last: catalog local reject.catalog_too_large"),
+        "{t}"
+    );
+    assert!(
+        !t.contains("info.catalog_published"),
+        "the catalog was sent:\n{t}"
+    );
+    let st = run_parvault(
+        &f.node,
+        &["folder-status", "--snapshot", f.snap.to_str().unwrap()],
+    );
+    let s = text(&st);
+    assert!(
+        s.contains("Envelope Refusals  : 1 (last: catalog local reject.catalog_too_large"),
+        "{s}"
+    );
+    gate_ran("trust_enforcement_gc_owner::d22_oversize_catalog_refused_visibly");
+}
+
+/// D24 (qa056, B-182 review): under `--no-gc` the refusal totals are still written, and
+/// `folder-status` shows them although there is no version store.
+#[test]
+fn d24_no_gc_refusals_in_folder_status() {
+    let host = spawn_host();
+    let f = LocalFolder::new();
+    many_files(&f, 8);
+    let out = ring_pass_env(
+        &f,
+        &host.addr,
+        &["--no-gc"],
+        &[SMALL_DHT_BUDGET],
+        Duration::from_secs(120),
+    );
+    let t = text(&out);
+    assert!(t.contains("envelope refusal(s) this pass"), "{t}");
+    let st = run_parvault(
+        &f.node,
+        &["folder-status", "--snapshot", f.snap.to_str().unwrap()],
+    );
+    let s = text(&st);
+    assert!(st.status.success(), "{s}");
+    assert!(s.contains("Envelope Refusals  : 1 "), "{s}");
+    gate_ran("trust_enforcement_gc_owner::d24_no_gc_refusals_in_folder_status");
+}
+
+/// `s` without ANSI colour sequences (`ESC [ ... m`), as a terminal would show it.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }

@@ -1592,9 +1592,36 @@ pub mod catalog {
         write_vault_keys_unchecked(data_dir, seed_phrase, vault_namespace, sealing_passphrase)
     }
 
+    /// D10 for a namespace D16 refuses: an existing `.vaultkey` an earlier build wrote for it
+    /// is written again (same keys) with the sealing chain of [`register_vault_keys`], so a
+    /// file still sealed by `enclave_sealing.seed` is resealed under the configured
+    /// passphrase. Such a vault is not registered anew; with no file for `vault_namespace`
+    /// nothing is written (`Ok(None)`). A namespace inside the rule is left to
+    /// [`register_vault_keys`] (`Ok(None)`).
+    pub fn reseal_out_of_rule_vault_keys(
+        data_dir: &Path,
+        seed_phrase: &str,
+        vault_namespace: &str,
+        sealing_passphrase: Option<&str>,
+    ) -> std::io::Result<Option<PathBuf>> {
+        if namespace_ok(vault_namespace) {
+            return Ok(None);
+        }
+        // Path-safe first: `vaultkey_path` joins the namespace as one file name.
+        let path_safe = !(vault_namespace.is_empty()
+            || vault_namespace == "."
+            || vault_namespace == ".."
+            || vault_namespace.contains(['/', '\\', '\0']));
+        if !path_safe || !vaultkey_path(data_dir, vault_namespace).is_file() {
+            return Ok(None);
+        }
+        write_vault_keys_unchecked(data_dir, seed_phrase, vault_namespace, sealing_passphrase)
+            .map(Some)
+    }
+
     /// [`register_vault_keys`] without the D16 namespace rule (only a path-safe single segment):
-    /// what builds before the rule wrote, so tests can make such a registration. Not for use
-    /// outside tests.
+    /// what builds before the rule wrote. Outside tests, only
+    /// [`reseal_out_of_rule_vault_keys`] calls it, on a file that already exists.
     #[doc(hidden)]
     pub fn write_vault_keys_unchecked(
         data_dir: &Path,
