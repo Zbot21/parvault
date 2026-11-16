@@ -9363,11 +9363,16 @@ fn b59_handoff_shard_audited_by_owner() {
         "no pass credited to the new host {h_id}:\n{}",
         owner.log_text()
     );
-    let rel = b59_relocations(&owner);
+    // The pass is booked in the quota ledger before the auditor state file (with the new
+    // relocation) is saved in the same tick, so poll the file too.
     assert!(
-        rel.as_object()
-            .is_some_and(|m| m.values().any(|r| r["host_addr"] == h.addr.as_str())),
-        "{rel}"
+        eventually(|| b59_relocations(&owner)
+            .as_object()
+            .is_some_and(|m| m.values().any(|r| r["host_addr"] == h.addr.as_str()))),
+        "no relocation to {} saved: {}\n{}",
+        h.addr,
+        b59_relocations(&owner),
+        owner.log_text()
     );
     assert!(
         !h.log_text().contains("reject.por_not_storer"),
