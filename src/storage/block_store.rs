@@ -676,9 +676,10 @@ impl BlockStore {
 
         {
             let mut q = self.quota.lock().expect("quota mutex poisoned");
-            q.roll_epoch_if_due(std::time::Instant::now()); // B-162
-                                                            // B-161: a full file-backed node refuses (`reject.node_capacity`); it never evicts
-                                                            // shards held for other accounts to admit a put.
+            // B-162: a new write epoch once the current one has run its length.
+            q.roll_epoch_if_due(std::time::Instant::now());
+            // B-161: a full file-backed node refuses (`reject.node_capacity`); it never evicts
+            // shards held for other accounts to admit a put.
             if let Err(code) = q.quota_decision(owner_peer_id, shard_size) {
                 tracing::warn!(code, owner = owner_peer_id, "refused a shard over quota");
                 return Err(StorageError::QuotaExceeded(owner_peer_id.to_string()));
@@ -2115,8 +2116,9 @@ impl BlockStore {
         let shard_size = bytes.len() as u64;
         {
             let mut q = self.quota.lock().expect("quota mutex poisoned");
-            q.roll_epoch_if_due(std::time::Instant::now()); // B-162
-                                                            // B-161: as `put_shard`, refuse rather than evict other accounts' shards.
+            // B-162: a new write epoch once the current one has run its length.
+            q.roll_epoch_if_due(std::time::Instant::now());
+            // B-161: as `put_shard`, refuse rather than evict other accounts' shards.
             if let Err(code) = q.quota_decision(owner_peer_id, shard_size) {
                 tracing::warn!(code, owner = owner_peer_id, "refused a shard over quota");
                 return Err(StorageError::QuotaExceeded(owner_peer_id.to_string()));
