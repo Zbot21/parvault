@@ -309,6 +309,20 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                     code = "reject.vault_namespace_unsupported",
                     "{e}; this vault syncs but the daemon's VFS does not list it"
                 );
+                // D10: a key file an earlier build wrote for it is still resealed under the
+                // configured passphrase (not re-registered).
+                if let Some(path) = parvault::vfs::catalog::reseal_out_of_rule_vault_keys(
+                    &cfg.data_dir,
+                    phrase,
+                    &vault_namespace,
+                    cfg.device_sealing_passphrase.as_deref(),
+                )? {
+                    tracing::info!(
+                        code = "info.vaultkey_resealed",
+                        path = %path.display(),
+                        "an existing vault key file of an unsupported namespace was resealed"
+                    );
+                }
             }
             Err(e) => return Err(e.into()),
         }

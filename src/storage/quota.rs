@@ -443,7 +443,8 @@ fn v1_cgroup_dir(path: &str, mount_root: &str, mount_point: &str) -> Option<Stri
 ///   names a directory that does not exist. Every limit from the resolved directory up to the
 ///   mount point counts (the lowest wins), so a joined path that does not exist still reaches
 ///   the mount point's own `memory.limit_in_bytes`. Without a usable mountinfo entry, the mount
-///   point is `/sys/fs/cgroup/memory` with root `/`.
+///   point is `/sys/fs/cgroup/memory` with root `/`. A path outside every memory mount's root
+///   (another cgroup's tree is mounted there) has no limit, as the JDK reads it.
 ///
 /// `max` and v1's unlimited value mean none.
 pub fn cgroup_limit(
@@ -476,12 +477,12 @@ pub fn cgroup_limit(
             }
             for (mount_root, mount_point) in &mounts {
                 let top = under_root(mount_point);
-                let dir = match v1_cgroup_dir(path, mount_root, mount_point) {
-                    Some(d) => under_root(&d),
-                    // The path is outside this mount's root: walk the whole path under the
-                    // mount point, which ends at the mount point's own limit.
-                    None => top.join(path.trim_start_matches('/')),
+                // A path outside this mount's root is another cgroup's tree: no limit from it
+                // (as the JDK reads it), never the mount point's own, a sibling's limit.
+                let Some(d) = v1_cgroup_dir(path, mount_root, mount_point) else {
+                    continue;
                 };
+                let dir = under_root(&d);
                 if let Some(v) = lowest_limit_up_to(dir, &top, "memory.limit_in_bytes") {
                     return Some(v);
                 }

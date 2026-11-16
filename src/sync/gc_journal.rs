@@ -1189,9 +1189,10 @@ impl<'a> GcRun<'a> {
                 }
                 let take = work.len().min(MAX_FREE_ORDER_SHARDS);
                 let chunk: Vec<(bool, usize, ShardId)> = work.drain(..take).collect();
-                // D12: stamped now, at send, not at the pass start: a slow host before this one
+                // D12: stamped with the wall time at send (the run's clock pair, read before
+                // step 1), not the pass start: slow steps 1-5 or a slow host before this one
                 // must not make the order stale on arrival (`reject.free_stale`).
-                let ts = now.saturating_add(spent_ms(started));
+                let ts = now.saturating_add(spent_ms(self.started));
                 let epoch = order_epoch(self.journal.last_epoch, ts);
                 self.journal.last_epoch = epoch;
                 self.journal.save(&self.paths)?;
