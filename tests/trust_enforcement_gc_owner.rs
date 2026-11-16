@@ -1445,3 +1445,55 @@ fn b192_shards_recorded_under_alias_restore_cold() {
     );
     gate_ran("trust_enforcement_gc_owner::b192_shards_recorded_under_alias_restore_cold");
 }
+
+/// Sends `sig` (`STOP` or `CONT`) to a host daemon.
+fn signal_host(host: &Host, sig: &str) {
+    let st = std::process::Command::new("kill")
+        .arg(format!("-{sig}"))
+        .arg(host.child.id().to_string())
+        .status()
+        .unwrap();
+    assert!(st.success(), "kill -{sig}");
+}
+
+/// D12 (qa056): of three hosts, the one first in send order is stopped (SIGSTOP: it holds
+/// every connection without answering). In the same pass the other two still apply their
+/// orders (stamped when sent, not at the pass start, so none arrives stale), and only the
+/// stopped host's free stays journalled.
+#[test]
+fn b154_stalled_host_does_not_starve_the_others() {
+    let mut hosts = vec![spawn_host(), spawn_host(), spawn_host()];
+    hosts.sort_by(|a, b| a.addr.cmp(&b.addr));
+    let peers = hosts
+        .iter()
+        .map(|h| h.addr.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let f = LocalFolder::new();
+    f.write("one");
+    let out = ring_pass_key_hex(&f, &peers);
+    assert!(out.status.success(), "{}", text(&out));
+    let before: Vec<usize> = hosts.iter().map(|h| applied_orders(h).len()).collect();
+    let seeded: Vec<_> = hosts
+        .iter()
+        .enumerate()
+        .map(|(i, h)| (absent_shard(0x40 + i as u8), h.addr.clone()))
+        .collect();
+    seed_pending(&f, &seeded);
+    signal_host(&hosts[0], "STOP");
+    let out = ring_pass_key_hex(&f, &peers);
+    signal_host(&hosts[0], "CONT");
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    for (h, n) in hosts.iter().zip(&before).skip(1) {
+        assert!(
+            applied_orders(h).len() > *n,
+            "host {} got no order this pass:\n{t}\n--- host log ---\n{}",
+            h.addr,
+            std::fs::read_to_string(&h.log).unwrap_or_default()
+        );
+    }
+    assert!(!t.contains("free_stale"), "{t}");
+    assert!(t.contains("Pending Frees      : 1 "), "{t}");
+    gate_ran("trust_enforcement_gc_owner::b154_stalled_host_does_not_starve_the_others");
+}
