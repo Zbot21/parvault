@@ -2006,9 +2006,10 @@ pub mod catalog {
             if let Some(client) = self.store.mesh_client() {
                 if !client.all_network_endpoints().is_empty() {
                     if let Ok(crate::network::DhtWireEnvelope::VaultCatalog(env)) = client
-                        .get_dht_envelope(
+                        .get_dht_envelope_for_owner(
                             &keys.dht_key,
                             crate::network::DhtEnvelopeKind::VaultCatalog,
+                            keys.owner_pubkey,
                         )
                     {
                         cands.push(env);
