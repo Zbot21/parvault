@@ -50,7 +50,10 @@ impl Node {
         NodeIdentity::load_or_generate_in_dir(&dir).unwrap();
         HybridKemKeypair::load_or_generate_in_dir(&dir).unwrap();
         HybridPqSigningKeypair::load_or_generate_in_dir(&dir).unwrap();
-        std::fs::write(dir.join("macaroon_root.key"), hex::encode(ROOT_KEY)).unwrap();
+        let key = dir.join("macaroon_root.key");
+        std::fs::write(&key, hex::encode(ROOT_KEY)).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
         Self { root, dir }
     }
 
@@ -66,6 +69,18 @@ impl Node {
 
     /// [`Self::start`] with extra environment variables.
     fn start_env(&self, run: &str, listen: &str, peers: &[String], env: &[(&str, &str)]) -> Daemon {
+        self.start_full(run, listen, peers, env, None)
+    }
+
+    /// [`Self::start_env`], with the gateway socket at `socket` instead of `--no-socket`.
+    fn start_full(
+        &self,
+        run: &str,
+        listen: &str,
+        peers: &[String],
+        env: &[(&str, &str)],
+        socket: Option<&Path>,
+    ) -> Daemon {
         let log = self.root.path().join(format!("{run}.log"));
         let f = std::fs::File::create(&log).unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
@@ -81,15 +96,12 @@ impl Node {
         if !peers.is_empty() {
             cmd.arg("--peers").arg(peers.join(","));
         }
-        cmd.args([
-            "daemon",
-            "start",
-            "--listen",
-            listen,
-            "--no-socket",
-            "--status-http",
-            "127.0.0.1:0",
-        ]);
+        cmd.args(["daemon", "start", "--listen", listen]);
+        match socket {
+            Some(sock) => cmd.arg("--ipc-socket").arg(sock),
+            None => cmd.arg("--no-socket"),
+        };
+        cmd.args(["--status-http", "127.0.0.1:0"]);
         let mut child = cmd
             .stdout(Stdio::from(f.try_clone().unwrap()))
             .stderr(Stdio::from(f))
@@ -329,14 +341,74 @@ fn b148_live_status_refused_without_token() {
     gate_ran("trust_enforcement_liveness::b148_live_status_refused_without_token");
 }
 
-/// T0 stub of track D still standing: the CLI half of `status --live` (it needs the daemon's
-/// socket, a flag the Lead adds to the frozen `config.rs`).
+/// Runs `parvault status --live --socket <sock> [extra]` on `node`'s data directory.
+fn status_live(node: &Node, sock: &Path, extra: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env_remove("PARVAULT_PEERS")
+        .env("PARVAULT_LAN_REGISTRY_DIR", node.root.path().join("reg"))
+        .arg("--data-dir")
+        .arg(&node.dir)
+        .args(["--no-lan-discovery", "status", "--live", "--socket"])
+        .arg(sock)
+        .args(extra);
+    common::output_within_deadline(&mut cmd)
+}
+
+/// B-148 item 2 accept (CLI): `parvault status --live` asks the daemon over its socket with a
+/// read-only token minted from the data directory's root key and prints its connected peer.
 #[test]
-fn track_d_status_live_cli_unbuilt() {
-    let tmp = tempfile::tempdir().unwrap();
-    let out = common::parvault_in(&tmp.path().join("node"), &["status", "--live"]);
-    common::assert_not_built_yet(&out, "status --live");
-    gate_ran("trust_enforcement_liveness::track_d_status_live_cli_unbuilt");
+fn b148_status_live_cli_shows_connected_peer() {
+    let b_node = Node::new("b148c-b");
+    let a_node = Node::new("b148c-a");
+    let b = b_node.start("b", common::LOOPBACK_EPHEMERAL, &[]);
+    let b_addr = format!("{}/p2p/{}", b.mesh, b_node.peer_id());
+    let sock = a_node.root.path().join("gw.sock");
+    let a = a_node.start_full("a", common::LOOPBACK_EPHEMERAL, &[b_addr], &[], Some(&sock));
+    let b_pid = b_node.peer_id();
+    assert!(eventually(Duration::from_secs(20), || a.connected_to(&b_pid)));
+    let out = status_live(&a_node, &sock, &[]);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        out.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("Live Status"), "{text}");
+    assert!(text.contains(&format!("{b_pid} connected")), "{text}");
+    assert!(text.contains(&a.mesh), "{text}");
+    drop(b);
+    gate_ran("trust_enforcement_liveness::b148_status_live_cli_shows_connected_peer");
+}
+
+/// B-148 item 2 reject (CLI): a token from another root key is refused by the daemon's status
+/// decision (`reject.status_token_invalid`), and nothing about its peers is printed.
+#[test]
+fn b148_status_live_cli_wrong_token_refused() {
+    let a_node = Node::new("b148cr-a");
+    let sock = a_node.root.path().join("gw.sock");
+    let _a = a_node.start_full("a", common::LOOPBACK_EPHEMERAL, &[], &[], Some(&sock));
+    let other = parvault::capabilities::CapabilityMacaroon::mint(
+        &[0x99; 32],
+        [7; 32],
+        [8; 32],
+        vec![parvault::capabilities::Caveat::ReadOnly],
+    )
+    .unwrap()
+    .to_compact_token();
+    let file = a_node.root.path().join("other.token");
+    std::fs::write(&file, other).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let out = status_live(&a_node, &sock, &["--macaroon-file", file.to_str().unwrap()]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("reject.status_token_invalid"), "{text}");
+    assert!(!text.contains("Peers "), "{text}");
+    gate_ran("trust_enforcement_liveness::b148_status_live_cli_wrong_token_refused");
 }
 
 /// Runs `parvault file store <file>` as a ring client (the test genesis) against `peers`.

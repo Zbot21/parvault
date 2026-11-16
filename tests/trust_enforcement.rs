@@ -142,7 +142,7 @@ fn spawn_without_ring_env(mut cmd: Command, root: TempDir, dir: PathBuf, log: Pa
 fn spawn_as_is(mut cmd: Command, root: TempDir, dir: PathBuf, log: PathBuf) -> Node {
     let log_file = std::fs::File::create(&log).unwrap();
     let child = cmd
-        .env("RUST_LOG", "info")
+        .env("RUST_LOG", "info,parvault::network::server_events=debug")
         .env("NO_COLOR", "1")
         .env_remove("PARVAULT_PEERS")
         .env_remove("PARVAULT_GENESIS_PUBKEY_HEX")

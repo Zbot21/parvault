@@ -2436,7 +2436,7 @@ struct PersistedZeroTrustDhtStateRef<'a> {
 
 /// The envelope store's budget (B-152 b, A-152 part 4): total bytes, total keys, and keys and
 /// bytes per owner. At the cap a new key is refused, never another evicted (an evicted key loses
-/// its version floor and may be the only copy of an ADR-18 catalog).
+/// its version floor and may be the only copy of an ADR-18 disaster-recovery vault catalog).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DhtStoreLimits {
     pub max_bytes: u64,
