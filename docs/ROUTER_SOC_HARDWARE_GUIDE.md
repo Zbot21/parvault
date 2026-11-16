@@ -250,7 +250,7 @@ parvault up \
 ## 7. OpenWrt `procd` Service Installation
 
 ### Binary Installation
-The command downloads the latest published release, <!-- metric:released_version_tag -->`v0.5.4`<!-- /metric -->. It is a dev build (`-dev` in each asset name): its `SHA256SUMS` is signed with the project's dev key, not a release key. OpenWrt's dropbear has no `ssh-keygen`, so verify `SHA256SUMS` against `SHA256SUMS.sig` on another machine first ([Verify a download](REPRODUCIBLE_BUILDS.md#verify-a-download)) and copy that verified `SHA256SUMS` to `/tmp` on the router; the router then checks the binary against it.
+The command downloads the latest published release, <!-- metric:released_version_tag -->`v0.5.6`<!-- /metric -->. It is a dev build (`-dev` in each asset name): its `SHA256SUMS` is signed with the project's dev key, not a release key. OpenWrt's dropbear has no `ssh-keygen`, so verify `SHA256SUMS` against `SHA256SUMS.sig` on another machine first ([Verify a download](REPRODUCIBLE_BUILDS.md#verify-a-download)) and copy that verified `SHA256SUMS` to `/tmp` on the router; the router then checks the binary against it.
 
 ```bash
 # 1. Download the static aarch64 (or x86_64) musl binary and check it against the verified SHA256SUMS

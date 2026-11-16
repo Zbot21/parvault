@@ -644,8 +644,9 @@ mod tests {
         let (pem, _): (zeroize::Zeroizing<String>, u64) =
             generate(&["127.0.0.1".into()], 1_800_000_000).unwrap();
         assert!(pem.contains("-----BEGIN PRIVATE KEY-----"));
+        // The buffer is sized for the key PEM plus an optional newline: never regrown.
         assert!(
-            pem.capacity() == pem.len(),
+            pem.len() <= pem.capacity() && pem.capacity() - pem.len() <= 1,
             "{} {}",
             pem.capacity(),
             pem.len()

@@ -6,7 +6,7 @@
 
 ## 1. Adding `parvault` to `Cargo.toml`
 
-Pin the latest published release tag, <!-- metric:released_version_tag -->`v0.5.4`<!-- /metric -->:
+Pin the latest published release tag, <!-- metric:released_version_tag -->`v0.5.6`<!-- /metric -->:
 
 ```toml
 [dependencies]
