@@ -1678,6 +1678,34 @@ mod chunk_admit_tests {
         assert_eq!(g.unwrap().authorized_witness_pubkeys, eight, "7 kept out");
     }
 
+    /// B-167: the storer check finds a witness at the last allowed index (7 of 8), where
+    /// `names_key`'s loop runs to the end of a full grant, and refuses a ninth key.
+    #[test]
+    fn storer_decision_witness_at_index_seven() {
+        let keys: Vec<[u8; 32]> = (0..=MAX_GRANT_WITNESSES as u8)
+            .map(|i| NodeIdentity::from_seed([0x60 + i; 32]).public_key_bytes())
+            .collect();
+        let owner = NodeIdentity::from_seed([0x5f; 32]).public_key_bytes();
+        let witnesses = &keys[..MAX_GRANT_WITNESSES];
+        let decide = |k: [u8; 32]| {
+            por_storer_decision(&PorStorerFacts {
+                sender_device_id: None,
+                sender_key: Some(k),
+                accounted_owner: None,
+                grant: Some(GrantStorers { owner, witnesses }),
+            })
+        };
+        assert_eq!(witnesses.len(), 8);
+        assert_eq!(decide(witnesses[7]), Ok(()), "witness at index 7");
+        assert_eq!(decide(witnesses[0]), Ok(()), "witness at index 0");
+        assert_eq!(decide(owner), Ok(()), "grant owner");
+        assert_eq!(
+            decide(keys[MAX_GRANT_WITNESSES]),
+            Err("reject.por_not_storer"),
+            "a key past the 8 witnesses"
+        );
+    }
+
     #[test]
     fn grant_witness_bound_and_superset() {
         assert_eq!(

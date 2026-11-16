@@ -178,6 +178,11 @@ parvault --data-dir /var/lib/parvault up \
   --allow-peer-uid 1042 \
   --require-sealed-memfd
 
+# The daemon creates the socket 0600 (owner only), so a plugin running as another user
+# (uid 1042 here) cannot connect. Put the plugin user in a group the daemon user belongs to
+# (here the daemon's own group, parvault) and, as the daemon user after every start:
+chgrp parvault /var/run/parvault.sock && chmod 0660 /var/run/parvault.sock
+
 # WebDAV clients must present ${PLUGIN_TOK} or an offline attenuation of it on every request
 # (F-43); a token with a peer-UID caveat is refused over TCP.
 # Tokens go in a mode-600 file: --macaroon on argv is readable by any local user (/proc/<pid>/cmdline).
@@ -185,7 +190,15 @@ parvault --data-dir /var/lib/parvault up \
 parvault-fuse --socket /var/run/parvault.sock --macaroon-file ./plugin.token webdav --listen 127.0.0.1:4918
 
 # 5. Zero-key incremental folder push & macaroon-attenuated selective pull via parvault-sync (=m)
-parvault-sync --socket /var/run/parvault.sock --catalog ./gw-catalog.bin push --folder /srv/project
+#    A push stores, so it needs a write token (tokens are ReadOnly unless --write, B-16); the
+#    ReadOnly PLUGIN_TOK is refused (reject.gateway_macaroon_write_denied). The plugin user
+#    cannot read the daemon's 0600 macaroon_root.key to auto-mint one, so as the plugin user
+#    have the daemon user (`parvault` here) mint it, bound to uid 1042, into a 0600 file the
+#    plugin user owns:
+sudo -u parvault parvault --data-dir /var/lib/parvault token mint --write --allow-peer-uid 1042 --ttl-secs 3600 \
+  | ( umask 077; cat > ./push.token )
+parvault-sync --socket /var/run/parvault.sock --catalog ./gw-catalog.bin --macaroon-file ./push.token \
+  push --folder /srv/project
 parvault-sync --socket /var/run/parvault.sock --catalog ./gw-catalog.bin --macaroon-file ./plugin.token \
   pull --output /tmp/restored-docs --filter "docs/*"
 

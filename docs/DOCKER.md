@@ -39,7 +39,9 @@ docker load -i parvault-image-amd64-dev.tar
 docker image inspect -f '{{.Id}}' "$IMG"
 ```
 
-The image ID depends on Docker's image store. For `v0.5.3` amd64 it is `sha256:6404dc144b371cbd39ab67a2a92279a40569bc4dddbe08df84149f0988a496ad` (the config digest, classic store, as on Synology) or `sha256:e3254abb288999dd08d9aff904570d357016d687d6b61eb1954b839fa4d323eb` (the manifest digest, containerd store, as on recent Docker Desktop). Any other ID is a different image.
+The image ID is different for every release and depends on Docker's image store: the config digest on the classic store (as on Synology), or the manifest digest on the containerd store (as on recent Docker Desktop). Each release's notes list both IDs for its image, taken from the build whose image tar is the `parvault-image-amd64-dev.tar` line of that release's signed `SHA256SUMS`. Compare the ID with the notes of the release you downloaded; any other ID is a different image.
+
+Earlier releases, for reference only (not the ID of a newer image): `v0.5.3` amd64 is `sha256:6404dc144b371cbd39ab67a2a92279a40569bc4dddbe08df84149f0988a496ad` (config digest) or `sha256:e3254abb288999dd08d9aff904570d357016d687d6b61eb1954b839fa4d323eb` (manifest digest).
 
 ## 2. Start a ring (the first node)
 
@@ -51,7 +53,7 @@ docker run --rm --network none --user 65532:65532 --read-only --cap-drop ALL --s
 docker run -d --name "$NAME" --restart unless-stopped --network host --user 65532:65532 --read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /run/parvault:uid=65532,gid=65532,mode=0700 --tmpfs /tmp:mode=1777 -v "$VOL:/var/lib/parvault" "$IMG" --data-dir /var/lib/parvault up --ipc-socket /run/parvault/parvault.sock --listen "/ip4/0.0.0.0/tcp/$PORT"
 ```
 
-`wot init` prints `Started a new ring. Genesis public key: <64 hex>`. Run again, it refuses with `Error: Invalid key or hex encoding: this node is already in the ring <key>` (versions after 0.5.3 drop the `Invalid key or hex encoding:` prefix) and exit 1, and changes nothing. Wait for the daemon to turn healthy (usually seconds):
+`wot init` prints `Started a new ring. Genesis public key: <64 hex>`. Run again, it refuses with `Error: Invalid key or hex encoding: this node is already in the ring <key>` (from 0.5.5 the `Invalid key or hex encoding:` prefix is dropped) and exit 1, and changes nothing. Wait for the daemon to turn healthy (usually seconds):
 
 <!-- docker-doc: health -->
 ```sh

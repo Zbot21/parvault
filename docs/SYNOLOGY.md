@@ -34,13 +34,15 @@ The signature must say `Good "parvault-dev-build" signature for parvault-dev` wi
 1. In File Station, copy `parvault-image-amd64-dev.tar` **into the `docker` shared folder**. Imported from another share, Container Manager has dropped the tar's tag and tagged the image with a date instead (seen: `20251115`).
 2. Container Manager > Image > Add > Import from file, and pick the tar in `docker`.
 3. Check the image list. The tag should be `parvault:<version>-dev`. Whatever tag it shows is the one to put in every `image:` line of your project.
-4. Check the image ID. Container Manager shows the image's config digest, which must match:
+4. Check the image ID. Container Manager shows the image's config digest. It is different for every release: each release's notes list it (taken from the build whose image tar is the image line of that release's signed `SHA256SUMS`), and it must match the notes of the release you downloaded.
 
-| Release | amd64 image ID |
-|---|---|
-| `v0.5.3` | `sha256:6404dc144b371cbd39ab67a2a92279a40569bc4dddbe08df84149f0988a496ad` |
+Docker with the containerd image store (recent Docker Desktop, for example) shows the manifest digest instead; the release notes list that too. Both name the same image.
 
-Docker with the containerd image store (recent Docker Desktop, for example) shows the manifest digest instead: `e3254abb2889...` for `v0.5.3` amd64. Both name the same image.
+Earlier releases, for reference only (not the ID of a newer image):
+
+| Release | amd64 config digest | amd64 manifest digest |
+|---|---|---|
+| `v0.5.3` | `sha256:6404dc144b371cbd39ab67a2a92279a40569bc4dddbe08df84149f0988a496ad` | `e3254abb2889...` |
 
 Every service in the shipped files has `pull_policy: never`. Without it, a mistyped or missing tag makes Container Manager try to pull `parvault` from Docker Hub and fail with "pull access denied". With it, the error says the image is missing.
 
@@ -52,7 +54,7 @@ Every service in the shipped files has `pull_policy: never`. Without it, a misty
 
 On the first build, `init` creates the ring and exits 0. Its Log tab says `Started a new ring. Genesis public key: <64 hex>`. The daemon, `parvault`, turns healthy within about a minute (about 5 s on the test host).
 
-On every later start, `init` runs again, logs `Error: Invalid key or hex encoding: this node is already in the ring <key>` (versions after 0.5.3 drop the `Invalid key or hex encoding:` prefix) and exits 1. That is harmless: it refuses before writing anything. Container Manager shows it as stopped.
+On every later start, `init` runs again, logs `Error: Invalid key or hex encoding: this node is already in the ring <key>` (from 0.5.5 the `Invalid key or hex encoding:` prefix is dropped) and exits 1. That is harmless: it refuses before writing anything. Container Manager shows it as stopped.
 
 ## 4. Add a node
 

@@ -2064,8 +2064,10 @@ fn proof_relocation_accept_decision() {
     );
 }
 
-/// B-162: over every `u64` elapsed time and epoch length, the write-ceiling epoch never rolls
-/// over before its length, always does from it on, and once rolled stays rolled as time grows.
+/// B-162: over every `u64` elapsed time and epoch length (`quota_write_epoch_secs` is
+/// configurable), the write-ceiling epoch rolls over exactly when the elapsed time reaches its
+/// length (never before it, always from it on; a zero length rolls every check), and once
+/// rolled stays rolled as time grows.
 #[kani::proof]
 fn proof_epoch_rollover_decision() {
     use crate::storage::quota::{epoch_rollover_decision, QUOTA_WRITE_EPOCH_SECS};
@@ -2076,10 +2078,14 @@ fn proof_epoch_rollover_decision() {
     let rolled = epoch_rollover_decision(elapsed, len);
     kani::cover!(rolled, "epoch rolled over");
     kani::cover!(!rolled, "epoch continues");
+    kani::cover!(rolled && len > 0, "rolled after a non-zero length");
+    assert_eq!(
+        rolled,
+        len == 0 || elapsed >= len,
+        "rolls exactly from the epoch length"
+    );
     if rolled {
         assert!(epoch_rollover_decision(later, len), "monotone in time");
-    } else {
-        assert!(elapsed < len, "never before the epoch length");
     }
     assert!(
         epoch_rollover_decision(len, len),

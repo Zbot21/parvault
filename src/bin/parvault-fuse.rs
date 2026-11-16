@@ -120,15 +120,15 @@ fn main() -> anyhow::Result<()> {
 
         let cache_bytes = cli.cache_mib.saturating_mul(1024 * 1024);
         // B-16: the gateway token, from --macaroon(-file) or auto-minted for this UID.
-        let bus = |write: bool| {
+        let client_for = |write: bool| {
             let src = parvault::capabilities::GatewayTokenSource::from_args_or_auto(
                 default_macaroon.clone(),
                 &cli.data_dir,
                 write,
             );
-            parvault::gateway::ipc::GatewayBus::unix_socket(&cli.socket)
-                .with_token_source(Some(std::sync::Arc::new(src)))
+            GatewayIpcClient::new(&cli.socket).with_token_source(Some(std::sync::Arc::new(src)))
         };
+        let bus = |write: bool| parvault::gateway::ipc::GatewayBus::UnixSocket(client_for(write));
 
         match cli.command {
             FuseCommand::MountFd { fuse_fd, seed_dir } => {
@@ -204,12 +204,9 @@ fn main() -> anyhow::Result<()> {
                 std::fs::create_dir_all(&tmp_dir)?;
                 let _guard = TempDirGuard(tmp_dir.clone());
 
-                let write_bus = bus(true);
-                let client = match &write_bus {
-                    parvault::gateway::ipc::GatewayBus::UnixSocket(c) => c.clone(),
-                    #[allow(unreachable_patterns)]
-                    _ => GatewayIpcClient::new(&cli.socket),
-                };
+                // One client (one token source) for the direct store and the VFS bus.
+                let client = client_for(true);
+                let write_bus = parvault::gateway::ipc::GatewayBus::UnixSocket(client.clone());
                 let mfd = create_memfd("vfs-selftest")?;
                 let mut f = std::fs::File::from(mfd);
                 let payload: Vec<u8> = (0..(4 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
