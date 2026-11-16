@@ -16,7 +16,7 @@ However, embedding modern distributed storage on consumer and enterprise router 
 2. **Flash Storage Constraints:** Embedded NOR/NAND or eMMC partitions for router operating systems require ultra-compact static binaries (`< 15 MiB`) with zero external dynamic runtime dependencies (glibc, libssl, Python, or node.js).
 3. **Zero-IP Consumer Usability:** Homeowners and non-technical users cannot be expected to look up DHCP leases, configure static IPv4 subnets, or type `/ip4/192.168.1.142/tcp/4001/p2p/...` addresses.
 
-`parvault` <!-- metric:crate_version_tag -->v0.5.5<!-- /metric --> solves all three constraints:
+`parvault` <!-- metric:crate_version_tag -->v0.5.6<!-- /metric --> solves all three constraints:
 - **`--profile router-soc`:** Enforces **1 MiB streaming Reed-Solomon stripes** (`ROUTER_SOC_STRIPE_SIZE_BYTES = 1,048,576`), dropping transient peak heap allocations (`VmHWM`) from <!-- metric:bench.desktop.vmhwm -->`57.91 MiB`<!-- /metric --> to **<!-- metric:bench.soc.vmhwm -->`9.72–9.74 MiB`<!-- /metric -->** (`< 16 MiB`), operating safely inside a `32–48 MiB` container or cgroup ceiling while retaining 100% wire and manifest compatibility with desktop and NAS nodes.
 - **Static Zero-Dependency `musl` & `FROM scratch` Containers:** Stripped standalone binaries (<!-- metric:size.aarch64.range -->`0.67–6.30 MiB`<!-- /metric --> ARM64, <!-- metric:size.x86_64.range -->`0.78–8.09 MiB`<!-- /metric --> x86_64 across `parvault`, `parvault-seed`, `parvault-fuse`, and `parvault-sync` — with the zero-copy Unix socket gateway and optional built-in `=y` VFS folded directly into `parvault`) and minimal `FROM scratch` Docker/OCI images under 20 MiB.
 - **Cryptographic Zero-IP LAN Discovery & 4-Word SAS Pairing:** Fully automated LAN beaconing over UDP port `4009` with Ed25519-signed identity binding, 4-word BIP-39 pairing codes, and DHCP self-healing.
@@ -225,7 +225,7 @@ sequenceDiagram
 
 ## 6. Zero-Pairing BitTorrent-Style Public Commons Mode (`--public --tracker ...`)
 
-For users and router operators who do not wish to manage private join codes, device certificates, or invitation lists, `parvault` <!-- metric:crate_version_tag -->v0.5.5<!-- /metric --> supports **Public Commons Mode** (`--public`), analogous to joining a public BitTorrent swarm:
+For users and router operators who do not wish to manage private join codes, device certificates, or invitation lists, `parvault` <!-- metric:crate_version_tag -->v0.5.6<!-- /metric --> supports **Public Commons Mode** (`--public`), analogous to joining a public BitTorrent swarm:
 
 ```bash
 # Launch Router Cloud-NAS connecting directly to the Public Commons tracker:

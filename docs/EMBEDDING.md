@@ -1,4 +1,4 @@
-# Embedding `parvault` as a Rust Library (<!-- metric:crate_version_tag -->`v0.5.5`<!-- /metric -->)
+# Embedding `parvault` as a Rust Library (<!-- metric:crate_version_tag -->`v0.5.6`<!-- /metric -->)
 
 `parvault` is architected as a dual-purpose crate: every subsystem powering the `parvault`, `parvault-seed`, `parvault-fuse`, and `parvault-sync` binaries is exposed through a clean, memory-bounded Rust library API (`src/lib.rs`, `#![deny(unsafe_code)]`) suitable for embedding inside backup agents, NAS appliances, ISP gateway daemons, and zero-key quorum control planes.
 

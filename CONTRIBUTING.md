@@ -12,7 +12,7 @@ Thank you for contributing to **Neighborhood Cloud (`parvault`)**! Because `parv
    rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
    ```
 3. **Java `17+` & `tla2tools.jar` + Kani Rust Verifier (When modifying protocol state machines or wire parsers):**
-   Required to run the TLA+ TLC model checker across the **<!-- metric:tla_specs -->9<!-- /metric -->** formal specifications in [`specs/`](specs/) and `cargo kani` across the **<!-- metric:kani_harnesses -->49<!-- /metric -->** symbolic harnesses (`bash scripts/verify_formal_proofs.sh`).
+   Required to run the TLA+ TLC model checker across the **<!-- metric:tla_specs -->10<!-- /metric -->** formal specifications in [`specs/`](specs/) and `cargo kani` across the **<!-- metric:kani_harnesses -->79<!-- /metric -->** symbolic harnesses (`bash scripts/verify_formal_proofs.sh`).
 4. **Docker Engine:** Required to run the multi-container P2P regression and `48m` Router-SoC acceptance gate (`scripts/docker_acceptance_gate.sh`).
 
 ---
@@ -21,7 +21,7 @@ Thank you for contributing to **Neighborhood Cloud (`parvault`)**! Because `parv
 
 Before writing code, please read:
 - **[`AGENTS.md`](AGENTS.md):** Module-by-module source map (`src/`) and the **7 Non-Negotiable Zero-Trust & Memory-Safety Rules**.
-- **[`docs/ADR.md`](docs/ADR.md) & [`docs/adr/`](docs/adr/):** Master Architectural Decision Record Index, Active <!-- metric:crate_version_tag -->`v0.5.5`<!-- /metric --> Cryptographic Suite Guide, and **<!-- metric:adr_count -->33<!-- /metric --> strictly single-concern ADRs (`ADR-01` through <!-- metric:adr_last -->`ADR-33`<!-- /metric -->)**.
+- **[`docs/ADR.md`](docs/ADR.md) & [`docs/adr/`](docs/adr/):** Master Architectural Decision Record Index, Active <!-- metric:crate_version_tag -->`v0.5.6`<!-- /metric --> Cryptographic Suite Guide, and **<!-- metric:adr_count -->33<!-- /metric --> strictly single-concern ADRs (`ADR-01` through <!-- metric:adr_last -->`ADR-33`<!-- /metric -->)**.
 - **[`docs/SAFETY_AND_LINT_AUDIT.md`](docs/SAFETY_AND_LINT_AUDIT.md):** `#![deny/forbid(unsafe_code)]` posture, `src/os_sys.rs` POSIX syscall `SAFETY` proofs, and full `#[allow(...)]` lint audit.
 - **[`docs/SECURITY_AND_CRYPTOGRAPHY.md`](docs/SECURITY_AND_CRYPTOGRAPHY.md):** Mathematical proofs, combinatorial anonymity bounds, post-quantum hybrid combiners, and Kani/TLA+ invariants.
 - **[`docs/USER_AND_CLI_GUIDE.md`](docs/USER_AND_CLI_GUIDE.md):** Complete CLI flag reference and operational workflows for `parvault` and `parvault-seed`.
