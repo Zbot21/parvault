@@ -1269,6 +1269,11 @@ impl ZeroTrustSeedServer {
         self
     }
 
+    /// The seed's lite audit index, if it has one (C17: a `FreeShards` order on the seed removes the stripe's record).
+    pub fn lite_audit_index(&self) -> Option<&LiteAuditIndexHandle> {
+        self.lite_audit_index.as_ref()
+    }
+
     /// Initializes a `ZeroTrustSeedServer` in `HomelabRedundancyVault` mode bound to the
     /// homelab owner's composite post-quantum public key (`Ed25519 + ML-DSA-65`).
     pub fn new_homelab_vault(

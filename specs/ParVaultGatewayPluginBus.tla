@@ -28,9 +28,9 @@
 \*   const    ModeAdmitted      -> model-only: UIDs the socket's file mode admits (a set)
 \* @end
 \* The gateway plugin bus (ADR-27, ADR-32): the SO_PEERCRED UID allowlist per connection, the
-\* macaroon check on every command (ADR-28; since B-16 store, register and health too, and no
-\* root key means no service), the immutable ingest memfd, and QueryStatus. Plan-4 ruling (L-49).
-\* rootKeySet stays a choice in Init: every shipped gateway has a key, but a library-built engine may not, and the model shows it then serves nothing.
+\* macaroon check on every command (ADR-28; B-16: store, register, health too; no root key, no
+\* service), the immutable ingest memfd, and QueryStatus (L-49). rootKeySet is a choice in Init: a
+\* library-built engine may lack the key every shipped gateway has, and then serves nothing.
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS

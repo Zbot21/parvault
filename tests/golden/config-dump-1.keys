@@ -87,6 +87,9 @@ values.max_connections.value
 values.max_download_mbps
 values.max_download_mbps.source
 values.max_download_mbps.value
+values.max_held_shards
+values.max_held_shards.source
+values.max_held_shards.value
 values.max_storage_bytes
 values.max_storage_bytes.source
 values.max_storage_bytes.value

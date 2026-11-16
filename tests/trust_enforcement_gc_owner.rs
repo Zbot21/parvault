@@ -17,7 +17,7 @@ fn gate_ran(name: &str) {
     }
 }
 
-/// T0 stub of track B2: `restore-folder --version`.
+/// T0 stubs of track B2: `restore-folder --version`, `--no-gc` and (T0b) `folder-status`.
 #[test]
 fn track_b2_unbuilt_entries_refuse() {
     let tmp = tempfile::tempdir().unwrap();
@@ -51,5 +51,13 @@ fn track_b2_unbuilt_entries_refuse() {
     ] {
         common::assert_not_built_yet(&common::parvault_in(&dir, &args), "--no-gc");
     }
+    // T0b stub: `folder-status` (B-154); track B2 replaces this with accept and reject pairs.
+    common::assert_not_built_yet(
+        &common::parvault_in(
+            &dir,
+            &["folder-status", "--snapshot", snap.to_str().unwrap()],
+        ),
+        "folder-status",
+    );
     gate_ran("trust_enforcement_gc_owner::track_b2_unbuilt_entries_refuse");
 }
