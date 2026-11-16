@@ -1463,6 +1463,12 @@ pub struct FolderStats {
     /// The warning's code, from `storage_warning_decision`.
     #[serde(skip)]
     pub warn_code: Option<&'static str>,
+    /// B182-7: owner-side envelope refusals counted by this folder's passes so far.
+    #[serde(default)]
+    pub envelope_refusals_total: u64,
+    /// B182-7: the last one (`kind scope reason`).
+    #[serde(default)]
+    pub last_envelope_refusal: Option<String>,
 }
 
 /// The accounting of `snapshot` after a GC run, for a ring of `hosts` storage hosts.
@@ -1501,6 +1507,8 @@ pub fn folder_stats(
         version_store_bytes: report.version_store_bytes,
         warn: warn_code.is_some(),
         warn_code,
+        envelope_refusals_total: 0,
+        last_envelope_refusal: None,
     }
 }
 

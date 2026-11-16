@@ -829,7 +829,9 @@ fn b157_hanging_dial_not_doubled() {
 /// own copy at construction and rewrote the whole file from it, so an envelope a peer put after
 /// that load was lost on disk. Checked first as that exact interleaving, then as two concurrent
 /// writers (engine passes, each with a fresh engine as the daemon makes per pass, beside peer
-/// puts): the file on disk holds every key at its highest version.
+/// puts): the file on disk holds every key at its highest version. Since B-182 (B182-2) a pass
+/// puts no anchor envelope; the engine's own store write is its vault catalog, exported per pass
+/// as a versioned update whose version on disk never goes down.
 #[test]
 fn g28_two_dht_writers_lose_no_envelope_or_version_floor() {
     use parvault::config::ErasureTier;
@@ -858,6 +860,12 @@ fn g28_two_dht_writers_lose_no_envelope_or_version_floor() {
             .get_manifest_envelope(key)
             .map(|e| e.monotonic_version)
     };
+    let catalog_on_disk = |key: &[u8; 32]| -> Option<u64> {
+        ZeroTrustDhtStore::with_persistence_dir(&data)
+            .get_vault_catalog_envelope(key)
+            .map(|e| e.monotonic_version)
+    };
+    const G28_PHRASE: &str = "g28 two writers catalog passphrase";
 
     // 1. The interleaving: engine made, then a peer put, then the engine's pass.
     std::fs::write(folder.join("a.txt"), "first").unwrap();
@@ -884,14 +892,25 @@ fn g28_two_dht_writers_lose_no_envelope_or_version_floor() {
         Some(7),
         "the peer's envelope was lost on disk"
     );
-    let own = snap.signed_dht_envelope.clone().unwrap();
-    assert_eq!(on_disk(&own.dht_key), Some(own.monotonic_version));
+    let anchor = snap.signed_dht_envelope.clone().unwrap();
+    assert_eq!(
+        on_disk(&anchor.dht_key),
+        None,
+        "B182-2: no anchor envelope put"
+    );
+    let own = engine
+        .export_encrypted_vault_catalog(G28_PHRASE, "g28", &snap)
+        .unwrap();
+    assert_eq!(catalog_on_disk(&own.dht_key), Some(own.monotonic_version));
 
     // 2. Two concurrent writers.
     const ROUNDS: u64 = 40;
     let last_own = std::thread::scope(|s| {
         let syncer = s.spawn(|| {
             let mut snap = snap.clone();
+            let mut last = None;
+            // The catalog's floor on disk never goes down across rounds.
+            let mut floor = catalog_on_disk(&own.dht_key).unwrap();
             for i in 0..ROUNDS {
                 let mut e = FolderSyncEngine::new(
                     store.clone(),
@@ -902,8 +921,24 @@ fn g28_two_dht_writers_lose_no_envelope_or_version_floor() {
                 e.load_previous_snapshot(&snap);
                 std::fs::write(folder.join("a.txt"), format!("round {i}")).unwrap();
                 snap = e.sync_folder_once(&folder).unwrap();
+                let cat = e
+                    .export_encrypted_vault_catalog(G28_PHRASE, "g28", &snap)
+                    .unwrap();
+                assert_eq!(cat.dht_key, own.dht_key);
+                let held = catalog_on_disk(&cat.dht_key).unwrap();
+                assert!(
+                    held >= floor && held >= cat.monotonic_version,
+                    "round {i}: catalog on disk {held}, floor {floor}, exported {}",
+                    cat.monotonic_version
+                );
+                assert!(
+                    cat.monotonic_version > floor,
+                    "round {i}: catalog not versioned up"
+                );
+                floor = held;
+                last = Some(cat);
             }
-            snap.signed_dht_envelope.unwrap()
+            last.unwrap()
         });
         let peers = s.spawn(|| {
             for v in 8..8 + ROUNDS {
@@ -923,7 +958,10 @@ fn g28_two_dht_writers_lose_no_envelope_or_version_floor() {
             .dht_key;
         assert_eq!(on_disk(&key), Some(8 + ROUNDS - 1), "peer {p}");
     }
-    assert_eq!(on_disk(&last_own.dht_key), Some(last_own.monotonic_version));
+    assert_eq!(
+        catalog_on_disk(&last_own.dht_key),
+        Some(last_own.monotonic_version)
+    );
     gate_ran("trust_enforcement_liveness::g28_two_dht_writers_lose_no_envelope_or_version_floor");
 }
 

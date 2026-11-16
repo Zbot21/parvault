@@ -467,9 +467,8 @@ impl FolderSyncEngine {
         self.tier = snapshot.tier;
         self.cached_entries = snapshot.files.clone();
         self.deleted_tombstones = snapshot.deleted_tombstones.clone();
-        if let Some(env) = &snapshot.signed_dht_envelope {
-            let _ = self.store.put_dht_manifest_envelope(env.clone());
-        }
+        // B182-2: the anchor envelope stays in the snapshot (device-snapshot import binds the
+        // owner with it) but is not put in the envelope store.
         self.last_envelope = snapshot.signed_dht_envelope.clone();
     }
 
@@ -737,7 +736,9 @@ impl FolderSyncEngine {
         self.current_version = next_version;
         self.last_pass = summary;
 
-        // Seal a monotonic SignedDhtManifestEnvelope anchored at the first file's manifest (or synthetic folder root).
+        // Seal a monotonic SignedDhtManifestEnvelope anchored at the first file's manifest. B182-2:
+        // it is embedded in the snapshot only (owner binding on device-snapshot import), never
+        // put locally or on the ring; the vault catalog is the folder's only ring record.
         let signed_dht_envelope = if let Some((_, first_entry)) = next_entries.iter().next() {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -753,14 +754,6 @@ impl FolderSyncEngine {
                 monotonic_ver,
                 monotonic_ver,
             )?;
-            let _ = self.store.put_dht_manifest_envelope(env.clone());
-            if let Some(client) = self.store.mesh_client() {
-                if !client.all_network_endpoints().is_empty() {
-                    let _ = client.put_dht_envelope(
-                        crate::network::DhtWireEnvelope::ClassicalManifest(env.clone()),
-                    );
-                }
-            }
             Some(env)
         } else {
             None
@@ -1299,11 +1292,19 @@ impl FolderSyncEngine {
             vault_namespace,
             snapshot,
         )?;
-        let _ = self.store.put_dht_vault_catalog_envelope(env.clone());
+        // B182-6: a refused put is reported, never discarded.
+        crate::storage::block_store::report_local_envelope_put(
+            crate::storage::block_store::EnvelopeKind::Catalog,
+            &self.store.put_dht_vault_catalog_envelope(env.clone()),
+        );
         if let Some(client) = self.store.mesh_client() {
             if !client.all_network_endpoints().is_empty() {
-                let _ = client
-                    .put_dht_envelope(crate::network::DhtWireEnvelope::VaultCatalog(env.clone()));
+                crate::storage::block_store::report_ring_envelope_put(
+                    crate::storage::block_store::EnvelopeKind::Catalog,
+                    &client.put_dht_envelope_report(crate::network::DhtWireEnvelope::VaultCatalog(
+                        env.clone(),
+                    )),
+                );
             }
         }
         Ok(env)
@@ -1329,25 +1330,38 @@ impl FolderSyncEngine {
             vault_namespace,
             snapshot,
         )?;
-        let local_ok = self
-            .store
-            .put_dht_vault_catalog_envelope(env.clone())
-            .is_ok();
+        // B182-6: a refused local put or any refusing ring host is reported, never discarded.
+        let local_ok = crate::storage::block_store::report_local_envelope_put(
+            crate::storage::block_store::EnvelopeKind::Catalog,
+            &self.store.put_dht_vault_catalog_envelope(env.clone()),
+        );
         let client = client.or(self.store.mesh_client());
         let acked = match client {
             Some(c) if !c.all_network_endpoints().is_empty() => {
-                match c.put_dht_envelope(crate::network::DhtWireEnvelope::VaultCatalog(env.clone()))
-                {
-                    Ok(n) => n > 0,
-                    Err(e) => {
-                        tracing::warn!(
-                            code = "warn.catalog_publish_failed",
-                            error = %e,
-                            "no ring host acknowledged the catalog; it is republished next pass"
-                        );
-                        false
-                    }
+                let report = c.put_dht_envelope_report(
+                    crate::network::DhtWireEnvelope::VaultCatalog(env.clone()),
+                );
+                if let Ok(r) = &report {
+                    tracing::info!(
+                        code = "info.catalog_published",
+                        version = env.monotonic_version,
+                        hosts_stored = r.hosts_stored as u64,
+                        hosts_refused = r.hosts_refused as u64,
+                        hosts_failed = r.hosts_failed as u64,
+                        "vault catalog put on the ring"
+                    );
                 }
+                let stored = crate::storage::block_store::report_ring_envelope_put(
+                    crate::storage::block_store::EnvelopeKind::Catalog,
+                    &report,
+                );
+                if stored == 0 {
+                    tracing::warn!(
+                        code = "warn.catalog_publish_failed",
+                        "no ring host acknowledged the catalog; it is republished next pass"
+                    );
+                }
+                stored > 0
             }
             _ => local_ok,
         };
@@ -1446,12 +1460,16 @@ impl FolderSyncEngine {
         modified_unix_ms: u64,
         plaintext_sha256: Hash32,
     ) -> Result<SyncedFileEntry, StorageError> {
-        let manifest = self.store.store_file_streaming(
+        // B182-1: the manifest is saved locally only; the vault catalog carries it to the ring.
+        let manifest = self.store.store_file_streaming_with(
             &self.owner_identity.device_peer_id(),
             abs_path,
             &self.master_key,
             self.tier,
             DEFAULT_SYNC_STRIPE_BYTES,
+            crate::storage::block_store::manifest_publish_decision(
+                crate::storage::block_store::ManifestOrigin::FolderSync,
+            ),
         )?;
 
         let (_, _, n_total) = self.tier.params();

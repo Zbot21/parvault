@@ -528,3 +528,18 @@ suite      S-D10-LEGACY-READ test=trust_enforcement_restore::d10_daemon_reads_le
 suite      S-D13-LIVE test=trust_enforcement_restore::d13_running_daemon_lists_other_process_catalog needs=cmd:sh   # D13: a running daemon lists a catalog another process wrote, no restart
 suite      S-D16-FLOOR test=trust_enforcement_restore::d16_floor_of_any_registered_namespace_survives_backup needs=cmd:sh   # D16: one namespace rule; every registered floor survives backup, others refused (reject.vault_namespace_unsupported)
 suite      S-D16-UPGRADE test=trust_enforcement_restore::d16_existing_unsupported_registration_still_listed_and_warned needs=cmd:sh   # D16: an earlier registration outside the rule is still listed and warned at start (warn.vault_namespace_unsupported)
+
+# --- v0.5.6 B-182: envelope growth (arch182, L-141; B182-1 to B182-8, B182-10) --------------------
+claim      B182-CATALOG-INPLACE sym=src/storage/block_store.rs::dht_store_decision accept=trust_enforcement_b182::b182_catalog_updates_in_place_over_cap reject=trust_enforcement_b182::b182_owner_refusals_surface code=reject.dht_owner_key_cap bin=parvault ref=docs/security/TRUST_FINDINGS.md   # B182-5: a held catalog updates at or over the owner share; a new key there is refused
+kani       B182-CATALOG-INPLACE sym=src/storage/block_store.rs::dht_store_decision harness=dht_store_decision_respects_budget cover=held catalog updated at the owner cap
+kani       B182-FOLDER-ONLY-CATALOG sym=src/storage/block_store.rs::manifest_publish_decision harness=manifest_publish_decision cover=folder sync stays local
+suite      S-B182-T1 test=trust_enforcement_b182::b182_churn_past_owner_cap_keys_bounded needs=cmd:sh   # B182-3: 120 changed passes past a 24-key owner share; one catalog key per host
+suite      S-B182-GREP test=trust_enforcement_b182::b182_envelope_puts_never_discarded needs=cmd:sh   # B182-6: no envelope put result is discarded
+suite      S-B182-LOCAL test=trust_enforcement_b182::b182_folder_paths_publish_no_manifest_envelope needs=cmd:sh   # B182-1, B182-2
+suite      S-B182-T2 test=trust_enforcement_b182::b182_disaster_restore_newest_version needs=cmd:sh   # B182-10: recover-from-seed and catalog resume without per-file envelopes
+suite      S-B182-T3 test=trust_enforcement_b182::b182_every_retained_version_restores needs=cmd:sh   # B182-10: restore-folder --version N with manifests/ and the envelope store deleted
+suite      S-B182-T4R test=trust_enforcement_b182::b182_no_refusal_no_line needs=cmd:sh   # B182-7: no refusal, no pass line
+suite      S-B182-T5 test=trust_enforcement_b182::b182_host_rules_unchanged needs=cmd:sh   # B182-4: owner immutability, monotonicity, cap, merge floor, no removal request
+suite      S-B182-T6 test=trust_enforcement_b182::b182_legacy_store_over_cap_at_load needs=cmd:sh   # B182-8
+suite      S-B182-T6R test=trust_enforcement_b182::b182_store_under_cap_no_warning needs=cmd:sh   # B182-8: under the share, no warning
+suite      S-B182-T7 test=trust_enforcement_b182::b182_wire_golden_unchanged needs=cmd:sh   # no wire change

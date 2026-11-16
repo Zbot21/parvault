@@ -92,6 +92,21 @@ fn dht_store_decision_respects_budget() {
     {
         assert!(r.is_ok());
     }
+    // B182-CATALOG-INPLACE (B182-5): an update of a held key (a vault catalog replaced in place)
+    // within the byte budget is accepted whatever the owner's key count, at or over its share.
+    if !f.store_corrupt
+        && f.replaces_existing
+        && f.total_bytes
+            .saturating_sub(f.old_len)
+            .saturating_add(f.new_len)
+            <= l.max_bytes
+    {
+        assert!(r.is_ok());
+    }
+    kani::cover!(
+        r.is_ok() && f.replaces_existing && f.owner_keys >= l.max_owner_keys,
+        "held catalog updated at the owner cap"
+    );
     kani::cover!(r.is_ok() && !f.replaces_existing, "new key stored");
     kani::cover!(r.is_ok() && f.replaces_existing, "update stored");
     kani::cover!(r == Err("reject.dht_store_full"), "full store refuses");
@@ -137,5 +152,40 @@ fn kad_record_budget_respected() {
     kani::cover!(
         r == Err("reject.dht_record_store_full"),
         "full kad store refuses"
+    );
+}
+
+/// B182-1 (`v0.5.6`, B-182): folder sync and the lite path never publish a per-file manifest
+/// envelope to the ring (their vault catalog is the folder's only ring record); `file store` and
+/// the gateway still do.
+#[kani::proof]
+#[kani::unwind(2)]
+fn manifest_publish_decision() {
+    use crate::storage::block_store::{ManifestOrigin, ManifestPublish};
+    let origin: ManifestOrigin = kani::any();
+    let p = crate::storage::block_store::manifest_publish_decision(origin);
+    if matches!(
+        origin,
+        ManifestOrigin::FolderSync | ManifestOrigin::LiteSeed
+    ) {
+        assert!(p == ManifestPublish::LocalOnly);
+    } else {
+        assert!(p == ManifestPublish::Ring);
+    }
+    kani::cover!(
+        origin == ManifestOrigin::FolderSync && p == ManifestPublish::LocalOnly,
+        "folder sync stays local"
+    );
+    kani::cover!(
+        origin == ManifestOrigin::LiteSeed && p == ManifestPublish::LocalOnly,
+        "lite seed stays local"
+    );
+    kani::cover!(
+        origin == ManifestOrigin::FileStore && p == ManifestPublish::Ring,
+        "file store publishes"
+    );
+    kani::cover!(
+        origin == ManifestOrigin::Gateway && p == ManifestPublish::Ring,
+        "gateway publishes"
     );
 }
