@@ -3995,7 +3995,7 @@ mod tests {
         );
         assert!(dht_reply_answered(None));
         assert!(dht_reply_answered(Some(DHT_ENVELOPE_NOT_FOUND_TEXT)));
-        assert!(dht_reply_answered(Some(&V055_NOT_FOUND.to_string())));
+        assert!(dht_reply_answered(Some(V055_NOT_FOUND)));
         assert!(!dht_reply_answered(Some(
             crate::manifest::VARIANT_DISABLED_TEXT
         )));

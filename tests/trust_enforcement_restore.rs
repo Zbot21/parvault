@@ -1453,7 +1453,7 @@ fn d14_seed_vault_catalog_imported_over_the_network() {
     ]);
     let (mut peer, peer_addr) = common::spawn_on_ephemeral_port(&mut cmd, &peer_log);
     let peer_before = fingerprint(&peer_dir);
-    parvault::vfs::register_vault_keys(&dir, SEED_A, NS).unwrap();
+    parvault::vfs::register_vault_keys(&dir, SEED_A, NS, None).unwrap();
     let d = up(&dir, None, &[("PARVAULT_PEERS", peer_addr.as_str())]);
     wait_get(
         &d,
