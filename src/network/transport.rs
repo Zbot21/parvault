@@ -16,6 +16,97 @@ pub struct GateParams {
     /// The NEW-3 counters this swarm records into, and which swarm it is.
     pub counters: Option<std::sync::Arc<crate::traversal_metrics::TraversalCounters>>,
     pub origin: crate::traversal_metrics::Origin,
+    /// Kademlia intervals and record-store limits (B-152 b; [`KadParams::for_profile`]).
+    pub kad: KadParams,
+}
+
+/// The shortest replication interval a test may set (arch152 5.1, arch152b E4).
+pub const MIN_KAD_REPLICATION_SECS: u64 = 60;
+
+/// Kademlia intervals and record-store limits (B-152 b; arch152b A-152 part 2 governs). All five
+/// values are explicit per profile: with `None` the replication interval falls back to the
+/// publication interval, and the replication job is also what removes expired records, so it
+/// is never off (router-soc too).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KadParams {
+    pub replication_secs: u64,
+    pub publication_secs: u64,
+    pub record_ttl_secs: u64,
+    pub max_records: usize,
+    pub max_value_bytes: usize,
+    /// Total bytes of record values the store may hold (`reject.dht_record_store_full`).
+    pub max_total_bytes: u64,
+}
+
+impl KadParams {
+    /// Per profile: replication desktop and homelab-nas 3,600 s, router-soc 21,600 s;
+    /// publication 79,200 s and TTL 172,800 s on all; `max_records` 1,024, 512, 128; total
+    /// bytes 64 MiB, 16 MiB, 4 MiB. `max_value_bytes` stays 2 MiB, the wire's packet limit: a
+    /// manifest envelope grows by about 2.3 kB per stripe, so a smaller value cap would refuse
+    /// large files' manifests; the total budget bounds the memory.
+    pub const fn for_profile(profile: crate::profile::HardwareProfile) -> Self {
+        use crate::profile::HardwareProfile as P;
+        let (replication_secs, max_records, max_total_bytes) = match profile {
+            P::Desktop => (3_600, 1_024, 64 << 20),
+            P::HomelabNas => (3_600, 512, 16 << 20),
+            P::RouterSoc => (21_600, 128, 4 << 20),
+        };
+        Self {
+            replication_secs,
+            publication_secs: 79_200,
+            record_ttl_secs: 172_800,
+            max_records,
+            max_value_bytes: 2 * 1024 * 1024,
+            max_total_bytes,
+        }
+    }
+
+    /// The same with a test replication interval (E4), refused below
+    /// [`MIN_KAD_REPLICATION_SECS`].
+    pub fn with_replication_secs(mut self, secs: u64) -> Result<Self, &'static str> {
+        if secs < MIN_KAD_REPLICATION_SECS {
+            return Err("reject.kad_replication_too_short");
+        }
+        self.replication_secs = secs;
+        Ok(self)
+    }
+}
+
+/// The Kademlia parameters of this process's server swarm (the last one built), for the
+/// inbound-record budget in `server_events`. Desktop's until a server swarm is built.
+pub fn server_kad_params() -> KadParams {
+    SERVER_KAD
+        .lock()
+        .map(|g| g.unwrap_or_default())
+        .unwrap_or_default()
+}
+
+static SERVER_KAD: std::sync::Mutex<Option<KadParams>> = std::sync::Mutex::new(None);
+
+/// The test and tuning knob for the Kademlia replication interval (E4), in seconds.
+pub const KAD_REPLICATION_ENV: &str = "PARVAULT_KAD_REPLICATION_SECS";
+
+impl KadParams {
+    /// Applies [`KAD_REPLICATION_ENV`]'s value, if set: whole seconds, at least
+    /// [`MIN_KAD_REPLICATION_SECS`].
+    pub fn with_replication_env(self, raw: Option<&str>) -> Result<Self, &'static str> {
+        match raw {
+            None => Ok(self),
+            Some(v) => {
+                let secs: u64 = v
+                    .trim()
+                    .parse()
+                    .map_err(|_| "reject.kad_replication_invalid")?;
+                self.with_replication_secs(secs)
+            }
+        }
+    }
+}
+
+impl Default for KadParams {
+    fn default() -> Self {
+        Self::for_profile(crate::profile::HardwareProfile::Desktop)
+    }
 }
 
 impl GateParams {
@@ -26,6 +117,7 @@ impl GateParams {
             identify_cache: IDENTIFY_DEFAULT_CACHE,
             counters: None,
             origin: crate::traversal_metrics::Origin::Daemon,
+            kad: KadParams::default(),
         }
     }
 
@@ -41,7 +133,14 @@ impl GateParams {
             identify_cache,
             counters: None,
             origin: crate::traversal_metrics::Origin::Daemon,
+            kad: KadParams::default(),
         }
+    }
+
+    /// Uses `kad` for the Kademlia intervals and store limits.
+    pub fn with_kad(mut self, kad: KadParams) -> Self {
+        self.kad = kad;
+        self
     }
 
     /// Records into `counters` as `origin`.
@@ -138,6 +237,24 @@ fn build_swarm(
         std::sync::Arc::clone(&gate.set),
     )
     .boxed();
+    let mut gate = gate;
+    if kad_server {
+        let raw = std::env::var(KAD_REPLICATION_ENV).ok();
+        gate.kad = gate
+            .kad
+            .with_replication_env(raw.as_deref())
+            .map_err(|code| {
+                anyhow::anyhow!(
+                    "{code}: {KAD_REPLICATION_ENV} must be whole seconds, at least {MIN_KAD_REPLICATION_SECS}"
+                )
+            })?;
+        if raw.is_some() {
+            tracing::info!(
+                replication_secs = gate.kad.replication_secs,
+                "Kademlia replication interval set by {KAD_REPLICATION_ENV}"
+            );
+        }
+    }
     let behaviour = construct_behaviour(&keypair, enable_mdns, kad_server, &gate)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let peer_id = keypair.public().to_peer_id();
@@ -159,13 +276,23 @@ fn construct_behaviour(
     let local_peer_id = key.public().to_peer_id();
 
     // 1. Kademlia DHT for peer discovery & encrypted FileManifest storage (ADR-02).
+    let p = gate.kad;
+    if kad_server {
+        if let Ok(mut g) = SERVER_KAD.lock() {
+            *g = Some(p);
+        }
+    }
     let store_config = kad::store::MemoryStoreConfig {
-        max_value_bytes: 2 * 1024 * 1024,
+        max_records: p.max_records,
+        max_value_bytes: p.max_value_bytes,
         ..Default::default()
     };
     let store = kad::store::MemoryStore::with_config(local_peer_id, store_config);
     let mut kad_config = kad::Config::new(StreamProtocol::new("/parvault/kad/1.0.0"));
     kad_config.set_query_timeout(Duration::from_secs(10));
+    kad_config.set_replication_interval(Some(Duration::from_secs(p.replication_secs)));
+    kad_config.set_publication_interval(Some(Duration::from_secs(p.publication_secs)));
+    kad_config.set_record_ttl(Some(Duration::from_secs(p.record_ttl_secs)));
     kad_config.set_max_packet_size(2 * 1024 * 1024);
     // F-10b: inbound records (and provider records) are handed to the application, which stores
     // a record only if it is a valid signed DHT envelope for its key (`server_events`).
@@ -236,6 +363,54 @@ fn construct_behaviour(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// arch152 2.1, arch152b 2.1-2.3: every value explicit per profile.
+    #[test]
+    fn kad_params_pinned_per_profile() {
+        use crate::profile::HardwareProfile as P;
+        let row = |p| {
+            let k = KadParams::for_profile(p);
+            (
+                k.replication_secs,
+                k.publication_secs,
+                k.record_ttl_secs,
+                k.max_records,
+                k.max_value_bytes,
+                k.max_total_bytes,
+            )
+        };
+        assert_eq!(
+            row(P::Desktop),
+            (3_600, 79_200, 172_800, 1_024, 2 << 20, 64 << 20)
+        );
+        assert_eq!(
+            row(P::HomelabNas),
+            (3_600, 79_200, 172_800, 512, 2 << 20, 16 << 20)
+        );
+        assert_eq!(
+            row(P::RouterSoc),
+            (21_600, 79_200, 172_800, 128, 2 << 20, 4 << 20)
+        );
+        let d = KadParams::for_profile(P::Desktop);
+        assert_eq!(
+            d.with_replication_secs(59),
+            Err("reject.kad_replication_too_short")
+        );
+        assert_eq!(d.with_replication_secs(60).unwrap().replication_secs, 60);
+        assert_eq!(d.with_replication_env(None), Ok(d));
+        assert_eq!(
+            d.with_replication_env(Some("90")).unwrap().replication_secs,
+            90
+        );
+        assert_eq!(
+            d.with_replication_env(Some("10")),
+            Err("reject.kad_replication_too_short")
+        );
+        assert_eq!(
+            d.with_replication_env(Some("1h")),
+            Err("reject.kad_replication_invalid")
+        );
+    }
 
     /// B-41 / F-11: the client swarm never runs mDNS, so its event loop has no mDNS arm.
     #[tokio::test]

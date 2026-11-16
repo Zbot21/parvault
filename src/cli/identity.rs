@@ -10,22 +10,16 @@ pub(crate) async fn status(env: CliEnv, command: Commands) -> anyhow::Result<()>
         block_store,
         ..
     } = env;
-    // `--socket` and `--macaroon-file` (track D) are bound here when `--live` is built.
     let Commands::Status {
         live,
-        socket: _,
-        macaroon_file: _,
+        socket,
+        macaroon_file,
     } = command
     else {
         unreachable!("status() is only dispatched for Commands::Status")
     };
     if live {
-        // v0.5.6 T0 stub (G3): track D asks the daemon (`QueryLiveStatus`).
-        return Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt {
-            track: "D",
-            entry: "status --live",
-        })
-        .into());
+        return status_live(&cfg.data_dir, socket, macaroon_file);
     }
     let node_id = NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?;
     let pq_keypair = HybridPqSigningKeypair::load_or_generate_in_dir(&cfg.data_dir)?;
@@ -285,4 +279,99 @@ fn print_audit_status(cfg: &NodeConfig) {
     println!(
         "  a given shard is challenged about once per S x interval (S = shards that host holds for you)"
     );
+}
+
+/// `parvault status --live` (B-148 item 2): asks the running daemon over its gateway socket
+/// (`QueryLiveStatus`) with `--macaroon-file`'s token, or a read-only token minted from
+/// `<data>/macaroon_root.key`, and prints its live state.
+#[cfg(unix)]
+fn status_live(
+    data_dir: &std::path::Path,
+    socket: Option<std::path::PathBuf>,
+    macaroon_file: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    let socket = socket.ok_or_else(|| {
+        anyhow::anyhow!("status --live needs --socket <SOCK_PATH> (the daemon's --ipc-socket)")
+    })?;
+    let explicit = parvault::capabilities::token_from_args(None, macaroon_file.as_deref())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let token =
+        parvault::capabilities::GatewayTokenSource::from_args_or_auto(explicit, data_dir, false)
+            .current()
+            .map_err(|e| anyhow::anyhow!(e))?;
+    let client = parvault::gateway::ipc::GatewayIpcClient::new(&socket);
+    let snap = client.query_live_status(Some(token)).map_err(|e| {
+        anyhow::anyhow!(
+            "status --live: the daemon at {} did not answer ({}): {e}",
+            socket.display(),
+            parvault::live_status::live_refusal_code(&e)
+        )
+    })?;
+    for line in live_lines(&snap) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn status_live(
+    _data_dir: &std::path::Path,
+    _socket: Option<std::path::PathBuf>,
+    _macaroon_file: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    anyhow::bail!("status --live needs the gateway socket, which is Unix-only")
+}
+
+/// The text `status --live` prints.
+fn live_lines(s: &parvault::live_status::LiveStatusSnapshot) -> Vec<String> {
+    let connected = s.peers.iter().filter(|p| p.connected).count();
+    let admitted = s.peers.iter().filter(|p| p.admitted).count();
+    let mut out = vec![
+        "=== ParVault Daemon Live Status ===".to_string(),
+        format!(
+            "Peers                 : {connected} connected, {admitted} admitted ({} listed)",
+            s.peers.len()
+        ),
+    ];
+    for p in &s.peers {
+        out.push(format!(
+            "  {} {} {}{}",
+            p.peer_id,
+            if p.connected {
+                "connected"
+            } else {
+                "not connected"
+            },
+            if p.admitted {
+                "admitted"
+            } else {
+                "not yet admitted"
+            },
+            p.addrs
+                .first()
+                .map(|a| format!(" ({a})"))
+                .unwrap_or_default()
+        ));
+    }
+    out.push(format!(
+        "Listening on          : {}",
+        s.listen_addrs.join(", ")
+    ));
+    out.push(format!(
+        "Shards held           : {}{}",
+        s.shards_held,
+        match s.held_shard_bound {
+            Some(b) => format!(" of at most {b} ({})", s.held_shard_bound_source),
+            None => String::new(),
+        }
+    ));
+    out.push(format!(
+        "Anonymous memory      : {} bytes",
+        s.anon_rss_bytes
+    ));
+    out.push(format!(
+        "Restore scheduler     : {} network fetches, {} cache misses, {} queued, {} scavenger deferrals",
+        s.fetch.network_fetches, s.fetch.cache_misses, s.fetch.foreground_queued, s.fetch.scavenger_preempted
+    ));
+    out
 }
