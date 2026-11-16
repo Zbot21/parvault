@@ -1,0 +1,31 @@
+{
+  "baseline": "VF-8",
+  "label": "box",
+  "profile": "release",
+  "recorded_unix": 1794832837,
+  "runs": [
+    {
+      "ttfb_loaded_ms": 18.171,
+      "ttfb_idle_ms": 15.074
+    },
+    {
+      "ttfb_loaded_ms": 19.687,
+      "ttfb_idle_ms": 19.367
+    },
+    {
+      "ttfb_loaded_ms": 18.447,
+      "ttfb_idle_ms": 18.559
+    },
+    {
+      "ttfb_loaded_ms": 19.24,
+      "ttfb_idle_ms": 19.318
+    },
+    {
+      "ttfb_loaded_ms": 21.749,
+      "ttfb_idle_ms": 17.358
+    }
+  ],
+  "median_ttfb_loaded_ms": 19.24,
+  "median_ttfb_idle_ms": 18.559,
+  "bound_ms_2x_idle_plus_100": 137.118
+}
