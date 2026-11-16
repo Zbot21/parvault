@@ -282,7 +282,7 @@ fn e1_windows_equivalent() {
     assert_eq!(rc, 0, "{err}");
     assert_eq!(String::from_utf8_lossy(&body), "200\n207\n207\n200\n");
     assert!(
-        err.matches("Re-using existing").count() >= 3,
+        err.matches("Re-using existing").count() + err.matches("Reusing existing").count() >= 3,
         "keep-alive: {err}"
     );
     assert!(err.contains("DAV: 1"), "{err}");
