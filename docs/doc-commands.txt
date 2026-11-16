@@ -14,53 +14,53 @@ export PARVAULT_SEED_PHRASE="$(parvault new-seed-phrase)"; echo "$PARVAULT_SEED_
 parvault watch-folder --folder ~/Documents --vault-namespace laptop --once
 parvault watch-folder --folder ~/Documents --public --tracker /ip4/<YOUR_SEED_IP>/tcp/4002/p2p/<SEED_PEER_ID> --once
 
-## README.md:160 node=main skip="needs the Rust toolchain and this repository; CI's rust-tests job runs these"
+## README.md:161 node=main skip="needs the Rust toolchain and this repository; CI's rust-tests job runs these"
 TLA2TOOLS_JAR=/path/to/tla2tools.jar cargo test --release
 bash scripts/verify_formal_proofs.sh
 cargo run --release --bin parvault-seed -- self-test
 cargo run --release --bin parvault -- gateway self-test
 bash scripts/build_bins.sh --profile release --out dist && bash scripts/plugin_self_test.sh dist/parvault dist/parvault-fuse dist/parvault-sync
 
-## README.md:178 node=seed background ready="Zero-Trust Seed & Redundancy Server Status Report"
+## README.md:179 node=seed background ready="Zero-Trust Seed & Redundancy Server Status Report"
 parvault-seed start --no-fs --in-memory-mb 256 --mode public-bootstrap --listen /ip4/0.0.0.0/tcp/4002
 
-## README.md:184 node=plugins
+## README.md:185 node=plugins
 parvault init
 parvault wot init        # or join an existing ring with `parvault wot install-chain`
 SOCK=/var/run/parvault.sock
 
-## README.md:191 node=plugins background ready="Zero-Copy IPC Gateway listening"
+## README.md:192 node=plugins background ready="Zero-Copy IPC Gateway listening"
 parvault up --folder /mnt/usb-nas/shared --ipc-socket "$SOCK" --strict-plugins --allow-peer-uid "$(id -u)" --require-sealed-memfd
 
-## README.md:196 node=plugins
+## README.md:197 node=plugins
 TOKEN=$(parvault token mint --read-only --ttl-secs 3600)
 ( umask 077; printf '%s\n' "$TOKEN" > ./plugin.token )   # --macaroon-file: not visible in the process list
 
-## README.md:205 node=plugins background ready="serving HTTP-Range / WebDAV VFS"
+## README.md:206 node=plugins background ready="serving HTTP-Range / WebDAV VFS"
 parvault-fuse --socket "$SOCK" --macaroon-file ./plugin.token --cache-dir /tmp/pv-cache --cache-mib 512 webdav --listen 127.0.0.1:8088
 
-## README.md:211 node=plugins
+## README.md:212 node=plugins
 curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
 
-## README.md:217 node=plugins expect-exit=3
+## README.md:218 node=plugins expect-exit=3
 mkdir -p ~/Documents && echo "hello" > ~/Documents/hello.txt   # something to push
 parvault-sync --socket "$SOCK" --catalog ./gw-catalog.bin push --folder ~/Documents
 
-## README.md:222 node=plugins
+## README.md:223 node=plugins
 parvault-sync --socket "$SOCK" --catalog ./gw-catalog.bin --macaroon-file ./plugin.token pull --output /tmp/restored
 
-## README.md:228 node=vfs
+## README.md:229 node=vfs
 parvault init && parvault wot init
 mkdir -p /mnt/usb-nas/shared
 
-## README.md:234 node=vfs background ready="Built-in VFS WebDAV listening on http://127.0.0.1:8088"
+## README.md:235 node=vfs background ready="Built-in VFS WebDAV listening on http://127.0.0.1:8088"
 parvault up --no-socket --vfs-seed-dir /mnt/usb-nas/shared --vfs-webdav-listen 127.0.0.1:8088
 
-## README.md:238 node=vfs
+## README.md:239 node=vfs
 TOKEN="$(parvault token mint --read-only --ttl-secs 86400)"
 curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
 
-## README.md:248 node=main skip="needs the Rust toolchain, Docker, or cross linkers and this repository; CI's rust-tests and release jobs run these"
+## README.md:249 node=main skip="needs the Rust toolchain, Docker, or cross linkers and this repository; CI's rust-tests and release jobs run these"
 cargo run --release --bin parvault-bench -- run --payload-mib 64
 bash scripts/docker_acceptance_gate.sh
 bash scripts/build_bins.sh --profile soc --target x86_64-unknown-linux-musl --out dist
