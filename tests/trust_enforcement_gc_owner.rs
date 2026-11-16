@@ -1232,3 +1232,144 @@ fn b154_free_for_unreachable_alias_goes_to_given_host() {
     );
     gate_ran("trust_enforcement_gc_owner::b154_free_for_unreachable_alias_goes_to_given_host");
 }
+
+/// A shard id no host holds, distinct per `n`.
+fn absent_shard(n: u8) -> parvault::storage::ShardId {
+    parvault::storage::ShardId {
+        stripe_merkle_root: [n; 32],
+        shard_index: n as u32,
+        shard_hash: [n ^ 0xff; 32],
+    }
+}
+
+/// Appends pending frees `(shard, host)` to `f`'s GC journal, as an older owner would have
+/// written them.
+fn seed_pending(f: &LocalFolder, entries: &[(parvault::storage::ShardId, String)]) {
+    let paths = parvault::sync::gc_journal::GcPaths::for_snapshot(&f.snap);
+    let mut j = parvault::sync::gc_journal::GcJournal::load(&paths).unwrap();
+    for (id, host) in entries {
+        j.pending.push(parvault::sync::gc_journal::PendingFree {
+            shard_id: *id,
+            shard_len: 4096,
+            host: host.clone(),
+            attempts: 0,
+            first_attempt_ms: now_ms(),
+            next_pass: 0,
+            skew_refusals: 0,
+        });
+    }
+    j.save(&paths).unwrap();
+}
+
+/// A loopback address nothing listens on, under `host`'s peer id.
+fn dead_alias_of(host: &Host) -> String {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    format!(
+        "/ip4/127.0.0.1/tcp/{port}/p2p/{}",
+        host.addr.split("/p2p/").nth(1).unwrap()
+    )
+}
+
+/// The `FreeShards` orders a host applied, as `shards=` counts from its log.
+fn applied_orders(host: &Host) -> Vec<String> {
+    std::fs::read_to_string(&host.log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains("info.free_order_applied"))
+        .filter_map(|l| l.split("shards=").nth(1))
+        .map(|t| t.split_whitespace().next().unwrap_or("").to_string())
+        .collect()
+}
+
+/// B154-OFFLINE migration: a journal from the old code holds one shard under both a host's
+/// dead alias and its given address, and a second shard under the alias only. They merge under
+/// the given address: one order of 2 shards, no double free, and the journal empties.
+#[test]
+fn b154_alias_journal_migrates_without_double_free() {
+    let h1 = spawn_host();
+    let h2 = spawn_host();
+    let peers = format!("{},{}", h1.plain_addr(), h2.plain_addr());
+    let f = LocalFolder::new();
+    f.write("one");
+    let out = ring_pass_key_hex(&f, &peers);
+    assert!(out.status.success(), "{}", text(&out));
+    let before = applied_orders(&h1).len();
+    let alias = dead_alias_of(&h1);
+    seed_pending(
+        &f,
+        &[
+            (absent_shard(1), alias.clone()),
+            (absent_shard(1), h1.plain_addr().to_string()),
+            (absent_shard(2), alias),
+        ],
+    );
+    let out = ring_pass_key_hex(&f, &peers);
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(t.contains("Pending Frees      : 0 "), "{t}");
+    assert_eq!(applied_orders(&h1)[before..], ["2".to_string()], "{t}");
+    gate_ran("trust_enforcement_gc_owner::b154_alias_journal_migrates_without_double_free");
+}
+
+/// B154-OFFLINE discovery-only host: a host the owner was not given (no `--peers` or seed entry
+/// for its peer id), journalled under a dead alias and under a reachable address of the same
+/// peer id. The dead alias does not make the host unreachable: one order reaches it through the
+/// address that answers, and the journal empties.
+#[test]
+fn b154_discovery_only_host_reached_past_dead_alias() {
+    let h1 = spawn_host();
+    let h2 = spawn_host();
+    let peers = h2.plain_addr().to_string();
+    let f = LocalFolder::new();
+    f.write("one");
+    let out = ring_pass_key_hex(&f, &peers);
+    assert!(out.status.success(), "{}", text(&out));
+    let alias = dead_alias_of(&h1);
+    seed_pending(
+        &f,
+        &[
+            (absent_shard(1), alias.clone()),
+            (absent_shard(2), alias),
+            (absent_shard(2), h1.addr.clone()),
+        ],
+    );
+    let out = ring_pass_key_hex(&f, &peers);
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(t.contains("Pending Frees      : 0 "), "{t}");
+    assert_eq!(applied_orders(&h1), ["2".to_string()], "{t}");
+    gate_ran("trust_enforcement_gc_owner::b154_discovery_only_host_reached_past_dead_alias");
+}
+
+/// B154-OFFLINE safety: an alias under host 1's peer id whose address is host 2's. The dial
+/// expects host 1's id, Noise authenticates host 2: a mismatch, so no order reaches host 2, the
+/// order (signed for host 1's key) is never sent, and the entry stays pending.
+#[test]
+fn b154_alias_answered_by_another_node_frees_nothing_there() {
+    let h1 = spawn_host();
+    let h2 = spawn_host();
+    let peers = h2.plain_addr().to_string();
+    let f = LocalFolder::new();
+    f.write("one");
+    let out = ring_pass_key_hex(&f, &peers);
+    assert!(out.status.success(), "{}", text(&out));
+    let h1_pid = h1.addr.split("/p2p/").nth(1).unwrap();
+    let wrong = format!("{}/p2p/{h1_pid}", h2.plain_addr());
+    let h2_before = applied_orders(&h2).len();
+    seed_pending(&f, &[(absent_shard(1), wrong)]);
+    for _ in 0..2 {
+        let out = ring_pass_key_hex(&f, &peers);
+        let t = text(&out);
+        assert!(out.status.success(), "{t}");
+        assert!(t.contains("Pending Frees      : 1 "), "{t}");
+    }
+    let h2_log = std::fs::read_to_string(&h2.log).unwrap_or_default();
+    assert_eq!(applied_orders(&h2).len(), h2_before, "{h2_log}");
+    assert!(!h2_log.contains("refused a free order"), "{h2_log}");
+    assert!(applied_orders(&h1).is_empty());
+    gate_ran("trust_enforcement_gc_owner::b154_alias_answered_by_another_node_frees_nothing_there");
+}
