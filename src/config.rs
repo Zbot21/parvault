@@ -592,7 +592,7 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
 
-        /// Prune local shards belonging to deleted file tombstones after syncing.
+        /// Deprecated (B-154): with version GC on, a deleted file is freed when the last retained version holding it ages out; with --no-gc, prunes deleted files' shards at once as before.
         #[arg(long, default_value_t = false)]
         prune_deleted: bool,
 
