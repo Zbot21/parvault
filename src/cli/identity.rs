@@ -10,7 +10,13 @@ pub(crate) async fn status(env: CliEnv, command: Commands) -> anyhow::Result<()>
         block_store,
         ..
     } = env;
-    let Commands::Status { live } = command else {
+    // `--socket` and `--macaroon-file` (track D) are bound here when `--live` is built.
+    let Commands::Status {
+        live,
+        socket: _,
+        macaroon_file: _,
+    } = command
+    else {
         unreachable!("status() is only dispatched for Commands::Status")
     };
     if live {
