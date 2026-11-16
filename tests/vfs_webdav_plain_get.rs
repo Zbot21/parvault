@@ -64,7 +64,13 @@ fn edge(
     let seed = dir.join("seed");
     std::fs::create_dir_all(&seed).unwrap();
     std::fs::write(seed.join("f.bin"), content()).unwrap();
-    let vfs = VirtualVaultFs::new(&sock, dir.join("cache"), 2 * BLOCKS * MIB)
+    // B-16: the ingest's StorePayload presents the bus token (a write token).
+    let bus = parvault::gateway::GatewayBus::unix_socket(&sock).with_token_source(Some(
+        std::sync::Arc::new(parvault::capabilities::GatewayTokenSource::Fixed(token(
+            Vec::new(),
+        ))),
+    ));
+    let vfs = VirtualVaultFs::with_bus(bus, dir.join("cache"), 2 * BLOCKS * MIB)
         .unwrap()
         .with_default_macaroon(Some(token(Vec::new())));
     assert_eq!(vfs.ingest_local_directory(&seed).unwrap(), 1);

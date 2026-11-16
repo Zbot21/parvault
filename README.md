@@ -209,7 +209,7 @@ parvault-fuse --socket "$SOCK" --macaroon-file ./plugin.token \
 ```bash
 curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
 ```
-With no ring peer to take the data, `push` keeps it on this machine and exits with code 3 ("N stripe(s) kept only on this machine: NOT backed up"):
+Without `--macaroon-file`, `parvault-sync` and `parvault-fuse` mint their own 15-minute token for your UID from the daemon's `0600` key file (`--data-dir`, default `.parvault-data`): write for `push`, read-only for `pull`. Every gateway command needs a token since v0.5.5, and `parvault token mint` tokens are read-only unless `--write`. With no ring peer to take the data, `push` keeps it on this machine and exits with code 3 ("N stripe(s) kept only on this machine: NOT backed up"):
 <!-- doc-cmd: node plugins -->
 <!-- doc-cmd: expect-exit 3 -->
 ```bash

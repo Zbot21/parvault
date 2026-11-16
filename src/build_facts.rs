@@ -40,3 +40,17 @@ pub fn long_version() -> &'static str {
         )
     })
 }
+
+/// clap's `long_version` for the daemon-runtime binaries: the manifest version line
+/// (`<version> (manifest <NAME>)`, L-16), then the build-facts lines.
+#[cfg(feature = "daemon-runtime")]
+pub fn daemon_long_version() -> &'static str {
+    static LONG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LONG.get_or_init(|| {
+        format!(
+            "{}\n{}",
+            crate::manifest::ACTIVE_VERSION_LINE,
+            build_facts_lines(build_facts())
+        )
+    })
+}

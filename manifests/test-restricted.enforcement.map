@@ -1,0 +1,10 @@
+# Per-manifest enforcement map (L-16 S8, G-1 ruling 4): manifest test-restricted (CI only).
+# Run: run_enforcement_gates.sh --all --manifest test-restricted <repo>. Only the lines below are
+# evaluated, built with the feature list on the `manifest` line (G-1 C4, never --all-features).
+# The shared claim suite is not run here: it needs HandshakeWoT, which this manifest refuses (C10).
+# E-WIRE completeness: every variant is claimed in the shared map or refused here (refuses=).
+# kind     id        keys
+manifest   test-restricted features=daemon-runtime,vfs,status-ui,manifest-test-restricted
+claim      MAN-VARIANT sym=src/manifest/mod.rs::manifest_variant_decision accept=trust_enforcement::man_variant_enabled_served reject=trust_enforcement::man_variant_disabled_refused code=reject.variant_disabled_by_manifest bin=parvault ref=docs/security/TRUST_FINDINGS.md refuses=MeshWireRequest::AdmitPublicTicket,MeshWireRequest::HandshakeWoT
+kani       MAN-VARIANT sym=src/manifest/mod.rs::manifest_variant_decision harness=proof_manifest_variant_decision cover=disabled variant refused
+enum       E-WIRE    sym=src/network/behaviour.rs::MeshWireRequest exclude=QueryNodeStatus,LookupWanRendezvous

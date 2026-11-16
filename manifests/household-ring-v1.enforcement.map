@@ -1,0 +1,7 @@
+# Per-manifest enforcement map (L-16 S8, G-1 ruling 4): manifest household-ring-v1 (the default).
+# Run: run_enforcement_gates.sh --all --manifest household-ring-v1 <repo>. The household manifest
+# serves every variant, so its claims are the shared map's (.enforcement.map); this map pins the
+# feature list and checks E-WIRE completeness for it: no variant is refused here.
+# kind     id        keys
+manifest   household-ring-v1 features=daemon-runtime,vfs,status-ui,manifest-household-ring-v1
+enum       E-WIRE    sym=src/network/behaviour.rs::MeshWireRequest exclude=QueryNodeStatus,LookupWanRendezvous

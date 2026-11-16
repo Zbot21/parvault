@@ -1,0 +1,12 @@
+diff --git a/specs/ParVaultGatewayPluginBus.tla b/specs/ParVaultGatewayPluginBus.tla
+--- a/specs/ParVaultGatewayPluginBus.tla
++++ b/specs/ParVaultGatewayPluginBus.tla
+@@ -105,7 +105,7 @@
+ \* gateway_macaroon_decision (B-16): no root key, no service; then a token with a valid tag
+ \* whose caveats allow this frame (peer UID here, scope for reads).
+ GatedAuthorized(t, u) ==
+-    /\ rootKeySet   \* @guard macaroon-nokey sym=src/gateway/engine.rs::gateway_macaroon_decision
++    /\ TRUE
+     /\ t /= NoToken /\ t.key = "root"   \* @guard macaroon-frame sym=src/gateway/engine.rs::gateway_macaroon_decision
+     /\ UidCaveatOk(t, u)
+ ReadAuthorized(t, u) ==

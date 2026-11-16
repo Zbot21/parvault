@@ -1,7 +1,7 @@
 diff --git a/specs/ParVaultGatewayPluginBus.tla b/specs/ParVaultGatewayPluginBus.tla
 --- a/specs/ParVaultGatewayPluginBus.tla
 +++ b/specs/ParVaultGatewayPluginBus.tla
-@@ -101,7 +101,7 @@
+@@ -122,7 +122,7 @@
  \* status_auth_decision: a verifier (root key) and a snapshot, then a valid, ReadOnly,
  \* unscoped token whose AllowedPeerUid (if any) is the caller's.
  StatusAuthorized(t, u) ==

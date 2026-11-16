@@ -62,8 +62,8 @@ use tracing::{info, warn};
 #[derive(Parser, Debug)]
 #[command(
     name = "parvault-seed",
-    version,
-    long_version = parvault::build_facts::long_version(),
+    version = parvault::manifest::ACTIVE_VERSION_LINE,
+    long_version = parvault::build_facts::daemon_long_version(),
     about = "Standalone Zero-Trust Seed & Redundancy Server for ParVault (ADR-16)"
 )]
 struct SeedCli {
@@ -1398,6 +1398,10 @@ fn print_status_report(
     println!("  ParVault Zero-Trust Seed & Redundancy Server Status Report (ADR-16)     ");
     println!("========================================================================");
     println!("Operating Mode            : {:?}", report.mode);
+    println!(
+        "Manifest                  : {}",
+        parvault::manifest::ACTIVE_NAME
+    );
     println!("Assigned PeerRole         : {:?}", report.peer_role);
     println!("Listen Multiaddr          : {}", listen);
     println!("Data Directory            : {}", data_dir.display());

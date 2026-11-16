@@ -151,7 +151,7 @@ tlc.generated.ParVaultBootstrapAndEarnedTier = 331
 tlc.generated.ParVaultLiteClientAndSeedFailover = 212
 tlc.generated.ParVaultZeroKeyAdminAndQuorum = 744,403,592
 tlc.distinct.ParVaultProtocol = 3,040
-tlc.generated.ParVaultGatewayPluginBus = 215,120
+tlc.generated.ParVaultGatewayPluginBus = 270,732
 tlc.distinct.ParVaultConfidentialityAndTrust = 944
 tlc.distinct.ParVaultAnonymity = 441
 tlc.distinct.ParVaultPostQuantum = 1,656
@@ -162,8 +162,8 @@ tlc.depth.ParVaultZeroKeyAdminAndQuorum = 21
 tlc.generated.ParVaultZeroKeyAdminAndQuorum.RootOffDisk = 1,271,394,056
 tlc.distinct.ParVaultZeroKeyAdminAndQuorum.RootOffDisk = 873,792
 tlc.depth.ParVaultZeroKeyAdminAndQuorum.RootOffDisk = 21
-tlc.distinct.ParVaultGatewayPluginBus = 7,540
-tlc.depth.ParVaultGatewayPluginBus = 10
+tlc.distinct.ParVaultGatewayPluginBus = 20,288
+tlc.depth.ParVaultGatewayPluginBus = 12
 # ParVaultPorAudit measured 2026-11-15 at b522cdb on evo-x2 (B-59; tla2tools v1.8.0):
 # java -cp tla2tools.jar tlc2.TLC -workers 4 -config ParVaultPorAudit.cfg ParVaultPorAudit.tla
 tlc.generated.ParVaultPorAudit = 16,201
@@ -218,6 +218,6 @@ bench.soc.headroom_32m = 22.26 MiB
 bench.soc.headroom_48m = 38.26 MiB
 bench.soc.vmhwm_reduction = 5.9x
 aes.enc.span = 496.5–589.2 MiB/s
-tlc.generated = 2,016,102,560
-tlc.distinct = 1,401,076
+tlc.generated = 2,016,158,172
+tlc.distinct = 1,413,824
 # <<< end generated

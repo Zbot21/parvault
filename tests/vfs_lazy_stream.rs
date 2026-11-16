@@ -26,6 +26,24 @@ use std::net::TcpStream;
 use std::time::Duration;
 use tempfile::tempdir;
 
+/// B-16: every gated gateway command needs a token; tests present this write token (no caveats).
+fn wtok(key: [u8; 32]) -> Option<std::sync::Arc<parvault::capabilities::GatewayTokenSource>> {
+    Some(std::sync::Arc::new(
+        parvault::capabilities::GatewayTokenSource::Fixed(
+            parvault::capabilities::CapabilityMacaroon::mint(
+                &key,
+                [0x5A; 32],
+                [0x5B; 32],
+                Vec::new(),
+            )
+            .unwrap(),
+        ),
+    ))
+}
+
+/// The root key of the tests' gateways that had none before B-16.
+const TEST_GW_KEY: [u8; 32] = [0x6C; 32];
+
 fn deterministic_stripe_plaintext(stripe_index: u64, len: usize) -> Vec<u8> {
     let mut out = vec![0u8; len];
     let mut state = stripe_index
@@ -135,10 +153,11 @@ fn test_vfs_lazy_fetch_latency() {
 
     let mut server = GatewayIpcServer::new(&sock_path, store, mk)
         .with_profile(HardwareProfile::RouterSoc)
+        .with_macaroon_root_key(TEST_GW_KEY)
         .spawn()
         .expect("spawn GatewayIpcServer");
 
-    let client = GatewayIpcClient::new(&sock_path);
+    let client = GatewayIpcClient::new(&sock_path).with_token_source(wtok(TEST_GW_KEY));
     let eph = client
         .register_manifest(manifest_10gib.clone())
         .expect("register 10 GiB manifest over IPC");
@@ -147,8 +166,12 @@ fn test_vfs_lazy_fetch_latency() {
 
     // 1. Mount VirtualVaultFs with a strict 4 MiB LRU disk cache (< 5 MiB read slice!)
     let cache_cap_bytes = 4 * 1024 * 1024;
-    let vfs =
-        VirtualVaultFs::new(&sock_path, &cache_dir, cache_cap_bytes).expect("init VirtualVaultFs");
+    let vfs = VirtualVaultFs::with_bus(
+        parvault::gateway::GatewayBus::unix_socket(&sock_path).with_token_source(wtok(TEST_GW_KEY)),
+        &cache_dir,
+        cache_cap_bytes,
+    )
+    .expect("init VirtualVaultFs");
     let ino = vfs
         .register_lazy_file(
             "/vault/dataset_10gib.bin",

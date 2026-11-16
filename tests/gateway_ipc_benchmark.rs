@@ -31,6 +31,24 @@ use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 /// Writes this test's gate sentinel (ADR-30 `suite` line in `.enforcement.map`).
+/// B-16: every gated gateway command needs a token; tests present this write token (no caveats).
+fn wtok(key: [u8; 32]) -> Option<std::sync::Arc<parvault::capabilities::GatewayTokenSource>> {
+    Some(std::sync::Arc::new(
+        parvault::capabilities::GatewayTokenSource::Fixed(
+            parvault::capabilities::CapabilityMacaroon::mint(
+                &key,
+                [0x5A; 32],
+                [0x5B; 32],
+                Vec::new(),
+            )
+            .unwrap(),
+        ),
+    ))
+}
+
+/// The root key of the tests' gateways that had none before B-16.
+const TEST_GW_KEY: [u8; 32] = [0x6C; 32];
+
 fn gate_ran(name: &str) {
     if let Ok(dir) = std::env::var("GATES_SENTINEL_DIR") {
         std::fs::write(std::path::Path::new(&dir).join(name), b"ran").expect("sentinel");
@@ -65,10 +83,11 @@ fn test_gateway_zero_copy_ipc_streaming() {
 
     let mut server = GatewayIpcServer::new(&sock_path, store, mk)
         .with_profile(HardwareProfile::RouterSoc)
+        .with_macaroon_root_key(TEST_GW_KEY)
         .spawn()
         .expect("spawn GatewayIpcServer");
 
-    let client = GatewayIpcClient::new(&sock_path);
+    let client = GatewayIpcClient::new(&sock_path).with_token_source(wtok(TEST_GW_KEY));
 
     // 1. Allocate 100 MiB memfd in kernel shmem without mapping PTEs into userspace VmRSS.
     const PAYLOAD_MIB: usize = 100;
@@ -172,12 +191,14 @@ fn test_gateway_macaroon_sub_millisecond_ram_enforcement() {
         .expect("spawn server");
 
     let client = GatewayIpcClient::new(&sock_path);
+    // B-16: the store presents a write token; `client` presents only the tokens each fetch names.
+    let store_client = GatewayIpcClient::new(&sock_path).with_token_source(wtok(root_key));
     let payload: Vec<u8> = (0..(2 * 1024 * 1024)).map(|i| (i % 253) as u8).collect();
     let in_mfd = create_memfd("mac-in").expect("memfd");
     let mut in_f = File::from(in_mfd);
     in_f.write_all(&payload).unwrap();
     in_f.seek(SeekFrom::Start(0)).unwrap();
-    let manifest = client
+    let manifest = store_client
         .store_memfd(
             in_f.as_raw_fd(),
             payload.len() as u64,

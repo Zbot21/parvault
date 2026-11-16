@@ -1,0 +1,12 @@
+diff --git a/specs/ParVaultGatewayPluginBus.tla b/specs/ParVaultGatewayPluginBus.tla
+--- a/specs/ParVaultGatewayPluginBus.tla
++++ b/specs/ParVaultGatewayPluginBus.tla
+@@ -189,7 +189,7 @@
+ StorePayload(u, t, sealed) ==
+     /\ u \in conns
+     /\ Cardinality(stored) < 2
+-    /\ WriteAuthorized(t, u)   \* @guard store-macaroon sym=src/gateway/engine.rs::gateway_macaroon_decision
++    /\ TRUE   \* @guard store-macaroon sym=src/gateway/engine.rs::gateway_macaroon_decision
+     /\ IngestSealedOk(sealed)
+     /\ stored' = stored \cup {[sealed |-> sealed, mutated |-> FALSE]}
+     /\ lastWrite' = <<u, t>>

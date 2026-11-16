@@ -1,0 +1,12 @@
+diff --git a/specs/ParVaultGatewayPluginBus.tla b/specs/ParVaultGatewayPluginBus.tla
+--- a/specs/ParVaultGatewayPluginBus.tla
++++ b/specs/ParVaultGatewayPluginBus.tla
+@@ -117,7 +117,7 @@
+ \* yet, also one with no manifest or range caveat (scope "any").
+ WriteAuthorized(t, u) ==
+     /\ GatedAuthorized(t, u)
+-    /\ t.write /\ t.scope = "any"   \* @guard macaroon-write sym=src/gateway/engine.rs::gateway_macaroon_decision
++    /\ TRUE
+ IngestSealedOk(sealed) == ~requireSealed \/ sealed   \* @guard memfd-seal sym=src/gateway/engine.rs::gateway_memfd_seal_decision
+ \* status_auth_decision: a verifier (root key) and a snapshot, then a valid, ReadOnly,
+ \* unscoped token whose AllowedPeerUid (if any) is the caller's.

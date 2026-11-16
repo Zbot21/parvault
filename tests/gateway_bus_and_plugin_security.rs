@@ -23,6 +23,24 @@ use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::sync::watch;
 
+/// B-16: every gated gateway command needs a token; tests present this write token (no caveats).
+fn wtok(key: [u8; 32]) -> Option<std::sync::Arc<parvault::capabilities::GatewayTokenSource>> {
+    Some(std::sync::Arc::new(
+        parvault::capabilities::GatewayTokenSource::Fixed(
+            parvault::capabilities::CapabilityMacaroon::mint(
+                &key,
+                [0x5A; 32],
+                [0x5B; 32],
+                Vec::new(),
+            )
+            .unwrap(),
+        ),
+    ))
+}
+
+/// The root key of the tests' gateways that had none before B-16.
+const TEST_GW_KEY: [u8; 32] = [0x6C; 32];
+
 fn deterministic_payload(len: usize) -> Vec<u8> {
     let mut out = vec![0u8; len];
     let mut s = 0x9E37_79B9_7F4A_7C15u64;
@@ -74,7 +92,7 @@ async fn test_gateway_bus_in_process_vs_unix_socket_bit_for_bit_parity() {
         .with_require_sealed_ingest_memfd(true)
         .spawn()
         .expect("spawn GatewayIpcServer");
-    let bus_sock = GatewayBus::unix_socket(&sock_path);
+    let bus_sock = GatewayBus::unix_socket(&sock_path).with_token_source(wtok(root_key));
 
     // Store identical payload across both transports using sealed memfd descriptors:
     let mfd_a = File::from(create_memfd_sized("parity-a", payload.len() as u64).unwrap());
@@ -237,11 +255,12 @@ async fn test_require_sealed_ingest_memfd_blocks_unsealed_and_accepts_sealed() {
     .unwrap();
     let server = GatewayIpcServer::new(&sock_path, store, MasterKey::generate())
         .with_profile(HardwareProfile::RouterSoc)
+        .with_macaroon_root_key(TEST_GW_KEY)
         .with_require_sealed_ingest_memfd(true);
     let engine_ref = Arc::clone(server.engine());
     let mut handle = server.spawn().unwrap();
 
-    let client = GatewayIpcClient::new(&sock_path);
+    let client = GatewayIpcClient::new(&sock_path).with_token_source(wtok(TEST_GW_KEY));
     let data = deterministic_payload(128 * 1024);
 
     // 1. Unsealed memfd MUST be rejected before hashing or encrypting a single byte:
@@ -438,7 +457,7 @@ async fn test_cli_mint_offline_attenuate_inspect_and_gateway_fetch_range_enforce
         .with_require_sealed_ingest_memfd(true);
     let engine_ref = Arc::clone(ipc_server.engine());
     let mut srv = ipc_server.spawn().unwrap();
-    let bus = GatewayBus::unix_socket(&sock_path);
+    let bus = GatewayBus::unix_socket(&sock_path).with_token_source(wtok(root_key_bytes));
 
     let payload = deterministic_payload(512 * 1024);
     let in_file = File::from(create_memfd_sized("cli-tok-in", payload.len() as u64).unwrap());

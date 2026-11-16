@@ -8,6 +8,10 @@
 use crate::bootstrap::{SeedServerMode, ZeroTrustSeedServer};
 use crate::config::NodeConfig;
 use crate::crypto::{HybridKemKeypair, NodeIdentity};
+use crate::manifest::{
+    manifest_variant_decision, AdmissionPolicy, AdmitCtx, AdmitOutcome, Credential, Manifest,
+    WireKind, VARIANT_DISABLED_TEXT,
+};
 use crate::network::behaviour::{
     DhtEnvelopeKind, DhtWireEnvelope, MeshWireRequest, MeshWireResponse,
 };
@@ -260,6 +264,8 @@ pub struct WireState<'a> {
 /// | 18 | `SubmitAbuseTakedownReport` | always queued | refused unless public bootstrapper |
 /// | 19 | `BroadcastEvictionOrder` | identical since F-08: `council_from_manifest` | identical |
 pub trait WireRolePolicy {
+    /// The compiled-in manifest (L-16 S2-S4). Both role impls name `crate::manifest::Active`.
+    type Manifest: Manifest;
     /// Row 2.
     fn record_put_shard_admission_ip(&self) -> bool;
     /// Rows 6 and 11: blinded shards longer than this are refused; 0 disables the check.
@@ -287,6 +293,7 @@ pub struct SeedWirePolicy {
 }
 
 impl WireRolePolicy for DaemonWirePolicy<'_> {
+    type Manifest = crate::manifest::Active;
     fn record_put_shard_admission_ip(&self) -> bool {
         false
     }
@@ -308,6 +315,7 @@ impl WireRolePolicy for DaemonWirePolicy<'_> {
 }
 
 impl WireRolePolicy for SeedWirePolicy {
+    type Manifest = crate::manifest::Active;
     fn record_put_shard_admission_ip(&self) -> bool {
         true
     }
@@ -375,8 +383,14 @@ pub fn admission_decision(facts: &AdmissionFacts) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The manifest's admission fact for one sender key (S2): the single source of `sender_trusted`
+/// and of every other production "is this key admitted" question in the handler (G-1 C7).
+fn manifest_admits<M: Manifest>(wot: &WebOfTrustRegistry, sender: &[u8; 32]) -> bool {
+    <M::Admission as AdmissionPolicy>::is_admitted(wot, sender, now_unix_ms())
+}
+
 /// Facts for `class` about the sender of this request.
-fn admission_facts(
+fn admission_facts<M: Manifest>(
     peer: &WirePeer<'_>,
     class: AdmissionClass,
     wot: &WebOfTrustRegistry,
@@ -384,13 +398,17 @@ fn admission_facts(
     AdmissionFacts {
         class,
         sender_pubkey: peer.pubkey,
-        sender_trusted: peer.pubkey.is_some_and(|pk| wot.is_peer_trusted(&pk)),
+        sender_trusted: peer.pubkey.is_some_and(|pk| manifest_admits::<M>(wot, &pk)),
     }
 }
 
 /// Runs the decision and logs a refusal; `true` admits.
-fn admitted(peer: &WirePeer<'_>, class: AdmissionClass, wot: &WebOfTrustRegistry) -> bool {
-    match admission_decision(&admission_facts(peer, class, wot)) {
+fn admitted<M: Manifest>(
+    peer: &WirePeer<'_>,
+    class: AdmissionClass,
+    wot: &WebOfTrustRegistry,
+) -> bool {
+    match admission_decision(&admission_facts::<M>(peer, class, wot)) {
         Ok(()) => true,
         Err(code) => {
             warn!(code, peer = %peer.peer_id, "refused a request from a peer that is not admitted");
@@ -432,14 +450,31 @@ pub const fn admission_class(request: &MeshWireRequest) -> AdmissionClass {
 }
 
 /// The single admission check: `Some(rejection)` refuses the request before dispatch.
-fn admit(
+fn admit<M: Manifest>(
     peer: &WirePeer<'_>,
     request: &MeshWireRequest,
     class: AdmissionClass,
     st: &mut WireState<'_>,
 ) -> Option<MeshWireResponse> {
-    (!admitted(peer, class, st.wot))
+    (!admitted::<M>(peer, class, st.wot))
         .then(|| reject_response(request, NOT_ADMITTED_TEXT.to_string()))
+}
+
+/// The manifest variant gate (S3): `Some(rejection)` refuses a variant the manifest does not
+/// serve, before admission and any state change. The refusal has the request's existing shape;
+/// the code goes to the local log only (G-1 C8).
+fn manifest_variant_gate<M: Manifest>(
+    peer: &WirePeer<'_>,
+    request: &MeshWireRequest,
+) -> Option<MeshWireResponse> {
+    let kind = WireKind::from(request);
+    match manifest_variant_decision(<M::Admission as AdmissionPolicy>::variant_enabled(kind)) {
+        Ok(()) => None,
+        Err(code) => {
+            warn!(code, ?kind, manifest = M::NAME, peer = %peer.peer_id, "refused a request type this manifest does not serve");
+            Some(reject_response(request, VARIANT_DISABLED_TEXT.to_string()))
+        }
+    }
 }
 
 /// What the shard-owner decision needs to know about one request.
@@ -960,8 +995,11 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
     policy: &P,
     deferred: &mut Option<DeferredJob>,
 ) -> MeshWireResponse {
+    if let Some(rejection) = manifest_variant_gate::<P::Manifest>(peer, &request) {
+        return rejection;
+    }
     let class = admission_class(&request);
-    if let Some(rejection) = admit(peer, &request, class, &mut st) {
+    if let Some(rejection) = admit::<P::Manifest>(peer, &request, class, &mut st) {
         return rejection;
     }
     let WireState {
@@ -987,88 +1025,49 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
 
     match request {
         MeshWireRequest::HandshakeWoT { chain, .. } => {
-            let leaf_pk = chain.leaf_pubkey();
-            if let Some(reason) = eviction.is_ingress_blocked(
-                remote_ip,
-                Some(remote_peer_id),
-                leaf_pk.as_ref(),
-                None,
-                None,
+            let ctx = AdmitCtx {
+                wot,
+                eviction,
+                verifier_pubkey: node_identity.public_key_bytes(),
+            };
+            match <<P::Manifest as Manifest>::Admission as AdmissionPolicy>::admit(
+                ctx,
+                Credential::Handshake(&chain),
+                peer,
+                now_unix_ms(),
             ) {
-                warn!(%reason, peer = %remote_peer_id, "refused a handshake from a blocked peer");
-                return handshake_refused();
-            }
-            if let Err(code) = WebOfTrustRegistry::ring_handshake_decision(wot.genesis_pubkey()) {
-                warn!(code, peer = %remote_peer_id, "refused a handshake: this node is in no ring");
-                return handshake_refused();
-            }
-            if let Err(code) = WebOfTrustRegistry::chain_leaf_decision(leaf_pk, remote_pubkey) {
-                warn!(code, peer = %remote_peer_id, "refused a handshake for another key's chain");
-                return handshake_refused();
-            }
-            match wot.verify_and_admit_chain(&chain) {
-                Ok(_) => {
-                    if let (Some(ip), Some(pk)) = (remote_ip, leaf_pk) {
-                        let _ = eviction.record_peer_admission_ip(ip, pk);
-                    }
+                AdmitOutcome::Admitted | AdmitOutcome::AlreadyAdmitted => {
                     MeshWireResponse::HandshakeAck {
                         accepted: true,
                         reason: None,
                     }
                 }
-                Err(e) => {
-                    // ADR-05 Red-Team Fix (RT3-03): Never penalize `chain.leaf_pubkey()` on an
-                    // unverified `HandshakeWoT` failure.
-                    let code = handshake_refusal_code(&e);
-                    warn!(code, error = %e, peer = %remote_peer_id, "refused a handshake");
-                    handshake_refused()
-                }
+                AdmitOutcome::Refused { .. } => handshake_refused(),
             }
         }
         MeshWireRequest::AdmitPublicTicket(ticket) => {
             let verifier_pubkey = node_identity.public_key_bytes();
             let required_pow_bits = wot.required_public_pow_bits();
-            let ack =
-                |admitted: bool, reason: Option<String>| MeshWireResponse::AdmitPublicTicketAck {
-                    admitted,
-                    reason,
-                    verifier_pubkey,
-                    required_pow_bits,
-                };
-            if let Some(reason) = eviction.is_ingress_blocked(
-                remote_ip,
-                Some(remote_peer_id),
-                Some(&ticket.peer_pubkey),
-                None,
-                None,
-            ) {
-                return ack(false, Some(reason));
-            }
-            let subnet = remote_ip
-                .map(PrivacyPreservingEvictionEngine::canonicalize_ip_subnet)
-                .unwrap_or_else(|| "unknown".to_string());
-            let facts = wot.ticket_facts(
-                &ticket,
-                remote_pubkey,
+            let ctx = AdmitCtx {
+                wot,
+                eviction,
                 verifier_pubkey,
-                &subnet,
-                now_unix_ms(),
-            );
-            if let Err(code) = WebOfTrustRegistry::public_ticket_decision(&facts) {
-                warn!(code, peer = %remote_peer_id, "refused a public-commons ticket");
-                return ack(false, Some("public-commons ticket refused".to_string()));
-            }
-            if facts.already_admitted {
-                return ack(true, None);
-            }
-            match wot.verify_and_admit_public_ticket(&ticket) {
-                Ok(()) => {
-                    if let Some(ip) = remote_ip {
-                        let _ = eviction.record_peer_admission_ip(ip, ticket.peer_pubkey);
-                    }
-                    ack(true, None)
-                }
-                Err(e) => ack(false, Some(e.to_string())),
+            };
+            let (admitted, reason) =
+                match <<P::Manifest as Manifest>::Admission as AdmissionPolicy>::admit(
+                    ctx,
+                    Credential::PublicTicket(&ticket),
+                    peer,
+                    now_unix_ms(),
+                ) {
+                    AdmitOutcome::Admitted | AdmitOutcome::AlreadyAdmitted => (true, None),
+                    AdmitOutcome::Refused { reason } => (false, reason),
+                };
+            MeshWireResponse::AdmitPublicTicketAck {
+                admitted,
+                reason,
+                verifier_pubkey,
+                required_pow_bits,
             }
         }
         MeshWireRequest::PutShard {
@@ -1989,7 +1988,7 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
             let source_subnet =
                 remote_ip.map(|ip| crate::bootstrap::canonical_sybil_subnet_key(ip, None));
             // F-22: the admission-IP map is written only for admitted signers.
-            let signer_admitted = wot.is_peer_trusted(&signer_pk);
+            let signer_admitted = manifest_admits::<P::Manifest>(wot, &signer_pk);
             match wan_registry.register_from(slot_key, entry, now_unix_ms(), source_subnet) {
                 Ok(stored) => {
                     if stored && signer_admitted {
@@ -2088,7 +2087,7 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                         .into_iter()
                         .filter(|ep| {
                             crate::config::NodeConfig::extract_ed25519_pubkey_from_peer_str(ep)
-                                .is_some_and(|pk| wot.is_peer_trusted(&pk))
+                                .is_some_and(|pk| manifest_admits::<P::Manifest>(wot, &pk))
                         })
                         .collect();
                     if let Err(code) = crate::network::council_fetch::spawn_council_fetch(

@@ -4141,17 +4141,21 @@ fn r3_sync_push_local_only_exits_with_code() {
             "--ipc-socket",
         ])
         .arg(&sock);
+    let data_dir = dir.clone();
     let _node = spawn(cmd, root, dir, log);
     let deadline = Instant::now() + Duration::from_secs(30);
     while !sock.exists() {
         assert!(Instant::now() < deadline, "gateway socket never appeared");
         std::thread::sleep(Duration::from_millis(100));
     }
+    // B-16: push auto-mints a write token from the daemon's data directory.
     let push = |extra: &[&str]| {
         Command::new(common::plugin_bin(
             "parvault-sync",
             env!("CARGO_BIN_EXE_parvault-sync"),
         ))
+        .arg("--data-dir")
+        .arg(&data_dir)
         .arg("--socket")
         .arg(&sock)
         .arg("--catalog")
@@ -6398,7 +6402,10 @@ fn f43_plugin_requires_macaroon() {
 fn gw_up(label: &str, extra: &[&str], key: Option<[u8; 32]>) -> (Node, PathBuf) {
     let (root, dir, reg, log) = prepare(label);
     if let Some(k) = key {
-        std::fs::write(dir.join("macaroon_root.key"), hex::encode(k)).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("macaroon_root.key");
+        std::fs::write(&path, hex::encode(k)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
     let sock = dir.join("gw.sock");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
@@ -6423,11 +6430,23 @@ fn gw_up(label: &str, extra: &[&str], key: Option<[u8; 32]>) -> (Node, PathBuf) 
     (node, sock)
 }
 
-/// Stores `data` over the socket from a memfd, sealed when `seal` is set.
+/// Stores `data` over the socket from a memfd, sealed when `seal` is set, with a write token
+/// auto-minted from the daemon's root key file (the socket lives in its data directory; B-16).
 fn gw_store(
     sock: &Path,
     data: &[u8],
     seal: bool,
+) -> std::io::Result<parvault::gateway::ipc::EphemeralShardManifest> {
+    let src = parvault::capabilities::GatewayTokenSource::auto_mint(sock.parent().unwrap(), true);
+    gw_store_as(sock, data, seal, Some(src))
+}
+
+/// `gw_store` presenting `token` (none when `None`).
+fn gw_store_as(
+    sock: &Path,
+    data: &[u8],
+    seal: bool,
+    token: Option<parvault::capabilities::GatewayTokenSource>,
 ) -> std::io::Result<parvault::gateway::ipc::EphemeralShardManifest> {
     use std::os::fd::{AsFd, AsRawFd};
     let file = std::fs::File::from(
@@ -6437,11 +6456,13 @@ fn gw_store(
     if seal {
         parvault::os_sys::seal_memfd_immutable(file.as_fd()).unwrap();
     }
-    parvault::gateway::GatewayBus::unix_socket(sock).store_memfd_sync(
-        file.as_raw_fd(),
-        data.len() as u64,
-        parvault::gateway::RetentionPolicy::Persistent,
-    )
+    parvault::gateway::GatewayBus::unix_socket(sock)
+        .with_token_source(token.map(std::sync::Arc::new))
+        .store_memfd_sync(
+            file.as_raw_fd(),
+            data.len() as u64,
+            parvault::gateway::RetentionPolicy::Persistent,
+        )
 }
 
 const GW_KEY: [u8; 32] = [0x28; 32];
@@ -7303,10 +7324,17 @@ fn status_ipc_manifest_scoped_token_refused() {
 /// With no gateway root key there is no verifier, so QueryStatus is refused even with a token.
 #[test]
 fn status_ipc_without_root_key_refused() {
+    // B-16: a daemon has no keyless mode; with no key file it creates one (0600), so a token
+    // from any other key is refused as invalid.
     let (node, sock) = gw_up("st-nokey", &[], None);
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(node.dir.join("macaroon_root.key")).expect("no key created");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
     let tok = gw_token(vec![parvault::capabilities::Caveat::ReadOnly]);
     assert!(status_client(&sock).query_status(Some(tok)).is_err());
-    assert_logged(&node, "reject.status_unavailable");
+    assert_logged(&node, "reject.status_token_invalid");
 }
 
 // ---- Item 6 C1: InstallCouncilManifest over admin RPC (plan-6 ruling, L-53) -----------------
@@ -9350,4 +9378,370 @@ fn metrics_http_counts_status_refusals() {
         "{text}"
     );
     gate_ran("trust_enforcement::metrics_http_counts_status_refusals");
+}
+
+// --- MAN-VARIANT (L-16 S3): the compiled-in manifest gates wire variants --------------------------
+
+/// The manifest the `parvault` binary under test was built with, from its `--version` line.
+fn active_manifest() -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .arg("--version")
+        .output()
+        .expect("parvault --version");
+    let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let name = line
+        .rsplit_once("(manifest ")
+        .and_then(|(_, rest)| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("no manifest in --version: {line}"));
+    name.to_string()
+}
+
+const VARIANT_DISABLED_TEXT: &str = "request type not served by this node's manifest";
+
+/// MAN-VARIANT accept: a variant the manifest enables is served. In the household build that is
+/// `AdmitPublicTicket` (a stranger's ticket admits it); in the test-restricted build, which serves
+/// no credential arm, it is `QueryNodeStatus`. No variant refusal is logged.
+#[test]
+fn man_variant_enabled_served() {
+    let node = spawn_public_daemon("man-on");
+    match active_manifest().as_str() {
+        "household-ring-v1" => {
+            let stranger = key(0xB1);
+            let resp = admit_ticket(&node, &stranger, DEFAULT_PUBLIC_WOT_POW_BITS);
+            assert!(
+                matches!(
+                    resp,
+                    MeshWireResponse::AdmitPublicTicketAck { admitted: true, .. }
+                ),
+                "{resp:?}\n{}",
+                node.log_text()
+            );
+        }
+        "test-restricted" => {
+            let resp = send_as_stranger(&key(0xB1), &node, MeshWireRequest::QueryNodeStatus);
+            assert!(
+                matches!(&resp, MeshWireResponse::NodeStatusResult { peer_id, .. } if !peer_id.is_empty()),
+                "{resp:?}\n{}",
+                node.log_text()
+            );
+        }
+        other => panic!("unknown manifest {other}"),
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !node.log_text().contains("variant_disabled_by_manifest"),
+        "{}",
+        node.log_text()
+    );
+    gate_ran("trust_enforcement::man_variant_enabled_served");
+}
+
+/// MAN-VARIANT reject: the test-restricted build refuses `AdmitPublicTicket` and `HandshakeWoT`
+/// before admission, in each request's existing refusal shape, logs the code, and admits nothing
+/// (the stranger's put is then refused as not admitted). In the household build the same ticket
+/// admits (the twin, so the shared suite asserts the default manifest refuses nothing).
+#[test]
+fn man_variant_disabled_refused() {
+    let node = spawn_public_daemon("man-off");
+    let stranger = key(0xB2);
+    let resp = admit_ticket(&node, &stranger, DEFAULT_PUBLIC_WOT_POW_BITS);
+    match active_manifest().as_str() {
+        "test-restricted" => {
+            match &resp {
+                MeshWireResponse::AdmitPublicTicketAck {
+                    admitted: false,
+                    reason: Some(r),
+                    ..
+                } => assert_eq!(r, VARIANT_DISABLED_TEXT),
+                other => panic!("{other:?}\n{}", node.log_text()),
+            }
+            assert_logged(&node, "reject.variant_disabled_by_manifest");
+            let hs = send_as_stranger(
+                &stranger,
+                &node,
+                MeshWireRequest::HandshakeWoT {
+                    chain: DelegationChain { hops: Vec::new() },
+                    asn: None,
+                    region: None,
+                },
+            );
+            assert!(
+                matches!(&hs, MeshWireResponse::HandshakeAck { accepted: false, reason: Some(r) } if r == VARIANT_DISABLED_TEXT),
+                "{hs:?}"
+            );
+            let (sid, bytes) = shard(0x17, 1024);
+            let put = send_as_stranger(&stranger, &node, put_shard("", sid, bytes, None));
+            assert_eq!(refusal_text(&put).as_deref(), Some(NOT_ADMITTED), "{put:?}");
+        }
+        "household-ring-v1" => {
+            assert!(
+                matches!(
+                    resp,
+                    MeshWireResponse::AdmitPublicTicketAck { admitted: true, .. }
+                ),
+                "{resp:?}"
+            );
+            assert!(!node.log_text().contains("variant_disabled_by_manifest"));
+        }
+        other => panic!("unknown manifest {other}"),
+    }
+    gate_ran("trust_enforcement::man_variant_disabled_refused");
+}
+
+// --- B-16: gateway macaroons on every command, fail closed (L-86) -------------------------------
+
+fn fixed(
+    t: parvault::capabilities::CapabilityMacaroon,
+) -> parvault::capabilities::GatewayTokenSource {
+    parvault::capabilities::GatewayTokenSource::Fixed(t)
+}
+
+fn gw_client(
+    sock: &Path,
+    token: Option<parvault::capabilities::CapabilityMacaroon>,
+) -> parvault::gateway::ipc::GatewayIpcClient {
+    parvault::gateway::ipc::GatewayIpcClient::new(sock)
+        .with_token_source(token.map(|t| std::sync::Arc::new(fixed(t))))
+}
+
+fn gw_file_manifest(root: [u8; 32]) -> parvault::storage::FileManifest {
+    parvault::storage::FileManifest {
+        version: 2,
+        file_merkle_root: root,
+        file_salt: [0x21; 32],
+        original_file_size: 4096,
+        stripe_size_bytes: 1 << 20,
+        tier: ErasureTier::Consumer,
+        stripes: Vec::new(),
+        witness_peers: Vec::new(),
+    }
+}
+
+/// G-STORE accept: a write token (no `ReadOnly`) stores, and the file reads back.
+#[test]
+fn gstore_write_token_stores() {
+    let (_node, sock) = gw_up("gst-ok", &[], Some(GW_KEY));
+    let data = vec![0x61; 64 * 1024];
+    let m = gw_store_as(&sock, &data, false, Some(fixed(gw_token(Vec::new())))).unwrap();
+    let got = parvault::gateway::GatewayBus::unix_socket(&sock)
+        .fetch_payload_bytes_sync(
+            m.shard_hashes.clone(),
+            Some(gw_manifest_token(m.file_merkle_root)),
+        )
+        .unwrap();
+    assert_eq!(got, data);
+    gate_ran("trust_enforcement::gstore_write_token_stores");
+}
+
+/// G-STORE reject: a `ReadOnly` token cannot store.
+#[test]
+fn gstore_readonly_token_refused() {
+    let (node, sock) = gw_up("gst-ro", &[], Some(GW_KEY));
+    let tok = gw_token(vec![parvault::capabilities::Caveat::ReadOnly]);
+    let err = gw_store_as(&sock, &[0x62; 4096], false, Some(fixed(tok))).unwrap_err();
+    assert!(err.to_string().contains("StorePayload refused"), "{err}");
+    assert_logged(&node, "reject.gateway_macaroon_write_denied");
+    gate_ran("trust_enforcement::gstore_readonly_token_refused");
+}
+
+/// G-STORE (A-16 C3): `StorePayload` has no manifest root yet, so a token scoped by
+/// `AllowedManifest` or `ByteRange` cannot store either.
+#[test]
+fn gstore_scoped_token_refused() {
+    let (node, sock) = gw_up("gst-scope", &[], Some(GW_KEY));
+    for cav in [
+        parvault::capabilities::Caveat::AllowedManifest([0x44; 32]),
+        parvault::capabilities::Caveat::ByteRange {
+            offset: 0,
+            length: 1 << 30,
+        },
+    ] {
+        let tok = gw_token(vec![cav]);
+        assert!(gw_store_as(&sock, &[0x63; 4096], false, Some(fixed(tok))).is_err());
+    }
+    assert_logged(&node, "reject.gateway_macaroon_write_denied");
+    gate_ran("trust_enforcement::gstore_scoped_token_refused");
+}
+
+/// G-STORE reject (A-16 C4): a store with no token is refused for the token, not the seal, so
+/// the token check runs before the seal check and before the descriptor is read.
+#[test]
+fn gstore_missing_token_refused() {
+    let (node, sock) = gw_up("gst-none", &["--require-sealed-memfd"], Some(GW_KEY));
+    let err = gw_store_as(&sock, &[0x64; 4096], false, None).unwrap_err();
+    assert!(
+        err.to_string().contains("reject.gateway_macaroon_missing"),
+        "{err}"
+    );
+    assert_logged(&node, "reject.gateway_macaroon_missing");
+    assert!(
+        !node.log_text().contains("reject.gateway_memfd_unsealed"),
+        "the seal was checked before the token:\n{}",
+        node.log_text()
+    );
+    gate_ran("trust_enforcement::gstore_missing_token_refused");
+}
+
+/// G-REG accept: a write token scoped to the manifest's root registers it.
+#[test]
+fn greg_write_token_registers() {
+    let (_node, sock) = gw_up("greg-ok", &[], Some(GW_KEY));
+    let root = [0x71; 32];
+    let tok = gw_token(vec![parvault::capabilities::Caveat::AllowedManifest(root)]);
+    let eph = gw_client(&sock, Some(tok))
+        .register_manifest(gw_file_manifest(root))
+        .unwrap();
+    assert_eq!(eph.file_merkle_root, root);
+    gate_ran("trust_enforcement::greg_write_token_registers");
+}
+
+/// G-REG reject: a `ReadOnly` token cannot register a manifest.
+#[test]
+fn greg_readonly_token_refused() {
+    let (node, sock) = gw_up("greg-ro", &[], Some(GW_KEY));
+    let root = [0x72; 32];
+    let tok = gw_token(vec![
+        parvault::capabilities::Caveat::ReadOnly,
+        parvault::capabilities::Caveat::AllowedManifest(root),
+    ]);
+    let err = gw_client(&sock, Some(tok))
+        .register_manifest(gw_file_manifest(root))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("RegisterManifest refused"),
+        "{err}"
+    );
+    assert_logged(&node, "reject.gateway_macaroon_write_denied");
+    gate_ran("trust_enforcement::greg_readonly_token_refused");
+}
+
+/// G-HEALTH accept: `QueryHealthStatusAuthed` with a `ReadOnly` token is served, and
+/// `parvault gateway health` (auto-minting from the data directory) prints it.
+#[test]
+fn ghealth_token_served() {
+    let (node, sock) = gw_up("gh-ok", &[], Some(GW_KEY));
+    let tok = gw_token(vec![parvault::capabilities::Caveat::ReadOnly]);
+    let (_iops, _peers, sla) = gw_client(&sock, Some(tok)).query_health_sync().unwrap();
+    assert!(sla > 0.0);
+    let out = common::output_within_deadline(
+        Command::new(env!("CARGO_BIN_EXE_parvault"))
+            .arg("--data-dir")
+            .arg(&node.dir)
+            .args(["gateway", "--socket"])
+            .arg(&sock)
+            .arg("health"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("por_sla_score"));
+    gate_ran("trust_enforcement::ghealth_token_served");
+}
+
+/// G-HEALTH reject: the tokenless `QueryHealthStatus` (index 4) and an authed frame with no
+/// token are both refused.
+#[test]
+fn ghealth_missing_token_refused() {
+    let (node, sock) = gw_up("gh-none", &[], Some(GW_KEY));
+    let client = gw_client(&sock, None);
+    let err = client.query_health_sync().unwrap_err();
+    assert!(
+        err.to_string().contains("QueryHealthStatus refused"),
+        "{err}"
+    );
+    let resp = client
+        .send_request_sync(&parvault::gateway::IpcCommand::QueryHealthStatus, None)
+        .unwrap();
+    assert!(
+        matches!(&resp, parvault::gateway::IpcResponse::Error { message } if message.contains("reject.gateway_macaroon_missing")),
+        "{resp:?}"
+    );
+    assert_logged(&node, "reject.gateway_macaroon_missing");
+    gate_ran("trust_enforcement::ghealth_missing_token_refused");
+}
+
+/// G-NOKEY reject: no root key, no service. The shipped binary has no keyless mode (`gateway
+/// serve` creates `macaroon_root.key`); a library gateway built without one refuses
+/// `FetchRange` and `FetchPayload` even with a token.
+#[test]
+fn gfetch_no_root_key_refused() {
+    use parvault::gateway::GatewayIpcServer;
+    // The binary: a gateway started with no key file creates one (mode 0600).
+    let (root, dir, reg, log) = prepare("gnokey-bin");
+    let sock_bin = dir.join("gw.sock");
+    let child = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .arg("--data-dir")
+        .arg(&dir)
+        .args(["gateway", "--socket"])
+        .arg(&sock_bin)
+        .arg("serve")
+        .stdout(Stdio::from(std::fs::File::create(&log).unwrap()))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let node = Node {
+        child,
+        dir: dir.clone(),
+        log,
+        addr: String::new(),
+        _root: root,
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !sock_bin.exists() {
+        assert!(Instant::now() < deadline, "no socket:\n{}", node.log_text());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(dir.join("macaroon_root.key")).expect("no root key created");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+    drop(node);
+
+    // A library gateway without a key: real socket, real frames.
+    let lib = temp_root("gnokey-lib");
+    let sock = lib.path().join("gw.sock");
+    let store = parvault::storage::BlockStore::new(
+        lib.path().join("store"),
+        parvault::storage::QuotaManager::new(64 << 20, 16 << 20),
+    )
+    .unwrap();
+    let mut srv = GatewayIpcServer::new(&sock, store, MasterKey::generate())
+        .spawn()
+        .unwrap();
+    let client = gw_client(&sock, Some(gw_token(Vec::new())));
+    let eph = parvault::gateway::ipc::EphemeralShardManifest {
+        file_merkle_root: [0x73; 32],
+        shard_hashes: vec![[0x74; 32]],
+        total_size: 4096,
+        stripe_size_bytes: 1 << 20,
+    };
+    let range = client.fetch_range_bytes(&eph, 0, 16, None).unwrap_err();
+    assert!(
+        range
+            .to_string()
+            .contains("reject.gateway_macaroon_no_root_key"),
+        "{range}"
+    );
+    let payload = client
+        .fetch_payload_bytes(eph.shard_hashes.clone(), None)
+        .unwrap_err();
+    assert!(
+        payload
+            .to_string()
+            .contains("reject.gateway_macaroon_no_root_key"),
+        "{payload}"
+    );
+    let health = client.query_health_sync().unwrap_err();
+    assert!(
+        health
+            .to_string()
+            .contains("reject.gateway_macaroon_no_root_key"),
+        "{health}"
+    );
+    srv.shutdown();
+    gate_ran("trust_enforcement::gfetch_no_root_key_refused");
 }

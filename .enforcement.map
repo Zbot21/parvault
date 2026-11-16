@@ -119,7 +119,13 @@ tla-mutant TM-GPB-STATUS   spec=specs/ParVaultGatewayPluginBus.tla inv=StatusOnl
 tla-mutant TM-GPB-FETCHPAY spec=specs/ParVaultGatewayPluginBus.tla inv=NoReadWithoutCapability patch=specs/mutants/ParVaultGatewayPluginBus-fetch-payload-macaroon.patch
 tla-mutant TM-GPB-SCOPE    spec=specs/ParVaultGatewayPluginBus.tla inv=NoReadWithoutCapability patch=specs/mutants/ParVaultGatewayPluginBus-macaroon-scope.patch
 tla-mutant TM-GPB-STATUSVER spec=specs/ParVaultGatewayPluginBus.tla inv=StatusOnlyWithIssuedToken patch=specs/mutants/ParVaultGatewayPluginBus-status-verifier.patch
-waive TM-GPB-W-TYPE inv=specs/ParVaultGatewayPluginBus.tla::TypeOK reason=type invariant, not a security property, with no guard to remove; it types conns, lastRead and lastStatus and omits lastUnauth and stored, whose shapes are fixed by the actions that write them
+# B-16 (L-86): store, register and health carry a token; no root key, no service.
+tla-mutant TM-GPB-STORE    spec=specs/ParVaultGatewayPluginBus.tla inv=WriteOnlyWithWriteToken patch=specs/mutants/ParVaultGatewayPluginBus-store-macaroon.patch
+tla-mutant TM-GPB-REG      spec=specs/ParVaultGatewayPluginBus.tla inv=WriteOnlyWithWriteToken patch=specs/mutants/ParVaultGatewayPluginBus-register-macaroon.patch
+tla-mutant TM-GPB-WRITE    spec=specs/ParVaultGatewayPluginBus.tla inv=WriteOnlyWithWriteToken patch=specs/mutants/ParVaultGatewayPluginBus-macaroon-write.patch
+tla-mutant TM-GPB-HEALTH   spec=specs/ParVaultGatewayPluginBus.tla inv=HealthOnlyWithIssuedToken patch=specs/mutants/ParVaultGatewayPluginBus-health-macaroon.patch
+tla-mutant TM-GPB-NOKEY    spec=specs/ParVaultGatewayPluginBus.tla inv=NoServiceWithoutRootKey patch=specs/mutants/ParVaultGatewayPluginBus-macaroon-nokey.patch
+waive TM-GPB-W-TYPE inv=specs/ParVaultGatewayPluginBus.tla::TypeOK reason=type invariant, not a security property, with no guard to remove; it types conns, lastRead and lastStatus and omits lastWrite, lastHealth and stored, whose shapes are fixed by the actions that write them
 reach      TR-UID-ALLOWLIST sym=src/gateway/engine.rs::gateway_peer_uid_decision from=src/gateway/server.rs::spawn
 reach      TR-MACAROON-FRAME sym=src/gateway/engine.rs::gateway_macaroon_decision from=src/gateway/server.rs::execute_engine_command
 reach      TR-MACAROON-UID-CAVEAT sym=src/capabilities.rs::evaluate_caveats from=src/gateway/server.rs::execute_engine_command
@@ -136,6 +142,10 @@ reach      P-01      sym=src/network/wot.rs::verify_and_admit_public_ticket_deci
 kani       P-01      sym=src/network/wot.rs::is_peer_trust_decision harness=proof_peer_trust_never_quarantined cover=quarantined peer refused
 kani       P-01      sym=src/network/wot.rs::verify_and_admit_chain_shape_decision harness=proof_chain_shape_bounded_and_rooted cover=too deep or empty refused
 kani       P-01      sym=src/network/wot.rs::verify_and_admit_public_ticket_decision harness=proof_public_ticket_admission cover=revoked ticket refused
+# L-16 S3: the manifest variant gate. The claim pair runs per manifest (manifests/test-restricted.enforcement.map);
+# the shared Kani harness runs once here (G-1 ruling 6).
+kani       MAN-VARIANT sym=src/manifest/mod.rs::manifest_variant_decision harness=proof_manifest_variant_decision cover=disabled variant refused
+reach      MAN-VARIANT sym=src/manifest/mod.rs::manifest_variant_decision from=src/network/wire_handler.rs::handle_mesh_wire_request
 waive      P-01      sym=src/network/wot.rs::is_peer_trusted reason=stateful wrapper over is_peer_trust_decision (kani proof_peer_trust_never_quarantined); registry HashMaps are outside CBMC
 waive      P-01      sym=src/network/wot.rs::is_peer_quarantined reason=set lookup with no decision; its use in trust is proven by proof_peer_trust_never_quarantined
 waive      P-01      sym=src/network/wot.rs::verify_and_admit_chain reason=stateful wrapper over verify_and_admit_chain_shape_decision (kani proof_chain_shape_bounded_and_rooted) and chain_admission_decision; Ed25519 hop signatures are outside CBMC
@@ -279,6 +289,15 @@ kani       F-43      sym=src/vfs.rs::webdav_auth_decision harness=proof_webdav_a
 # --- D-ADR (2c): gateway enforcement pairs ---
 claim      G-MAC     sym=src/gateway/engine.rs::gateway_macaroon_decision accept=trust_enforcement::gmac_frame_inside_caveat_served reject=trust_enforcement::gmac_frame_outside_caveat_refused code=reject.gateway_macaroon_caveat bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-28-stateless-macaroon-capability-attenuation.md
 claim      G-PAY     sym=src/gateway/engine.rs::gateway_macaroon_decision accept=trust_enforcement::gpay_in_scope_token_fetches_file reject=trust_enforcement::gpay_other_manifest_token_refused code=reject.gateway_macaroon_caveat bin=parvault ref=docs/security/TRUST_FINDINGS.md
+# B-16 (L-86, A-16): every gated gateway command carries a token; a token without ReadOnly is a write token.
+claim      G-STORE   sym=src/gateway/engine.rs::gateway_macaroon_decision accept=trust_enforcement::gstore_write_token_stores reject=trust_enforcement::gstore_readonly_token_refused code=reject.gateway_macaroon_write_denied bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=IpcCommand::StorePayload
+claim      G-STORE-SCOPE sym=src/gateway/engine.rs::gateway_macaroon_decision accept=trust_enforcement::gstore_write_token_stores reject=trust_enforcement::gstore_scoped_token_refused code=reject.gateway_macaroon_write_denied bin=parvault ref=docs/security/TRUST_FINDINGS.md
+claim      G-STORE-MISSING sym=src/gateway/engine.rs::gateway_macaroon_decision accept=trust_enforcement::gstore_write_token_stores reject=trust_enforcement::gstore_missing_token_refused code=reject.gateway_macaroon_missing bin=parvault ref=docs/security/TRUST_FINDINGS.md
+claim      G-REG     sym=src/gateway/engine.rs::gateway_macaroon_decision accept=trust_enforcement::greg_write_token_registers reject=trust_enforcement::greg_readonly_token_refused code=reject.gateway_macaroon_write_denied bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=IpcCommand::RegisterManifest
+claim      G-HEALTH  sym=src/gateway/engine.rs::gateway_macaroon_decision accept=trust_enforcement::ghealth_token_served reject=trust_enforcement::ghealth_missing_token_refused code=reject.gateway_macaroon_missing bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=IpcCommand::QueryHealthStatus,IpcCommand::QueryHealthStatusAuthed
+claim      G-NOKEY   sym=src/gateway/engine.rs::gateway_macaroon_decision accept=trust_enforcement::gpay_in_scope_token_fetches_file reject=trust_enforcement::gfetch_no_root_key_refused code=reject.gateway_macaroon_no_root_key bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=IpcCommand::FetchRange,IpcCommand::FetchPayload
+kani       G-NOKEY   sym=src/gateway/engine.rs::gateway_macaroon_decision harness=proof_gateway_macaroon_decision cover=no root key refused
+kani       G-STORE   sym=src/capabilities.rs::permits_write harness=proof_readonly_refuses_write_and_write_permit cover=read-only token cannot write
 claim      STATUS-IPC sym=src/http_edge.rs::status_auth_decision accept=trust_enforcement::status_ipc_readonly_token_served reject=trust_enforcement::status_ipc_missing_token_refused code=reject.status_token_missing bin=parvault ref=docs/security/TRUST_FINDINGS.md
 claim      STATUS-AUTH sym=src/http_edge.rs::status_auth_decision accept=trust_enforcement::status_http_readonly_bearer_served reject=trust_enforcement::status_http_no_token_unauthorized code=reject.status_token_missing bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-21-router-soc-1mib-streaming-profile.md
 claim      STATUS-HOST sym=src/http_edge.rs::status_auth_decision accept=trust_enforcement::status_http_ip_literal_host_served reject=trust_enforcement::status_http_dns_host_refused code=reject.status_host_mismatch bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-21-router-soc-1mib-streaming-profile.md

@@ -1,0 +1,12 @@
+diff --git a/specs/ParVaultGatewayPluginBus.tla b/specs/ParVaultGatewayPluginBus.tla
+--- a/specs/ParVaultGatewayPluginBus.tla
++++ b/specs/ParVaultGatewayPluginBus.tla
+@@ -172,7 +172,7 @@
+ \* (index 4) is always refused: it is QueryHealthStatusAuthed presenting no token.
+ RegisterManifest(u, t) ==
+     /\ u \in conns
+-    /\ WriteAuthorized(t, u)   \* @guard register-macaroon sym=src/gateway/engine.rs::gateway_macaroon_decision
++    /\ TRUE   \* @guard register-macaroon sym=src/gateway/engine.rs::gateway_macaroon_decision
+     /\ lastWrite' = <<u, t>>
+     /\ UNCHANGED <<allowlistSet, rootKeySet, requireSealed, snapshotPublished, conns,
+                    lastRead, lastStatus, lastHealth, stored>>

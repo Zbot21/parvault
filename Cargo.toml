@@ -40,7 +40,7 @@ name = "parvault"
 path = "src/lib.rs"
 
 [features]
-default = ["daemon-runtime", "vfs", "status-ui"]
+default = ["daemon-runtime", "vfs", "status-ui", "manifest-household-ring-v1"]
 # The full daemon: tokio, libp2p and everything that drives the ring (item 3, L-48).
 daemon-runtime = ["ipc-client", "status-ui", "dep:tokio", "dep:libp2p", "dep:async-trait", "dep:either"]
 # The gateway socket client, wire types and client-side crypto: what a plugin links. No tokio or libp2p.
@@ -52,6 +52,12 @@ status-ui = ["ipc-client"]
 # Not in `default`; a release build with it is a compile error, and shipped artifacts are
 # checked for it (scripts/check_no_insecure_metrics.sh).
 lab-insecure-metrics = ["daemon-runtime", "dep:if-addrs"]
+# The compiled-in manifest (L-16 seam): exactly one, and only with daemon-runtime (G-1 C1). The
+# socket-only binaries (fuse, sync, status) build without daemon-runtime and carry none.
+# `--all-features` enables two and fails by design (G-1 C3).
+manifest-household-ring-v1 = []
+# CI only, never shipped (scripts/build_bins.sh refuses it): serves no credential arm.
+manifest-test-restricted = []
 
 [package.metadata.kani]
 flags = { lib = true }

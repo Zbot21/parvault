@@ -5,7 +5,7 @@
 //! bounded `PinnedRingBudget` admission/eviction, and 40-lane single-wave hedged parallel `libp2p`
 //! TCP + Noise XX shard distribution & reconstruction (`TTFB < 60 ms` under `15ms / 2% loss`).
 //!
-//! Formal model: `specs/ParVaultGatewayPluginBus.tla` (guards `uid-allowlist`, `macaroon-frame`, `memfd-seal`, `fetch-payload-macaroon`).
+//! Formal model: `specs/ParVaultGatewayPluginBus.tla` (guards `uid-allowlist`, `macaroon-nokey`, `macaroon-frame`, `macaroon-write`, `memfd-seal`, `fetch-payload-macaroon`, `store-macaroon`, `register-macaroon`, `health-macaroon`).
 
 use crate::config::ErasureTier;
 
@@ -124,32 +124,56 @@ impl Default for GatewayConfig {
     }
 }
 
-/// ADR-28 (D-ADR): what the per-frame macaroon decision needs to know about one gateway read.
+/// ADR-28 (D-ADR): what the per-frame macaroon decision needs to know about one gateway command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GatewayMacaroonFacts {
-    /// The gateway holds a macaroon root key (every read must then carry a valid token).
+    /// The gateway holds a macaroon root key. Without one nothing is served (B-16, L-86).
     pub root_key_set: bool,
     /// The frame carries a macaroon.
     pub token_present: bool,
     /// Its HMAC chain is valid under the root key (only meaningful with a root key).
     pub tag_valid: bool,
+    /// The command writes (`StorePayload`, `RegisterManifest`).
+    pub is_write: bool,
+    /// The token may write here: it has no `ReadOnly` caveat (absence of `ReadOnly` means write,
+    /// A-16 C3), and for `StorePayload`, which has no manifest root yet, no `AllowedManifest` or
+    /// `ByteRange` caveat.
+    pub write_permitted: bool,
     /// Every caveat allows this frame's manifest, offset, length, time and peer UID.
     pub caveats_allow: bool,
 }
 
-/// ADR-28: a gateway read frame is served only if, with a root key, it carries a valid token, and
-/// any token it carries allows this frame (attenuation is enforced per frame).
+/// ADR-28, B-16: a gated gateway command is served only by a gateway with a root key, on a token
+/// with a valid tag that may write when the command writes and whose caveats allow the frame.
+/// Refusal order: no root key, missing, invalid, write denied, caveat.
 pub fn gateway_macaroon_decision(facts: &GatewayMacaroonFacts) -> Result<(), &'static str> {
-    if facts.root_key_set && !facts.token_present {
+    if !facts.root_key_set {
+        return Err("reject.gateway_macaroon_no_root_key");
+    }
+    if !facts.token_present {
         return Err("reject.gateway_macaroon_missing");
     }
-    if facts.root_key_set && !facts.tag_valid {
+    if !facts.tag_valid {
         return Err("reject.gateway_macaroon_invalid");
     }
-    if facts.token_present && !facts.caveats_allow {
+    if facts.is_write && !facts.write_permitted {
+        return Err("reject.gateway_macaroon_write_denied");
+    }
+    if !facts.caveats_allow {
         return Err("reject.gateway_macaroon_caveat");
     }
     Ok(())
+}
+
+/// What a gated gateway command asks of its token (B-16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatedFrame {
+    /// `FetchRange`, `FetchPayload`, `QueryHealthStatusAuthed`.
+    Read,
+    /// `StorePayload`: a write with no manifest root yet.
+    Store,
+    /// `RegisterManifest`: a write scoped to the manifest's root.
+    Register,
 }
 
 /// ADR-32: under `--require-sealed-memfd`, an ingest memfd must carry
@@ -507,6 +531,49 @@ mod unix_engine {
             gateway_peer_uid_decision(guard.as_deref(), peer_uid)
         }
 
+        /// B-16 (ADR-28): the macaroon check of one gated command, before any read of a passed
+        /// descriptor, the block store or the RAM manifest index. `frame` says whether it writes;
+        /// the caveats are evaluated against `manifest_root`, `[offset, offset + length)`, now and
+        /// the socket peer's UID. Logs the refusal code.
+        pub fn authorize_frame(
+            &self,
+            macaroon: Option<&CapabilityMacaroon>,
+            frame: GatedFrame,
+            manifest_root: [u8; 32],
+            offset: u64,
+            length: u64,
+            peer_uid: Option<u32>,
+        ) -> Result<(), &'static str> {
+            let key = self.macaroon_root_key.read().ok().and_then(|g| *g);
+            let is_write = frame != GatedFrame::Read;
+            let ctx = AccessRequestContext {
+                manifest_root,
+                offset,
+                length,
+                is_write,
+                now_unix_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+                peer_uid,
+            };
+            let facts = crate::gateway::engine::GatewayMacaroonFacts {
+                root_key_set: key.is_some(),
+                token_present: macaroon.is_some(),
+                tag_valid: match (key.as_ref(), macaroon) {
+                    (Some(k), Some(t)) => t.tag_valid(k),
+                    _ => false,
+                },
+                is_write,
+                write_permitted: macaroon
+                    .is_some_and(|t| t.permits_write(frame == GatedFrame::Store)),
+                caveats_allow: macaroon.is_some_and(|t| t.evaluate_caveats(&ctx)),
+            };
+            crate::gateway::engine::gateway_macaroon_decision(&facts).inspect_err(|code| {
+                tracing::warn!(code, ?frame, ?peer_uid, "refused a gateway command");
+            })
+        }
+
         /// Evaluates whether `peer_uid` satisfies any active `strict_allowed_peer_uids` policy.
         pub fn is_peer_uid_allowed(&self, peer_uid: Option<u32>) -> bool {
             self.peer_uid_decision(peer_uid).is_ok()
@@ -834,31 +901,30 @@ mod unix_engine {
                     peer_uid
                 );
             }
+            // B-16: no root key or no token is refused before the RAM index is consulted, so a
+            // refused caller learns nothing about which shard ids exist.
+            let key_set = self
+                .macaroon_root_key
+                .read()
+                .ok()
+                .and_then(|g| *g)
+                .is_some();
+            if !key_set || macaroon.is_none() {
+                if let Err(code) =
+                    self.authorize_frame(macaroon, GatedFrame::Read, [0u8; 32], 0, 0, peer_uid)
+                {
+                    anyhow::bail!("Macaroon capability rejected: {code}");
+                }
+            }
             let fm = self.resolve_manifest_by_shard_ids(ephemeral_shard_ids)?;
-            let required_key = self.macaroon_root_key.read().ok().and_then(|guard| *guard);
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            let ctx = AccessRequestContext {
-                manifest_root: fm.file_merkle_root,
-                offset: 0,
-                length: fm.original_file_size,
-                is_write: false,
-                now_unix_ms: now_ms,
+            if let Err(code) = self.authorize_frame(
+                macaroon,
+                GatedFrame::Read,
+                fm.file_merkle_root,
+                0,
+                fm.original_file_size,
                 peer_uid,
-            };
-            let facts = crate::gateway::engine::GatewayMacaroonFacts {
-                root_key_set: required_key.is_some(),
-                token_present: macaroon.is_some(),
-                tag_valid: match (required_key.as_ref(), macaroon) {
-                    (Some(key), Some(token)) => token.tag_valid(key),
-                    _ => false,
-                },
-                caveats_allow: macaroon.is_some_and(|t| t.evaluate_caveats(&ctx)),
-            };
-            if let Err(code) = crate::gateway::engine::gateway_macaroon_decision(&facts) {
-                tracing::warn!(code, "refused a gateway full-file fetch");
+            ) {
                 anyhow::bail!("Macaroon capability rejected: {code}");
             }
             self.stream_manifest_range_to_fd(&fm, 0, fm.original_file_size, output_fd)
@@ -904,32 +970,15 @@ mod unix_engine {
                     peer_uid
                 );
             }
-            let required_key = self.macaroon_root_key.read().ok().and_then(|guard| *guard);
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            let ctx = AccessRequestContext {
-                manifest_root: manifest.file_merkle_root,
-                offset,
-                length: len,
-                is_write: false,
-                now_unix_ms: now_ms,
-                peer_uid,
-            };
-
             // ADR-28: checked per frame, before any manifest or block-store lookup.
-            let facts = crate::gateway::engine::GatewayMacaroonFacts {
-                root_key_set: required_key.is_some(),
-                token_present: macaroon.is_some(),
-                tag_valid: match (required_key.as_ref(), macaroon) {
-                    (Some(key), Some(token)) => token.tag_valid(key),
-                    _ => false,
-                },
-                caveats_allow: macaroon.is_some_and(|t| t.evaluate_caveats(&ctx)),
-            };
-            if let Err(code) = crate::gateway::engine::gateway_macaroon_decision(&facts) {
-                tracing::warn!(code, "refused a gateway read frame");
+            if let Err(code) = self.authorize_frame(
+                macaroon,
+                GatedFrame::Read,
+                manifest.file_merkle_root,
+                offset,
+                len,
+                peer_uid,
+            ) {
                 anyhow::bail!("Macaroon capability rejected: {code}");
             }
 

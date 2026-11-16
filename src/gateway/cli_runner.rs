@@ -42,9 +42,14 @@ pub enum TokenAction {
         #[arg(long, value_name = "SECS")]
         ttl_secs: Option<u64>,
 
-        /// Attach `Caveat::ReadOnly` prohibiting write/mutation operations.
-        #[arg(long, default_value_t = false)]
+        /// Accepted for compatibility: tokens are `ReadOnly` unless `--write` (B-16).
+        #[arg(long, default_value_t = false, conflicts_with = "write")]
         read_only: bool,
+
+        /// Mint a write token (no `Caveat::ReadOnly`): it can store and register. Without this
+        /// flag the token is `ReadOnly`, since a token without `ReadOnly` may write (B-16).
+        #[arg(long, default_value_t = false)]
+        write: bool,
 
         /// Bind capability to a specific POSIX client UID verified via kernel `SO_PEERCRED`.
         #[arg(long, value_name = "UID")]
@@ -410,9 +415,11 @@ pub fn execute_token_cli(action: TokenAction, data_dir: &Path) -> anyhow::Result
             byte_range,
             ttl_secs,
             read_only,
+            write,
             allow_peer_uid,
             json,
         } => {
+            let _ = read_only; // the default since B-16
             let root_key = load_or_create_macaroon_root_key(data_dir, macaroon_key_hex.as_deref())?;
             let nonce_id: [u8; 32] = OsRng.gen();
             let issuer_fp = derive_key_id_bytes(&key_id);
@@ -420,7 +427,7 @@ pub fn execute_token_cli(action: TokenAction, data_dir: &Path) -> anyhow::Result
                 manifest_hex.as_deref(),
                 byte_range.as_deref(),
                 ttl_secs,
-                read_only,
+                !write,
                 allow_peer_uid,
             )?;
             let mac = CapabilityMacaroon::mint(&root_key, nonce_id, issuer_fp, caveats)?;
@@ -580,6 +587,38 @@ pub fn execute_token_cli(action: TokenAction, data_dir: &Path) -> anyhow::Result
     }
 }
 
+/// The token a `parvault gateway` client command presents (B-16): minted from
+/// `--macaroon-root-key-hex` when given, else auto-minted from `<data_dir>/macaroon_root.key`.
+/// Minted once here so a missing or unreadable key fails before any request.
+fn gateway_client_token(
+    data_dir: &Path,
+    root_key_hex: Option<&str>,
+    write: bool,
+) -> anyhow::Result<std::sync::Arc<crate::capabilities::GatewayTokenSource>> {
+    use crate::capabilities::{GatewayTokenSource, AUTO_MINT_TTL_MS};
+    let src = match root_key_hex.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(hex_key) => {
+            let key = parse_hex_32(hex_key, "--macaroon-root-key-hex")?;
+            let mut caveats = vec![
+                Caveat::ExpiresAtUnixMs(now_unix_ms().saturating_add(AUTO_MINT_TTL_MS)),
+                Caveat::AllowedPeerUid(crate::os_sys::geteuid()),
+            ];
+            if !write {
+                caveats.push(Caveat::ReadOnly);
+            }
+            GatewayTokenSource::Fixed(CapabilityMacaroon::mint(
+                &key,
+                OsRng.gen(),
+                derive_key_id_bytes("gateway-cli"),
+                caveats,
+            )?)
+        }
+        None => GatewayTokenSource::auto_mint(data_dir, write),
+    };
+    src.current().map_err(|e| anyhow::anyhow!(e))?;
+    Ok(std::sync::Arc::new(src))
+}
+
 fn load_or_init_gateway_master_key(
     data_dir: &Path,
     passphrase: Option<&str>,
@@ -593,6 +632,7 @@ fn load_or_init_gateway_master_key(
 #[cfg(unix)]
 async fn run_ipc_roundtrip_probe(
     socket_path: &Path,
+    token: std::sync::Arc<crate::capabilities::GatewayTokenSource>,
     size_mib: usize,
     net_iface: &str,
 ) -> anyhow::Result<()> {
@@ -605,7 +645,7 @@ async fn run_ipc_roundtrip_probe(
     use std::time::Instant;
 
     let total_bytes = (size_mib as u64) * 1024 * 1024;
-    let client = GatewayIpcClient::new(socket_path);
+    let client = GatewayIpcClient::new(socket_path).with_token_source(Some(token));
     let (rx_before, tx_before) = read_net_dev_bytes(net_iface).unwrap_or((0, 0));
 
     let in_mfd = create_memfd_sized("parvault-gate-in", total_bytes)?;
@@ -749,7 +789,12 @@ pub async fn execute_gateway_cli(
                         "`parvault gateway health` queries an active Unix socket and cannot be used with --no-socket"
                     );
                 }
-                let client = GatewayIpcClient::new(&opts.socket);
+                let token = gateway_client_token(
+                    &node_cfg.data_dir,
+                    opts.macaroon_root_key_hex.as_deref(),
+                    false,
+                )?;
+                let client = GatewayIpcClient::new(&opts.socket).with_token_source(Some(token));
                 let (iops, peer_count, por_sla_score) = client.query_health().await?;
                 println!(
                     "{}",
@@ -770,7 +815,12 @@ pub async fn execute_gateway_cli(
                         "`parvault gateway ipc-roundtrip` benchmarks an active Unix socket and cannot be used with --no-socket"
                     );
                 }
-                run_ipc_roundtrip_probe(&opts.socket, size_mib, &net_iface).await?;
+                let token = gateway_client_token(
+                    &node_cfg.data_dir,
+                    opts.macaroon_root_key_hex.as_deref(),
+                    true,
+                )?;
+                run_ipc_roundtrip_probe(&opts.socket, token, size_mib, &net_iface).await?;
             }
             GatewayAction::SelfTest => {
                 struct TempDirGuard(PathBuf);
@@ -792,13 +842,29 @@ pub async fn execute_gateway_cli(
                 let quota = QuotaManager::new(512 * 1024 * 1024, 64 * 1024 * 1024);
                 let store = BlockStore::new(&store_dir, quota)?;
                 let mk = MasterKey::generate();
+                // B-16: the self-test gateway has a root key like every other; the client
+                // presents a write token bound to this UID.
+                let mut root_key = [0u8; 32];
+                while root_key == [0u8; 32] {
+                    OsRng.fill_bytes(&mut root_key);
+                }
+                let euid = crate::os_sys::geteuid();
+                let token = CapabilityMacaroon::mint(
+                    &root_key,
+                    OsRng.gen(),
+                    derive_key_id_bytes("gateway-self-test"),
+                    vec![Caveat::AllowedPeerUid(euid)],
+                )?;
                 let mut srv = GatewayIpcServer::new(&sock, store, mk)
+                    .with_macaroon_root_key(root_key)
                     .with_profile(HardwareProfile::RouterSoc)
                     .with_require_sealed_ingest_memfd(true)
                     .with_strict_allowed_peer_uids(vec![crate::os_sys::geteuid()])
                     .spawn()?;
 
-                let bus = GatewayBus::unix_socket(&sock);
+                let bus = GatewayBus::unix_socket(&sock).with_token_source(Some(
+                    std::sync::Arc::new(crate::capabilities::GatewayTokenSource::Fixed(token)),
+                ));
                 let in_mfd = create_memfd("selftest-in")?;
                 let in_file = std::fs::File::from(in_mfd);
                 let sample = vec![0x5Au8; 2 * 1024 * 1024];
@@ -856,10 +922,11 @@ pub async fn execute_gateway_cli(
                     &node_cfg.data_dir,
                     node_cfg.device_sealing_passphrase.as_deref(),
                 )?;
-                let macaroon_root_key = resolve_optional_macaroon_root_key(
+                // B-16: no root key, no service; serve always has one.
+                let macaroon_root_key = Some(load_or_create_macaroon_root_key(
                     &node_cfg.data_dir,
                     opts.macaroon_root_key_hex.as_deref(),
-                )?;
+                )?);
                 let peers = node_cfg.effective_peers(cli_peers);
                 let stripe_size_bytes = opts.stripe_bytes.unwrap_or_else(|| {
                     if peers.is_empty() {

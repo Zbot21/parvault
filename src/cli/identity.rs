@@ -25,6 +25,10 @@ pub(crate) async fn status(env: CliEnv, command: Commands) -> anyhow::Result<()>
     println!("Hardware Profile      : {}", cfg.hardware_profile);
     println!("Trust Pool Mode       : {}", trust_mode);
     println!(
+        "Manifest              : {}",
+        parvault::manifest::ACTIVE_NAME
+    );
+    println!(
         "Primary Transport     : TCP + Noise XX + Yamux ({})",
         cfg.listen_tcp
     );

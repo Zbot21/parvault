@@ -46,6 +46,13 @@ struct FuseCli {
     #[arg(long, value_name = "PATH", global = true)]
     macaroon_file: Option<PathBuf>,
 
+    /// The daemon's data directory. Without `--macaroon` or `--macaroon-file`, a 15-minute token
+    /// for this UID is minted from its `0600` `macaroon_root.key`, and re-minted before it
+    /// expires (read-only, or write when a directory is ingested); the daemon refuses every
+    /// request without a token (B-16).
+    #[arg(long, default_value = ".parvault-data", global = true)]
+    data_dir: PathBuf,
+
     #[command(subcommand)]
     command: FuseCommand,
 }
@@ -112,14 +119,25 @@ fn main() -> anyhow::Result<()> {
         use std::os::fd::AsRawFd;
 
         let cache_bytes = cli.cache_mib.saturating_mul(1024 * 1024);
+        // B-16: the gateway token, from --macaroon(-file) or auto-minted for this UID.
+        let bus = |write: bool| {
+            let src = parvault::capabilities::GatewayTokenSource::from_args_or_auto(
+                default_macaroon.clone(),
+                &cli.data_dir,
+                write,
+            );
+            parvault::gateway::ipc::GatewayBus::unix_socket(&cli.socket)
+                .with_token_source(Some(std::sync::Arc::new(src)))
+        };
 
         match cli.command {
             FuseCommand::MountFd { fuse_fd, seed_dir } => {
                 if fuse_fd < 0 {
                     anyhow::bail!("invalid --fuse-fd {fuse_fd}");
                 }
-                let vfs = VirtualVaultFs::new(&cli.socket, &cli.cache_dir, cache_bytes)?
-                    .with_default_macaroon(default_macaroon);
+                let vfs =
+                    VirtualVaultFs::with_bus(bus(seed_dir.is_some()), &cli.cache_dir, cache_bytes)?
+                        .with_default_macaroon(default_macaroon.clone());
                 if let Some(dir) = seed_dir {
                     let count = vfs.ingest_local_directory(&dir)?;
                     eprintln!(
@@ -136,8 +154,9 @@ fn main() -> anyhow::Result<()> {
                 let pinned = default_macaroon.clone().ok_or_else(|| {
                     anyhow::anyhow!("webdav needs --macaroon: every request must present it or an attenuation of it (F-43)")
                 })?;
-                let vfs = VirtualVaultFs::new(&cli.socket, &cli.cache_dir, cache_bytes)?
-                    .with_default_macaroon(default_macaroon);
+                let vfs =
+                    VirtualVaultFs::with_bus(bus(seed_dir.is_some()), &cli.cache_dir, cache_bytes)?
+                        .with_default_macaroon(default_macaroon.clone());
                 if let Some(dir) = seed_dir {
                     let count = vfs.ingest_local_directory(&dir)?;
                     println!(
@@ -157,8 +176,8 @@ fn main() -> anyhow::Result<()> {
                 handle.wait();
             }
             FuseCommand::Sync { folder } => {
-                let vfs = VirtualVaultFs::new(&cli.socket, &cli.cache_dir, cache_bytes)?
-                    .with_default_macaroon(default_macaroon);
+                let vfs = VirtualVaultFs::with_bus(bus(true), &cli.cache_dir, cache_bytes)?
+                    .with_default_macaroon(default_macaroon.clone());
                 let count = vfs.ingest_local_directory(&folder)?;
                 println!(
                     "[parvault-fuse] synced {count} file(s) from {} over {}",
@@ -185,7 +204,12 @@ fn main() -> anyhow::Result<()> {
                 std::fs::create_dir_all(&tmp_dir)?;
                 let _guard = TempDirGuard(tmp_dir.clone());
 
-                let client = GatewayIpcClient::new(&cli.socket);
+                let write_bus = bus(true);
+                let client = match &write_bus {
+                    parvault::gateway::ipc::GatewayBus::UnixSocket(c) => c.clone(),
+                    #[allow(unreachable_patterns)]
+                    _ => GatewayIpcClient::new(&cli.socket),
+                };
                 let mfd = create_memfd("vfs-selftest")?;
                 let mut f = std::fs::File::from(mfd);
                 let payload: Vec<u8> = (0..(4 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
@@ -205,8 +229,9 @@ fn main() -> anyhow::Result<()> {
                     })?;
 
                 // Cap cache at 2 MiB and read 4 MiB across blocks to verify LRU eviction + <50ms TTFB.
-                let vfs = VirtualVaultFs::new(&cli.socket, tmp_dir.join("cache"), 2 * 1024 * 1024)?
-                    .with_default_macaroon(default_macaroon);
+                let vfs =
+                    VirtualVaultFs::with_bus(write_bus, tmp_dir.join("cache"), 2 * 1024 * 1024)?
+                        .with_default_macaroon(default_macaroon.clone());
                 let ino = vfs.register_lazy_file("/vault/test.bin", manifest, None)?;
                 let (slice, ttfb) =
                     vfs.read_range_with_ttfb(ino, 1024 * 1024 + 17, 2 * 1024 * 1024)?;

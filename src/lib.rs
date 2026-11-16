@@ -29,6 +29,8 @@ pub mod http_edge;
 pub mod insecure_metrics;
 pub mod lab_dial;
 #[cfg(feature = "daemon-runtime")]
+pub mod manifest;
+#[cfg(feature = "daemon-runtime")]
 pub mod network;
 #[cfg(unix)]
 pub mod os_sys;

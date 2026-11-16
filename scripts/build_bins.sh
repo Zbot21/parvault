@@ -18,7 +18,7 @@ done
 [[ ${#BINS[@]} -gt 0 ]] || BINS=(parvault parvault-seed parvault-fuse parvault-sync parvault-status)
 features_for() {
   case "$1" in
-    parvault|parvault-seed|parvault-bench) echo "" ;;                      # default (daemon-runtime, vfs, status-ui)
+    parvault|parvault-seed|parvault-bench) echo "" ;;                      # default (daemon-runtime, vfs, status-ui, manifest-household-ring-v1)
     parvault-fuse) echo "--no-default-features --features vfs" ;;
     parvault-sync) echo "--no-default-features --features ipc-client" ;;
     parvault-status) echo "--no-default-features --features status-ui" ;;
@@ -33,5 +33,10 @@ for bin in "${BINS[@]}"; do
   cargo build --locked --profile "$PROFILE" ${TARGET:+--target "$TARGET"} $feats --bin "$bin"
   dir="$TDIR/${TARGET:+$TARGET/}$( [[ $PROFILE == dev ]] && echo debug || echo "$PROFILE")"
   cp "$dir/$bin" "$OUT/$bin${TARGET:+-$TARGET}"
+  # L-16 (plan 1.3): a release daemon-runtime binary carries the default manifest only.
+  case "$bin" in
+    parvault|parvault-seed|parvault-bench)
+      bash "$(dirname "$0")/check_release_manifest.sh" "$OUT/$bin${TARGET:+-$TARGET}" ;;
+  esac
   echo "built $OUT/$bin${TARGET:+-$TARGET} ($feats)"
 done
