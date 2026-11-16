@@ -164,15 +164,28 @@ mod unix_webdav {
         /// Spawns a background stoppable HTTP `Range` (`206 Partial Content`) + WebDAV
         /// (`OPTIONS` / `PROPFIND`) server returning an RAII [`VfsWebdavServerHandle`]. Every
         /// request must present a token `verifier` accepts (F-43); there is no unauthenticated
-        /// constructor.
+        /// constructor. Plain HTTP: a non-loopback bind is refused (L-81,
+        /// `reject.edge_plain_http_nonloopback`); see [`Self::spawn_webdav_server_served`].
         pub fn spawn_webdav_server(
             &self,
             bind_addr: &str,
             verifier: WebdavVerifier,
         ) -> io::Result<VfsWebdavServerHandle> {
+            self.spawn_webdav_server_served(bind_addr, verifier, EdgeServe::Plain)
+        }
+
+        /// [`Self::spawn_webdav_server`] over `serve` (B-1 P1: TLS, or plain HTTP on loopback or
+        /// with the opt-out). The bind is checked by `EdgeServe::check_bind` before any accept.
+        pub fn spawn_webdav_server_served(
+            &self,
+            bind_addr: &str,
+            verifier: WebdavVerifier,
+            serve: EdgeServe,
+        ) -> io::Result<VfsWebdavServerHandle> {
             let listener = TcpListener::bind(bind_addr)?;
             listener.set_nonblocking(false)?;
             let local_addr = listener.local_addr()?;
+            serve.check_bind(local_addr)?;
             let shutdown_flag = Arc::new(AtomicBool::new(false));
             let shutdown_cl = Arc::clone(&shutdown_flag);
             let vfs = self.clone();
@@ -188,7 +201,7 @@ mod unix_webdav {
                         let Ok(stream) = conn else {
                             continue;
                         };
-                        spawn_webdav_conn(stream, &vfs, &verifier, &slots);
+                        spawn_webdav_conn(stream, &vfs, &verifier, &slots, &serve, local_addr);
                     }
                 })?;
 
@@ -201,19 +214,23 @@ mod unix_webdav {
 
         /// Serves an unprivileged HTTP `Range` (`206 Partial Content`) + WebDAV (`OPTIONS` /
         /// `PROPFIND`) endpoint for locked-down `prplOS` / `RDK-B` LXC containers without
-        /// `/dev/fuse`. Every request must present a token `verifier` accepts (F-43).
+        /// `/dev/fuse`. Every request must present a token `verifier` accepts (F-43). Plain HTTP,
+        /// loopback only (L-81).
         pub fn serve_webdav_blocking(
             &self,
             bind_addr: &str,
             verifier: WebdavVerifier,
         ) -> io::Result<()> {
             let listener = TcpListener::bind(bind_addr)?;
+            let local_addr = listener.local_addr()?;
+            let serve = EdgeServe::Plain;
+            serve.check_bind(local_addr)?;
             let slots = Arc::new(EdgeSlots::new(WEBDAV_MAX_CONNECTIONS));
             for conn in listener.incoming() {
                 let Ok(stream) = conn else {
                     continue;
                 };
-                spawn_webdav_conn(stream, self, &verifier, &slots);
+                spawn_webdav_conn(stream, self, &verifier, &slots, &serve, local_addr);
             }
             Ok(())
         }
@@ -222,9 +239,18 @@ mod unix_webdav {
     /// Most WebDAV connections served at once; more are dropped unanswered (pre-auth bound).
     const WEBDAV_MAX_CONNECTIONS: usize = 64;
     use crate::http_edge::{
-        pipelined_next, read_request_head_after, spawn_edge_conn, EdgeSlots, EdgeStream,
+        edge_host_allowed, keep_alive_next, pipelined_next, read_request_head_until,
+        spawn_edge_conn_served, EdgeServe, EdgeSlots, EdgeStream, EDGE_KEEPALIVE_IDLE,
         EDGE_MAX_REQUESTS_PER_CONN, RESP_403 as WEBDAV_403, RESP_502 as WEBDAV_502, WEBDAV_401,
     };
+    use std::time::Instant;
+
+    /// What a connection knows about its listener: the bound address and, on TLS, the
+    /// certificate's names for the `Host` check (A-TLS-7).
+    struct ListenerCtx {
+        bound: SocketAddr,
+        tls_names: Option<Arc<[String]>>,
+    }
 
     /// Runs one connection on its own thread within the server's slots (shared edge).
     fn spawn_webdav_conn(
@@ -232,11 +258,23 @@ mod unix_webdav {
         vfs: &VirtualVaultFs,
         verifier: &WebdavVerifier,
         slots: &Arc<EdgeSlots>,
+        serve: &EdgeServe,
+        bound: SocketAddr,
     ) {
         let (vfs, verifier) = (vfs.clone(), verifier.clone());
-        spawn_edge_conn(stream, slots, "parvault-vfs-http", move |stream| {
-            let _ = handle_webdav_http_conn(stream, &vfs, &verifier);
-        });
+        let ctx = ListenerCtx {
+            bound,
+            tls_names: serve.is_tls().then(|| Arc::from(serve.san_names())),
+        };
+        spawn_edge_conn_served(
+            stream,
+            slots,
+            "parvault-vfs-http",
+            serve,
+            move |stream, deadline| {
+                let _ = handle_webdav_http_conn(stream, &vfs, &verifier, &ctx, deadline);
+            },
+        );
     }
 
     fn now_unix_ms() -> u64 {
@@ -295,33 +333,49 @@ mod unix_webdav {
 
     /// What a connection does after one request.
     enum Next {
-        /// Serve the next pipelined request, if its bytes are already here (A-TLS-4).
+        /// The request authenticated and was answered in full: the connection may carry another.
         Continue,
-        /// Close: a refusal (401 and 403 close, A-TLS-5), a 502, or a body cut short.
+        /// Close: a refusal (401, 403 and 431 close, A-TLS-5), a 502, or a body cut short.
         Close,
     }
 
-    /// One connection: its first request, then any requests the client pipelined behind it in
-    /// the same reads (A-TLS-4), at most [`EDGE_MAX_REQUESTS_PER_CONN`]. The stream is never
-    /// read again after a response unless bytes of a next request are already buffered, so a
-    /// client that sends one request gets one answer and the close, as before v0.5.6.
+    /// One connection (A-TLS-4, A-TLS-5): its first request before the pre-auth `deadline` (on
+    /// TLS the handshake shares it), then, only while every request authenticates, further
+    /// requests on the same connection (TLS: keep-alive; plain: only already-pipelined ones), each within [`EDGE_KEEPALIVE_IDLE`], at most
+    /// [`EDGE_MAX_REQUESTS_PER_CONN`] in all. A refusal, `Connection: close`, a body without an
+    /// exact length or over the discard cap ends it. Auth runs per request: the connection
+    /// holds no auth state.
     fn handle_webdav_http_conn<S: EdgeStream + ?Sized>(
         stream: &mut S,
         vfs: &VirtualVaultFs,
         verifier: &WebdavVerifier,
+        ctx: &ListenerCtx,
+        first_deadline: Instant,
     ) -> io::Result<()> {
         let mut carry = Vec::new();
+        let mut deadline = first_deadline;
         for _ in 0..EDGE_MAX_REQUESTS_PER_CONN {
-            let Some(head) = read_request_head_after(stream, std::mem::take(&mut carry))? else {
+            let Some(head) = read_request_head_until(stream, std::mem::take(&mut carry), deadline)?
+            else {
                 return Ok(());
             };
-            if let Next::Close = serve_webdav_request(stream, vfs, verifier, &head)? {
+            if let Next::Close = serve_webdav_request(stream, vfs, verifier, ctx, &head)? {
                 return Ok(());
             }
-            match pipelined_next(&head) {
+            // Plain listeners (loopback, the opt-out) keep the T0 rule: only requests already
+            // pipelined behind this one are served. Keep-alive is for TLS, where every new
+            // connection costs a handshake.
+            let next = if ctx.tls_names.is_some() {
+                let body_deadline = Instant::now() + crate::http_edge::EDGE_HEAD_TIMEOUT;
+                keep_alive_next(stream, &head, body_deadline)
+            } else {
+                pipelined_next(&head)
+            };
+            match next {
                 Some(next) => carry = next,
                 None => return Ok(()),
             }
+            deadline = Instant::now() + EDGE_KEEPALIVE_IDLE;
         }
         Ok(())
     }
@@ -330,6 +384,7 @@ mod unix_webdav {
         stream: &mut S,
         vfs: &VirtualVaultFs,
         verifier: &WebdavVerifier,
+        ctx: &ListenerCtx,
         head: &[u8],
     ) -> io::Result<Next> {
         use crate::capabilities::Caveat;
@@ -344,12 +399,15 @@ mod unix_webdav {
 
         let mut range_header: Option<(u64, Option<u64>)> = None;
         let mut authorization: Option<&str> = None;
+        let mut host: Option<&str> = None;
         for hdr in lines {
             if hdr.is_empty() {
                 break;
             }
             if let Some((k, v)) = hdr.split_once(':') {
-                if k.eq_ignore_ascii_case("authorization") {
+                if k.eq_ignore_ascii_case("host") {
+                    host = Some(v.trim());
+                } else if k.eq_ignore_ascii_case("authorization") {
                     authorization = Some(v);
                 } else if k.eq_ignore_ascii_case("range") {
                     if let Some(spec) = v.trim().strip_prefix("bytes=") {
@@ -361,6 +419,19 @@ mod unix_webdav {
                         }
                     }
                 }
+            }
+        }
+
+        // A-TLS-7: on TLS the `Host` must be an IP literal for this bind or a certificate name
+        // (DNS rebinding); checked before the token. Plain listeners (loopback or the opt-out)
+        // keep the pre-v0.5.6 behaviour.
+        if let Some(names) = &ctx.tls_names {
+            if !edge_host_allowed(host, ctx.bound, names) {
+                refuse_webdav(
+                    stream,
+                    WebdavAuthRefusal::Forbidden("reject.webdav_host_mismatch"),
+                )?;
+                return Ok(Next::Close);
             }
         }
 
