@@ -9768,7 +9768,9 @@ fn active_manifest() -> String {
         .arg("--version")
         .output()
         .expect("parvault --version");
-    let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // The first line; `--version` (clap's long version) adds the build-facts lines after it.
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let line = text.lines().next().unwrap_or_default().trim().to_string();
     let name = line
         .rsplit_once("(manifest ")
         .and_then(|(_, rest)| rest.strip_suffix(')'))
