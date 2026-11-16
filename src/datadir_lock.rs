@@ -154,19 +154,21 @@ pub fn daemon_lock(data_dir: &Path) -> Result<DataDirLock, LockRefusal> {
 
 /// The files `up --init-if-absent` ignores when it decides whether a volume is empty
 /// (A-146-3): a fixed list, nothing else. The join-token file is ignored by its own name when it
-/// lives in the data dir; the genesis staging files (A-146-2, arch056c 2.4) are swept first.
-pub const EMPTY_VOLUME_IGNORED: &[&str] = &[
-    "lost+found",
-    "@eaDir",
-    DATADIR_LOCK_FILE,
-    EDGE_TLS_KEY_FILE,
-    EDGE_TLS_CERT_FILE,
-];
+/// lives in the data dir; the genesis staging files (A-146-2, arch056c 2.4) are swept first, and
+/// the edge TLS file's staging files ([`EDGE_TLS_TMP_PREFIX`]) are ignored.
+pub const EMPTY_VOLUME_IGNORED: &[&str] =
+    &["lost+found", "@eaDir", DATADIR_LOCK_FILE, EDGE_TLS_FILE];
 
-/// The edge TLS key the daemon writes at its first `up` (track A, A-TLS-6).
-pub const EDGE_TLS_KEY_FILE: &str = "edge_tls.key";
-/// The edge TLS certificate the daemon writes at its first `up` (track A, A-TLS-6).
-pub const EDGE_TLS_CERT_FILE: &str = "edge_tls.crt";
+/// The edge TLS certificate and key, one file the daemon writes at its first `up` (track A,
+/// A-TLS-6). Integration glue G-8 switches this to `edge_tls::EDGE_TLS_FILE`.
+pub const EDGE_TLS_FILE: &str = "edge_tls.pem";
+/// The prefix of the edge TLS file's staging files (glue G-8: `edge_tls::EDGE_TLS_TMP_PREFIX`).
+pub const EDGE_TLS_TMP_PREFIX: &str = ".tmp.edge_tls.pem.";
+
+/// Whether `name` is on the A-146-3 ignore list.
+pub fn ignored_on_empty_volume(name: &str) -> bool {
+    EMPTY_VOLUME_IGNORED.contains(&name) || name.starts_with(EDGE_TLS_TMP_PREFIX)
+}
 
 /// The ring files a data dir holds (arch056c 2.5: five values).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,7 +279,7 @@ pub fn classify_volume(
             || name == RING_GENESIS_PUB_FILE
             || name == CHAIN_DIR_NAME
             || ignored_name.is_some_and(|n| n == name)
-            || EMPTY_VOLUME_IGNORED.iter().any(|i| name == *i);
+            || name.to_str().is_some_and(ignored_on_empty_volume);
         other_files |= !known;
     }
     let chain_stored = match std::fs::read_dir(data_dir.join(CHAIN_DIR_NAME)) {
@@ -382,6 +384,24 @@ mod tests {
         std::os::unix::fs::symlink(&target, link_dir.path().join(DATADIR_LOCK_FILE)).unwrap();
         let r = DataDirLock::acquire(link_dir.path(), LockPurpose::Daemon);
         assert!(matches!(r, Err(LockRefusal::Io(_))), "{r:?}");
+    }
+
+    #[test]
+    fn the_ignore_list_is_fixed_and_covers_the_tls_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in [
+            "lost+found",
+            "@eaDir",
+            "edge_tls.pem",
+            ".tmp.edge_tls.pem.0a1b",
+            ".parvault.lock",
+        ] {
+            std::fs::write(dir.path().join(n), b"x").unwrap();
+        }
+        let v = classify_volume(dir.path(), None).unwrap();
+        assert!(!v.other_files && v.ring == RingFiles::Neither, "{v:?}");
+        std::fs::write(dir.path().join("edge_tls.key"), b"x").unwrap();
+        assert!(classify_volume(dir.path(), None).unwrap().other_files);
     }
 
     #[test]

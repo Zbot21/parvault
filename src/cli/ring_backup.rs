@@ -14,7 +14,7 @@ use parvault::crypto::backup_envelope::{
 };
 use parvault::crypto::keys::{fsync_dir, write_secret_file_atomic_0600};
 use parvault::crypto::{LocalFileKeystore, LocalKeystoreSealer, NodeIdentity};
-use parvault::datadir_lock::{DataDirLock, LockPurpose, EMPTY_VOLUME_IGNORED};
+use parvault::datadir_lock::{ignored_on_empty_volume, DataDirLock, LockPurpose};
 use parvault::network::admission::CHAIN_DIR_NAME;
 use std::path::Path;
 use zeroize::Zeroizing;
@@ -37,14 +37,56 @@ const RESTORE_STAGE: &str = ".ring_restore.stage";
 /// The write-ahead list of a restore's files (K9): present only while files are being moved.
 const RESTORE_PENDING: &str = ".ring_restore.pending";
 
-pub(crate) fn run(action: RingAction, data_dir: &Path) -> anyhow::Result<()> {
+/// What `ring backup | restore` reads from its caller: the data dir and, from a `NodeConfig`,
+/// the hardware profile (K1: `router-soc` writes with 19 MiB, t=2, p=1) and the configured
+/// genesis pin (K6). `main` passes `&cfg.data_dir` until integration glue G-13 passes `&cfg`;
+/// both compile against this one `run`.
+pub(crate) trait RingTarget {
+    /// The data dir.
+    fn data_dir(&self) -> &Path;
+    /// The writer's KDF parameters (K1).
+    fn writer_kdf(&self) -> KdfParams {
+        KdfParams::DEFAULT
+    }
+    /// The genesis public key the config pins, if any (K6).
+    fn configured_genesis(&self) -> Option<&str> {
+        None
+    }
+}
+
+impl RingTarget for std::path::PathBuf {
+    fn data_dir(&self) -> &Path {
+        self
+    }
+}
+
+impl RingTarget for parvault::config::NodeConfig {
+    fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+    fn writer_kdf(&self) -> KdfParams {
+        if self.hardware_profile == parvault::profile::HardwareProfile::RouterSoc {
+            KdfParams::ROUTER_SOC
+        } else {
+            KdfParams::DEFAULT
+        }
+    }
+    fn configured_genesis(&self) -> Option<&str> {
+        self.genesis_root_pubkey_hex
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+    }
+}
+
+pub(crate) fn run<T: RingTarget + ?Sized>(action: RingAction, target: &T) -> anyhow::Result<()> {
+    let data_dir = target.data_dir();
     match action {
         RingAction::Backup {
             out,
             passphrase_file,
         } => {
             let _lock = DataDirLock::acquire(data_dir, LockPurpose::RingBackup)?;
-            backup(data_dir, &out, &passphrase_file)
+            backup(data_dir, &out, &passphrase_file, target.writer_kdf())
         }
         RingAction::Restore {
             from,
@@ -53,15 +95,32 @@ pub(crate) fn run(action: RingAction, data_dir: &Path) -> anyhow::Result<()> {
             confirm_move,
         } => {
             let _lock = DataDirLock::acquire(data_dir, LockPurpose::RingRestore)?;
-            restore(
-                data_dir,
-                &from,
-                &passphrase_file,
-                expect_ring.as_deref(),
-                confirm_move,
-            )
+            let expected = expected_rings(expect_ring.as_deref(), target.configured_genesis())?;
+            restore(data_dir, &from, &passphrase_file, &expected, confirm_move)
         }
     }
+}
+
+/// K6: the ring ids a restore must match: `--expect-ring`, the config's genesis pin and
+/// `PARVAULT_GENESIS_PUBKEY_HEX`, each when given. Empty: print the ring id and proceed.
+fn expected_rings(flag: Option<&str>, config: Option<&str>) -> anyhow::Result<Vec<[u8; 32]>> {
+    let env = std::env::var("PARVAULT_GENESIS_PUBKEY_HEX")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let mut out = Vec::new();
+    for (what, v) in [
+        ("--expect-ring", flag),
+        ("the config's genesis_root_pubkey_hex", config),
+        ("PARVAULT_GENESIS_PUBKEY_HEX", env.as_deref()),
+    ] {
+        if let Some(h) = v {
+            out.push(
+                parse_hex32(h.as_bytes())
+                    .ok_or_else(|| anyhow::anyhow!("{what} must be 64 hex characters"))?,
+            );
+        }
+    }
+    Ok(out)
 }
 
 /// Reads the passphrase file (K8). `out` is the backup's `--out` directory (a passphrase file
@@ -136,7 +195,12 @@ fn is_chain_name(name: &str) -> bool {
         .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-fn backup(data_dir: &Path, out: &Path, passphrase_file: &Path) -> anyhow::Result<()> {
+fn backup(
+    data_dir: &Path,
+    out: &Path,
+    passphrase_file: &Path,
+    kdf: KdfParams,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(out)?;
     let pass = read_passphrase(passphrase_file, Some(out))?;
     let mut body = BackupBody::default();
@@ -185,7 +249,7 @@ fn backup(data_dir: &Path, out: &Path, passphrase_file: &Path) -> anyhow::Result
         zeroize::Zeroize::zeroize(&mut raw);
     }
     let plain = body.encode()?;
-    let bundle = env::seal(&pass, KdfParams::DEFAULT, ring_id, node_id, &plain)?;
+    let bundle = env::seal(&pass, kdf, ring_id, node_id, &plain)?;
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -268,7 +332,7 @@ fn target_empty(data_dir: &Path, pending: &[String]) -> anyhow::Result<bool> {
         let Some(name) = name.to_str() else {
             return Ok(false);
         };
-        let known = EMPTY_VOLUME_IGNORED.contains(&name)
+        let known = ignored_on_empty_volume(name)
             || name == RESTORE_STAGE
             || name == RESTORE_PENDING
             || is_pending_staging(name)
@@ -286,24 +350,10 @@ fn restore(
     data_dir: &Path,
     from: &Path,
     passphrase_file: &Path,
-    expect_ring: Option<&str>,
+    expected: &[[u8; 32]],
     confirm_move: bool,
 ) -> anyhow::Result<()> {
     use std::io::Read;
-    let expected = match expect_ring {
-        Some(h) => Some(
-            parse_hex32(h.as_bytes())
-                .ok_or_else(|| anyhow::anyhow!("--expect-ring must be 64 hex characters"))?,
-        ),
-        None => std::env::var("PARVAULT_GENESIS_PUBKEY_HEX")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .map(|h| {
-                parse_hex32(h.as_bytes())
-                    .ok_or_else(|| anyhow::anyhow!("PARVAULT_GENESIS_PUBKEY_HEX is not 64 hex"))
-            })
-            .transpose()?,
-    };
     let pass = read_passphrase(passphrase_file, None)?;
     let mut bytes = Vec::new();
     std::fs::File::open(from)
@@ -328,14 +378,14 @@ fn restore(
         _ => false,
     };
     let ring_matches =
-        consistent && header.is_some_and(|h| expected.is_none_or(|e| e == h.ring_id));
+        consistent && header.is_some_and(|h| expected.iter().all(|e| *e == h.ring_id));
     let pending = pending_names(data_dir)?;
     let empty = ring_matches && target_empty(data_dir, &pending)?;
     if let (Some(h), true) = (header, consistent) {
         println!("Bundle for ring {}", hex::encode(h.ring_id));
         println!("  node id: {}", hex::encode(h.node_id));
-        if expected.is_none() {
-            println!("  (no --expect-ring given: check this ring id)");
+        if expected.is_empty() {
+            println!("  (no --expect-ring and no configured genesis: check this ring id)");
         }
     }
     if let Err(code) = ring_restore_decision(
@@ -441,4 +491,95 @@ fn write_restore(data_dir: &Path, body: &BackupBody, pending: &[String]) -> anyh
     std::fs::remove_file(data_dir.join(RESTORE_PENDING))?;
     fsync_dir(data_dir)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parvault::config::NodeConfig;
+    use parvault::profile::HardwareProfile;
+    use std::path::PathBuf;
+
+    fn write_0600(path: &Path, bytes: &[u8]) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// A genesis node in `<tmp>/src` and its bundle written through a `NodeConfig` (glue G-13).
+    fn bundle_with(tmp: &Path, profile: HardwareProfile) -> (NodeConfig, PathBuf, PathBuf) {
+        let src = tmp.join("src");
+        NodeIdentity::init_ring_genesis_in_dir(&src).unwrap();
+        NodeIdentity::load_or_generate_in_dir(&src).unwrap();
+        let pass = tmp.join("pass");
+        write_0600(&pass, b"a passphrase of twenty-plus characters");
+        let cfg = NodeConfig {
+            data_dir: src,
+            hardware_profile: profile,
+            ..NodeConfig::default()
+        };
+        let out = tmp.join("out");
+        run(
+            RingAction::Backup {
+                out: out.clone(),
+                passphrase_file: pass.clone(),
+            },
+            &cfg,
+        )
+        .unwrap();
+        let bundle = std::fs::read_dir(&out)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        (cfg, bundle, pass)
+    }
+
+    #[test]
+    fn k1_the_router_soc_profile_writes_its_own_kdf_parameters() {
+        for (profile, want) in [
+            (HardwareProfile::RouterSoc, KdfParams::ROUTER_SOC),
+            (HardwareProfile::Desktop, KdfParams::DEFAULT),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (_, bundle, _) = bundle_with(tmp.path(), profile);
+            let (h, _) = env::parse_bundle(&std::fs::read(bundle).unwrap()).unwrap();
+            assert_eq!(h.kdf, want, "{profile:?}");
+        }
+    }
+
+    #[test]
+    fn k6_a_restore_matches_the_configured_genesis_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, bundle, pass) = bundle_with(tmp.path(), HardwareProfile::RouterSoc);
+        let ring = std::fs::read_to_string(src.data_dir.join("ring_genesis.pub")).unwrap();
+        let restore_into = |name: &str, pin: String| {
+            let cfg = NodeConfig {
+                data_dir: tmp.path().join(name),
+                genesis_root_pubkey_hex: Some(pin),
+                ..NodeConfig::default()
+            };
+            let r = run(
+                RingAction::Restore {
+                    from: bundle.clone(),
+                    passphrase_file: pass.clone(),
+                    expect_ring: None,
+                    confirm_move: true,
+                },
+                &cfg,
+            );
+            (r, cfg.data_dir)
+        };
+        let (r, dir) = restore_into("other", "ab".repeat(32));
+        let e = r.unwrap_err().to_string();
+        assert!(e.starts_with("reject.backup_wrong_ring"), "{e}");
+        assert!(!dir.join("node_identity.seed").exists());
+        let (r, dir) = restore_into("same", ring.trim().to_string());
+        r.unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("ring_genesis.seed")).unwrap(),
+            std::fs::read(src.data_dir.join("ring_genesis.seed")).unwrap()
+        );
+    }
 }

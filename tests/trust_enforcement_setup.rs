@@ -560,6 +560,9 @@ fn b174_second_holder_refused() {
 
 const PASS: &str = "correct horse battery staple, twice";
 
+/// The content of the `vaults/*.vaultkey` a test node holds (archC1 condition 5: never backed up).
+const VAULTKEY: [u8; 32] = [0x7e; 32];
+
 /// The files a bundle carries (K7) that a test node has.
 const CARRIED: &[&str] = &[
     "ring_genesis.seed",
@@ -578,6 +581,9 @@ fn genesis_node(dir: &Path) {
     let wot = run(dir, &["wot", "init"]);
     assert!(wot.status.success(), "{}", text(&wot));
     write_0600(&dir.join("macaroon_root.key"), &[0x5a; 32]);
+    // archC1 condition 5 (L-133): per-vault derived keys never go in a bundle.
+    std::fs::create_dir_all(dir.join("vaults")).unwrap();
+    write_0600(&dir.join("vaults/photos.vaultkey"), &VAULTKEY);
     std::fs::write(dir.join("quota_state.bin"), b"quota").unwrap();
     std::fs::write(dir.join("por_audit_state.json"), b"{}").unwrap();
     assert!(dir.join("master_key.sealed").exists());
@@ -694,6 +700,9 @@ fn b169_backup_restores_byte_identical_identity() {
         if src.join("master_key.sealed").exists() {
             secrets.push(master_key(src).to_vec());
         }
+        if src.join("vaults").exists() {
+            secrets.push(VAULTKEY.to_vec());
+        }
         for s in &secrets {
             assert!(!contains(&raw, s), "{name}: a secret in clear");
             assert!(
@@ -725,6 +734,7 @@ fn b169_backup_restores_byte_identical_identity() {
             "macaroon_root.key",
             "quota_state.bin",
             "por_audit_state.json",
+            "vaults/photos.vaultkey",
         ] {
             assert!(!target.join(f).exists(), "{name}: {f} restored");
         }
@@ -738,6 +748,52 @@ fn b169_backup_restores_byte_identical_identity() {
     )]);
     assert_eq!(ring_of(&tmp.path().join("restored-a")), ring_of(&a));
     gate_ran("trust_enforcement_setup::b169_backup_restores_byte_identical_identity");
+}
+
+/// archC1 condition 5 (L-133): a bundle never carries `vaults/*.vaultkey`, not even encrypted:
+/// the decrypted body of a real bundle has no entry under `vaults/` and no vaultkey bytes.
+#[test]
+fn b169_vaultkeys_are_not_in_the_bundle() {
+    use parvault::crypto::backup_envelope::{derive_key, open, parse_bundle, BackupBody};
+    let tmp = tempfile::tempdir().unwrap();
+    let (_a, bundle, _pass) = bundle_fixture(tmp.path());
+    let raw = std::fs::read(&bundle).unwrap();
+    let (h, ct) = parse_bundle(&raw).unwrap();
+    let key = derive_key(PASS, &h.salt, h.kdf).unwrap();
+    let plain = open(&key, &h, ct).unwrap();
+    let body = BackupBody::decode(&plain).unwrap();
+    assert!(
+        body.entries.iter().all(|(n, _)| !n.starts_with("vaults")),
+        "{body:?}"
+    );
+    assert!(!contains(&plain, &VAULTKEY));
+    gate_ran("trust_enforcement_setup::b169_vaultkeys_are_not_in_the_bundle");
+}
+
+/// K11, for the integrator once track B2 lands (B-154 version store): a restored owner's first
+/// pass publishes a catalog version above the existing one and frees nothing. Run with
+/// `--ignored` on `v0.5.6/integ`.
+#[test]
+#[ignore = "K11: needs track B2's version store; the integrator writes and enables it on v0.5.6/integ"]
+fn b169_restored_owner_publishes_above_and_frees_nothing() {
+    panic!(
+        "K11 integration test, to be written at integration: store a folder version on node A, \
+         ring backup A, stop A, ring restore into B with --confirm-move, run B's first sync \
+         pass, assert its catalog version is above A's last and that no FreeShards was sent"
+    );
+}
+
+/// C37: `up --interval-secs` below the floor is refused.
+#[test]
+fn c37_up_interval_below_floor_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = up_refused(&tmp.path().join("vol"), &["--interval-secs", "1"]);
+    assert!(
+        text(&out).contains("reject.interval_below_floor"),
+        "{}",
+        text(&out)
+    );
+    gate_ran("trust_enforcement_setup::c37_up_interval_below_floor_refused");
 }
 
 /// A genesis node, its bundle and the passphrase file.
