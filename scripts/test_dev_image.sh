@@ -7,12 +7,30 @@
 set -euo pipefail
 TAR=$1
 NAME="pv-devimg-test-$$"; VOL="pv-devimg-test-$$"
-cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; docker volume rm "$VOL" >/dev/null 2>&1 || true; }
+# shellcheck source=lib_test_slots.sh
+source "$(dirname "$0")/lib_test_slots.sh"
+RUNTAG="pv-devimg-test:$$"   # this run's own tag of the loaded image, removed at the end
+cleanup() {
+  restore_shared_tag
+  docker rm -fv "$NAME" >/dev/null 2>&1 || true
+  docker volume rm "$VOL" >/dev/null 2>&1 || true
+  docker rmi "$RUNTAG" >/dev/null 2>&1 || true
+}
 trap cleanup EXIT
 fail() { echo "test_dev_image: FAIL: $*" >&2; docker logs "$NAME" 2>&1 | tail -30 >&2 || true; exit 1; }
 
-TAG=$(docker load -i "$TAR" | sed -n 's/^Loaded image: //p')
-[[ "$TAG" =~ ^parvault:[0-9]+\.[0-9]+\.[0-9]+-dev$ ]] || fail "loaded '$TAG', want parvault:<ver>-dev"
+# `docker load` retags parvault:<ver>-dev, which a live container's tag may be: load under a lock,
+# tag the loaded image for this run, put the shared tag back, and test only $RUNTAG.
+load_and_adopt() {
+  [[ -n "$LOADED_GUESS" ]] && begin_load "$LOADED_GUESS"   # records the tag's current image, inside the lock
+  LOADED=$(docker load -i "$TAR" | sed -n 's/^Loaded image: //p')
+  [[ "$LOADED" =~ ^parvault:[0-9]+\.[0-9]+\.[0-9]+-dev$ ]] || fail "loaded '$LOADED', want parvault:<ver>-dev"
+  adopt_loaded_image "$LOADED" "$RUNTAG" || fail "could not tag the loaded image"
+}
+# the tar's tag is not known before loading: read it from the tar's manifest
+LOADED_GUESS=$(tar -xOf "$TAR" manifest.json 2>/dev/null | python3 -I -c 'import json,sys; print(json.load(sys.stdin)[0]["RepoTags"][0])' 2>/dev/null || true)
+with_image_lock load_and_adopt
+TAG=$RUNTAG
 echo "loaded $TAG ($(docker image inspect -f '{{.Architecture}} {{.Id}}' "$TAG"))"
 [[ "$(docker image inspect -f '{{.Config.User}}' "$TAG")" == "65532:65532" ]] || fail "image user is not 65532:65532"
 # No status listener by default (router_nas.rs: no flag, no listener); compose.yaml opts in.
@@ -55,4 +73,4 @@ echo "status page: no listener on 4080 by default"
 owners=$(docker cp "$NAME:/var/lib/parvault" - | tar -tv --numeric-owner | awk '{print $2}' | sort -u)
 [[ "$owners" == "65532/65532" ]] || fail "data volume entries owned by '$owners', want only 65532/65532"
 echo "data volume: $(docker cp "$NAME:/var/lib/parvault" - | tar -t | wc -l) entries, all owned by 65532:65532"
-echo "test_dev_image: PASS ($TAG)"
+echo "test_dev_image: PASS ($LOADED)"
