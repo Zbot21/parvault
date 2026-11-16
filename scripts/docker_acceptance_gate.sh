@@ -1029,11 +1029,11 @@ SIDE_NONE="$(status_get_tls "$SIDE_URL" "$SIDE_CA" | head -1)"
 SIDE_DNS="$(status_get_tls "$SIDE_URL" "$SIDE_CA" "$SIDE_TOKEN" rebind.example:4081 | head -1)"
 SIDE_QUERY="$(status_get_tls "$SIDE_URL?token=$SIDE_TOKEN" "$SIDE_CA" | head -1)"
 # Plain HTTP to the TLS port gets no HTTP answer.
-SIDE_PLAIN="$(status_get "http://${NET_PREFIX}.61:4081/api/v1/health" "$SIDE_TOKEN" | head -1)"
+SIDE_PLAIN="$(status_get "http://${NET_PREFIX}.61:4081/api/v1/health" "$SIDE_TOKEN" | head -1 | tr -d '[:space:]')"
 echo "sidecar (https): token=$(echo "$SIDE_OK" | head -1) none=$SIDE_NONE dns-host=$SIDE_DNS query-token=$SIDE_QUERY plain-http=${SIDE_PLAIN:-none}"
 if [ "$(echo "$SIDE_OK" | head -1)" != "200" ] || ! echo "$SIDE_OK" | grep -q '"version"' \
     || [ "$SIDE_NONE" != "401" ] || [ "$SIDE_DNS" != "403" ] || [ "$SIDE_QUERY" != "401" ] \
-    || [ -n "$SIDE_PLAIN" ]; then
+    || [[ "$SIDE_PLAIN" =~ ^[0-9]{3}$ ]]; then
     echo "ERROR: parvault-status sidecar answers wrong"; docker logs parvault-status-sidecar-${RUN_ID} || true
     exit 1
 fi

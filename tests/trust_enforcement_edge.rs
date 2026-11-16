@@ -12,7 +12,7 @@ mod common;
 mod edge_common;
 
 use edge_common::{
-    default_client, export_cert, init_node, parvault_out, pattern, req, tls_once, up, Tls,
+    default_client, export_cert, init_node, parvault_out, pattern, req, tls_once, Tls,
 };
 
 use parvault::capabilities::{CapabilityMacaroon, Caveat};
@@ -298,8 +298,34 @@ fn files() -> Vec<(&'static str, Vec<u8>)> {
     vec![("f.bin", pattern(F_LEN, 1))]
 }
 
+/// The plugin under test: a real `parvault-fuse` (`$PARVAULT_PLUGIN_BIN_DIR` or cargo's build).
+fn fuse_cmd() -> std::process::Command {
+    std::process::Command::new(common::plugin_bin(
+        "parvault-fuse",
+        env!("CARGO_BIN_EXE_parvault-fuse"),
+    ))
+}
+
+/// The daemon under test: a real `parvault` on `dir` (ring environment cleared).
+fn daemon_cmd(dir: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env_remove("PARVAULT_GENESIS_SEED_HEX")
+        .env_remove("PARVAULT_GENESIS_PUBKEY_HEX")
+        .env_remove("PARVAULT_PEERS")
+        .env("PARVAULT_LAN_REGISTRY_DIR", dir.join("lan-registry"))
+        .env("NO_COLOR", "1")
+        .arg("--data-dir")
+        .arg(dir)
+        .arg("--no-lan-discovery");
+    cmd
+}
+
+fn daemon_up(dir: &Path, extra: &[&str]) -> edge_common::Daemon {
+    edge_common::up_cmd(daemon_cmd(dir), dir, None, "/ip4/127.0.0.1/tcp/0", extra)
+}
+
 fn tls_edge(dir: &Path) -> edge_common::PluginEdge {
-    edge_common::plugin_edge(dir, "0.0.0.0:0", &files())
+    edge_common::plugin_edge(fuse_cmd(), dir, "0.0.0.0:0", &files())
 }
 
 /// B1-KEY, B1-PAIR and WEBDAV-HOST accept: an owner-only PEM with a matching pair serves TLS on
@@ -361,6 +387,7 @@ fn b1_key_group_readable_refused() {
     edge_common::write_pem(&pem, &["127.0.0.1"]);
     std::fs::set_permissions(&pem, std::fs::Permissions::from_mode(0o640)).unwrap();
     let (mut fuse, log, _gw, _) = edge_common::spawn_plugin(
+        fuse_cmd(),
         &dir,
         "0.0.0.0:0",
         &files(),
@@ -374,6 +401,7 @@ fn b1_key_group_readable_refused() {
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let dir2 = tmp.path().join("node2");
     let (mut fuse, log, _gw2, _) = edge_common::spawn_plugin(
+        fuse_cmd(),
         &dir2,
         "0.0.0.0:0",
         &files(),
@@ -400,6 +428,7 @@ fn b1_pair_mismatch_refused() {
     std::fs::write(&p, format!("{cert_a}{key_b}")).unwrap();
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
     let (mut fuse, log, _gw, _) = edge_common::spawn_plugin(
+        fuse_cmd(),
         &dir,
         "0.0.0.0:0",
         &files(),
@@ -450,6 +479,7 @@ fn sigkill_mid_rotate_keeps_a_pair() {
     let pem = dir.join(parvault::edge_tls::EDGE_TLS_FILE);
     let srv = tmp.path().join("srv");
     let (mut fuse, log, _gw, _) = edge_common::spawn_plugin(
+        fuse_cmd(),
         &srv,
         "0.0.0.0:0",
         &files(),
@@ -533,7 +563,7 @@ fn keepalive_caps_at_100_requests() {
 #[test]
 fn slots_and_pre_auth_deadline_hold_under_tls() {
     let tmp = tempfile::tempdir().unwrap();
-    let e = edge_common::plugin_edge(&tmp.path().join("node"), "[::]:0", &files());
+    let e = edge_common::plugin_edge(fuse_cmd(), &tmp.path().join("node"), "[::]:0", &files());
     let cfg = e.client();
     let port = e.addr.port();
     let v4: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -685,7 +715,7 @@ fn edge_framing_bare_lf_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("node");
     init_node(&dir);
-    let d = up(&dir, &["--status-http", "127.0.0.1:0"]);
+    let d = daemon_up(&dir, &["--status-http", "127.0.0.1:0"]);
     let addr = d.status.unwrap();
     let t = d.read_token();
     let raw = |r: &str| {
@@ -714,7 +744,7 @@ fn edge_framing_crlf_served() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("node");
     init_node(&dir);
-    let d = up(&dir, &["--status-http", "127.0.0.1:0"]);
+    let d = daemon_up(&dir, &["--status-http", "127.0.0.1:0"]);
     let addr = d.status.unwrap();
     let t = d.read_token();
     let mut s = TcpStream::connect(addr).unwrap();

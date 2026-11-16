@@ -719,12 +719,14 @@ impl EdgeTlsLoadError {
         }
     }
 
+    #[cfg(feature = "edge-tls")]
     fn mismatch() -> Self {
         Self::Mismatch {
             code: tls_key_pair_decision(false).err().unwrap_or_default(),
         }
     }
 
+    #[cfg(all(unix, feature = "edge-tls"))]
     fn key_mode(is_file: bool, uid: u32, mode: u32) -> Self {
         let owner = uid == crate::os_sys::geteuid();
         Self::KeyMode {

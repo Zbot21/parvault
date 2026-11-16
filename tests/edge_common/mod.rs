@@ -198,9 +198,19 @@ pub fn up_on(dir: &Path, listen: &str, extra: &[&str]) -> Daemon {
 
 /// [`up_on`] with a `--config` file.
 pub fn up_full(dir: &Path, config: Option<&Path>, listen: &str, extra: &[&str]) -> Daemon {
+    up_cmd(parvault_cmd(dir), dir, config, listen, extra)
+}
+
+/// [`up_full`] with the `parvault` command the caller built (its data-dir arguments included).
+pub fn up_cmd(
+    mut cmd: Command,
+    dir: &Path,
+    config: Option<&Path>,
+    listen: &str,
+    extra: &[&str],
+) -> Daemon {
     let log = dir.join("daemon.log");
     let file = std::fs::File::create(&log).unwrap();
-    let mut cmd = parvault_cmd(dir);
     if let Some(c) = config {
         cmd.arg("--config").arg(c);
     }
@@ -490,14 +500,6 @@ impl Drop for PluginEdge {
     }
 }
 
-/// The plugin binary (`$PARVAULT_PLUGIN_BIN_DIR` or cargo's).
-pub fn fuse_bin() -> PathBuf {
-    match std::env::var_os("PARVAULT_PLUGIN_BIN_DIR") {
-        Some(d) => Path::new(&d).join("parvault-fuse"),
-        None => PathBuf::from(env!("CARGO_BIN_EXE_parvault-fuse")),
-    }
-}
-
 /// An edge PEM file (certificate, key, SAN list) at `path`, mode 0600, as the daemon writes it.
 pub fn write_pem(path: &Path, sans: &[&str]) {
     use std::os::unix::fs::PermissionsExt;
@@ -506,14 +508,25 @@ pub fn write_pem(path: &Path, sans: &[&str]) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 
-/// Starts the gateway daemon in `dir` and `parvault-fuse webdav --listen <listen> --tls-pem
+/// Starts the gateway daemon in `dir` and `fuse` (a `parvault-fuse` command the suite builds)
+/// as `webdav --listen <listen> --tls-pem
 /// <dir>/edge.pem --seed-dir <files>`; waits until it serves HTTPS.
-pub fn plugin_edge(dir: &Path, listen: &str, files: &[(&str, Vec<u8>)]) -> PluginEdge {
+pub fn plugin_edge(
+    fuse: Command,
+    dir: &Path,
+    listen: &str,
+    files: &[(&str, Vec<u8>)],
+) -> PluginEdge {
     let pem = dir.join("edge.pem");
     std::fs::create_dir_all(dir).unwrap();
     write_pem(&pem, &["127.0.0.1", "::1", "nas.local"]);
-    let (fuse, log, gateway, parent) =
-        spawn_plugin(dir, listen, files, &["--tls-pem", pem.to_str().unwrap()]);
+    let (fuse, log, gateway, parent) = spawn_plugin(
+        fuse,
+        dir,
+        listen,
+        files,
+        &["--tls-pem", pem.to_str().unwrap()],
+    );
     let mut fuse = fuse;
     let text = wait_plugin(&log, &mut fuse, "WebDAV VFS on https://");
     let port: u16 = text
@@ -543,6 +556,7 @@ pub fn plugin_edge(dir: &Path, listen: &str, files: &[(&str, Vec<u8>)]) -> Plugi
 /// The daemon (gateway socket only) and a `parvault-fuse webdav` with `extra` flags; the plugin
 /// may have exited (a refusal). Returns (plugin, its log, the daemon, the pinned token).
 pub fn spawn_plugin(
+    mut fuse: Command,
     dir: &Path,
     listen: &str,
     files: &[(&str, Vec<u8>)],
@@ -580,7 +594,7 @@ pub fn spawn_plugin(
     let seed = write_seed(&dir.join("plugin"), files);
     let log = dir.join("fuse.log");
     let file = std::fs::File::create(&log).unwrap();
-    let fuse = Command::new(fuse_bin())
+    let fuse = fuse
         .arg("--socket")
         .arg(&sock)
         .arg("--cache-dir")
