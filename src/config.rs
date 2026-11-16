@@ -1009,6 +1009,9 @@ pub struct NodeConfig {
     /// may write up to 4x its allowance to this node; a restart also starts a new epoch.
     #[serde(default)]
     pub quota_write_epoch_secs: u64,
+    /// L-130: an explicit max held regular shards; wins over the memory-derived bound (`max_held_shards` in config.toml).
+    #[serde(default)]
+    pub max_held_shards: Option<u64>,
     /// Deterministic lab mode (`[lab]`, `docs/LAB_MODE.md`).
     #[serde(default)]
     pub lab: LabConfig,
@@ -1067,6 +1070,7 @@ impl Default for NodeConfig {
             por_audit_interval_secs: 0,
             por_audit_rtt_ms: 0,
             quota_write_epoch_secs: 0,
+            max_held_shards: None,
             lab: LabConfig::default(),
         }
     }
