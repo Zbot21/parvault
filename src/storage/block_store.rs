@@ -1040,6 +1040,14 @@ impl BlockStore {
             .set_limits(l)
     }
 
+    /// B182-6: envelope puts this node's own store refused since it was opened.
+    pub fn dht_envelope_refusals(&self) -> u64 {
+        self.dht_store
+            .lock()
+            .expect("dht_store mutex poisoned")
+            .refusals()
+    }
+
     /// The envelope store's budget in force (after the environment knobs).
     pub fn dht_store_limits(&self) -> DhtStoreLimits {
         self.dht_store
@@ -1862,11 +1870,24 @@ impl BlockStore {
 
     /// Saves a `FileManifest` to local disk (encrypted under `master_key`) and, when a
     /// `MeshClient` is configured with network peers, publishes a `SignedDhtManifestEnvelope`
-    /// to the Kademlia DHT over `libp2p`.
+    /// to the Kademlia DHT over `libp2p` ([`ManifestPublish::Ring`]).
     pub fn save_manifest(
         &self,
         master_key: &MasterKey,
         manifest: &FileManifest,
+    ) -> Result<PathBuf, StorageError> {
+        self.save_manifest_with(master_key, manifest, ManifestPublish::Ring)
+    }
+
+    /// [`Self::save_manifest`], publishing the manifest envelope only for
+    /// [`ManifestPublish::Ring`] (B182-1): with [`ManifestPublish::LocalOnly`] only the
+    /// encrypted local manifest is written (no envelope store put, no `PutDhtEnvelope`, no
+    /// Kademlia record). A refused envelope put is reported (B182-6), never discarded.
+    pub fn save_manifest_with(
+        &self,
+        master_key: &MasterKey,
+        manifest: &FileManifest,
+        publish: ManifestPublish,
     ) -> Result<PathBuf, StorageError> {
         let (_, encrypted) = manifest.to_encrypted_dht_record(master_key)?;
         let path = if let Some(ref mem) = self.in_memory {
@@ -1883,6 +1904,9 @@ impl BlockStore {
             Self::atomic_write_file(&p, &encrypted)?;
             p
         };
+        if publish == ManifestPublish::LocalOnly {
+            return Ok(path);
+        }
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1890,16 +1914,30 @@ impl BlockStore {
             .as_millis() as u64;
         if let Some(ref client) = self.mesh_client {
             if !client.all_network_endpoints().is_empty() {
-                if let Ok(env) = SignedDhtManifestEnvelope::seal(
+                match SignedDhtManifestEnvelope::seal(
                     master_key,
                     client.identity(),
                     manifest,
                     now_ms.max(1),
                     now_ms,
                 ) {
-                    let _ = self.put_dht_manifest_envelope(env.clone());
-                    let _ = client
-                        .put_dht_envelope(crate::network::DhtWireEnvelope::ClassicalManifest(env));
+                    Ok(env) => {
+                        report_local_envelope_put(
+                            EnvelopeKind::Manifest,
+                            &self.put_dht_manifest_envelope(env.clone()),
+                        );
+                        report_ring_envelope_put(
+                            EnvelopeKind::Manifest,
+                            &client.put_dht_envelope_report(
+                                crate::network::DhtWireEnvelope::ClassicalManifest(env),
+                            ),
+                        );
+                    }
+                    Err(e) => tracing::warn!(
+                        code = "warn.dht_envelope_not_sealed",
+                        error = %e,
+                        "manifest envelope not sealed; not published"
+                    ),
                 }
             }
         }
@@ -1950,7 +1988,8 @@ impl BlockStore {
     /// Streams a file from `input_path` in fixed `stripe_size_bytes` segments (16 MiB default per ADR-01),
     /// encrypts each stripe with AES-256-GCM prior to Reed-Solomon splitting, distributes all `N` shards
     /// across `libp2p` peers when `mesh_client` has network endpoints (or persists locally when in local mode),
-    /// and writes the encrypted `FileManifest`.
+    /// and writes the encrypted `FileManifest`, publishing its envelope to the ring
+    /// ([`ManifestPublish::Ring`]).
     pub fn store_file_streaming(
         &self,
         owner_peer_id: &str,
@@ -1958,6 +1997,26 @@ impl BlockStore {
         master_key: &MasterKey,
         tier: ErasureTier,
         stripe_size_bytes: usize,
+    ) -> Result<FileManifest, StorageError> {
+        self.store_file_streaming_with(
+            owner_peer_id,
+            input_path,
+            master_key,
+            tier,
+            stripe_size_bytes,
+            ManifestPublish::Ring,
+        )
+    }
+
+    /// [`Self::store_file_streaming`], with the manifest saved per `publish` (B182-1).
+    pub fn store_file_streaming_with(
+        &self,
+        owner_peer_id: &str,
+        input_path: &Path,
+        master_key: &MasterKey,
+        tier: ErasureTier,
+        stripe_size_bytes: usize,
+        publish: ManifestPublish,
     ) -> Result<FileManifest, StorageError> {
         let mut file = File::open(input_path)?;
         let original_file_size = file.metadata()?.len();
@@ -2046,7 +2105,7 @@ impl BlockStore {
             witness_peers: Vec::new(),
         };
 
-        self.save_manifest(master_key, &manifest)?;
+        self.save_manifest_with(master_key, &manifest, publish)?;
         Ok(manifest)
     }
 
@@ -2061,6 +2120,29 @@ impl BlockStore {
         master_key: &MasterKey,
         tier: ErasureTier,
         stripe_size_bytes: usize,
+    ) -> Result<FileManifest, StorageError> {
+        self.store_reader_streaming_with(
+            owner_peer_id,
+            reader,
+            expected_len,
+            master_key,
+            tier,
+            stripe_size_bytes,
+            ManifestPublish::Ring,
+        )
+    }
+
+    /// [`Self::store_reader_streaming`], with the manifest saved per `publish` (B182-1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_reader_streaming_with<R: Read>(
+        &self,
+        owner_peer_id: &str,
+        reader: &mut R,
+        expected_len: u64,
+        master_key: &MasterKey,
+        tier: ErasureTier,
+        stripe_size_bytes: usize,
+        publish: ManifestPublish,
     ) -> Result<FileManifest, StorageError> {
         let file_salt = generate_file_salt();
         let raw_cap =
@@ -2147,7 +2229,7 @@ impl BlockStore {
             witness_peers: Vec::new(),
         };
 
-        self.save_manifest(master_key, &manifest)?;
+        self.save_manifest_with(master_key, &manifest, publish)?;
         Ok(manifest)
     }
 
@@ -2875,6 +2957,140 @@ impl Default for DhtStoreLimits {
     }
 }
 
+/// Who stores a file's manifest (B182-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+pub enum ManifestOrigin {
+    /// A `watch-folder` pass (`FolderSyncEngine`): the vault catalog carries the manifest.
+    FolderSync,
+    /// The lite path through a seed: the vault catalog carries the manifest.
+    LiteSeed,
+    /// `parvault file store`: a single file with no catalog.
+    FileStore,
+    /// The gateway (FUSE, WebDAV, IPC writes).
+    Gateway,
+}
+
+/// Where a saved manifest goes (B182-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestPublish {
+    /// The local encrypted manifest, the local envelope store and the ring (`PutDhtEnvelope`
+    /// and a Kademlia record).
+    Ring,
+    /// The local encrypted manifest only.
+    LocalOnly,
+}
+
+/// B182-1: folder sync (and the lite path) never publish a per-file manifest envelope; their
+/// vault catalog (ADR-18, one key per vault, replaced in place) is the folder's only ring
+/// record, so an owner's key count follows its vaults, not its versions. `file store` and the
+/// gateway keep publishing (a single stored file has no catalog).
+pub const fn manifest_publish_decision(origin: ManifestOrigin) -> ManifestPublish {
+    match origin {
+        ManifestOrigin::FolderSync | ManifestOrigin::LiteSeed => ManifestPublish::LocalOnly,
+        ManifestOrigin::FileStore | ManifestOrigin::Gateway => ManifestPublish::Ring,
+    }
+}
+
+/// The kind of envelope an owner-side put carries, as `warn.dht_envelope_refused` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopeKind {
+    Manifest,
+    PqManifest,
+    Catalog,
+}
+
+impl EnvelopeKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            EnvelopeKind::Manifest => "manifest",
+            EnvelopeKind::PqManifest => "pq_manifest",
+            EnvelopeKind::Catalog => "catalog",
+        }
+    }
+}
+
+/// B182-7: the last owner-side envelope refusal this process reported (`kind scope reason`).
+static LAST_ENVELOPE_REFUSAL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// B182-7: the last owner-side envelope refusal this process reported, if any.
+pub fn last_envelope_refusal() -> Option<String> {
+    LAST_ENVELOPE_REFUSAL.lock().ok().and_then(|g| g.clone())
+}
+
+fn note_envelope_refusal(kind: EnvelopeKind, scope: &str, reason: &str) {
+    if let Ok(mut g) = LAST_ENVELOPE_REFUSAL.lock() {
+        *g = Some(format!("{} {scope} {reason}", kind.as_str()));
+    }
+}
+
+/// B182-6: reports an owner-side put into this node's own envelope store. A refusal logs
+/// `warn.dht_envelope_refused` (`scope=local`); the store counts it
+/// ([`BlockStore::dht_envelope_refusals`]). Returns whether the envelope was stored.
+pub fn report_local_envelope_put(kind: EnvelopeKind, res: &Result<(), StorageError>) -> bool {
+    match res {
+        Ok(()) => true,
+        Err(e) => {
+            let reason = crate::network::client::envelope_refusal_code(&e.to_string());
+            note_envelope_refusal(kind, "local", &reason);
+            tracing::warn!(
+                code = "warn.dht_envelope_refused",
+                kind = kind.as_str(),
+                scope = "local",
+                reason = %reason,
+                hosts_refused = 1u64,
+                hosts_stored = 0u64,
+                "this node's envelope store refused an owner envelope"
+            );
+            false
+        }
+    }
+}
+
+/// B182-6: reports an owner-side ring put. Any refusing host logs `warn.dht_envelope_refused`
+/// (`scope=ring`, with the first host's `reject.*` code and the host counts); a put that no
+/// host acknowledged and none refused logs `warn.dht_envelope_unacknowledged`. Returns the
+/// number of hosts that stored it.
+pub fn report_ring_envelope_put(
+    kind: EnvelopeKind,
+    res: &anyhow::Result<crate::network::client::DhtPutReport>,
+) -> usize {
+    match res {
+        Ok(r) => {
+            if r.hosts_refused > 0 {
+                note_envelope_refusal(kind, "ring", r.reason.as_deref().unwrap_or("unknown"));
+                tracing::warn!(
+                    code = "warn.dht_envelope_refused",
+                    kind = kind.as_str(),
+                    scope = "ring",
+                    reason = %r.reason.as_deref().unwrap_or("unknown"),
+                    hosts_refused = r.hosts_refused as u64,
+                    hosts_stored = r.hosts_stored as u64,
+                    "ring hosts refused an owner envelope"
+                );
+            } else if r.hosts_stored == 0 {
+                tracing::warn!(
+                    code = "warn.dht_envelope_unacknowledged",
+                    kind = kind.as_str(),
+                    hosts_failed = r.hosts_failed as u64,
+                    error = %r.last_error.as_ref().map(|e| e.to_string()).unwrap_or_default(),
+                    "no ring host acknowledged an owner envelope"
+                );
+            }
+            r.hosts_stored
+        }
+        Err(e) => {
+            tracing::warn!(
+                code = "warn.dht_envelope_unacknowledged",
+                kind = kind.as_str(),
+                error = %e,
+                "owner envelope not put on the ring"
+            );
+            0
+        }
+    }
+}
+
 /// What the envelope-store capacity decision needs (an envelope that already passed its
 /// signature and version checks).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2961,6 +3177,11 @@ pub struct ZeroTrustDhtStore {
     /// (inode, length, mtime) of the store file as this process last read or wrote it: a put
     /// re-reads the file only when another process replaced it since (G-28).
     seen: Option<FileStamp>,
+    /// B182-6: puts this store refused since it was built.
+    refusals: u64,
+    /// B182-8: the store file loaded (an over-cap owner is reported once per load).
+    loaded: bool,
+    over_cap_reported: bool,
 }
 
 type FileStamp = (u64, u64, std::time::SystemTime);
@@ -3079,6 +3300,8 @@ impl ZeroTrustDhtStore {
                 store.catalog_records = s.catalog_records;
                 store.recount();
                 store.seen = file_stamp(&path);
+                store.loaded = true;
+                store.report_owners_over_cap();
             }
             Err(error) => {
                 store.corrupt = true;
@@ -3098,6 +3321,42 @@ impl ZeroTrustDhtStore {
     /// The environment knobs ([`DhtStoreLimits::with_env_overrides`]) still apply.
     pub fn set_limits(&mut self, limits: DhtStoreLimits) {
         self.limits = limits.with_env_overrides();
+        self.report_owners_over_cap();
+    }
+
+    /// B182-8: once per load, logs `warn.dht_owner_over_cap_at_load` for each owner the loaded
+    /// store already holds at or over its key share (owner tag prefix, keys, share). It removes
+    /// nothing: those keys stay (refuse-not-evict), and the owner's new keys are refused.
+    fn report_owners_over_cap(&mut self) {
+        if !self.loaded || self.over_cap_reported {
+            return;
+        }
+        let share = self.limits.max_owner_keys;
+        let mut over: Vec<(&OwnerTag, u64)> = self
+            .owners
+            .iter()
+            .filter(|(_, u)| u.keys >= share)
+            .map(|(o, u)| (o, u.keys))
+            .collect();
+        if over.is_empty() {
+            return;
+        }
+        over.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
+        for (owner, keys) in over {
+            tracing::warn!(
+                code = "warn.dht_owner_over_cap_at_load",
+                owner = %hex::encode(&owner[..4]),
+                keys,
+                share,
+                "an owner already holds its key share; its new keys are refused, none is removed"
+            );
+        }
+        self.over_cap_reported = true;
+    }
+
+    /// B182-6: puts this store refused since it was built (owner-side and host-side alike).
+    pub fn refusals(&self) -> u64 {
+        self.refusals
     }
 
     pub fn limits(&self) -> DhtStoreLimits {
@@ -3200,6 +3459,17 @@ impl ZeroTrustDhtStore {
     /// state (so its owner, version and capacity checks see every writer's envelopes, and the
     /// caps refuse new keys, never evict), then writes the file atomically and unlocks.
     fn locked_put(
+        &mut self,
+        put: impl FnOnce(&mut Self) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
+        let r = self.locked_put_inner(put);
+        if r.is_err() {
+            self.refusals = self.refusals.saturating_add(1);
+        }
+        r
+    }
+
+    fn locked_put_inner(
         &mut self,
         put: impl FnOnce(&mut Self) -> Result<(), StorageError>,
     ) -> Result<(), StorageError> {

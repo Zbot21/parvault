@@ -443,6 +443,8 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
             .mesh_client()
             .map(|c| c.quota_refusals())
             .unwrap_or(0);
+        let envelope_refusals_before =
+            envelope_refusals_now(engine.store(), gc_client.as_ref(), is_lite_net_seed);
         let (snapshot, lite_receipts_count) = if let Some(seed_dir) = &lite_seed_dir {
             let pq_kp = HybridPqSigningKeypair::load_or_generate_in_dir(&cfg.data_dir)?;
             let cert = if let Some(cert_arg) = &device_cert {
@@ -623,7 +625,16 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                                 }
                             }
                         }
-                        let _ = store_with_net.save_manifest(&master_key, &entry.manifest);
+                        // B182-1: local manifest only; the vault catalog carries it.
+                        if let Err(e) = store_with_net.save_manifest_with(
+                            &master_key,
+                            &entry.manifest,
+                            parvault::storage::block_store::manifest_publish_decision(
+                                parvault::storage::block_store::ManifestOrigin::LiteSeed,
+                            ),
+                        ) {
+                            tracing::warn!(error = %e, "lite manifest not saved locally");
+                        }
                     }
                 }
                 if resyndicate {
@@ -653,10 +664,7 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                             < s.k_data
                     })
                     .count() as u64;
-                if let Some(ref env) = snap.signed_dht_envelope {
-                    let _ = net_client
-                        .put_dht_envelope(DhtWireEnvelope::ClassicalManifest(env.clone()));
-                }
+                // B182-2: the snapshot's anchor envelope is not published.
                 engine.load_previous_snapshot(&snap);
                 (snap, receipt_count)
             } else {
@@ -792,6 +800,18 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
             }
         }
 
+        // B182-7: a pass in which this node's store or a ring host refused an owner envelope
+        // says so (the warnings carry each refusal's kind, scope and reason).
+        let envelope_refusals_pass =
+            envelope_refusals_now(engine.store(), gc_client.as_ref(), is_lite_net_seed)
+                .saturating_sub(envelope_refusals_before);
+        if envelope_refusals_pass > 0 {
+            println!(
+                "[parvault] {envelope_refusals_pass} envelope refusal(s) this pass (last: {}); see warn.dht_envelope_refused",
+                parvault::storage::block_store::last_envelope_refusal().unwrap_or_default()
+            );
+        }
+
         if gc_on {
             match engine.gc_after_pass(&snapshot, &cfg.data_dir) {
                 Ok(report) => {
@@ -799,9 +819,27 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                         .as_ref()
                         .map(|c| c.all_network_endpoints().len() as u64)
                         .unwrap_or(0);
-                    let stats = parvault::sync::gc_journal::folder_stats(
+                    let mut stats = parvault::sync::gc_journal::folder_stats(
                         &snapshot, &policy, &report, hosts,
                     );
+                    // B182-7: the refusal total carries over from the last stats file.
+                    let prev = std::fs::read(parvault::sync::gc_journal::stats_path(
+                        &cfg.data_dir,
+                        &snapshot_out,
+                    ))
+                    .ok()
+                    .and_then(|raw| {
+                        serde_json::from_slice::<parvault::sync::gc_journal::FolderStats>(&raw).ok()
+                    });
+                    stats.envelope_refusals_total = prev
+                        .as_ref()
+                        .map_or(0, |p| p.envelope_refusals_total)
+                        .saturating_add(envelope_refusals_pass);
+                    stats.last_envelope_refusal = if envelope_refusals_pass > 0 {
+                        parvault::storage::block_store::last_envelope_refusal()
+                    } else {
+                        prev.and_then(|p| p.last_envelope_refusal)
+                    };
                     if let Err(e) = parvault::sync::gc_journal::write_stats(
                         &cfg.data_dir,
                         &snapshot_out,
@@ -882,6 +920,24 @@ fn changes_line(pass: &parvault::sync::PassSummary) -> String {
         pass.deleted,
         pass.uploaded_bytes as f64 / 1_000_000.0
     )
+}
+
+/// B182-7: owner-side envelope refusals so far in this process: this node's own store's, the
+/// store client's ring refusals, and (lite path) the GC client's.
+fn envelope_refusals_now(
+    store: &BlockStore,
+    gc_client: Option<&MeshClient>,
+    gc_client_is_separate: bool,
+) -> u64 {
+    let ring = store
+        .mesh_client()
+        .map_or(0, |c| c.envelope_refusals())
+        .saturating_add(if gc_client_is_separate {
+            gc_client.map_or(0, |c| c.envelope_refusals())
+        } else {
+            0
+        });
+    store.dht_envelope_refusals().saturating_add(ring)
 }
 
 fn print_gc_lines(
@@ -1245,6 +1301,11 @@ pub(crate) async fn folder_status(env: CliEnv, command: Commands) -> anyhow::Res
             if st.warn {
                 println!("Warning            : expected bytes exceed 1.25x the policy maximum");
             }
+            println!(
+                "Envelope Refusals  : {} (last: {})",
+                st.envelope_refusals_total,
+                st.last_envelope_refusal.as_deref().unwrap_or("none")
+            );
         }
         None => println!("Folder Size        : unknown (no stats file in this data dir)"),
     }

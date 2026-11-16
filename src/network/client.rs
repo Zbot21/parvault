@@ -1162,6 +1162,101 @@ fn is_not_admitted_refusal(resp: &MeshWireResponse) -> bool {
     }
 }
 
+/// B182-6 (`v0.5.6`): one envelope put's outcome across the ring, so an owner never discards a
+/// refusal: hosts that stored it, hosts that answered `stored: false` (with the first refusal's
+/// `reject.*` code), and hosts that could not be reached.
+#[derive(Debug, Default)]
+pub struct DhtPutReport {
+    pub hosts_stored: usize,
+    pub hosts_refused: usize,
+    pub hosts_failed: usize,
+    /// The first refusing host's `reject.*` code (or its error text when it has none).
+    pub reason: Option<String>,
+    /// The last error, for a put no host stored.
+    pub last_error: Option<anyhow::Error>,
+}
+
+/// The `reject.*` code inside a host's refusal text, or the text itself.
+pub fn envelope_refusal_code(text: &str) -> String {
+    match text.find("reject.") {
+        Some(i) => text[i..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+            .collect(),
+        None => text.to_string(),
+    }
+}
+
+impl MeshClient {
+    /// `PutDhtEnvelope` acknowledgements with `stored: false` since this client (or a clone of
+    /// it) was built (B182-6).
+    pub fn envelope_refusals(&self) -> u64 {
+        self.envelope_refusals
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Puts `envelope` on every ring endpoint and reports each host's answer (B182-6). A
+    /// `stored: false` acknowledgement is counted in [`Self::envelope_refusals`]. Fails only
+    /// when no network peer is configured.
+    pub fn put_dht_envelope_report(
+        &self,
+        envelope: DhtWireEnvelope,
+    ) -> anyhow::Result<DhtPutReport> {
+        let endpoints = self.all_network_endpoints();
+        if endpoints.is_empty() {
+            anyhow::bail!("no network peers configured for PutDhtEnvelope");
+        }
+        let mut r = DhtPutReport::default();
+        for ep in &endpoints {
+            match self.send_request(ep, MeshWireRequest::PutDhtEnvelope(envelope.clone())) {
+                Ok(MeshWireResponse::PutDhtEnvelopeAck { stored: true, .. }) => {
+                    r.hosts_stored += 1;
+                }
+                Ok(MeshWireResponse::PutDhtEnvelopeAck {
+                    stored: false,
+                    error,
+                }) => {
+                    self.envelope_refusals
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    r.hosts_refused += 1;
+                    let text = error.clone().unwrap_or_default();
+                    r.reason.get_or_insert_with(|| envelope_refusal_code(&text));
+                    r.last_error = Some(
+                        MeshClientError::RemoteRejected {
+                            peer: ep.clone(),
+                            reason: format!("PutDhtEnvelope rejected: {error:?}"),
+                        }
+                        .into(),
+                    );
+                }
+                Ok(other) => {
+                    r.hosts_failed += 1;
+                    r.last_error = Some(
+                        MeshClientError::ProtocolError(format!(
+                            "unexpected PutDhtEnvelope reply: {other:?}"
+                        ))
+                        .into(),
+                    );
+                }
+                Err(e) => {
+                    r.hosts_failed += 1;
+                    r.last_error = Some(e);
+                }
+            }
+        }
+        if r.hosts_stored == 0 && self.maybe_refresh_lan_peers_throttled() {
+            for ep in self.all_network_endpoints() {
+                if let Ok(MeshWireResponse::PutDhtEnvelopeAck { stored: true, .. }) =
+                    self.send_request(&ep, MeshWireRequest::PutDhtEnvelope(envelope.clone()))
+                {
+                    r.hosts_stored += 1;
+                }
+            }
+        }
+        Ok(r)
+    }
+}
+
 /// A (sender public key, peer address) pair that accepted this process's handshake.
 type AdmittedAt = ([u8; 32], String);
 
@@ -1185,6 +1280,8 @@ pub struct MeshClient {
     peer_rtt_ms: Arc<Mutex<HashMap<String, f64>>>,
     peer_status_cache: Arc<Mutex<HashMap<String, CachedNodeStatus>>>,
     discovered_peers: Arc<Mutex<HashSet<String>>>,
+    /// B182-6 (`v0.5.6`): `PutDhtEnvelope` acknowledgements with `stored: false` seen so far.
+    envelope_refusals: Arc<std::sync::atomic::AtomicU64>,
     worker: Arc<Mutex<Option<SwarmWorkerHandle>>>,
     /// Explicit admission source; `None` falls back to the process-wide one.
     admission: Option<Arc<crate::network::admission::AdmissionSource>>,
@@ -1337,6 +1434,7 @@ impl MeshClient {
             peer_rtt_ms: Arc::new(Mutex::new(HashMap::new())),
             peer_status_cache: Arc::new(Mutex::new(HashMap::new())),
             discovered_peers: Arc::new(Mutex::new(HashSet::new())),
+            envelope_refusals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             worker: Arc::new(Mutex::new(None)),
             admission: None,
             admitted_at: Arc::new(Mutex::new(HashSet::new())),
@@ -3196,57 +3294,13 @@ impl MeshClient {
     /// Publishes a `DhtWireEnvelope` into the persistent Kademlia DHT and replicates it across all
     /// configured mesh peers (and `seed_addr`), returning the count of peers that persisted the record.
     pub fn put_dht_envelope(&self, envelope: DhtWireEnvelope) -> anyhow::Result<usize> {
-        let endpoints = self.all_network_endpoints();
-        if endpoints.is_empty() {
-            anyhow::bail!("no network peers configured for PutDhtEnvelope");
+        let r = self.put_dht_envelope_report(envelope)?;
+        if r.hosts_stored == 0 {
+            return Err(r
+                .last_error
+                .unwrap_or_else(|| anyhow::anyhow!("PutDhtEnvelope failed on all peers")));
         }
-        let mut stored_count = 0usize;
-        let mut last_err = None;
-        for ep in &endpoints {
-            match self.send_request(ep, MeshWireRequest::PutDhtEnvelope(envelope.clone())) {
-                Ok(MeshWireResponse::PutDhtEnvelopeAck { stored: true, .. }) => {
-                    stored_count += 1;
-                }
-                Ok(MeshWireResponse::PutDhtEnvelopeAck {
-                    stored: false,
-                    error,
-                }) => {
-                    last_err = Some(
-                        MeshClientError::RemoteRejected {
-                            peer: ep.clone(),
-                            reason: format!("PutDhtEnvelope rejected: {error:?}"),
-                        }
-                        .into(),
-                    );
-                }
-                Ok(other) => {
-                    last_err = Some(
-                        MeshClientError::ProtocolError(format!(
-                            "unexpected PutDhtEnvelope reply: {other:?}"
-                        ))
-                        .into(),
-                    );
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                }
-            }
-        }
-        if stored_count == 0 && self.maybe_refresh_lan_peers_throttled() {
-            for ep in self.all_network_endpoints() {
-                if let Ok(MeshWireResponse::PutDhtEnvelopeAck { stored: true, .. }) =
-                    self.send_request(&ep, MeshWireRequest::PutDhtEnvelope(envelope.clone()))
-                {
-                    stored_count += 1;
-                }
-            }
-        }
-        if stored_count == 0 {
-            return Err(
-                last_err.unwrap_or_else(|| anyhow::anyhow!("PutDhtEnvelope failed on all peers"))
-            );
-        }
-        Ok(stored_count)
+        Ok(r.hosts_stored)
     }
 
     fn validate_dht_candidate(
