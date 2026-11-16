@@ -572,6 +572,7 @@ mod unix_vfs {
             &self,
             data_dir: &Path,
             block_store: &crate::storage::BlockStore,
+            sealing_passphrase: Option<&str>,
         ) -> io::Result<()> {
             let GatewayBus::InProcess(engine) = &self.bus else {
                 return Ok(());
@@ -583,6 +584,7 @@ mod unix_vfs {
                 Arc::clone(engine),
                 block_store,
                 data_dir,
+                sealing_passphrase,
             );
             importer.start()
         }
@@ -1552,14 +1554,10 @@ pub mod catalog {
             .join(format!("{namespace}.vaultkey"))
     }
 
-    fn namespace_is_segment(ns: &str) -> bool {
-        !(ns.is_empty()
-            || ns.contains('/')
-            || ns.contains('\\')
-            || ns.contains('\0')
-            || ns == "."
-            || ns == ".."
-            || ns == DEVICE_FOLDER)
+    /// D16: the shared namespace rule (also the ring backup's for `vaults/<ns>.floor`), and
+    /// not the device folder.
+    fn namespace_ok(ns: &str) -> bool {
+        crate::sync::catalog_resume::vault_namespace_ok(ns) && ns != DEVICE_FOLDER
     }
 
     fn io_err(e: impl std::fmt::Display) -> std::io::Error {
@@ -1569,19 +1567,49 @@ pub mod catalog {
     /// archC1: writes `<data_dir>/vaults/<namespace>.vaultkey` with the keys derived from
     /// `seed_phrase` for `vault_namespace` (vault master key, PQ catalog key, owner identity
     /// seed), never the phrase. The payload names its namespace, owner public key and catalog
-    /// DHT key; it is encrypted under a fresh file key sealed like `master_key.sealed` (the
-    /// data dir's keystore: `PARVAULT_PASSPHRASE` or `enclave_sealing.seed`) and written
-    /// atomically with mode `0600`. Called by `watch-folder --seed-phrase` on the vault's
-    /// writer node. Writing it again for the same namespace gives the same keys.
+    /// DHT key; it is encrypted under a fresh file key sealed exactly like `master_key.sealed`
+    /// (D10: `sealing_passphrase` is the config's `device_sealing_passphrase`, then
+    /// `PARVAULT_PASSPHRASE`, then `enclave_sealing.seed`) and written atomically with mode
+    /// `0600`. Called by `watch-folder --seed-phrase` on the vault's writer node. Writing it
+    /// again for the same namespace gives the same keys, and reseals a file an older build
+    /// sealed with `enclave_sealing.seed` under the passphrase.
     pub fn register_vault_keys(
         data_dir: &Path,
         seed_phrase: &str,
         vault_namespace: &str,
+        sealing_passphrase: Option<&str>,
     ) -> std::io::Result<PathBuf> {
-        if !namespace_is_segment(vault_namespace) {
+        if !namespace_ok(vault_namespace) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "vault namespace must be one path segment other than the device folder",
+                format!(
+                    "reject.vault_namespace_unsupported: a listed vault's namespace is 1 to 128 \
+                     printable ASCII characters (spaces allowed), no '/' or '\\', not '.', \
+                     '..' or '{DEVICE_FOLDER}'"
+                ),
+            ));
+        }
+        write_vault_keys_unchecked(data_dir, seed_phrase, vault_namespace, sealing_passphrase)
+    }
+
+    /// [`register_vault_keys`] without the D16 namespace rule (only a path-safe single segment):
+    /// what builds before the rule wrote, so tests can make such a registration. Not for use
+    /// outside tests.
+    #[doc(hidden)]
+    pub fn write_vault_keys_unchecked(
+        data_dir: &Path,
+        seed_phrase: &str,
+        vault_namespace: &str,
+        sealing_passphrase: Option<&str>,
+    ) -> std::io::Result<PathBuf> {
+        let ns_ok = !(vault_namespace.is_empty()
+            || vault_namespace == "."
+            || vault_namespace == ".."
+            || vault_namespace.contains(['/', '\\', '\0']));
+        if !ns_ok {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "vault namespace must be one path segment",
             ));
         }
         let canonical = crate::crypto::validate_recovery_seed_phrase_or_passphrase(seed_phrase)
@@ -1603,7 +1631,8 @@ pub mod catalog {
         payload.extend_from_slice(&id_seed);
         id_seed.zeroize();
         let sealer =
-            LocalFileKeystore::from_passphrase_or_csprng_in_dir(data_dir, None).map_err(io_err)?;
+            LocalFileKeystore::from_passphrase_or_csprng_in_dir(data_dir, sealing_passphrase)
+                .map_err(io_err)?;
         let file_key = MasterKey::generate();
         let sealed_file_key = sealer.seal_key(file_key.as_bytes()).map_err(io_err)?;
         let ct = crate::crypto::encrypt_manifest(&file_key, &payload).map_err(io_err)?;
@@ -1643,15 +1672,53 @@ pub mod catalog {
         }
     }
 
-    fn unseal_vaultkey(data_dir: &Path, blob: &[u8]) -> Option<VaultKeyPayload> {
+    /// D10 migration: the keystore a build before the fix sealed `.vaultkey` files with
+    /// (`PARVAULT_PASSPHRASE`, else `enclave_sealing.seed`, never the config's passphrase). Only
+    /// when a passphrase is configured (otherwise it is the current keystore) and that keystore
+    /// exists (never creates a seed). The next `watch-folder --seed-phrase` reseals the file.
+    fn legacy_vaultkey_sealer(
+        data_dir: &Path,
+        sealing_passphrase: Option<&str>,
+    ) -> Option<LocalFileKeystore> {
+        if !sealing_passphrase.is_some_and(|p| !p.trim().is_empty()) {
+            return None;
+        }
+        let env_pass = std::env::var("PARVAULT_PASSPHRASE")
+            .ok()
+            .is_some_and(|p| !p.trim().is_empty());
+        if !env_pass && !data_dir.join("enclave_sealing.seed").exists() {
+            return None;
+        }
+        LocalFileKeystore::from_passphrase_or_csprng_in_dir(data_dir, None).ok()
+    }
+
+    fn unseal_vaultkey(
+        data_dir: &Path,
+        blob: &[u8],
+        sealing_passphrase: Option<&str>,
+    ) -> Option<VaultKeyPayload> {
         if blob.len() < 7 || &blob[..4] != VAULTKEY_MAGIC || blob[4] != VAULTKEY_VERSION {
             return None;
         }
         let sealed_len = u16::from_be_bytes([blob[5], blob[6]]) as usize;
         let sealed = blob.get(7..7 + sealed_len)?;
         let ct = blob.get(7 + sealed_len..)?;
-        let sealer = LocalFileKeystore::from_passphrase_or_csprng_in_dir(data_dir, None).ok()?;
-        let mut file_key = sealer.unseal_key(sealed).ok()?;
+        let sealer =
+            LocalFileKeystore::from_passphrase_or_csprng_in_dir(data_dir, sealing_passphrase)
+                .ok()?;
+        let mut file_key = match sealer.unseal_key(sealed) {
+            Ok(k) => k,
+            Err(_) => {
+                let k = legacy_vaultkey_sealer(data_dir, sealing_passphrase)?
+                    .unseal_key(sealed)
+                    .ok()?;
+                tracing::warn!(
+                    code = "warn.vaultkey_legacy_seal",
+                    "a vault key file is still sealed by enclave_sealing.seed, not the configured passphrase; the next watch-folder --seed-phrase reseals it"
+                );
+                k
+            }
+        };
         let fk = MasterKey::from_bytes(file_key);
         file_key.zeroize();
         let mut p = crate::crypto::decrypt_manifest(&fk, ct).ok()?;
@@ -1689,10 +1756,15 @@ pub mod catalog {
         parsed
     }
 
-    /// Loads `vaults/<namespace>.vaultkey` through [`vaultkey_load_decision`].
-    pub fn load_vault_keys(data_dir: &Path, namespace: &str) -> Result<VaultKeys, &'static str> {
+    /// Loads `vaults/<namespace>.vaultkey` through [`vaultkey_load_decision`], unsealed with
+    /// the data dir's keystore under `sealing_passphrase` (the config's, as for the master key).
+    pub fn load_vault_keys(
+        data_dir: &Path,
+        namespace: &str,
+        sealing_passphrase: Option<&str>,
+    ) -> Result<VaultKeys, &'static str> {
         let blob = std::fs::read(vaultkey_path(data_dir, namespace)).unwrap_or_default();
-        let payload = unseal_vaultkey(data_dir, &blob);
+        let payload = unseal_vaultkey(data_dir, &blob, sealing_passphrase);
         let Some(p) = payload else {
             return vaultkey_load_decision(false, false, false, false).map(|()| unreachable!());
         };
@@ -1765,6 +1837,8 @@ pub mod catalog {
         engine: Arc<GatewayEngine>,
         store: BlockStore,
         data_dir: PathBuf,
+        /// The config's `device_sealing_passphrase` (D10), for the vault key files.
+        sealing_passphrase: Option<zeroize::Zeroizing<String>>,
         sources: Mutex<BTreeMap<String, SourceState>>,
         hydrate: Mutex<VecDeque<Ino>>,
         hydrated_bytes: AtomicU64,
@@ -1776,12 +1850,15 @@ pub mod catalog {
             engine: Arc<GatewayEngine>,
             store: &BlockStore,
             data_dir: &Path,
+            sealing_passphrase: Option<&str>,
         ) -> Arc<Self> {
             Arc::new(Self {
                 vfs,
                 engine,
                 store: store.clone(),
                 data_dir: data_dir.to_path_buf(),
+                sealing_passphrase: sealing_passphrase
+                    .map(|p| zeroize::Zeroizing::new(p.to_string())),
                 sources: Mutex::new(BTreeMap::new()),
                 hydrate: Mutex::new(VecDeque::new()),
                 hydrated_bytes: AtomicU64::new(0),
@@ -1917,6 +1994,11 @@ pub mod catalog {
         /// (`reject.catalog_foreign`), and not be older than the version applied before, also
         /// across restarts (`reject.catalog_rollback`). Only reads happen here.
         pub fn import_vault(&self, keys: &VaultKeys) -> Result<ImportReport, &'static str> {
+            // D13: a catalog another process (the vault's `watch-folder`, L-136) wrote into the
+            // shared envelope store file since this process last read it.
+            if let Err(e) = self.store.refresh_dht_store_from_disk() {
+                tracing::warn!(error = %e, "could not re-read the DHT envelope store");
+            }
             let mut cands = Vec::new();
             if let Some(env) = self.store.get_dht_vault_catalog_envelope(&keys.dht_key) {
                 cands.push(env);
@@ -1974,7 +2056,11 @@ pub mod catalog {
         /// Every registered seed vault (`vaults/*.vaultkey`); a refused key file is logged.
         pub fn import_vaults(&self) {
             for ns in registered_namespaces(&self.data_dir) {
-                match load_vault_keys(&self.data_dir, &ns) {
+                match load_vault_keys(
+                    &self.data_dir,
+                    &ns,
+                    self.sealing_passphrase.as_deref().map(String::as_str),
+                ) {
                     Ok(keys) => {
                         if let Ok(r) = self.import_vault(&keys) {
                             if r.upserted + r.removed > 0 {
@@ -2131,6 +2217,17 @@ pub mod catalog {
 
         /// Starts the import timer and the scavenger threads; sets the VFS re-import hook (T2).
         pub fn start(self: &Arc<Self>) -> std::io::Result<()> {
+            // D16: a vault an earlier build registered under a namespace the rule now refuses
+            // is still listed, and said so at every start: its floor is not in ring backups.
+            for ns in registered_namespaces(&self.data_dir) {
+                if !namespace_ok(&ns) {
+                    tracing::warn!(
+                        code = "warn.vault_namespace_unsupported",
+                        vault = %ns,
+                        "vault {ns:?} was registered by an earlier build under a namespace the current rule refuses (1 to 128 printable ASCII characters, no '/' or '\\', not '.', '..' or '{DEVICE_FOLDER}'): it is still listed, but `ring backup` does not carry its rollback floor and `watch-folder --seed-phrase` no longer re-registers it; move it to a supported namespace"
+                    );
+                }
+            }
             self.import_all();
             let weak: Weak<Self> = Arc::downgrade(self);
             self.vfs.set_reimport_hook(Some(Arc::new(move || {

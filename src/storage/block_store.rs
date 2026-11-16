@@ -599,6 +599,25 @@ impl BlockStore {
             .put_vault_catalog_envelope(envelope)
     }
 
+    /// D13 (`v0.5.6` QA fix): merges the envelope store file into this process's store if
+    /// another process sharing the data dir (a `watch-folder`, L-136) replaced it since this
+    /// process last read or wrote it, so a reader (the daemon's catalog import) sees its
+    /// envelopes. The same lock, re-read and merge rules as a put (`locked_put`,
+    /// `merge_from_disk`), without the put or a write; skipped without taking the lock when the
+    /// file's stamp (inode, length, mtime) is unchanged, or when the store is in memory only or
+    /// already refused as corrupt.
+    pub fn refresh_dht_store_from_disk(&self) -> Result<(), StorageError> {
+        let mut s = self.dht_store.lock().expect("dht_store mutex poisoned");
+        let Some(path) = s.persistence_path.clone() else {
+            return Ok(());
+        };
+        if s.corrupt || file_stamp(&path) == s.seen {
+            return Ok(());
+        }
+        let _lock = lock_store_file(&path)?;
+        s.merge_from_disk(&path)
+    }
+
     pub fn get_dht_vault_catalog_envelope(
         &self,
         dht_key: &[u8; 32],

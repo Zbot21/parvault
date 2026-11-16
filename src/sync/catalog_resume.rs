@@ -89,3 +89,18 @@ pub fn catalog_resume_decision(
         },
     }
 }
+
+/// D16 (`v0.5.6` QA fix): the one rule for a seed vault namespace that a data dir keeps files
+/// for (`vaults/<ns>.vaultkey`, `vaults/<ns>.floor`). `register_vault_keys` refuses any other
+/// (`reject.vault_namespace_unsupported`) and a ring backup carries the floor of every name it
+/// allows, so no registered vault's rollback floor is lost in a backup. 1 to 128 bytes of
+/// printable ASCII (spaces allowed), no `/` or `\`, not `.` or `..`: the backup format's entry
+/// names are ASCII (`crypto::backup_envelope`) and a restore lists them one per line.
+pub fn vault_namespace_ok(ns: &str) -> bool {
+    (1..=128).contains(&ns.len())
+        && ns != "."
+        && ns != ".."
+        && ns
+            .bytes()
+            .all(|b| (0x20..=0x7e).contains(&b) && b != b'/' && b != b'\\')
+}
