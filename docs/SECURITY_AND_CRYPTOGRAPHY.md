@@ -1,6 +1,6 @@
 # Security Architecture, Cryptographic Proofs & Formal Verification (`SECURITY_AND_CRYPTOGRAPHY.md`)
 
-This document details the mathematical, cryptographic, game-theoretic, and formal-verification foundations of **`parvault`** (`parvault`, `parvault-seed`, `parvault-fuse`, and `parvault-sync`), covering the single-concern Architectural Decision Records [`ADR-01` through `ADR-33`](ADR.md) in [`docs/adr/`](adr/) and <!-- metric:crate_version_tag -->`v0.5.4`<!-- /metric --> formal verification (<!-- metric:kani_harnesses -->`36`<!-- /metric --> Kani Rust Bounded Model Checking symbolic harnesses + <!-- metric:tla_specs -->`9`<!-- /metric --> TLA+ TLC specifications).
+This document details the mathematical, cryptographic, game-theoretic, and formal-verification foundations of **`parvault`** (`parvault`, `parvault-seed`, `parvault-fuse`, and `parvault-sync`), covering the single-concern Architectural Decision Records [`ADR-01` through `ADR-33`](ADR.md) in [`docs/adr/`](adr/) and <!-- metric:crate_version_tag -->`v0.5.5`<!-- /metric --> formal verification (<!-- metric:kani_harnesses -->`44`<!-- /metric --> Kani Rust Bounded Model Checking symbolic harnesses + <!-- metric:tla_specs -->`9`<!-- /metric --> TLA+ TLC specifications).
 
 ---
 
@@ -149,7 +149,7 @@ To protect long-lived backup shards and P2P envelopes against **Harvest-Now, Dec
 
 ## 7. Machine-Checked Formal Verification & Test Suite Matrix
 
-> **TLA+ claim accounting (L-47, 2d-β):** the specs carry <!-- metric:tla.guards -->`32`<!-- /metric --> `@guard` checks, each traced to one Rust decision function and covered by a guard-removal mutant; <!-- metric:tla.structural -->`8`<!-- /metric --> `@structural` properties that hold by construction (for example, no wire message carries a key) and are **not** model-checked; and <!-- metric:tla.assumptions -->`13`<!-- /metric --> `@assume` threat-model bounds. Invariants that were true only because a flag was hard-coded `FALSE` were removed from the model rather than kept as vacuous claims.
+> **TLA+ claim accounting (L-47, 2d-β):** the specs carry <!-- metric:tla.guards -->`33`<!-- /metric --> `@guard` checks, each traced to one Rust decision function and covered by a guard-removal mutant; <!-- metric:tla.structural -->`8`<!-- /metric --> `@structural` properties that hold by construction (for example, no wire message carries a key) and are **not** model-checked; and <!-- metric:tla.assumptions -->`13`<!-- /metric --> `@assume` threat-model bounds. Invariants that were true only because a flag was hard-coded `FALSE` were removed from the model rather than kept as vacuous claims.
 
 > [!IMPORTANT]
 > **Scope & Abstraction Boundaries of Formal Models (`A5`, `D1`):**
@@ -166,9 +166,9 @@ To protect long-lived backup shards and P2P envelopes against **Harvest-Now, Dec
 bash scripts/verify_formal_proofs.sh
 ```
 
-### 7.2 Kani Rust Bounded Model Checking Matrix (<!-- metric:kani_harnesses -->`36`<!-- /metric --> Symbolic Harnesses)
+### 7.2 Kani Rust Bounded Model Checking Matrix (<!-- metric:kani_harnesses -->`44`<!-- /metric --> Symbolic Harnesses)
 
-All <!-- metric:kani_harnesses -->36<!-- /metric --> harnesses exercise real production code with symbolic `kani::any()` inputs (`cargo kani` $\to$ `VERIFICATION:- SUCCESSFUL`). Non-vacuity is independently verified by mutating the quorum assertion (`tally < min_quorum` $\to$ `tally + 1 < min_quorum`) in `proof_eviction_quorum_sub_threshold_and_duplicate_signer_rejected` and confirming CBMC emits a concrete counterexample (`VERIFICATION:- FAILED`) before restoring the invariant.
+All <!-- metric:kani_harnesses -->44<!-- /metric --> harnesses exercise real production code with symbolic `kani::any()` inputs (`cargo kani` $\to$ `VERIFICATION:- SUCCESSFUL`). Non-vacuity is independently verified by mutating the quorum assertion (`tally < min_quorum` $\to$ `tally + 1 < min_quorum`) in `proof_eviction_quorum_sub_threshold_and_duplicate_signer_rejected` and confirming CBMC emits a concrete counterexample (`VERIFICATION:- FAILED`) before restoring the invariant.
 
 | Kani Proof Harness | Target Production Module / Function | Symbolic Property Verified (`kani::any()`) | CBMC Result |
 | :--- | :--- | :--- | :---: |
@@ -213,7 +213,7 @@ Every invariant of `parvault` is model-checked and tested across **<!-- metric:t
 | **4-Layer Anonymity & 8-Profile Degraded Network Recovery (`ADR-11`)** | [`tests/anonymity_and_degraded_net_tests.rs`](../tests/anonymity_and_degraded_net_tests.rs) | Verification of `> 224-bit` combinatorial locator wall, per-shard capabilities, voucher nullifiers, 1-hop onion routing, and hedged $K$-of-$N$ recovery across 8 degraded profiles | **100% PASS (`0 bytes` lost across all 8 profiles)** |
 | **Post-Quantum Hybrid Cryptography Proofs (`ADR-12`)** | [`tests/post_quantum_security_proofs.rs`](../tests/post_quantum_security_proofs.rs) | NIST FIPS 203 `ML-KEM-768` + `X25519` Shor resilience, FIPS 204 `ML-DSA-65` + `Ed25519` unforgeability, and 512-bit `PqVaultMasterKey` (`AES-256-GCM` + `ChaCha20-Poly1305`) Grover resistance | **100% PASS** |
 | **Elastic Bootstrap, Seed Server, Lite-Client & Anonymous Telemetry (`ADR-15`–`ADR-17`, `ADR-20`)** | [`tests/bootstrap_and_earned_tier_tests.rs`](../tests/bootstrap_and_earned_tier_tests.rs)<br>[`tests/seed_server_integration.rs`](../tests/seed_server_integration.rs)<br>[`tests/sync_daemon_usability_and_cli_regression_tests.rs`](../tests/sync_daemon_usability_and_cli_regression_tests.rs)<br>[`tests/anonymous_telemetry_tests.rs`](../tests/anonymous_telemetry_tests.rs) | Day-1 Personal Ring, Foundation Seed Anchor auto-drain, zero-knowledge elastic re-sharding, `ZeroTrustSeedServer`, Lite-Client `1.0x` syndication & NAS-death failover, and rotating-nullifier census beacons | **100% PASS** |
-| **5-Domain Red-Team Suite (`ADR-18`, `ADR-19`) & Live `libp2p` TCP Multi-Daemon Regression (lite client `ADR-20`)** | [`tests/red_team_hardening_tests.rs`](../tests/red_team_hardening_tests.rs)<br>[`tests/sync_daemon_usability_and_cli_regression_tests.rs`](../tests/sync_daemon_usability_and_cli_regression_tests.rs)<br>[`tests/phase1_to_4_integration.rs`](../tests/phase1_to_4_integration.rs) | House-fire seed recovery, capability pinning, NTP skew, generation-scoped tombstones, `with_limit` OOM defense, Hashcash PoW + IQR trimming, path-traversal blocking, and live `libp2p` TCP multi-daemon sync/prune/recovery | **100% PASS (<!-- metric:tests_pass -->665 / 665<!-- /metric --> total tests)** |
+| **5-Domain Red-Team Suite (`ADR-18`, `ADR-19`) & Live `libp2p` TCP Multi-Daemon Regression (lite client `ADR-20`)** | [`tests/red_team_hardening_tests.rs`](../tests/red_team_hardening_tests.rs)<br>[`tests/sync_daemon_usability_and_cli_regression_tests.rs`](../tests/sync_daemon_usability_and_cli_regression_tests.rs)<br>[`tests/phase1_to_4_integration.rs`](../tests/phase1_to_4_integration.rs) | House-fire seed recovery, capability pinning, NTP skew, generation-scoped tombstones, `with_limit` OOM defense, Hashcash PoW + IQR trimming, path-traversal blocking, and live `libp2p` TCP multi-daemon sync/prune/recovery | **100% PASS (<!-- metric:tests_pass -->713 / 713<!-- /metric --> total tests)** |
 
 ---
 

@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+---
+
+## [`0.5.5`] - 2026-11-16
+
 ### Added
 - **One compiled-in manifest (L-16 seam S1-S4, `v0.5.5`).** Cargo feature `manifest-household-ring-v1` (in `default`) selects the manifest under `daemon-runtime`; no manifest, or two, fail to build with a `compile_error!`. `--version` of `parvault`, `parvault-seed` and `parvault-bench`, and local status, print it. Admission facts, a per-variant gate (`reject.variant_disabled_by_manifest`) and the `HandshakeWoT` and `AdmitPublicTicket` arms now come from the manifest; behaviour is unchanged. `--all-features` no longer builds (it enables two manifests; `cargo tree` is fine). The manifest name is not sent on the wire. A CI-only `manifest-test-restricted` manifest exists; `scripts/build_bins.sh` refuses to ship it.
 - **Synology without SSH (B-146).** `deploy/synology/compose.yaml` is now one project that starts a ring from Container Manager alone: a run-once `init` service (`wot init`, `network_mode: none`, `restart: "no"`, the same hardening) beside the daemon on the fixed-name volume `parvault-data`. On later starts `init` exits 1 (`already in the ring`) harmlessly. A commented `invite-node2` example prints a token to its Log tab and waits for a healthy daemon (`depends_on: service_healthy`), so it cannot run before the ring exists on a fresh volume. New `deploy/synology/join.compose.yaml` joins a ring: `identity` prints the key to its Log tab, `install-chain` takes the token from a marked placeholder, and the daemon starts only once it succeeds. New `deploy/docker/compose.yaml` is the same join for a Docker host, with `--peers`, a non-default `--listen` port and the image's own healthcheck. Every shipped service has `pull_policy: never`.

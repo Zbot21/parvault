@@ -14,7 +14,7 @@
 # has no shell, so do not add a `--health-cmd` or a shell-form `healthcheck:`.
 name: parvault
 x-oneshot: &oneshot
-  image: parvault:0.5.4-dev
+  image: parvault:0.5.5-dev
   pull_policy: never            # a local-only image: never fall back to a registry pull
   user: "65532:65532"
   network_mode: none
@@ -41,7 +41,7 @@ services:
     command: ["--data-dir", "/var/lib/parvault", "wot", "install-chain",
               "--token", "PASTE_TOKEN_HERE"]
   parvault:
-    image: parvault:0.5.4-dev
+    image: parvault:0.5.5-dev
     pull_policy: never
     restart: unless-stopped
     user: "65532:65532"

@@ -15,8 +15,8 @@ INSTALL_DIR="${PARVAULT_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 # version, and release.yml fails if it differs from the tag. PARVAULT_VERSION=latest asks GitHub
 # for its "Latest" release, which does not exist (404) while every release is a pre-release; once
 # it does, the tag it names must be this script's own version or newer (no downgrade).
-VERSION="${PARVAULT_VERSION:-v0.5.4}"
-MIN_VERSION=v0.5.4   # equal to the default above (scripts/test_install.sh checks)
+VERSION="${PARVAULT_VERSION:-v0.5.5}"
+MIN_VERSION=v0.5.5   # equal to the default above (scripts/test_install.sh checks)
 BINS="${PARVAULT_BINS:-parvault parvault-seed parvault-fuse parvault-sync parvault-status}"
 
 ARCH="$(uname -m)"

@@ -12,7 +12,7 @@
 #               docs/SYNOLOGY.md "Add a node"). Its token appears in its Log tab.
 name: parvault
 x-oneshot: &oneshot
-  image: parvault:0.5.4-dev
+  image: parvault:0.5.5-dev
   pull_policy: never            # a local-only image: never fall back to a registry pull
   user: "65532:65532"
   network_mode: none
@@ -31,7 +31,7 @@ services:
     <<: *oneshot
     command: ["--data-dir", "/var/lib/parvault", "wot", "init"]
   parvault:
-    image: parvault:0.5.4-dev
+    image: parvault:0.5.5-dev
     pull_policy: never
     container_name: parvault
     restart: unless-stopped

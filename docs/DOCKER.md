@@ -10,7 +10,7 @@ Every block below uses these shell variables. Set them first, in the shell you r
 
 <!-- docker-doc: vars -->
 ```sh
-IMG=parvault:0.5.4-dev        # the tag `docker load` prints
+IMG=parvault:0.5.5-dev        # the tag `docker load` prints
 VOL=parvault-data             # this node's data volume
 NAME=parvault                 # this node's daemon container
 PORT=4001                     # this node's mesh port (TCP); e.g. 4011 if 4001 is taken

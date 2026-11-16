@@ -175,7 +175,7 @@ The volume is kept. `init` or `install-chain` runs again and exits as on any lat
 Optional; [DOCKER.md](DOCKER.md) is the full shell guide. Over SSH on the NAS, the first run can be done with `docker run` on the same volume (it starts owned by `65532:65532`). After that, use `deploy/synology/compose.yaml` on that node, whether it started the ring or joined one: its `init` exits 1 (`already in the ring`) and the daemon starts. Do not use `join.compose.yaml` there: its placeholder token would hold the daemon back.
 
 ```sh
-IMG=parvault:0.5.4-dev   # the tag you imported
+IMG=parvault:0.5.5-dev   # the tag you imported
 sudo docker load -i parvault-image-amd64-dev.tar
 # This NAS starts a new ring (the first node):
 sudo docker run --rm --network none --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges:true --read-only --tmpfs /tmp:mode=1777 -v parvault-data:/var/lib/parvault "$IMG" --data-dir /var/lib/parvault wot init
