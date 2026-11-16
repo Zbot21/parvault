@@ -276,6 +276,9 @@ pub fn global() -> &'static FetchScheduler {
     static G: OnceLock<FetchScheduler> = OnceLock::new();
     G.get_or_init(|| {
         if std::env::var("PARVAULT_TEST_SCHED_NO_PRIORITY").as_deref() == Ok("1") {
+            tracing::warn!(
+                "PARVAULT_TEST_SCHED_NO_PRIORITY=1: test-only switch, foreground reads get no priority over the scavenger"
+            );
             FetchScheduler::without_priority()
         } else {
             FetchScheduler::new()

@@ -423,6 +423,23 @@ pub const fn catalog_import_decision(
     Ok(CatalogImport::Apply)
 }
 
+/// Claim `VAULTKEY` (`@guard`, archC1 condition 1): whether a `vaults/<namespace>.vaultkey`
+/// file is used. It must unseal under this data dir's keystore, name the namespace its file
+/// name says, and hold keys whose owner public key and catalog DHT key are the ones recorded
+/// in it; a file swapped in from another vault, data dir or name is refused.
+pub const fn vaultkey_load_decision(
+    unsealed: bool,
+    namespace_matches: bool,
+    owner_matches: bool,
+    dht_key_matches: bool,
+) -> Result<(), &'static str> {
+    if unsealed && namespace_matches && owner_matches && dht_key_matches {
+        Ok(())
+    } else {
+        Err("reject.vaultkey_mismatch")
+    }
+}
+
 /// Path segments as [`VirtualVaultFs::register_lazy_file`] reads them (`.` and `..` dropped).
 #[cfg(unix)]
 fn vfs_path_parts(virtual_path: &str) -> Vec<&str> {
@@ -582,12 +599,17 @@ mod unix_vfs {
             data_dir: &Path,
             block_store: &crate::storage::BlockStore,
         ) -> io::Result<()> {
-            let _ = block_store;
             let GatewayBus::InProcess(engine) = &self.bus else {
                 return Ok(());
             };
-            let importer =
-                super::catalog::CatalogImporter::new(self.clone(), Arc::clone(engine), data_dir);
+            // Built now, so a set test switch is logged at startup.
+            let _ = crate::fetch_sched::global();
+            let importer = super::catalog::CatalogImporter::new(
+                self.clone(),
+                Arc::clone(engine),
+                block_store,
+                data_dir,
+            );
             importer.start()
         }
 
@@ -1493,18 +1515,30 @@ pub use crate::webdav::VfsWebdavServerHandle;
 #[cfg(unix)]
 pub use unix_vfs::VirtualVaultFs;
 
+#[cfg(all(unix, feature = "daemon-runtime"))]
+pub use catalog::register_vault_keys;
+
 /// B-20 catalog import and the in-daemon scavenger (L-94, arch056b S1), `v0.5.6` track C.
 #[cfg(all(unix, feature = "daemon-runtime"))]
 pub mod catalog {
-    use super::{catalog_import_decision, CatalogImport, Ino, LazyFileSpec, VirtualVaultFs};
+    use super::{
+        catalog_import_decision, vaultkey_load_decision, CatalogImport, Ino, LazyFileSpec,
+        VirtualVaultFs,
+    };
+    use crate::crypto::{
+        LocalFileKeystore, LocalKeystoreSealer, MasterKey, NodeIdentity, PqVaultMasterKey,
+    };
     use crate::fetch_sched;
+    use crate::gateway::engine::VaultReader;
     use crate::gateway::GatewayEngine;
+    use crate::storage::BlockStore;
     use crate::sync::{sanitize_sync_relative_path, FolderSnapshotManifest};
     use std::collections::{BTreeMap, VecDeque};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, Weak};
     use std::time::{Duration, Instant};
+    use zeroize::Zeroize;
 
     /// The snapshot the daemon's own folder sync (`up --watch-folder`) keeps in its data dir.
     pub const DEVICE_SNAPSHOT_FILE: &str = "appliance_folder_snapshot.manifest.bin";
@@ -1519,6 +1553,222 @@ pub mod catalog {
     pub const SCAVENGER_BYTES_PER_HOUR: u64 = 4 * 1024 * 1024 * 1024;
     /// The scavenger fills the block cache up to this share (percent).
     pub const SCAVENGER_CACHE_SHARE_PCT: u64 = 75;
+
+    /// The folder of vault key files in a data dir (archC1).
+    pub const VAULTS_DIR: &str = "vaults";
+    const VAULTKEY_MAGIC: &[u8; 4] = b"PVVK";
+    /// The `.vaultkey` format version.
+    pub const VAULTKEY_VERSION: u8 = 1;
+    /// A snapshot file larger than this is not decoded.
+    pub const MAX_SNAPSHOT_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
+    /// One registered seed vault's derived keys (never the phrase; archC1).
+    pub struct VaultKeys {
+        pub namespace: String,
+        pub owner_pubkey: [u8; 32],
+        pub dht_key: [u8; 32],
+        master_key: MasterKey,
+        pq_key: PqVaultMasterKey,
+        owner: NodeIdentity,
+    }
+
+    fn vaultkey_path(data_dir: &Path, namespace: &str) -> PathBuf {
+        data_dir
+            .join(VAULTS_DIR)
+            .join(format!("{namespace}.vaultkey"))
+    }
+
+    fn namespace_is_segment(ns: &str) -> bool {
+        !(ns.is_empty()
+            || ns.contains('/')
+            || ns.contains('\\')
+            || ns.contains('\0')
+            || ns == "."
+            || ns == ".."
+            || ns == DEVICE_FOLDER)
+    }
+
+    fn io_err(e: impl std::fmt::Display) -> std::io::Error {
+        std::io::Error::other(e.to_string())
+    }
+
+    /// archC1: writes `<data_dir>/vaults/<namespace>.vaultkey` with the keys derived from
+    /// `seed_phrase` for `vault_namespace` (vault master key, PQ catalog key, owner identity
+    /// seed), never the phrase. The payload names its namespace, owner public key and catalog
+    /// DHT key; it is encrypted under a fresh file key sealed like `master_key.sealed` (the
+    /// data dir's keystore: `PARVAULT_PASSPHRASE` or `enclave_sealing.seed`) and written
+    /// atomically with mode `0600`. Called by `watch-folder --seed-phrase` on the vault's
+    /// writer node. Writing it again for the same namespace gives the same keys.
+    pub fn register_vault_keys(
+        data_dir: &Path,
+        seed_phrase: &str,
+        vault_namespace: &str,
+    ) -> std::io::Result<PathBuf> {
+        if !namespace_is_segment(vault_namespace) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "vault namespace must be one path segment other than the device folder",
+            ));
+        }
+        let canonical = crate::crypto::validate_recovery_seed_phrase_or_passphrase(seed_phrase)
+            .map_err(io_err)?;
+        let mk = MasterKey::from_recovery_seed_phrase(&canonical, vault_namespace);
+        let pq = PqVaultMasterKey::from_recovery_seed_phrase(&canonical, vault_namespace);
+        let owner = NodeIdentity::from_recovery_seed_phrase(&canonical, vault_namespace);
+        let dht_key = mk.derive_vault_root_dht_key(vault_namespace);
+        let ns = vault_namespace.as_bytes();
+        let mut payload = Vec::with_capacity(1 + 2 + ns.len() + 32 * 4 + 64);
+        payload.push(VAULTKEY_VERSION);
+        payload.extend_from_slice(&(ns.len() as u16).to_be_bytes());
+        payload.extend_from_slice(ns);
+        payload.extend_from_slice(&owner.public_key_bytes());
+        payload.extend_from_slice(&dht_key);
+        payload.extend_from_slice(mk.as_bytes());
+        payload.extend_from_slice(pq.as_bytes());
+        let mut id_seed = owner.master_seed_bytes();
+        payload.extend_from_slice(&id_seed);
+        id_seed.zeroize();
+        let sealer =
+            LocalFileKeystore::from_passphrase_or_csprng_in_dir(data_dir, None).map_err(io_err)?;
+        let file_key = MasterKey::generate();
+        let sealed_file_key = sealer.seal_key(file_key.as_bytes()).map_err(io_err)?;
+        let ct = crate::crypto::encrypt_manifest(&file_key, &payload).map_err(io_err)?;
+        payload.zeroize();
+        let mut blob = Vec::with_capacity(4 + 1 + 2 + sealed_file_key.len() + ct.len());
+        blob.extend_from_slice(VAULTKEY_MAGIC);
+        blob.push(VAULTKEY_VERSION);
+        blob.extend_from_slice(&(sealed_file_key.len() as u16).to_be_bytes());
+        blob.extend_from_slice(&sealed_file_key);
+        blob.extend_from_slice(&ct);
+        let dir = data_dir.join(VAULTS_DIR);
+        std::fs::create_dir_all(&dir)?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let path = vaultkey_path(data_dir, vault_namespace);
+        crate::crypto::write_secret_file_atomic_0600(&path, &blob).map_err(io_err)?;
+        Ok(path)
+    }
+
+    /// The payload fields of a `.vaultkey` file, or `None` when it does not parse.
+    struct VaultKeyPayload {
+        namespace: String,
+        owner_pubkey: [u8; 32],
+        dht_key: [u8; 32],
+        mk: [u8; 32],
+        pq: [u8; 64],
+        id_seed: [u8; 32],
+    }
+
+    impl Drop for VaultKeyPayload {
+        fn drop(&mut self) {
+            self.mk.zeroize();
+            self.pq.zeroize();
+            self.id_seed.zeroize();
+        }
+    }
+
+    fn unseal_vaultkey(data_dir: &Path, blob: &[u8]) -> Option<VaultKeyPayload> {
+        if blob.len() < 7 || &blob[..4] != VAULTKEY_MAGIC || blob[4] != VAULTKEY_VERSION {
+            return None;
+        }
+        let sealed_len = u16::from_be_bytes([blob[5], blob[6]]) as usize;
+        let sealed = blob.get(7..7 + sealed_len)?;
+        let ct = blob.get(7 + sealed_len..)?;
+        let sealer = LocalFileKeystore::from_passphrase_or_csprng_in_dir(data_dir, None).ok()?;
+        let mut file_key = sealer.unseal_key(sealed).ok()?;
+        let fk = MasterKey::from_bytes(file_key);
+        file_key.zeroize();
+        let mut p = crate::crypto::decrypt_manifest(&fk, ct).ok()?;
+        let parsed = (|| {
+            if p.first() != Some(&VAULTKEY_VERSION) {
+                return None;
+            }
+            let ns_len = u16::from_be_bytes([*p.get(1)?, *p.get(2)?]) as usize;
+            let ns = std::str::from_utf8(p.get(3..3 + ns_len)?).ok()?.to_string();
+            let mut at = 3 + ns_len;
+            let mut take = |n: usize| {
+                let v = p.get(at..at + n).map(<[u8]>::to_vec);
+                at += n;
+                v
+            };
+            let owner: [u8; 32] = take(32)?.try_into().ok()?;
+            let dht: [u8; 32] = take(32)?.try_into().ok()?;
+            let mut mk_v = take(32)?;
+            let mut pq_v = take(64)?;
+            let mut id_v = take(32)?;
+            let out = VaultKeyPayload {
+                namespace: ns,
+                owner_pubkey: owner,
+                dht_key: dht,
+                mk: mk_v.as_slice().try_into().ok()?,
+                pq: pq_v.as_slice().try_into().ok()?,
+                id_seed: id_v.as_slice().try_into().ok()?,
+            };
+            mk_v.zeroize();
+            pq_v.zeroize();
+            id_v.zeroize();
+            (at == p.len()).then_some(out)
+        })();
+        p.zeroize();
+        parsed
+    }
+
+    /// Loads `vaults/<namespace>.vaultkey` through [`vaultkey_load_decision`].
+    pub fn load_vault_keys(data_dir: &Path, namespace: &str) -> Result<VaultKeys, &'static str> {
+        let blob = std::fs::read(vaultkey_path(data_dir, namespace)).unwrap_or_default();
+        let payload = unseal_vaultkey(data_dir, &blob);
+        let Some(p) = payload else {
+            return vaultkey_load_decision(false, false, false, false).map(|()| unreachable!());
+        };
+        let mk = MasterKey::from_bytes(p.mk);
+        let owner = NodeIdentity::from_seed(p.id_seed);
+        let decision = vaultkey_load_decision(
+            true,
+            p.namespace == namespace,
+            owner.public_key_bytes() == p.owner_pubkey,
+            mk.derive_vault_root_dht_key(&p.namespace) == p.dht_key,
+        );
+        decision.map(|()| VaultKeys {
+            namespace: p.namespace.clone(),
+            owner_pubkey: p.owner_pubkey,
+            dht_key: p.dht_key,
+            master_key: mk,
+            pq_key: PqVaultMasterKey::from_bytes(p.pq),
+            owner,
+        })
+    }
+
+    /// The namespaces with a `.vaultkey` file in `data_dir`.
+    pub fn registered_namespaces(data_dir: &Path) -> Vec<String> {
+        let Ok(rd) = std::fs::read_dir(data_dir.join(VAULTS_DIR)) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = rd
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                name.strip_suffix(".vaultkey").map(str::to_string)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn floor_path(data_dir: &Path, namespace: &str) -> PathBuf {
+        data_dir.join(VAULTS_DIR).join(format!("{namespace}.floor"))
+    }
+
+    /// The highest catalog version applied for a seed vault, kept across restarts so an older
+    /// catalog is a rollback after a restart too.
+    fn read_floor(data_dir: &Path, namespace: &str) -> u64 {
+        std::fs::read(floor_path(data_dir, namespace))
+            .ok()
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0)
+    }
 
     /// What one import did.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1539,6 +1789,7 @@ pub mod catalog {
     pub struct CatalogImporter {
         vfs: VirtualVaultFs,
         engine: Arc<GatewayEngine>,
+        store: BlockStore,
         data_dir: PathBuf,
         sources: Mutex<BTreeMap<String, SourceState>>,
         hydrate: Mutex<VecDeque<Ino>>,
@@ -1546,10 +1797,16 @@ pub mod catalog {
     }
 
     impl CatalogImporter {
-        pub fn new(vfs: VirtualVaultFs, engine: Arc<GatewayEngine>, data_dir: &Path) -> Arc<Self> {
+        pub fn new(
+            vfs: VirtualVaultFs,
+            engine: Arc<GatewayEngine>,
+            store: &BlockStore,
+            data_dir: &Path,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 vfs,
                 engine,
+                store: store.clone(),
                 data_dir: data_dir.to_path_buf(),
                 sources: Mutex::new(BTreeMap::new()),
                 hydrate: Mutex::new(VecDeque::new()),
@@ -1577,6 +1834,30 @@ pub mod catalog {
             key_matches: bool,
             snapshot: &FolderSnapshotManifest,
         ) -> Result<ImportReport, &'static str> {
+            self.import_source(
+                folder,
+                envelope_verifies,
+                key_matches,
+                snapshot.version,
+                0,
+                || Some(snapshot.clone()),
+                None,
+            )
+        }
+
+        /// The decision, then (only on `Apply`) `open` and the listing changes. `floor` is a
+        /// version already applied in an earlier run; `reader` serves a seed vault's files.
+        #[allow(clippy::too_many_arguments)]
+        fn import_source(
+            &self,
+            folder: &str,
+            envelope_verifies: bool,
+            key_matches: bool,
+            version: u64,
+            floor: u64,
+            open: impl FnOnce() -> Option<FolderSnapshotManifest>,
+            reader: Option<Arc<VaultReader>>,
+        ) -> Result<ImportReport, &'static str> {
             // A folder name that is not one path segment is not one of this data dir's vaults.
             let folder_ok =
                 !(folder.is_empty() || folder.contains('/') || folder == "." || folder == "..");
@@ -1585,25 +1866,26 @@ pub mod catalog {
             }
             let mut sources = self.sources.lock().unwrap_or_else(|e| e.into_inner());
             let st = sources.entry(folder.to_string()).or_default();
-            let decision = catalog_import_decision(
-                envelope_verifies,
-                key_matches,
-                snapshot.version,
-                st.loaded_version,
-            );
+            let loaded = st.loaded_version.max(floor);
+            let decision = catalog_import_decision(envelope_verifies, key_matches, version, loaded);
             match decision {
                 Err(code) => {
-                    tracing::warn!(code, folder, version = snapshot.version, "catalog refused");
+                    tracing::warn!(code, folder, version, loaded, "catalog refused");
                     return Err(code);
                 }
-                Ok(CatalogImport::Unchanged) => {
+                Ok(CatalogImport::Unchanged) if st.loaded_version == version => {
                     return Ok(ImportReport {
                         unchanged: st.files.len(),
                         ..ImportReport::default()
                     })
                 }
-                Ok(CatalogImport::Apply) => {}
+                // The version applied in an earlier run, not yet listed in this one.
+                Ok(CatalogImport::Unchanged) | Ok(CatalogImport::Apply) => {}
             }
+            let Some(snapshot) = open() else {
+                tracing::warn!(folder, version, "catalog did not open; listing unchanged");
+                return Ok(ImportReport::default());
+            };
             let mut report = ImportReport::default();
             let mut next = BTreeMap::new();
             let mut fresh = Vec::new();
@@ -1619,7 +1901,12 @@ pub mod catalog {
                         continue;
                     }
                 }
-                let eph = self.engine.index_catalog_manifest(entry.manifest.clone());
+                let eph = match &reader {
+                    Some(r) => self
+                        .engine
+                        .index_vault_manifest(entry.manifest.clone(), Arc::clone(r)),
+                    None => self.engine.index_catalog_manifest(entry.manifest.clone()),
+                };
                 let spec = LazyFileSpec {
                     manifest: eph,
                     macaroon: None,
@@ -1641,7 +1928,7 @@ pub mod catalog {
                 }
             }
             st.files = next;
-            st.loaded_version = snapshot.version;
+            st.loaded_version = version;
             drop(sources);
             self.hydrate
                 .lock()
@@ -1650,10 +1937,96 @@ pub mod catalog {
             Ok(report)
         }
 
+        /// A registered seed vault (archC1): its catalog envelope from this node's DHT store
+        /// and, with mesh peers, from the DHT. Each candidate goes through the decision, newest
+        /// first: it must verify and carry both the registered DHT key and owner key
+        /// (`reject.catalog_foreign`), and not be older than the version applied before, also
+        /// across restarts (`reject.catalog_rollback`). Only reads happen here.
+        pub fn import_vault(&self, keys: &VaultKeys) -> Result<ImportReport, &'static str> {
+            let mut cands = Vec::new();
+            if let Some(env) = self.store.get_dht_vault_catalog_envelope(&keys.dht_key) {
+                cands.push(env);
+            }
+            if let Some(client) = self.store.mesh_client() {
+                if !client.all_network_endpoints().is_empty() {
+                    if let Ok(crate::network::DhtWireEnvelope::VaultCatalog(env)) = client
+                        .get_dht_envelope(
+                            &keys.dht_key,
+                            crate::network::DhtEnvelopeKind::VaultCatalog,
+                        )
+                    {
+                        cands.push(env);
+                    }
+                }
+            }
+            cands.sort_by(|a, b| b.monotonic_version.cmp(&a.monotonic_version));
+            let floor = read_floor(&self.data_dir, &keys.namespace);
+            let mut last = Ok(ImportReport::default());
+            for env in cands {
+                let verifies = env.verify_zero_knowledge();
+                let key_matches =
+                    env.dht_key == keys.dht_key && env.owner_pubkey == keys.owner_pubkey;
+                let reader = Arc::new(VaultReader::new(
+                    keys.master_key.clone(),
+                    &keys.owner,
+                    &self.store,
+                ));
+                let r = self.import_source(
+                    &keys.namespace,
+                    verifies,
+                    key_matches,
+                    env.monotonic_version,
+                    floor,
+                    || env.open(&keys.master_key, &keys.pq_key).ok(),
+                    Some(reader),
+                );
+                match r {
+                    Ok(rep) => {
+                        if env.monotonic_version > floor {
+                            let _ = crate::storage::BlockStore::atomic_write_file(
+                                &floor_path(&self.data_dir, &keys.namespace),
+                                &env.monotonic_version.to_be_bytes(),
+                            );
+                        }
+                        return Ok(rep);
+                    }
+                    Err(code) => last = Err(code),
+                }
+            }
+            last
+        }
+
+        /// Every registered seed vault (`vaults/*.vaultkey`); a refused key file is logged.
+        pub fn import_vaults(&self) {
+            for ns in registered_namespaces(&self.data_dir) {
+                match load_vault_keys(&self.data_dir, &ns) {
+                    Ok(keys) => {
+                        if let Ok(r) = self.import_vault(&keys) {
+                            if r.upserted + r.removed > 0 {
+                                tracing::info!(
+                                    vault = %ns,
+                                    upserted = r.upserted,
+                                    removed = r.removed,
+                                    "vault catalog imported"
+                                );
+                            }
+                        }
+                    }
+                    Err(code) => tracing::warn!(code, vault = %ns, "vault key file refused"),
+                }
+            }
+        }
+
         /// The device vault: the snapshot the daemon's own folder sync writes in its data dir,
         /// under the data dir's key (a local source: the daemon wrote it, so it verifies).
         pub fn import_device_snapshot(&self) -> Option<Result<ImportReport, &'static str>> {
-            let raw = std::fs::read(self.data_dir.join(DEVICE_SNAPSHOT_FILE)).ok()?;
+            let path = self.data_dir.join(DEVICE_SNAPSHOT_FILE);
+            let too_big = std::fs::metadata(&path).ok()?.len() > MAX_SNAPSHOT_FILE_BYTES;
+            let raw = if too_big {
+                Vec::new()
+            } else {
+                std::fs::read(&path).ok()?
+            };
             let Ok(snap) = FolderSnapshotManifest::decode_bytes(&raw) else {
                 // A file that does not decode does not verify.
                 let refused = catalog_import_decision(false, false, 0, 0);
@@ -1675,14 +2048,28 @@ pub mod catalog {
             Some(self.import_snapshot(DEVICE_FOLDER, verifies, key_matches, &snap))
         }
 
-        /// The length and mtime of every catalog file (a change triggers an import).
-        fn sources_stamp(&self) -> Option<(u64, std::time::SystemTime)> {
-            let m = std::fs::metadata(self.data_dir.join(DEVICE_SNAPSHOT_FILE)).ok()?;
-            Some((m.len(), m.modified().ok()?))
+        /// The length and mtime of every catalog file and vault key file (a change triggers an
+        /// import).
+        fn sources_stamp(&self) -> Vec<(u64, Option<std::time::SystemTime>)> {
+            let mut paths = vec![
+                self.data_dir.join(DEVICE_SNAPSHOT_FILE),
+                self.data_dir.join("zero_trust_dht_store.bin"),
+            ];
+            for ns in registered_namespaces(&self.data_dir) {
+                paths.push(vaultkey_path(&self.data_dir, &ns));
+            }
+            paths
+                .iter()
+                .map(|p| match std::fs::metadata(p) {
+                    Ok(m) => (m.len(), m.modified().ok()),
+                    Err(_) => (0, None),
+                })
+                .collect()
         }
 
         /// One import of every source this data dir holds keys for.
         pub fn import_all(&self) {
+            self.import_vaults();
             if let Some(Ok(r)) = self.import_device_snapshot() {
                 if r.upserted + r.removed > 0 {
                     tracing::info!(

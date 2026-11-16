@@ -269,7 +269,12 @@ mod b20 {
     pub fn data_dir(root: &Path, name: &str) -> PathBuf {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("macaroon_root.key"), hex::encode(ROOT_KEY)).unwrap();
+        let key = dir.join("macaroon_root.key");
+        std::fs::write(&key, hex::encode(ROOT_KEY)).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         dir
     }
 
@@ -299,17 +304,18 @@ mod b20 {
             .env_remove("PARVAULT_GENESIS_PUBKEY_HEX")
             .arg("--data-dir")
             .arg(dir)
-            .args([
-                "--no-lan-discovery",
-                "up",
-                "--no-socket",
-                "--listen",
-                common::LOOPBACK_EPHEMERAL,
-                "--vfs-webdav-listen",
-                "127.0.0.1:0",
-                "--interval-secs",
-                "1",
-            ]);
+            .args(["--no-lan-discovery", "up"]);
+        if !extra_args.contains(&"--ipc-socket") {
+            cmd.arg("--no-socket");
+        }
+        cmd.args([
+            "--listen",
+            common::LOOPBACK_EPHEMERAL,
+            "--vfs-webdav-listen",
+            "127.0.0.1:0",
+            "--interval-secs",
+            "1",
+        ]);
         if let Some(f) = folder {
             cmd.arg("--folder").arg(f);
         }
@@ -729,4 +735,315 @@ fn l72_priority_mutant_fails_the_accept_test() {
         "the mutant passed the accept test"
     );
     gate_ran("trust_enforcement_restore::l72_priority_mutant_fails_the_accept_test");
+}
+
+/// B-20 (plan 3.3): `parvault-sync` lists its catalog and pulls with a read-only token; a
+/// read-only token cannot push.
+#[cfg(unix)]
+#[test]
+fn b20_parvault_sync_read_only_listing() {
+    use b20::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    let root = tempfile::tempdir().unwrap();
+    let dir = data_dir(root.path(), "data");
+    let sock = root.path().join("gw.sock");
+    let sock_s = sock.to_str().unwrap().to_string();
+    let _d = up_with(&dir, None, &[], &["--ipc-socket", &sock_s]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !sock.exists() {
+        assert!(Instant::now() < deadline, "no gateway socket");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let folder = root.path().join("push");
+    std::fs::create_dir_all(&folder).unwrap();
+    let body: Vec<u8> = (0..200_000u32).map(|i| (i % 239) as u8).collect();
+    std::fs::write(folder.join("doc.bin"), &body).unwrap();
+    let catalog = root.path().join("catalog.bin");
+    let sync = |args: &[&str], tok: Option<&Path>| {
+        let mut cmd = Command::new(common::plugin_bin(
+            "parvault-sync",
+            env!("CARGO_BIN_EXE_parvault-sync"),
+        ));
+        cmd.arg("--data-dir")
+            .arg(&dir)
+            .arg("--socket")
+            .arg(&sock)
+            .arg("--catalog")
+            .arg(&catalog);
+        if let Some(t) = tok {
+            cmd.arg("--macaroon-file").arg(t);
+        }
+        cmd.args(args);
+        common::output_within_deadline(&mut cmd)
+    };
+    let out = sync(
+        &[
+            "push",
+            "--folder",
+            folder.to_str().unwrap(),
+            "--allow-local-only",
+        ],
+        None,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ro = root.path().join("ro.tok");
+    std::fs::write(&ro, read_token()).unwrap();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let out = sync(&["list"], Some(&ro));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && text.contains("doc.bin"), "{text}");
+    let restored = root.path().join("restored");
+    let out = sync(&["pull", "--output", restored.to_str().unwrap()], Some(&ro));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(restored.join("doc.bin")).unwrap(), body);
+    // The same read-only token cannot store.
+    std::fs::write(folder.join("new.bin"), b"not with a read token").unwrap();
+    let out = sync(
+        &[
+            "push",
+            "--folder",
+            folder.to_str().unwrap(),
+            "--allow-local-only",
+        ],
+        Some(&ro),
+    );
+    assert!(!out.status.success(), "a read-only token pushed");
+    gate_ran("trust_enforcement_restore::b20_parvault_sync_read_only_listing");
+}
+
+// --- B-20 seed vaults (archC1, L-133) -----------------------------------------------------------
+
+#[cfg(unix)]
+mod seedvault {
+    use super::b20::*;
+    use super::*;
+    use parvault::crypto::{MasterKey, NodeIdentity};
+    use parvault::storage::{BlockStore, QuotaManager};
+    use parvault::sync::{EncryptedVaultCatalogEnvelope, FolderSyncEngine};
+    use std::collections::{BTreeMap, HashMap};
+
+    pub const SEED_A: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    pub const SEED_B: &str = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
+    pub const NS: &str = "photos";
+
+    /// A seed vault's folder sync, writing shards and its catalog envelope into `dir` (the
+    /// node's data dir) as `watch-folder --seed-phrase` does.
+    pub struct Writer {
+        engine: FolderSyncEngine,
+        seed: &'static str,
+    }
+
+    impl Writer {
+        pub fn new(dir: &Path, seed: &'static str) -> Self {
+            let canonical =
+                parvault::crypto::validate_recovery_seed_phrase_or_passphrase(seed).unwrap();
+            let mk = MasterKey::from_recovery_seed_phrase(&canonical, NS);
+            let owner = NodeIdentity::from_recovery_seed_phrase(&canonical, NS);
+            let store = BlockStore::new(dir, QuotaManager::new(1 << 30, 1 << 28)).unwrap();
+            Self {
+                engine: FolderSyncEngine::new(
+                    store,
+                    mk,
+                    owner,
+                    parvault::config::ErasureTier::Consumer,
+                ),
+                seed,
+            }
+        }
+
+        /// One pass over `folder` and the exported catalog envelope.
+        pub fn pass(&mut self, folder: &Path) -> EncryptedVaultCatalogEnvelope {
+            let snap = self.engine.sync_folder_once(folder).unwrap();
+            self.engine.load_previous_snapshot(&snap);
+            self.engine
+                .export_encrypted_vault_catalog(self.seed, NS, &snap)
+                .unwrap()
+        }
+    }
+
+    /// `zero_trust_dht_store.bin`'s layout (`storage::block_store`), to plant an envelope the
+    /// way a DHT peer could hand one back.
+    #[derive(serde::Serialize, serde::Deserialize, Default)]
+    struct DhtState {
+        records: HashMap<[u8; 32], parvault::storage::SignedDhtManifestEnvelope>,
+        pq_records: HashMap<[u8; 32], parvault::crypto::PqSignedDhtManifestEnvelope>,
+        catalog_records: HashMap<[u8; 32], EncryptedVaultCatalogEnvelope>,
+    }
+
+    /// Stores `env` in `dir`'s DHT store under `key`, bypassing the store's own checks.
+    pub fn plant(dir: &Path, key: [u8; 32], env: EncryptedVaultCatalogEnvelope) {
+        let path = dir.join("zero_trust_dht_store.bin");
+        let mut st: DhtState = std::fs::read(&path)
+            .ok()
+            .and_then(|b| bincode::deserialize(&b).ok())
+            .unwrap_or_default();
+        st.catalog_records.insert(key, env);
+        std::fs::write(&path, bincode::serialize(&st).unwrap()).unwrap();
+    }
+
+    /// What a daemon could change for the vault: its shard files and the DHT store.
+    pub fn fingerprint(dir: &Path) -> BTreeMap<String, u64> {
+        let mut out = BTreeMap::new();
+        if let Ok(rd) = std::fs::read_dir(dir.join("shards")) {
+            for e in rd.filter_map(Result::ok) {
+                let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+                out.insert(e.file_name().to_string_lossy().to_string(), len);
+            }
+        }
+        let dht = std::fs::read(dir.join("zero_trust_dht_store.bin")).unwrap_or_default();
+        let h = dht.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3)
+        });
+        out.insert("zero_trust_dht_store.bin".into(), h);
+        out
+    }
+}
+
+/// VAULTKEY and B20-LIST accept for a seed vault (archC1): a registered vault's catalog is
+/// listed under `/<namespace>/` and read; across import, read and the scavenger the daemon
+/// stores, deletes, frees and publishes nothing for it (condition 2).
+#[cfg(unix)]
+#[test]
+fn b20_seed_vault_listed_and_read() {
+    use b20::*;
+    use seedvault::*;
+    let root = tempfile::tempdir().unwrap();
+    let dir = data_dir(root.path(), "data");
+    let folder = root.path().join("src");
+    std::fs::create_dir_all(&folder).unwrap();
+    let body: Vec<u8> = (0..1_500_000u32).map(|i| (i % 233) as u8).collect();
+    std::fs::write(folder.join("a.bin"), &body).unwrap();
+    std::fs::write(folder.join("b.txt"), b"seed vault b").unwrap();
+    Writer::new(&dir, SEED_A).pass(&folder);
+    let kf = parvault::vfs::register_vault_keys(&dir, SEED_A, NS).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&kf).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    let raw = std::fs::read(&kf).unwrap();
+    let mk = parvault::crypto::MasterKey::from_recovery_seed_phrase(
+        &parvault::crypto::validate_recovery_seed_phrase_or_passphrase(SEED_A).unwrap(),
+        NS,
+    );
+    assert!(
+        !raw.windows(32).any(|w| w == mk.as_bytes()),
+        "the key file holds no plaintext key"
+    );
+    let before = fingerprint(&dir);
+    let d = up(&dir, None, &[]);
+    wait_get(&d, "/photos/a.bin", "seed vault listed", |st, b| {
+        st == 200 && b == body.as_slice()
+    });
+    wait_get(&d, "/photos/b.txt", "second file", |st, b| {
+        st == 200 && b == b"seed vault b"
+    });
+    // Let the scavenger hydrate, then compare.
+    std::thread::sleep(Duration::from_secs(4));
+    let log = d.log_text();
+    d.stop();
+    assert_eq!(
+        fingerprint(&dir),
+        before,
+        "the daemon changed the vault's shards or DHT store"
+    );
+    for word in ["PutShard", "DeleteShard", "FreeShards", "put_dht_envelope"] {
+        assert!(!log.contains(word), "{word} in the log:\n{log}");
+    }
+    assert!(!log.contains(SEED_A), "the phrase is not logged");
+    gate_ran("trust_enforcement_restore::b20_seed_vault_listed_and_read");
+}
+
+/// VAULTKEY reject (archC1 condition 1): a key file renamed to another namespace is refused.
+#[cfg(unix)]
+#[test]
+fn b20_swapped_vaultkey_refused() {
+    use b20::*;
+    use seedvault::*;
+    let root = tempfile::tempdir().unwrap();
+    let dir = data_dir(root.path(), "data");
+    let folder = root.path().join("src");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.txt"), b"renamed key").unwrap();
+    Writer::new(&dir, SEED_A).pass(&folder);
+    let kf = parvault::vfs::register_vault_keys(&dir, SEED_A, NS).unwrap();
+    std::fs::rename(&kf, kf.with_file_name("music.vaultkey")).unwrap();
+    let d = up(&dir, None, &[]);
+    d.assert_logged("reject.vaultkey_mismatch");
+    for p in ["/music/a.txt", "/photos/a.txt"] {
+        let (st, _) = http(&d.webdav, "GET", p, &read_token(), &[]);
+        assert_eq!(st, 404, "{p}");
+    }
+    gate_ran("trust_enforcement_restore::b20_swapped_vaultkey_refused");
+}
+
+/// B20-LIST reject for a seed vault (archC1 condition 3): a validly signed catalog of another
+/// owner at the vault's DHT key is not imported.
+#[cfg(unix)]
+#[test]
+fn b20_seed_vault_foreign_catalog_refused() {
+    use b20::*;
+    use seedvault::*;
+    let root = tempfile::tempdir().unwrap();
+    let dir = data_dir(root.path(), "data");
+    let other = root.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let folder = root.path().join("src");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.txt"), b"not your vault").unwrap();
+    let env_b = Writer::new(&other, SEED_B).pass(&folder);
+    assert!(env_b.verify_zero_knowledge());
+    parvault::vfs::register_vault_keys(&dir, SEED_A, NS).unwrap();
+    let mk_a = parvault::crypto::MasterKey::from_recovery_seed_phrase(
+        &parvault::crypto::validate_recovery_seed_phrase_or_passphrase(SEED_A).unwrap(),
+        NS,
+    );
+    plant(&dir, mk_a.derive_vault_root_dht_key(NS), env_b);
+    let d = up(&dir, None, &[]);
+    d.assert_logged("reject.catalog_foreign");
+    let (st, _) = http(&d.webdav, "GET", "/photos/a.txt", &read_token(), &[]);
+    assert_eq!(st, 404);
+    gate_ran("trust_enforcement_restore::b20_seed_vault_foreign_catalog_refused");
+}
+
+/// B20-LIST-RB reject for a seed vault: after version 2 was applied, version 1 is a rollback,
+/// also after a restart.
+#[cfg(unix)]
+#[test]
+fn b20_seed_vault_rollback_refused() {
+    use b20::*;
+    use seedvault::*;
+    let root = tempfile::tempdir().unwrap();
+    let dir = data_dir(root.path(), "data");
+    let folder = root.path().join("src");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.txt"), b"vault v1").unwrap();
+    let mut w = Writer::new(&dir, SEED_A);
+    let env1 = w.pass(&folder);
+    std::fs::write(folder.join("a.txt"), b"vault v2").unwrap();
+    let env2 = w.pass(&folder);
+    assert!(env2.monotonic_version > env1.monotonic_version);
+    drop(w);
+    parvault::vfs::register_vault_keys(&dir, SEED_A, NS).unwrap();
+    let d = up(&dir, None, &[]);
+    wait_get(&d, "/photos/a.txt", "v2", |st, b| {
+        st == 200 && b == b"vault v2"
+    });
+    d.stop();
+    let key = env1.dht_key;
+    plant(&dir, key, env1);
+    let d = up(&dir, None, &[]);
+    d.assert_logged("reject.catalog_rollback");
+    let (st, body) = http(&d.webdav, "GET", "/photos/a.txt", &read_token(), &[]);
+    assert_ne!((st, body.as_slice()), (200, &b"vault v1"[..]));
+    gate_ran("trust_enforcement_restore::b20_seed_vault_rollback_refused");
 }

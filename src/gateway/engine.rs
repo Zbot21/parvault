@@ -353,6 +353,60 @@ mod unix_engine {
         bytes_served_lan: AtomicU64,
         /// Last snapshot the daemon published for `QueryStatus` (item 3); `None` refuses it.
         status_snapshot: RwLock<Option<crate::gateway::ipc::StatusSnapshot>>,
+        /// B-20 (archC1): readers of registered seed vaults, by file Merkle root.
+        vault_readers: RwLock<HashMap<[u8; 32], Arc<VaultReader>>>,
+    }
+
+    /// B-20 (archC1 condition 2): what the daemon holds for a registered seed vault. It can
+    /// only decrypt the vault's stripes and sign the owner read tokens its shard reads carry:
+    /// its one method reads a plaintext range. Nothing here stores, deletes, frees or
+    /// publishes.
+    pub struct VaultReader {
+        master_key: MasterKey,
+        store: BlockStore,
+    }
+
+    impl VaultReader {
+        /// A reader over `base`'s shards whose network reads sign as `owner`.
+        pub fn new(master_key: MasterKey, owner: &NodeIdentity, base: &BlockStore) -> Self {
+            Self {
+                master_key,
+                store: base.clone().with_owner_mesh_identity(owner),
+            }
+        }
+
+        fn read_range<W: std::io::Write>(
+            &self,
+            fm: &FileManifest,
+            offset: u64,
+            len: u64,
+            out: &mut W,
+        ) -> anyhow::Result<u64> {
+            read_admitted(&self.store, &self.master_key, fm, offset, len, out)
+        }
+    }
+
+    /// L-72 (S2): reads `[offset, offset + len)` of `fm` stripe by stripe, each admitted by the
+    /// fetch scheduler before it is read.
+    fn read_admitted<W: std::io::Write>(
+        store: &BlockStore,
+        key: &MasterKey,
+        fm: &FileManifest,
+        offset: u64,
+        len: u64,
+        out: &mut W,
+    ) -> anyhow::Result<u64> {
+        let end = offset.saturating_add(len).min(fm.original_file_size);
+        let stripe_sz = fm.stripe_size_bytes.max(1) as u64;
+        let mut streamed = 0u64;
+        let mut at = offset;
+        while at < end {
+            let stripe_end = (at / stripe_sz + 1).saturating_mul(stripe_sz).min(end);
+            let _slot = crate::fetch_sched::global().admit();
+            streamed += store.read_plaintext_range(fm, key, at, stripe_end - at, out)?;
+            at = stripe_end;
+        }
+        Ok(streamed)
     }
 
     impl GatewayEngine {
@@ -396,6 +450,7 @@ mod unix_engine {
                 require_sealed_ingest_memfd: AtomicBool::new(false),
                 by_merkle_root: RwLock::new(HashMap::new()),
                 status_snapshot: RwLock::new(None),
+                vault_readers: RwLock::new(HashMap::new()),
                 by_shard_vec_hash: RwLock::new(HashMap::new()),
                 pinned_ring: RwLock::new(PinnedRingBudget::new(DEFAULT_PINNED_RING_MAX_BYTES)),
                 ops_counter: AtomicU64::new(0),
@@ -457,6 +512,7 @@ mod unix_engine {
                 require_sealed_ingest_memfd: AtomicBool::new(cfg.require_sealed_ingest_memfd),
                 by_merkle_root: RwLock::new(HashMap::new()),
                 status_snapshot: RwLock::new(None),
+                vault_readers: RwLock::new(HashMap::new()),
                 by_shard_vec_hash: RwLock::new(HashMap::new()),
                 pinned_ring: RwLock::new(PinnedRingBudget::new(DEFAULT_PINNED_RING_MAX_BYTES)),
                 ops_counter: AtomicU64::new(0),
@@ -684,6 +740,19 @@ mod unix_engine {
         /// B-20: indexes a manifest from an imported vault catalog in RAM only (the catalog is
         /// its persistent home), so `FetchRange` resolves it.
         pub fn index_catalog_manifest(&self, fm: FileManifest) -> EphemeralShardManifest {
+            self.index_manifest_in_ram(fm)
+        }
+
+        /// B-20 (archC1): reads of `fm` decrypt with `reader`'s vault key and sign as the
+        /// vault owner; indexes `fm` in RAM like [`Self::index_catalog_manifest`].
+        pub fn index_vault_manifest(
+            &self,
+            fm: FileManifest,
+            reader: Arc<VaultReader>,
+        ) -> EphemeralShardManifest {
+            if let Ok(mut g) = self.vault_readers.write() {
+                g.insert(fm.file_merkle_root, reader);
+            }
             self.index_manifest_in_ram(fm)
         }
 
@@ -1026,27 +1095,34 @@ mod unix_engine {
                 return Ok(0);
             }
 
+            let reader = self
+                .vault_readers
+                .read()
+                .ok()
+                .and_then(|g| g.get(&fm.file_merkle_root).cloned());
+            if let Some(reader) = reader {
+                use std::io::{Seek, SeekFrom};
+                let _ = out_file.set_len(0);
+                let _ = out_file.seek(SeekFrom::Start(0));
+                let streamed = reader.read_range(fm, offset, len, &mut out_file)?;
+                let _ = out_file.seek(SeekFrom::Start(0));
+                self.ops_counter.fetch_add(1, Ordering::Relaxed);
+                self.bytes_served_lan.fetch_add(streamed, Ordering::Relaxed);
+                return Ok(streamed);
+            }
+
             if self.peers.is_empty() && self.block_store.mesh_client().is_some() {
                 use std::io::{Seek, SeekFrom};
                 let _ = out_file.set_len(0);
                 let _ = out_file.seek(SeekFrom::Start(0));
-                // L-72 (S2): each stripe is admitted by the fetch scheduler before it is read.
-                let end = offset.saturating_add(len).min(fm.original_file_size);
-                let stripe_sz = fm.stripe_size_bytes.max(1) as u64;
-                let mut streamed = 0u64;
-                let mut at = offset;
-                while at < end {
-                    let stripe_end = (at / stripe_sz + 1).saturating_mul(stripe_sz).min(end);
-                    let _slot = crate::fetch_sched::global().admit();
-                    streamed += self.block_store.read_plaintext_range(
-                        fm,
-                        &self.master_key,
-                        at,
-                        stripe_end - at,
-                        &mut out_file,
-                    )?;
-                    at = stripe_end;
-                }
+                let streamed = read_admitted(
+                    &self.block_store,
+                    &self.master_key,
+                    fm,
+                    offset,
+                    len,
+                    &mut out_file,
+                )?;
                 let _ = out_file.seek(SeekFrom::Start(0));
                 self.ops_counter.fetch_add(1, Ordering::Relaxed);
                 self.bytes_served_lan.fetch_add(streamed, Ordering::Relaxed);
@@ -1349,4 +1425,4 @@ mod unix_engine {
 }
 
 #[cfg(unix)]
-pub use unix_engine::GatewayEngine;
+pub use unix_engine::{GatewayEngine, VaultReader};
