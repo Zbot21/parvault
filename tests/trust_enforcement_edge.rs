@@ -909,3 +909,90 @@ fn unbuilt_start_flags_refuse_before_any_file() {
     }
     gate_ran("trust_enforcement_edge::unbuilt_start_flags_refuse_before_any_file");
 }
+
+/// WEBDAV-PATH accept: a name with a space and a non-ASCII letter is served by its encoded path,
+/// and every PROPFIND href is the listed collection plus one encoded segment (no `..`, nothing
+/// outside it).
+#[test]
+fn webdav_encoded_path_served() {
+    let tmp = tempfile::tempdir().unwrap();
+    let files = vec![
+        ("My File ü.txt", b"spaced\n".to_vec()),
+        ("f.bin", pattern(1024, 4)),
+    ];
+    let e = edge_common::plugin_edge(fuse_cmd(), &tmp.path().join("node"), "0.0.0.0:0", &files);
+    let (addr, cfg, t) = (e.addr, e.client(), e.read_token());
+    let r = tls_once(
+        addr,
+        &cfg,
+        &req("GET", "/My%20File%20%C3%BC.txt", addr, Some(&t), ""),
+    );
+    assert_eq!(
+        (r.status(), r.body.as_slice()),
+        (200, &b"spaced\n"[..]),
+        "{}",
+        r.head
+    );
+    let r = tls_once(
+        addr,
+        &cfg,
+        &req("PROPFIND", "/", addr, Some(&t), "Depth: 1\r\n"),
+    );
+    assert_eq!(r.status(), 207, "{}", r.head);
+    let text = r.text();
+    let hrefs: Vec<&str> = text
+        .split("<D:href>")
+        .skip(1)
+        .filter_map(|h| h.split("</D:href>").next())
+        .collect();
+    assert!(hrefs.contains(&"/My%20File%20%C3%BC.txt"), "{hrefs:?}");
+    for h in &hrefs {
+        assert!(
+            h.starts_with('/') && !h.contains("..") && !h.contains("//"),
+            "{h}"
+        );
+    }
+    assert!(text.contains("<D:getlastmodified>"), "{text}");
+    gate_ran("trust_enforcement_edge::webdav_encoded_path_served");
+}
+
+/// WEBDAV-PATH reject (Lead security condition): a target decoded once that holds a `.` or `..`
+/// segment, a NUL, a decoded `/` or a backslash in a segment, a double encoding, or a bad escape
+/// is answered 400 before auth, logged as `reject.webdav_path_invalid`; nothing is looked up.
+#[test]
+fn webdav_traversal_paths_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let e = tls_edge(&tmp.path().join("node"));
+    let (addr, cfg, t) = (e.addr, e.client(), e.read_token());
+    for path in [
+        "/%2e%2e/",
+        "/a/..%2f..%2fetc",
+        "/../f.bin",
+        "/./f.bin",
+        "/%2E%2E/f.bin",
+        "/%00",
+        "/f.bin%00",
+        "/%252e%252e",
+        "/%252e%252e/f.bin",
+        "/a%2Fb",
+        "/a%5Cb",
+        "/a\\b",
+        "/f%2",
+        "/f%zz",
+    ] {
+        for method in ["GET", "PROPFIND"] {
+            let r = tls_once(
+                addr,
+                &cfg,
+                &req(method, path, addr, Some(&t), "Depth: 1\r\n"),
+            );
+            assert_eq!(r.status(), 400, "{method} {path}: {}", r.head);
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !e.log_text().contains("reject.webdav_path_invalid") {
+        assert!(Instant::now() < deadline, "{}", e.log_text());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    gate_ran("trust_enforcement_edge::webdav_traversal_paths_refused");
+}

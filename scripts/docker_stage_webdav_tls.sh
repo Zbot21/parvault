@@ -64,7 +64,7 @@ chmod +x "$CTX/parvault"
 cat > "$CTX/Dockerfile" <<'EOF'
 FROM ubuntu:24.04
 RUN apt-get update -o Acquire::Retries=3 \
-    && apt-get install -y --no-install-recommends davfs2 curl ca-certificates \
+    && apt-get install -y --no-install-recommends davfs2 curl ca-certificates busybox-syslogd \
     && rm -rf /var/lib/apt/lists/*
 COPY parvault /usr/local/bin/parvault
 RUN printf 'parvault:x:65532:65532:parvault:/var/lib/parvault:/usr/sbin/nologin\n' >> /etc/passwd \
@@ -145,15 +145,17 @@ if [ -c /dev/fuse ]; then
     chmod 0644 "$TMP/pv.pem"
     docker create --name "$DAVFS_WAIVED" --label "$LABEL" --network "$NET" --user 0:0 \
         --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined \
-        -v "$SEED:/seed:ro" -v "$TMP/pv.pem:/etc/davfs2/certs/pv.pem:ro" -v "$TMP/secrets:/run/secrets.in:ro" \
+        -v "$SEED:/seed:ro" -v "$TMP/pv.pem:/etc/davfs2/certs/pv.pem:ro" -v "$TMP/secrets:/run/secrets.in:ro" -e DAVFS_DEBUG="${DAVFS_DEBUG:-}" \
         --entrypoint sh "$IMG" -c '
           set -e
+          syslogd -n -O /tmp/sys.log & sleep 0.3
           install -m 0600 /run/secrets.in /etc/davfs2/secrets
+          if [ -n "${DAVFS_DEBUG:-}" ]; then echo "debug most" >> /etc/davfs2/davfs2.conf; fi
           echo "trust_ca_cert pv.pem" >> /etc/davfs2/davfs2.conf
           echo "use_locks 0" >> /etc/davfs2/davfs2.conf
           mkdir -p /mnt/vault
           mount -t davfs "'"https://$EDGE_IP:8443/"'" /mnt/vault -o ro
-          ls -la /mnt/vault
+          ls -la /mnt/vault || { sleep 1; tail -80 /tmp/sys.log; exit 4; }
           for f in notes.txt readme.txt photo.bin video.bin; do cmp /mnt/vault/$f /seed/$f; done
           if touch /mnt/vault/new.txt 2>/dev/null; then echo "write allowed"; exit 3; fi
           umount /mnt/vault

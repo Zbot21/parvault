@@ -396,7 +396,26 @@ mod unix_webdav {
         };
         let mut parts = request_line.split_whitespace();
         let method = parts.next().unwrap_or("GET");
-        let raw_path = parts.next().unwrap_or("/");
+        let target = parts.next().unwrap_or("/");
+        // The target as the VFS names it: the query dropped, each segment percent-decoded once
+        // (clients send `My%20File.txt`) and checked (`webdav_path_segments`). Lookups use only
+        // those segments under the vault root; the raw target never reaches a lookup or the
+        // filesystem. A target that fails the check is a 400 before auth.
+        let segments = match webdav_path_segments(target.split('?').next().unwrap_or("/")) {
+            Ok(s) => s,
+            Err(code) => {
+                let peer = stream
+                    .peer_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
+                tracing::warn!(code, peer = %peer, "refused a WebDAV request path");
+                stream.write_all(crate::http_edge::RESP_400)?;
+                stream.flush()?;
+                return Ok(Next::Close);
+            }
+        };
+        let normalized = format!("/{}", segments.join("/"));
+        let raw_path = normalized.as_str();
 
         let mut range_header: Option<(u64, Option<u64>)> = None;
         let mut authorization: Option<&str> = None;
@@ -508,18 +527,65 @@ mod unix_webdav {
                     v.extend(vfs.readdir(node.ino));
                     v
                 } else {
-                    vec![node]
+                    vec![node.clone()]
+                };
+                // RFC 4918 hrefs: the full path of each member, percent-encoded, a collection's
+                // ending in `/`; and the properties davfs2 and WebClient read (a missing
+                // `getlastmodified` makes davfs2 refuse the listing).
+                let base = {
+                    let trimmed = raw_path.trim_matches('/');
+                    if trimmed.is_empty() {
+                        String::from("/")
+                    } else {
+                        format!("/{}/", encode_path(trimmed))
+                    }
                 };
                 for item in entries {
-                    let href = if item.ino == VFS_ROOT_INO {
-                        "/".to_string()
+                    // A member href is the listed collection plus one encoded segment; a name
+                    // that could step out of it (`.`, `..`, a separator) is never listed.
+                    if item.ino != node.ino
+                        && (item.name.is_empty()
+                            || item.name == "."
+                            || item.name == ".."
+                            || item.name.contains(['/', '\\', '\0']))
+                    {
+                        continue;
+                    }
+                    let href = if item.ino == node.ino {
+                        if item.is_dir {
+                            base.clone()
+                        } else {
+                            base.trim_end_matches('/').to_string()
+                        }
+                    } else if item.is_dir {
+                        format!("{base}{}/", encode_segment(&item.name))
                     } else {
-                        format!("/{}", item.name)
+                        format!("{base}{}", encode_segment(&item.name))
                     };
-                    let res_type = if item.is_dir { "<D:collection/>" } else { "" };
+                    let (res_type, length, ctype) = if item.is_dir {
+                        ("<D:collection/>", String::new(), "httpd/unix-directory")
+                    } else {
+                        (
+                            "",
+                            format!(
+                                "<D:getcontentlength>{}</D:getcontentlength>",
+                                item.size_bytes
+                            ),
+                            "application/octet-stream",
+                        )
+                    };
+                    let display = if item.ino == VFS_ROOT_INO {
+                        ""
+                    } else {
+                        item.name.as_str()
+                    };
                     xml.push_str(&format!(
-                        "<D:response><D:href>{href}</D:href><D:propstat><D:prop><D:resourcetype>{res_type}</D:resourcetype><D:getcontentlength>{}</D:getcontentlength></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>",
-                        item.size_bytes
+                        "<D:response><D:href>{href}</D:href><D:propstat><D:prop><D:resourcetype>{res_type}</D:resourcetype>{length}<D:displayname>{}</D:displayname><D:getlastmodified>{}</D:getlastmodified><D:getetag>\"{:x}-{:x}-{:x}\"</D:getetag><D:getcontenttype>{ctype}</D:getcontenttype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>",
+                        xml_escape(display),
+                        http_date(item.mtime_unix_secs),
+                        item.ino,
+                        item.size_bytes,
+                        item.mtime_unix_secs,
                     ));
                 }
                 xml.push_str("</D:multistatus>");
@@ -611,6 +677,158 @@ mod unix_webdav {
         }
         stream.flush()?;
         Ok(Next::Continue)
+    }
+
+    /// The segments of a request path (QA of the davfs2 fix, Lead security condition): each
+    /// `/`-separated segment percent-decoded exactly once. Refused (`reject.webdav_path_invalid`):
+    /// a malformed escape, non-UTF-8, a NUL, a `.` or `..` segment, a decoded `/` (`%2F`) or a
+    /// backslash in a segment, and a segment that still holds a `%XX` escape after the decode
+    /// (double encoding, `%252e`). Empty segments (`//`, a trailing `/`) are dropped.
+    pub(super) fn webdav_path_segments(target: &str) -> Result<Vec<String>, &'static str> {
+        const BAD: &str = "reject.webdav_path_invalid";
+        if !target.starts_with('/') {
+            return Err(BAD);
+        }
+        let mut out = Vec::new();
+        for raw in target.split('/').filter(|s| !s.is_empty()) {
+            let seg = percent_decode_segment(raw).ok_or(BAD)?;
+            let still_encoded = seg
+                .as_bytes()
+                .windows(3)
+                .any(|w| w[0] == b'%' && w[1].is_ascii_hexdigit() && w[2].is_ascii_hexdigit());
+            if seg == "." || seg == ".." || seg.contains(['/', '\\', '\0']) || still_encoded {
+                return Err(BAD);
+            }
+            out.push(seg);
+        }
+        Ok(out)
+    }
+
+    /// Decodes the `%XX` escapes of one segment; `None` for a malformed escape or non-UTF-8.
+    fn percent_decode_segment(p: &str) -> Option<String> {
+        let b = p.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'%' {
+                let hex = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+                if !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+                    return None;
+                }
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 3;
+            } else {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).ok()
+    }
+
+    /// Percent-encodes one path segment (RFC 3986 unreserved characters stay).
+    pub(super) fn encode_segment(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for &c in s.as_bytes() {
+            if c.is_ascii_alphanumeric() || b"-._~".contains(&c) {
+                out.push(c as char);
+            } else {
+                out.push_str(&format!("%{c:02X}"));
+            }
+        }
+        out
+    }
+
+    /// [`encode_segment`] for each segment of a `/`-separated path.
+    pub(super) fn encode_path(p: &str) -> String {
+        p.split('/')
+            .map(encode_segment)
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    pub(super) fn xml_escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    }
+
+    /// An RFC 1123 date (`Sun, 06 Nov 1994 08:49:37 GMT`), for `getlastmodified`.
+    pub(super) fn http_date(unix_secs: u64) -> String {
+        const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let days = (unix_secs / 86_400) as i64;
+        let rem = unix_secs % 86_400;
+        // H. Hinnant's civil_from_days.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        format!(
+            "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+            DAYS[(days.rem_euclid(7)) as usize],
+            d,
+            MONTHS[(m - 1) as usize],
+            y,
+            rem / 3600,
+            (rem % 3600) / 60,
+            rem % 60
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn dates_paths_and_escapes() {
+            assert_eq!(http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
+            assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+            assert_eq!(
+                webdav_path_segments("/dir/My%20File.txt"),
+                Ok(vec!["dir".to_string(), "My File.txt".to_string()])
+            );
+            assert_eq!(webdav_path_segments("//a//"), Ok(vec!["a".to_string()]));
+            assert_eq!(webdav_path_segments("/"), Ok(vec![]));
+            assert_eq!(
+                webdav_path_segments("/f%2Ebin"),
+                Ok(vec!["f.bin".to_string()])
+            );
+            for bad in [
+                "/%2e%2e/",
+                "/a/..%2f..%2fetc",
+                "/..",
+                "/a/../b",
+                "/./f",
+                "/%2E",
+                "/a%00b",
+                "/%00",
+                "/%252e%252e",
+                "/a%2Fb",
+                "/a%5Cb",
+                "/a\\b",
+                "/a%2",
+                "/a%zz",
+                "/%C3%28",
+                "relative",
+            ] {
+                assert_eq!(
+                    webdav_path_segments(bad),
+                    Err("reject.webdav_path_invalid"),
+                    "{bad}"
+                );
+            }
+            assert_eq!(encode_segment("My File+ü.txt"), "My%20File%2B%C3%BC.txt");
+            assert_eq!(encode_path("a b/c"), "a%20b/c");
+            assert_eq!(xml_escape("<a&b>"), "&lt;a&amp;b&gt;");
+        }
     }
 }
 
