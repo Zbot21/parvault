@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+- **Track E (`v0.5.6`): one-service setup, the data-dir lock and an encrypted ring backup.** A data dir now serves one process: `up` and `daemon start` hold an exclusive lock on `<data>/.parvault.lock` from before they write anything until they exit, and `wot init`, `wot install-chain`, `ring backup` and `ring restore` take it too (`reject.datadir_locked`, B-174). `up --init-if-absent` starts a ring on an empty volume, is a no-op on its own ring, completes an init killed between its two writes, and refuses anything else (`reject.init_volume_not_empty`, `reject.init_partial_state`); the Synology `compose.yaml` is now one service, with no exited `init` container (B-146 item 8). `up --join-token-file` joins from a `0600` file, once, and always wins over `--init-if-absent`; `PARVAULT_JOIN_TOKEN` is refused. `wot invite --out` writes the token `0600` and prints only the path. `parvault ring backup` / `ring restore` (B-169): Argon2id with a random salt then HKDF-SHA256, XChaCha20-Poly1305, a fixed header as AAD (v1 fixture checked in); the vault master key and the per-vault version floors are in the bundle, and the gateway token key, the TLS key and the per-vault keys (`vaults/*.vaultkey`) are not; a restore needs an empty data dir and `--confirm-move`, and is crash-safe. A placeholder join token now says `not a token: paste the token from the ring holder's invite log` (B-155). Upgrade: the busybox tar backup of the `v0.5.5` guide is replaced by `ring backup` (`docs/SYNOLOGY.md` step 5); delete old unencrypted tars.
+
 ---
 
 ## [`0.5.5`] - 2026-11-16

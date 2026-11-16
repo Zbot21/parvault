@@ -17,7 +17,7 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)
 DOC="$REPO/docs/DOCKER.md"
 DIST=$(cd "${1:?usage: test_docker_doc.sh <dist dir>}" && pwd)
 ID="pvdd-$$"
-# shellcheck source=lib_test_slots.sh
+# shellcheck source=scripts/lib_test_slots.sh
 source "$(dirname "$0")/lib_test_slots.sh"
 if [[ -n "${PORT_BASE:-}" ]]; then PB=$PORT_BASE; else pick_port_base doc 4201 10 10 || exit 1; fi
 WORK=$(mktemp -d)
@@ -51,6 +51,7 @@ run() {
   if [[ $node == a ]]; then port=$PB; peers="127.0.0.1:$((PB + 1))"; else port=$((PB + 1)); peers="127.0.0.1:$PB"; fi
   {
     echo 'set -euo pipefail'
+    # shellcheck disable=SC2016  # written into the generated script verbatim, expanded there
     echo 'docker() { if [[ "$1" == run ]]; then shift; command docker run -e PARVAULT_NO_LAN_DISCOVERY=1 "$@"; else command docker "$@"; fi; }'
     echo "IMG=${RUN_IMG:-$IMG} VOL=$ID-$node NAME=$ID-$node PORT=$port PEERS=$peers CHECK=$WORK/check-$node BACKUP=$WORK/backup-$node"
     echo "$pre"
@@ -102,7 +103,7 @@ ok "join: node b ($K) joined ring $G, healthy on tcp/$((PB + 1)) with --peers 12
 
 # 5. store and restore from node b
 out=$(run b roundtrip)
-grep -q 'Restore Verified' <<<"$out" && grep -qx 'byte-identical' <<<"$out" || fail "roundtrip: $out"
+if ! { grep -q 'Restore Verified' <<<"$out" && grep -qx 'byte-identical' <<<"$out"; }; then fail "roundtrip: $out"; fi
 for n in a b; do
   command docker logs "$ID-$n" 2>&1 | grep -q 'Kademlia routing table updated' || fail "$ID-$n logged no Kademlia update"
 done
@@ -118,5 +119,5 @@ ok "upgrade: node b replaced, healthy, still in the ring (a second round trip pa
 run b remove >/dev/null
 command docker volume inspect "$ID-b" >/dev/null 2>&1 && fail "remove left the volume"
 [[ -n "$(ls -A "$WORK/backup-b/$ID-b-backup")" ]] || fail "remove made no backup"
-ok "remove: node b stopped, copied ($(ls "$WORK/backup-b/$ID-b-backup" | wc -l) entries), container and volume gone"
+ok "remove: node b stopped, copied ($(find "$WORK/backup-b/$ID-b-backup" -mindepth 1 -maxdepth 1 | wc -l) entries), container and volume gone"
 echo "test_docker_doc: PASS ($IMG)"

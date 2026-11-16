@@ -8,11 +8,11 @@ Three compose files ship, one per role:
 
 | File | Use it on | What it does |
 |---|---|---|
-| [`deploy/synology/compose.yaml`](../deploy/synology/compose.yaml) | the first node | starts a new ring (`init`), runs the daemon, issues invites |
+| [`deploy/synology/compose.yaml`](../deploy/synology/compose.yaml) | the first node | one service: the daemon starts a new ring on an empty volume (`up --init-if-absent`), then runs; issues invites |
 | [`deploy/synology/join.compose.yaml`](../deploy/synology/join.compose.yaml) | every other NAS | prints its key (`identity`), installs a token (`install-chain`), runs the daemon |
 | [`deploy/docker/compose.yaml`](../deploy/docker/compose.yaml) | a Linux or Docker Desktop host | the same join, with `--peers` and a non-default `--listen` port |
 
-`scripts/test_compose_projects.sh` runs all three on a real Docker host with the real image: first start, rebuild, join, a store and byte-identical restore, and the invite race described in step 4.
+`scripts/test_compose_projects.sh` runs all three on a real Docker host with the real image: first start, rebuild, join, a store and byte-identical restore, the invite described in step 4, and the encrypted ring backup and restore of step 5 in the documented order.
 
 ## 1. Verify the download
 
@@ -50,11 +50,11 @@ Every service in the shipped files has `pull_policy: never`. Without it, a misty
 
 1. In File Station, make a folder, for example `docker/parvault`, and copy `deploy/synology/compose.yaml` into it.
 2. Set every `image:` line in it to the tag from step 2.
-3. Container Manager > **Project** > Create. Do not use the Container wizard: it cannot run the one-shot service beside the daemon on one volume. Choose the folder, use the existing `compose.yaml`, and build.
+3. Container Manager > **Project** > Create. Choose the folder, use the existing `compose.yaml`, and build.
 
-On the first build, `init` creates the ring and exits 0. Its Log tab says `Started a new ring. Genesis public key: <64 hex>`. The daemon, `parvault`, turns healthy within about a minute (about 5 s on the test host).
+The project has one service, the daemon `parvault`. On the first build the volume is empty, so the daemon creates the ring before it starts (`up --init-if-absent`): its Log tab says `Started a new ring. Genesis public key: <64 hex>`. It turns healthy within about a minute (about 5 s on the test host). On every later start it finds its ring and just runs. Nothing is left behind as an exited container.
 
-On every later start, `init` runs again, logs `Error: Invalid key or hex encoding: this node is already in the ring <key>` (from 0.5.5 the `Invalid key or hex encoding:` prefix is dropped) and exits 1. That is harmless: it refuses before writing anything. Container Manager shows it as stopped.
+`--init-if-absent` never starts a second ring over data it does not know: a volume that holds anything but its own ring (and `lost+found`, `@eaDir`) is refused with `reject.init_volume_not_empty` and left as it is. One data dir serves one process: a second daemon or a `wot` command on the same volume while the daemon runs is refused (`reject.datadir_locked`).
 
 ## 4. Add a node
 
@@ -71,7 +71,7 @@ Each new node needs a token from the first node, issued for the new node's key.
 
 Once the node has joined, you can delete its `invite-*` service on the first node. Left in place it prints a token on every start, which is harmless: a token admits only the key it names.
 
-**Why the invite waits for a healthy daemon.** An invite reads the ring's genesis, which `init` writes on the very first start. Started beside `init` on a fresh volume, an invite can run first and fail with `this node does not hold a ring genesis`. So the example invite has `depends_on: parvault: condition: service_healthy`: the daemon only runs, and so only turns healthy, once the ring exists. It does not use `init` with `service_completed_successfully`, because `init` exits 1 on every later start and would block those starts. Both the race and the fix are covered by the test script.
+**Why the invite waits for a healthy daemon.** An invite reads the ring's genesis, which the daemon writes on the very first start. Started beside it on a fresh volume, an invite can run first and fail with `this node does not hold a ring genesis`. So the example invite has `depends_on: parvault: condition: service_healthy`: the daemon turns healthy only once the ring exists. The test script covers it.
 
 **A node on another Docker host** (a Linux server, a desktop with Docker): follow [DOCKER.md](DOCKER.md), or use `deploy/docker/compose.yaml` with `docker compose up -d` in the same three steps. Read the key with `docker compose logs identity`. Set `--peers` to the first node's LAN address and port (`<NAS IP>:4001`); LAN discovery does not reach into Docker Desktop or WSL2. Its example `--listen` port is TCP 4011, for a host where 4001 is taken. It uses the image's own healthcheck. Do not add `--health-cmd` or a shell-form `healthcheck:`: the image has no shell, so those always fail.
 
@@ -82,73 +82,76 @@ Once the node has joined, you can delete its `invite-*` service on the first nod
 - **No volume in the UI.** Data lives in the named volume `parvault-data`, which starts owned by `65532:65532`. Container Manager does not list named volumes, but it is there and survives rebuilds.
 - **Deleting a project can delete its data.** Deleting a project in Container Manager can remove its volume, and with it the node's keys and ring membership. To change a project, stop it, edit `compose.yaml`, and build. Never delete the first node's project: its volume holds the ring genesis, which every invite needs.
 
-**Back up the first node's volume (UI only).** `parvault-data` holds the node's keys and, on the first node, the ring genesis secret, which every invite needs. Without a copy, losing it ends the ring. Make one once, and again after any change of ring. The copy is one tar file; a restore is a second project.
+**Encrypted ring backup (UI only).** `parvault-data` holds the node's keys and, on the first node, the ring genesis secret, which every invite needs. Without a copy, losing it ends the ring. `parvault ring backup` writes one encrypted file of what makes this node itself: the ring genesis and its pin, the node key, its chains, the council files, the PQ keys, `config.toml`, each vault's catalog version floor and the vault master key. It leaves out the gateway token key (a restore would revive every token ever issued), the TLS key, the per-vault keys (your seed phrase recovers them), and the quota, audit and shard state. The file is Argon2id-protected (64 MiB, 3 passes) with a passphrase of at least 20 characters and XChaCha20-Poly1305; without the passphrase it is useless. Make one once, and again after any change of ring.
 
-Both projects use `busybox`, because the ParVault image has no shell and no `tar`. It is a one-time manual pull, by digest so the project never fetches anything else: in Container Manager > Registry, search `busybox`, download the tag `1.37.0`, then check in Image that it is the one pinned below. Compare the image's **RepoDigest** (the multi-arch index digest `sha256:a7dbc319...`) in the image details, not the image ID: on a classic-store Docker the image ID is the config digest and differs. If you pull a different version, put that image's digest in both `image:` lines. `pull_policy: never` stops Compose from fetching on its own.
+*The passphrase (once per NAS).* The backup reads the passphrase from a file owned by the container user with mode `0600`, which File Station cannot make. A one-shot `busybox` project installs it into its own volume, `parvault-secrets`. Pull `busybox` once by digest: in Container Manager > Registry, search `busybox`, download the tag `1.37.0`, then check in Image that its **RepoDigest** is the one pinned below (the multi-arch index digest `sha256:a7dbc319...`), not the image ID.
 
-*Export*
-
-1. Control Panel > Shared Folder > Create a folder, for example `parvault-backup`. Give only your own account Read/Write and everyone else No access; leave "Hide this shared folder in My Network Places" on. Do not enable a recycle bin or a share to other users.
-2. **Stop the `parvault` project** (Project > Action > Stop), so the store database is not being written while it is copied.
-3. Make a second project (folder `docker/parvault-export`) from this `compose.yaml`, and build it:
+1. Make a shared folder `parvault-secrets-in` that only your account can read. Put a text file `passphrase.txt` in it holding the passphrase (at least 20 characters; one trailing newline is ignored).
+2. Make a project (folder `docker/parvault-passphrase`) from this `compose.yaml` and build it. It prints `installed`. Then delete `passphrase.txt` and keep the passphrase somewhere other than this NAS. Stop the project, but **do not delete it**: deleting it can delete `parvault-secrets`.
 
 ```yaml
-name: parvault-export
+name: parvault-passphrase
 services:
-  export:
+  passphrase:
     image: busybox@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec   # busybox 1.37.0
     pull_policy: never
     network_mode: none
     restart: "no"
     read_only: true
     cap_drop: [ALL]
-    cap_add: [DAC_OVERRIDE]    # to read files owned by 65532
+    cap_add: [CHOWN, DAC_OVERRIDE]   # to read your file and hand the copy to the container user
     security_opt: ["no-new-privileges:true"]
-    command: ["sh", "-c", "umask 077 && tar -cf /backup/parvault-data.tar -C /data . && echo exported"]
+    command: ["sh", "-c", "umask 077 && cp /in/passphrase.txt /secrets/passphrase && chmod 0600 /secrets/passphrase && chown 65532:65532 /secrets/passphrase && echo installed"]
     volumes:
-      - parvault-data:/data:ro
+      - parvault-secrets:/secrets
+      - /volume1/parvault-secrets-in:/in:ro
+volumes:
+  parvault-secrets:
+    name: parvault-secrets
+```
+
+*Backup.*
+
+1. Make a shared folder `parvault-backup` for the backup files. Give only your own account Read/Write and everyone else No access.
+2. **Stop the `parvault` project.** The backup takes the data-dir lock, which the running daemon holds (`reject.datadir_locked`).
+3. Make a project (folder `docker/parvault-ring-backup`) from this `compose.yaml`, with `image:` set, and build it:
+
+```yaml
+name: parvault-ring-backup
+services:
+  ring-backup:
+    image: parvault:0.5.5-dev
+    pull_policy: never
+    user: "65532:65532"
+    network_mode: none
+    restart: "no"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    command: ["--data-dir", "/var/lib/parvault", "ring", "backup", "--out", "/backup", "--passphrase-file", "/secrets/passphrase"]
+    volumes:
+      - parvault-data:/var/lib/parvault
+      - parvault-secrets:/secrets:ro
       - /volume1/parvault-backup:/backup
 volumes:
   parvault-data:
     external: true
     name: parvault-data
-```
-
-It prints `exported` and exits 0. Set the share's path in place of `/volume1/parvault-backup` if the share is on another volume. Then stop and delete the `parvault-export` project, which touches no data (its volume is `external`), and **start the `parvault` project again**.
-
-The tar keeps the files' owner (65532) and modes. The tar itself is owned by `root` with mode `0600` (from `umask 077`). The share's own permissions decide who can reach it: on DSM, an administrator can open the share in File Station and download `parvault-data.tar`, and a share permission may not be enough for a non-admin to read a root-owned `0600` file (we have not tested this on DSM). If you need another account to read it, copy it out as an administrator instead of loosening the file's mode.
-
-*Restore (import).* This **replaces the volume's entire contents**: everything in `parvault-data` is deleted first, including anything not in the backup, and then the tar is extracted. Use it to bring back a lost or damaged node, never on a node that is working. The volume must exist (the project declares it `external`): if it is gone, build and start the `parvault` project once to create it, then continue.
-
-1. **Stop the `parvault` project.**
-2. Make a project (folder `docker/parvault-import`) from this `compose.yaml`, and build it. It first checks that `/backup/parvault-data.tar` is a readable tar holding the node's identity (`node_identity.seed`), then empties the volume and extracts the tar into it, keeping owners (65532) and modes. If the import prints nothing or an error (no tar, a wrong share path, or a tar that is not a ParVault export), the volume was not touched:
-
-```yaml
-name: parvault-import
-services:
-  import:
-    image: busybox@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec   # busybox 1.37.0
-    pull_policy: never
-    network_mode: none
-    restart: "no"
-    read_only: true
-    cap_drop: [ALL]
-    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE]   # to delete the old files, keep owners and modes, and write into the volume
-    security_opt: ["no-new-privileges:true"]
-    command: ["sh", "-c", "tar -tf /backup/parvault-data.tar >/dev/null && tar -tf /backup/parvault-data.tar | grep -q 'node_identity[.]seed$' && find /data -mindepth 1 -delete && tar -xpf /backup/parvault-data.tar -C /data && echo imported"]
-    volumes:
-      - parvault-data:/data
-      - /volume1/parvault-backup:/backup:ro
-volumes:
-  parvault-data:
+  parvault-secrets:
     external: true
-    name: parvault-data
+    name: parvault-secrets
 ```
 
-3. It prints `imported` and exits 0. **Stop and delete the `parvault-import` project** (its volume is `external`, so the data stays).
-4. **Start the `parvault` project.** It turns healthy with the same ring; `init` exits 1 (`already in the ring`), as on any later start.
+Its Log tab names the file (`parvault-ring-backup-<node>-<time>.pvbak`), the ring id and the node id; note the ring id. Delete the `parvault-ring-backup` project (its volumes are `external`, so no data goes) and **start the `parvault` project again**. Not yet tested on DSM: whether the container user (65532) may write into a share and read a `0600` file there (H-4). If the backup logs `Permission denied` for `/backup`, report it rather than loosening the share for everyone.
 
-**Keep it private: anyone with that copy can admit nodes to your ring.** Do not put it in a shared folder others can read, a cloud sync folder, or a backup job that uploads it unencrypted. If you also back up the share with Hyper Backup, encrypt that task (Hyper Backup > Backup Settings > Enable client-side encryption). Backing up the Docker volume path directly (`/volume1/@docker/volumes/parvault-data`) in Hyper Backup is not documented by Synology, so this guide does not rely on it.
+*Restore, on a new NAS or a new volume.* A restore **moves** the node: the old one must be stopped and never started again, because two live nodes with one identity break the ring's one-writer rule. The restore runs before the daemon's very first start, because that start would otherwise create a new ring on the empty volume (`reject.backup_target_not_empty` afterwards).
+
+1. Import the image and install the same passphrase on this NAS (above). Copy the `.pvbak` file into its `parvault-backup` share.
+2. In `deploy/synology/compose.yaml`, before the first build, uncomment the `ring-restore` service, the `depends_on` block in `parvault` and `parvault-secrets` under `volumes`. Put the file name in place of `BUNDLE_FILE_NAME` and the ring id in place of `RING_ID_64_HEX`.
+3. Build. `ring-restore` logs `Restored node ... of ring ...` and exits 0; then the daemon starts in that ring and turns healthy. A wrong passphrase, a damaged or foreign file, or a used volume is refused with a `reject.backup_*` code and changes nothing.
+4. Stop the project, comment the three blocks again, and build.
+
+*Residual risks.* The file and its passphrase leaked together; a compromised running NAS; rolling back to an older backup; restoring and then starting the old node anyway (a clone); the file's header names the ring and node ids in clear; tar exports made with the `v0.5.5` guide are not encrypted, so delete them once you have an encrypted backup. If you also back up the share with Hyper Backup, encrypt that task (Hyper Backup > Backup Settings > Enable client-side encryption).
 
 What every project also does:
 
@@ -170,11 +173,11 @@ On a Docker host with `deploy/docker/compose.yaml`, open its `--listen` port (TC
 1. Verify the new tar (step 1), copy it into the `docker` share, import it, and check its tag and image ID (step 2).
 2. Stop the project, change **every** `image:` line in `compose.yaml` to the new tag, and build (Project > Action > Build).
 
-The volume is kept. `init` or `install-chain` runs again and exits as on any later start. Do not delete the project to upgrade.
+The volume is kept: the daemon finds its ring (`install-chain` on a joined node runs again and exits 0). Do not delete the project to upgrade.
 
 ## Appendix: the same over SSH
 
-Optional; [DOCKER.md](DOCKER.md) is the full shell guide. Over SSH on the NAS, the first run can be done with `docker run` on the same volume (it starts owned by `65532:65532`). After that, use `deploy/synology/compose.yaml` on that node, whether it started the ring or joined one: its `init` exits 1 (`already in the ring`) and the daemon starts. Do not use `join.compose.yaml` there: its placeholder token would hold the daemon back.
+Optional; [DOCKER.md](DOCKER.md) is the full shell guide. Over SSH on the NAS, the first run can be done with `docker run` on the same volume (it starts owned by `65532:65532`). After that, use `deploy/synology/compose.yaml` on that node, whether it started the ring or joined one: `up --init-if-absent` finds the ring and the daemon starts. Do not use `join.compose.yaml` there: its placeholder token would hold the daemon back.
 
 ```sh
 IMG=parvault:0.5.5-dev   # the tag you imported

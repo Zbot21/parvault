@@ -584,6 +584,8 @@ fn genesis_node(dir: &Path) {
     // archC1 condition 5 (L-133): per-vault derived keys never go in a bundle.
     std::fs::create_dir_all(dir.join("vaults")).unwrap();
     write_0600(&dir.join("vaults/photos.vaultkey"), &VAULTKEY);
+    // Track C's version floor (L-133): not secret, and it does go in a bundle.
+    std::fs::write(dir.join("vaults/photos.floor"), b"42").unwrap();
     std::fs::write(dir.join("quota_state.bin"), b"quota").unwrap();
     std::fs::write(dir.join("por_audit_state.json"), b"{}").unwrap();
     assert!(dir.join("master_key.sealed").exists());
@@ -738,6 +740,14 @@ fn b169_backup_restores_byte_identical_identity() {
         ] {
             assert!(!target.join(f).exists(), "{name}: {f} restored");
         }
+        if src.join("vaults").exists() {
+            assert_eq!(
+                std::fs::read(target.join("vaults/photos.floor")).unwrap(),
+                b"42",
+                "{name}: version floor"
+            );
+        }
+        assert!(!target.join("macaroon_root.key").exists(), "{name}");
         assert!(!target.join(".ring_restore.pending").exists());
         assert!(!target.join(".ring_restore.stage").exists());
     }
@@ -750,8 +760,9 @@ fn b169_backup_restores_byte_identical_identity() {
     gate_ran("trust_enforcement_setup::b169_backup_restores_byte_identical_identity");
 }
 
-/// archC1 condition 5 (L-133): a bundle never carries `vaults/*.vaultkey`, not even encrypted:
-/// the decrypted body of a real bundle has no entry under `vaults/` and no vaultkey bytes.
+/// archC1 condition 5 and L-133: a bundle never carries `vaults/*.vaultkey`, not even
+/// encrypted, and does carry track C's version floor `vaults/*.floor`: the decrypted body of a
+/// real bundle has exactly the floor under `vaults/` and no vaultkey bytes.
 #[test]
 fn b169_vaultkeys_are_not_in_the_bundle() {
     use parvault::crypto::backup_envelope::{derive_key, open, parse_bundle, BackupBody};
@@ -762,10 +773,14 @@ fn b169_vaultkeys_are_not_in_the_bundle() {
     let key = derive_key(PASS, &h.salt, h.kdf).unwrap();
     let plain = open(&key, &h, ct).unwrap();
     let body = BackupBody::decode(&plain).unwrap();
-    assert!(
-        body.entries.iter().all(|(n, _)| !n.starts_with("vaults")),
-        "{body:?}"
-    );
+    let vaults: Vec<&str> = body
+        .entries
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .filter(|n| n.starts_with("vaults"))
+        .collect();
+    assert_eq!(vaults, ["vaults/photos.floor"], "{body:?}");
+    assert_eq!(body.get("vaults/photos.floor"), Some(&b"42"[..]));
     assert!(!contains(&plain, &VAULTKEY));
     gate_ran("trust_enforcement_setup::b169_vaultkeys_are_not_in_the_bundle");
 }
@@ -1090,10 +1105,21 @@ fn b169_restore_sigkill_then_rerun_succeeds() {
         let _ = child.kill();
         let status = child.wait().unwrap();
         let label = format!("round {round}");
-        if status.success() {
-            // It finished before the kill: the restore is complete, and a rerun refuses it.
+        // Complete: the list is written before the first rename and removed last, so no list
+        // and no stage with the node seed in place means every file was moved (the kill may land
+        // after that, before the process exits).
+        let complete = !target.join(".ring_restore.pending").exists()
+            && !target.join(".ring_restore.stage").exists()
+            && target.join("node_identity.seed").exists();
+        if status.success() || complete {
             finished += 1;
             assert_eq!(ring_of(&target), want, "{label}");
+            assert_eq!(
+                std::fs::read(target.join("node_identity.seed")).unwrap(),
+                node,
+                "{label}"
+            );
+            assert_eq!(master_key(&target), master_key(&a), "{label}");
             assert!(!target.join(".ring_restore.pending").exists(), "{label}");
             assert!(!target.join(".ring_restore.stage").exists(), "{label}");
         } else {
@@ -1113,7 +1139,7 @@ fn b169_restore_sigkill_then_rerun_succeeds() {
     let moved = ["ring_genesis.pub", "node_pq_kem.bin"];
     std::fs::write(
         target.join(".ring_restore.pending"),
-        CARRIED.join("\n") + "\nmaster_key.sealed\nenclave_sealing.seed",
+        CARRIED.join("\n") + "\nmaster_key.sealed\nenclave_sealing.seed\nvaults/photos.floor",
     )
     .unwrap();
     for f in CARRIED

@@ -3,10 +3,11 @@
 //! (`DataDirLock`, B-174), so neither runs beside a daemon on the same data dir.
 //!
 //! In the bundle (K7, D-50 Q11): the ring genesis seed and pin, the node identity seed, the
-//! installed chains, the council manifest and history, the two PQ key files, `config.toml`, and
-//! the vault master key (unsealed inside the bundle, resealed for the new node on restore).
+//! installed chains, the council manifest and history, the two PQ key files, `config.toml`, the
+//! per-vault version floors (`vaults/*.floor`, L-133), and the vault master key (unsealed inside the bundle, resealed for the new node on restore).
 //! Never in it: `macaroon_root.key` (a restore would revive every token ever minted), the TLS
-//! key, quota, PoR and shard state.
+//! key, the per-vault derived keys (`vaults/*.vaultkey`, archC1 condition 5), quota, PoR and
+//! shard state.
 
 use parvault::config::RingAction;
 use parvault::crypto::backup_envelope::{
@@ -188,6 +189,37 @@ fn parse_hex32(text: &[u8]) -> Option<[u8; 32]> {
     raw.as_slice().try_into().ok()
 }
 
+/// The per-vault directory (track C, L-133): `<ns>.floor` (the last applied catalog version, so
+/// a restore keeps refusing a rolled-back catalog) goes in the bundle; `<ns>.vaultkey` never
+/// does (archC1 condition 5: the seed phrase recovers it).
+const VAULTS_DIR: &str = "vaults";
+
+/// `vaults/<ns>.floor`, `<ns>` of 1 to 128 ASCII letters, digits, `-`, `_` or `.`, not starting
+/// with `.`.
+fn is_floor_name(name: &str) -> bool {
+    name.strip_prefix(VAULTS_DIR)
+        .and_then(|r| r.strip_prefix('/'))
+        .and_then(|r| r.strip_suffix(".floor"))
+        .is_some_and(|ns| {
+            (1..=128).contains(&ns.len())
+                && !ns.starts_with('.')
+                && ns
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        })
+}
+
+/// The subdirectory a bundle entry lives in, if any.
+fn sub_dir_of(name: &str) -> Option<&'static str> {
+    if is_chain_name(name) {
+        Some(CHAIN_DIR_NAME)
+    } else if is_floor_name(name) {
+        Some(VAULTS_DIR)
+    } else {
+        None
+    }
+}
+
 fn is_chain_name(name: &str) -> bool {
     name.strip_prefix(CHAIN_DIR_NAME)
         .and_then(|r| r.strip_prefix('/'))
@@ -209,11 +241,15 @@ fn backup(
             body.entries.push(((*name).to_string(), bytes));
         }
     }
-    if let Ok(rd) = std::fs::read_dir(data_dir.join(CHAIN_DIR_NAME)) {
+    for dir in [CHAIN_DIR_NAME, VAULTS_DIR] {
+        let Ok(rd) = std::fs::read_dir(data_dir.join(dir)) else {
+            continue;
+        };
         let mut names: Vec<String> = Vec::new();
         for e in rd {
-            let name = format!("{CHAIN_DIR_NAME}/{}", e?.file_name().to_string_lossy());
-            if is_chain_name(&name) {
+            let name = format!("{dir}/{}", e?.file_name().to_string_lossy());
+            // Only chains and version floors; never `vaults/*.vaultkey` (archC1 condition 5).
+            if sub_dir_of(&name) == Some(dir) {
                 names.push(name);
             }
         }
@@ -275,7 +311,7 @@ fn backup(
 /// pin must agree).
 fn body_consistent(body: &BackupBody, header: &env::BackupHeader) -> bool {
     let names_ok = body.entries.iter().all(|(n, _)| {
-        BUNDLE_FILES.contains(&n.as_str()) || is_chain_name(n) || n == VAULT_MASTER_KEY
+        BUNDLE_FILES.contains(&n.as_str()) || sub_dir_of(n).is_some() || n == VAULT_MASTER_KEY
     });
     let mut seen = std::collections::BTreeSet::new();
     let unique = body.entries.iter().all(|(n, _)| seen.insert(n.as_str()));
@@ -304,7 +340,7 @@ fn pending_names(data_dir: &Path) -> anyhow::Result<Vec<String>> {
     let names: Vec<String> = text.lines().map(str::to_string).collect();
     anyhow::ensure!(
         names.iter().all(|n| BUNDLE_FILES.contains(&n.as_str())
-            || is_chain_name(n)
+            || sub_dir_of(n).is_some()
             || n == "master_key.sealed"
             || n == "enclave_sealing.seed"),
         "{RESTORE_PENDING} names a file a restore never writes; remove the data dir by hand"
@@ -338,7 +374,7 @@ fn target_empty(data_dir: &Path, pending: &[String]) -> anyhow::Result<bool> {
             || is_pending_staging(name)
             || pending
                 .iter()
-                .any(|p| p == name || (name == CHAIN_DIR_NAME && is_chain_name(p)));
+                .any(|p| p == name || sub_dir_of(p) == Some(name));
         if !known {
             return Ok(false);
         }
@@ -447,7 +483,9 @@ fn write_restore(data_dir: &Path, body: &BackupBody, pending: &[String]) -> anyh
     if stage.exists() {
         std::fs::remove_dir_all(&stage)?;
     }
-    std::fs::create_dir_all(stage.join(CHAIN_DIR_NAME))?;
+    for dir in [CHAIN_DIR_NAME, VAULTS_DIR] {
+        std::fs::create_dir_all(stage.join(dir))?;
+    }
     let mut names: Vec<String> = Vec::new();
     for (name, data) in &body.entries {
         if name == VAULT_MASTER_KEY {
@@ -467,22 +505,25 @@ fn write_restore(data_dir: &Path, body: &BackupBody, pending: &[String]) -> anyh
             names.push("enclave_sealing.seed".to_string());
         }
     }
-    fsync_dir(&stage.join(CHAIN_DIR_NAME))?;
+    for dir in [CHAIN_DIR_NAME, VAULTS_DIR] {
+        fsync_dir(&stage.join(dir))?;
+    }
     fsync_dir(&stage)?;
     parvault::storage::fsio::atomic_write_file(
         &data_dir.join(RESTORE_PENDING),
         names.join("\n").as_bytes(),
     )?;
     fsync_dir(data_dir)?;
-    let has_chains = names.iter().any(|n| is_chain_name(n));
-    if has_chains {
-        std::fs::create_dir_all(data_dir.join(CHAIN_DIR_NAME))?;
+    let dirs: std::collections::BTreeSet<&str> =
+        names.iter().filter_map(|n| sub_dir_of(n)).collect();
+    for dir in &dirs {
+        std::fs::create_dir_all(data_dir.join(dir))?;
     }
     for name in &names {
         std::fs::rename(stage.join(name), data_dir.join(name))?;
     }
-    if has_chains {
-        fsync_dir(&data_dir.join(CHAIN_DIR_NAME))?;
+    for dir in &dirs {
+        fsync_dir(&data_dir.join(dir))?;
     }
     fsync_dir(data_dir)?;
     // The stage first: while the list exists, a rerun redoes the whole restore.

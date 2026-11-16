@@ -96,7 +96,9 @@ docker run -d --name "$NAME" --restart unless-stopped --network host --user 6553
 2. Issue a token for that key on the first node, as above.
 3. Put the token in place of `PASTE_TOKEN_HERE` and run `docker compose up -d` again. On later starts `install-chain` installs the same token again and exits 0.
 
-The project and volume are named `parvault` and `parvault-data`; rename both to run a second node on one host. To start a ring with compose, use [`deploy/synology/compose.yaml`](../deploy/synology/compose.yaml): it works on any Docker host (its `init` service exits 1 on later starts, harmlessly).
+The project and volume are named `parvault` and `parvault-data`; rename both to run a second node on one host. To start a ring with compose, use [`deploy/synology/compose.yaml`](../deploy/synology/compose.yaml): it works on any Docker host. Its one service, the daemon, starts the ring on an empty volume (`up --init-if-absent`) and refuses a volume that holds anything else (`reject.init_volume_not_empty`).
+
+**Joining from a token file.** Instead of `install-chain --token`, the daemon can join on its first start: `up --join-token-file <file>`. The file must be a regular file owned by the container user (65532) with mode `0600` (`reject.join_token_mode` otherwise); the token is never read from an environment variable, which `docker inspect` shows (`PARVAULT_JOIN_TOKEN` is refused). A configured token always wins over `--init-if-absent`: a join that fails never starts a new ring. The token is used once: on later starts the daemon finds its ring. On the first node, `wot invite --peer <KEY> --out <file>` writes the token to a `0600` file and prints only its path.
 
 ## 4. Networking and health
 
@@ -127,6 +129,24 @@ cmp "$CHECK/sample.bin" "$CHECK/restored.bin" && echo "byte-identical"
 ```
 
 The restore ends with `=== ParVault Vault Restore Verified ===`, and both daemons' logs show `Kademlia routing table updated`.
+
+## 5a. Encrypted ring backup
+
+`parvault ring backup` writes one encrypted file of this node's identity: the ring genesis (on the first node), the node key, its chains, council and PQ key files, `config.toml`, the vaults' catalog version floors and the vault master key. It leaves out the gateway token key, the TLS key, the per-vault keys (the seed phrase recovers them), and the quota, audit and shard state. The passphrase comes from a `0600` file owned by 65532, outside `--out`, of at least 20 characters. One data dir serves one process, so stop the daemon first (`reject.datadir_locked` otherwise):
+
+```sh
+docker stop "$NAME"
+docker run --rm --network none --user 65532:65532 --read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp:mode=1777 -v "$VOL:/var/lib/parvault" -v "$SECRETS:/secrets:ro" -v "$BACKUP:/backup" "$IMG" --data-dir /var/lib/parvault ring backup --out /backup --passphrase-file /secrets/passphrase
+docker start "$NAME"
+```
+
+A restore **moves** the node to a new, empty volume: the old node must never run again. Run it before the daemon's first start on that volume (a started daemon has made a new ring there, and the restore refuses it: `reject.backup_target_not_empty`):
+
+```sh
+docker run --rm --network none --user 65532:65532 --read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp:mode=1777 -v "$NEWVOL:/var/lib/parvault" -v "$SECRETS:/secrets:ro" -v "$BACKUP:/backup:ro" "$IMG" --data-dir /var/lib/parvault ring restore --from /backup/<file>.pvbak --passphrase-file /secrets/passphrase --expect-ring <ring id> --confirm-move
+```
+
+A wrong passphrase, a damaged or foreign file, a used volume or a missing `--confirm-move` is refused with a `reject.backup_*` code and changes nothing. [SYNOLOGY.md](SYNOLOGY.md) step 5 has the same as Container Manager projects and lists the residual risks.
 
 ## 6. Upgrading
 
