@@ -10,7 +10,7 @@ mod edge_common;
 
 use edge_common::{
     default_client, export_cert, gate_ran, init_node, parvault_out, pattern, req, tls_once, up,
-    write_seed,
+    up_refused, write_seed,
 };
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -206,4 +206,68 @@ fn b180_gateway_socket_group() {
     );
     assert!(!ok && out.contains("reject.socket_group_unknown"), "{out}");
     gate_ran("edge_daemon_tls::b180_gateway_socket_group");
+}
+
+/// QA D5: `parvault tls rotate` replaces an edge file that does not load (no key, or a key and
+/// certificate from two issues) with a fresh owner-only pair, keeps the stored SANs it can still
+/// read, and names what was wrong; the daemon then starts on it. A group-readable file and a
+/// symlink are still refused, and left as they are.
+#[test]
+fn qa056_d5_tls_rotate_replaces_an_invalid_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("node");
+    drop(tls_daemon(&dir, &["--tls-san", "nas.local"]));
+    let pem = dir.join("edge_tls.pem");
+    let set_mode = |p: &Path, m: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    };
+    let text = String::from_utf8(std::fs::read(&pem).unwrap()).unwrap();
+    let key_at = text.find("-----BEGIN PRIVATE KEY-----").unwrap();
+    let key_end = text.find("-----END PRIVATE KEY-----\n").unwrap() + 26;
+    let other = parvault::edge_tls::generate_pem(&["127.0.0.1".into()]).unwrap();
+    let other_key = &other[other.find("-----BEGIN PRIVATE KEY-----").unwrap()
+        ..other.find("-----END PRIVATE KEY-----\n").unwrap() + 26];
+    let no_key = format!("{}{}", &text[..key_at], &text[key_end..]);
+    let mismatched = format!("{}{other_key}{}", &text[..key_at], &text[key_end..]);
+    for (broken, code) in [
+        (no_key, "reject.tls_pem_invalid"),
+        (mismatched, "reject.tls_key_cert_mismatch"),
+    ] {
+        std::fs::write(&pem, &broken).unwrap();
+        set_mode(&pem, 0o600);
+        let out = up_refused(&dir, &["--vfs-webdav-listen", "0.0.0.0:0"]);
+        assert!(out.contains(code) && out.contains("tls rotate"), "{out}");
+        let (ok, out) = parvault_out(&dir, &["tls", "rotate"]);
+        assert!(ok, "{out}");
+        assert!(
+            out.contains(code),
+            "the warning names what was wrong: {out}"
+        );
+        assert!(out.contains("nas.local"), "the stored SANs are kept: {out}");
+        let meta = std::fs::symlink_metadata(&pem).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        let d = up(&dir, &["--vfs-webdav-listen", "0.0.0.0:0"]);
+        assert_eq!(edge_common::webdav_scheme(&d), "https");
+        drop(d);
+    }
+    // Still refused: a group-readable file (left unchanged) and a symlink to a valid pair.
+    let good = std::fs::read(&pem).unwrap();
+    set_mode(&pem, 0o640);
+    let (ok, out) = parvault_out(&dir, &["tls", "rotate"]);
+    assert!(!ok && out.contains("reject.tls_key_mode"), "{out}");
+    assert_eq!(std::fs::read(&pem).unwrap(), good);
+    set_mode(&pem, 0o600);
+    let real = tmp.path().join("real.pem");
+    std::fs::rename(&pem, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &pem).unwrap();
+    let (ok, out) = parvault_out(&dir, &["tls", "rotate"]);
+    assert!(!ok && out.contains("reject.tls_key_mode"), "{out}");
+    assert!(std::fs::symlink_metadata(&pem)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(std::fs::read(&real).unwrap(), good);
+    gate_ran("edge_daemon_tls::qa056_d5_tls_rotate_replaces_an_invalid_file");
 }

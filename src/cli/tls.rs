@@ -21,7 +21,13 @@ pub(crate) fn run(action: TlsAction, data_dir: &Path) -> anyhow::Result<()> {
             );
         }
         TlsAction::Rotate => {
-            let info = parvault::edge_tls::rotate(data_dir)?;
+            let r = parvault::edge_tls::rotate(data_dir)?;
+            if let Some(e) = &r.replaced_invalid {
+                eprintln!(
+                    "warning: the edge TLS file did not load ({e}); replaced it with a new pair"
+                );
+            }
+            let info = r.info;
             println!("issued a new edge key and certificate; restart the daemon to serve it");
             println!(
                 "every client must register the new certificate again (`parvault tls export --out webdav.crt`)"

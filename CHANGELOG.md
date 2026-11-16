@@ -31,6 +31,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **`--prune-deleted` is deprecated:** with GC on, a deleted file is freed when the last retained version holding it ages out.
 - A host that answers full (`reject.node_shard_count`, `reject.node_capacity`) is skipped by placement for 10 minutes. After a pass a host refused for this owner's quota, `watch-folder` runs GC and, if it freed anything, retries the pass once (B-163 item 3).
 
+### Fixed
+- **Held-shard bound under cgroup v1 in a container (final QA D2).** On a cgroup-v1 host without a cgroup namespace (Docker's default there, e.g. Synology DSM), the L-130 bound read host RAM instead of the container's limit: `/proc/self/cgroup` names `/docker/<id>`, but Docker mounts that cgroup at `/sys/fs/cgroup/memory` itself. The v1 directory is now resolved through `/proc/self/mountinfo` (mount root and mount point), and every limit up to the mount point counts, so a 64 MiB container on an 8 GiB NAS (`homelab-nas`) bounds about 5,100 shards, not about 660,000. v2 is unchanged.
+- **`parvault tls rotate` repairs an edge certificate file that does not load (final QA D5).** A file that passes the owner-only rule but holds an invalid PEM or a key and certificate that do not match is replaced by a new pair (one rename, `0600`), keeping the SANs still stored in it, with a warning naming the refusal. A symlink, another owner's file or a mode other than `0600` is still refused and left as it is; the start refusal's advice now says which of the two applies.
+- **The generated edge key PEM is zeroized (final QA D4).** The certificate-and-key PEM is built in one `Zeroizing` buffer through to the write; no plain copy of the key is freed unwiped.
+
 ---
 
 ## [`0.5.5`] - 2026-11-16
