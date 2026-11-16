@@ -551,3 +551,7 @@ suite      S-D12-STALL-BOUND test=trust_enforcement_gc_owner::d12_stall_inside_f
 suite      S-D16-BACKUP-WARN test=trust_enforcement_restore::d16_backup_names_each_skipped_floor needs=cmd:sh   # D16: ring backup names each skipped floor and why (warn.ring_backup_floor_skipped)
 suite      S-D8-ALT-CAP test=trust_enforcement_gc_owner::d8_alias_alternatives_capped needs=cmd:sh   # D8: one failed alias request tries at most MAX_ALIAS_ALTERNATIVES (4) other addresses
 suite      S-D8-DEAD-SKIP test=trust_enforcement_gc_owner::d8_dead_alternative_skipped needs=cmd:sh   # D8: a dead-marked alternative is not dialed again
+suite      S-D21-NOGC test=trust_enforcement_gc_owner::d21_no_gc_no_change_pass_reseals_nothing needs=cmd:sh   # D21: no catalog sealed twice at one version under --no-gc; no false refusals
+suite      S-D21-LAG test=trust_enforcement_gc_owner::d21_unacknowledged_catalog_not_resealed needs=cmd:sh   # D21: an unacknowledged catalog is put again, not resealed at its version
+suite      S-D22-OVERSIZE test=trust_enforcement_gc_owner::d22_oversize_catalog_refused_visibly needs=cmd:sh   # D22: an oversize catalog is refused before sending (reject.catalog_too_large), seen in the pass line and folder-status
+suite      S-D24-NOGC-STATS test=trust_enforcement_gc_owner::d24_no_gc_refusals_in_folder_status needs=cmd:sh   # D24: refusal totals kept and shown under --no-gc

@@ -598,7 +598,19 @@ fn ring_pass_peers(f: &LocalFolder, peers: &str) -> Output {
 
 /// A ring pass with `extra` watch-folder flags, within `limit`.
 fn ring_pass_args(f: &LocalFolder, peers: &str, extra: &[&str], limit: Duration) -> Output {
+    ring_pass_env(f, peers, extra, &[], limit)
+}
+
+/// [`ring_pass_args`] with `env` set on the owner process.
+fn ring_pass_env(
+    f: &LocalFolder,
+    peers: &str,
+    extra: &[&str],
+    env: &[(&str, &str)],
+    limit: Duration,
+) -> Output {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.envs(env.iter().copied());
     cmd.env("PARVAULT_LAN_REGISTRY_DIR", f.node.join("lan-registry"))
         .env("PARVAULT_GENESIS_SEED_HEX", GENESIS_SEED_HEX)
         .env("PARVAULT_SEED_PHRASE", PHRASE)
@@ -2117,4 +2129,131 @@ fn d12_stall_inside_free_shards_is_bounded_and_carried() {
         "deferred shards still journalled: {left:?}"
     );
     gate_ran("trust_enforcement_gc_owner::d12_stall_inside_free_shards_is_bounded_and_carried");
+}
+
+/// D21 (qa056, B-182 review): under `--no-gc`, a no-change pass seals no second catalog at the
+/// same version (this node's store and every host would refuse it as a rollback): no
+/// `warn.dht_envelope_refused`, no refusal pass line.
+#[test]
+fn d21_no_gc_no_change_pass_reseals_nothing() {
+    let hosts = [spawn_host(), spawn_host()];
+    let peers = format!("{},{}", hosts[0].addr, hosts[1].addr);
+    let f = LocalFolder::new();
+    f.write("one");
+    let limit = Duration::from_secs(120);
+    let out = ring_pass_args(&f, &peers, &["--no-gc"], limit);
+    assert!(out.status.success(), "{}", text(&out));
+    let out = ring_pass_args(&f, &peers, &["--no-gc"], limit);
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(!t.contains("warn.dht_envelope_refused"), "{t}");
+    assert!(!t.contains("envelope refusal(s) this pass"), "{t}");
+    gate_ran("trust_enforcement_gc_owner::d21_no_gc_no_change_pass_reseals_nothing");
+}
+
+/// D21 with GC on: version 2's catalog reached no host (the host is down), so it lags; the
+/// next no-change pass puts that same envelope again instead of sealing a second one at
+/// version 2, which this node's store would refuse as a rollback.
+#[test]
+fn d21_unacknowledged_catalog_not_resealed() {
+    let mut host = spawn_host();
+    let peers = host.addr.clone();
+    let f = LocalFolder::new();
+    f.write("one");
+    let limit = Duration::from_secs(120);
+    let out = ring_pass_args(&f, &peers, &[], limit);
+    assert!(out.status.success(), "{}", text(&out));
+    f.write("two, changed");
+    host.stop();
+    let out = ring_pass_args(&f, &peers, &[], limit);
+    let t2 = text(&out);
+    assert!(t2.contains("warn.catalog_publish_failed"), "{t2}");
+    let out = ring_pass_args(&f, &peers, &[], limit);
+    let t = text(&out);
+    assert!(
+        !t.contains("warn.dht_envelope_refused"),
+        "{t2}\n--- pass 3 ---\n{t}"
+    );
+    assert!(!t.contains("envelope refusal(s) this pass"), "{t}");
+    gate_ran("trust_enforcement_gc_owner::d21_unacknowledged_catalog_not_resealed");
+}
+
+/// Writes `n` small files (one stripe each) into `f`.
+fn many_files(f: &LocalFolder, n: usize) {
+    for i in 0..n {
+        std::fs::write(f.folder.join(format!("f{i:03}.txt")), format!("file {i}")).unwrap();
+    }
+}
+
+/// The envelope budget the D22 tests give the owner process: an owner share of 12,288 bytes,
+/// under the catalog of 8 files.
+const SMALL_DHT_BUDGET: (&str, &str) = ("PARVAULT_DHT_STORE_MAX_BYTES", "16384");
+
+/// D22 (qa056, B-182 review): a catalog over the smallest limit the owner knows (here its
+/// per-owner envelope share) is a refusal the owner sees before anything is sent:
+/// `warn.dht_envelope_refused reason=reject.catalog_too_large` with the size and limit, the
+/// refusal pass line, and `folder-status`; no host is sent it.
+#[test]
+fn d22_oversize_catalog_refused_visibly() {
+    let host = spawn_host();
+    let f = LocalFolder::new();
+    many_files(&f, 8);
+    let out = ring_pass_env(
+        &f,
+        &host.addr,
+        &[],
+        &[SMALL_DHT_BUDGET],
+        Duration::from_secs(120),
+    );
+    let t = text(&out);
+    let warn = t
+        .lines()
+        .find(|l| l.contains("warn.dht_envelope_refused") && l.contains("reject.catalog_too_large"))
+        .unwrap_or_else(|| panic!("no catalog_too_large refusal:\n{t}"));
+    assert!(warn.contains("limit_bytes=12288"), "{warn}");
+    assert!(warn.contains("size_bytes="), "{warn}");
+    assert!(
+        t.contains("envelope refusal(s) this pass (last: catalog local reject.catalog_too_large"),
+        "{t}"
+    );
+    assert!(
+        !t.contains("info.catalog_published"),
+        "the catalog was sent:\n{t}"
+    );
+    let st = run_parvault(
+        &f.node,
+        &["folder-status", "--snapshot", f.snap.to_str().unwrap()],
+    );
+    let s = text(&st);
+    assert!(
+        s.contains("Envelope Refusals  : 1 (last: catalog local reject.catalog_too_large"),
+        "{s}"
+    );
+    gate_ran("trust_enforcement_gc_owner::d22_oversize_catalog_refused_visibly");
+}
+
+/// D24 (qa056, B-182 review): under `--no-gc` the refusal totals are still written, and
+/// `folder-status` shows them although there is no version store.
+#[test]
+fn d24_no_gc_refusals_in_folder_status() {
+    let host = spawn_host();
+    let f = LocalFolder::new();
+    many_files(&f, 8);
+    let out = ring_pass_env(
+        &f,
+        &host.addr,
+        &["--no-gc"],
+        &[SMALL_DHT_BUDGET],
+        Duration::from_secs(120),
+    );
+    let t = text(&out);
+    assert!(t.contains("envelope refusal(s) this pass"), "{t}");
+    let st = run_parvault(
+        &f.node,
+        &["folder-status", "--snapshot", f.snap.to_str().unwrap()],
+    );
+    let s = text(&st);
+    assert!(st.status.success(), "{s}");
+    assert!(s.contains("Envelope Refusals  : 1 "), "{s}");
+    gate_ran("trust_enforcement_gc_owner::d24_no_gc_refusals_in_folder_status");
 }
