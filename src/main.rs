@@ -105,6 +105,11 @@ fn validate_early_command_flags(cmd: &Commands) -> anyhow::Result<()> {
             vfs_webdav_listen,
             vfs_fuse_fd,
             vfs_seed_dir,
+            ipc_socket,
+            no_socket,
+            tls_san,
+            insecure_plain_http,
+            gateway_socket_group,
             ..
         }
         | Commands::Daemon {
@@ -113,15 +118,57 @@ fn validate_early_command_flags(cmd: &Commands) -> anyhow::Result<()> {
                     vfs_webdav_listen,
                     vfs_fuse_fd,
                     vfs_seed_dir,
+                    ipc_socket,
+                    no_socket,
+                    tls_san,
+                    insecure_plain_http,
+                    gateway_socket_group,
                     ..
                 },
-        } => validate_builtin_vfs_flags(
-            vfs_webdav_listen.as_deref(),
-            *vfs_fuse_fd,
-            vfs_seed_dir.as_deref(),
-        ),
+        } => {
+            validate_builtin_vfs_flags(
+                vfs_webdav_listen.as_deref(),
+                *vfs_fuse_fd,
+                vfs_seed_dir.as_deref(),
+            )?;
+            refuse_unbuilt_daemon_flags(
+                !tls_san.is_empty() || *insecure_plain_http,
+                gateway_socket_group.is_some(),
+                ipc_socket.is_some() && !*no_socket,
+            )
+        }
         _ => Ok(()),
     }
+}
+
+/// `v0.5.6` T0 stubs of `up` / `daemon start` (qa-t0 LOW): refused here, before any identity,
+/// root key, beacon, data-dir lock or socket exists. The track that builds a flag deletes its
+/// arm (track A the edge TLS flags, B-180 the socket group); the late refusals in
+/// `edge_tls::ensure_cert` and `GatewayIpcServer::with_socket_group` stay until then.
+fn refuse_unbuilt_daemon_flags(
+    edge_tls_flag: bool,
+    socket_group: bool,
+    has_ipc_socket: bool,
+) -> anyhow::Result<()> {
+    // B-180: a usage error comes first (the group applies to the gateway socket only).
+    if socket_group && !has_ipc_socket {
+        anyhow::bail!("--gateway-socket-group needs --ipc-socket");
+    }
+    if edge_tls_flag {
+        return Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt {
+            track: "A",
+            entry: "--tls-san / --insecure-plain-http",
+        })
+        .into());
+    }
+    if socket_group {
+        return Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt {
+            track: "A or E (B-180)",
+            entry: "--gateway-socket-group",
+        })
+        .into());
+    }
+    Ok(())
 }
 
 fn command_needs_network_discovery(cmd: &Commands) -> bool {
