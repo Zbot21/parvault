@@ -379,6 +379,232 @@ pub fn shard_delete_decision(facts: &ShardDeleteFacts) -> Result<(), &'static st
     }
 }
 
+/// B-158: a `DeleteShard` token must be signed within this window of the host's clock (30 s,
+/// as F-41, `MAX_CAPABILITY_CLOCK_SKEW_MS`); an older or future-dated token is refused.
+pub const DELETE_TOKEN_SKEW_MS: u64 = 30_000;
+
+const DELETE_TOKEN_DOMAIN: &[u8] = b"parvault-owner-shard-delete-v1:";
+
+fn now_ms_wall() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Length of a `DeleteShard` v1 token payload: domain, stripe root, shard index, timestamp.
+pub const DELETE_TOKEN_PAYLOAD_LEN: usize = DELETE_TOKEN_DOMAIN.len() + 32 + 4 + 8;
+
+/// B-158 (D-47 Q5): a `DeleteShard` token is fresh when its signed timestamp is within
+/// [`DELETE_TOKEN_SKEW_MS`] of `now_ms`, either side. Pure; a claim and a Kani target.
+pub const fn delete_freshness_decision(timestamp_ms: u64, now_ms: u64) -> Result<(), &'static str> {
+    if timestamp_ms.abs_diff(now_ms) <= DELETE_TOKEN_SKEW_MS {
+        Ok(())
+    } else {
+        Err("reject.delete_stale")
+    }
+}
+
+/// B-158 (B-154 2.4): a `FreeShards` order must be signed within this window (30 s).
+pub const FREE_ORDER_SKEW_MS: u64 = 30_000;
+
+/// C11: a signer's epoch mark may be dropped this long after the order that set it was
+/// accepted. Any order it guards is stale by then: an accepted order was signed at most
+/// [`FREE_ORDER_SKEW_MS`] after its acceptance, and is refused [`FREE_ORDER_SKEW_MS`] after
+/// it was signed.
+pub const FREE_EPOCH_TTL_MS: u64 = 2 * FREE_ORDER_SKEW_MS;
+
+/// Most signers whose epoch mark a host holds at once (entries expire after
+/// [`FREE_EPOCH_TTL_MS`]); a new signer is refused while the store is full.
+pub const MAX_FREE_EPOCH_SIGNERS: usize = 4096;
+
+/// The state file of the per-signer epoch marks (absent on `--no-fs`: RAM only, which the
+/// verdict accepts: orders are host-bound inside Noise, so only this host could replay one).
+pub const FREE_EPOCH_FILE: &str = "free_order_epochs.bin";
+
+const FREE_EPOCH_MAGIC: &[u8; 8] = b"PVFREPO1";
+
+/// What [`free_order_decision`] needs to know, in the check order of C12.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreeOrderFacts {
+    /// 1 to [`crate::network::MAX_FREE_ORDER_SHARDS`] shards and a 64-byte signature.
+    pub shape_ok: bool,
+    /// The order names this host's node identity key.
+    pub host_matches: bool,
+    /// `|timestamp_ms - now| <= FREE_ORDER_SKEW_MS`.
+    pub fresh: bool,
+    /// The owner's Ed25519 signature over [`free_order_signing_bytes`] verifies.
+    pub signature_valid: bool,
+    /// The host can judge the epoch: its marks were not lost in the last
+    /// [`FREE_EPOCH_TTL_MS`], and the signer has a mark or there is room for one.
+    pub epoch_state_ok: bool,
+    /// `gc_epoch` exceeds the last epoch this host accepted from this signer.
+    pub epoch_advances: bool,
+}
+
+/// B-158, B-154 2.4, C12: an owner's `FreeShards` order is admitted only with the exact shape,
+/// for this host, fresh, validly signed and with a new epoch, checked in that order. Each
+/// shard is then decided by [`shard_delete_decision`]. Pure; a claim and a Kani target.
+pub const fn free_order_decision(f: &FreeOrderFacts) -> Result<(), &'static str> {
+    if !f.shape_ok {
+        return Err("reject.free_order_malformed");
+    }
+    if !f.host_matches {
+        return Err("reject.free_wrong_host");
+    }
+    if !f.fresh {
+        return Err("reject.free_stale");
+    }
+    if !f.signature_valid {
+        return Err("reject.free_bad_signature");
+    }
+    if !f.epoch_state_ok {
+        return Err("reject.free_epoch_unavailable");
+    }
+    if !f.epoch_advances {
+        return Err("reject.free_epoch_replay");
+    }
+    Ok(())
+}
+
+/// The bytes a [`crate::network::FreeShardsOrder`] signature covers (B-154 2.4):
+/// `FREE_ORDER_DOMAIN || host || timestamp_ms || gc_epoch || u32 count || shard_ids[]`, integers
+/// big-endian, each shard id `stripe_merkle_root || shard_index || shard_hash`. The one encoder
+/// of the order: the owner (track B2) signs with [`sign_free_order`] and the host verifies these.
+pub fn free_order_signing_bytes(
+    host_ed25519_pubkey: &[u8; 32],
+    timestamp_ms: u64,
+    gc_epoch: u64,
+    shard_ids: &[ShardId],
+) -> Vec<u8> {
+    let domain = crate::network::FREE_ORDER_DOMAIN;
+    let mut out = Vec::with_capacity(domain.len() + 32 + 8 + 8 + 4 + shard_ids.len() * 68);
+    out.extend_from_slice(domain);
+    out.extend_from_slice(host_ed25519_pubkey);
+    out.extend_from_slice(&timestamp_ms.to_be_bytes());
+    out.extend_from_slice(&gc_epoch.to_be_bytes());
+    out.extend_from_slice(
+        &u32::try_from(shard_ids.len())
+            .unwrap_or(u32::MAX)
+            .to_be_bytes(),
+    );
+    for s in shard_ids {
+        out.extend_from_slice(&s.stripe_merkle_root);
+        out.extend_from_slice(&s.shard_index.to_be_bytes());
+        out.extend_from_slice(&s.shard_hash);
+    }
+    out
+}
+
+/// Signs a `FreeShards` order for `host` as `owner` (the vault owner identity).
+pub fn sign_free_order(
+    owner: &NodeIdentity,
+    host_ed25519_pubkey: [u8; 32],
+    timestamp_ms: u64,
+    gc_epoch: u64,
+    shard_ids: Vec<ShardId>,
+) -> crate::network::FreeShardsOrder {
+    let msg = free_order_signing_bytes(&host_ed25519_pubkey, timestamp_ms, gc_epoch, &shard_ids);
+    crate::network::FreeShardsOrder {
+        host_ed25519_pubkey,
+        owner_ed25519_pubkey: owner.public_key_bytes(),
+        timestamp_ms,
+        gc_epoch,
+        shard_ids,
+        signature: owner.sign(&msg).to_vec(),
+    }
+}
+
+/// One signer's epoch mark: the last epoch accepted and when (wall clock, ms).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct FreeEpochMark {
+    epoch: u64,
+    accepted_ms: u64,
+}
+
+/// The per-signer epoch marks of `FreeShards` orders (C11 verify half, C12), persisted to
+/// [`FREE_EPOCH_FILE`] (tagged, atomic) unless RAM only. A file that exists and does not decode
+/// is not trusted: the host starts empty and refuses every order for [`FREE_EPOCH_TTL_MS`], after
+/// which every order the lost marks guarded is stale.
+#[derive(Debug, Default)]
+struct FreeEpochStore {
+    marks: HashMap<[u8; 32], FreeEpochMark>,
+    path: Option<std::path::PathBuf>,
+    /// Orders are refused until this time (ms): the marks were lost.
+    refuse_until_ms: u64,
+}
+
+impl FreeEpochStore {
+    fn load(path: std::path::PathBuf, now_ms: u64) -> Self {
+        let mut s = Self {
+            path: Some(path.clone()),
+            ..Self::default()
+        };
+        let lost = match crate::storage::fsio::read_state_file(&path) {
+            Ok(None) => false,
+            Ok(Some(raw)) => match Self::decode(&raw) {
+                Some(marks) => {
+                    s.marks = marks;
+                    false
+                }
+                None => true,
+            },
+            Err(_) => true,
+        };
+        if lost {
+            tracing::warn!(
+                code = "warn.free_epoch_state_corrupt",
+                path = %path.display(),
+                "free-order epoch marks unreadable; refusing orders for 60 s"
+            );
+            s.refuse_until_ms = now_ms.saturating_add(FREE_EPOCH_TTL_MS);
+        }
+        s
+    }
+
+    fn decode(raw: &[u8]) -> Option<HashMap<[u8; 32], FreeEpochMark>> {
+        let body = raw.strip_prefix(FREE_EPOCH_MAGIC.as_slice())?;
+        let marks: Vec<([u8; 32], FreeEpochMark)> = bincode::deserialize(body).ok()?;
+        (marks.len() <= MAX_FREE_EPOCH_SIGNERS).then(|| marks.into_iter().collect())
+    }
+
+    fn expire(&mut self, now_ms: u64) {
+        self.marks
+            .retain(|_, m| now_ms.saturating_sub(m.accepted_ms) < FREE_EPOCH_TTL_MS);
+    }
+
+    /// (`epoch_state_ok`, `epoch_advances`) for `signer` at `epoch`.
+    fn facts(&mut self, signer: &[u8; 32], epoch: u64, now_ms: u64) -> (bool, bool) {
+        if now_ms < self.refuse_until_ms {
+            return (false, false);
+        }
+        self.expire(now_ms);
+        match self.marks.get(signer) {
+            Some(m) => (true, epoch > m.epoch),
+            None => (self.marks.len() < MAX_FREE_EPOCH_SIGNERS, true),
+        }
+    }
+
+    fn advance(&mut self, signer: [u8; 32], epoch: u64, now_ms: u64) {
+        self.marks.insert(
+            signer,
+            FreeEpochMark {
+                epoch,
+                accepted_ms: now_ms,
+            },
+        );
+        if let Some(path) = &self.path {
+            let marks: Vec<_> = self.marks.iter().map(|(k, v)| (*k, *v)).collect();
+            let mut raw = FREE_EPOCH_MAGIC.to_vec();
+            if let Ok(body) = bincode::serialize(&marks) {
+                raw.extend_from_slice(&body);
+                if let Err(e) = crate::storage::fsio::atomic_write_file(path, &raw) {
+                    tracing::warn!(error = %e, "could not write the free-order epoch marks");
+                }
+            }
+        }
+    }
+}
+
 /// What the repair-read decision needs to know (F-02b).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RepairReadFacts {
@@ -617,6 +843,8 @@ pub struct PorVerifierEngine {
     chunk_rate: ChunkRateState,
     /// Optional path to persist `session_keys_ram` and `repair_grants_ram` across daemon restarts.
     persistence_path: Option<std::path::PathBuf>,
+    /// B-158: per-signer `FreeShards` epoch marks (own file, so the PoR state layout is unchanged).
+    free_epochs: FreeEpochStore,
 }
 
 impl PorVerifierEngine {
@@ -631,6 +859,7 @@ impl PorVerifierEngine {
             blocked_ddos_challenges: 0,
             chunk_rate: ChunkRateState::default(),
             persistence_path: None,
+            free_epochs: FreeEpochStore::default(),
         }
     }
 
@@ -678,6 +907,7 @@ impl PorVerifierEngine {
             blocked_ddos_challenges: 0,
             chunk_rate: ChunkRateState::default(),
             persistence_path: Some(path),
+            free_epochs: FreeEpochStore::load(data_dir.join(FREE_EPOCH_FILE), now_ms_wall()),
         }
     }
 
@@ -689,8 +919,11 @@ impl PorVerifierEngine {
                 repair_grants: self.repair_grants_ram.clone(),
                 shard_grant_owners: self.shard_grant_owners.clone(),
             };
+            // B-152 (a), arch056c 1.7: written atomically (was a plain write).
             if let Ok(encoded) = bincode::serialize(&state) {
-                let _ = std::fs::write(path, encoded);
+                if let Err(e) = crate::storage::fsio::atomic_write_file(path, &encoded) {
+                    tracing::warn!(error = %e, "could not write the PoR verifier state");
+                }
             }
         }
     }
@@ -796,10 +1029,124 @@ impl PorVerifierEngine {
     /// fresh `Bind` of a shard no longer stored (e.g. LRU-evicted), so a stale owner keeps
     /// nothing over the new owner's shard (F-38-GRANT).
     pub fn clear_shard_binding(&mut self, shard_id: &ShardId) {
-        let key = shard_id.file_key();
-        let had_session = self.session_keys_ram.remove(&key).is_some();
-        if self.shard_grant_owners.remove(&key).is_some() || had_session {
+        self.forget_shards(std::slice::from_ref(shard_id));
+    }
+
+    /// B-152 (a), arch056c 1.3: forgets the PoR entries of removed shards (session key, grant
+    /// owner) and drops a repair grant once no held shard of its (root, owner) stays bound to it,
+    /// writing the state once for the batch.
+    ///
+    /// Bindings are keyed by `ShardId::file_key`, whose root part is 8 bytes; a grant is kept
+    /// while any bound shard of the same owner shares that prefix, so a prefix collision only
+    /// keeps a grant longer, never drops one in use.
+    pub fn forget_shards(&mut self, shard_ids: &[ShardId]) {
+        let mut changed = false;
+        let mut candidates: HashMap<String, Vec<(Hash32, [u8; 32])>> = HashMap::new();
+        for id in shard_ids {
+            let key = id.file_key();
+            changed |= self.session_keys_ram.remove(&key).is_some();
+            if let Some(owner) = self.shard_grant_owners.remove(&key) {
+                changed = true;
+                candidates
+                    .entry(hex::encode(&id.stripe_merkle_root[..8]))
+                    .or_default()
+                    .push((id.stripe_merkle_root, owner));
+            }
+        }
+        if !candidates.is_empty() {
+            let mut kept = HashSet::new();
+            for (key, owner) in &self.shard_grant_owners {
+                let prefix = key.split('_').next().unwrap_or_default();
+                if let Some(c) = candidates.get(prefix) {
+                    for (root, o) in c {
+                        if o == owner {
+                            kept.insert((*root, *o));
+                        }
+                    }
+                }
+            }
+            for (root, owner) in candidates.into_values().flatten() {
+                if !kept.contains(&(root, owner)) {
+                    changed |= self.repair_grants_ram.remove(&(root, owner)).is_some();
+                }
+            }
+        }
+        if changed {
             self.persist_state_if_configured();
+        }
+    }
+
+    /// Entries per PoR index: session keys, shard grant owners, repair grants (B-152 (a)).
+    pub fn index_counts(&self) -> (usize, usize, usize) {
+        (
+            self.session_keys_ram.len(),
+            self.shard_grant_owners.len(),
+            self.repair_grants_ram.len(),
+        )
+    }
+
+    /// B-158, C12: the order-level checks of a `FreeShards` order for `host` (this node's
+    /// identity key) at `now_ms`, through [`free_order_decision`]. The epoch mark is not moved:
+    /// call [`Self::advance_free_epoch`] once a shard of the order was authorized.
+    pub fn free_order_check(
+        &mut self,
+        order: &crate::network::FreeShardsOrder,
+        host: &[u8; 32],
+        now_ms: u64,
+    ) -> Result<(), &'static str> {
+        let n = order.shard_ids.len();
+        let shape_ok =
+            (1..=crate::network::MAX_FREE_ORDER_SHARDS).contains(&n) && order.signature.len() == 64;
+        let host_matches = order.host_ed25519_pubkey == *host;
+        let fresh = order.timestamp_ms.abs_diff(now_ms) <= FREE_ORDER_SKEW_MS;
+        // Each check runs only when the ones before it passed (C12): no signature work for a
+        // malformed, misdirected or stale order.
+        let signature_valid = shape_ok && host_matches && fresh && {
+            let mut sig = [0u8; 64];
+            sig.copy_from_slice(&order.signature);
+            let msg = free_order_signing_bytes(
+                &order.host_ed25519_pubkey,
+                order.timestamp_ms,
+                order.gc_epoch,
+                &order.shard_ids,
+            );
+            NodeIdentity::verify_with_pubkey(&order.owner_ed25519_pubkey, &msg, &sig)
+        };
+        let (epoch_state_ok, epoch_advances) = if signature_valid {
+            self.free_epochs
+                .facts(&order.owner_ed25519_pubkey, order.gc_epoch, now_ms)
+        } else {
+            (false, false)
+        };
+        free_order_decision(&FreeOrderFacts {
+            shape_ok,
+            host_matches,
+            fresh,
+            signature_valid,
+            epoch_state_ok,
+            epoch_advances,
+        })
+    }
+
+    /// C12: records `epoch` as the last one accepted from `signer` (after a valid order with at
+    /// least one authorized shard), persisted when the engine has a data dir.
+    pub fn advance_free_epoch(&mut self, signer: [u8; 32], epoch: u64, now_ms: u64) {
+        self.free_epochs.advance(signer, epoch, now_ms);
+    }
+
+    /// The facts of [`shard_delete_decision`] for `signer` deleting `shard_id`, whose accounted
+    /// owner (the device id that stored it) is `accounted_owner` (F-36).
+    pub fn shard_delete_facts(
+        &self,
+        shard_id: &ShardId,
+        signer: &[u8; 32],
+        accounted_owner: Option<&str>,
+    ) -> ShardDeleteFacts {
+        ShardDeleteFacts {
+            grant_owner: self.grant_for_shard(shard_id).map(|g| g.owner_pubkey),
+            signer: *signer,
+            signer_is_accounted_owner: accounted_owner
+                == Some(NodeIdentity::device_peer_id_for_pubkey(signer).as_str()),
         }
     }
 
@@ -838,48 +1185,37 @@ impl PorVerifierEngine {
         (owner_pub, payload, sig)
     }
 
-    /// Verifies an owner-signed unblinded shard deletion request against the stripe's `RepairGrant.owner_pubkey`.
+    /// Verifies an owner-signed unblinded shard deletion request against the stripe's
+    /// `RepairGrant.owner_pubkey`; `Err` carries the reason code.
     ///
     /// `accounted_owner` is the device id the shard is accounted to (the key that stored it).
+    /// The payload has the exact v1 length and a timestamp within [`DELETE_TOKEN_SKEW_MS`] of
+    /// `now_ms` (B-158). Nothing changes here: the binding is cleared only after the shard is
+    /// removed (C13, B-178), by the wire handler's single removal path.
     pub fn authorize_owner_shard_delete(
-        &mut self,
+        &self,
         shard_id: &ShardId,
         owner_pub: &[u8; 32],
         signed_payload: &[u8],
         sig: &[u8; 64],
         accounted_owner: Option<&str>,
-    ) -> bool {
-        const DOMAIN_PREFIX: &[u8] = b"parvault-owner-shard-delete-v1:";
-        let expected_min_len = DOMAIN_PREFIX.len() + 32 + 4 + 8;
-        if signed_payload.len() < expected_min_len
-            || !signed_payload.starts_with(DOMAIN_PREFIX)
-            || &signed_payload[DOMAIN_PREFIX.len()..DOMAIN_PREFIX.len() + 32]
-                != shard_id.stripe_merkle_root.as_slice()
-            || &signed_payload[DOMAIN_PREFIX.len() + 32..DOMAIN_PREFIX.len() + 36]
-                != shard_id.shard_index.to_be_bytes().as_slice()
+        now_ms: u64,
+    ) -> Result<(), &'static str> {
+        let d = DELETE_TOKEN_DOMAIN.len();
+        if signed_payload.len() != DELETE_TOKEN_PAYLOAD_LEN
+            || !signed_payload.starts_with(DELETE_TOKEN_DOMAIN)
+            || &signed_payload[d..d + 32] != shard_id.stripe_merkle_root.as_slice()
+            || &signed_payload[d + 32..d + 36] != shard_id.shard_index.to_be_bytes().as_slice()
         {
-            return false;
+            return Err("reject.delete_token_malformed");
         }
+        let mut ts = [0u8; 8];
+        ts.copy_from_slice(&signed_payload[d + 36..d + 44]);
+        delete_freshness_decision(u64::from_be_bytes(ts), now_ms)?;
         if !NodeIdentity::verify_with_pubkey(owner_pub, signed_payload, sig) {
-            return false;
+            return Err("reject.delete_bad_signature");
         }
-        let facts = ShardDeleteFacts {
-            grant_owner: self.grant_for_shard(shard_id).map(|g| g.owner_pubkey),
-            signer: *owner_pub,
-            signer_is_accounted_owner: accounted_owner
-                == Some(NodeIdentity::device_peer_id_for_pubkey(owner_pub).as_str()),
-        };
-        let authorized = match shard_delete_decision(&facts) {
-            Ok(()) => true,
-            Err(code) => {
-                tracing::warn!(code, "refused a shard delete signed by another key");
-                false
-            }
-        };
-        if authorized {
-            self.clear_shard_binding(shard_id);
-        }
-        authorized
+        shard_delete_decision(&self.shard_delete_facts(shard_id, owner_pub, accounted_owner))
     }
 
     /// Runs [`por_prescreen_decision`] for one challenge; a refusal is logged with its code,
@@ -2015,6 +2351,243 @@ mod chunk_admit_tests {
                 8193
             )),
             Err("reject.por_rate_limited")
+        );
+    }
+
+    fn order_facts() -> FreeOrderFacts {
+        FreeOrderFacts {
+            shape_ok: true,
+            host_matches: true,
+            fresh: true,
+            signature_valid: true,
+            epoch_state_ok: true,
+            epoch_advances: true,
+        }
+    }
+
+    /// B154-FREE: every fact is needed, and the codes follow C12's check order.
+    #[test]
+    fn free_order_decision_needs_every_fact_in_order() {
+        assert_eq!(free_order_decision(&order_facts()), Ok(()));
+        let all_false = FreeOrderFacts {
+            shape_ok: false,
+            host_matches: false,
+            fresh: false,
+            signature_valid: false,
+            epoch_state_ok: false,
+            epoch_advances: false,
+        };
+        assert_eq!(
+            free_order_decision(&all_false),
+            Err("reject.free_order_malformed")
+        );
+        type Unset = fn(&mut FreeOrderFacts);
+        let cases: [(Unset, &str); 6] = [
+            (|f| f.shape_ok = false, "reject.free_order_malformed"),
+            (|f| f.host_matches = false, "reject.free_wrong_host"),
+            (|f| f.fresh = false, "reject.free_stale"),
+            (|f| f.signature_valid = false, "reject.free_bad_signature"),
+            (
+                |f| f.epoch_state_ok = false,
+                "reject.free_epoch_unavailable",
+            ),
+            (|f| f.epoch_advances = false, "reject.free_epoch_replay"),
+        ];
+        for (unset, code) in cases {
+            let mut f = order_facts();
+            unset(&mut f);
+            assert_eq!(free_order_decision(&f), Err(code));
+        }
+    }
+
+    /// qa-t0 (proposal f): every string a `FreeShards` ack carries (whole-order `error` or a
+    /// shard's `Refused`) is one of these codes, built by `free_order_decision`,
+    /// `shard_delete_decision` or the wire arm, never text a peer supplied: ASCII `[a-z._]`, at
+    /// most 40 bytes.
+    #[test]
+    fn free_ack_codes_are_short_ascii() {
+        const FREE_ACK_CODES: &[&str] = &[
+            "reject.free_order_malformed",
+            "reject.free_wrong_host",
+            "reject.free_stale",
+            "reject.free_bad_signature",
+            "reject.free_epoch_unavailable",
+            "reject.free_epoch_replay",
+            "reject.delete_not_shard_owner",
+            "reject.free_remove_failed",
+        ];
+        for c in FREE_ACK_CODES {
+            assert!(c.len() <= 40, "{c}");
+            assert!(c.starts_with("reject."), "{c}");
+            assert!(
+                c.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'.' || b == b'_'),
+                "{c}"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_freshness_window_both_sides() {
+        let now = 1_000_000;
+        assert_eq!(delete_freshness_decision(now - 30_000, now), Ok(()));
+        assert_eq!(delete_freshness_decision(now + 30_000, now), Ok(()));
+        assert_eq!(
+            delete_freshness_decision(now - 30_001, now),
+            Err("reject.delete_stale")
+        );
+        assert_eq!(
+            delete_freshness_decision(now + 30_001, now),
+            Err("reject.delete_stale")
+        );
+    }
+
+    fn signed(
+        owner: &NodeIdentity,
+        host: [u8; 32],
+        ts: u64,
+        epoch: u64,
+    ) -> crate::network::FreeShardsOrder {
+        sign_free_order(owner, host, ts, epoch, vec![sid(1), sid(2)])
+    }
+
+    #[test]
+    fn free_order_check_shape_host_time_signature_epoch() {
+        let mut e = engine();
+        let owner = NodeIdentity::from_seed([0xA1; 32]);
+        let host = [0x11; 32];
+        let now = 5_000_000;
+        assert_eq!(
+            e.free_order_check(&signed(&owner, host, now, 7), &host, now),
+            Ok(())
+        );
+        assert_eq!(
+            e.free_order_check(&signed(&owner, [0x12; 32], now, 7), &host, now),
+            Err("reject.free_wrong_host")
+        );
+        assert_eq!(
+            e.free_order_check(&signed(&owner, host, now - 31_000, 7), &host, now),
+            Err("reject.free_stale")
+        );
+        // C24: a future-dated order is stale too.
+        assert_eq!(
+            e.free_order_check(&signed(&owner, host, now + 31_000, 7), &host, now),
+            Err("reject.free_stale")
+        );
+        let mut tampered = signed(&owner, host, now, 7);
+        tampered.gc_epoch = 8;
+        assert_eq!(
+            e.free_order_check(&tampered, &host, now),
+            Err("reject.free_bad_signature")
+        );
+        let mut empty = signed(&owner, host, now, 7);
+        empty.shard_ids.clear();
+        assert_eq!(
+            e.free_order_check(&empty, &host, now),
+            Err("reject.free_order_malformed")
+        );
+        let mut big = signed(&owner, host, now, 7);
+        big.shard_ids = vec![sid(1); crate::network::MAX_FREE_ORDER_SHARDS + 1];
+        assert_eq!(
+            e.free_order_check(&big, &host, now),
+            Err("reject.free_order_malformed")
+        );
+        // The epoch: a mark set at 7 refuses 7 and 6, accepts 8; it expires after 60 s.
+        e.advance_free_epoch(owner.public_key_bytes(), 7, now);
+        assert_eq!(
+            e.free_order_check(&signed(&owner, host, now, 7), &host, now),
+            Err("reject.free_epoch_replay")
+        );
+        assert_eq!(
+            e.free_order_check(&signed(&owner, host, now, 6), &host, now),
+            Err("reject.free_epoch_replay")
+        );
+        assert_eq!(
+            e.free_order_check(&signed(&owner, host, now, 8), &host, now),
+            Ok(())
+        );
+        let later = now + FREE_EPOCH_TTL_MS;
+        assert_eq!(
+            e.free_order_check(&signed(&owner, host, later, 7), &host, later),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn free_epoch_marks_persist_and_a_corrupt_file_refuses_for_the_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = NodeIdentity::from_seed([0xA2; 32]);
+        let host = [0x11; 32];
+        let now = now_ms_wall();
+        {
+            let mut e = PorVerifierEngine::with_persistence_dir(300, dir.path());
+            e.advance_free_epoch(owner.public_key_bytes(), 9, now);
+        }
+        let mut e = PorVerifierEngine::with_persistence_dir(300, dir.path());
+        assert_eq!(
+            e.free_order_check(&signed(&owner, host, now, 9), &host, now),
+            Err("reject.free_epoch_replay")
+        );
+        std::fs::write(dir.path().join(FREE_EPOCH_FILE), b"not a mark file").unwrap();
+        let mut e = PorVerifierEngine::with_persistence_dir(300, dir.path());
+        let t = now_ms_wall();
+        assert_eq!(
+            e.free_order_check(&signed(&owner, host, t, 10), &host, t),
+            Err("reject.free_epoch_unavailable")
+        );
+        let after = t + FREE_EPOCH_TTL_MS + 1;
+        assert_eq!(
+            e.free_order_check(&signed(&owner, host, after, 10), &host, after),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn free_epoch_store_full_refuses_a_new_signer() {
+        let mut e = engine();
+        let now = 9_000_000;
+        for i in 0..MAX_FREE_EPOCH_SIGNERS {
+            let mut k = [0u8; 32];
+            k[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            e.advance_free_epoch(k, 1, now);
+        }
+        let owner = NodeIdentity::from_seed([0xA3; 32]);
+        let host = [0x11; 32];
+        assert_eq!(
+            e.free_order_check(&signed(&owner, host, now, 1), &host, now),
+            Err("reject.free_epoch_unavailable")
+        );
+        let later = now + FREE_EPOCH_TTL_MS;
+        assert_eq!(
+            e.free_order_check(&signed(&owner, host, later, 1), &host, later),
+            Ok(())
+        );
+    }
+
+    /// B-178 (C13): authorizing a delete changes nothing; the binding stays until the removal.
+    #[test]
+    fn authorizing_a_delete_keeps_the_binding() {
+        let mut e = engine();
+        let owner = NodeIdentity::from_seed([0xA4; 32]);
+        let s = sid(3);
+        let grant = RepairGrant::issue(&owner, s.stripe_merkle_root, vec![], ErasureTier::Homelab);
+        e.register_repair_grant_for_stored(grant, &[s]).unwrap();
+        let now = now_ms_wall();
+        let (pk, payload, sig) = PorVerifierEngine::sign_owner_shard_delete_token(&owner, &s, now);
+        assert_eq!(
+            e.authorize_owner_shard_delete(&s, &pk, &payload, &sig, None, now),
+            Ok(())
+        );
+        assert_eq!(e.shard_grant_owner(&s), Some(pk));
+        assert_eq!(
+            e.authorize_owner_shard_delete(&s, &pk, &payload, &sig, None, now + 31_000),
+            Err("reject.delete_stale")
+        );
+        let mut long = payload.clone();
+        long.push(0);
+        assert_eq!(
+            e.authorize_owner_shard_delete(&s, &pk, &long, &sig, None, now),
+            Err("reject.delete_token_malformed")
         );
     }
 }

@@ -603,6 +603,19 @@ fn assert_same_except_eviction(a: &Outcome, b: &Outcome) {
     assert_eq!(strip(a), strip(b));
 }
 
+/// A removal (C18) rewrites each fixture's eviction index without the shard's attribution; the
+/// seeds' index also holds their admission-IP records (row 2), so only its bytes differ.
+fn assert_identical_removal(o: &[Outcome; 3]) {
+    assert_same_except_eviction(&o[0], &o[1]);
+    assert_same_except_eviction(&o[1], &o[2]);
+    for x in o {
+        assert!(
+            x.changed.contains_key("eviction_index.bin"),
+            "the attribution record was forgotten: {x:?}"
+        );
+    }
+}
+
 // --- request builders ---------------------------------------------------------------------------
 
 fn shard(seed: u8, len: usize) -> (ShardId, Vec<u8>) {
@@ -995,7 +1008,7 @@ fn delete_shard() {
         },
     );
     assert!(o[0].resp.contains("deleted: true"), "{}", o[0].resp);
-    assert_identical(&o);
+    assert_identical_removal(&o);
     // Absolute: the shard is gone and its quota is released under the sender's device id.
     for fx in &t.fx {
         assert!(!fx.store.has_shard(&sid), "{:?}: shard deleted", fx.role);
@@ -1021,40 +1034,176 @@ fn delete_shard() {
         },
     );
     assert!(o[0].resp.contains("deleted: true"), "{}", o[0].resp);
-    assert_identical(&o);
+    assert_identical_removal(&o);
     for fx in &t.fx {
         assert!(!fx.store.has_shard(&sid2), "{:?}: shard deleted", fx.role);
         assert_eq!(fx.hosted(&device), 0, "{:?}: released in full", fx.role);
     }
 }
 
-// --- FreeShards (v0.5.6 T0 stub, identical) -----------------------------------------------------
+// --- FreeShards (B-158, identical) ---------------------------------------------------------------
 
-/// B-158: until track B1 builds the host path, both handlers refuse every order the same way
-/// and free nothing; B1 replaces this case with the real accept and refuse cases.
+/// B-158 (C15): both handlers decide a free order the same way: an order for another host and a
+/// stranger's shard are refused, the owner's order frees its shard and credits its account, a
+/// shard not held is `NotHeld`, and the same order resent is a replay.
 #[test]
 fn free_shards() {
     let _g = env_guard();
     let mut t = Trio::new("free");
     let peer = Peer::new(0x63, "198.51.100.4");
+    let other = Peer::new(0x64, "198.51.100.5");
     t.admit(&peer);
+    t.admit(&other);
     let device = peer.ident.device_peer_id();
+    let host = NodeIdentity::from_seed([0x11; 32]).public_key_bytes();
     let (sid, bytes) = shard(6, 1024);
+    let (absent, _) = shard(7, 1024);
     t.run(&peer, &put_shard_req("", sid, bytes, [6; 32]));
-    let order = parvault::network::FreeShardsOrder {
-        host_ed25519_pubkey: [0; 32],
-        owner_ed25519_pubkey: peer.ident.public_key_bytes(),
-        timestamp_ms: now_ms(),
-        gc_epoch: 1,
-        shard_ids: vec![sid],
-        signature: vec![0; 64],
+    let sign = |who: &Peer, host: [u8; 32], epoch: u64, ids: Vec<ShardId>| {
+        parvault::por::verifier::sign_free_order(&who.ident, host, now_ms(), epoch, ids)
     };
-    let o = t.run(&peer, &MeshWireRequest::FreeShards { order });
-    assert!(o[0].resp.starts_with("FreeShardsAck"), "{}", o[0].resp);
-    assert!(o[0].resp.contains("not_built_yet"), "{}", o[0].resp);
+
+    let wrong_host = sign(&peer, [0x22; 32], 1, vec![sid]);
+    let o = t.run(&peer, &MeshWireRequest::FreeShards { order: wrong_host });
+    assert!(
+        o[0].resp.contains("reject.free_wrong_host"),
+        "{}",
+        o[0].resp
+    );
+    assert_identical(&o);
+
+    let stranger = sign(&other, host, 1, vec![sid]);
+    let o = t.run(&other, &MeshWireRequest::FreeShards { order: stranger });
+    assert!(
+        o[0].resp.contains("reject.delete_not_shard_owner"),
+        "{}",
+        o[0].resp
+    );
     assert_identical(&o);
     for fx in &t.fx {
         assert!(fx.store.has_shard(&sid), "{:?}: nothing freed", fx.role);
+        assert_eq!(fx.hosted(&device), 1024, "{:?}: quota unchanged", fx.role);
+    }
+
+    let order = sign(&peer, host, 2, vec![sid, absent]);
+    let o = t.run(
+        &peer,
+        &MeshWireRequest::FreeShards {
+            order: order.clone(),
+        },
+    );
+    assert!(o[0].resp.contains("[Freed, NotHeld]"), "{}", o[0].resp);
+    assert_identical_removal(&o);
+    for fx in &t.fx {
+        assert!(!fx.store.has_shard(&sid), "{:?}: freed", fx.role);
+        assert_eq!(fx.hosted(&device), 0, "{:?}: quota credited", fx.role);
+    }
+
+    let o = t.run(&peer, &MeshWireRequest::FreeShards { order });
+    assert!(
+        o[0].resp.contains("reject.free_epoch_replay"),
+        "{}",
+        o[0].resp
+    );
+    assert_identical(&o);
+}
+
+/// C17: a valid free order on a node with a lite audit index (a seed) removes the signer's own
+/// record of each named stripe and never another client's record of the same root; every role
+/// does the same.
+#[test]
+fn free_shards_removes_only_the_signers_lite_record() {
+    use parvault::por::lite_index::{LiteAuditIndex, LiteAuditRecord, LiteAuditShard};
+    let _g = env_guard();
+    let mut t = Trio::new("free-lite");
+    let peer = Peer::new(0x66, "198.51.100.7");
+    t.admit(&peer);
+    let host = NodeIdentity::from_seed([0x11; 32]).public_key_bytes();
+    let (sid, bytes) = shard(10, 1024);
+    t.run(&peer, &put_shard_req("", sid, bytes, [10; 32]));
+    let rec = |client: String| LiteAuditRecord {
+        client,
+        stripe_merkle_root: sid.stripe_merkle_root,
+        shard_len: 1024,
+        shards: vec![LiteAuditShard {
+            shard_index: 0,
+            shard_hash: sid.shard_hash,
+            chunk_root: [1; 32],
+            host_addr: "/ip4/127.0.0.1/tcp/4001".into(),
+        }],
+        unwitnessed: false,
+    };
+    let mut indexes = Vec::new();
+    for fx in &mut t.fx {
+        let idx = std::sync::Arc::new(std::sync::Mutex::new(LiteAuditIndex::in_memory()));
+        idx.lock().unwrap().insert(rec(peer.ident.device_peer_id()));
+        idx.lock().unwrap().insert(rec("another-client".into()));
+        let server = match fx.role {
+            Role::Daemon | Role::SeedHomelab => ZeroTrustSeedServer::new_homelab_vault(
+                "server-peer",
+                fx.store.clone(),
+                t.keys.owner_pq.public_key(),
+                2,
+            ),
+            Role::SeedPublic => ZeroTrustSeedServer::new_public_bootstrapper(
+                "server-peer",
+                fx.store.clone(),
+                t.keys.voucher_issuer.public_key_bytes(),
+                2,
+            ),
+        };
+        fx.server = server.with_lite_audit_index(std::sync::Arc::clone(&idx));
+        indexes.push(idx);
+    }
+    let order = parvault::por::verifier::sign_free_order(&peer.ident, host, now_ms(), 1, vec![sid]);
+    let o = t.run(&peer, &MeshWireRequest::FreeShards { order });
+    assert!(o[0].resp.contains("[Freed]"), "{}", o[0].resp);
+    assert_identical_removal(&o);
+    for idx in &indexes {
+        let idx = idx.lock().unwrap();
+        assert_eq!(idx.len(), 1, "only the signer's record left");
+        assert_eq!(
+            idx.sample_targets(4).len(),
+            1,
+            "another client's record of the same root stays"
+        );
+    }
+}
+
+// --- Held-shard bound (B-152 (a), identical) -------------------------------------------------------
+
+/// arch152b 3.4, L-130: at the held-shard bound both handlers refuse a new shard the same way
+/// (`reject.node_shard_count`, decided before any eviction) and store nothing.
+#[test]
+fn put_shard_over_held_shard_bound() {
+    let _g = env_guard();
+    let mut t = Trio::new("held");
+    let peer = Peer::new(0x65, "198.51.100.6");
+    t.admit(&peer);
+    let device = peer.ident.device_peer_id();
+    t.each(|fx, _| {
+        fx.store.quota().lock().unwrap().set_held_shard_bound(
+            parvault::storage::quota::HeldShardBound {
+                max: 1,
+                source: parvault::storage::quota::HeldShardBoundSource::Config,
+                memory_bytes: None,
+            },
+        );
+    });
+    let (sid, bytes) = shard(8, 1024);
+    let (sid2, bytes2) = shard(9, 1024);
+    let o = t.run(&peer, &put_shard_req("", sid, bytes, [8; 32]));
+    assert!(o[0].resp.contains("stored: true"), "{}", o[0].resp);
+    let o = t.run(&peer, &put_shard_req("", sid2, bytes2, [9; 32]));
+    assert!(o[0].resp.contains("stored: false"), "{}", o[0].resp);
+    assert!(
+        o[0].resp.contains("reject.node_shard_count"),
+        "{}",
+        o[0].resp
+    );
+    assert_identical(&o);
+    for fx in &t.fx {
+        assert!(!fx.store.has_shard(&sid2), "{:?}: refused", fx.role);
         assert_eq!(fx.hosted(&device), 1024, "{:?}: quota unchanged", fx.role);
     }
 }

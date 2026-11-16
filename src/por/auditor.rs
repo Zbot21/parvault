@@ -150,6 +150,9 @@ pub struct AuditorState {
     /// The last scan's stripe -> assigned hosts (RAM only).
     #[serde(skip)]
     last_assigned: BTreeMap<[u8; 32], Vec<String>>,
+    /// B-147: the audit journal was replayed (RAM only; once per process, at the first job).
+    #[serde(skip)]
+    journal_replayed: bool,
 }
 
 /// Where a handed-off shard was found (A-113 C5).
@@ -291,6 +294,11 @@ impl AuditorState {
     }
 
     fn save(&self, data_dir: Option<&Path>) {
+        self.save_to(data_dir);
+    }
+
+    /// Writes [`AUDIT_STATE_FILE`] atomically into `data_dir` (nothing for `None`).
+    pub fn save_to(&self, data_dir: Option<&Path>) {
         let Some(data_dir) = data_dir else {
             return;
         };
@@ -687,11 +695,15 @@ fn run_due_probe(ctx: &AuditJobCtx, now: u64) -> Option<AuditJobOutcome> {
                     unanswered: 0,
                 },
             );
-            st.passed = st.passed.saturating_add(1);
             st.note_host(&cand, now);
-            if let Ok(mut q) = ctx.block_store.quota().lock() {
-                q.record_por_outcome(&prover, true);
-            }
+            crate::por::audit_journal::credit_audit(
+                ctx.data_dir.as_deref(),
+                &mut st,
+                &ctx.block_store,
+                &prover,
+                true,
+                None,
+            );
             // An accepted move ends the round; a later drop resumes with this backoff (C11).
             finish_round(&mut st);
             AuditJobOutcome::Judged {
@@ -722,6 +734,13 @@ fn run_due_probe(ctx: &AuditJobCtx, now: u64) -> Option<AuditJobOutcome> {
 /// takes the tick instead.
 pub fn run_audit_job(ctx: &AuditJobCtx) -> AuditJobOutcome {
     let now = now_ms();
+    // B-147: the first job after a start applies the audit journal.
+    if let (Some(dir), Ok(mut st)) = (ctx.data_dir.as_deref(), ctx.state.lock()) {
+        if !st.journal_replayed {
+            st.journal_replayed = true;
+            crate::por::audit_journal::replay_journal(dir, &mut st, &ctx.block_store);
+        }
+    }
     if let Some(outcome) = run_due_probe(ctx, now) {
         return outcome;
     }
@@ -813,21 +832,22 @@ pub fn run_audit_job(ctx: &AuditJobCtx) -> AuditJobOutcome {
     let answered = !matches!(credit, Ok(AuditCredit::Unanswered));
     note_relocation_outcome(ctx, &mut st, &target, answered, now);
     match credit {
-        Ok(AuditCredit::Pass) => {
-            st.passed = st.passed.saturating_add(1);
-            if let Ok(mut q) = ctx.block_store.quota().lock() {
-                q.record_por_outcome(&prover, true);
-            }
-        }
-        Ok(AuditCredit::Fail) => {
-            st.failed = st.failed.saturating_add(1);
-            if st.degraded.len() < MAX_AUDIT_STATE_ENTRIES {
-                st.degraded.insert(file_key);
-            }
-            if let Ok(mut q) = ctx.block_store.quota().lock() {
-                q.record_por_outcome(&prover, false);
-            }
-        }
+        Ok(AuditCredit::Pass) => crate::por::audit_journal::credit_audit(
+            ctx.data_dir.as_deref(),
+            &mut st,
+            &ctx.block_store,
+            &prover,
+            true,
+            None,
+        ),
+        Ok(AuditCredit::Fail) => crate::por::audit_journal::credit_audit(
+            ctx.data_dir.as_deref(),
+            &mut st,
+            &ctx.block_store,
+            &prover,
+            false,
+            Some(file_key),
+        ),
         Ok(AuditCredit::Unanswered) => {
             st.unanswered = st.unanswered.saturating_add(1);
             // A decoded answer that came back Unanswered was late (the only such case).

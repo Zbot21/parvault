@@ -1,7 +1,8 @@
 //! Formal model: `specs/ParVaultConfidentialityAndTrust.tla` (guard `slashed-sticky`).
 use crate::config::ErasureTier;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 /// Rolling SLA threshold (99.5% PoR pass rate) required to qualify for the 80% efficiency
 /// Homelab / Prosumer pool (`16-of-20`, 1.25x expansion factor).
@@ -121,7 +122,10 @@ pub struct QuotaManager {
     shard_sizes: HashMap<String, u64>,
     #[serde(default)]
     shard_owners: HashMap<String, String>,
-    lru_queue: VecDeque<String>,
+    /// B-152 (a): the LRU order, oldest first. Persisted in the `VecDeque<String>` layout of
+    /// `5943dca` (the same bytes), held in RAM as an O(log n) index; empty and inert on
+    /// file-backed stores, which never evict (B-161).
+    lru_queue: LruIndex,
     #[serde(default)]
     min_free_disk_bytes: u64,
     #[serde(default)]
@@ -147,6 +151,263 @@ pub struct QuotaManager {
     /// [`QUOTA_WRITE_EPOCH_SECS`]; `quota_write_epoch_secs` in `config.toml`).
     #[serde(skip)]
     write_epoch_ms: u64,
+    /// B-152 (a), L-130: the held-shard bound (RAM only; `None` keeps no bound, as before
+    /// `v0.5.6`, until the daemon sets it at startup).
+    #[serde(skip)]
+    held_bound: Option<HeldShardBound>,
+}
+
+/// B-152 (a): the LRU order of held shards in O(log n): a sequence number per key and the keys
+/// by sequence, sharing one allocation per key. Serialized exactly as the `VecDeque<String>`
+/// it replaces (a length, then the keys oldest first), so `quota_state.bin` keeps its layout.
+#[derive(Debug, Clone, Default)]
+pub struct LruIndex {
+    next_seq: u64,
+    by_key: HashMap<Arc<str>, u64>,
+    by_seq: BTreeMap<u64, Arc<str>>,
+    /// File-backed stores: no order is kept (RAM only, never serialized).
+    disabled: bool,
+}
+
+impl LruIndex {
+    fn touch(&mut self, key: &str) {
+        if self.disabled {
+            return;
+        }
+        let k: Arc<str> = match self.by_key.get_key_value(key) {
+            Some((k, seq)) => {
+                let k = Arc::clone(k);
+                self.by_seq.remove(seq);
+                k
+            }
+            None => Arc::from(key),
+        };
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        self.by_seq.insert(seq, Arc::clone(&k));
+        self.by_key.insert(k, seq);
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Some(seq) = self.by_key.remove(key) {
+            self.by_seq.remove(&seq);
+        }
+    }
+
+    fn pop_oldest(&mut self) -> Option<String> {
+        let (_, k) = self.by_seq.pop_first()?;
+        self.by_key.remove(&k);
+        Some(k.to_string())
+    }
+}
+
+impl Serialize for LruIndex {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.by_seq.values().map(|k| &**k))
+    }
+}
+
+impl<'de> Deserialize<'de> for LruIndex {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let keys = Vec::<String>::deserialize(deserializer)?;
+        let mut idx = Self::default();
+        for k in keys {
+            idx.touch(&k);
+        }
+        Ok(idx)
+    }
+}
+
+/// B-152 (a), L-130: measured anon bytes per held regular shard, the whole daemon's anon growth
+/// over 2,000 held shards (`b152_two_cycles_of_2000_shards`, release build on the EVO-X2,
+/// 2026-11-16: 3,252 B; heap152's heap-only figure at `5943dca` was about 2.5 kB). The
+/// held-shard bound divides the index memory budget by it; `v0.5.7`'s re-key targets 300 B.
+pub const BYTES_PER_HELD_SHARD: u64 = 3_252;
+
+/// Where the held-shard bound came from (logged at startup, shown in live status).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldShardBoundSource {
+    /// `max_held_shards` in `config.toml`.
+    Config,
+    /// The cgroup memory limit the daemon runs under.
+    Cgroup,
+    /// Physical RAM (no cgroup limit).
+    PhysicalRam,
+    /// No memory figure could be read: the profile ceiling.
+    ProfileCeiling,
+}
+
+impl HeldShardBoundSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Config => "config",
+            Self::Cgroup => "cgroup",
+            Self::PhysicalRam => "ram",
+            Self::ProfileCeiling => "profile-ceiling",
+        }
+    }
+}
+
+/// The held-shard bound (L-130) and its source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeldShardBound {
+    pub max: u64,
+    pub source: HeldShardBoundSource,
+    /// The memory figure it was derived from, if any (bytes).
+    pub memory_bytes: Option<u64>,
+}
+
+/// L-130 per profile: the share of memory (percent) the per-shard indexes may use, and the floor
+/// and ceiling of the bound. Shares and ceilings are L-130's; the floors are track B1's
+/// proposal (low enough that a 64 MiB NAS container still derives from its memory).
+pub const fn held_shard_profile(profile: crate::profile::HardwareProfile) -> (u64, u64, u64) {
+    use crate::profile::HardwareProfile;
+    match profile {
+        HardwareProfile::RouterSoc => (15, 512, 4_096),
+        HardwareProfile::HomelabNas => (25, 2_048, 1_048_576),
+        HardwareProfile::Desktop => (25, 8_192, 4_194_304),
+    }
+}
+
+/// L-130: max held shards = memory x share / [`BYTES_PER_HELD_SHARD`], clamped to the profile's
+/// floor and ceiling; an explicit config value wins unclamped (at least 1). Pure; a Kani target.
+pub const fn held_shard_bound_from(
+    memory_bytes: Option<u64>,
+    memory_is_cgroup: bool,
+    share_pct: u64,
+    floor: u64,
+    ceiling: u64,
+    config_override: Option<u64>,
+) -> HeldShardBound {
+    if let Some(n) = config_override {
+        return HeldShardBound {
+            max: if n == 0 { 1 } else { n },
+            source: HeldShardBoundSource::Config,
+            memory_bytes,
+        };
+    }
+    let Some(mem) = memory_bytes else {
+        return HeldShardBound {
+            max: ceiling,
+            source: HeldShardBoundSource::ProfileCeiling,
+            memory_bytes: None,
+        };
+    };
+    let derived = mem / 100 * share_pct / BYTES_PER_HELD_SHARD;
+    let max = if derived < floor {
+        floor
+    } else if derived > ceiling {
+        ceiling
+    } else {
+        derived
+    };
+    HeldShardBound {
+        max,
+        source: if memory_is_cgroup {
+            HeldShardBoundSource::Cgroup
+        } else {
+            HeldShardBoundSource::PhysicalRam
+        },
+        memory_bytes: Some(mem),
+    }
+}
+
+/// B-152 (a), arch152b 3.4: a new regular shard is refused once the node holds `max` (memory
+/// for the per-shard indexes, L-130), before any eviction (C31): refuse, never evict.
+pub const fn held_shard_decision(held: u64, max: u64) -> Result<(), &'static str> {
+    if held >= max {
+        Err("reject.node_shard_count")
+    } else {
+        Ok(())
+    }
+}
+
+/// The memory limit this process runs under: the lowest cgroup v2 `memory.max` on its path
+/// (`/proc/self/cgroup`, walking up to the root, as the kernel applies every ancestor's limit),
+/// else the cgroup v1 `memory.limit_in_bytes`, else `MemTotal` from `/proc/meminfo`. Returns
+/// the bytes and whether a cgroup limit applied.
+pub fn read_memory_limit() -> Option<(u64, bool)> {
+    let ram = std::fs::read_to_string("/proc/meminfo").ok().and_then(|t| {
+        t.lines()
+            .find_map(|l| l.strip_prefix("MemTotal:"))
+            .and_then(|v| v.trim().strip_suffix("kB"))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|kb| kb.saturating_mul(1024))
+    });
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|t| cgroup_limit(&t, std::path::Path::new("/sys/fs/cgroup")));
+    match (cgroup, ram) {
+        (Some(c), Some(r)) if c < r => Some((c, true)),
+        (Some(c), None) => Some((c, true)),
+        (_, Some(r)) => Some((r, false)),
+        (None, None) => None,
+    }
+}
+
+/// The lowest memory limit on this process's cgroup path, given `/proc/self/cgroup` text and
+/// the cgroup mount root: v2 (`0::/path`, every `memory.max` from the leaf up) or v1 (the
+/// `memory` controller's `memory.limit_in_bytes`). `max` and v1's near-`u64::MAX` mean none.
+pub fn cgroup_limit(proc_self_cgroup: &str, root: &std::path::Path) -> Option<u64> {
+    let read = |p: std::path::PathBuf| -> Option<u64> {
+        std::fs::read_to_string(p)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v < (1u64 << 60))
+    };
+    for line in proc_self_cgroup.lines() {
+        let mut parts = line.splitn(3, ':');
+        let (_, controllers, path) = (parts.next()?, parts.next()?, parts.next()?);
+        let rel = path.trim_start_matches('/');
+        if controllers.is_empty() {
+            let mut dir = root.join(rel);
+            let mut lowest: Option<u64> = None;
+            loop {
+                if let Some(v) = read(dir.join("memory.max")) {
+                    lowest = Some(lowest.map_or(v, |l| l.min(v)));
+                }
+                if dir == root || !dir.pop() || !dir.starts_with(root) {
+                    break;
+                }
+            }
+            if lowest.is_some() {
+                return lowest;
+            }
+        } else if controllers.split(',').any(|c| c == "memory") {
+            if let Some(v) = read(root.join("memory").join(rel).join("memory.limit_in_bytes")) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// L-130 at startup: the held-shard bound for `profile` from the memory the daemon runs under
+/// ([`read_memory_limit`]), an explicit config value winning; logged once with its source
+/// (`info.held_shard_bound`).
+pub fn held_shard_bound_at_startup(
+    profile: crate::profile::HardwareProfile,
+    config_override: Option<u64>,
+) -> HeldShardBound {
+    let (share, floor, ceiling) = held_shard_profile(profile);
+    let mem = read_memory_limit();
+    let b = held_shard_bound_from(
+        mem.map(|m| m.0),
+        mem.is_some_and(|m| m.1),
+        share,
+        floor,
+        ceiling,
+        config_override,
+    );
+    tracing::info!(
+        code = "info.held_shard_bound",
+        max_held_shards = b.max,
+        source = b.source.as_str(),
+        memory_bytes = b.memory_bytes.unwrap_or(0),
+        bytes_per_shard = BYTES_PER_HELD_SHARD,
+        "held-shard bound"
+    );
+    b
 }
 
 /// B-162: the write-ceiling epoch (24 h). The per-peer ceiling of 4x the allowance resets at
@@ -166,6 +427,21 @@ pub const fn epoch_rollover_decision(elapsed_ms: u64, epoch_len_ms: u64) -> bool
         return true;
     }
     elapsed_ms / epoch_len_ms >= 1
+}
+
+/// B-159 (C16, B154-QUOTA): which account a removal credits and by how much. A shard the
+/// ledger recorded credits its recorded owner its recorded size; only an unrecorded shard
+/// falls back to the caller's account and the file's length.
+pub fn removal_credit(
+    recorded_owner: Option<String>,
+    recorded_bytes: Option<u64>,
+    caller: &str,
+    file_bytes: u64,
+) -> (String, u64) {
+    (
+        recorded_owner.unwrap_or_else(|| caller.to_string()),
+        recorded_bytes.unwrap_or(file_bytes),
+    )
 }
 
 /// Loads `quota_state.bin` (B-52 QA): an absent file is a fresh state; any other read or decode
@@ -201,7 +477,7 @@ impl QuotaManager {
             peer_accounts: HashMap::new(),
             shard_sizes: HashMap::new(),
             shard_owners: HashMap::new(),
-            lru_queue: VecDeque::new(),
+            lru_queue: LruIndex::default(),
             min_free_disk_bytes: 0,
             observed_free_disk_bytes: None,
             persistence_path: None,
@@ -209,6 +485,7 @@ impl QuotaManager {
             load_error: None,
             epoch_started: None,
             write_epoch_ms: QUOTA_WRITE_EPOCH_MS,
+            held_bound: None,
         }
     }
 
@@ -216,6 +493,16 @@ impl QuotaManager {
     /// [`QUOTA_WRITE_EPOCH_SECS`]). Call before binding persistence; a loaded state keeps it.
     pub fn set_write_epoch_secs(&mut self, epoch_secs: u64) {
         self.write_epoch_ms = epoch_secs.saturating_mul(1000);
+    }
+
+    /// L-130: sets the held-shard bound (at startup, from [`held_shard_bound_at_startup`]).
+    pub fn set_held_shard_bound(&mut self, bound: HeldShardBound) {
+        self.held_bound = Some(bound);
+    }
+
+    /// The held-shard bound and the shards held now, for live status (B-148).
+    pub fn held_shard_bound(&self) -> Option<(HeldShardBound, u64)> {
+        self.held_bound.map(|b| (b, self.shard_sizes.len() as u64))
     }
 
     /// B-162: the write-ceiling epoch length in ms.
@@ -290,6 +577,7 @@ impl QuotaManager {
                 }
                 // B-162: the epoch is RAM only, so a loaded state starts a new one.
                 loaded.write_epoch_ms = self.write_epoch_ms;
+                loaded.held_bound = self.held_bound;
                 loaded.reset_epoch_ingress_counters();
                 loaded.epoch_started = Some(std::time::Instant::now());
                 *self = loaded;
@@ -386,6 +674,24 @@ impl QuotaManager {
         self.persist();
     }
 
+    /// B-147 (G5): sets `peer_id`'s audit counters to journalled post-values (only the given
+    /// ones; the caller applies each only where it is above the current value) and persists.
+    pub fn apply_por_post_values(
+        &mut self,
+        peer_id: &str,
+        por_passes: Option<u64>,
+        por_failures: Option<u64>,
+    ) {
+        let acct = self.peer_accounts.entry(peer_id.to_string()).or_default();
+        if let Some(v) = por_passes {
+            acct.por_passes = v;
+        }
+        if let Some(v) = por_failures {
+            acct.por_failures = v;
+        }
+        self.persist();
+    }
+
     /// Checks whether `peer_id` is within both the node's physical disk ceiling and its
     /// tier-weighted reciprocity allowance (`bootstrap_grace_bytes + contributed / factor`).
     pub fn can_accept_shard(&self, peer_id: &str, shard_bytes: u64) -> bool {
@@ -403,6 +709,10 @@ impl QuotaManager {
         }
         if let Some(code) = self.persist_failed.get() {
             return Err(code);
+        }
+        // B-152 (a), arch152b 3.4: the held-shard bound, before any capacity or eviction rule.
+        if let Some(b) = self.held_bound {
+            held_shard_decision(self.shard_sizes.len() as u64, b.max)?;
         }
         if let Some(free_bytes) = self.observed_free_disk_bytes {
             if free_bytes.saturating_sub(shard_bytes) < self.min_free_disk_bytes {
@@ -501,29 +811,71 @@ impl QuotaManager {
         self.persist();
     }
 
-    /// Updates LRU recency when a shard is read or audited.
+    /// Updates LRU recency when a shard is read or audited: O(log n) (B-152 (a); was an O(n)
+    /// retain over every held shard). Nothing on a file-backed store.
     pub fn touch_shard(&mut self, shard_key: &str) {
-        self.lru_queue.retain(|k| k != shard_key);
-        self.lru_queue.push_back(shard_key.to_string());
+        self.lru_queue.touch(shard_key);
     }
 
-    /// Removes a shard from quota accounting.
+    /// B-152 (a): turns the LRU off and frees it. A file-backed store never evicts (B-161), so
+    /// it keeps no recency order; `quota_state.bin` then carries an empty queue, which every
+    /// earlier release loads.
+    pub fn disable_lru(&mut self) {
+        self.lru_queue = LruIndex {
+            disabled: true,
+            ..LruIndex::default()
+        };
+    }
+
+    /// Shard keys in LRU order, oldest first (tests and the fixture check).
+    pub fn lru_order(&self) -> Vec<String> {
+        self.lru_queue
+            .by_seq
+            .values()
+            .map(|k| k.to_string())
+            .collect()
+    }
+
+    /// Regular shards this ledger accounts for (B-152 (a), the held-shard bound).
+    pub fn held_shard_count(&self) -> usize {
+        self.shard_sizes.len()
+    }
+
+    /// Removes a shard from quota accounting (B-159, C16): the bytes recorded for it are
+    /// credited back to the account it was stored for (`shard_owners`), as
+    /// [`Self::evict_lru_to_fit`] does, never to whoever asked for the removal. `peer_id` and
+    /// `shard_bytes` are used only for a shard this ledger never recorded.
     pub fn record_shard_removed(&mut self, peer_id: &str, shard_key: &str, shard_bytes: u64) {
-        self.shard_sizes.remove(shard_key);
-        self.shard_owners.remove(shard_key);
-        self.lru_queue.retain(|k| k != shard_key);
-        self.used_storage_bytes = self.used_storage_bytes.saturating_sub(shard_bytes);
-        if let Some(acct) = self.peer_accounts.get_mut(peer_id) {
-            acct.bytes_hosted_for_peer = acct.bytes_hosted_for_peer.saturating_sub(shard_bytes);
-        }
+        self.record_shard_removed_deferred(peer_id, shard_key, shard_bytes);
         self.persist();
+    }
+
+    /// [`Self::record_shard_removed`] without the state write (call
+    /// [`Self::flush_persistence`] after the batch).
+    pub fn record_shard_removed_deferred(
+        &mut self,
+        peer_id: &str,
+        shard_key: &str,
+        shard_bytes: u64,
+    ) {
+        let (owner, bytes) = removal_credit(
+            self.shard_owners.remove(shard_key),
+            self.shard_sizes.remove(shard_key),
+            peer_id,
+            shard_bytes,
+        );
+        self.lru_queue.remove(shard_key);
+        self.used_storage_bytes = self.used_storage_bytes.saturating_sub(bytes);
+        if let Some(acct) = self.peer_accounts.get_mut(&owner) {
+            acct.bytes_hosted_for_peer = acct.bytes_hosted_for_peer.saturating_sub(bytes);
+        }
     }
 
     /// Evicts least-recently-used shard keys until at least `needed_bytes` of free space is available.
     pub fn evict_lru_to_fit(&mut self, needed_bytes: u64) -> Vec<String> {
         let mut evicted = Vec::new();
         while self.available_storage_bytes() < needed_bytes {
-            let Some(oldest_key) = self.lru_queue.pop_front() else {
+            let Some(oldest_key) = self.lru_queue.pop_oldest() else {
                 break;
             };
             if let Some(sz) = self.shard_sizes.remove(&oldest_key) {
@@ -737,5 +1089,149 @@ mod tests {
         q.flush_persistence();
         let back = std::fs::read(dir.path().join("quota_state.bin")).unwrap();
         assert_eq!(back.len(), V053.len());
+    }
+
+    /// B-152 (a), arch152 3.1, arch152b 3.2: the `v0.5.3` (`5943dca` layout) fixture loads into
+    /// the O(log n) LRU with its queue order unchanged and the same hosted bytes, and writes back
+    /// the same bytes; a file-backed store keeps no LRU and still loads it.
+    #[test]
+    fn b152_lru_keeps_the_persisted_layout_and_order() {
+        const V053: &[u8] = include_bytes!("../../tests/fixtures/quota_state_v0_5_3.bin");
+        #[derive(serde::Deserialize)]
+        struct Old {
+            _max: u64,
+            _used: u64,
+            _grace: u64,
+            _accounts: HashMap<String, PeerCreditAccount>,
+            _sizes: HashMap<String, u64>,
+            _owners: HashMap<String, String>,
+            lru_queue: std::collections::VecDeque<String>,
+            _min_free: u64,
+            _observed: Option<u64>,
+        }
+        let old: Old = bincode::deserialize(V053).unwrap();
+        assert!(!old.lru_queue.is_empty());
+        let q: QuotaManager = bincode::deserialize(V053).unwrap();
+        assert_eq!(q.lru_order(), Vec::from(old.lru_queue.clone()));
+        // Same layout (the maps' order varies by process, so the length is compared).
+        assert_eq!(bincode::serialize(&q).unwrap().len(), V053.len());
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("quota_state.bin"), V053).unwrap();
+        let store = crate::storage::BlockStore::new(dir.path(), QuotaManager::new(1 << 30, 20_000))
+            .unwrap();
+        let q = store.quota();
+        let q = q.lock().unwrap();
+        assert_eq!(
+            q.peer_account("owner-a").unwrap().bytes_hosted_for_peer,
+            5_000
+        );
+        assert_eq!(
+            q.peer_account("owner-b").unwrap().bytes_hosted_for_peer,
+            4_000
+        );
+        assert!(q.lru_order().is_empty(), "a file-backed store keeps no LRU");
+    }
+
+    /// B-152 (a): the in-memory LRU evicts oldest first, a touch moves a key to the back, a
+    /// removal leaves no entry; 100,000 touches over 100,000 keys stay well under a second.
+    #[test]
+    fn b152_lru_order_and_touch_cost() {
+        let mut q = QuotaManager::new(10_000, 1 << 20);
+        for k in ["a", "b", "c", "d"] {
+            q.record_shard_stored("p", k.into(), 2_000);
+        }
+        q.touch_shard("a");
+        q.record_shard_removed("p", "c", 2_000);
+        assert_eq!(q.lru_order(), vec!["b", "d", "a"]);
+        assert_eq!(q.evict_lru_to_fit(5_000), vec!["b"]);
+        assert_eq!(q.lru_order(), vec!["d", "a"]);
+
+        let mut big = QuotaManager::new(u64::MAX, u64::MAX);
+        for i in 0..100_000u32 {
+            big.record_shard_stored_deferred("p", format!("k{i}"), 1);
+        }
+        let t = std::time::Instant::now();
+        for i in 0..100_000u32 {
+            big.touch_shard(&format!("k{}", (i * 7_919) % 100_000));
+        }
+        let took = t.elapsed();
+        eprintln!("touch_shard x100000 at 100000 keys: {took:?}");
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+        assert_eq!(big.lru_order().len(), 100_000);
+    }
+
+    #[test]
+    fn b152_held_shard_bound_derivation() {
+        use crate::profile::HardwareProfile::*;
+        const MIB: u64 = 1 << 20;
+        let nas = held_shard_profile(HomelabNas);
+        let at = |mem: u64| held_shard_bound_from(Some(mem), true, nas.0, nas.1, nas.2, None);
+        // L-130 test: 64 MiB and 256 MiB derive bounds in that ratio.
+        let (b64, b256) = (at(64 * MIB), at(256 * MIB));
+        assert_eq!(b64.source, HeldShardBoundSource::Cgroup);
+        assert_eq!(b64.max, 64 * MIB / 100 * 25 / BYTES_PER_HELD_SHARD);
+        assert!(b256.max.abs_diff(4 * b64.max) <= 4, "{b64:?} {b256:?}");
+        // Clamped to the floor and the ceiling; an override wins; no figure: the ceiling.
+        assert_eq!(at(MIB).max, nas.1);
+        assert_eq!(at(1 << 50).max, nas.2);
+        let o = held_shard_bound_from(Some(64 * MIB), true, nas.0, nas.1, nas.2, Some(3));
+        assert_eq!((o.max, o.source), (3, HeldShardBoundSource::Config));
+        let none = held_shard_bound_from(None, false, nas.0, nas.1, nas.2, None);
+        assert_eq!(
+            (none.max, none.source),
+            (nas.2, HeldShardBoundSource::ProfileCeiling)
+        );
+        let ram = held_shard_bound_from(Some(256 * MIB), false, nas.0, nas.1, nas.2, None);
+        assert_eq!(ram.source, HeldShardBoundSource::PhysicalRam);
+        for p in [RouterSoc, HomelabNas, Desktop] {
+            let (share, floor, ceiling) = held_shard_profile(p);
+            assert!(share > 0 && floor <= ceiling);
+        }
+    }
+
+    /// L-130: the cgroup limit is the lowest `memory.max` on the process's v2 path (a parent's
+    /// limit applies to a child), `max` is none; v1 reads the memory controller.
+    #[test]
+    fn b152_cgroup_limit_reads_the_path_the_process_runs_under() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        std::fs::create_dir_all(r.join("a/b/c")).unwrap();
+        std::fs::write(r.join("a/memory.max"), "268435456\n").unwrap();
+        std::fs::write(r.join("a/b/memory.max"), "max\n").unwrap();
+        std::fs::write(r.join("a/b/c/memory.max"), "67108864\n").unwrap();
+        assert_eq!(cgroup_limit("0::/a/b/c\n", r), Some(64 << 20));
+        assert_eq!(cgroup_limit("0::/a/b\n", r), Some(256 << 20));
+        assert_eq!(cgroup_limit("0::/\n", r), None);
+        std::fs::create_dir_all(r.join("memory/svc")).unwrap();
+        std::fs::write(r.join("memory/svc/memory.limit_in_bytes"), "134217728").unwrap();
+        assert_eq!(
+            cgroup_limit("4:cpu:/x\n3:memory:/svc\n", r),
+            Some(128 << 20)
+        );
+        std::fs::write(
+            r.join("memory/svc/memory.limit_in_bytes"),
+            "9223372036854771712",
+        )
+        .unwrap();
+        assert_eq!(cgroup_limit("3:memory:/svc\n", r), None);
+    }
+
+    /// arch152b 3.4: the bound refuses a new shard at the count, in `quota_decision`.
+    #[test]
+    fn b152_held_shard_bound_refuses_at_the_count() {
+        let mut q = QuotaManager::new(1 << 30, 1 << 30);
+        q.set_held_shard_bound(HeldShardBound {
+            max: 2,
+            source: HeldShardBoundSource::Config,
+            memory_bytes: None,
+        });
+        q.record_shard_stored("p", "a".into(), 1);
+        assert!(q.quota_decision("p", 1).is_ok());
+        q.record_shard_stored("p", "b".into(), 1);
+        assert_eq!(q.quota_decision("p", 1), Err("reject.node_shard_count"));
+        q.record_shard_removed("p", "a", 1);
+        assert!(q.quota_decision("p", 1).is_ok());
+        assert_eq!(held_shard_decision(2, 2), Err("reject.node_shard_count"));
     }
 }
