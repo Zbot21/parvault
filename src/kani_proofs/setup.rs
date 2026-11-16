@@ -46,3 +46,34 @@ fn proof_init_if_absent_never_second_genesis() {
     kani::cover!(d == InitIfAbsent::OwnRing, "own ring is a no-op");
     kani::cover!(refused_as(d, "volume_not_empty"), "unknown volume refused");
 }
+
+/// B169-RESTORE (K2-K11): over all seven facts, a restore is `Ok` only when every one holds,
+/// and refused otherwise.
+#[kani::proof]
+fn proof_ring_restore_needs_every_fact() {
+    let f: [bool; 7] = kani::any();
+    let d = crate::crypto::backup_envelope::ring_restore_decision(
+        f[0], f[1], f[2], f[3], f[4], f[5], f[6],
+    );
+    let all = f[0] && f[1] && f[2] && f[3] && f[4] && f[5] && f[6];
+    assert_eq!(d.is_ok(), all);
+    kani::cover!(d.is_ok(), "restore allowed");
+    kani::cover!(!f[2] && d.is_err(), "unauthenticated bundle refused");
+    kani::cover!(
+        f[0] && f[1] && f[2] && f[3] && f[4] && f[5] && !f[6],
+        "move not confirmed refused"
+    );
+}
+
+/// B169-KEYFILE (K8): a passphrase file is accepted only outside `--out`, owner-only and valid.
+#[kani::proof]
+fn proof_passphrase_file_needs_owner_only_outside_out() {
+    let (inside_out, owner_only, valid): (bool, bool, bool) = kani::any();
+    let d = crate::crypto::backup_envelope::passphrase_file_decision(inside_out, owner_only, valid);
+    assert_eq!(d.is_ok(), !inside_out && owner_only && valid);
+    kani::cover!(d.is_ok(), "passphrase file accepted");
+    kani::cover!(
+        !owner_only && !inside_out && d.is_err(),
+        "non-0600 passphrase file refused"
+    );
+}

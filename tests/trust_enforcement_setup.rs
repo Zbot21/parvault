@@ -519,8 +519,8 @@ fn b174_concurrent_init_one_ring() {
     gate_ran("trust_enforcement_setup::b174_concurrent_init_one_ring");
 }
 
-/// B174-LOCK reject: while a daemon runs, `wot init`, `wot install-chain` and a second `up` on
-/// its data dir are refused (`reject.datadir_locked`) and change nothing.
+/// B174-LOCK reject: while a daemon runs, `wot init`, `wot install-chain`, `ring backup` and a
+/// second `up` on its data dir are refused (`reject.datadir_locked`) and change nothing.
 #[test]
 fn b174_second_holder_refused() {
     let tmp = tempfile::tempdir().unwrap();
@@ -532,9 +532,14 @@ fn b174_second_holder_refused() {
     )]);
     let before = ring_of(&dir);
     let chains = snapshot(&dir.join("wot_chains"));
+    let pass = tmp.path().join("pass");
+    write_0600(&pass, PASS.as_bytes());
+    let out = tmp.path().join("out");
+    let (p, o) = (pass.to_str().unwrap(), out.to_str().unwrap());
     for args in [
         vec!["wot", "init"],
         vec!["wot", "install-chain", "--token", "00"],
+        vec!["ring", "backup", "--out", o, "--passphrase-file", p],
         up_args(&[]),
     ] {
         let out = run(&dir, &args);
@@ -551,24 +556,577 @@ fn b174_second_holder_refused() {
     gate_ran("trust_enforcement_setup::b174_second_holder_refused");
 }
 
-/// T0 stubs still open in track E until B-169 lands: `ring backup|restore`.
+// ---- B169-RESTORE, B169-KEYFILE -----------------------------------------------------------
+
+const PASS: &str = "correct horse battery staple, twice";
+
+/// The files a bundle carries (K7) that a test node has.
+const CARRIED: &[&str] = &[
+    "ring_genesis.seed",
+    "ring_genesis.pub",
+    "node_identity.seed",
+    "node_pq_kem.bin",
+    "owner_pq_keypair.bin",
+    "config.toml",
+];
+
+/// A genesis node with a vault master key (`parvault init` then `wot init`), plus state a
+/// bundle must leave out (K7).
+fn genesis_node(dir: &Path) {
+    let init = run(dir, &["init"]);
+    assert!(init.status.success(), "{}", text(&init));
+    let wot = run(dir, &["wot", "init"]);
+    assert!(wot.status.success(), "{}", text(&wot));
+    write_0600(&dir.join("macaroon_root.key"), &[0x5a; 32]);
+    std::fs::write(dir.join("quota_state.bin"), b"quota").unwrap();
+    std::fs::write(dir.join("por_audit_state.json"), b"{}").unwrap();
+    assert!(dir.join("master_key.sealed").exists());
+}
+
+fn pass_file(tmp: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+    let p = tmp.join(name);
+    write_0600(&p, bytes);
+    p
+}
+
+/// `ring backup` of `dir` into `out`; returns the bundle path.
+fn backup(dir: &Path, out: &Path, pass: &Path) -> PathBuf {
+    let o = run(
+        dir,
+        &[
+            "ring",
+            "backup",
+            "--out",
+            out.to_str().unwrap(),
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let mut found: Vec<PathBuf> = std::fs::read_dir(out)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "pvbak"))
+        .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    let b = found.pop().unwrap();
+    assert!(text(&o).contains(b.to_str().unwrap()), "{}", text(&o));
+    b
+}
+
+fn restore_cmd(target: &Path, bundle: &Path, pass: &Path, extra: &[&str]) -> Command {
+    let mut c = pv(target);
+    c.args([
+        "ring",
+        "restore",
+        "--from",
+        bundle.to_str().unwrap(),
+        "--passphrase-file",
+        pass.to_str().unwrap(),
+    ])
+    .args(extra);
+    c
+}
+
+fn restore(target: &Path, bundle: &Path, pass: &Path, extra: &[&str]) -> Output {
+    common::output_within_deadline(&mut restore_cmd(target, bundle, pass, extra))
+}
+
+/// The vault master key in `dir`, unsealed with its keystore.
+fn master_key(dir: &Path) -> [u8; 32] {
+    use parvault::crypto::{LocalFileKeystore, LocalKeystoreSealer};
+    assert!(dir.join("enclave_sealing.seed").exists());
+    let ks = LocalFileKeystore::from_passphrase_or_csprng_in_dir(dir, None).unwrap();
+    ks.unseal_key(&std::fs::read(dir.join("master_key.sealed")).unwrap())
+        .unwrap()
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// B169-RESTORE accept (K5, K7, K12): a genesis node and a joined node (pin and chain, no
+/// genesis seed) are backed up and restored into empty data dirs: every carried file is
+/// byte-identical, the master key unseals to the same key, the left-out files are absent, the
+/// bundle holds no secret seed or the master key in clear, and the restored node starts. The
+/// passphrase file is written with CRLF and read back with a BOM and no newline (K8).
 #[test]
-fn track_e_ring_backup_stubs_refuse() {
+fn b169_backup_restores_byte_identical_identity() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().join("node");
-    let pass = tmp.path().join("pass");
-    let p = pass.to_str().unwrap();
-    for (args, entry) in [
-        (
-            vec!["ring", "backup", "--out", "b", "--passphrase-file", p],
-            "ring backup",
-        ),
-        (
-            vec!["ring", "restore", "--from", "b.bin", "--passphrase-file", p],
-            "ring restore",
-        ),
-    ] {
-        common::assert_not_built_yet(&common::parvault_in(&dir, &args), entry);
+    let a = tmp.path().join("a");
+    genesis_node(&a);
+    let key = node_key(&tmp.path().join("b"));
+    let tok = tmp.path().join("b.tok");
+    let inv = run(
+        &a,
+        &[
+            "wot",
+            "invite",
+            "--peer",
+            &key,
+            "--out",
+            tok.to_str().unwrap(),
+        ],
+    );
+    assert!(inv.status.success(), "{}", text(&inv));
+    let b = tmp.path().join("b");
+    let chain = run(
+        &b,
+        &[
+            "wot",
+            "install-chain",
+            "--token",
+            std::fs::read_to_string(&tok).unwrap().trim(),
+        ],
+    );
+    assert!(chain.status.success(), "{}", text(&chain));
+    let crlf = pass_file(tmp.path(), "crlf", format!("{PASS}\r\n").as_bytes());
+    let mut bom_bytes = vec![0xEF, 0xBB, 0xBF];
+    bom_bytes.extend_from_slice(PASS.as_bytes());
+    let bom = pass_file(tmp.path(), "bom", &bom_bytes);
+    for (src, name) in [(&a, "a"), (&b, "b")] {
+        let bundle = backup(src, &tmp.path().join(format!("out-{name}")), &crlf);
+        let raw = std::fs::read(&bundle).unwrap();
+        let mut secrets: Vec<Vec<u8>> = ["ring_genesis.seed", "node_identity.seed"]
+            .iter()
+            .filter_map(|f| std::fs::read(src.join(f)).ok())
+            .collect();
+        if src.join("master_key.sealed").exists() {
+            secrets.push(master_key(src).to_vec());
+        }
+        for s in &secrets {
+            assert!(!contains(&raw, s), "{name}: a secret in clear");
+            assert!(
+                !contains(&raw, hex::encode(s).as_bytes()),
+                "{name}: hex secret"
+            );
+        }
+        let target = tmp.path().join(format!("restored-{name}"));
+        let out = restore(&target, &bundle, &bom, &["--confirm-move"]);
+        assert!(out.status.success(), "{name}: {}", text(&out));
+        for f in CARRIED {
+            assert_eq!(
+                std::fs::read(src.join(f)).ok(),
+                std::fs::read(target.join(f)).ok(),
+                "{name}: {f}"
+            );
+        }
+        let bytes = |d: &Path| -> Vec<Vec<u8>> {
+            snapshot(&d.join("wot_chains"))
+                .into_values()
+                .map(|(b, _)| b)
+                .collect()
+        };
+        assert_eq!(bytes(src), bytes(&target), "{name}: chains");
+        if src.join("master_key.sealed").exists() {
+            assert_eq!(master_key(src), master_key(&target), "{name}: master key");
+        }
+        for f in [
+            "macaroon_root.key",
+            "quota_state.bin",
+            "por_audit_state.json",
+        ] {
+            assert!(!target.join(f).exists(), "{name}: {f} restored");
+        }
+        assert!(!target.join(".ring_restore.pending").exists());
+        assert!(!target.join(".ring_restore.stage").exists());
     }
-    gate_ran("trust_enforcement_setup::track_e_ring_backup_stubs_refuse");
+    let _d = Daemons(vec![spawn_up(
+        &tmp.path().join("restored-a"),
+        &["--init-if-absent"],
+        &tmp.path().join("up.log"),
+    )]);
+    assert_eq!(ring_of(&tmp.path().join("restored-a")), ring_of(&a));
+    gate_ran("trust_enforcement_setup::b169_backup_restores_byte_identical_identity");
+}
+
+/// A genesis node, its bundle and the passphrase file.
+fn bundle_fixture(tmp: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let a = tmp.join("a");
+    genesis_node(&a);
+    let pass = pass_file(tmp, "pass", PASS.as_bytes());
+    let bundle = backup(&a, &tmp.join("out"), &pass);
+    (a, bundle, pass)
+}
+
+/// An empty target with an ignored entry, its snapshot, and the refusal text of a restore.
+fn refused_restore(tmp: &Path, name: &str, bundle: &Path, pass: &Path, extra: &[&str]) -> String {
+    let target = tmp.join(name);
+    std::fs::create_dir_all(target.join("lost+found")).unwrap();
+    let before = snapshot(&target);
+    let out = common::output_within_deadline(&mut restore_cmd(&target, bundle, pass, extra));
+    assert!(!out.status.success(), "{name}: restored: {}", text(&out));
+    assert_eq!(snapshot(&target), before, "{name}: target changed");
+    text(&out)
+}
+
+/// B169-RESTORE reject (each leaves the target byte-identical): a wrong passphrase, a flipped
+/// header byte (ids, salt, nonce: all AAD) and a flipped ciphertext byte are
+/// `reject.backup_auth_failed`.
+#[test]
+fn b169_wrong_passphrase_or_tamper_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_a, bundle, pass) = bundle_fixture(tmp.path());
+    let wrong = pass_file(tmp.path(), "wrong", b"incorrect horse battery staple");
+    let t = refused_restore(tmp.path(), "t0", &bundle, &wrong, &["--confirm-move"]);
+    assert!(t.contains("reject.backup_auth_failed"), "{t}");
+    let raw = std::fs::read(&bundle).unwrap();
+    for (i, at) in [30usize, 50, 70, 110, raw.len() - 1]
+        .into_iter()
+        .enumerate()
+    {
+        let mut b = raw.clone();
+        b[at] ^= 0x01;
+        let f = tmp.path().join(format!("flip{i}.pvbak"));
+        std::fs::write(&f, &b).unwrap();
+        let t = refused_restore(
+            tmp.path(),
+            &format!("t{}", i + 1),
+            &f,
+            &pass,
+            &["--confirm-move"],
+        );
+        assert!(t.contains("reject.backup_auth_failed"), "byte {at}: {t}");
+    }
+    gate_ran("trust_enforcement_setup::b169_wrong_passphrase_or_tamper_refused");
+}
+
+/// B169-RESTORE reject (K6): `--expect-ring` of another ring is `reject.backup_wrong_ring`.
+#[test]
+fn b169_foreign_ring() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_a, bundle, pass) = bundle_fixture(tmp.path());
+    let other = "ab".repeat(32);
+    let t = refused_restore(
+        tmp.path(),
+        "t",
+        &bundle,
+        &pass,
+        &["--expect-ring", &other, "--confirm-move"],
+    );
+    assert!(t.contains("reject.backup_wrong_ring"), "{t}");
+    gate_ran("trust_enforcement_setup::b169_foreign_ring");
+}
+
+/// B169-RESTORE reject: a target that is not empty (a node already there) is
+/// `reject.backup_target_not_empty`, unchanged.
+#[test]
+fn b169_target_not_empty_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, bundle, pass) = bundle_fixture(tmp.path());
+    let before = snapshot(&a);
+    let out = restore(&a, &bundle, &pass, &["--confirm-move"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("reject.backup_target_not_empty"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(snapshot(&a), before);
+    gate_ran("trust_enforcement_setup::b169_target_not_empty_refused");
+}
+
+/// B169-RESTORE reject (K2): a bundle claiming 4 GiB of Argon2 memory is
+/// `reject.backup_kdf_params` with no allocation: it runs under a 3 GiB address-space limit
+/// that a real restore (the control) fits in.
+#[test]
+fn b169_kdf_params_refused_before_allocating() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_a, bundle, pass) = bundle_fixture(tmp.path());
+    let mut raw = std::fs::read(&bundle).unwrap();
+    raw[11..15].copy_from_slice(&(4u32 * 1024 * 1024).to_le_bytes());
+    let huge = tmp.path().join("huge.pvbak");
+    std::fs::write(&huge, &raw).unwrap();
+    let limited = |target: &Path, b: &Path| {
+        let c = restore_cmd(target, b, &pass, &["--confirm-move"]);
+        let prog = c.get_program().to_owned();
+        let args: Vec<_> = c.get_args().map(|a| a.to_owned()).collect();
+        let mut sh = Command::new("sh");
+        sh.arg("-c")
+            .arg("ulimit -v 3145728; exec \"$0\" \"$@\"")
+            .arg(prog)
+            .args(args)
+            .env("MALLOC_ARENA_MAX", "2")
+            .env_remove("PARVAULT_GENESIS_PUBKEY_HEX")
+            .env_remove("PARVAULT_PASSPHRASE");
+        common::output_within_deadline(&mut sh)
+    };
+    let target = tmp.path().join("t");
+    std::fs::create_dir_all(&target).unwrap();
+    let out = limited(&target, &huge);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("reject.backup_kdf_params"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(snapshot(&target), BTreeMap::new());
+    let control = limited(&tmp.path().join("control"), &bundle);
+    assert!(control.status.success(), "control: {}", text(&control));
+    gate_ran("trust_enforcement_setup::b169_kdf_params_refused_before_allocating");
+}
+
+/// B169-RESTORE reject (K5): a correctly encrypted bundle whose header node id is not the
+/// body's node key is `reject.backup_inconsistent`.
+#[test]
+fn b169_inconsistent_ids_refused() {
+    use parvault::crypto::backup_envelope::{seal, BackupBody, KdfParams};
+    use zeroize::Zeroizing;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a");
+    genesis_node(&a);
+    let mut body = BackupBody::default();
+    for f in [
+        "ring_genesis.seed",
+        "ring_genesis.pub",
+        "node_identity.seed",
+    ] {
+        body.entries.push((
+            f.to_string(),
+            Zeroizing::new(std::fs::read(a.join(f)).unwrap()),
+        ));
+    }
+    let ring: [u8; 32] = hex::decode(ring_of(&a).1.unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let forged = seal(
+        PASS,
+        KdfParams::ROUTER_SOC,
+        ring,
+        [0x55; 32],
+        &body.encode().unwrap(),
+    )
+    .unwrap();
+    let f = tmp.path().join("forged.pvbak");
+    std::fs::write(&f, forged).unwrap();
+    let pass = pass_file(tmp.path(), "pass", PASS.as_bytes());
+    let t = refused_restore(tmp.path(), "t", &f, &pass, &["--confirm-move"]);
+    assert!(t.contains("reject.backup_inconsistent"), "{t}");
+    gate_ran("trust_enforcement_setup::b169_inconsistent_ids_refused");
+}
+
+/// B169-RESTORE reject (K4): trailing bytes, an unknown version and a truncated bundle are
+/// `reject.backup_format`.
+#[test]
+fn b169_format_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_a, bundle, pass) = bundle_fixture(tmp.path());
+    let raw = std::fs::read(&bundle).unwrap();
+    let mut trailing = raw.clone();
+    trailing.push(0);
+    let mut v2 = raw.clone();
+    v2[8] = 2;
+    let short = raw[..raw.len() - 1].to_vec();
+    for (i, b) in [trailing, v2, short].into_iter().enumerate() {
+        let f = tmp.path().join(format!("f{i}.pvbak"));
+        std::fs::write(&f, b).unwrap();
+        let t = refused_restore(tmp.path(), &format!("t{i}"), &f, &pass, &["--confirm-move"]);
+        assert!(t.contains("reject.backup_format"), "{i}: {t}");
+    }
+    gate_ran("trust_enforcement_setup::b169_format_refused");
+}
+
+/// B169-RESTORE reject (K11): without `--confirm-move` the restore is refused, names the ring
+/// and node, and says the old node must be retired.
+#[test]
+fn b169_move_not_confirmed_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, bundle, pass) = bundle_fixture(tmp.path());
+    let t = refused_restore(tmp.path(), "t", &bundle, &pass, &[]);
+    assert!(t.contains("reject.backup_move_not_confirmed"), "{t}");
+    assert!(t.contains(&ring_of(&a).1.unwrap()), "{t}");
+    assert!(t.contains("retired"), "{t}");
+    gate_ran("trust_enforcement_setup::b169_move_not_confirmed_refused");
+}
+
+/// B169-KEYFILE accept: a `0600` passphrase file of 20 characters outside `--out` backs up.
+#[test]
+fn b169_passphrase_file_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a");
+    genesis_node(&a);
+    let pass = pass_file(tmp.path(), "pass", "x".repeat(20).as_bytes());
+    backup(&a, &tmp.path().join("out"), &pass);
+    gate_ran("trust_enforcement_setup::b169_passphrase_file_accepted");
+}
+
+/// B169-KEYFILE reject (K8): a passphrase file that is group-readable is
+/// `reject.backup_passphrase_mode`; one inside `--out` is `reject.backup_passphrase_in_out`;
+/// 19 characters, or bytes that are not UTF-8, are `reject.backup_passphrase_weak`. No bundle
+/// is written.
+#[test]
+fn b169_passphrase_mode_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a");
+    genesis_node(&a);
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let loose = pass_file(tmp.path(), "loose", PASS.as_bytes());
+    std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let inside = pass_file(&out, "inside", PASS.as_bytes());
+    let short = pass_file(tmp.path(), "short", "x".repeat(19).as_bytes());
+    let latin1 = pass_file(tmp.path(), "latin1", &[0xe9; 24]);
+    for (f, code) in [
+        (&loose, "reject.backup_passphrase_mode"),
+        (&inside, "reject.backup_passphrase_in_out"),
+        (&short, "reject.backup_passphrase_weak"),
+        (&latin1, "reject.backup_passphrase_weak"),
+    ] {
+        let o = run(
+            &a,
+            &[
+                "ring",
+                "backup",
+                "--out",
+                out.to_str().unwrap(),
+                "--passphrase-file",
+                f.to_str().unwrap(),
+            ],
+        );
+        assert!(!o.status.success());
+        assert!(text(&o).contains(code), "{code}: {}", text(&o));
+    }
+    let bundles = std::fs::read_dir(&out)
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|x| x == "pvbak")
+        })
+        .count();
+    assert_eq!(bundles, 0);
+    gate_ran("trust_enforcement_setup::b169_passphrase_mode_refused");
+}
+
+/// K9: SIGKILL at any point of a restore, then a rerun succeeds with the same identity. Each
+/// round kills the restore after a growing delay (across the KDF and the file moves); one more
+/// case starts from a crash after half the files were moved.
+#[test]
+fn b169_restore_sigkill_then_rerun_succeeds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, bundle, pass) = bundle_fixture(tmp.path());
+    let want = ring_of(&a);
+    let node = std::fs::read(a.join("node_identity.seed")).unwrap();
+    let check = |target: &Path, label: &str| {
+        let out = restore(target, &bundle, &pass, &["--confirm-move"]);
+        assert!(out.status.success(), "{label}: {}", text(&out));
+        assert_eq!(ring_of(target), want, "{label}");
+        assert_eq!(
+            std::fs::read(target.join("node_identity.seed")).unwrap(),
+            node,
+            "{label}"
+        );
+        assert_eq!(master_key(target), master_key(&a), "{label}");
+    };
+    let (mut finished, mut cut) = (0, 0);
+    for round in 0..24u64 {
+        let target = tmp.path().join(format!("k{round}"));
+        let mut child = restore_cmd(&target, &bundle, &pass, &["--confirm-move"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(round * 8));
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+        let label = format!("round {round}");
+        if status.success() {
+            // It finished before the kill: the restore is complete, and a rerun refuses it.
+            finished += 1;
+            assert_eq!(ring_of(&target), want, "{label}");
+            assert!(!target.join(".ring_restore.pending").exists(), "{label}");
+            assert!(!target.join(".ring_restore.stage").exists(), "{label}");
+        } else {
+            cut += 1;
+            check(&target, &label);
+        }
+    }
+    assert!(
+        cut > 0,
+        "no round was killed mid-restore ({finished} finished)"
+    );
+    // A crash after the list was written and half the files were moved.
+    let target = tmp.path().join("half");
+    check(&target, "first");
+    let stage = target.join(".ring_restore.stage");
+    std::fs::create_dir_all(&stage).unwrap();
+    let moved = ["ring_genesis.pub", "node_pq_kem.bin"];
+    std::fs::write(
+        target.join(".ring_restore.pending"),
+        CARRIED.join("\n") + "\nmaster_key.sealed\nenclave_sealing.seed",
+    )
+    .unwrap();
+    for f in CARRIED
+        .iter()
+        .filter(|f| !moved.contains(f) && target.join(f).exists())
+    {
+        std::fs::rename(target.join(f), stage.join(f)).unwrap();
+    }
+    check(&target, "after a crash mid-move");
+    gate_ran("trust_enforcement_setup::b169_restore_sigkill_then_rerun_succeeds");
+}
+
+/// The v1 fixture (K4): `tests/fixtures/ring_backup_v1.pvbak`, written once by this release
+/// (passphrase [`FIXTURE_PASS`], ring seed `11`*32, node seed `22`*32, master key `33`*32,
+/// `router-soc` KDF). Every later release must decrypt and restore it.
+const FIXTURE_PASS: &str = "parvault ring backup v1 fixture";
+
+#[test]
+fn b169_v1_fixture_restores() {
+    use parvault::crypto::NodeIdentity;
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ring_backup_v1.pvbak");
+    let pass = pass_file(tmp.path(), "pass", FIXTURE_PASS.as_bytes());
+    let ring = hex::encode(NodeIdentity::from_seed([0x11; 32]).public_key_bytes());
+    let target = tmp.path().join("t");
+    let out = restore(
+        &target,
+        &fixture,
+        &pass,
+        &["--expect-ring", &ring, "--confirm-move"],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(ring_of(&target), (Some(ring.clone()), Some(ring)));
+    assert_eq!(
+        std::fs::read(target.join("node_identity.seed")).unwrap(),
+        vec![0x22; 32]
+    );
+    assert_eq!(master_key(&target), [0x33; 32]);
+    gate_ran("trust_enforcement_setup::b169_v1_fixture_restores");
+}
+
+/// Writes the v1 fixture (run once, by hand: `--ignored`, with `PARVAULT_WRITE_FIXTURE=<path>`).
+#[test]
+#[ignore]
+fn b169_write_v1_fixture() {
+    use parvault::crypto::backup_envelope::{seal, BackupBody, KdfParams};
+    use parvault::crypto::NodeIdentity;
+    use zeroize::Zeroizing;
+    let ring = NodeIdentity::from_seed([0x11; 32]).public_key_bytes();
+    let node = NodeIdentity::from_seed([0x22; 32]).public_key_bytes();
+    let body = BackupBody {
+        entries: vec![
+            ("ring_genesis.seed".into(), Zeroizing::new(vec![0x11; 32])),
+            (
+                "ring_genesis.pub".into(),
+                Zeroizing::new(hex::encode(ring).into_bytes()),
+            ),
+            ("node_identity.seed".into(), Zeroizing::new(vec![0x22; 32])),
+            ("vault_master_key".into(), Zeroizing::new(vec![0x33; 32])),
+        ],
+    };
+    let b = seal(
+        FIXTURE_PASS,
+        KdfParams::ROUTER_SOC,
+        ring,
+        node,
+        &body.encode().unwrap(),
+    )
+    .unwrap();
+    std::fs::write(std::env::var("PARVAULT_WRITE_FIXTURE").unwrap(), &b).unwrap();
+    println!("FIXTURE_HEX={}", hex::encode(&b));
 }
