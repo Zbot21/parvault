@@ -137,6 +137,35 @@ pub struct QuotaManager {
     /// never overwritten. Cleared only by a restart that loads the file.
     #[serde(skip)]
     load_error: Option<&'static str>,
+    /// B-162: when the current write-ceiling epoch started, on the monotonic clock. RAM only:
+    /// `quota_state.bin` is a bincode dump of this struct, so a new serialized field would make
+    /// every existing file fail to load (`reject.quota_state_corrupt`). A restart starts a new
+    /// epoch (the counters are zeroed on load).
+    #[serde(skip)]
+    epoch_started: Option<std::time::Instant>,
+    /// B-162: the write-ceiling epoch length in ms (RAM only; 0 means
+    /// [`QUOTA_WRITE_EPOCH_SECS`]; `quota_write_epoch_secs` in `config.toml`).
+    #[serde(skip)]
+    write_epoch_ms: u64,
+}
+
+/// B-162: the write-ceiling epoch (24 h). The per-peer ceiling of 4x the allowance resets at
+/// the start of each epoch, so it is a daily upload budget, not a lifetime cap.
+pub const QUOTA_WRITE_EPOCH_SECS: u64 = 86_400;
+
+const QUOTA_WRITE_EPOCH_MS: u64 = QUOTA_WRITE_EPOCH_SECS * 1000;
+
+/// B-162: the info code logged when a new write-ceiling epoch starts.
+pub const INFO_QUOTA_WRITE_EPOCH_ROLLED: &str = "info.quota_write_epoch_rolled";
+
+/// B-162: a new write-ceiling epoch starts once `elapsed_ms` since the current one started
+/// reaches `epoch_len_ms`, that is once a whole epoch has elapsed. A zero length (never
+/// configured: [`QuotaManager::write_epoch_ms`] maps 0 to the default) always rolls over.
+pub const fn epoch_rollover_decision(elapsed_ms: u64, epoch_len_ms: u64) -> bool {
+    if epoch_len_ms == 0 {
+        return true;
+    }
+    elapsed_ms / epoch_len_ms >= 1
 }
 
 /// Loads `quota_state.bin` (B-52 QA): an absent file is a fresh state; any other read or decode
@@ -178,7 +207,46 @@ impl QuotaManager {
             persistence_path: None,
             persist_failed: std::cell::Cell::new(None),
             load_error: None,
+            epoch_started: None,
+            write_epoch_ms: QUOTA_WRITE_EPOCH_MS,
         }
+    }
+
+    /// B-162: sets the write-ceiling epoch length in seconds (0 keeps
+    /// [`QUOTA_WRITE_EPOCH_SECS`]). Call before binding persistence; a loaded state keeps it.
+    pub fn set_write_epoch_secs(&mut self, epoch_secs: u64) {
+        self.write_epoch_ms = epoch_secs.saturating_mul(1000);
+    }
+
+    /// B-162: the write-ceiling epoch length in ms.
+    pub const fn write_epoch_ms(&self) -> u64 {
+        if self.write_epoch_ms == 0 {
+            QUOTA_WRITE_EPOCH_MS
+        } else {
+            self.write_epoch_ms
+        }
+    }
+
+    /// B-162: starts a new write-ceiling epoch when the current one has lasted
+    /// [`Self::write_epoch_ms`]: zeroes every peer's epoch ingress counter, restarts the timer at
+    /// `now` and persists. The first call starts the timer. Hosted bytes are never changed.
+    /// Returns whether a new epoch started.
+    pub fn roll_epoch_if_due(&mut self, now: std::time::Instant) -> bool {
+        let started = *self.epoch_started.get_or_insert(now);
+        let elapsed_ms =
+            u64::try_from(now.saturating_duration_since(started).as_millis()).unwrap_or(u64::MAX);
+        if !epoch_rollover_decision(elapsed_ms, self.write_epoch_ms()) {
+            return false;
+        }
+        self.reset_epoch_ingress_counters();
+        self.epoch_started = Some(now);
+        self.persist();
+        tracing::info!(
+            code = INFO_QUOTA_WRITE_EPOCH_ROLLED,
+            epoch_ms = self.write_epoch_ms(),
+            "new write-ceiling epoch; per-peer write counters reset"
+        );
+        true
     }
 
     /// Loads or binds a persistent `QuotaManager` at `data_dir/quota_state.bin`.
@@ -220,6 +288,10 @@ impl QuotaManager {
                 if self.min_free_disk_bytes > 0 {
                     loaded.min_free_disk_bytes = self.min_free_disk_bytes;
                 }
+                // B-162: the epoch is RAM only, so a loaded state starts a new one.
+                loaded.write_epoch_ms = self.write_epoch_ms;
+                loaded.reset_epoch_ingress_counters();
+                loaded.epoch_started = Some(std::time::Instant::now());
                 *self = loaded;
             }
             Ok(None) => {}
@@ -361,7 +433,8 @@ impl QuotaManager {
         Ok(())
     }
 
-    /// Resets per-epoch ingress write counters at the start of a new epoch.
+    /// Resets per-epoch ingress write counters at the start of a new epoch (B-162: called by
+    /// [`Self::roll_epoch_if_due`] and on load).
     pub fn reset_epoch_ingress_counters(&mut self) {
         for acct in self.peer_accounts.values_mut() {
             acct.epoch_ingress_bytes_written = 0;
@@ -539,5 +612,130 @@ mod tests {
         q.flush_persistence();
         assert!(q.quota_decision("local", 1024).is_ok());
         assert!(path.is_file());
+    }
+
+    /// B-162: the rollover boundary: not before the epoch length, from it on.
+    #[test]
+    fn b162_epoch_rollover_boundaries() {
+        let len = QUOTA_WRITE_EPOCH_SECS * 1000;
+        assert!(!epoch_rollover_decision(0, len));
+        assert!(!epoch_rollover_decision(len - 1, len));
+        assert!(epoch_rollover_decision(len, len));
+        assert!(epoch_rollover_decision(u64::MAX, len));
+        assert!(epoch_rollover_decision(u64::MAX, u64::MAX));
+        assert!(!epoch_rollover_decision(u64::MAX - 1, u64::MAX));
+        let q = QuotaManager::new(1 << 30, 1 << 20);
+        assert_eq!(q.write_epoch_ms(), 24 * 60 * 60 * 1000);
+        let mut z = QuotaManager::new(1 << 30, 1 << 20);
+        z.set_write_epoch_secs(0);
+        assert_eq!(z.write_epoch_ms(), QUOTA_WRITE_EPOCH_SECS * 1000);
+        z.set_write_epoch_secs(6);
+        assert_eq!(z.write_epoch_ms(), 6_000);
+    }
+
+    /// Fills `peer`'s write ceiling (4x a 5,000-byte grace) by put-and-delete churn, leaving
+    /// it hosting one 1,000-byte shard.
+    fn b162_churn_to_ceiling(q: &mut QuotaManager, peer: &str) {
+        for i in 0..19 {
+            let k = format!("churn-{i}");
+            assert!(q.quota_decision(peer, 1_000).is_ok(), "put {i}");
+            q.record_shard_stored(peer, k.clone(), 1_000);
+            q.record_shard_removed(peer, &k, 1_000);
+        }
+        q.record_shard_stored(peer, "kept".into(), 1_000);
+        assert_eq!(
+            q.quota_decision(peer, 1_000),
+            Err("reject.peer_write_amplification")
+        );
+    }
+
+    /// B-162: a peer refused at its write ceiling is accepted after the epoch rolls; the
+    /// rollover leaves hosted bytes unchanged and only happens once the epoch has lasted.
+    #[test]
+    fn b162_refused_peer_accepted_after_rollover() {
+        let mut q = QuotaManager::new(1 << 30, 5_000);
+        q.set_write_epoch_secs(60);
+        let t0 = std::time::Instant::now();
+        assert!(!q.roll_epoch_if_due(t0), "the first call starts the epoch");
+        b162_churn_to_ceiling(&mut q, "peer-a");
+        let hosted = q.peer_account("peer-a").unwrap().bytes_hosted_for_peer;
+        assert_eq!(hosted, 1_000);
+        let used = q.used_storage_bytes();
+        assert!(!q.roll_epoch_if_due(t0 + std::time::Duration::from_millis(59_999)));
+        assert_eq!(
+            q.quota_decision("peer-a", 1_000),
+            Err("reject.peer_write_amplification")
+        );
+        let t1 = t0 + std::time::Duration::from_millis(60_000);
+        assert!(q.roll_epoch_if_due(t1));
+        assert!(q.quota_decision("peer-a", 1_000).is_ok());
+        let acct = q.peer_account("peer-a").unwrap();
+        assert_eq!(acct.bytes_hosted_for_peer, hosted, "hosted bytes unchanged");
+        assert_eq!(acct.epoch_ingress_bytes_written, 0);
+        assert_eq!(q.used_storage_bytes(), used);
+        // The timer restarted at t1: no second rollover before t1 + 60 s.
+        assert!(!q.roll_epoch_if_due(t1 + std::time::Duration::from_millis(59_999)));
+        assert!(q.roll_epoch_if_due(t1 + std::time::Duration::from_millis(60_000)));
+    }
+
+    /// B-162: the rollover is persisted (the zeroed counters reach `quota_state.bin`), and a
+    /// restart starts a new epoch with the hosted bytes kept.
+    #[test]
+    fn b162_rollover_persists_and_restart_starts_new_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut q = QuotaManager::with_persistence_dir(1 << 30, 5_000, dir.path());
+        b162_churn_to_ceiling(&mut q, "peer-a");
+        drop(q);
+        let mut q = QuotaManager::with_persistence_dir(1 << 30, 5_000, dir.path());
+        let acct = q.peer_account("peer-a").unwrap();
+        assert_eq!(acct.bytes_hosted_for_peer, 1_000);
+        assert_eq!(
+            acct.epoch_ingress_bytes_written, 0,
+            "a restart opens a new epoch"
+        );
+        assert!(q.quota_decision("peer-a", 1_000).is_ok());
+        b162_churn_to_ceiling(&mut q, "peer-b");
+        let later =
+            std::time::Instant::now() + std::time::Duration::from_secs(QUOTA_WRITE_EPOCH_SECS);
+        assert!(q.roll_epoch_if_due(later));
+        let raw = std::fs::read(dir.path().join("quota_state.bin")).unwrap();
+        let on_disk: QuotaManager = bincode::deserialize(&raw).unwrap();
+        let b = on_disk.peer_account("peer-b").unwrap();
+        assert_eq!(b.epoch_ingress_bytes_written, 0);
+        assert_eq!(b.bytes_hosted_for_peer, 1_000);
+    }
+
+    /// B-162 upgrade: a `quota_state.bin` written by `v0.5.3` (`a92f647`, generated by
+    /// `QuotaManager::with_persistence_dir` and `record_shard_*` on that tree) loads with the same
+    /// hosted bytes, its epoch counters zeroed, and is written back in the same layout.
+    #[test]
+    fn b162_v0_5_3_quota_state_loads() {
+        const V053: &[u8] = include_bytes!("../../tests/fixtures/quota_state_v0_5_3.bin");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("quota_state.bin"), V053).unwrap();
+        let q = QuotaManager::with_persistence_dir(1 << 30, 20_000, dir.path());
+        assert!(q.quota_decision("owner-a", 1_000).is_ok());
+        assert_eq!(q.used_storage_bytes(), 9_000);
+        let a = q.peer_account("owner-a").unwrap();
+        assert_eq!(a.bytes_hosted_for_peer, 5_000);
+        assert_eq!(a.epoch_ingress_bytes_written, 0);
+        let b = q.peer_account("owner-b").unwrap();
+        assert_eq!(b.bytes_hosted_for_peer, 4_000);
+        assert_eq!(b.epoch_ingress_bytes_written, 0);
+        assert_eq!(q.shard_owner(&("aa".repeat(32) + "-0")), Some("owner-a"));
+        assert_eq!(q.shard_owner(&("bb".repeat(32) + "-1")), Some("owner-b"));
+        // The fixture really holds non-zero counters (5,000 and 5,500), so the zeroing is real.
+        let raw: QuotaManager = bincode::deserialize(V053).unwrap();
+        assert_eq!(
+            raw.peer_account("owner-b")
+                .unwrap()
+                .epoch_ingress_bytes_written,
+            5_500
+        );
+        // Same layout: re-serialized, the state has the v0.5.3 length.
+        assert_eq!(bincode::serialize(&q).unwrap().len(), V053.len());
+        q.flush_persistence();
+        let back = std::fs::read(dir.path().join("quota_state.bin")).unwrap();
+        assert_eq!(back.len(), V053.len());
     }
 }

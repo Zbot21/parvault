@@ -102,6 +102,7 @@ pub const DUMP_SCHEMA: &[(&str, FieldKind, FieldClass)] = &[
     ("por_audit_enabled", Key, Plain),
     ("por_audit_interval_secs", Key, Plain),
     ("por_audit_rtt_ms", Key, Plain),
+    ("quota_write_epoch_secs", Key, Plain),
     ("lab.deterministic", Key, Plain),
     ("lab.relays", Key, PlainUrl),
     // Global args.

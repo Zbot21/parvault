@@ -472,6 +472,7 @@ async fn run(
 
     let mut quota = QuotaManager::new(cfg.max_storage_bytes, cfg.bootstrap_grace_bytes);
     quota.set_min_free_disk_bytes(cfg.min_free_disk_bytes);
+    quota.set_write_epoch_secs(cfg.quota_write_epoch_secs);
     let block_store = BlockStore::new(&cfg.data_dir, quota)?
         .with_stripe_size_bytes(cfg.stripe_size_bytes)
         .with_mesh_client(mesh_client.clone());

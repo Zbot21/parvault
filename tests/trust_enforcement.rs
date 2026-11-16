@@ -5748,6 +5748,338 @@ fn adr07_shard_over_peer_quota_refused() {
     gate_ran("trust_enforcement::adr07_shard_over_peer_quota_refused");
 }
 
+// --- B-161: a full node refuses a put; it never evicts other accounts' shards -----------------
+
+/// B-161: a ring host whose node capacity is `cap` bytes (`config.toml`): `daemon start`, or
+/// `up` with a gateway socket at `<root>/gw.sock` when `gateway` is set (its local stores use the
+/// deferred-flush put path).
+fn b161_host(label: &str, cap: u64, gateway: bool) -> Node {
+    let (root, dir, reg, log) = prepare(label);
+    std::fs::write(
+        dir.join("config.toml"),
+        format!("max_storage_bytes = {cap}\n"),
+    )
+    .unwrap();
+    let sock = root.path().join("gw.sock");
+    let cmd = if gateway {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+        cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+            .arg("--data-dir")
+            .arg(&dir)
+            .args([
+                "--no-lan-discovery",
+                "up",
+                "--listen",
+                common::LOOPBACK_EPHEMERAL,
+                "--ipc-socket",
+            ])
+            .arg(&sock);
+        cmd
+    } else {
+        daemon_command(&dir, &reg)
+    };
+    let node = spawn(cmd, root, dir, log);
+    if gateway {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !sock.exists() {
+            assert!(Instant::now() < deadline, "gateway socket never appeared");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    node
+}
+
+/// The shard file names a host holds.
+fn shard_names(dir: &Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_dir(dir.join("shards"))
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "shard"))
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The bytes of the shard files a host holds (its accounted used storage).
+fn shard_bytes_on(dir: &Path) -> u64 {
+    shard_names(dir)
+        .iter()
+        .map(|n| std::fs::metadata(dir.join("shards").join(n)).unwrap().len())
+        .sum()
+}
+
+/// B-161: owner A, a ring client that stored one 40 KB file with every shard on `host`.
+struct B161Owner {
+    root: TempDir,
+    dir: PathBuf,
+    reg: PathBuf,
+    key_hex: String,
+    root_hex: String,
+    data: Vec<u8>,
+}
+
+impl B161Owner {
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+        cmd.env("PARVAULT_LAN_REGISTRY_DIR", &self.reg)
+            .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+            .arg("--data-dir")
+            .arg(&self.dir)
+            .arg("--no-lan-discovery")
+            .args(args);
+        common::output_within_deadline(&mut cmd)
+    }
+
+    fn store_on(host: &Node, label: &str) -> Self {
+        let (root, dir, reg, _log) = prepare(label);
+        let mut store = parvault::network::KnownPeersStore::load(&dir);
+        let pid = host.peer_id().to_string();
+        store.upsert_pinned_multiaddr(
+            &pid,
+            &format!("{}/p2p/{pid}", host.addr),
+            None,
+            Some("daemon"),
+        );
+        store.save(&dir).unwrap();
+        let file = root.path().join("doc.bin");
+        let data: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&file, &data).unwrap();
+        let mut owner = Self {
+            root,
+            dir,
+            reg,
+            key_hex: hex::encode([0x61u8; 32]),
+            root_hex: String::new(),
+            data,
+        };
+        let out = owner.run(&[
+            "file",
+            "store",
+            "--tier",
+            "consumer",
+            "--key-hex",
+            &owner.key_hex.clone(),
+            "--path",
+            file.to_str().unwrap(),
+        ]);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "{stdout}\nhost log:\n{}",
+            host.log_text()
+        );
+        assert_eq!(
+            shard_files(&host.dir),
+            20,
+            "every shard on the host\n{stdout}"
+        );
+        assert_eq!(shard_files(&owner.dir), 0, "no local shard\n{stdout}");
+        owner.root_hex = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("File Merkle Root : "))
+            .expect("root printed")
+            .trim()
+            .to_string();
+        owner
+    }
+
+    /// A's file restores byte for byte from the host alone.
+    fn assert_restores(&self, host: &Node) {
+        let restored = self.root.path().join("restored.bin");
+        let out = self.run(&[
+            "file",
+            "restore",
+            &self.root_hex,
+            "--output",
+            restored.to_str().unwrap(),
+            "--key-hex",
+            &self.key_hex,
+        ]);
+        assert!(
+            out.status.success(),
+            "{}\nhost log:\n{}",
+            String::from_utf8_lossy(&out.stderr),
+            host.log_text()
+        );
+        assert_eq!(
+            std::fs::read(&restored).unwrap(),
+            self.data,
+            "restore byte-for-byte"
+        );
+    }
+}
+
+/// B-161: owner B, within its own quota, puts one shard one byte larger than the host's free
+/// space after A's file. Returns the response.
+fn b161_put_over_free_space(host: &Node, cap: u64, overshoot: u64) -> MeshWireResponse {
+    let used = shard_bytes_on(&host.dir);
+    assert!(used < cap, "A's file fits: used={used} cap={cap}");
+    let len = cap - used + overshoot;
+    let (sid, bytes) = shard(0xB2, usize::try_from(len).unwrap());
+    send(&key(0xB2), host, put_shard("", sid, bytes, None))
+}
+
+const B161_CAP: u64 = 100_000;
+
+/// B-161 reject: a full host refuses owner B's put with `reject.node_capacity`; every A shard
+/// file stays and A's file restores byte for byte (released versions evicted A's shards).
+#[test]
+fn b161_full_node_refuses_other_owner_put() {
+    let host = b161_host("b161-r", B161_CAP, false);
+    let owner = B161Owner::store_on(&host, "b161-r-a");
+    let before = shard_names(&host.dir);
+    let resp = b161_put_over_free_space(&host, B161_CAP, 1);
+    assert!(!stored(&resp), "{resp:?}");
+    assert_logged(&host, "reject.node_capacity");
+    assert_eq!(shard_names(&host.dir), before, "no A shard evicted");
+    owner.assert_restores(&host);
+    gate_ran("trust_enforcement::b161_full_node_refuses_other_owner_put");
+}
+
+/// B-161 accept: the same put of exactly the free space is stored beside A's shards.
+#[test]
+fn b161_node_with_room_stores_other_owner_put() {
+    let host = b161_host("b161-a", B161_CAP, false);
+    let owner = B161Owner::store_on(&host, "b161-a-a");
+    let before = shard_names(&host.dir);
+    let resp = b161_put_over_free_space(&host, B161_CAP, 0);
+    assert!(stored(&resp), "{resp:?}\n{}", host.log_text());
+    assert!(shard_names(&host.dir).is_superset(&before));
+    assert_eq!(shard_files(&host.dir), before.len() + 1);
+    owner.assert_restores(&host);
+    gate_ran("trust_enforcement::b161_node_with_room_stores_other_owner_put");
+}
+
+/// B-161: `parvault-sync push` of a 64 KiB file through the host's gateway (local stores, the
+/// deferred-flush put path).
+fn b161_gateway_push(host: &Node) -> std::process::Output {
+    let root = host.dir.parent().unwrap();
+    let folder = root.join("push");
+    std::fs::create_dir_all(&folder).unwrap();
+    let body: Vec<u8> = (0..65_536u32).map(|i| (i % 241) as u8).collect();
+    std::fs::write(folder.join("big.bin"), body).unwrap();
+    let mut cmd = Command::new(common::plugin_bin(
+        "parvault-sync",
+        env!("CARGO_BIN_EXE_parvault-sync"),
+    ));
+    cmd.arg("--socket")
+        .arg(root.join("gw.sock"))
+        .arg("--catalog")
+        .arg(root.join("catalog.bin"))
+        .args(["push", "--folder"])
+        .arg(&folder)
+        .arg("--allow-local-only");
+    common::output_within_deadline(&mut cmd)
+}
+
+/// B-161 reject (deferred-flush path): the gateway's local store on a full host is refused with
+/// `reject.node_capacity`; every A shard file stays and A's file restores byte for byte.
+#[test]
+fn b161_full_node_refuses_gateway_store() {
+    let host = b161_host("b161-gr", B161_CAP, true);
+    let owner = B161Owner::store_on(&host, "b161-gr-a");
+    let before = shard_names(&host.dir);
+    let out = b161_gateway_push(&host);
+    assert!(
+        !out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_logged(&host, "reject.node_capacity");
+    assert!(
+        shard_names(&host.dir).is_superset(&before),
+        "no A shard evicted"
+    );
+    owner.assert_restores(&host);
+    gate_ran("trust_enforcement::b161_full_node_refuses_gateway_store");
+}
+
+/// B-161 accept (deferred-flush path): with room, the same push is stored and A's shards stay.
+#[test]
+fn b161_node_with_room_stores_gateway_push() {
+    let host = b161_host("b161-ga", 10 * 1024 * 1024, true);
+    let owner = B161Owner::store_on(&host, "b161-ga-a");
+    let before = shard_names(&host.dir);
+    let out = b161_gateway_push(&host);
+    assert!(
+        out.status.success(),
+        "{}\n{}\nhost log:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+        host.log_text()
+    );
+    let after = shard_names(&host.dir);
+    assert!(after.is_superset(&before) && after.len() > before.len());
+    owner.assert_restores(&host);
+    gate_ran("trust_enforcement::b161_node_with_room_stores_gateway_push");
+}
+
+// --- B-162: the per-peer write ceiling resets each epoch ---------------------------------------
+
+/// B-162: a daemon with a 4 KiB per-peer grace (a 16 KiB write ceiling per epoch) and, when
+/// set, a write-ceiling epoch of `epoch_secs` (`config.toml`; else the 24 h default).
+fn b162_host(label: &str, epoch_secs: Option<u64>) -> Node {
+    let (root, dir, reg, log) = prepare(label);
+    let mut cfg = String::from("bootstrap_grace_bytes = 4096\n");
+    if let Some(secs) = epoch_secs {
+        cfg.push_str(&format!("quota_write_epoch_secs = {secs}\n"));
+    }
+    std::fs::write(dir.join("config.toml"), cfg).unwrap();
+    spawn(daemon_command(&dir, &reg), root, dir, log)
+}
+
+/// B-162: five put-and-delete cycles of a 3,000-byte shard (15,000 bytes written, nothing held),
+/// then a sixth put, over the 16,384-byte ceiling. Returns that put's response.
+fn b162_churn_then_put(node: &Node, member: &NodeIdentity) -> MeshWireResponse {
+    for seed in 0x60u8..0x65 {
+        let (sid, bytes) = shard(seed, 3000);
+        assert!(stored(&send(member, node, put_shard("", sid, bytes, None))));
+        assert!(deleted(&send(member, node, delete_req(member, sid))));
+    }
+    let (sid, bytes) = shard(0x65, 3000);
+    send(member, node, put_shard("", sid, bytes, None))
+}
+
+/// B-162 reject: within one epoch, a peer that churned past 4x its allowance is refused
+/// (`reject.peer_write_amplification`) although it holds nothing.
+#[test]
+fn b162_write_ceiling_refuses_within_epoch() {
+    let node = b162_host("b162-r", None);
+    let resp = b162_churn_then_put(&node, &key(0xD6));
+    assert!(!stored(&resp), "{resp:?}");
+    assert_logged(&node, "reject.peer_write_amplification");
+    gate_ran("trust_enforcement::b162_write_ceiling_refuses_within_epoch");
+}
+
+/// B-162 accept: with a 6 s epoch the same peer is refused within the epoch and accepted in the
+/// next (released versions refused it for good: the ceiling never reset).
+#[test]
+fn b162_write_ceiling_reopens_next_epoch() {
+    const EPOCH_SECS: u64 = 6;
+    const EPOCH_MS: u64 = EPOCH_SECS * 1000;
+    let node = b162_host("b162-a", Some(EPOCH_SECS));
+    let member = key(0xD6);
+    // The epoch starts at the node's first put, no earlier than `t0`.
+    let t0 = Instant::now();
+    let resp = b162_churn_then_put(&node, &member);
+    assert!(
+        t0.elapsed() < Duration::from_millis(EPOCH_MS),
+        "the churn outlasted the epoch; the refusal check is inconclusive"
+    );
+    assert!(!stored(&resp), "{resp:?}");
+    assert_logged(&node, "reject.peer_write_amplification");
+    std::thread::sleep(
+        (t0 + Duration::from_millis(EPOCH_MS + 2_000)).saturating_duration_since(Instant::now()),
+    );
+    let (sid, bytes) = shard(0x65, 3000);
+    let resp = send(&member, &node, put_shard("", sid, bytes, None));
+    assert!(stored(&resp), "{resp:?}\n{}", node.log_text());
+    gate_ran("trust_enforcement::b162_write_ceiling_reopens_next_epoch");
+}
+
 // --- ADR-12: hybrid signatures need both halves ------------------------------------------------------
 
 /// ADR-12 reject: a device cert whose Ed25519 half is valid but whose ML-DSA-65 half is broken is

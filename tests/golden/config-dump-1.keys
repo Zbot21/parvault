@@ -120,6 +120,9 @@ values.por_timeout_ms.value
 values.public_trackers
 values.public_trackers.source
 values.public_trackers.value
+values.quota_write_epoch_secs
+values.quota_write_epoch_secs.source
+values.quota_write_epoch_secs.value
 values.status_http_bind
 values.status_http_bind.source
 values.status_http_bind.value

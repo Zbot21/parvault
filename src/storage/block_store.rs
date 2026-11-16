@@ -614,6 +614,7 @@ impl BlockStore {
         if let Some(ref mem) = self.in_memory {
             let max_cap = {
                 let mut q = self.quota.lock().expect("quota mutex poisoned");
+                q.roll_epoch_if_due(std::time::Instant::now()); // B-162
                 if !q.can_accept_shard(owner_peer_id, shard_size) {
                     let evicted = q.evict_lru_to_fit(shard_size);
                     {
@@ -675,17 +676,12 @@ impl BlockStore {
 
         {
             let mut q = self.quota.lock().expect("quota mutex poisoned");
-            if !q.can_accept_shard(owner_peer_id, shard_size) {
-                // Attempt LRU garbage collection of evictable cached shards first.
-                let evicted = q.evict_lru_to_fit(shard_size);
-                for evicted_key in evicted {
-                    let p = self.shards_dir.join(format!("{evicted_key}.shard"));
-                    let _ = fs::remove_file(p);
-                }
-                if let Err(code) = q.quota_decision(owner_peer_id, shard_size) {
-                    tracing::warn!(code, owner = owner_peer_id, "refused a shard over quota");
-                    return Err(StorageError::QuotaExceeded(owner_peer_id.to_string()));
-                }
+            q.roll_epoch_if_due(std::time::Instant::now()); // B-162
+                                                            // B-161: a full file-backed node refuses (`reject.node_capacity`); it never evicts
+                                                            // shards held for other accounts to admit a put.
+            if let Err(code) = q.quota_decision(owner_peer_id, shard_size) {
+                tracing::warn!(code, owner = owner_peer_id, "refused a shard over quota");
+                return Err(StorageError::QuotaExceeded(owner_peer_id.to_string()));
             }
         }
 
@@ -2119,15 +2115,11 @@ impl BlockStore {
         let shard_size = bytes.len() as u64;
         {
             let mut q = self.quota.lock().expect("quota mutex poisoned");
-            if !q.can_accept_shard(owner_peer_id, shard_size) {
-                let evicted = q.evict_lru_to_fit(shard_size);
-                for evicted_key in evicted {
-                    let p = self.shards_dir.join(format!("{evicted_key}.shard"));
-                    let _ = fs::remove_file(p);
-                }
-                if !q.can_accept_shard(owner_peer_id, shard_size) {
-                    return Err(StorageError::QuotaExceeded(owner_peer_id.to_string()));
-                }
+            q.roll_epoch_if_due(std::time::Instant::now()); // B-162
+                                                            // B-161: as `put_shard`, refuse rather than evict other accounts' shards.
+            if let Err(code) = q.quota_decision(owner_peer_id, shard_size) {
+                tracing::warn!(code, owner = owner_peer_id, "refused a shard over quota");
+                return Err(StorageError::QuotaExceeded(owner_peer_id.to_string()));
             }
         }
         let path = self.shard_path(id);
@@ -2758,5 +2750,84 @@ mod tests {
         let restored_data = fs::read(&output_path).expect("read restored");
         assert_eq!(restored_data.len(), original_data.len());
         assert_eq!(restored_data, original_data);
+    }
+
+    fn b161_shard(seed: u8, len: usize) -> (ShardId, Vec<u8>) {
+        let bytes = vec![seed; len];
+        let id = ShardId {
+            stripe_merkle_root: [seed; 32],
+            shard_index: 0,
+            shard_hash: hash_shard_leaf(0, &bytes),
+        };
+        (id, bytes)
+    }
+
+    /// B-161: on a full file-backed store, a put from owner B within its own quota is refused
+    /// (`reject.node_capacity`) through both put paths, and leaves the node's used bytes, A's
+    /// hosted bytes and every A shard file unchanged (no eviction of another account).
+    #[test]
+    fn b161_full_node_refuses_without_evicting_other_accounts() {
+        for deferred in [false, true] {
+            let dir = tempdir().unwrap();
+            let store = BlockStore::new(dir.path(), QuotaManager::new(8_000, 1 << 20)).unwrap();
+            let a_shards = [b161_shard(0xA1, 4_000), b161_shard(0xA2, 4_000)];
+            for (id, bytes) in &a_shards {
+                store.put_shard("owner-a", id, bytes).unwrap();
+            }
+            let (b_id, b_bytes) = b161_shard(0xB1, 100);
+            assert_eq!(
+                store.quota().lock().unwrap().quota_decision("owner-b", 100),
+                Err("reject.node_capacity")
+            );
+            let refused = if deferred {
+                store.put_shard_deferred_flush("owner-b", &b_id, &b_bytes)
+            } else {
+                store.put_shard("owner-b", &b_id, &b_bytes).map(|_| ())
+            };
+            assert!(
+                matches!(refused, Err(StorageError::QuotaExceeded(_))),
+                "deferred={deferred}: {refused:?}"
+            );
+            let q = store.quota();
+            let q = q.lock().unwrap();
+            assert_eq!(q.used_storage_bytes(), 8_000, "deferred={deferred}");
+            assert_eq!(
+                q.peer_account("owner-a").unwrap().bytes_hosted_for_peer,
+                8_000,
+                "deferred={deferred}"
+            );
+            assert!(q.peer_account("owner-b").is_none(), "deferred={deferred}");
+            drop(q);
+            for (id, bytes) in &a_shards {
+                assert_eq!(&store.get_shard(id).unwrap(), bytes, "deferred={deferred}");
+            }
+            assert!(!store.shard_path(&b_id).exists(), "deferred={deferred}");
+        }
+    }
+
+    /// B-161 accept twin: with room for it, owner B's put is stored beside A's shards.
+    #[test]
+    fn b161_node_with_room_stores_other_owner_shard() {
+        for deferred in [false, true] {
+            let dir = tempdir().unwrap();
+            let store = BlockStore::new(dir.path(), QuotaManager::new(8_100, 1 << 20)).unwrap();
+            let a_shards = [b161_shard(0xA1, 4_000), b161_shard(0xA2, 4_000)];
+            for (id, bytes) in &a_shards {
+                store.put_shard("owner-a", id, bytes).unwrap();
+            }
+            let (b_id, b_bytes) = b161_shard(0xB1, 100);
+            if deferred {
+                store
+                    .put_shard_deferred_flush("owner-b", &b_id, &b_bytes)
+                    .unwrap();
+            } else {
+                store.put_shard("owner-b", &b_id, &b_bytes).unwrap();
+            }
+            assert_eq!(store.get_shard(&b_id).unwrap(), b_bytes);
+            for (id, bytes) in &a_shards {
+                assert_eq!(&store.get_shard(id).unwrap(), bytes);
+            }
+            assert_eq!(store.quota().lock().unwrap().used_storage_bytes(), 8_100);
+        }
     }
 }
