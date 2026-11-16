@@ -125,6 +125,8 @@ Claim lines in `.enforcement.map` use the finding id, or the finding id with a s
 | B154-INTERVAL | B-154 C37: the minimum `watch-folder` interval (2 s), refused not clamped. |
 | B154-RETAIN | B-154 C25, C28: retention keeps the newest and the last N; an implausible clock drops nothing for its age. |
 | B154-FOREIGN | B-154 C6, C7: a catalog on the ring that this device did not publish (a second writer) stops every free. |
+| B163-RETRY | B-163 item 3 (C35): after a quota refusal the owner runs GC and retries the pass once, only if GC freed something. |
+| B154-CEIL | L-119: retention above the client ceilings (50 recent, 90 daily, 52 weekly) is refused, not clamped. |
 | B154-WARN | B-154 L-122, C44: a folder's expected stored bytes (with pending and abandoned frees) above 1.25x what its policy can hold warn. |
 | F-39 | Low | A quorum of council epoch n can sign two different epoch n+1 manifests; nodes keep the successor they install first, and no node can prove the fork to another. | 2c | Accepted for v0.5.0 (documented in ADR-26); equivocation evidence is v0.6.0 |
 | F-40 | Medium | A blinded-shard read token (`GetBlindedShard`) was checked without its ±30 s clock-skew window, so a captured token stayed valid forever. | 2c | Fixed in v0.5.0 (QA signed off): `blinded_read_decision` requires the registered capability key, this locator, a fresh token (`reject.blinded_read_stale`) and a valid signature (`reject.blinded_read_sig_invalid`; claim E-BREAD); tests `f40_stale_blinded_read_token_refused` (60 s old token refused, fresh served) and `blinded_read_decision_rules`; QA and architect sign-off for 2c (token replay) |

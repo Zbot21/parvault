@@ -159,11 +159,10 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
         device_cert,
         resyndicate_lite,
         no_gc,
-        // B-154 retention (track B2): bound here when the version GC is built.
-        keep_last: _,
-        keep_daily: _,
-        keep_weekly: _,
-        max_stored_bytes: _,
+        keep_last,
+        keep_daily,
+        keep_weekly,
+        max_stored_bytes,
     } = command
     else {
         unreachable!("watch_folder() is only dispatched for Commands::WatchFolder")
@@ -180,7 +179,13 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
             parvault::sync::retention::MIN_WATCH_INTERVAL_SECS
         );
     }
-    let policy = retention_policy()?;
+    // L-119: the folder's tunables, checked against the client ceilings (refused, not clamped).
+    let policy = parvault::sync::retention::RetentionPolicy::checked(
+        keep_last,
+        keep_daily,
+        keep_weekly,
+        max_stored_bytes,
+    )?;
     let effective_tier = if public_mode {
         println!(
             "[parvault] Public Commons mode active: zero-knowledge AES-256-GCM encryption + 10-of-20 Reed-Solomon sharding."
@@ -734,18 +739,6 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
     Ok(())
 }
 
-/// The folder's retention policy (L-119 tunables; checked against the client ceilings, refused
-/// not clamped). The `--keep-*` flags arrive with the T0 follow-up; until then the defaults.
-fn retention_policy() -> anyhow::Result<parvault::sync::retention::RetentionPolicy> {
-    use parvault::sync::retention::*;
-    Ok(RetentionPolicy::checked(
-        KEEP_LAST_DEFAULT,
-        KEEP_DAILY_DEFAULT,
-        KEEP_WEEKLY_DEFAULT,
-        None,
-    )?)
-}
-
 /// `Changes : 2 modified, 0 added, 0 deleted, 1.6 MB uploaded` or `none` (B-154 3).
 fn changes_line(pass: &parvault::sync::PassSummary) -> String {
     if pass.no_change {
@@ -780,11 +773,12 @@ fn print_gc_lines(
             .unwrap_or_default()
     );
     println!(
-        "Version GC         : {} version(s) dropped, {} shard(s) freed on hosts, {} local, {} order(s)",
+        "Version GC         : {} version(s) dropped, {} shard(s) freed on hosts, {} local, {} order(s), {} DeleteShard fallback(s)",
         report.versions_dropped,
         report.shards_freed,
         report.local_shards_freed,
-        report.orders_sent
+        report.orders_sent,
+        report.fallback_deletes
     );
     println!(
         "Pending Frees      : {} ({} bytes); abandoned {} ({} bytes)",
@@ -1062,16 +1056,72 @@ pub(crate) async fn recover_from_seed(env: CliEnv, command: Commands) -> anyhow:
 
 /// `folder-status` (B-154, track B2): the retained versions and stored bytes of a folder.
 /// T0b stub: refused until track B2 builds it.
+/// `parvault folder-status` (B-154 C30, L-122): one folder's versions, policy, frees and
+/// accounting from its version store, journal and stats file. No network.
 pub(crate) async fn folder_status(env: CliEnv, command: Commands) -> anyhow::Result<()> {
-    let _ = env;
-    let Commands::FolderStatus { snapshot: _ } = command else {
+    let CliEnv { cfg, .. } = env;
+    let Commands::FolderStatus { snapshot } = command else {
         unreachable!("folder_status() is only dispatched for Commands::FolderStatus")
     };
-    Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt {
-        track: "B2",
-        entry: "folder-status",
-    })
-    .into())
+    use parvault::sync::gc_journal::{stats_path, FolderStats, GcJournal, GcPaths};
+    let store = parvault::sync::retention::VersionStore::for_snapshot(&snapshot);
+    let versions = store.list()?;
+    if versions.is_empty() {
+        anyhow::bail!(
+            "no version store for {} (back it up with watch-folder first; --no-gc keeps none)",
+            snapshot.display()
+        );
+    }
+    let journal = GcJournal::load(&GcPaths::for_snapshot(&snapshot))?;
+    println!("=== Folder Status (B-154) ===");
+    println!("Snapshot           : {}", snapshot.display());
+    println!(
+        "Versions Retained  : {} ({})",
+        versions.len(),
+        versions
+            .iter()
+            .map(|m| m.version.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if let Some((l, d, w, cap)) = journal.policy {
+        println!(
+            "Policy             : last {l}, daily {d}, weekly {w}{}",
+            cap.map(|c| format!(", cap {c} bytes")).unwrap_or_default()
+        );
+    }
+    println!(
+        "Pending Frees      : {} ({} bytes); abandoned {} ({} bytes)",
+        journal.pending.len(),
+        journal.pending_bytes(),
+        journal.abandoned.len(),
+        journal.abandoned_bytes()
+    );
+    println!(
+        "Version Store      : {} bytes on this disk",
+        store.local_bytes()
+    );
+    match std::fs::read(stats_path(&cfg.data_dir, &snapshot))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<FolderStats>(&raw).ok())
+    {
+        Some(st) => {
+            println!("Folder Size        : {} bytes", st.disk_bytes);
+            println!(
+                "Stored             : {} bytes (pre-erasure)",
+                st.stored_cipher_bytes
+            );
+            println!(
+                "Expected On Ring   : {} bytes (expected; policy maximum {} bytes)",
+                st.expected_stored_bytes, st.policy_max_bytes
+            );
+            if st.warn {
+                println!("Warning            : expected bytes exceed 1.25x the policy maximum");
+            }
+        }
+        None => println!("Folder Size        : unknown (no stats file in this data dir)"),
+    }
+    Ok(())
 }
 
 #[cfg(test)]

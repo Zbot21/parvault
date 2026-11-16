@@ -19,7 +19,7 @@
 use super::engine::FolderSnapshotManifest;
 use super::retention::{self, RetentionPolicy, VersionMeta, VersionStore, DAY_MS};
 use crate::crypto::NodeIdentity;
-use crate::network::behaviour::{FreeShardOutcome, FreeShardsOrder, MAX_FREE_ORDER_SHARDS};
+use crate::network::behaviour::{FreeShardOutcome, MAX_FREE_ORDER_SHARDS};
 use crate::network::client::{FreeShardsReply, PrePlaceHook};
 use crate::network::MeshClient;
 use crate::sharding::merkle::Hash32;
@@ -36,6 +36,8 @@ pub const ABANDON_AFTER_MS: u64 = 30 * DAY_MS;
 pub const MAX_ABANDONED_PER_HOST: usize = 4096;
 /// The longest backoff between retries, in passes (B-154 2.4).
 pub const MAX_BACKOFF_PASSES: u64 = 60;
+/// How long one `FreeShards` order may take (up to 1024 shards purged on the host).
+pub const FREE_ORDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// The retry reason of a host that did not answer.
 const UNREACHABLE: &str = "unreachable";
 /// The pseudo-host of the owner's own block store.
@@ -178,53 +180,7 @@ pub fn foreign_catalog_decision(
     }
 }
 
-/// The signed bytes of a [`FreeShardsOrder`]: `FREE_ORDER_DOMAIN || host || timestamp_ms ||
-/// gc_epoch || u32 count || per shard (stripe root, u32 index, shard hash)`, integers
-/// big-endian (B-154 2.4).
-pub fn free_order_signing_bytes(
-    host: &[u8; 32],
-    timestamp_ms: u64,
-    gc_epoch: u64,
-    shard_ids: &[ShardId],
-) -> Vec<u8> {
-    let domain = crate::network::behaviour::FREE_ORDER_DOMAIN;
-    let mut buf = Vec::with_capacity(domain.len() + 32 + 8 + 8 + 4 + shard_ids.len() * 68);
-    buf.extend_from_slice(domain);
-    buf.extend_from_slice(host);
-    buf.extend_from_slice(&timestamp_ms.to_be_bytes());
-    buf.extend_from_slice(&gc_epoch.to_be_bytes());
-    buf.extend_from_slice(&(shard_ids.len() as u32).to_be_bytes());
-    for id in shard_ids {
-        buf.extend_from_slice(&id.stripe_merkle_root);
-        buf.extend_from_slice(&id.shard_index.to_be_bytes());
-        buf.extend_from_slice(&id.shard_hash);
-    }
-    buf
-}
-
-/// Signs one order (C10: one epoch per order; C12: retries re-sign).
-pub fn sign_free_order(
-    owner: &NodeIdentity,
-    host: [u8; 32],
-    timestamp_ms: u64,
-    gc_epoch: u64,
-    shard_ids: Vec<ShardId>,
-) -> FreeShardsOrder {
-    let sig = owner.sign(&free_order_signing_bytes(
-        &host,
-        timestamp_ms,
-        gc_epoch,
-        &shard_ids,
-    ));
-    FreeShardsOrder {
-        host_ed25519_pubkey: host,
-        owner_ed25519_pubkey: owner.public_key_bytes(),
-        timestamp_ms,
-        gc_epoch,
-        shard_ids,
-        signature: sig.to_vec(),
-    }
-}
+pub use crate::por::verifier::{free_order_signing_bytes, sign_free_order};
 
 // --- The journal -----------------------------------------------------------------------------
 
@@ -1003,6 +959,9 @@ impl<'a> GcRun<'a> {
         let Some(client) = self.settings.client.clone() else {
             return self.journal.save(&self.paths);
         };
+        // A host purges each shard of an order (shred, fsync): a full order takes seconds, far
+        // over the default 1.2 s request timeout (track B1 measured 2.3 s for 666 shards).
+        let client = client.with_timeout(FREE_ORDER_TIMEOUT);
         // Due work per host: pending entries whose backoff has passed, and abandoned entries
         // not retried for a day.
         let mut by_host: BTreeMap<String, Vec<usize>> = BTreeMap::new();

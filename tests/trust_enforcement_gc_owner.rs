@@ -546,6 +546,11 @@ fn ring_pass(f: &LocalFolder, host: &Host) -> Output {
 
 /// A `watch-folder --once` pass of `f` against the hosts in `peers` (comma-separated).
 fn ring_pass_peers(f: &LocalFolder, peers: &str) -> Output {
+    ring_pass_args(f, peers, &[], Duration::from_secs(240))
+}
+
+/// A ring pass with `extra` watch-folder flags, within `limit`.
+fn ring_pass_args(f: &LocalFolder, peers: &str, extra: &[&str], limit: Duration) -> Output {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_parvault"));
     cmd.env("PARVAULT_LAN_REGISTRY_DIR", f.node.join("lan-registry"))
         .env("PARVAULT_GENESIS_SEED_HEX", GENESIS_SEED_HEX)
@@ -565,8 +570,9 @@ fn ring_pass_peers(f: &LocalFolder, peers: &str) -> Output {
             "--vault-namespace",
             "b2-ring",
             "--once",
-        ]);
-    output_within(&mut cmd, Duration::from_secs(240))
+        ])
+        .args(extra);
+    output_within(&mut cmd, limit)
 }
 
 /// `restore-folder --version` of `f` through the ring.
@@ -701,6 +707,8 @@ fn b154_own_catalog_frees_on_host() {
     f.write("a v4");
     let t = ring_pass_ok(&f, &host);
     assert!(!t.contains("reject.gc_foreign_catalog"), "{t}");
+    // Freed through the host's FreeShards path (track B1), not the old DeleteShard.
+    assert!(t.contains("0 DeleteShard fallback(s)"), "{t}");
     assert_eq!(f.versions(), vec![2, 3, 4], "{t}");
     let held = host.shard_names();
     assert!(
@@ -743,37 +751,102 @@ fn b154_foreign_catalog_frees_nothing() {
     gate_ran("trust_enforcement_gc_owner::b154_foreign_catalog_frees_nothing");
 }
 
-/// C24 (over 1024 shards): 60 changed files of one stripe each (Homelab, 20 shards) on one
-/// host; when version 1 ages out its 1,200 shards go in two orders (1024 + 176), every one
-/// freed.
+/// C24 (over 1024 shards): 52 files of one stripe each (Homelab, 20 shards) on one host, kept
+/// one version; when the next version drops them all, their 1,040 shards go in two orders
+/// (1024 + 16), every one freed through the host's `FreeShards` path.
 #[test]
 fn b154_over_1024_shards_freed_in_two_orders() {
     let host = spawn_host();
     let f = LocalFolder::new();
-    let names: Vec<String> = (0..60).map(|i| format!("f{i:02}.txt")).collect();
-    let write_all = |tag: &str| {
-        for n in &names {
-            std::fs::write(f.folder.join(n), format!("{tag} {n}")).unwrap();
-        }
-    };
-    write_all("v1");
-    ring_pass_ok(&f, &host);
+    let keep_one = ["--keep-last", "1", "--keep-daily", "0"];
+    let names: Vec<String> = (0..52).map(|i| format!("f{i:02}.txt")).collect();
+    for n in &names {
+        std::fs::write(f.folder.join(n), format!("v1 {n}")).unwrap();
+    }
+    let out = ring_pass_args(&f, &host.addr, &keep_one, Duration::from_secs(900));
+    assert!(out.status.success(), "{}", text(&out));
     let v1: Vec<String> = names
         .iter()
         .flat_map(|n| shard_names_of(&f, 1, n))
         .collect();
-    assert_eq!(v1.len(), 1200);
-    for tag in ["v2", "v3"] {
-        write_all(tag);
-        ring_pass_ok(&f, &host);
+    assert_eq!(v1.len(), 1040);
+    for n in &names {
+        std::fs::remove_file(f.folder.join(n)).unwrap();
     }
-    write_all("v4");
-    let t = ring_pass_ok(&f, &host);
-    assert!(t.contains("2 order(s)"), "{t}");
+    f.write("the only file left");
+    let out = ring_pass_args(&f, &host.addr, &keep_one, Duration::from_secs(900));
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(t.contains("2 order(s), 0 DeleteShard fallback(s)"), "{t}");
     let held = host.shard_names();
     assert!(v1.iter().all(|n| !held.contains(n)), "{t}");
     assert!(t.contains("Pending Frees      : 0 "), "{t}");
     gate_ran("trust_enforcement_gc_owner::b154_over_1024_shards_freed_in_two_orders");
+}
+
+// --- B163-RETRY (C35) ------------------------------------------------------------------------
+
+/// 200 KiB of incompressible bytes tagged `tag` (one stripe: 20 shards of about 13 KiB).
+fn big_body(tag: u8) -> Vec<u8> {
+    let mut x = 0x9E37_79B9u32 ^ tag as u32;
+    (0..204_800)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        })
+        .collect()
+}
+
+/// B163-RETRY accept (C35): a host allows this owner about 3.6 versions of a 200 KiB file.
+/// The fourth version is refused for quota; GC drops version 1 and frees it on the host, and the
+/// pass is retried once and stored on the host.
+#[test]
+fn b163_full_owner_gcs_then_stores() {
+    let host = spawn_host_with("bootstrap_grace_bytes = 921600\n");
+    let f = LocalFolder::new();
+    for tag in 1..=3u8 {
+        std::fs::write(f.folder.join("a.bin"), big_body(tag)).unwrap();
+        ring_pass_ok(&f, &host);
+    }
+    std::fs::write(f.folder.join("a.bin"), big_body(4)).unwrap();
+    let t = ring_pass_ok(&f, &host);
+    assert!(t.contains("retrying 1 file(s) once"), "{t}");
+    assert!(!t.contains("warn.gc_quota_retry_spent"), "{t}");
+    let retried = t.split("retrying 1 file(s) once").nth(1).unwrap();
+    assert!(!retried.contains("NOT backed up"), "{t}");
+    let newest = *f.versions().last().unwrap();
+    let held = host.shard_names();
+    assert!(
+        shard_names_of(&f, newest, "a.bin")
+            .iter()
+            .all(|n| held.contains(n)),
+        "the retried version is on the host\n{t}"
+    );
+    gate_ran("trust_enforcement_gc_owner::b163_full_owner_gcs_then_stores");
+}
+
+/// B163-RETRY reject (C35): a first pass over the owner's allowance has nothing to free; the
+/// retry is spent (`warn.gc_quota_retry_spent`), nothing is retried, and the pass reports the
+/// stripe not backed up (exit 3).
+#[test]
+fn b163_quota_retry_spent_without_frees() {
+    let host = spawn_host_with("bootstrap_grace_bytes = 102400\n");
+    let f = LocalFolder::new();
+    std::fs::write(f.folder.join("a.bin"), big_body(1)).unwrap();
+    let out = ring_pass(&f, &host);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(3), "{t}");
+    assert!(t.contains("warn.gc_quota_retry_spent"), "{t}");
+    assert!(!t.contains("retrying"), "{t}");
+    assert!(
+        std::fs::read_to_string(&host.log)
+            .unwrap_or_default()
+            .contains("peer_quota_exceeded"),
+        "the host refused for quota"
+    );
+    gate_ran("trust_enforcement_gc_owner::b163_quota_retry_spent_without_frees");
 }
 
 // --- B154-WARN (L-122, C43, C44) -------------------------------------------------------------
@@ -829,4 +902,143 @@ fn b154_stuck_frees_warn() {
     let t = churn_two_hosts(14, true);
     assert!(t.contains("warn.folder_storage_ratio"), "{t}");
     gate_ran("trust_enforcement_gc_owner::b154_stuck_frees_warn");
+}
+
+// --- B154-CEIL (L-119 ceilings) and folder-status (C30) ----------------------------------------
+
+/// B154-CEIL accept: the ceilings themselves (50 recent, 90 daily, 52 weekly) are accepted.
+#[test]
+fn b154_ceilings_accepted() {
+    let f = LocalFolder::new();
+    f.write("one");
+    let out = pass_with(
+        &f,
+        &[
+            "--keep-last",
+            "50",
+            "--keep-daily",
+            "90",
+            "--keep-weekly",
+            "52",
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out).contains("policy: last 50, daily 90, weekly 52"),
+        "{}",
+        text(&out)
+    );
+    gate_ran("trust_enforcement_gc_owner::b154_ceilings_accepted");
+}
+
+/// B154-CEIL reject (L-119): one over any ceiling is refused, never clamped
+/// (`reject.retention_above_ceiling`); no pass runs.
+#[test]
+fn b154_above_ceiling_refused() {
+    for flags in [
+        ["--keep-last", "51"],
+        ["--keep-daily", "91"],
+        ["--keep-weekly", "53"],
+    ] {
+        let f = LocalFolder::new();
+        f.write("one");
+        let out = pass_with(&f, &flags);
+        let t = text(&out);
+        assert!(!out.status.success(), "{t}");
+        assert!(t.contains("reject.retention_above_ceiling"), "{t}");
+        assert!(f.versions().is_empty());
+    }
+    gate_ran("trust_enforcement_gc_owner::b154_above_ceiling_refused");
+}
+
+/// `--keep-last 1 --keep-daily 0` keeps only the newest version.
+#[test]
+fn b154_keep_last_one_keeps_newest_only() {
+    let f = LocalFolder::new();
+    for body in ["a", "b", "c"] {
+        f.write(body);
+        let out = pass_with(&f, &["--keep-last", "1", "--keep-daily", "0"]);
+        assert!(out.status.success(), "{}", text(&out));
+    }
+    assert_eq!(f.versions(), vec![3]);
+    gate_ran("trust_enforcement_gc_owner::b154_keep_last_one_keeps_newest_only");
+}
+
+/// C30: `folder-status` shows the retained versions, the policy, frees and the version
+/// store's bytes on this disk.
+#[test]
+fn b154_folder_status_shows_versions_and_store() {
+    let f = LocalFolder::new();
+    for body in ["a", "b"] {
+        f.write(body);
+        pass(&f);
+    }
+    let out = run_parvault(
+        &f.node,
+        &["folder-status", "--snapshot", f.snap.to_str().unwrap()],
+    );
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(t.contains("Versions Retained  : 2 (1, 2)"), "{t}");
+    assert!(
+        t.contains("Policy             : last 3, daily 3, weekly 0"),
+        "{t}"
+    );
+    assert!(t.contains("Version Store      : "), "{t}");
+    assert!(t.contains("Folder Size        : 1 bytes"), "{t}");
+    gate_ran("trust_enforcement_gc_owner::b154_folder_status_shows_versions_and_store");
+}
+
+/// `folder-status` of a folder never backed up with GC fails and says why.
+#[test]
+fn b154_folder_status_without_store_fails() {
+    let f = LocalFolder::new();
+    let out = run_parvault(
+        &f.node,
+        &["folder-status", "--snapshot", f.snap.to_str().unwrap()],
+    );
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(t.contains("no version store"), "{t}");
+    gate_ran("trust_enforcement_gc_owner::b154_folder_status_without_store_fails");
+}
+
+/// `up --no-gc` starts and runs its folder passes without a version store. Needs track E's
+/// removal of the `up --no-gc` stub (`daemon_cmds.rs`) and G-17: runs at integration.
+#[test]
+#[ignore = "needs track E's daemon_cmds.rs --no-gc stub removal (integration)"]
+fn b154_up_no_gc_runs_without_versions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let node = tmp.path().join("node");
+    let folder = tmp.path().join("folder");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.txt"), "up").unwrap();
+    let log = tmp.path().join("up.log");
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", node.join("lan-registry"))
+        .env_remove("PARVAULT_PEERS")
+        .arg("--data-dir")
+        .arg(&node)
+        .args([
+            "--no-lan-discovery",
+            "up",
+            "--no-socket",
+            "--no-gc",
+            "--listen",
+        ])
+        .arg(common::LOOPBACK_EPHEMERAL)
+        .arg("--watch-folder")
+        .arg(&folder);
+    let (mut child, _addr) = common::spawn_on_ephemeral_port(&mut cmd, &log);
+    let snap = node.join("appliance_folder_snapshot.manifest.bin");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !snap.exists() {
+        assert!(std::time::Instant::now() < deadline, "no pass in 30 s");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(!VersionStore::for_snapshot(&snap).dir().exists());
+    gate_ran("trust_enforcement_gc_owner::b154_up_no_gc_runs_without_versions");
 }
