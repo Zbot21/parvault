@@ -418,6 +418,30 @@ fn b154_v055_snapshot_upgrades_and_stays_readable() {
     let old: v055::FolderSnapshotManifest = bincode::deserialize(&raw).unwrap();
     assert_eq!(old.version, 2);
     assert_eq!(old.files.len(), 1);
+    // Every field of the frozen layout decodes to what the current decoder reads.
+    let cur = parvault::sync::FolderSnapshotManifest::decode_bytes(&raw).unwrap();
+    assert_eq!(old.folder_merkle_root, cur.folder_merkle_root);
+    assert_eq!(old.tier, cur.tier);
+    assert_eq!(
+        old.signed_dht_envelope.map(|e| e.monotonic_version),
+        cur.signed_dht_envelope.map(|e| e.monotonic_version)
+    );
+    for (k, e) in &old.files {
+        let c = &cur.files[k];
+        assert_eq!(e.relative_path, c.relative_path);
+        assert_eq!(e.size_bytes, c.size_bytes);
+        assert_eq!(e.modified_unix_ms, c.modified_unix_ms);
+        assert_eq!(e.plaintext_sha256, c.plaintext_sha256);
+        assert_eq!(e.file_merkle_root, c.file_merkle_root);
+        assert_eq!(e.manifest, c.manifest);
+        assert_eq!(e.shard_pseudonyms, c.shard_pseudonyms);
+    }
+    for (k, t) in &old.deleted_tombstones {
+        let c = &cur.deleted_tombstones[k];
+        assert_eq!(t.relative_path, c.relative_path);
+        assert_eq!(t.deleted_at_version, c.deleted_at_version);
+        assert_eq!(t.previous_merkle_root, c.previous_merkle_root);
+    }
     gate_ran("trust_enforcement_gc_owner::b154_v055_snapshot_upgrades_and_stays_readable");
 }
 
@@ -429,7 +453,6 @@ mod v055 {
     use std::collections::BTreeMap;
 
     #[derive(Deserialize)]
-    #[allow(dead_code)]
     pub struct SyncedFileEntry {
         pub relative_path: String,
         pub size_bytes: u64,
@@ -441,7 +464,6 @@ mod v055 {
     }
 
     #[derive(Deserialize)]
-    #[allow(dead_code)]
     pub struct DeletedFileTombstone {
         pub relative_path: String,
         pub deleted_at_version: u64,
@@ -449,7 +471,6 @@ mod v055 {
     }
 
     #[derive(Deserialize)]
-    #[allow(dead_code)]
     pub struct FolderSnapshotManifest {
         pub version: u64,
         pub folder_merkle_root: [u8; 32],
