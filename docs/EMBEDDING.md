@@ -10,7 +10,7 @@ Pin the latest published release tag, <!-- metric:released_version_tag -->`v0.5.
 
 ```toml
 [dependencies]
-parvault = { git = "https://github.com/Zbot21/parvault.git", tag = "v0.5.4" }
+parvault = { git = "https://github.com/Zbot21/parvault.git", tag = "v0.5.6" }
 anyhow = "1"
 ```
 

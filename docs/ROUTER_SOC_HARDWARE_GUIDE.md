@@ -255,8 +255,8 @@ The command downloads the latest published release, <!-- metric:released_version
 ```bash
 # 1. Download the static aarch64 (or x86_64) musl binary and check it against the verified SHA256SUMS
 cd /tmp
-wget https://github.com/Zbot21/parvault/releases/download/v0.5.4/parvault-aarch64-unknown-linux-musl-dev
-head -n1 SHA256SUMS        # the verified copy; must be: # parvault v0.5.4 dev
+wget https://github.com/Zbot21/parvault/releases/download/v0.5.6/parvault-aarch64-unknown-linux-musl-dev
+head -n1 SHA256SUMS        # the verified copy; must be: # parvault v0.5.6 dev
 grep -v '^#' SHA256SUMS | grep ' parvault-aarch64-unknown-linux-musl-dev$' | sha256sum -c -
 mv parvault-aarch64-unknown-linux-musl-dev /usr/bin/parvault
 chmod +x /usr/bin/parvault
@@ -268,7 +268,7 @@ mkdir -p /etc/parvault /mnt/nas/.parvault-data /mnt/nas/shared
 ### Configuration File (`/etc/parvault/router.toml`)
 Copy `deploy/router-soc/parvault-router.toml`:
 ```toml
-# ParVault v0.5.5 Turnkey Router Cloud-NAS Configuration (ADR-21)
+# ParVault v0.5.6 Turnkey Router Cloud-NAS Configuration (ADR-21)
 # Designed for OpenWrt / prplOS / ARM64 & x86_64 Gateway SoCs (<= 32-48 MiB cgroup RAM)
 
 hardware_profile = "router-soc"
