@@ -69,6 +69,17 @@ Built with `--profile soc` (`opt-level = "z"`, `lto = "fat"`, `codegen-units = 1
 | `parvault-status` (`x86_64-unknown-linux-musl`) | `--profile soc` | <!-- metric:size.parvault-status.x86_64.bytes -->`1,202,336 B`<!-- /metric --> | **<!-- metric:size.parvault-status.x86_64 -->`1.15 MiB`<!-- /metric -->** | Status page sidecar (`status-ui` only: no tokio, no libp2p); holds no key, reads status over the gateway socket. |
 | `parvault:router-soc` (`deploy/Dockerfile.router-soc`) | `FROM scratch` | — | **<!-- metric:docker.compressed -->`6.48 MB`<!-- /metric --> compressed** (<!-- metric:docker.unpacked -->`20.6 MB`<!-- /metric --> unpacked) | Verified inside `--memory=48m --memory-swap=48m` cgroup at **<!-- metric:docker.live_rss -->`8.36 MiB`<!-- /metric -->** live RSS, idle on the ring, not an upper bound (`0` OOM kills) |
 
+**Edge TLS in the plugins (`v0.5.6`, B-1, A-TLS-3).** Since `v0.5.6` `parvault-fuse` and `parvault-status` link rustls with ring (feature `edge-tls`, in `vfs` and `status-ui`) and load a PEM file; they never generate one. Measured by track A on the EVO-X2 with `--profile soc`, musl, before and after the feature (the table above is regenerated at the release):
+
+| Plugin | Target | Without `edge-tls` | With | Growth |
+| :--- | :--- | ---: | ---: | ---: |
+| `parvault-fuse` | `aarch64` | `1,185,584 B` | `1,775,472 B` | `+576 KiB` |
+| `parvault-status` | `aarch64` | `1,120,016 B` | `1,709,920 B` | `+576 KiB` |
+| `parvault-fuse` | `x86_64` | `1,333,576 B` | `2,152,808 B` | `+800 KiB` |
+| `parvault-status` | `x86_64` | `1,251,624 B` | `2,066,792 B` | `+796 KiB` |
+
+The budget (arch056a A-TLS-3) is `+700 KiB` per plugin on `aarch64`; both are within it. `x86_64` grows more (wider instructions, ring's assembly) and has no separate budget.
+
 ---
 
 ## 5. Formal Verification & Automated Test Summary (`v0.5.0-M3`)

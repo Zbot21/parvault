@@ -334,10 +334,25 @@ curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
 
 Clients that cannot send a Bearer token (Finder, davfs2, Windows) use any user name and the token as the password.
 
-> [!WARNING]
-> There is no TLS in `v0.5.3`. On loopback (`127.0.0.1`) nothing leaves the machine, but over a LAN the token travels **in clear** and anyone who sees it can read your vault until it expires. Keep `--ttl-secs` short. Built-in TLS is planned for `v0.6.0`.
+On a loopback bind (`127.0.0.1`) the edge serves plain HTTP: nothing leaves the machine. Any other bind serves **HTTPS only** (`v0.5.6`): the first such `up` makes a self-signed certificate in the data dir, and clients register it once:
 
-**Windows:** its WebDAV client sends Basic auth over plain HTTP only after you allow it. In an administrator prompt run `reg add HKLM\SYSTEM\CurrentControlSet\Services\WebClient\Parameters /v BasicAuthLevel /t REG_DWORD /d 2 /f`, then restart the `WebClient` service (`net stop webclient && net start webclient`).
+<!-- doc-cmd: node laptop -->
+<!-- doc-cmd: background ready="Built-in VFS WebDAV listening on https://0.0.0.0:8443" -->
+```bash
+parvault up --no-socket --vfs-seed-dir ~/Documents --vfs-webdav-listen 0.0.0.0:8443
+```
+
+<!-- doc-cmd: node laptop -->
+```bash
+parvault tls show
+parvault tls export --out webdav.crt
+TOKEN="$(parvault token mint --read-only --ttl-secs 86400)"
+curl -fsS --cacert webdav.crt -u "token:$TOKEN" -X PROPFIND -H "Depth: 1" https://127.0.0.1:8443/
+```
+
+Check the fingerprint `tls show` prints before you trust the file on a client. Plain HTTP on a LAN bind needs `--insecure-plain-http` and sends the token in clear.
+
+**Windows:** register `webdav.crt` and map the drive as in [`docs/WINDOWS.md`](docs/WINDOWS.md) (`net use Z: \\<ip>@SSL@8443\DavWWWRoot /user:token <token>`). The drive is read-only.
 
 ## 5. Planned: The Automatic "Trust & Storage Ladder"
 

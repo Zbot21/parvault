@@ -9,6 +9,6 @@ set        status-ui features=status-ui default-features=no
 set        daemon-runtime features=daemon-runtime,manifest-household-ring-v1 default-features=no
 set        manifest-household-ring-v1 features=daemon-runtime,vfs,status-ui,manifest-household-ring-v1 default-features=no
 set        manifest-test-restricted features=daemon-runtime,vfs,status-ui,manifest-test-restricted default-features=no
-# One audited lint allow: tests/common/mod.rs:4 (docs/SAFETY_AND_LINT_AUDIT.md). No allowed
-# unused dependency.
-ratchet    allows=1 deps=0
+# Two audited lint allows: tests/common/mod.rs:4 and tests/edge_common/mod.rs:6 (v0.5.6 track A)
+# (docs/SAFETY_AND_LINT_AUDIT.md). No allowed unused dependency.
+ratchet    allows=2 deps=0

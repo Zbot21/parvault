@@ -76,6 +76,13 @@ enum FuseCommand {
         /// Optional local directory to ingest into `parvault` and expose lazily.
         #[arg(long)]
         seed_dir: Option<PathBuf>,
+        /// Serve TLS with this PEM file: certificate and key together, mode 0600 (for example
+        /// the daemon's `edge_tls.pem` copied for this user). Needed on a non-loopback bind (L-81).
+        #[arg(long, value_name = "FILE")]
+        tls_pem: Option<PathBuf>,
+        /// Serve plain HTTP on a non-loopback bind: tokens cross the network in clear (L-81).
+        #[arg(long, conflicts_with = "tls_pem")]
+        insecure_plain_http: bool,
     },
     /// Ingest a local folder into `parvault` via sealed zero-copy `memfd` `SCM_RIGHTS`.
     Sync {
@@ -148,7 +155,18 @@ fn main() -> anyhow::Result<()> {
                 let dev_file = parvault::os_sys::adopt_fuse_dev_fd(fuse_fd)?;
                 vfs.serve_fuse_fd_blocking(dev_file)?;
             }
-            FuseCommand::Webdav { listen, seed_dir } => {
+            FuseCommand::Webdav {
+                listen,
+                seed_dir,
+                tls_pem,
+                insecure_plain_http,
+            } => {
+                // B1-PLAIN-FUSE (L-81, A-TLS-3): the plugin loads PEM, never generates; plain
+                // HTTP only on loopback or with the opt-out (checked at the bind).
+                let serve = parvault::http_edge::EdgeServe::from_plugin_flags(
+                    tls_pem.as_deref(),
+                    insecure_plain_http,
+                )?;
                 // F-43 (L-44): every request must present this token or an offline attenuation
                 // of it; the plugin holds no root key, so there is no server without one.
                 let pinned = default_macaroon.clone().ok_or_else(|| {
@@ -164,12 +182,14 @@ fn main() -> anyhow::Result<()> {
                         dir.display()
                     );
                 }
-                let handle = vfs.spawn_webdav_server(
+                let scheme = serve.scheme();
+                let handle = vfs.spawn_webdav_server_served(
                     &listen,
                     parvault::vfs::WebdavVerifier::PinnedParent(pinned),
+                    serve,
                 )?;
                 println!(
-                    "[parvault-fuse] serving HTTP-Range / WebDAV VFS on http://{} (gateway={})",
+                    "[parvault-fuse] serving HTTP-Range / WebDAV VFS on {scheme}://{} (gateway={})",
                     handle.local_addr(),
                     cli.socket.display()
                 );

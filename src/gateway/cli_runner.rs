@@ -410,6 +410,9 @@ fn describe_caveat_text(c: &Caveat) -> String {
     }
 }
 
+/// Longest token `token mint` prints without a warning (L-123 Q4: under 255 characters).
+pub const WEBDAV_TOKEN_WARN_CHARS: usize = 254;
+
 /// Executes `parvault token { mint, attenuate, inspect }`.
 pub fn execute_token_cli(action: TokenAction, data_dir: &Path) -> anyhow::Result<()> {
     match action {
@@ -426,14 +429,6 @@ pub fn execute_token_cli(action: TokenAction, data_dir: &Path) -> anyhow::Result
             out,
         } => {
             let _ = read_only; // the default since B-16
-            if out.is_some() {
-                // v0.5.6 T0 stub (G3): track A writes the file.
-                return Err(crate::seam::not_built_yet(crate::seam::Unbuilt {
-                    track: "A",
-                    entry: "token mint --out",
-                })
-                .into());
-            }
             let root_key = load_or_create_macaroon_root_key(data_dir, macaroon_key_hex.as_deref())?;
             let nonce_id: [u8; 32] = OsRng.gen();
             let issuer_fp = derive_key_id_bytes(&key_id);
@@ -446,6 +441,29 @@ pub fn execute_token_cli(action: TokenAction, data_dir: &Path) -> anyhow::Result
             )?;
             let mac = CapabilityMacaroon::mint(&root_key, nonce_id, issuer_fp, caveats)?;
             let compact = mac.to_compact_token();
+            // L-123 Q4: Windows caps a password near 256 characters; a WebDAV token stays under
+            // 255 (a ReadOnly token with an expiry is about 230).
+            if compact.len() > WEBDAV_TOKEN_WARN_CHARS {
+                eprintln!(
+                    "warning: this token is {} characters; Windows WebClient may refuse a password over {} (fewer caveats make it shorter)",
+                    compact.len(),
+                    WEBDAV_TOKEN_WARN_CHARS
+                );
+            }
+            if let Some(path) = out {
+                // A-146-6 style: owner-only, written atomically; only the path is printed, so
+                // the token is not in a container log.
+                #[cfg(unix)]
+                crate::capabilities::write_file_atomic(
+                    &path,
+                    format!("{compact}\n").as_bytes(),
+                    0o600,
+                )?;
+                #[cfg(not(unix))]
+                std::fs::write(&path, format!("{compact}\n"))?;
+                println!("{}", path.display());
+                return Ok(());
+            }
             if json {
                 println!(
                     "{}",
@@ -490,6 +508,15 @@ pub fn execute_token_cli(action: TokenAction, data_dir: &Path) -> anyhow::Result
                 mac = mac.attenuate(cav)?;
             }
             let compact = mac.to_compact_token();
+            // L-123 Q4: Windows caps a password near 256 characters; a WebDAV token stays under
+            // 255 (a ReadOnly token with an expiry is about 230).
+            if compact.len() > WEBDAV_TOKEN_WARN_CHARS {
+                eprintln!(
+                    "warning: this token is {} characters; Windows WebClient may refuse a password over {} (fewer caveats make it shorter)",
+                    compact.len(),
+                    WEBDAV_TOKEN_WARN_CHARS
+                );
+            }
             if json {
                 println!(
                     "{}",

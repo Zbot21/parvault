@@ -51,6 +51,7 @@ Across the entire repository (`src/`, `tests/`, `benches/`), **23 avoidable `#[a
 | `src/telemetry.rs:241` | `clippy::too_many_arguments` | `AnonymousTelemetryBeacon::create_with_pow` (`9` args) | Public SemVer `ADR-17` Sybil-resistant PoW census constructor extending `AnonymousTelemetryBeacon::create` with `pow_difficulty_bits: u8`. |
 | `src/por/verifier.rs:887` | `clippy::too_many_arguments` | `PorVerifierEngine::prescreen` (`&mut self` + `7` args) | Private helper: gathers the five raw facts of one challenge (range, session, issue time, nonce, HMAC) plus `now` and the shard id, builds `PorPrescreenFacts`, and logs and counts a refusal; both callers pass already-unpacked values from different request shapes, so a wrapper struct would only rename the same seven values. |
 | `tests/common/mod.rs:4` | `dead_code` (inner, module scope) | shared integration-test helpers | Each integration test binary compiles `mod common;` separately and uses only some helpers, so the unused ones warn per binary; test-only, never in the library or shipped binaries. |
+| `tests/edge_common/mod.rs:6` | `dead_code` (inner, module scope) | shared helpers of the `v0.5.6` edge suites (`trust_enforcement_edge`; on integration also `edge_daemon_tls`, `webdav_tls`, `windows_equiv_acceptance`) | As `tests/common/mod.rs`: each test binary compiles `mod edge_common;` separately and uses only some helpers; test-only, never in the library or shipped binaries. |
 
 ---
 

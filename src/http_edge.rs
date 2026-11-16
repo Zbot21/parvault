@@ -33,6 +33,8 @@ pub const WEBDAV_401: &[u8] = b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: B
 pub const STATUS_401: &[u8] = b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"parvault-status\"\r\nWWW-Authenticate: Basic realm=\"parvault-status\", charset=\"UTF-8\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 pub const RESP_403: &[u8] =
     b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+pub const RESP_400: &[u8] =
+    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 pub const RESP_431: &[u8] = b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 pub const RESP_502: &[u8] =
     b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -65,7 +67,18 @@ impl EdgeVerifier {
 /// Plan-3 ruling change 8 (DNS rebinding): the `Host` must be an IP literal or `localhost`,
 /// with an optional port. On a wildcard bind any IP literal passes; on a specific bind only that
 /// address, plus `localhost` when it is loopback. A missing `Host` or a DNS name is refused.
+/// [`edge_host_allowed`] with no certificate names.
 pub fn status_host_allowed(host: Option<&str>, bound: std::net::SocketAddr) -> bool {
+    edge_host_allowed(host, bound, &[])
+}
+
+/// A-TLS-7: the `Host` rule of both edges. As [`status_host_allowed`], plus a DNS name that is
+/// one of `names` (the edge certificate's SAN names, case-insensitive, a trailing dot ignored).
+pub fn edge_host_allowed(
+    host: Option<&str>,
+    bound: std::net::SocketAddr,
+    names: &[String],
+) -> bool {
     let Some(h) = host.map(str::trim).filter(|h| !h.is_empty()) else {
         return false;
     };
@@ -87,7 +100,14 @@ pub fn status_host_allowed(host: Option<&str>, bound: std::net::SocketAddr) -> b
     }
     match name.parse::<IpAddr>() {
         Ok(literal) => ip.is_unspecified() || literal == ip,
-        Err(_) => false,
+        Err(_) => {
+            let bare = name.strip_suffix('.').unwrap_or(name);
+            !bare.is_empty()
+                && names
+                    .iter()
+                    .filter(|n| n.parse::<IpAddr>().is_err())
+                    .any(|n| n.strip_suffix('.').unwrap_or(n).eq_ignore_ascii_case(bare))
+        }
     }
 }
 
@@ -141,10 +161,18 @@ impl EdgeSlots {
 }
 
 /// Runs `handle` for one connection on its own thread (256 KiB stack) within `slots`; over
-/// either cap the connection is dropped unanswered.
-pub fn spawn_edge_conn<F>(mut stream: TcpStream, slots: &Arc<EdgeSlots>, name: &str, handle: F)
+/// either cap the connection is dropped unanswered. Plain TCP; [`spawn_edge_conn_served`] is the
+/// same with TLS.
+pub fn spawn_edge_conn<F>(stream: TcpStream, slots: &Arc<EdgeSlots>, name: &str, handle: F)
 where
     F: FnOnce(&mut TcpStream) + Send + 'static,
+{
+    spawn_edge_owned(stream, slots, name, move |mut s| handle(&mut s));
+}
+
+fn spawn_edge_owned<F>(stream: TcpStream, slots: &Arc<EdgeSlots>, name: &str, handle: F)
+where
+    F: FnOnce(TcpStream) + Send + 'static,
 {
     let ip = stream.peer_addr().ok().map(|a| a.ip());
     if !slots.acquire(ip) {
@@ -159,7 +187,7 @@ where
         .name(name.into())
         .stack_size(256 * 1024)
         .spawn(move || {
-            handle(&mut stream);
+            handle(stream);
             slots_cl.release(ip);
         });
     if spawned.is_err() {
@@ -167,17 +195,46 @@ where
     }
 }
 
+/// [`spawn_edge_conn`] over `serve`'s transport (B-1 P1): on TLS the handshake runs on the
+/// connection's thread, after the slot is taken, and it and the first request head share one
+/// pre-auth deadline of [`EDGE_HEAD_TIMEOUT`] from the accept (A-TLS-5): `handle` gets the stream
+/// and that deadline. A failed or stalled handshake frees the slot with no HTTP answer.
+pub fn spawn_edge_conn_served<F>(
+    stream: TcpStream,
+    slots: &Arc<EdgeSlots>,
+    name: &str,
+    serve: &EdgeServe,
+    handle: F,
+) where
+    F: FnOnce(&mut dyn EdgeStream, Instant) + Send + 'static,
+{
+    let deadline = Instant::now() + EDGE_HEAD_TIMEOUT;
+    let serve = serve.clone();
+    spawn_edge_owned(stream, slots, name, move |mut sock| match serve {
+        EdgeServe::Plain | EdgeServe::InsecurePlain => handle(&mut sock, deadline),
+        #[cfg(feature = "edge-tls")]
+        EdgeServe::Tls(tls) => match TlsEdgeStream::accept(&tls.config, sock, deadline) {
+            Ok(mut s) => {
+                handle(&mut s, deadline);
+                s.close();
+            }
+            Err(e) => tracing::debug!(error = %e, "edge TLS handshake failed"),
+        },
+    });
+}
+
 /// A connection the edge reads requests from and writes responses to (v0.5.6 T0, B-1 P0): the
 /// WebDAV and status handlers take this, not `TcpStream`, so track A can serve them over TLS.
 pub trait EdgeStream: Read + Write {
-    /// Bounds the next read (the head deadline shrinks it read by read).
-    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+    /// Bounds the next read (the head deadline shrinks it read by read). On TLS it bounds the
+    /// whole `read` call, however many socket reads it takes.
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
     /// The client's address (logged with a refusal).
     fn peer_addr(&self) -> io::Result<std::net::SocketAddr>;
 }
 
 impl EdgeStream for TcpStream {
-    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
         TcpStream::set_read_timeout(self, timeout)
     }
     fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
@@ -216,7 +273,17 @@ pub fn read_request_head_after<S: EdgeStream + ?Sized>(
     stream: &mut S,
     carry: Vec<u8>,
 ) -> io::Result<Option<RequestHead>> {
-    let deadline = Instant::now() + EDGE_HEAD_TIMEOUT;
+    read_request_head_until(stream, carry, Instant::now() + EDGE_HEAD_TIMEOUT)
+}
+
+/// [`read_request_head_after`] under a given `deadline` (the connection's pre-auth deadline, or
+/// the keep-alive idle bound). A head that breaks the framing rules ([`head_framing_decision`])
+/// is answered 400 and the connection closes (request smuggling, QA of T0).
+pub fn read_request_head_until<S: EdgeStream + ?Sized>(
+    stream: &mut S,
+    carry: Vec<u8>,
+    deadline: Instant,
+) -> io::Result<Option<RequestHead>> {
     let mut head = carry;
     head.reserve(1024);
     let mut chunk = [0u8; 2048];
@@ -227,6 +294,16 @@ pub fn read_request_head_after<S: EdgeStream + ?Sized>(
             .position(|w| w == b"\r\n\r\n")
         {
             let remainder = head.split_off(end + 4);
+            if let Err(code) = head_framing_decision(&head) {
+                let peer = stream
+                    .peer_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
+                tracing::warn!(code, peer = %peer, "refused a malformed request head");
+                stream.write_all(RESP_400)?;
+                stream.flush()?;
+                return Ok(None);
+            }
             return Ok(Some(RequestHead { head, remainder }));
         }
         if head.len() >= EDGE_MAX_HEAD_BYTES {
@@ -245,6 +322,76 @@ pub fn read_request_head_after<S: EdgeStream + ?Sized>(
     }
 }
 
+/// Request smuggling (QA of T0): the framing every head must have before any handler parses it,
+/// so the body-length reader and the handlers agree on where each header line ends. Lines end
+/// in CRLF only (a bare LF or CR is refused); no NUL; no obsolete line folding; header names are
+/// tokens with the colon right after; the request line is `METHOD SP target SP HTTP/1.x`; at
+/// most one `Host`, `Authorization`, `Content-Length` and `Transfer-Encoding`; never both of the
+/// last two.
+pub fn head_framing_decision(head: &[u8]) -> Result<(), &'static str> {
+    let Some(body) = head.strip_suffix(b"\r\n\r\n") else {
+        return Err("reject.edge_head_framing");
+    };
+    if body.contains(&0) {
+        return Err("reject.edge_head_framing");
+    }
+    for (i, &b) in body.iter().enumerate() {
+        let lf_ok = b != b'\n' || (i > 0 && body[i - 1] == b'\r');
+        let cr_ok = b != b'\r' || body.get(i + 1) == Some(&b'\n');
+        if !lf_ok || !cr_ok {
+            return Err("reject.edge_bare_lf");
+        }
+    }
+    let Ok(text) = std::str::from_utf8(body) else {
+        return Err("reject.edge_head_framing");
+    };
+    let mut lines = text.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let parts: Vec<&str> = request_line.split(' ').collect();
+    let method_ok = |m: &str| !m.is_empty() && m.bytes().all(is_tchar);
+    if parts.len() != 3
+        || !method_ok(parts[0])
+        || parts[1].is_empty()
+        || !(parts[2] == "HTTP/1.1" || parts[2] == "HTTP/1.0")
+    {
+        return Err("reject.edge_head_framing");
+    }
+    let (mut host, mut auth, mut cl, mut te) = (0u8, 0u8, 0u8, 0u8);
+    for line in lines {
+        let Some((name, _value)) = line.split_once(':') else {
+            return Err("reject.edge_head_framing");
+        };
+        if name.is_empty() || !name.bytes().all(is_tchar) {
+            // Also refuses obsolete folding (a line starting with SP or HT).
+            return Err("reject.edge_head_framing");
+        }
+        let count = if name.eq_ignore_ascii_case("host") {
+            &mut host
+        } else if name.eq_ignore_ascii_case("authorization") {
+            &mut auth
+        } else if name.eq_ignore_ascii_case("content-length") {
+            &mut cl
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            &mut te
+        } else {
+            continue;
+        };
+        *count += 1;
+        if *count > 1 {
+            return Err("reject.edge_duplicate_header");
+        }
+    }
+    if cl > 0 && te > 0 {
+        return Err("reject.edge_te_with_cl");
+    }
+    Ok(())
+}
+
+/// RFC 9110 `tchar`.
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
 /// Most requests one connection may carry (A-TLS-5's cap; until track A adds keep-alive a
 /// connection carries more than one only when the client pipelined them, A-TLS-4).
 pub const EDGE_MAX_REQUESTS_PER_CONN: usize = 100;
@@ -253,6 +400,14 @@ pub const EDGE_MAX_REQUESTS_PER_CONN: usize = 100;
 /// skipped exactly: a `Transfer-Encoding` header, a malformed or repeated length.
 pub fn request_body_len(head: &[u8]) -> Option<u64> {
     let text = std::str::from_utf8(head).ok()?;
+    // A bare LF would let the handlers (which split on any LF) see a header this reader does
+    // not: no length is trusted from such a head (QA of T0).
+    if text
+        .split("\r\n")
+        .any(|l| l.contains('\n') || l.contains('\r'))
+    {
+        return None;
+    }
     let mut len = None;
     for line in text.split("\r\n").skip(1) {
         let Some((k, v)) = line.split_once(':') else {
@@ -265,16 +420,38 @@ pub fn request_body_len(head: &[u8]) -> Option<u64> {
             if len.is_some() {
                 return None;
             }
-            len = Some(v.trim().parse::<u64>().ok()?);
+            // ASCII digits only (`+5`, `-0`, `5 5` and an empty value are refused).
+            let v = v.trim_matches(|c| c == ' ' || c == '\t');
+            if v.is_empty() || v.len() > 19 || !v.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            len = Some(v.parse::<u64>().ok()?);
         }
     }
     Some(len.unwrap_or(0))
 }
 
 /// Whether the request asked to close the connection after its answer (`Connection: close`).
+/// An `HTTP/1.0` request closes unless it asks for `Connection: keep-alive`.
 pub fn request_wants_close(head: &[u8]) -> bool {
-    String::from_utf8_lossy(head)
+    let text = String::from_utf8_lossy(head);
+    let http10 = text
         .split("\r\n")
+        .next()
+        .is_some_and(|l| l.ends_with(" HTTP/1.0"));
+    let keep = text
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|l| l.split_once(':'))
+        .filter(|(k, _)| k.trim().eq_ignore_ascii_case("connection"))
+        .any(|(_, v)| {
+            v.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("keep-alive"))
+        });
+    if http10 && !keep {
+        return true;
+    }
+    text.split("\r\n")
         .skip(1)
         .filter_map(|l| l.split_once(':'))
         .filter(|(k, _)| k.trim().eq_ignore_ascii_case("connection"))
@@ -294,6 +471,500 @@ pub fn pipelined_next(head: &RequestHead) -> Option<Vec<u8>> {
         return None;
     }
     Some(head.remainder[body..].to_vec())
+}
+
+/// A-TLS-5: an authenticated keep-alive connection waits at most this long for its next request.
+pub const EDGE_KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
+/// Largest request body read and discarded to keep a connection open (a `PROPFIND`'s XML);
+/// a longer one closes the connection after its answer.
+pub const EDGE_MAX_DISCARD_BODY: u64 = 64 * 1024;
+
+/// Reads and discards this request's body (`remainder` first, then the stream, before
+/// `deadline`) and returns the bytes after it: the start of the next request. `None` closes the
+/// connection: no exact length (`Transfer-Encoding`, a malformed length), a body over
+/// [`EDGE_MAX_DISCARD_BODY`], `Connection: close`, or a body cut short.
+pub fn keep_alive_next<S: EdgeStream + ?Sized>(
+    stream: &mut S,
+    head: &RequestHead,
+    deadline: Instant,
+) -> Option<Vec<u8>> {
+    if request_wants_close(&head.head) {
+        return None;
+    }
+    let body = request_body_len(&head.head)?;
+    if body > EDGE_MAX_DISCARD_BODY {
+        return None;
+    }
+    let body = body as usize;
+    if head.remainder.len() >= body {
+        return Some(head.remainder[body..].to_vec());
+    }
+    let mut left = body - head.remainder.len();
+    let mut chunk = [0u8; 2048];
+    while left > 0 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || stream.set_read_timeout(Some(remaining)).is_err() {
+            return None;
+        }
+        match stream.read(&mut chunk[..left.min(2048)]) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => left -= n,
+        }
+    }
+    Some(Vec::new())
+}
+
+/// How an edge listener carries HTTP (B-1, L-81).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeTransport {
+    Tls,
+    Plain,
+}
+
+/// B1-PLAIN (L-81): TLS when a certificate is configured; plain HTTP on a loopback bind (a local
+/// reverse proxy, tests) or with `--insecure-plain-http`; any other plain bind is refused, so a
+/// token never crosses the LAN in clear by default.
+pub fn edge_transport_decision(
+    bind_loopback: bool,
+    tls_configured: bool,
+    insecure_opt_out: bool,
+) -> Result<EdgeTransport, &'static str> {
+    if tls_configured {
+        return Ok(EdgeTransport::Tls);
+    }
+    if bind_loopback || insecure_opt_out {
+        return Ok(EdgeTransport::Plain);
+    }
+    Err("reject.edge_plain_http_nonloopback")
+}
+
+/// B1-KEY (A-TLS-8): the edge key file follows the root-key rule: a regular file owned by the
+/// effective UID with mode exactly `0600` (permission bits; `read_owner_only_file` opens it with
+/// `O_NOFOLLOW`, so a symlink never gets here).
+pub fn tls_key_file_decision(
+    is_regular: bool,
+    mode: u32,
+    owner_uid_matches: bool,
+) -> Result<(), &'static str> {
+    if is_regular && owner_uid_matches && mode & 0o777 == 0o600 {
+        Ok(())
+    } else {
+        Err("reject.tls_key_mode")
+    }
+}
+
+/// B1-PAIR (A-TLS-8): the certificate's public key must be the private key's (compared as
+/// SubjectPublicKeyInfo bytes); a pair from two rotations or two hosts is refused.
+pub fn tls_key_pair_decision(spki_matches: bool) -> Result<(), &'static str> {
+    if spki_matches {
+        Ok(())
+    } else {
+        Err("reject.tls_key_cert_mismatch")
+    }
+}
+
+/// The transport an edge listener serves (B-1 P1). There is no TLS-less non-loopback listener
+/// without [`EdgeServe::InsecurePlain`]: [`EdgeServe::check_bind`] runs at every bind.
+#[derive(Clone)]
+pub enum EdgeServe {
+    /// Plain HTTP; refused on a non-loopback bind.
+    Plain,
+    /// Plain HTTP on any bind (`--insecure-plain-http`, L-81 opt-out).
+    InsecurePlain,
+    /// TLS with the edge certificate.
+    #[cfg(feature = "edge-tls")]
+    Tls(EdgeTlsServer),
+}
+
+impl EdgeServe {
+    pub fn is_tls(&self) -> bool {
+        match self {
+            Self::Plain | Self::InsecurePlain => false,
+            #[cfg(feature = "edge-tls")]
+            Self::Tls(_) => true,
+        }
+    }
+
+    /// `https` or `http`, for the start-up line.
+    pub fn scheme(&self) -> &'static str {
+        if self.is_tls() {
+            "https"
+        } else {
+            "http"
+        }
+    }
+
+    /// The certificate's DNS SAN names the `Host` check also accepts (A-TLS-7); none on plain.
+    pub fn san_names(&self) -> &[String] {
+        match self {
+            Self::Plain | Self::InsecurePlain => &[],
+            #[cfg(feature = "edge-tls")]
+            Self::Tls(t) => &t.names,
+        }
+    }
+
+    /// A plugin's transport (`--tls-pem`, `--insecure-plain-http`; A-TLS-3: plugins load PEM,
+    /// never generate). With neither, plain HTTP, which the bind check refuses off loopback.
+    #[cfg(unix)]
+    pub fn from_plugin_flags(
+        tls_pem: Option<&std::path::Path>,
+        insecure_plain_http: bool,
+    ) -> io::Result<Self> {
+        match (tls_pem, insecure_plain_http) {
+            #[cfg(feature = "edge-tls")]
+            (Some(p), _) => EdgeTlsServer::load(p)
+                .map(Self::Tls)
+                .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string())),
+            #[cfg(not(feature = "edge-tls"))]
+            (Some(_), _) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this build has no edge TLS (feature edge-tls)",
+            )),
+            (None, true) => Ok(Self::InsecurePlain),
+            (None, false) => Ok(Self::Plain),
+        }
+    }
+
+    /// [`edge_transport_decision`] for a listener bound at `bound`; the refusal is logged and
+    /// returned as `PermissionDenied` carrying its code.
+    pub fn check_bind(&self, bound: std::net::SocketAddr) -> io::Result<()> {
+        let loopback = bound.ip().to_canonical().is_loopback();
+        let opt_out = matches!(self, Self::InsecurePlain);
+        match edge_transport_decision(loopback, self.is_tls(), opt_out) {
+            Ok(_) => {
+                if opt_out && !loopback {
+                    tracing::warn!(%bound, "plain HTTP on a non-loopback edge: tokens cross the network in clear");
+                }
+                Ok(())
+            }
+            Err(code) => {
+                tracing::error!(code, %bound, "refused a plain-HTTP edge on a non-loopback bind");
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("{code}: plain HTTP on {bound} is refused (not loopback); serve TLS, bind loopback, or pass --insecure-plain-http"),
+                ))
+            }
+        }
+    }
+}
+
+/// The PEM label of the SAN list ParVault keeps beside its certificate and key in one file
+/// (TLS stacks skip unknown PEM sections). `tls show` and the `Host` check read it.
+pub const EDGE_NAMES_PEM_LABEL: &str = "PARVAULT EDGE NAMES";
+
+/// One PEM section, 64 columns, LF line ends.
+pub fn pem_section(label: &str, der: &[u8]) -> String {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut out = format!("-----BEGIN {label}-----\n");
+    for line in b64.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(line).unwrap_or(""));
+        out.push('\n');
+    }
+    out.push_str(&format!("-----END {label}-----\n"));
+    out
+}
+
+/// The SAN list of an edge PEM file ([`EDGE_NAMES_PEM_LABEL`]); empty when it has none (a
+/// certificate the user brought).
+pub fn pem_edge_names(pem: &[u8]) -> Vec<String> {
+    use base64::Engine as _;
+    let text = String::from_utf8_lossy(pem);
+    let begin = format!("-----BEGIN {EDGE_NAMES_PEM_LABEL}-----");
+    let end = format!("-----END {EDGE_NAMES_PEM_LABEL}-----");
+    let Some(start) = text.find(&begin) else {
+        return Vec::new();
+    };
+    let rest = &text[start + begin.len()..];
+    let Some(stop) = rest.find(&end) else {
+        return Vec::new();
+    };
+    let b64: String = rest[..stop].split_whitespace().collect();
+    let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&raw)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Why an edge PEM file was not loaded; `code()` is the logged refusal.
+#[derive(Debug)]
+pub enum EdgeTlsLoadError {
+    /// It could not be opened or read.
+    Io(io::Error),
+    /// Not owner-only (B1-KEY); `code` is [`tls_key_file_decision`]'s.
+    KeyMode {
+        code: &'static str,
+        is_file: bool,
+        uid: u32,
+        mode: u32,
+    },
+    /// The certificate's public key is not the key's (B1-PAIR); `code` is
+    /// [`tls_key_pair_decision`]'s.
+    Mismatch { code: &'static str },
+    /// No certificate, no key, or one rustls refuses.
+    Invalid(String),
+}
+
+impl EdgeTlsLoadError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Io(_) => "reject.tls_pem_unreadable",
+            Self::KeyMode { code, .. } | Self::Mismatch { code } => code,
+            Self::Invalid(_) => "reject.tls_pem_invalid",
+        }
+    }
+
+    #[cfg(feature = "edge-tls")]
+    fn mismatch() -> Self {
+        Self::Mismatch {
+            code: tls_key_pair_decision(false).err().unwrap_or_default(),
+        }
+    }
+
+    #[cfg(all(unix, feature = "edge-tls"))]
+    fn key_mode(is_file: bool, uid: u32, mode: u32) -> Self {
+        let owner = uid == crate::os_sys::geteuid();
+        Self::KeyMode {
+            code: tls_key_file_decision(is_file, mode, owner)
+                .err()
+                .unwrap_or_default(),
+            is_file,
+            uid,
+            mode,
+        }
+    }
+}
+
+impl std::fmt::Display for EdgeTlsLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let code = self.code();
+        match self {
+            Self::Io(e) => write!(f, "{code}: {e}"),
+            Self::KeyMode {
+                is_file, uid, mode, ..
+            } => write!(
+                f,
+                "{code}: the edge key file must be a regular file owned by UID {} with mode 0600 (regular={is_file}, UID {uid}, mode {mode:o})",
+                crate::os_sys::geteuid()
+            ),
+            Self::Mismatch { .. } => {
+                write!(f, "{code}: the certificate does not match the private key")
+            }
+            Self::Invalid(why) => write!(f, "{code}: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for EdgeTlsLoadError {}
+
+/// The edge's TLS server config, loaded from one PEM file holding the certificate (chain) and
+/// its private key (B-1 P1; A-TLS-2: rustls with the ring provider passed in, never
+/// `install_default`, since libp2p's rustls shares the process; A-TLS-9: TLS 1.3 and 1.2).
+#[cfg(feature = "edge-tls")]
+#[derive(Clone)]
+pub struct EdgeTlsServer {
+    config: Arc<rustls::ServerConfig>,
+    names: Arc<[String]>,
+    /// SHA-256 of the leaf's SubjectPublicKeyInfo (`curl --pinnedpubkey sha256//<base64>`).
+    pub spki_sha256: [u8; 32],
+    /// SHA-256 of the leaf's DER (the certificate fingerprint clients display).
+    pub cert_sha256: [u8; 32],
+    /// The leaf, DER.
+    pub leaf_der: Arc<[u8]>,
+}
+
+#[cfg(feature = "edge-tls")]
+impl EdgeTlsServer {
+    /// Loads `path` under the root-key file rule (A-TLS-8: `O_NOFOLLOW`, regular, euid, `0600`).
+    #[cfg(unix)]
+    pub fn load(path: &std::path::Path) -> Result<Self, EdgeTlsLoadError> {
+        use crate::capabilities::{read_owner_only_file, OwnerFileRefusal};
+        let pem = match read_owner_only_file(path) {
+            Ok(p) => p,
+            Err(OwnerFileRefusal::NotOwnerOnly { is_file, uid, mode }) => {
+                return Err(EdgeTlsLoadError::key_mode(is_file, uid, mode));
+            }
+            // `O_NOFOLLOW` on a symlink: not a regular file.
+            Err(OwnerFileRefusal::Open(e)) if e.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(EdgeTlsLoadError::key_mode(false, u32::MAX, 0));
+            }
+            Err(
+                OwnerFileRefusal::Open(e) | OwnerFileRefusal::Stat(e) | OwnerFileRefusal::Read(e),
+            ) => return Err(EdgeTlsLoadError::Io(e)),
+            Err(OwnerFileRefusal::TooLarge) => {
+                return Err(EdgeTlsLoadError::Invalid(
+                    "the PEM file is over 64 KiB".into(),
+                ))
+            }
+        };
+        Self::from_pem(&pem)
+    }
+
+    /// Builds the server from PEM bytes (certificate chain, then any key section; the SAN list
+    /// section is optional). Refuses a key that does not match the leaf (B1-PAIR).
+    pub fn from_pem(pem: &[u8]) -> Result<Self, EdgeTlsLoadError> {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use sha2::{Digest, Sha256};
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem)
+            .collect::<Result<_, _>>()
+            .map_err(|e| EdgeTlsLoadError::Invalid(format!("certificate PEM: {e}")))?;
+        let Some(leaf) = certs.first().cloned() else {
+            return Err(EdgeTlsLoadError::Invalid(
+                "no certificate in the PEM file".into(),
+            ));
+        };
+        let key = PrivateKeyDer::from_pem_slice(pem)
+            .map_err(|e| EdgeTlsLoadError::Invalid(format!("private key PEM: {e}")))?;
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let certified =
+            rustls::sign::CertifiedKey::from_der(certs.clone(), key.clone_key(), &provider)
+                .map_err(|e| match e {
+                    rustls::Error::InconsistentKeys(_) => EdgeTlsLoadError::mismatch(),
+                    other => EdgeTlsLoadError::Invalid(format!("key: {other}")),
+                })?;
+        // `from_der` lets an unknown consistency pass; the edge requires a positive match.
+        tls_key_pair_decision(certified.keys_match().is_ok())
+            .map_err(|_| EdgeTlsLoadError::mismatch())?;
+        let spki = certified
+            .key
+            .public_key()
+            .ok_or_else(EdgeTlsLoadError::mismatch)?;
+        let mut config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+            .map_err(|e| EdgeTlsLoadError::Invalid(format!("protocol versions: {e}")))?
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| match e {
+                rustls::Error::InconsistentKeys(_) => EdgeTlsLoadError::mismatch(),
+                other => EdgeTlsLoadError::Invalid(format!("server config: {other}")),
+            })?;
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Ok(Self {
+            config: Arc::new(config),
+            names: pem_edge_names(pem).into(),
+            spki_sha256: Sha256::digest(spki.as_ref()).into(),
+            cert_sha256: Sha256::digest(leaf.as_ref()).into(),
+            leaf_der: Arc::from(leaf.as_ref()),
+        })
+    }
+
+    /// The SAN list stored with the certificate (DNS names and IP literals).
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+}
+
+/// One TLS connection on the edge (rustls's blocking API, no tokio, L-48). Reads honour the
+/// deadline set through [`EdgeStream::set_read_timeout`] across every socket read, so a client
+/// that drips a TLS record byte by byte cannot stretch a head past its deadline.
+#[cfg(feature = "edge-tls")]
+pub struct TlsEdgeStream {
+    conn: rustls::ServerConnection,
+    sock: TcpStream,
+    deadline: Option<Instant>,
+}
+
+#[cfg(feature = "edge-tls")]
+impl TlsEdgeStream {
+    /// Runs the handshake on `sock` before `deadline`.
+    pub fn accept(
+        config: &Arc<rustls::ServerConfig>,
+        sock: TcpStream,
+        deadline: Instant,
+    ) -> io::Result<Self> {
+        let conn = rustls::ServerConnection::new(Arc::clone(config)).map_err(io::Error::other)?;
+        let mut s = Self {
+            conn,
+            sock,
+            deadline: Some(deadline),
+        };
+        while s.conn.is_handshaking() {
+            s.flush_tls()?;
+            if !s.conn.is_handshaking() {
+                break;
+            }
+            if s.read_tls_once()? == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+        }
+        s.flush_tls()?;
+        Ok(s)
+    }
+
+    fn read_tls_once(&mut self) -> io::Result<usize> {
+        if let Some(d) = self.deadline {
+            let left = d.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            self.sock.set_read_timeout(Some(left))?;
+        }
+        let n = self.conn.read_tls(&mut self.sock)?;
+        if let Err(e) = self.conn.process_new_packets() {
+            let _ = self.flush_tls();
+            return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+        }
+        Ok(n)
+    }
+
+    fn flush_tls(&mut self) -> io::Result<()> {
+        while self.conn.wants_write() {
+            self.conn.write_tls(&mut self.sock)?;
+        }
+        Ok(())
+    }
+
+    /// Sends `close_notify` (best effort).
+    pub fn close(&mut self) {
+        self.conn.send_close_notify();
+        let _ = self.flush_tls();
+    }
+}
+
+#[cfg(feature = "edge-tls")]
+impl Read for TlsEdgeStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match self.conn.reader().read(buf) {
+                Ok(n) => return Ok(n),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+            if self.read_tls_once()? == 0 {
+                return Ok(0);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "edge-tls")]
+impl Write for TlsEdgeStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.conn.writer().write(buf)?;
+        self.flush_tls()?;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.conn.writer().flush()?;
+        self.flush_tls()
+    }
+}
+
+#[cfg(feature = "edge-tls")]
+impl EdgeStream for TlsEdgeStream {
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        self.deadline = timeout.map(|t| Instant::now() + t);
+        Ok(())
+    }
+    fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.sock.peer_addr()
+    }
 }
 
 /// Longest token text accepted from a header (`PARVAULT-MAC-V1:` plus the hex of the largest

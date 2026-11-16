@@ -1,0 +1,40 @@
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -141,33 +141,18 @@
+     }
+ }
+ 
+-/// `v0.5.6` T0 stubs of `up` / `daemon start` (qa-t0 LOW): refused here, before any identity,
+-/// root key, beacon, data-dir lock or socket exists. The track that builds a flag deletes its
+-/// arm (track A the edge TLS flags, B-180 the socket group); the late refusals in
+-/// `edge_tls::ensure_cert` and `GatewayIpcServer::with_socket_group` stay until then.
++/// `up` / `daemon start` usage checks before any side effect: the gateway socket group applies to
++/// the gateway socket only (B-180). The edge TLS flags and the socket group are built (track A,
++/// integration glue G-14 removed their T0 refusals).
+ fn refuse_unbuilt_daemon_flags(
+     edge_tls_flag: bool,
+     socket_group: bool,
+     has_ipc_socket: bool,
+ ) -> anyhow::Result<()> {
+-    // B-180: a usage error comes first (the group applies to the gateway socket only).
++    let _ = edge_tls_flag;
+     if socket_group && !has_ipc_socket {
+         anyhow::bail!("--gateway-socket-group needs --ipc-socket");
+     }
+-    if edge_tls_flag {
+-        return Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt {
+-            track: "A",
+-            entry: "--tls-san / --insecure-plain-http",
+-        })
+-        .into());
+-    }
+-    if socket_group {
+-        return Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt {
+-            track: "A or E (B-180)",
+-            entry: "--gateway-socket-group",
+-        })
+-        .into());
+-    }
+     Ok(())
+ }
+ 

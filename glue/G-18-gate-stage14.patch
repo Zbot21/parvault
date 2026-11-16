@@ -1,0 +1,17 @@
+diff --git a/scripts/docker_acceptance_gate.sh b/scripts/docker_acceptance_gate.sh
+index f60cd74..0424edf 100644
+--- a/scripts/docker_acceptance_gate.sh
++++ b/scripts/docker_acceptance_gate.sh
+@@ -1150,6 +1150,12 @@ docker rm -fv "$VFS_NETEM" >/dev/null 2>&1 || true
+     || { echo "ERROR: stage 12c: the WebDAV leg under netem 15ms/2% failed or exceeded 600 s (exit $VFS_NETEM_RC)"; exit 1; }
+ echo "Mounted MP4 gate verified: FUSE ${VFS_FUSE_RESULT}; WebDAV 206 PASS (plain and under netem)."
+ 
++# --- Stage 14-webdav-tls (v0.5.6 track A; E1 steps 5 and 9) ------------------------------------
++# Read-only WebDAV over TLS from a bridge-mode container: the published-port leg with --tls-san and
++# an rclone copy (scripts/docker_stage_webdav_tls.sh; its own containers, labelled with this run).
++PARVAULT_GATE_RUN_ID="${RUN_ID}" PARVAULT_GATE_STAGE_DIR="$STAGE_DIR" bash scripts/docker_stage_webdav_tls.sh \
++    || { echo "ERROR: stage 14-webdav-tls failed"; exit 1; }
++
+ echo "================================================================================"
+ PARVAULT_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+ echo " PARVAULT v${PARVAULT_VERSION} MULTI-CONTAINER & ROUTER-SOC DOCKER ACCEPTANCE SUMMARY"

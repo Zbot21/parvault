@@ -1066,6 +1066,73 @@ pub fn read_owner_only_file(
     Ok(raw)
 }
 
+/// Writes `bytes` to `path` with mode `mode` by a fsynced temporary file
+/// (`.tmp.<name>.<hex>` beside it, `O_NOFOLLOW`, created new) and one rename, then fsyncs the
+/// directory: a reader sees the old file or the new one, never a part (A-TLS-8, A-146-6).
+#[cfg(unix)]
+pub fn write_file_atomic(path: &std::path::Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?
+        .to_string_lossy()
+        .into_owned();
+    let mut tag = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut tag);
+    let tmp = dir.join(format!(".tmp.{name}.{}", hex::encode(tag)));
+    let res = (|| {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&tmp)?;
+        // The umask may have narrowed the mode; set it exactly.
+        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)?;
+        std::fs::File::open(&dir)?.sync_all()
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// B-180: the gid of `group`, a numeric gid or a name in `/etc/group` (no NSS lookup: the
+/// daemon links no libc resolver for it; a container's `/etc/group` or a number is enough).
+#[cfg(unix)]
+pub fn resolve_group_id(group: &str) -> std::io::Result<u32> {
+    if let Ok(gid) = group.parse::<u32>() {
+        return Ok(gid);
+    }
+    let table = std::fs::read_to_string("/etc/group")?;
+    group_id_in(&table, group).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("reject.socket_group_unknown: no group {group:?} in /etc/group (pass a numeric gid)"),
+        )
+    })
+}
+
+/// The gid of `group` in an `/etc/group` text (`name:password:gid:members`).
+pub fn group_id_in(table: &str, group: &str) -> Option<u32> {
+    table.lines().find_map(|l| {
+        let mut f = l.split(':');
+        let name = f.next()?;
+        let _pw = f.next()?;
+        let gid = f.next()?;
+        (name == group).then(|| gid.trim().parse().ok()).flatten()
+    })
+}
+
 /// Mints a gateway token for this process's effective UID from the root key file at `key_file`
 /// (B-16, A-16 C1). The file must pass [`read_owner_only_file`]; the key bytes are zeroized
 /// after the mint.

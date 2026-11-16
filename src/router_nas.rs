@@ -12,9 +12,10 @@
 use crate::capabilities::CapabilityMacaroon;
 use crate::gateway::ipc::GatewayBus;
 use crate::http_edge::{
-    presented_token, read_request_head, spawn_edge_conn, status_auth_decision, status_auth_facts,
-    status_host_allowed, EdgeSlots, EdgeStream, EdgeVerifier, PresentedToken, RequestHead,
-    StatusAuthFacts, StatusTransport, RESP_403, RESP_502, RESP_503, STATUS_401,
+    edge_host_allowed, presented_token, read_request_head_until, spawn_edge_conn_served,
+    status_auth_decision, status_auth_facts, EdgeServe, EdgeSlots, EdgeStream, EdgeVerifier,
+    PresentedToken, RequestHead, StatusAuthFacts, StatusTransport, RESP_403, RESP_502, RESP_503,
+    STATUS_401,
 };
 use crate::traversal_metrics::TraversalCounters;
 use std::io::{self, Write};
@@ -75,6 +76,8 @@ pub struct StatusEdgeExtras {
 struct EdgeView<'a> {
     counters: Option<&'a TraversalCounters>,
     config_digest: Option<&'a str>,
+    /// The edge certificate's SAN names (empty on plain HTTP), for the `Host` check.
+    names: &'a [String],
 }
 
 /// The metrics route (`docs/METRICS.md`).
@@ -121,12 +124,26 @@ pub struct RouterNasStatusServer;
 
 impl RouterNasStatusServer {
     /// Binds `bind_addr` (`:0` for an ephemeral port) and serves the snapshot from `bus` to
-    /// requests whose token `verifier` accepts. No default address: no flag, no listener.
+    /// requests whose token `verifier` accepts. No default address: no flag, no listener. Plain
+    /// HTTP on any bind, as before `v0.5.6`; [`Self::bind_and_spawn_served`] refuses a
+    /// non-loopback plain bind (L-81).
     pub fn bind_and_spawn(
         bind_addr: SocketAddr,
         bus: GatewayBus,
         verifier: EdgeVerifier,
         extras: StatusEdgeExtras,
+    ) -> io::Result<(SocketAddr, RouterNasServerHandle)> {
+        Self::bind_and_spawn_served(bind_addr, bus, verifier, extras, EdgeServe::InsecurePlain)
+    }
+
+    /// [`Self::bind_and_spawn`] over `serve` (B-1 P1: TLS, or plain on loopback or with the
+    /// opt-out). The `Host` check also accepts the certificate's SAN names (A-TLS-7).
+    pub fn bind_and_spawn_served(
+        bind_addr: SocketAddr,
+        bus: GatewayBus,
+        verifier: EdgeVerifier,
+        extras: StatusEdgeExtras,
+        serve: EdgeServe,
     ) -> io::Result<(SocketAddr, RouterNasServerHandle)> {
         let StatusEdgeExtras {
             counters,
@@ -136,6 +153,8 @@ impl RouterNasStatusServer {
         let listener = TcpListener::bind(bind_addr)?;
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
+        serve.check_bind(local_addr)?;
+        let names: Arc<[String]> = Arc::from(serve.san_names());
         let shutdown = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&shutdown);
         let slots = Arc::new(EdgeSlots::new(STATUS_MAX_CONNECTIONS));
@@ -148,24 +167,33 @@ impl RouterNasStatusServer {
                             if stream.set_nonblocking(false).is_err() {
                                 continue;
                             }
-                            let (bus, verifier, counters, digest) = (
+                            let (bus, verifier, counters, digest, names) = (
                                 bus.clone(),
                                 verifier.clone(),
                                 counters.clone(),
                                 config_digest.clone(),
+                                Arc::clone(&names),
                             );
-                            spawn_edge_conn(stream, &slots, "parvault-status-http", move |s| {
-                                let _ = handle_status_conn(
-                                    s,
-                                    &bus,
-                                    &verifier,
-                                    local_addr,
-                                    EdgeView {
-                                        counters: counters.as_deref(),
-                                        config_digest: digest.as_deref(),
-                                    },
-                                );
-                            });
+                            spawn_edge_conn_served(
+                                stream,
+                                &slots,
+                                "parvault-status-http",
+                                &serve,
+                                move |s, deadline| {
+                                    let _ = handle_status_conn(
+                                        s,
+                                        &bus,
+                                        &verifier,
+                                        local_addr,
+                                        EdgeView {
+                                            counters: counters.as_deref(),
+                                            config_digest: digest.as_deref(),
+                                            names: &names,
+                                        },
+                                        deadline,
+                                    );
+                                },
+                            );
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(20));
@@ -215,8 +243,13 @@ fn handle_status_conn(
     verifier: &EdgeVerifier,
     bound: SocketAddr,
     view: EdgeView<'_>,
+    deadline: std::time::Instant,
 ) -> io::Result<()> {
     let counters = view.counters;
+    // The head is read under the connection's pre-auth deadline (A-TLS-5: on TLS the handshake
+    // spent part of it).
+    let read_request_head =
+        |s: &mut dyn EdgeStream| read_request_head_until(s, Vec::new(), deadline);
     let Some(head) = read_request_head(stream)? else {
         return Ok(());
     };
@@ -252,7 +285,7 @@ fn handle_status_conn(
         Some(&verify),
         now_unix_ms(),
         StatusTransport::Tcp,
-        status_host_allowed(host, bound),
+        edge_host_allowed(host, bound, view.names),
         true,
     );
     if matches!(presented, PresentedToken::Malformed) {
@@ -308,9 +341,24 @@ fn handle_status_conn(
                 send_response(stream, "200 OK", "application/json", &json)
             }
             Err(e) => {
+                // QA of T0: a refusal by code is answered with that code, not a bare 503: 501
+                // while the gateway has no live status yet (`reject.not_built_yet`), 503 else.
+                let text = e.to_string();
+                let code = reject_code_in(&text);
                 tracing::warn!(peer = %peer, error = %e, "live status not served by the gateway");
-                stream.write_all(RESP_503)?;
-                stream.flush()
+                let status = if code == Some(crate::seam::NOT_BUILT_YET) {
+                    "501 Not Implemented"
+                } else {
+                    "503 Service Unavailable"
+                };
+                let body =
+                    serde_json::json!({ "error": code.unwrap_or("reject.status_unavailable") });
+                send_response(
+                    stream,
+                    status,
+                    "application/json",
+                    body.to_string().as_bytes(),
+                )
             }
         };
     }
@@ -359,6 +407,16 @@ fn handle_status_conn(
             b"{\"error\":\"not found\"}\n",
         ),
     }
+}
+
+/// The first `reject.<code>` token in an error text (codes are `[a-z0-9_.]`).
+fn reject_code_in(text: &str) -> Option<&str> {
+    let start = text.find("reject.")?;
+    let rest = &text[start..];
+    let end = rest
+        .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.'))
+        .unwrap_or(rest.len());
+    Some(rest[..end].trim_end_matches('.'))
 }
 
 /// QA item 3: no scripts, no external loads, no framing; the dashboard's inline `<style>` only.

@@ -40,6 +40,15 @@ struct StatusCli {
     /// File holding the pinned token (mode 600; refused if group or others can read it).
     #[arg(long, value_name = "PATH")]
     macaroon_file: Option<PathBuf>,
+
+    /// Serve TLS with this PEM file: certificate and key together, mode 0600. Needed on a
+    /// non-loopback `--listen` (L-81).
+    #[arg(long, value_name = "FILE")]
+    tls_pem: Option<PathBuf>,
+
+    /// Serve plain HTTP on a non-loopback `--listen`: the token crosses the network in clear.
+    #[arg(long, conflicts_with = "tls_pem")]
+    insecure_plain_http: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -67,15 +76,21 @@ fn main() -> anyhow::Result<()> {
         )
     })?;
 
-    let (bound, handle) = parvault::router_nas::RouterNasStatusServer::bind_and_spawn(
+    let serve = parvault::http_edge::EdgeServe::from_plugin_flags(
+        cli.tls_pem.as_deref(),
+        cli.insecure_plain_http,
+    )?;
+    let scheme = serve.scheme();
+    let (bound, handle) = parvault::router_nas::RouterNasStatusServer::bind_and_spawn_served(
         cli.listen,
         parvault::gateway::ipc::GatewayBus::unix_socket(&cli.socket),
         parvault::http_edge::EdgeVerifier::PinnedParent(pinned),
         // The sidecar has no traversal counters (`/metrics` is 404 after auth) and no digest.
         parvault::router_nas::StatusEdgeExtras::default(),
+        serve,
     )?;
     println!(
-        "[parvault-status] Status Server listening on http://{bound} (gateway={})",
+        "[parvault-status] Status Server listening on {scheme}://{bound} (gateway={})",
         cli.socket.display()
     );
     handle.wait();
