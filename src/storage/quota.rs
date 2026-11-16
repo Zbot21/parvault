@@ -324,19 +324,28 @@ pub const fn held_shard_decision(held: u64, max: u64) -> Result<(), &'static str
 
 /// The memory limit this process runs under: the lowest cgroup v2 `memory.max` on its path
 /// (`/proc/self/cgroup`, walking up to the root, as the kernel applies every ancestor's limit),
-/// else the cgroup v1 `memory.limit_in_bytes`, else `MemTotal` from `/proc/meminfo`. Returns
-/// the bytes and whether a cgroup limit applied.
+/// else the cgroup v1 `memory.limit_in_bytes` (its directory resolved through
+/// `/proc/self/mountinfo`, [`cgroup_limit`]), else `MemTotal` from `/proc/meminfo`. Returns the
+/// bytes and whether a cgroup limit applied.
 pub fn read_memory_limit() -> Option<(u64, bool)> {
-    let ram = std::fs::read_to_string("/proc/meminfo").ok().and_then(|t| {
-        t.lines()
-            .find_map(|l| l.strip_prefix("MemTotal:"))
-            .and_then(|v| v.trim().strip_suffix("kB"))
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map(|kb| kb.saturating_mul(1024))
-    });
-    let cgroup = std::fs::read_to_string("/proc/self/cgroup")
+    read_memory_limit_at(std::path::Path::new("/"))
+}
+
+/// [`read_memory_limit`] under `root` (`/` in production; a fake tree in tests).
+pub fn read_memory_limit_at(root: &std::path::Path) -> Option<(u64, bool)> {
+    let ram = std::fs::read_to_string(root.join("proc/meminfo"))
         .ok()
-        .and_then(|t| cgroup_limit(&t, std::path::Path::new("/sys/fs/cgroup")));
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("MemTotal:"))
+                .and_then(|v| v.trim().strip_suffix("kB"))
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(|kb| kb.saturating_mul(1024))
+        });
+    let mountinfo = std::fs::read_to_string(root.join("proc/self/mountinfo")).unwrap_or_default();
+    let cgroup = std::fs::read_to_string(root.join("proc/self/cgroup"))
+        .ok()
+        .and_then(|t| cgroup_limit(&t, &mountinfo, root));
     match (cgroup, ram) {
         (Some(c), Some(r)) if c < r => Some((c, true)),
         (Some(c), None) => Some((c, true)),
@@ -345,37 +354,137 @@ pub fn read_memory_limit() -> Option<(u64, bool)> {
     }
 }
 
-/// The lowest memory limit on this process's cgroup path, given `/proc/self/cgroup` text and
-/// the cgroup mount root: v2 (`0::/path`, every `memory.max` from the leaf up) or v1 (the
-/// `memory` controller's `memory.limit_in_bytes`). `max` and v1's near-`u64::MAX` mean none.
-pub fn cgroup_limit(proc_self_cgroup: &str, root: &std::path::Path) -> Option<u64> {
-    let read = |p: std::path::PathBuf| -> Option<u64> {
-        std::fs::read_to_string(p)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|v| *v < (1u64 << 60))
-    };
+/// A cgroup limit file's value; `max` (v2) and v1's unlimited (`PAGE_COUNTER_MAX` pages, about
+/// `i64::MAX` rounded down to the page size: 9223372036854771712 with 4 KiB pages) are none.
+fn cgroup_limit_value(p: &std::path::Path) -> Option<u64> {
+    std::fs::read_to_string(p)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v < (1u64 << 60))
+}
+
+/// The lowest `file` limit from `dir` up to `top` (inclusive), every ancestor's limit applying
+/// to a child.
+fn lowest_limit_up_to(
+    mut dir: std::path::PathBuf,
+    top: &std::path::Path,
+    file: &str,
+) -> Option<u64> {
+    let mut lowest: Option<u64> = None;
+    loop {
+        if let Some(v) = cgroup_limit_value(&dir.join(file)) {
+            lowest = Some(lowest.map_or(v, |l| l.min(v)));
+        }
+        if dir == top || !dir.pop() || !dir.starts_with(top) {
+            break;
+        }
+    }
+    lowest
+}
+
+/// A mountinfo path field with its octal escapes (`\040` for a space) decoded.
+fn mountinfo_unescape(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\'
+            && i + 3 < b.len()
+            && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c))
+        {
+            out.push((b[i + 1] - b'0') * 64 + (b[i + 2] - b'0') * 8 + (b[i + 3] - b'0'));
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The cgroup v1 `memory` hierarchy mounts in `/proc/self/mountinfo` text: (root of the mount
+/// within the hierarchy, field 4; mount point, field 5).
+fn v1_memory_mounts(mountinfo: &str) -> Vec<(String, String)> {
+    mountinfo
+        .lines()
+        .filter_map(|l| {
+            let (pre, post) = l.split_once(" - ")?;
+            let pre: Vec<&str> = pre.split(' ').collect();
+            let mut post = post.split(' ');
+            let (fstype, _source, opts) = (post.next()?, post.next()?, post.next()?);
+            (fstype == "cgroup" && pre.len() >= 5 && opts.split(',').any(|o| o == "memory"))
+                .then(|| (mountinfo_unescape(pre[3]), mountinfo_unescape(pre[4])))
+        })
+        .collect()
+}
+
+/// The directory of cgroup `path` under a v1 mount of hierarchy root `mount_root` at
+/// `mount_point`, as the JDK resolves it: root `/` joins the whole path; a path under the mount
+/// root joins the rest (the container's own cgroup, mounted at the mount point, when the path
+/// is the root); otherwise none.
+fn v1_cgroup_dir(path: &str, mount_root: &str, mount_point: &str) -> Option<String> {
+    let path = path.trim_end_matches('/');
+    let mount_root = mount_root.trim_end_matches('/');
+    if mount_root.is_empty() {
+        return Some(format!("{mount_point}{path}"));
+    }
+    let rest = path.strip_prefix(mount_root)?;
+    (rest.is_empty() || rest.starts_with('/')).then(|| format!("{mount_point}{rest}"))
+}
+
+/// The lowest memory limit on this process's cgroup path, given `/proc/self/cgroup` and
+/// `/proc/self/mountinfo` text and the filesystem root `root` (`/` in production):
+///
+/// - v2 (`0::/path`): every `memory.max` from the leaf up to `/sys/fs/cgroup`.
+/// - v1 (the `memory` controller): `memory.limit_in_bytes` in the process's directory, resolved
+///   through mountinfo (mount root, field 4; mount point, field 5). Inside a Docker container
+///   without a cgroup namespace, `/proc/self/cgroup` names `/docker/<id>` but that cgroup is
+///   mounted at `/sys/fs/cgroup/memory` itself (mount root `/docker/<id>`), so joining the two
+///   names a directory that does not exist. Every limit from the resolved directory up to the
+///   mount point counts (the lowest wins), so a joined path that does not exist still reaches
+///   the mount point's own `memory.limit_in_bytes`. Without a usable mountinfo entry, the mount
+///   point is `/sys/fs/cgroup/memory` with root `/`.
+///
+/// `max` and v1's unlimited value mean none.
+pub fn cgroup_limit(
+    proc_self_cgroup: &str,
+    mountinfo: &str,
+    root: &std::path::Path,
+) -> Option<u64> {
+    let under_root = |p: &str| root.join(p.trim_start_matches('/'));
+    let v2_root = under_root("/sys/fs/cgroup");
     for line in proc_self_cgroup.lines() {
         let mut parts = line.splitn(3, ':');
         let (_, controllers, path) = (parts.next()?, parts.next()?, parts.next()?);
-        let rel = path.trim_start_matches('/');
         if controllers.is_empty() {
-            let mut dir = root.join(rel);
-            let mut lowest: Option<u64> = None;
-            loop {
-                if let Some(v) = read(dir.join("memory.max")) {
-                    lowest = Some(lowest.map_or(v, |l| l.min(v)));
-                }
-                if dir == root || !dir.pop() || !dir.starts_with(root) {
-                    break;
-                }
-            }
-            if lowest.is_some() {
-                return lowest;
+            let dir = v2_root.join(path.trim_start_matches('/'));
+            if let Some(v) = lowest_limit_up_to(dir, &v2_root, "memory.max") {
+                return Some(v);
             }
         } else if controllers.split(',').any(|c| c == "memory") {
-            if let Some(v) = read(root.join("memory").join(rel).join("memory.limit_in_bytes")) {
-                return Some(v);
+            let mut mounts = v1_memory_mounts(mountinfo);
+            // A mount whose root holds the path first (the longest such root), then the others.
+            mounts.sort_by_key(|(r, _)| {
+                std::cmp::Reverse(
+                    v1_cgroup_dir(path, r, "")
+                        .map(|_| r.trim_end_matches('/').len() + 1)
+                        .unwrap_or(0),
+                )
+            });
+            if mounts.is_empty() {
+                mounts.push(("/".to_string(), "/sys/fs/cgroup/memory".to_string()));
+            }
+            for (mount_root, mount_point) in &mounts {
+                let top = under_root(mount_point);
+                let dir = match v1_cgroup_dir(path, mount_root, mount_point) {
+                    Some(d) => under_root(&d),
+                    // The path is outside this mount's root: walk the whole path under the
+                    // mount point, which ends at the mount point's own limit.
+                    None => top.join(path.trim_start_matches('/')),
+                };
+                if let Some(v) = lowest_limit_up_to(dir, &top, "memory.limit_in_bytes") {
+                    return Some(v);
+                }
             }
         }
     }
@@ -1205,25 +1314,183 @@ mod tests {
     fn b152_cgroup_limit_reads_the_path_the_process_runs_under() {
         let root = tempfile::tempdir().unwrap();
         let r = root.path();
-        std::fs::create_dir_all(r.join("a/b/c")).unwrap();
-        std::fs::write(r.join("a/memory.max"), "268435456\n").unwrap();
-        std::fs::write(r.join("a/b/memory.max"), "max\n").unwrap();
-        std::fs::write(r.join("a/b/c/memory.max"), "67108864\n").unwrap();
-        assert_eq!(cgroup_limit("0::/a/b/c\n", r), Some(64 << 20));
-        assert_eq!(cgroup_limit("0::/a/b\n", r), Some(256 << 20));
-        assert_eq!(cgroup_limit("0::/\n", r), None);
-        std::fs::create_dir_all(r.join("memory/svc")).unwrap();
-        std::fs::write(r.join("memory/svc/memory.limit_in_bytes"), "134217728").unwrap();
+        let cg = r.join("sys/fs/cgroup");
+        std::fs::create_dir_all(cg.join("a/b/c")).unwrap();
+        std::fs::write(cg.join("a/memory.max"), "268435456\n").unwrap();
+        std::fs::write(cg.join("a/b/memory.max"), "max\n").unwrap();
+        std::fs::write(cg.join("a/b/c/memory.max"), "67108864\n").unwrap();
+        assert_eq!(cgroup_limit("0::/a/b/c\n", "", r), Some(64 << 20));
+        assert_eq!(cgroup_limit("0::/a/b\n", "", r), Some(256 << 20));
+        assert_eq!(cgroup_limit("0::/\n", "", r), None);
+        std::fs::create_dir_all(cg.join("memory/svc")).unwrap();
+        std::fs::write(cg.join("memory/svc/memory.limit_in_bytes"), "134217728").unwrap();
         assert_eq!(
-            cgroup_limit("4:cpu:/x\n3:memory:/svc\n", r),
+            cgroup_limit("4:cpu:/x\n3:memory:/svc\n", "", r),
             Some(128 << 20)
         );
         std::fs::write(
-            r.join("memory/svc/memory.limit_in_bytes"),
+            cg.join("memory/svc/memory.limit_in_bytes"),
             "9223372036854771712",
         )
         .unwrap();
-        assert_eq!(cgroup_limit("3:memory:/svc\n", r), None);
+        assert_eq!(cgroup_limit("3:memory:/svc\n", "", r), None);
+    }
+
+    /// QA D2: mountinfo paths decode octal escapes; only `cgroup` mounts with the `memory`
+    /// option count; the resolved directory follows the JDK's rule.
+    #[test]
+    fn qa056_d2_mountinfo_parsing_and_dir_rule() {
+        let mi = "1 0 0:1 / /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu\n\
+                  2 0 0:2 /docker/x /sys/fs/cgroup/mem\\040ory rw shared:3 - cgroup cgroup rw,memory\n\
+                  3 0 0:3 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n";
+        assert_eq!(
+            v1_memory_mounts(mi),
+            vec![(
+                "/docker/x".to_string(),
+                "/sys/fs/cgroup/mem ory".to_string()
+            )]
+        );
+        assert_eq!(v1_cgroup_dir("/svc", "/", "/m").as_deref(), Some("/m/svc"));
+        assert_eq!(
+            v1_cgroup_dir("/docker/x", "/docker/x", "/m").as_deref(),
+            Some("/m")
+        );
+        assert_eq!(
+            v1_cgroup_dir("/docker/x/y", "/docker/x", "/m").as_deref(),
+            Some("/m/y")
+        );
+        assert_eq!(v1_cgroup_dir("/docker/xy", "/docker/x", "/m"), None);
+        assert_eq!(v1_cgroup_dir("/other", "/docker/x", "/m"), None);
+    }
+
+    /// A fake `/` for [`read_memory_limit_at`]: 8 GiB of RAM, `cgroup` as `/proc/self/cgroup`,
+    /// `mountinfo` as `/proc/self/mountinfo`, and `files` (path under `/`, contents).
+    fn fake_root(cgroup: &str, mountinfo: &str, files: &[(&str, &str)]) -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        std::fs::create_dir_all(r.join("proc/self")).unwrap();
+        std::fs::create_dir_all(r.join("sys/fs/cgroup")).unwrap();
+        std::fs::write(r.join("proc/meminfo"), "MemTotal:        8388608 kB\n").unwrap();
+        std::fs::write(r.join("proc/self/cgroup"), cgroup).unwrap();
+        std::fs::write(r.join("proc/self/mountinfo"), mountinfo).unwrap();
+        for (p, v) in files {
+            let p = r.join(p);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, v).unwrap();
+        }
+        t
+    }
+
+    const GIB8: u64 = 8 << 30;
+    const V1_UNLIMITED: &str = "9223372036854771712\n";
+    const DOCKER_ID: &str = "4f1d0c2b9e8a";
+
+    /// QA D2: cgroup v1 inside a Docker container without a cgroup namespace (a Synology DSM
+    /// host): `/proc/self/cgroup` names `/docker/<id>`, but Docker mounts that cgroup itself at
+    /// `/sys/fs/cgroup/memory` (mountinfo root `/docker/<id>`). The limit is the container's
+    /// 64 MiB, not host RAM.
+    #[test]
+    fn qa056_d2_cgroup_v1_docker_container_reads_the_container_limit() {
+        let cg = format!(
+            "12:pids:/docker/{DOCKER_ID}\n4:memory:/docker/{DOCKER_ID}\n1:name=systemd:/docker/{DOCKER_ID}\n"
+        );
+        let mi = format!(
+            "700 600 0:50 / / rw,relatime - overlay overlay rw\n\
+             710 709 0:22 /docker/{DOCKER_ID} /sys/fs/cgroup/cpu,cpuacct ro,nosuid,nodev,noexec,relatime - cgroup cgroup rw,cpu,cpuacct\n\
+             711 709 0:23 /docker/{DOCKER_ID} /sys/fs/cgroup/memory ro,nosuid,nodev,noexec,relatime - cgroup cgroup rw,memory\n"
+        );
+        let t = fake_root(
+            &cg,
+            &mi,
+            &[
+                ("sys/fs/cgroup/memory/memory.limit_in_bytes", "67108864\n"),
+                ("sys/fs/cgroup/cpu,cpuacct/cpu.shares", "1024\n"),
+            ],
+        );
+        assert_eq!(read_memory_limit_at(t.path()), Some((64 << 20, true)));
+        // The held-shard bound then follows the container, not the 8 GiB host.
+        let (share, floor, ceiling) =
+            held_shard_profile(crate::profile::HardwareProfile::HomelabNas);
+        let b = held_shard_bound_from(Some(64 << 20), true, share, floor, ceiling, None);
+        let host = held_shard_bound_from(Some(GIB8), false, share, floor, ceiling, None);
+        assert_eq!(b.source, HeldShardBoundSource::Cgroup);
+        assert!(b.max < host.max, "{} vs {}", b.max, host.max);
+    }
+
+    /// QA D2: the same container when mountinfo is unreadable or names root `/`: walking up from
+    /// the joined path reaches the mount point's own `memory.limit_in_bytes`.
+    #[test]
+    fn qa056_d2_cgroup_v1_docker_falls_back_to_the_mount_point() {
+        let cg = format!("4:memory:/docker/{DOCKER_ID}\n");
+        let files = [("sys/fs/cgroup/memory/memory.limit_in_bytes", "67108864\n")];
+        let t = fake_root(&cg, "", &files);
+        assert_eq!(read_memory_limit_at(t.path()), Some((64 << 20, true)));
+        let mi = "711 709 0:23 / /sys/fs/cgroup/memory ro,relatime - cgroup cgroup rw,memory\n";
+        let t = fake_root(&cg, mi, &files);
+        assert_eq!(read_memory_limit_at(t.path()), Some((64 << 20, true)));
+    }
+
+    /// QA D2: v1 on the host (root `/` mounted at `/sys/fs/cgroup/memory`): the process's own
+    /// directory; v1's unlimited value (`PAGE_COUNTER_MAX` pages) is no limit.
+    #[test]
+    fn qa056_d2_cgroup_v1_host_and_unlimited() {
+        let cg = "4:cpu:/x\n3:memory:/svc\n";
+        let mi = "30 25 0:27 / /sys/fs/cgroup/memory rw,relatime - cgroup cgroup rw,memory\n";
+        let t = fake_root(
+            cg,
+            mi,
+            &[
+                ("sys/fs/cgroup/memory/memory.limit_in_bytes", V1_UNLIMITED),
+                (
+                    "sys/fs/cgroup/memory/svc/memory.limit_in_bytes",
+                    "134217728\n",
+                ),
+            ],
+        );
+        assert_eq!(read_memory_limit_at(t.path()), Some((128 << 20, true)));
+        let t = fake_root(
+            cg,
+            mi,
+            &[
+                ("sys/fs/cgroup/memory/memory.limit_in_bytes", V1_UNLIMITED),
+                (
+                    "sys/fs/cgroup/memory/svc/memory.limit_in_bytes",
+                    V1_UNLIMITED,
+                ),
+            ],
+        );
+        assert_eq!(read_memory_limit_at(t.path()), Some((GIB8, false)));
+        // A container with no `-m`: v1 unlimited at its mount point.
+        let cg = format!("4:memory:/docker/{DOCKER_ID}\n");
+        let mi = format!(
+            "711 709 0:23 /docker/{DOCKER_ID} /sys/fs/cgroup/memory ro - cgroup cgroup rw,memory\n"
+        );
+        let t = fake_root(
+            &cg,
+            &mi,
+            &[("sys/fs/cgroup/memory/memory.limit_in_bytes", V1_UNLIMITED)],
+        );
+        assert_eq!(read_memory_limit_at(t.path()), Some((GIB8, false)));
+    }
+
+    /// QA D2: v2 unchanged: a container (private namespace, `0::/`) reads the mount root; a host
+    /// process reads the lowest `memory.max` on its path; no cgroup at all is RAM.
+    #[test]
+    fn qa056_d2_cgroup_v2_container_host_and_none() {
+        let mi = "35 24 0:30 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n";
+        let t = fake_root("0::/\n", mi, &[("sys/fs/cgroup/memory.max", "67108864\n")]);
+        assert_eq!(read_memory_limit_at(t.path()), Some((64 << 20, true)));
+        let t = fake_root(
+            "0::/system.slice/pv.service\n",
+            mi,
+            &[
+                ("sys/fs/cgroup/system.slice/memory.max", "268435456\n"),
+                ("sys/fs/cgroup/system.slice/pv.service/memory.max", "max\n"),
+            ],
+        );
+        assert_eq!(read_memory_limit_at(t.path()), Some((256 << 20, true)));
+        let t = fake_root("", "", &[]);
+        assert_eq!(read_memory_limit_at(t.path()), Some((GIB8, false)));
     }
 
     /// arch152b 3.4: the bound refuses a new shard at the count, in `quota_decision`.
