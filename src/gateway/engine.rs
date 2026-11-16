@@ -700,14 +700,21 @@ mod unix_engine {
         }
 
         /// `QueryLiveStatus` (`v0.5.6`, V1): the same decision as [`Self::query_status`], then
-        /// [`crate::live_status::snapshot`].
+        /// [`crate::live_status::snapshot_with`] with the block store's shard facts (B-148,
+        /// glue G-5: `BlockStore::shards_held` and the quota's held-shard bound).
         pub fn query_live_status(
             &self,
             macaroon: Option<&CapabilityMacaroon>,
             peer_uid: Option<u32>,
         ) -> anyhow::Result<crate::live_status::LiveStatusSnapshot> {
             self.query_status(macaroon, peer_uid)?;
-            Ok(crate::live_status::snapshot()?)
+            let bound = self.block_store.held_shard_bound();
+            let facts = crate::live_status::ShardFacts {
+                shards_held: self.block_store.shards_held(),
+                held_shard_bound: bound.map(|(max, _)| max),
+                held_shard_bound_source: bound.map(|(_, s)| s.to_string()).unwrap_or_default(),
+            };
+            Ok(crate::live_status::snapshot_with(&facts)?)
         }
 
         /// Returns `true` iff `StorePayload` requires `F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW` seals.

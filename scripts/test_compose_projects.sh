@@ -13,6 +13,9 @@
 #                                      the documented order (the main project's `ring-restore`
 #                                      service before the daemon's first start): same ring and
 #                                      node key; the same restore after a first start is refused
+#   deploy/synology/compose.yaml       older versions (T5): with `up --folder`, the run-once
+#     restore-version                  `restore-version` service restores a retained version beside
+#                                      the running daemon; a dropped version is refused
 # Each run uses its own project and volume names (<prefix>-<pid>-<n>) and loopback ports, adds
 # --no-lan-discovery so it never meets a real ring, and removes everything with `down -v`.
 # Usage: scripts/test_compose_projects.sh [image tag]   (default parvault:<Cargo.toml version>-dev,
@@ -39,6 +42,9 @@ cleanup() {
   # the bundle is owned by 65532: remove it from inside a container
   if [[ -d "$WORK/rbak" ]]; then
     docker run --rm -v "$WORK/rbak:/b" --entrypoint sh "$BB" -c 'rm -f /b/*' >/dev/null 2>&1 || true
+  fi
+  if [[ -d "$WORK/restore" ]]; then   # restored files are owned by 65532 too
+    docker run --rm -v "$WORK/restore:/r" --entrypoint sh "$BB" -c 'rm -rf /r/*' >/dev/null 2>&1 || true
   fi
   for f in "$WORK"/p*.yaml; do
     [[ -e "$f" ]] && { docker compose -f "$f" down -v --remove-orphans >/dev/null 2>&1 || true; }
@@ -100,6 +106,37 @@ s = s.replace('BUNDLE_FILE_NAME', bundle).replace('RING_ID_64_HEX', ring).replac
 if re.search(r'^(    # depends_on:|  # ring-restore:|  # parvault-secrets:)', s, re.M) or 'condition: service_completed_successfully' not in s:
     sys.exit('enable_restore: the compose file no longer has the documented commented blocks')
 open(path, 'w').write(s)
+EOF
+}
+# with_folder <file> <host dir>: the daemon backs up <host dir> (`up --folder /watched`, 2 s).
+with_folder() {
+  python3 -I - "$1" "$2" <<'EOF'
+import sys
+path, src = sys.argv[1:]
+s = open(path).read()
+a = '"up", "--init-if-absent",'
+b = '\n      - parvault-data:/var/lib/parvault\n'
+if s.count(a) != 1 or s.count(b) != 1:
+    sys.exit('with_folder: the compose file no longer has one daemon command and data volume')
+s = s.replace(a, a + ' "--folder", "/watched", "--interval-secs", "2",')
+s = s.replace(b, b + '      - %s:/watched:ro\n' % src)
+open(path, 'w').write(s)
+EOF
+}
+# enable_restore_version <file> <version> <out dir>: uncomment the documented restore-version
+# service (T5).
+enable_restore_version() {
+  python3 -I - "$@" <<'EOF'
+import re, sys
+path, version, out = sys.argv[1:]
+s = open(path).read()
+def on(m):
+    return re.sub(r'^  # ?', '  ', m.group(0), flags=re.M)
+s2 = re.sub(r'^  # restore-version:\n(?:  #   .*\n)+', on, s, flags=re.M)
+if s2 == s or 'VERSION_NUMBER' not in s2:
+    sys.exit('enable_restore_version: the compose file no longer has the documented commented block')
+s2 = s2.replace('VERSION_NUMBER', version).replace('/volume1/parvault-restore', out)
+open(path, 'w').write(s2)
 EOF
 }
 up() { docker compose -f "$1" up -d >"$WORK/up.log" 2>&1; }
@@ -234,7 +271,7 @@ ok "passphrase project: installed 65532 0600 in its own volume"
 mkdir -m 0777 "$WORK/rbak"
 doc_project parvault-ring-backup "$WORK/prbak.yaml" "name: parvault-ring-backup=name: $ID-rbak" \
   "name: parvault-data=name: $ID-6-data" "name: parvault-secrets=name: $ID-sec" \
-  "/volume1/parvault-backup=$WORK/rbak" "image: parvault:0.5.5-dev=image: $TAG"
+  "/volume1/parvault-backup=$WORK/rbak" "image: parvault:0.5.6-dev=image: $TAG"
 if run_once "$WORK/prbak.yaml" ring-backup; then fail "ring backup ran beside the daemon"; fi
 logs "$WORK/prbak.yaml" ring-backup | grep -q 'reject.datadir_locked' || fail "backup beside the daemon said: $(logs "$WORK/prbak.yaml" ring-backup)"
 ok "ring backup with the daemon running: reject.datadir_locked"
@@ -275,4 +312,41 @@ up "$M2" || fail "restored node, restore commented out: $(tail -3 "$WORK/up.log"
 wait_healthy "$M2"
 [[ "$(ring_of 8)" == "$GB" ]] || fail "restored node lost ring $GB"
 ok "documented restore: ring $GB, node $KA, healthy; healthy again with the restore commented out"
+
+# 5. Older versions (T5, glue G-24): the daemon backs up a folder; the run-once restore-version
+# service restores a retained version beside the running daemon, and refuses a dropped one.
+SNAPF=/var/lib/parvault/appliance_folder_snapshot.manifest.bin
+wait_versions() { # <n> <list>: until folder-status on node n retains exactly "(<list>)"
+  for _ in $(seq 1 60); do
+    client "$1" folder-status --snapshot "$SNAPF" | grep -q "^Versions Retained  : .* ($2)\$" && return 0
+    sleep 2
+  done
+  fail "node $1 never retained versions ($2): $(client "$1" folder-status --snapshot "$SNAPF")"
+}
+mkdir -m 0777 "$WORK/watched" "$WORK/restore"
+printf 'version one\n' > "$WORK/watched/a.txt"
+V=$(variant deploy/synology/compose.yaml 9 $((PB + 8)))
+with_folder "$V" "$WORK/watched"
+up "$V" || fail "folder backup start: $(tail -3 "$WORK/up.log")"
+wait_healthy "$V"
+wait_versions 9 "1"
+printf 'version two\n' > "$WORK/watched/a.txt"
+wait_versions 9 "1, 2"
+enable_restore_version "$V" 1 "$WORK/restore"
+up "$V" || fail "restore-version: $(tail -3 "$WORK/up.log")"
+for _ in $(seq 1 60); do [[ "$(state "$V" restore-version)" == exited* ]] && break; sleep 2; done
+[[ "$(state "$V" restore-version)" == "exited 0" ]] || fail "restore-version: '$(state "$V" restore-version)' $(logs "$V" restore-version)"
+[[ "$(state "$V" parvault)" == "running 0" ]] || fail "the daemon did not keep running: $(state "$V" parvault)"
+[[ "$(docker run --rm --user 65532:65532 -v "$WORK/restore:/r:ro" --entrypoint cat "$BB" /r/a.txt)" == "version one" ]] \
+  || fail "restore-version did not restore version 1: $(logs "$V" restore-version)"
+ok "restore-version: version 1 restored beside the running daemon"
+docker compose -f "$V" rm -f restore-version >/dev/null 2>&1
+V2=$(variant deploy/synology/compose.yaml 9 $((PB + 8)))
+with_folder "$V2" "$WORK/watched"
+enable_restore_version "$V2" 7 "$WORK/restore"
+up "$V2" || fail "restore-version of a dropped version: $(tail -3 "$WORK/up.log")"
+for _ in $(seq 1 60); do [[ "$(state "$V2" restore-version)" == exited* ]] && break; sleep 2; done
+[[ "$(state "$V2" restore-version)" == "exited 1" ]] || fail "dropped version: '$(state "$V2" restore-version)'"
+logs "$V2" restore-version | grep -q 'reject.version_not_retained' || fail "dropped version said: $(logs "$V2" restore-version)"
+ok "restore-version of a version not retained: reject.version_not_retained"
 echo "test_compose_projects: PASS ($SRC_TAG = $(docker image inspect -f '{{.Id}}' "$TAG"))"

@@ -13,9 +13,7 @@ use crate::crypto::{
 };
 use crate::sharding::merkle::{compute_file_merkle_root, hash_shard_leaf, Hash32};
 use crate::sharding::reconstruct_ciphertext_stripe;
-use crate::storage::{
-    BlockStore, FileManifest, ShardId, SignedDhtManifestEnvelope, StorageError, ZeroTrustDhtStore,
-};
+use crate::storage::{BlockStore, FileManifest, ShardId, SignedDhtManifestEnvelope, StorageError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::borrow::Borrow;
@@ -285,7 +283,6 @@ pub struct FolderSyncEngine {
     current_version: u64,
     cached_entries: BTreeMap<String, SyncedFileEntry>,
     deleted_tombstones: BTreeMap<String, DeletedFileTombstone>,
-    dht_store: ZeroTrustDhtStore,
     /// The previous pass's envelope, reused by a no-change pass (B-154 3).
     last_envelope: Option<SignedDhtManifestEnvelope>,
     /// What the last `sync_folder_once` did (B-154 3).
@@ -358,7 +355,10 @@ impl FolderSyncEngine {
         if let Some(client) = store.mesh_client().cloned() {
             store.set_mesh_client(Some(client.with_identity(owner_identity.clone())));
         }
-        let dht_store = ZeroTrustDhtStore::with_persistence_dir(store.root_dir());
+        // G-28: the engine writes envelopes through `store`'s one `ZeroTrustDhtStore` (the
+        // daemon's, with its profile limits), never a second copy of `dht_store.bin`: two
+        // in-memory copies each rewrite the whole file, so the last writer would drop the other's
+        // envelopes and version floors.
         Self {
             store,
             master_key,
@@ -367,7 +367,6 @@ impl FolderSyncEngine {
             current_version: 0,
             cached_entries: BTreeMap::new(),
             deleted_tombstones: BTreeMap::new(),
-            dht_store,
             last_envelope: None,
             last_pass: PassSummary::default(),
             gc: None,
@@ -428,10 +427,6 @@ impl FolderSyncEngine {
         self.current_version
     }
 
-    pub const fn dht_store(&self) -> &ZeroTrustDhtStore {
-        &self.dht_store
-    }
-
     pub const fn deleted_tombstones(&self) -> &BTreeMap<String, DeletedFileTombstone> {
         &self.deleted_tombstones
     }
@@ -469,7 +464,7 @@ impl FolderSyncEngine {
         self.cached_entries = snapshot.files.clone();
         self.deleted_tombstones = snapshot.deleted_tombstones.clone();
         if let Some(env) = &snapshot.signed_dht_envelope {
-            let _ = self.dht_store.put_manifest_envelope(env.clone());
+            let _ = self.store.put_dht_manifest_envelope(env.clone());
         }
         self.last_envelope = snapshot.signed_dht_envelope.clone();
     }
@@ -754,7 +749,6 @@ impl FolderSyncEngine {
                 monotonic_ver,
                 monotonic_ver,
             )?;
-            let _ = self.dht_store.put_manifest_envelope(env.clone());
             let _ = self.store.put_dht_manifest_envelope(env.clone());
             if let Some(client) = self.store.mesh_client() {
                 if !client.all_network_endpoints().is_empty() {

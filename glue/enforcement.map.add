@@ -1,3 +1,0 @@
-# Track A lines to append to .enforcement.map with glue G-19 (the files in glue/tests move to tests/; needs G-11, G-12, G-14).
-suite      S-E1      test=windows_equiv_acceptance::e1_windows_equivalent needs=cmd:curl   # v0.5.6 E1
-artifact   A-TLS-DOCKER script=scripts/docker_stage_webdav_tls.sh bin=parvault suite=docker_acceptance_gate::docker_acceptance_gate   # stage 14-webdav-tls, called by the acceptance gate

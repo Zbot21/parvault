@@ -755,7 +755,7 @@ fn edge_framing_crlf_served() {
     let _ = s.read_to_end(&mut got);
     let text = String::from_utf8_lossy(&got);
     assert!(text.starts_with("HTTP/1.1 200 "), "{text}");
-    // `/live` until track D builds it: 501 with the code in the body (QA of T0).
+    // `/live` (track D, B-148): served on the same framing.
     let mut s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     s.write_all(req("GET", "/live", addr, Some(&t), "").as_bytes())
@@ -763,13 +763,7 @@ fn edge_framing_crlf_served() {
     let mut got = Vec::new();
     let _ = s.read_to_end(&mut got);
     let text = String::from_utf8_lossy(&got);
-    assert!(
-        text.starts_with("HTTP/1.1 501 ") || text.starts_with("HTTP/1.1 200 "),
-        "{text}"
-    );
-    if text.starts_with("HTTP/1.1 501 ") {
-        assert!(text.contains("reject.not_built_yet"), "{text}");
-    }
+    assert!(text.starts_with("HTTP/1.1 200 "), "{text}");
     gate_ran("trust_enforcement_edge::edge_framing_crlf_served");
 }
 
@@ -851,63 +845,6 @@ fn webdav_host_outside_sans_refused() {
         std::thread::sleep(Duration::from_millis(50));
     }
     gate_ran("trust_enforcement_edge::webdav_host_outside_sans_refused");
-}
-
-/// The files under `dir`, relative, sorted (empty when `dir` does not exist).
-fn files_under(dir: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p.clone());
-            }
-            out.push(p.strip_prefix(dir).unwrap().display().to_string());
-        }
-    }
-    out.sort();
-    out
-}
-
-/// qa-t0 LOW: `daemon start` and `up` refuse `--tls-san`, `--insecure-plain-http` and
-/// `--gateway-socket-group` (T0 stubs) before any side effect: a fresh data dir gets no file
-/// (no identity, root key, lock, beacon registry or socket). Tracks A and B-180 replace the
-/// refusals with accept and reject pairs.
-#[test]
-fn unbuilt_start_flags_refuse_before_any_file() {
-    let tmp = tempfile::tempdir().unwrap();
-    let sock = tmp.path().join("gw.sock");
-    let sock = sock.to_str().unwrap();
-    let cases: [(&[&str], &str); 3] = [
-        (
-            &["--tls-san", "nas.local"],
-            "--tls-san / --insecure-plain-http",
-        ),
-        (
-            &["--insecure-plain-http"],
-            "--tls-san / --insecure-plain-http",
-        ),
-        (
-            &["--ipc-socket", sock, "--gateway-socket-group", "parvault"],
-            "--gateway-socket-group",
-        ),
-    ];
-    for cmd in [&["daemon", "start"][..], &["up"][..]] {
-        for (i, (flag, entry)) in cases.iter().enumerate() {
-            let dir = tmp.path().join(format!("{}-{i}", cmd.join("-")));
-            let mut args = cmd.to_vec();
-            args.extend_from_slice(&["--listen", common::LOOPBACK_EPHEMERAL]);
-            args.extend_from_slice(flag);
-            common::assert_not_built_yet(&common::parvault_in(&dir, &args), entry);
-            assert_eq!(files_under(&dir), Vec::<String>::new(), "{args:?}");
-            assert!(!Path::new(sock).exists(), "{args:?}");
-        }
-    }
-    gate_ran("trust_enforcement_edge::unbuilt_start_flags_refuse_before_any_file");
 }
 
 /// WEBDAV-PATH accept: a name with a space and a non-ASCII letter is served by its encoded path,

@@ -159,11 +159,11 @@ pub fn daemon_lock(data_dir: &Path) -> Result<DataDirLock, LockRefusal> {
 pub const EMPTY_VOLUME_IGNORED: &[&str] =
     &["lost+found", "@eaDir", DATADIR_LOCK_FILE, EDGE_TLS_FILE];
 
-/// The edge TLS certificate and key, one file the daemon writes at its first `up` (track A,
-/// A-TLS-6). Integration glue G-8 switches this to `edge_tls::EDGE_TLS_FILE`.
-pub const EDGE_TLS_FILE: &str = "edge_tls.pem";
-/// The prefix of the edge TLS file's staging files (glue G-8: `edge_tls::EDGE_TLS_TMP_PREFIX`).
-pub const EDGE_TLS_TMP_PREFIX: &str = ".tmp.edge_tls.pem.";
+/// The edge TLS certificate and key, one `0600` file the daemon writes at its first `up`
+/// (track A, A-TLS-6; glue G-8).
+pub use crate::edge_tls::EDGE_TLS_FILE;
+/// The prefix of the edge TLS file's staging files (glue G-8).
+pub use crate::edge_tls::EDGE_TLS_TMP_PREFIX;
 
 /// Whether `name` is on the A-146-3 ignore list.
 pub fn ignored_on_empty_volume(name: &str) -> bool {

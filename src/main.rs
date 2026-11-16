@@ -100,6 +100,14 @@ fn validate_builtin_vfs_flags(
 }
 
 fn validate_early_command_flags(cmd: &Commands) -> anyhow::Result<()> {
+    // C37 (glue G-22): the watch-interval floor, refused before `up --init-if-absent` creates a
+    // ring or any other file.
+    if let Commands::Up { interval_secs, .. } = cmd {
+        let floor = parvault::sync::retention::MIN_WATCH_INTERVAL_SECS;
+        if *interval_secs < floor {
+            anyhow::bail!("reject.interval_below_floor: --interval-secs must be at least {floor}");
+        }
+    }
     match cmd {
         Commands::Up {
             vfs_webdav_listen,
@@ -141,32 +149,17 @@ fn validate_early_command_flags(cmd: &Commands) -> anyhow::Result<()> {
     }
 }
 
-/// `v0.5.6` T0 stubs of `up` / `daemon start` (qa-t0 LOW): refused here, before any identity,
-/// root key, beacon, data-dir lock or socket exists. The track that builds a flag deletes its
-/// arm (track A the edge TLS flags, B-180 the socket group); the late refusals in
-/// `edge_tls::ensure_cert` and `GatewayIpcServer::with_socket_group` stay until then.
+/// `up` / `daemon start` usage checks before any side effect: the gateway socket group applies to
+/// the gateway socket only (B-180). The edge TLS flags and the socket group are built (track A,
+/// integration glue G-14 removed their T0 refusals).
 fn refuse_unbuilt_daemon_flags(
     edge_tls_flag: bool,
     socket_group: bool,
     has_ipc_socket: bool,
 ) -> anyhow::Result<()> {
-    // B-180: a usage error comes first (the group applies to the gateway socket only).
+    let _ = edge_tls_flag;
     if socket_group && !has_ipc_socket {
         anyhow::bail!("--gateway-socket-group needs --ipc-socket");
-    }
-    if edge_tls_flag {
-        return Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt {
-            track: "A",
-            entry: "--tls-san / --insecure-plain-http",
-        })
-        .into());
-    }
-    if socket_group {
-        return Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt {
-            track: "A or E (B-180)",
-            entry: "--gateway-socket-group",
-        })
-        .into());
     }
     Ok(())
 }
@@ -460,14 +453,14 @@ async fn run(
         return cli::wot::run(action, &cfg.data_dir);
     }
 
-    // v0.5.6: the edge certificate (track A) and the genesis backup (track E) read only the
-    // data dir, like `wot`.
+    // v0.5.6: the edge certificate (track A) reads only the data dir, like `wot`; the genesis
+    // backup (track E) also reads the profile's KDF and the pinned genesis (K1, K6; glue G-13).
     if let Commands::Tls { action } = cli.command {
         return cli::tls::run(action, &cfg.data_dir);
     }
 
     if let Commands::Ring { action } = cli.command {
-        return cli::ring_backup::run(action, &cfg.data_dir);
+        return cli::ring_backup::run(action, &cfg);
     }
 
     if let Commands::Token { action } = cli.command {
@@ -548,6 +541,11 @@ async fn run(
     let mut quota = QuotaManager::new(cfg.max_storage_bytes, cfg.bootstrap_grace_bytes);
     quota.set_min_free_disk_bytes(cfg.min_free_disk_bytes);
     quota.set_write_epoch_secs(cfg.quota_write_epoch_secs);
+    // L-130 (track B1, glue G-15): the held-shard bound, from `max_held_shards` or memory.
+    quota.set_held_shard_bound(parvault::storage::quota::held_shard_bound_at_startup(
+        cfg.hardware_profile,
+        cfg.max_held_shards,
+    ));
     let block_store = BlockStore::new(&cfg.data_dir, quota)?
         .with_stripe_size_bytes(cfg.stripe_size_bytes)
         .with_mesh_client(mesh_client.clone());

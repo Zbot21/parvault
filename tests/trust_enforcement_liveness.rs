@@ -823,3 +823,308 @@ fn b157_hanging_dial_not_doubled() {
     assert!(n <= 2, "{n} parallel dials to a hanging address:\n{log}");
     gate_ran("trust_enforcement_liveness::b157_hanging_dial_not_doubled");
 }
+
+/// G-28: the folder sync engine and the daemon's wire handler write one `ZeroTrustDhtStore`
+/// (the `BlockStore`'s), not two copies of `dht_store.bin`. Before the fix the engine loaded its
+/// own copy at construction and rewrote the whole file from it, so an envelope a peer put after
+/// that load was lost on disk. Checked first as that exact interleaving, then as two concurrent
+/// writers (engine passes, each with a fresh engine as the daemon makes per pass, beside peer
+/// puts): the file on disk holds every key at its highest version.
+#[test]
+fn g28_two_dht_writers_lose_no_envelope_or_version_floor() {
+    use parvault::config::ErasureTier;
+    use parvault::crypto::MasterKey;
+    use parvault::storage::{
+        BlockStore, FileManifest, QuotaManager, SignedDhtManifestEnvelope, ZeroTrustDhtStore,
+    };
+    use parvault::sync::FolderSyncEngine;
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    let folder = tmp.path().join("folder");
+    std::fs::create_dir_all(&folder).unwrap();
+    let store = BlockStore::new(&data, QuotaManager::new(1 << 30, 1 << 28)).unwrap();
+    let mk = MasterKey::generate();
+    let owner = NodeIdentity::from_master_key(&mk);
+    let peer_mks: Vec<MasterKey> = (0..4).map(|_| MasterKey::generate()).collect();
+    let peer_put = |manifest: &FileManifest, p: usize, version: u64| -> [u8; 32] {
+        let id = NodeIdentity::from_master_key(&peer_mks[p]);
+        let env =
+            SignedDhtManifestEnvelope::seal(&peer_mks[p], &id, manifest, version, version).unwrap();
+        store.put_dht_manifest_envelope(env.clone()).unwrap();
+        env.dht_key
+    };
+    let on_disk = |key: &[u8; 32]| -> Option<u64> {
+        ZeroTrustDhtStore::with_persistence_dir(&data)
+            .get_manifest_envelope(key)
+            .map(|e| e.monotonic_version)
+    };
+
+    // 1. The interleaving: engine made, then a peer put, then the engine's pass.
+    std::fs::write(folder.join("a.txt"), "first").unwrap();
+    let mut engine = FolderSyncEngine::new(
+        store.clone(),
+        mk.clone(),
+        owner.clone(),
+        ErasureTier::Homelab,
+    );
+    let snap = engine.sync_folder_once(&folder).unwrap();
+    let manifest = snap.files["a.txt"].manifest.clone();
+    let mut engine = FolderSyncEngine::new(
+        store.clone(),
+        mk.clone(),
+        owner.clone(),
+        ErasureTier::Homelab,
+    );
+    engine.load_previous_snapshot(&snap);
+    let peer_key = peer_put(&manifest, 0, 7);
+    std::fs::write(folder.join("a.txt"), "second").unwrap();
+    let snap = engine.sync_folder_once(&folder).unwrap();
+    assert_eq!(
+        on_disk(&peer_key),
+        Some(7),
+        "the peer's envelope was lost on disk"
+    );
+    let own = snap.signed_dht_envelope.clone().unwrap();
+    assert_eq!(on_disk(&own.dht_key), Some(own.monotonic_version));
+
+    // 2. Two concurrent writers.
+    const ROUNDS: u64 = 40;
+    let last_own = std::thread::scope(|s| {
+        let syncer = s.spawn(|| {
+            let mut snap = snap.clone();
+            for i in 0..ROUNDS {
+                let mut e = FolderSyncEngine::new(
+                    store.clone(),
+                    mk.clone(),
+                    owner.clone(),
+                    ErasureTier::Homelab,
+                );
+                e.load_previous_snapshot(&snap);
+                std::fs::write(folder.join("a.txt"), format!("round {i}")).unwrap();
+                snap = e.sync_folder_once(&folder).unwrap();
+            }
+            snap.signed_dht_envelope.unwrap()
+        });
+        let peers = s.spawn(|| {
+            for v in 8..8 + ROUNDS {
+                for p in 0..peer_mks.len() {
+                    peer_put(&manifest, p, v);
+                }
+            }
+        });
+        peers.join().unwrap();
+        syncer.join().unwrap()
+    });
+    // Read back without another write (a write would persist the whole store again).
+    for (p, pmk) in peer_mks.iter().enumerate() {
+        let id = NodeIdentity::from_master_key(pmk);
+        let key = SignedDhtManifestEnvelope::seal(pmk, &id, &manifest, 1, 1)
+            .unwrap()
+            .dht_key;
+        assert_eq!(on_disk(&key), Some(8 + ROUNDS - 1), "peer {p}");
+    }
+    assert_eq!(on_disk(&last_own.dht_key), Some(last_own.monotonic_version));
+    gate_ran("trust_enforcement_liveness::g28_two_dht_writers_lose_no_envelope_or_version_floor");
+}
+
+/// G-28 merge rule: per key, a lower version never replaces a higher one, whichever side holds
+/// it; the owner already on disk keeps the key; a key one side lacks is taken from the other.
+#[test]
+fn g28_merge_never_lowers_a_floor() {
+    use parvault::storage::block_store::{dht_merge_pick, DhtMergePick};
+    let (a, b) = ([1u8; 32], [2u8; 32]);
+    assert_eq!(
+        dht_merge_pick(Some((a, 5)), Some((a, 4))),
+        DhtMergePick::Disk
+    );
+    assert_eq!(
+        dht_merge_pick(Some((a, 4)), Some((a, 5))),
+        DhtMergePick::Memory
+    );
+    assert_eq!(
+        dht_merge_pick(Some((a, 5)), Some((a, 5))),
+        DhtMergePick::Disk
+    );
+    assert_eq!(
+        dht_merge_pick(Some((a, 1)), Some((b, 9))),
+        DhtMergePick::Disk
+    );
+    assert_eq!(dht_merge_pick(None, Some((b, 1))), DhtMergePick::Memory);
+    assert_eq!(dht_merge_pick(Some((a, 1)), None), DhtMergePick::Disk);
+    for d in 0..6u64 {
+        for m in 0..6u64 {
+            let kept = match dht_merge_pick(Some((a, d)), Some((a, m))) {
+                DhtMergePick::Disk => d,
+                DhtMergePick::Memory => m,
+            };
+            assert_eq!(kept, d.max(m), "disk {d}, memory {m}");
+        }
+    }
+    gate_ran("trust_enforcement_liveness::g28_merge_never_lowers_a_floor");
+}
+
+/// Rounds each G-28 writer process runs.
+const G28_ROUNDS: u64 = 150;
+
+/// G-28 helper: one writer process, spawned by `g28_two_processes_lose_no_envelope_or_floor`
+/// (a no-op when run on its own). It keeps one store open for its whole life, as a daemon or a
+/// `watch-folder` loop does, and per round puts its own key's next version and tries the shared
+/// key at an interleaved version (2i + id), recording the highest one it was granted.
+#[test]
+fn g28_writer_child() {
+    use parvault::crypto::MasterKey;
+    use parvault::storage::{FileManifest, SignedDhtManifestEnvelope, ZeroTrustDhtStore};
+    let Ok(dir) = std::env::var("PV_G28_CHILD_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let me: u64 = std::env::var("PV_G28_CHILD_ID").unwrap().parse().unwrap();
+    let manifest =
+        FileManifest::decode_bytes(&std::fs::read(dir.join("manifest.bin")).unwrap()).unwrap();
+    let own = MasterKey::from_hex(&format!("{:02x}", 0x10 + me).repeat(32)).unwrap();
+    let shared = MasterKey::from_hex(&"5a".repeat(32)).unwrap();
+    let seal = |mk: &MasterKey, v: u64| {
+        SignedDhtManifestEnvelope::seal(mk, &NodeIdentity::from_master_key(mk), &manifest, v, v)
+            .unwrap()
+    };
+    let mut store = ZeroTrustDhtStore::with_persistence_dir(&dir.join("data"));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !dir.join("go").exists() {
+        assert!(Instant::now() < deadline, "no start signal");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut granted = 0;
+    for i in 1..=G28_ROUNDS {
+        store.put_manifest_envelope(seal(&own, i)).unwrap();
+        let v = 2 * i + me;
+        if store.put_manifest_envelope(seal(&shared, v)).is_ok() {
+            granted = v;
+        }
+    }
+    std::fs::write(dir.join(format!("granted-{me}")), granted.to_string()).unwrap();
+}
+
+/// G-28 across processes (a daemon and a `watch-folder` client may share one data dir): two
+/// writer processes, each with its own long-lived store on one `zero_trust_dht_store.bin`, put
+/// interleaved envelopes. On disk afterwards each writer's own key is at its last version, and
+/// the shared key is at the highest version either writer was granted (no floor lowered).
+#[test]
+fn g28_two_processes_lose_no_envelope_or_floor() {
+    use parvault::config::ErasureTier;
+    use parvault::crypto::MasterKey;
+    use parvault::storage::{
+        BlockStore, QuotaManager, SignedDhtManifestEnvelope, ZeroTrustDhtStore,
+    };
+    use parvault::sync::FolderSyncEngine;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // One manifest both writers seal (any real manifest will do).
+    let folder = dir.join("folder");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.txt"), "g28").unwrap();
+    let mk = MasterKey::generate();
+    let mut engine = FolderSyncEngine::new(
+        BlockStore::new(dir.join("scratch"), QuotaManager::new(1 << 30, 1 << 28)).unwrap(),
+        mk.clone(),
+        NodeIdentity::from_master_key(&mk),
+        ErasureTier::Homelab,
+    );
+    let manifest = engine.sync_folder_once(&folder).unwrap().files["a.txt"]
+        .manifest
+        .clone();
+    std::fs::write(
+        dir.join("manifest.bin"),
+        bincode::serialize(&manifest).unwrap(),
+    )
+    .unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let children: Vec<Child> = (0..2u64)
+        .map(|id| {
+            Command::new(&exe)
+                .args([
+                    "g28_writer_child",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("PV_G28_CHILD_DIR", dir)
+                .env("PV_G28_CHILD_ID", id.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    std::fs::write(dir.join("go"), b"").unwrap();
+    for c in children {
+        let out = c.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let disk = ZeroTrustDhtStore::with_persistence_dir(&dir.join("data"));
+    let key_of = |mk: &MasterKey| {
+        SignedDhtManifestEnvelope::seal(mk, &NodeIdentity::from_master_key(mk), &manifest, 1, 1)
+            .unwrap()
+            .dht_key
+    };
+    let version = |mk: &MasterKey| {
+        disk.get_manifest_envelope(&key_of(mk))
+            .map(|e| e.monotonic_version)
+    };
+    let mut granted = Vec::new();
+    for id in 0..2u64 {
+        let own = MasterKey::from_hex(&format!("{:02x}", 0x10 + id).repeat(32)).unwrap();
+        assert_eq!(version(&own), Some(G28_ROUNDS), "writer {id}'s own key");
+        let g: u64 = std::fs::read_to_string(dir.join(format!("granted-{id}")))
+            .unwrap()
+            .parse()
+            .unwrap();
+        granted.push(g);
+    }
+    let shared = MasterKey::from_hex(&"5a".repeat(32)).unwrap();
+    assert_eq!(
+        version(&shared),
+        granted.iter().copied().max(),
+        "the shared key's floor (granted {granted:?})"
+    );
+    gate_ran("trust_enforcement_liveness::g28_two_processes_lose_no_envelope_or_floor");
+}
+
+/// G-29 (A-152 parts 2 and 4; Lead choice (b)): a `router-soc` daemon reports its profile's
+/// limits at start (`info.profile_limits`): Kademlia replication 21,600 s, publication
+/// 79,200 s, TTL 172,800 s, 128 records in 4 MiB, and an envelope store of 2,048 keys in
+/// 8 MiB with owner shares of 1,536 keys and 6 MiB.
+#[test]
+fn g29_router_soc_daemon_reports_its_profile_limits() {
+    let node = Node::new("g29");
+    std::fs::write(
+        node.dir.join("config.toml"),
+        "hardware_profile = \"router-soc\"\n",
+    )
+    .unwrap();
+    let d = node.start("g29", common::LOOPBACK_EPHEMERAL, &[]);
+    let log = d.log_text();
+    let line = log
+        .lines()
+        .find(|l| l.contains("info.profile_limits"))
+        .unwrap_or_else(|| panic!("no info.profile_limits line:\n{log}"));
+    for field in [
+        "router-soc",
+        "kad_replication_secs=21600",
+        "kad_publication_secs=79200",
+        "kad_record_ttl_secs=172800",
+        "kad_max_records=128",
+        "kad_max_total_bytes=4194304",
+        "dht_store_max_keys=2048",
+        "dht_store_max_bytes=8388608",
+        "dht_store_max_owner_keys=1536",
+        "dht_store_max_owner_bytes=6291456",
+    ] {
+        assert!(line.contains(field), "{field} not in: {line}");
+    }
+    d.stop();
+    gate_ran("trust_enforcement_liveness::g29_router_soc_daemon_reports_its_profile_limits");
+}

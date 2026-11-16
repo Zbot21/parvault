@@ -785,20 +785,307 @@ fn b169_vaultkeys_are_not_in_the_bundle() {
     gate_ran("trust_enforcement_setup::b169_vaultkeys_are_not_in_the_bundle");
 }
 
-/// K11, for the integrator once track B2 lands (B-154 version store): a restored owner's first
-/// pass publishes a catalog version above the existing one and frees nothing. Run with
-/// `--ignored` on `v0.5.6/integ`.
-#[test]
-#[ignore = "K11: needs track B2's version store; the integrator writes and enables it on v0.5.6/integ"]
-fn b169_restored_owner_publishes_above_and_frees_nothing() {
-    panic!(
-        "K11 integration test, to be written at integration: store a folder version on node A, \
-         ring backup A, stop A, ring restore into B with --confirm-move, run B's first sync \
-         pass, assert its catalog version is above A's last and that no FreeShards was sent"
-    );
+// --- G-23: a vault resumes from the ring's catalog (B-169 K11) ---------------------------------
+
+/// The vault phrase and namespace of the G-23 tests.
+const K11_PHRASE: &str = "k11 restored owner vault phrase";
+const K11_NS: &str = "k11";
+
+/// A storage host in the ring whose genesis seed is `seed` (hex), on a loopback port; killed
+/// on drop. Returns (daemons, data dir, `addr/p2p/id`).
+fn k11_host(tmp: &Path, name: &str, seed_hex: &str) -> (Daemons, PathBuf, String) {
+    let dir = tmp.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let id = parvault::crypto::NodeIdentity::load_or_generate_in_dir(&dir).unwrap();
+    let pid = parvault::network::node_identity_libp2p_peer_id(&id).unwrap();
+    let mut cmd = pv(&dir);
+    cmd.env("PARVAULT_GENESIS_SEED_HEX", seed_hex).args([
+        "daemon",
+        "start",
+        "--no-socket",
+        "--listen",
+        common::LOOPBACK_EPHEMERAL,
+    ]);
+    let (child, addr) = common::spawn_on_ephemeral_port(&mut cmd, &tmp.join(format!("{name}.log")));
+    (Daemons(vec![child]), dir, format!("{addr}/p2p/{pid}"))
 }
 
-/// C37: `up --interval-secs` below the floor is refused.
+/// One `watch-folder --once` pass of `folder` from node `dir` against `peers`, with the vault
+/// phrase; `extra_env` adds variables. Waits up to 120 s.
+fn k11_pass(
+    dir: &Path,
+    folder: &Path,
+    snap: &Path,
+    peers: &str,
+    extra_env: &[(&str, &str)],
+) -> Output {
+    let mut cmd = pv(dir);
+    cmd.env("PARVAULT_SEED_PHRASE", K11_PHRASE)
+        .env("RUST_LOG", "info")
+        .envs(extra_env.iter().copied())
+        .args(["--peers", peers, "watch-folder", "--folder"])
+        .arg(folder)
+        .arg("--snapshot-out")
+        .arg(snap)
+        .args(["--vault-namespace", K11_NS, "--once"]);
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() > Duration::from_secs(120) {
+            let _ = child.kill();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    child.wait_with_output().unwrap()
+}
+
+fn k11_pass_ok(dir: &Path, folder: &Path, snap: &Path, peers: &str) -> String {
+    let out = k11_pass(dir, folder, snap, peers, &[]);
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    t
+}
+
+/// The vault catalog version the host holds on disk (its envelope store file).
+fn k11_host_catalog_version(host_dir: &Path) -> Option<u64> {
+    let mk = parvault::crypto::MasterKey::from_recovery_seed_phrase(K11_PHRASE, K11_NS);
+    let key = mk.derive_vault_root_dht_key(K11_NS);
+    parvault::storage::ZeroTrustDhtStore::with_persistence_dir(host_dir)
+        .get_vault_catalog_envelope(&key)
+        .map(|e| e.monotonic_version)
+}
+
+fn k11_shards(host_dir: &Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_dir(host_dir.join("shards"))
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A ring owner A (`init`, `wot init`) with one host in its ring and a vault backed up twice
+/// (catalog version 2 on the host). Returns (tmp-relative paths, host, A's genesis seed hex).
+struct K11Ring {
+    a: PathBuf,
+    folder: PathBuf,
+    snap_a: PathBuf,
+    host: Daemons,
+    host_dir: PathBuf,
+    host_addr: String,
+    seed_hex: String,
+}
+
+fn k11_ring(tmp: &Path) -> K11Ring {
+    let a = tmp.join("a");
+    assert!(run(&a, &["init"]).status.success());
+    assert!(run(&a, &["wot", "init"]).status.success());
+    let seed_hex = hex::encode(std::fs::read(a.join("ring_genesis.seed")).unwrap());
+    let (host, host_dir, host_addr) = k11_host(tmp, "host", &seed_hex);
+    let folder = tmp.join("folder");
+    std::fs::create_dir_all(&folder).unwrap();
+    let snap_a = tmp.join("a.snap");
+    std::fs::write(folder.join("f.txt"), "v1").unwrap();
+    let t = k11_pass_ok(&a, &folder, &snap_a, &host_addr);
+    assert!(t.contains("Snapshot Version   : 1"), "{t}");
+    std::fs::write(folder.join("f.txt"), "v2").unwrap();
+    let t = k11_pass_ok(&a, &folder, &snap_a, &host_addr);
+    assert!(t.contains("Snapshot Version   : 2"), "{t}");
+    assert_eq!(k11_host_catalog_version(&host_dir), Some(2));
+    K11Ring {
+        a,
+        folder,
+        snap_a,
+        host,
+        host_dir,
+        host_addr,
+        seed_hex,
+    }
+}
+
+/// K11 (G-23, claim CATALOG-RESUME accept): the owner is moved with `ring backup` and
+/// `ring restore --confirm-move` (no folder snapshot travels in the bundle). The restored node's
+/// first pass resumes from the ring's catalog (version 2), publishes version 3 and frees nothing
+/// on the host. The old node, still running (a clone, not a move), then hits C7: its next pass
+/// sees the restored node's catalog, frees nothing and says so.
+#[test]
+fn b169_restored_owner_publishes_above_and_frees_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut r = k11_ring(tmp.path());
+    let pass = pass_file(tmp.path(), "pass.txt", format!("{PASS}\n").as_bytes());
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let bundle = backup(&r.a, &out, &pass);
+    let b = tmp.path().join("b");
+    let o = restore(&b, &bundle, &pass, &["--confirm-move"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let held = k11_shards(&r.host_dir);
+    std::fs::write(r.folder.join("f.txt"), "v3 from the restored node").unwrap();
+    let t = k11_pass_ok(&b, &r.folder, &tmp.path().join("b.snap"), &r.host_addr);
+    assert!(
+        t.contains("resumed vault 'k11' from the ring's catalog version 2"),
+        "{t}"
+    );
+    assert!(t.contains("Snapshot Version   : 3"), "{t}");
+    assert_eq!(k11_host_catalog_version(&r.host_dir), Some(3), "{t}");
+    let after = k11_shards(&r.host_dir);
+    assert!(
+        held.is_subset(&after),
+        "the restored node's pass freed shards\n{t}"
+    );
+    // C7: the old node is still there and runs a changed pass.
+    std::fs::write(r.folder.join("f.txt"), "v3 from the old node").unwrap();
+    let t = k11_pass_ok(&r.a, &r.folder, &r.snap_a, &r.host_addr);
+    assert!(t.contains("reject.gc_foreign_catalog"), "{t}");
+    assert!(
+        held.is_subset(&k11_shards(&r.host_dir)),
+        "the old node freed shards\n{t}"
+    );
+    assert_eq!(k11_host_catalog_version(&r.host_dir), Some(3), "{t}");
+    r.host.stop_all();
+    gate_ran("trust_enforcement_setup::b169_restored_owner_publishes_above_and_frees_nothing");
+}
+
+/// G-23: a fresh node given only the seed phrase (no backup, no snapshot) resumes the vault the
+/// same way: its first pass over the same folder resumes version 2 and finds no change
+/// (nothing published), and a changed file then publishes version 3 above the ring's 2.
+#[test]
+fn g23_fresh_node_from_phrase_resumes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut r = k11_ring(tmp.path());
+    let c = tmp.path().join("c");
+    assert!(run(&c, &["init"]).status.success());
+    let t = text(&{
+        let out = k11_pass(
+            &c,
+            &r.folder,
+            &tmp.path().join("c.snap"),
+            &r.host_addr,
+            &[("PARVAULT_GENESIS_SEED_HEX", &r.seed_hex)],
+        );
+        assert!(out.status.success(), "{}", text(&out));
+        out
+    });
+    assert!(
+        t.contains("resumed vault 'k11' from the ring's catalog version 2"),
+        "{t}"
+    );
+    assert!(t.contains("Snapshot Version   : 2 (no change)"), "{t}");
+    assert_eq!(k11_host_catalog_version(&r.host_dir), Some(2), "{t}");
+    std::fs::write(r.folder.join("f.txt"), "v3 from a fresh node").unwrap();
+    let out = k11_pass(
+        &c,
+        &r.folder,
+        &tmp.path().join("c.snap"),
+        &r.host_addr,
+        &[("PARVAULT_GENESIS_SEED_HEX", &r.seed_hex)],
+    );
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(
+        !t.contains("resumed vault"),
+        "resumed again from a local snapshot\n{t}"
+    );
+    assert!(t.contains("Snapshot Version   : 3"), "{t}");
+    assert_eq!(k11_host_catalog_version(&r.host_dir), Some(3), "{t}");
+    r.host.stop_all();
+    gate_ran("trust_enforcement_setup::g23_fresh_node_from_phrase_resumes");
+}
+
+/// G-23 (claim CATALOG-RESUME reject): with no snapshot and no ring host answering, the pass
+/// refuses (`reject.catalog_resume_unreachable`) and publishes nothing (no snapshot written),
+/// rather than start the vault again at version 1.
+#[test]
+fn g23_unreachable_ring_refuses_to_publish() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path().join("d");
+    assert!(run(&d, &["init"]).status.success());
+    let folder = tmp.path().join("folder");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("f.txt"), "x").unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let snap = tmp.path().join("d.snap");
+    let out = k11_pass(
+        &d,
+        &folder,
+        &snap,
+        &format!("/ip4/127.0.0.1/tcp/{port}"),
+        &[],
+    );
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(t.contains("reject.catalog_resume_unreachable"), "{t}");
+    assert!(!snap.exists(), "a snapshot was written\n{t}");
+    gate_ran("trust_enforcement_setup::g23_unreachable_ring_refuses_to_publish");
+}
+
+/// G-23: a catalog at this vault's key that another owner signed is never adopted: the fresh
+/// node logs `warn.catalog_resume_foreign` and starts at version 1.
+#[test]
+fn g23_foreign_catalog_not_adopted() {
+    use parvault::crypto::{MasterKey, NodeIdentity, PqVaultMasterKey};
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a");
+    assert!(run(&a, &["init"]).status.success());
+    assert!(run(&a, &["wot", "init"]).status.success());
+    let seed_hex = hex::encode(std::fs::read(a.join("ring_genesis.seed")).unwrap());
+    // A squatter seals a catalog under this vault's keys but signs it with its own identity,
+    // and it is already in the host's envelope store.
+    let host_dir = tmp.path().join("host");
+    {
+        let scratch = tmp.path().join("scratch");
+        let folder = tmp.path().join("sq");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("x.txt"), "squat").unwrap();
+        let mk = MasterKey::from_recovery_seed_phrase(K11_PHRASE, K11_NS);
+        let pq = PqVaultMasterKey::from_recovery_seed_phrase(K11_PHRASE, K11_NS);
+        let squatter = NodeIdentity::generate();
+        let mut engine = parvault::sync::FolderSyncEngine::new(
+            parvault::storage::BlockStore::new(
+                &scratch,
+                parvault::storage::QuotaManager::new(1 << 30, 1 << 28),
+            )
+            .unwrap(),
+            mk.clone(),
+            squatter.clone(),
+            parvault::config::ErasureTier::Homelab,
+        );
+        let mut snap = engine.sync_folder_once(&folder).unwrap();
+        snap.version = 9;
+        let env =
+            parvault::sync::EncryptedVaultCatalogEnvelope::seal(&mk, &pq, &squatter, K11_NS, &snap)
+                .unwrap();
+        assert!(env.verify_zero_knowledge());
+        parvault::storage::ZeroTrustDhtStore::with_persistence_dir(&host_dir)
+            .put_vault_catalog_envelope(env)
+            .unwrap();
+    }
+    let (mut host, _, host_addr) = k11_host(tmp.path(), "host", &seed_hex);
+    let folder = tmp.path().join("folder");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("f.txt"), "mine").unwrap();
+    let out = k11_pass(&a, &folder, &tmp.path().join("a.snap"), &host_addr, &[]);
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(t.contains("warn.catalog_resume_foreign"), "{t}");
+    assert!(!t.contains("resumed vault"), "{t}");
+    assert!(t.contains("Snapshot Version   : 1"), "{t}");
+    host.stop_all();
+    gate_ran("trust_enforcement_setup::g23_foreign_catalog_not_adopted");
+}
+
+/// C37: `up --interval-secs` below the floor is refused, and (glue G-22) before any side
+/// effect: `up --init-if-absent --interval-secs 1` on a fresh empty volume leaves it empty (no
+/// ring, no identity, no lock).
 #[test]
 fn c37_up_interval_below_floor_refused() {
     let tmp = tempfile::tempdir().unwrap();
@@ -808,6 +1095,19 @@ fn c37_up_interval_below_floor_refused() {
         "{}",
         text(&out)
     );
+    let vol = tmp.path().join("fresh");
+    std::fs::create_dir(&vol).unwrap();
+    let out = up_refused(&vol, &["--init-if-absent", "--interval-secs", "1"]);
+    assert!(
+        text(&out).contains("reject.interval_below_floor"),
+        "{}",
+        text(&out)
+    );
+    let left: Vec<_> = std::fs::read_dir(&vol)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "the volume was written: {left:?}");
     gate_ran("trust_enforcement_setup::c37_up_interval_below_floor_refused");
 }
 

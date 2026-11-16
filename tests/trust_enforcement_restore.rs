@@ -218,6 +218,101 @@ fn upsert_never_hides_the_path_from_readers() {
     gate_ran("trust_enforcement_restore::upsert_never_hides_the_path_from_readers");
 }
 
+/// T2 (glue G-26): a read of a file whose stripes version GC freed (the host removal path a
+/// `FreeShards` order takes: `delete_shard_deferred`, then `flush_removals`) re-imports the
+/// catalogs once; the re-import gives the path a new inode that still names the freed stripes,
+/// the read is retried once on it, and it fails with an error, not a panic or a loop. The path
+/// stays listed.
+#[cfg(unix)]
+#[test]
+fn t2_freed_stripe_reimports_once_then_fails_cleanly() {
+    use parvault::crypto::{MasterKey, NodeIdentity};
+    use parvault::storage::{BlockStore, QuotaManager};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Reads go through the process fetch scheduler, which the S6 tests hold.
+    let _sched = SCHED_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let mk = MasterKey::generate();
+    let owner = NodeIdentity::from_master_key(&mk).device_peer_id();
+    let store = BlockStore::new(
+        dir.path().join("store"),
+        QuotaManager::new(256 * 1024 * 1024, 32 * 1024 * 1024),
+    )
+    .unwrap();
+    let engine = Arc::new(GatewayEngine::from_local_block_store(store.clone(), mk));
+    let key = [0x6C; 32];
+    engine.set_macaroon_root_key(Some(key));
+    let tok =
+        parvault::capabilities::CapabilityMacaroon::mint(&key, [0x5A; 32], [0x5B; 32], vec![])
+            .unwrap();
+    let vfs = Arc::new(
+        VirtualVaultFs::with_bus(
+            GatewayBus::in_process(engine),
+            dir.path().join("cache"),
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+        .with_default_macaroon(Some(tok)),
+    );
+    let seed = dir.path().join("seed");
+    std::fs::create_dir_all(&seed).unwrap();
+    std::fs::write(seed.join("f.bin"), vec![0x42u8; 300 * 1024]).unwrap();
+    assert_eq!(vfs.ingest_local_directory(&seed).unwrap(), 1);
+    // A cold inode for the same file (the ingest may have warmed the cache of `/f.bin`).
+    let manifest = vfs.lookup_path("/f.bin").unwrap().manifest.unwrap();
+    vfs.upsert_file(
+        "/g.bin",
+        LazyFileSpec {
+            manifest: manifest.clone(),
+            macaroon: None,
+            mtime_unix_secs: None,
+        },
+    )
+    .unwrap();
+    let node = vfs.lookup_path("/g.bin").unwrap();
+
+    // Version GC frees every stripe of this version on the host.
+    let held = store.list_stored_shards().unwrap();
+    assert!(!held.is_empty());
+    for (id, _) in &held {
+        assert!(store.delete_shard_deferred(&owner, id).unwrap());
+    }
+    store.flush_removals();
+    assert!(store.list_stored_shards().unwrap().is_empty());
+
+    // The re-import: the catalog still names the freed version (a new inode, same manifest).
+    let calls = Arc::new(AtomicUsize::new(0));
+    let weak = Arc::downgrade(&vfs);
+    let (c, m) = (Arc::clone(&calls), manifest.clone());
+    vfs.set_reimport_hook(Some(Arc::new(move || {
+        c.fetch_add(1, Ordering::SeqCst);
+        if let Some(v) = weak.upgrade() {
+            v.upsert_file(
+                "/g.bin",
+                LazyFileSpec {
+                    manifest: m.clone(),
+                    macaroon: None,
+                    mtime_unix_secs: None,
+                },
+            )
+            .unwrap();
+        }
+    })));
+    let started = Instant::now();
+    let err = vfs
+        .read_range_with_ttfb(node.ino, 0, 4096)
+        .expect_err("a freed stripe cannot be read");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "one re-import per failed read"
+    );
+    assert!(started.elapsed() < Duration::from_secs(60), "{err}");
+    let after = vfs.lookup_path("/g.bin").expect("the path stays listed");
+    assert_ne!(after.ino, node.ino, "the re-import replaced the inode");
+    gate_ran("trust_enforcement_restore::t2_freed_stripe_reimports_once_then_fails_cleanly");
+}
+
 // --- B-20: catalog listing on the real binary ---------------------------------------------------
 
 #[cfg(unix)]
@@ -279,7 +374,8 @@ mod b20 {
     }
 
     /// `parvault up --no-socket` on `dir` with WebDAV on an ephemeral port and, with `folder`,
-    /// the daemon's own folder sync every second (a changed catalog imports within a second).
+    /// the daemon's own folder sync every 2 s, the C37 floor (a changed catalog imports within a
+    /// second of the pass that wrote it).
     pub fn up(dir: &Path, folder: Option<&Path>, extra_env: &[(&str, &str)]) -> Daemon {
         up_with(dir, folder, extra_env, &[])
     }
@@ -314,7 +410,7 @@ mod b20 {
             "--vfs-webdav-listen",
             "127.0.0.1:0",
             "--interval-secs",
-            "1",
+            "2",
         ]);
         if let Some(f) = folder {
             cmd.arg("--folder").arg(f);

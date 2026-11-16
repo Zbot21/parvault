@@ -1003,10 +1003,8 @@ fn b154_folder_status_without_store_fails() {
     gate_ran("trust_enforcement_gc_owner::b154_folder_status_without_store_fails");
 }
 
-/// `up --no-gc` starts and runs its folder passes without a version store. Needs track E's
-/// removal of the `up --no-gc` stub (`daemon_cmds.rs`) and G-17: runs at integration.
+/// `up --no-gc` starts and runs its folder passes without a version store (with G-17 applied).
 #[test]
-#[ignore = "needs track E's daemon_cmds.rs --no-gc stub removal (integration)"]
 fn b154_up_no_gc_runs_without_versions() {
     let tmp = tempfile::tempdir().unwrap();
     let node = tmp.path().join("node");
@@ -1016,6 +1014,7 @@ fn b154_up_no_gc_runs_without_versions() {
     let log = tmp.path().join("up.log");
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_parvault"));
     cmd.env("PARVAULT_LAN_REGISTRY_DIR", node.join("lan-registry"))
+        .env("PARVAULT_GENESIS_SEED_HEX", GENESIS_SEED_HEX)
         .env_remove("PARVAULT_PEERS")
         .arg("--data-dir")
         .arg(&node)
@@ -1027,7 +1026,7 @@ fn b154_up_no_gc_runs_without_versions() {
             "--listen",
         ])
         .arg(common::LOOPBACK_EPHEMERAL)
-        .arg("--watch-folder")
+        .arg("--folder")
         .arg(&folder);
     let (mut child, _addr) = common::spawn_on_ephemeral_port(&mut cmd, &log);
     let snap = node.join("appliance_folder_snapshot.manifest.bin");

@@ -1032,6 +1032,22 @@ impl BlockStore {
         self.shard_id_by_file_key.lock().map_or(0, |m| m.len())
     }
 
+    /// B-152 (b), A-152 part 4: sets the envelope store's budget (at startup, per profile).
+    pub fn set_dht_store_limits(&self, l: DhtStoreLimits) {
+        self.dht_store
+            .lock()
+            .expect("dht_store mutex poisoned")
+            .set_limits(l)
+    }
+
+    /// The envelope store's budget in force (after the environment knobs).
+    pub fn dht_store_limits(&self) -> DhtStoreLimits {
+        self.dht_store
+            .lock()
+            .expect("dht_store mutex poisoned")
+            .limits()
+    }
+
     pub fn has_shard(&self, id: &ShardId) -> bool {
         if let Some(ref mem) = self.in_memory {
             return mem
@@ -2942,6 +2958,85 @@ pub struct ZeroTrustDhtStore {
     /// The store file exists but did not load: puts are refused and the file is never
     /// rewritten, so every version floor it holds survives (A-152 4.4).
     corrupt: bool,
+    /// (inode, length, mtime) of the store file as this process last read or wrote it: a put
+    /// re-reads the file only when another process replaced it since (G-28).
+    seen: Option<FileStamp>,
+}
+
+type FileStamp = (u64, u64, std::time::SystemTime);
+
+/// Which copy of one key's envelope the G-28 merge keeps: the store file's or this process's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DhtMergePick {
+    Disk,
+    Memory,
+}
+
+/// The G-28 merge rule for one key held on disk and/or in memory, given each side's
+/// (owner, version): a version floor is never lowered (the higher version wins), and the
+/// owner already on disk keeps the key (owner immutability, as on a put).
+pub fn dht_merge_pick(
+    disk: Option<(OwnerTag, u64)>,
+    memory: Option<(OwnerTag, u64)>,
+) -> DhtMergePick {
+    match (disk, memory) {
+        (None, _) => DhtMergePick::Memory,
+        (Some(_), None) => DhtMergePick::Disk,
+        (Some((d_owner, d_ver)), Some((m_owner, m_ver))) => {
+            if d_owner == m_owner && m_ver > d_ver {
+                DhtMergePick::Memory
+            } else {
+                DhtMergePick::Disk
+            }
+        }
+    }
+}
+
+/// The lock file beside the store file (G-28): `<store file>.lock`.
+pub fn dht_store_lock_path(store_file: &Path) -> PathBuf {
+    let mut name = store_file.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Opens `<store file>.lock` (created `0600`, never truncated, never through a symlink) and
+/// takes its exclusive `flock`, waiting for another writer. Released when the file is dropped,
+/// or by the kernel when the process dies.
+fn lock_store_file(store_file: &Path) -> Result<fs::File, StorageError> {
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = opts.open(dht_store_lock_path(store_file))?;
+    file.lock()?;
+    Ok(file)
+}
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let m = fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(&m);
+    #[cfg(not(unix))]
+    let ino = 0;
+    Some((ino, m.len(), m.modified().ok()?))
+}
+
+/// Merges one map of the store file into this process's map by [`dht_merge_pick`].
+fn merge_map<E>(
+    memory: &mut HashMap<[u8; 32], E>,
+    disk: HashMap<[u8; 32], E>,
+    side: impl Fn(&E) -> (OwnerTag, u64),
+) {
+    for (key, d) in disk {
+        let pick = dht_merge_pick(Some(side(&d)), memory.get(&key).map(&side));
+        if pick == DhtMergePick::Disk {
+            memory.insert(key, d);
+        }
+    }
 }
 
 const KIND_CLASSICAL: u8 = 0;
@@ -2983,6 +3078,7 @@ impl ZeroTrustDhtStore {
                 store.pq_records = s.pq_records;
                 store.catalog_records = s.catalog_records;
                 store.recount();
+                store.seen = file_stamp(&path);
             }
             Err(error) => {
                 store.corrupt = true;
@@ -3097,24 +3193,90 @@ impl ZeroTrustDhtStore {
         Ok(())
     }
 
-    fn persist_if_configured(&self) {
+    /// G-28: runs one put under the store file's lock when the store is persisted. Under an
+    /// exclusive `flock` on `<store file>.lock` it re-reads the file if another process replaced
+    /// it (a daemon and a `watch-folder` client may share a data dir), merges it in by
+    /// [`dht_merge_pick`] (a version floor is never lowered), runs `put` against the merged
+    /// state (so its owner, version and capacity checks see every writer's envelopes, and the
+    /// caps refuse new keys, never evict), then writes the file atomically and unlocks.
+    fn locked_put(
+        &mut self,
+        put: impl FnOnce(&mut Self) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
+        let Some(path) = self.persistence_path.clone() else {
+            return put(self);
+        };
         if self.corrupt {
-            return;
+            return put(self);
         }
-        if let Some(ref path) = self.persistence_path {
-            let state = PersistedZeroTrustDhtStateRef {
-                records: &self.records,
-                pq_records: &self.pq_records,
-                catalog_records: &self.catalog_records,
-            };
-            match bincode::serialize(&state) {
-                Ok(raw) => {
-                    if let Err(e) = BlockStore::atomic_write_file(path, &raw) {
-                        tracing::warn!(error = %e, "DHT envelope store not persisted");
+        let _lock = lock_store_file(&path)?;
+        self.merge_from_disk(&path)?;
+        put(self)?;
+        self.write_store_file(&path);
+        Ok(())
+    }
+
+    /// Re-reads the store file (under its lock) if it changed since this process last saw it,
+    /// and merges it in. A file that no longer decodes makes this store refuse every put.
+    fn merge_from_disk(&mut self, path: &Path) -> Result<(), StorageError> {
+        let stamp = file_stamp(path);
+        if stamp.is_none() || stamp == self.seen {
+            return Ok(());
+        }
+        let loaded = fs::read(path).map_err(|e| e.to_string()).and_then(|bytes| {
+            bincode::deserialize::<PersistedZeroTrustDhtState>(&bytes).map_err(|e| e.to_string())
+        });
+        match loaded {
+            Ok(disk) => {
+                merge_map(&mut self.records, disk.records, |e| {
+                    (e.owner_pubkey, e.monotonic_version)
+                });
+                merge_map(&mut self.pq_records, disk.pq_records, |e| {
+                    (pq_owner_tag(&e.owner_pq_pubkey), e.monotonic_version)
+                });
+                merge_map(&mut self.catalog_records, disk.catalog_records, |e| {
+                    (e.owner_pubkey, e.monotonic_version)
+                });
+                self.recount();
+                self.seen = stamp;
+                Ok(())
+            }
+            Err(error) => {
+                self.corrupt = true;
+                tracing::error!(
+                    code = "error.dht_store_unreadable",
+                    path = %path.display(),
+                    %error,
+                    "the DHT envelope store does not load; refusing DHT puts until it is repaired or removed"
+                );
+                Err(StorageError::Io(std::io::Error::other(
+                    "reject.dht_store_corrupt",
+                )))
+            }
+        }
+    }
+
+    /// Writes the store atomically (temporary file, fsync, rename, fsync of the directory).
+    fn write_store_file(&mut self, path: &Path) {
+        let state = PersistedZeroTrustDhtStateRef {
+            records: &self.records,
+            pq_records: &self.pq_records,
+            catalog_records: &self.catalog_records,
+        };
+        match bincode::serialize(&state) {
+            Ok(raw) => {
+                if let Err(e) = BlockStore::atomic_write_file(path, &raw) {
+                    tracing::warn!(error = %e, "DHT envelope store not persisted");
+                    return;
+                }
+                if let Some(dir) = path.parent() {
+                    if let Ok(d) = fs::File::open(dir) {
+                        let _ = d.sync_all();
                     }
                 }
-                Err(e) => tracing::warn!(error = %e, "DHT envelope store not serialised"),
+                self.seen = file_stamp(path);
             }
+            Err(e) => tracing::warn!(error = %e, "DHT envelope store not serialised"),
         }
     }
 
@@ -3127,25 +3289,26 @@ impl ZeroTrustDhtStore {
         &mut self,
         envelope: SignedDhtManifestEnvelope,
     ) -> Result<(), StorageError> {
-        if !envelope.verify_zero_knowledge() {
-            return Err(StorageError::DhtManifestPoisonedOrRollback);
-        }
-        if let Some(existing) = self.records.get(&envelope.dht_key) {
-            if existing.owner_pubkey != envelope.owner_pubkey
-                || envelope.monotonic_version <= existing.monotonic_version
-            {
+        self.locked_put(move |s| {
+            if !envelope.verify_zero_knowledge() {
                 return Err(StorageError::DhtManifestPoisonedOrRollback);
             }
-        }
-        self.admit(
-            KIND_CLASSICAL,
-            envelope.dht_key,
-            envelope.owner_pubkey,
-            serialized_len(&envelope),
-        )?;
-        self.records.insert(envelope.dht_key, envelope);
-        self.persist_if_configured();
-        Ok(())
+            if let Some(existing) = s.records.get(&envelope.dht_key) {
+                if existing.owner_pubkey != envelope.owner_pubkey
+                    || envelope.monotonic_version <= existing.monotonic_version
+                {
+                    return Err(StorageError::DhtManifestPoisonedOrRollback);
+                }
+            }
+            s.admit(
+                KIND_CLASSICAL,
+                envelope.dht_key,
+                envelope.owner_pubkey,
+                serialized_len(&envelope),
+            )?;
+            s.records.insert(envelope.dht_key, envelope);
+            Ok(())
+        })
     }
 
     pub fn get_manifest_envelope(&self, dht_key: &[u8; 32]) -> Option<&SignedDhtManifestEnvelope> {
@@ -3159,25 +3322,26 @@ impl ZeroTrustDhtStore {
         &mut self,
         envelope: crate::crypto::PqSignedDhtManifestEnvelope,
     ) -> Result<(), StorageError> {
-        if !envelope.verify_zero_knowledge_pq() {
-            return Err(StorageError::DhtManifestPoisonedOrRollback);
-        }
-        if let Some(existing) = self.pq_records.get(&envelope.dht_key) {
-            if existing.owner_pq_pubkey != envelope.owner_pq_pubkey
-                || envelope.monotonic_version <= existing.monotonic_version
-            {
+        self.locked_put(move |s| {
+            if !envelope.verify_zero_knowledge_pq() {
                 return Err(StorageError::DhtManifestPoisonedOrRollback);
             }
-        }
-        self.admit(
-            KIND_PQ,
-            envelope.dht_key,
-            pq_owner_tag(&envelope.owner_pq_pubkey),
-            serialized_len(&envelope),
-        )?;
-        self.pq_records.insert(envelope.dht_key, envelope);
-        self.persist_if_configured();
-        Ok(())
+            if let Some(existing) = s.pq_records.get(&envelope.dht_key) {
+                if existing.owner_pq_pubkey != envelope.owner_pq_pubkey
+                    || envelope.monotonic_version <= existing.monotonic_version
+                {
+                    return Err(StorageError::DhtManifestPoisonedOrRollback);
+                }
+            }
+            s.admit(
+                KIND_PQ,
+                envelope.dht_key,
+                pq_owner_tag(&envelope.owner_pq_pubkey),
+                serialized_len(&envelope),
+            )?;
+            s.pq_records.insert(envelope.dht_key, envelope);
+            Ok(())
+        })
     }
 
     pub fn get_pq_manifest_envelope(
@@ -3194,25 +3358,26 @@ impl ZeroTrustDhtStore {
         &mut self,
         envelope: crate::sync::EncryptedVaultCatalogEnvelope,
     ) -> Result<(), StorageError> {
-        if !envelope.verify_zero_knowledge() {
-            return Err(StorageError::DhtManifestPoisonedOrRollback);
-        }
-        if let Some(existing) = self.catalog_records.get(&envelope.dht_key) {
-            if existing.owner_pubkey != envelope.owner_pubkey
-                || envelope.monotonic_version <= existing.monotonic_version
-            {
+        self.locked_put(move |s| {
+            if !envelope.verify_zero_knowledge() {
                 return Err(StorageError::DhtManifestPoisonedOrRollback);
             }
-        }
-        self.admit(
-            KIND_CATALOG,
-            envelope.dht_key,
-            envelope.owner_pubkey,
-            serialized_len(&envelope),
-        )?;
-        self.catalog_records.insert(envelope.dht_key, envelope);
-        self.persist_if_configured();
-        Ok(())
+            if let Some(existing) = s.catalog_records.get(&envelope.dht_key) {
+                if existing.owner_pubkey != envelope.owner_pubkey
+                    || envelope.monotonic_version <= existing.monotonic_version
+                {
+                    return Err(StorageError::DhtManifestPoisonedOrRollback);
+                }
+            }
+            s.admit(
+                KIND_CATALOG,
+                envelope.dht_key,
+                envelope.owner_pubkey,
+                serialized_len(&envelope),
+            )?;
+            s.catalog_records.insert(envelope.dht_key, envelope);
+            Ok(())
+        })
     }
 
     pub fn get_vault_catalog_envelope(

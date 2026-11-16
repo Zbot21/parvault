@@ -12,7 +12,7 @@
 #               docs/SYNOLOGY.md "Add a node"). Its token appears in its Log tab.
 name: parvault
 x-oneshot: &oneshot
-  image: parvault:0.5.5-dev
+  image: parvault:0.5.6-dev
   pull_policy: never            # a local-only image: never fall back to a registry pull
   user: "65532:65532"
   network_mode: none
@@ -28,7 +28,7 @@ x-oneshot: &oneshot
     - parvault-data:/var/lib/parvault
 services:
   parvault:
-    image: parvault:0.5.5-dev
+    image: parvault:0.5.6-dev
     pull_policy: never
     container_name: parvault
     restart: unless-stopped
@@ -88,6 +88,19 @@ services:
   #     - parvault-data:/var/lib/parvault
   #     - parvault-secrets:/secrets:ro
   #     - /volume1/parvault-backup:/backup:ro
+  # Restore an older version of the folder the daemon backs up (`up --folder`; docs/SYNOLOGY.md
+  # "Older versions"): set VERSION_NUMBER to one of the retained versions `folder-status` lists,
+  # uncomment, build once; the files land in /volume1/parvault-restore. The daemon keeps running.
+  # Comment it again afterwards.
+  # restore-version:
+  #   <<: *oneshot
+  #   network_mode: host
+  #   command: ["--data-dir", "/var/lib/parvault", "restore-folder",
+  #             "--snapshot", "/var/lib/parvault/appliance_folder_snapshot.manifest.bin",
+  #             "--version", "VERSION_NUMBER", "--out-dir", "/restore"]
+  #   volumes:
+  #     - parvault-data:/var/lib/parvault
+  #     - /volume1/parvault-restore:/restore
 volumes:
   parvault-data:
     name: parvault-data   # fixed name: the project's services and later rebuilds share it

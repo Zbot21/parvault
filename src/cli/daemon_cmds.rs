@@ -49,9 +49,11 @@ pub(crate) async fn up(env: CliEnv, command: Commands) -> anyhow::Result<()> {
     else {
         unreachable!("up() is only dispatched for Commands::Up")
     };
-    // C37: the watch interval has a floor (B2 exports MIN_WATCH_INTERVAL_SECS).
-    if interval_secs < 2 {
-        anyhow::bail!("reject.interval_below_floor: --interval-secs must be at least 2");
+    // C37: the watch interval has a floor. `main::validate_early_command_flags` refuses first,
+    // before any file exists (glue G-22); this check stays as defence in depth.
+    let floor = parvault::sync::retention::MIN_WATCH_INTERVAL_SECS;
+    if interval_secs < floor {
+        anyhow::bail!("reject.interval_below_floor: --interval-secs must be at least {floor}");
     }
     // B-174 (track E): the daemon holds the data-dir lock for its lifetime: the one
     // `onboarding::up_setup_preflight` took before any file was created.
@@ -96,7 +98,7 @@ pub(crate) async fn up(env: CliEnv, command: Commands) -> anyhow::Result<()> {
         vfs_seed_dir,
         vfs_cache_mib,
         watch_folder: effective_folder,
-        sync_interval_secs: interval_secs, // C37; B2 exports MIN_WATCH_INTERVAL_SECS
+        sync_interval_secs: interval_secs, // C37: at least MIN_WATCH_INTERVAL_SECS
         sync_tier: effective_tier,
         wan_announce: !deterministic && (wan || !wan_seeds.is_empty()),
         wan_seeds,

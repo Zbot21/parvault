@@ -143,6 +143,7 @@ Claim lines in `.enforcement.map` use the finding id, or the finding id with a s
 | B163-RETRY | B-163 item 3 (C35): after a quota refusal the owner runs GC and retries the pass once, only if GC freed something. |
 | B154-CEIL | L-119: retention above the client ceilings (50 recent, 90 daily, 52 weekly) is refused, not clamped. |
 | B154-WARN | B-154 L-122, C44: a folder's expected stored bytes (with pending and abandoned frees) above 1.25x what its policy can hold warn. |
+| CATALOG-RESUME | G-23 (B-169 K11, `v0.5.6` integration): a `watch-folder` pass with no local snapshot resumes the vault from the ring's catalog only when it verifies under this vault's owner and catalog keys (the B20-LIST rule); an unreachable ring refuses (`reject.catalog_resume_unreachable`) rather than restart the vault at version 1. |
 | B157-REDIAL | B-157 (`v0.5.6`): the daemon redials only ring members (configured peers, admitted members' identify listen addresses), never an unknown or observed address (`reject.redial_not_ring_member`). |
 | B152-DHT-STORE | B-152 (b) (`v0.5.6`, A-152 part 4): the envelope store refuses at its budget and never evicts (`reject.dht_store_full`, `reject.dht_owner_key_cap`); a store file that does not load refuses every put and is never treated as empty (`reject.dht_store_corrupt`). |
 | B152-DHT-FULL | B152-DHT-STORE, the store budget (`reject.dht_store_full`). |

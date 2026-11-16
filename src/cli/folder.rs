@@ -108,6 +108,87 @@ pub(crate) fn effective_seed_phrase(arg: Option<String>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// G-23: the catalog to resume a vault from when this node has no snapshot of it.
+/// `Ok(Ok(Some(snapshot)))` resumes; `Ok(Ok(None))` starts at version 1 (no ring, no catalog,
+/// or only a catalog that is not this vault's, which is logged and never adopted);
+/// `Ok(Err(code))` is [`catalog_resume_decision`]'s refusal (the ring did not answer).
+///
+/// [`catalog_resume_decision`]: parvault::sync::catalog_resume::catalog_resume_decision
+fn resume_vault_from_ring(
+    client: Option<&MeshClient>,
+    catalog_dht_key: &[u8; 32],
+    owner: &NodeIdentity,
+    master_key: &MasterKey,
+    phrase: &str,
+    vault_namespace: &str,
+) -> anyhow::Result<Result<Option<FolderSnapshotManifest>, &'static str>> {
+    use parvault::sync::catalog_resume::{catalog_resume_decision, CatalogFetch, CatalogResume};
+    let client = client.filter(|c| !c.all_network_endpoints().is_empty());
+    let (fetch, best) = match client {
+        None => (CatalogFetch::NoRing, None),
+        Some(c) => {
+            let (answered, found) = c.fetch_vault_catalogs(catalog_dht_key);
+            // The newest catalog that is this vault's, else (for the log) any other.
+            let rank = |e: &parvault::sync::EncryptedVaultCatalogEnvelope| {
+                let verifies = e.verify_zero_knowledge();
+                let key_matches =
+                    e.dht_key == *catalog_dht_key && e.owner_pubkey == owner.public_key_bytes();
+                (
+                    verifies && key_matches,
+                    e.monotonic_version,
+                    verifies,
+                    key_matches,
+                )
+            };
+            let best = found
+                .into_iter()
+                .map(|e| (rank(&e), e))
+                .max_by_key(|(r, _)| (r.0, r.1));
+            let fetch = match (&best, answered) {
+                (_, 0) => CatalogFetch::Unreachable,
+                (None, _) => CatalogFetch::NotFound,
+                (Some(((_, version, verifies, key_matches), _)), _) => CatalogFetch::Found {
+                    envelope_verifies: *verifies,
+                    key_matches: *key_matches,
+                    version: *version,
+                },
+            };
+            (fetch, best.map(|(_, e)| e))
+        }
+    };
+    match catalog_resume_decision(false, fetch) {
+        Err(code) => Ok(Err(code)),
+        Ok(CatalogResume::Resume) => {
+            let env = best.expect("Resume needs a catalog");
+            let canonical = parvault::crypto::validate_recovery_seed_phrase_or_passphrase(phrase)?;
+            let pq = parvault::crypto::PqVaultMasterKey::from_recovery_seed_phrase(
+                &canonical,
+                vault_namespace,
+            );
+            match env.open(master_key, &pq) {
+                Ok(snapshot) => Ok(Ok(Some(snapshot))),
+                Err(e) => {
+                    tracing::warn!(
+                        code = "warn.catalog_resume_foreign",
+                        error = %e,
+                        "the ring's catalog for this vault key does not open with this phrase; not adopted, starting at version 1"
+                    );
+                    Ok(Ok(None))
+                }
+            }
+        }
+        Ok(_) => {
+            if let CatalogFetch::Found { .. } = fetch {
+                tracing::warn!(
+                    code = "warn.catalog_resume_foreign",
+                    "the ring's catalog for this vault key is not this vault's (signature or owner); not adopted, starting at version 1"
+                );
+            }
+            Ok(Ok(None))
+        }
+    }
+}
+
 /// The vault keys: derived from the recovery phrase and namespace when one is given (ADR-18),
 /// otherwise the node's sealed master key (or `--key-hex`).
 pub(crate) fn vault_keys(
@@ -211,6 +292,12 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
         &cfg,
         key_hex.as_deref(),
     )?;
+    // B-20, L-133 (track C, glue G-10): a seed vault's writer node registers the vault's keys
+    // (never the phrase), so its daemon's VFS can list the vault. Idempotent.
+    #[cfg(all(unix, feature = "vfs"))]
+    if let Some(phrase) = effective_seed_phrase.as_deref() {
+        parvault::vfs::register_vault_keys(&cfg.data_dir, phrase, &vault_namespace)?;
+    }
 
     let mut store_for_sync = block_store
         .clone()
@@ -307,6 +394,46 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
         }
     }
     let catalog_dht_key = master_key.derive_vault_root_dht_key(&vault_namespace);
+    // G-23 (B-169 K11): with no local snapshot, a seed-phrase vault resumes from the ring's
+    // catalog, so a restored owner (or any fresh node given the phrase) continues the vault's
+    // versions instead of starting at 1 and being refused as a rollback. Only a catalog that
+    // verifies under this vault's owner key and catalog key is adopted; an unreachable ring
+    // refuses the pass rather than fork the vault (retried each interval, or an error with
+    // `--once`).
+    if let Some(phrase) = effective_seed_phrase.as_deref() {
+        if prev_version.is_none() {
+            loop {
+                match resume_vault_from_ring(
+                    gc_client.as_ref(),
+                    &catalog_dht_key,
+                    &owner_identity,
+                    &master_key,
+                    phrase,
+                    &vault_namespace,
+                )? {
+                    Ok(Some(snapshot)) => {
+                        println!(
+                            "[parvault] resumed vault '{vault_namespace}' from the ring's catalog version {}",
+                            snapshot.version
+                        );
+                        engine.load_previous_snapshot(&snapshot);
+                        break;
+                    }
+                    Ok(None) => break,
+                    Err(code) if once => anyhow::bail!(
+                        "{code}: no ring host answered for this vault's catalog; nothing was published (run again when a host is reachable)"
+                    ),
+                    Err(code) => {
+                        tracing::warn!(
+                            code,
+                            "no ring host answered for this vault's catalog; nothing published, retrying next pass"
+                        );
+                        tokio::time::sleep(Duration::from_secs(interval_secs.max(1))).await;
+                    }
+                }
+            }
+        }
+    }
     let mut retried_for_quota = false;
 
     loop {

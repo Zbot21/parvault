@@ -120,7 +120,7 @@ volumes:
 name: parvault-ring-backup
 services:
   ring-backup:
-    image: parvault:0.5.5-dev
+    image: parvault:0.5.6-dev
     pull_policy: never
     user: "65532:65532"
     network_mode: none
@@ -158,6 +158,8 @@ What every project also does:
 - Runs each service as `65532:65532`, with `cap_drop: [ALL]`, `no-new-privileges`, a read-only root, and tmpfs for `/tmp` (and `/run/parvault` for the daemon). The one-shot services have `network_mode: none` and `restart: "no"`.
 - The Synology projects turn on the token-gated status page, bound to loopback (`--status-http 127.0.0.1:4080` in `command:`); the image alone has none. To use it from the LAN, change `127.0.0.1` to the NAS's LAN address. With host networking that is the NAS's own interface, so never use `0.0.0.0` or a WAN-facing address.
 
+**Older versions (UI only).** When the daemon backs up a folder (`up --folder`), it keeps older versions of it (by default the last 3, plus one a day for 3 days). To get one back, make a shared folder `parvault-restore`, then in `compose.yaml` uncomment the `restore-version` service, set `VERSION_NUMBER` to a retained version, and build. The service runs once and writes that version's files into `parvault-restore`; the daemon keeps running. Comment the service again afterwards. A version that is no longer retained is refused (`reject.version_not_retained`) and its error lists the retained versions.
+
 ## 6. Firewall
 
 If the DSM firewall is on (Control Panel > Security > Firewall), allow from the LAN:
@@ -180,7 +182,7 @@ The volume is kept: the daemon finds its ring (`install-chain` on a joined node 
 Optional; [DOCKER.md](DOCKER.md) is the full shell guide. Over SSH on the NAS, the first run can be done with `docker run` on the same volume (it starts owned by `65532:65532`). After that, use `deploy/synology/compose.yaml` on that node, whether it started the ring or joined one: `up --init-if-absent` finds the ring and the daemon starts. Do not use `join.compose.yaml` there: its placeholder token would hold the daemon back.
 
 ```sh
-IMG=parvault:0.5.5-dev   # the tag you imported
+IMG=parvault:0.5.6-dev   # the tag you imported
 sudo docker load -i parvault-image-amd64-dev.tar
 # This NAS starts a new ring (the first node):
 sudo docker run --rm --network none --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges:true --read-only --tmpfs /tmp:mode=1777 -v parvault-data:/var/lib/parvault "$IMG" --data-dir /var/lib/parvault wot init

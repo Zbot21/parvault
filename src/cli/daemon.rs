@@ -46,6 +46,34 @@ pub(crate) async fn run_daemon(
     opts: DaemonLaunchOptions,
 ) -> anyhow::Result<()> {
     let start_instant = Instant::now();
+    // B-152 (b), A-152 part 4: the envelope store's per-profile budget (glue G-4).
+    block_store.set_dht_store_limits(parvault::storage::block_store::DhtStoreLimits::for_profile(
+        cfg.hardware_profile,
+    ));
+    // G-29: the profile's Kademlia and envelope-store limits in force, once at start.
+    {
+        use parvault::network::transport::{KadParams, KAD_REPLICATION_ENV};
+        let kad = KadParams::for_profile(cfg.hardware_profile);
+        let kad = kad
+            .with_replication_env(std::env::var(KAD_REPLICATION_ENV).ok().as_deref())
+            .unwrap_or(kad);
+        let dht = block_store.dht_store_limits();
+        info!(
+            code = "info.profile_limits",
+            profile = cfg.hardware_profile.as_str(),
+            kad_replication_secs = kad.replication_secs,
+            kad_publication_secs = kad.publication_secs,
+            kad_record_ttl_secs = kad.record_ttl_secs,
+            kad_max_records = kad.max_records,
+            kad_max_value_bytes = kad.max_value_bytes,
+            kad_max_total_bytes = kad.max_total_bytes,
+            dht_store_max_keys = dht.max_keys,
+            dht_store_max_bytes = dht.max_bytes,
+            dht_store_max_owner_keys = dht.max_owner_keys,
+            dht_store_max_owner_bytes = dht.max_owner_bytes,
+            "profile limits"
+        );
+    }
     // Deterministic lab mode: the side-channel and conflict rule, then every listener and
     // dial-set address (main ran the same checks before creating any file).
     parvault::config::lab_side_channel_decision(&opts.eff)
@@ -125,10 +153,14 @@ pub(crate) async fn run_daemon(
         keypair,
         cfg.enable_quic,
         opts.lan_discovery_enabled && !deterministic,
-        parvault::network::GateParams::for_set(Arc::clone(&dial_set)).with_counters(
-            counters.clone(),
-            parvault::traversal_metrics::Origin::Daemon,
-        ),
+        parvault::network::GateParams::for_set(Arc::clone(&dial_set))
+            .with_counters(
+                counters.clone(),
+                parvault::traversal_metrics::Origin::Daemon,
+            )
+            .with_kad(parvault::network::transport::KadParams::for_profile(
+                cfg.hardware_profile,
+            )),
     )?;
     let tcp_addr: Multiaddr = cfg.listen_tcp.parse()?;
     swarm.listen_on(tcp_addr.clone())?;
@@ -170,12 +202,16 @@ pub(crate) async fn run_daemon(
     };
     let beacon_handle = spawn_beacon(&opts, &block_store, local, bound_tcp_port, init_explicit_ip);
 
-    // A-TLS-6 (track A): the edge certificate, made at the first `up` (never at `init`) and
-    // before any edge listener binds. `None`: plain HTTP, as before v0.5.6.
-    let edge_cert = parvault::edge_tls::ensure_cert(&cfg.data_dir, &opts.edge_tls)?;
-    if let Some(ref cert) = edge_cert {
-        info!(spki_sha256 = %hex::encode(cert.spki_sha256), "edge TLS certificate");
-    }
+    // A-TLS-6 (track A, glue G-11): the edge certificate, made at the first `up` with a
+    // non-loopback WebDAV or status bind (never at `init`) and before any edge listener binds.
+    let edges = parvault::edge_tls::prepare_edges(
+        &cfg.data_dir,
+        &opts.edge_tls,
+        &parvault::edge_tls::EdgeBinds {
+            webdav: opts.vfs_webdav_listen.clone(),
+            status: opts.status_http_bind.clone(),
+        },
+    )?;
 
     let status_state = spawn_status_server(&opts, &cfg, &block_store, local, start_instant).await?;
 
@@ -214,7 +250,7 @@ pub(crate) async fn run_daemon(
                 anyhow::anyhow!("--status-http needs a gateway macaroon root key")
             })?;
             let sock_addr: SocketAddr = bind_str.parse()?;
-            let (bound_http, handle) = RouterNasStatusServer::bind_and_spawn(
+            let (bound_http, handle) = RouterNasStatusServer::bind_and_spawn_served(
                 sock_addr,
                 parvault::gateway::ipc::GatewayBus::in_process(Arc::clone(eng)),
                 parvault::http_edge::EdgeVerifier::RootKey(root_key),
@@ -222,9 +258,11 @@ pub(crate) async fn run_daemon(
                     counters: parvault::traversal_metrics::process_counters(),
                     config_digest: Some(opts.config_digest.clone()),
                 },
+                edges.status.clone(),
             )?;
             println!(
-                "[parvault] Embedded Status Server listening on http://{}",
+                "[parvault] Embedded Status Server listening on {}://{}",
+                edges.status.scheme(),
                 bound_http
             );
             info!(%bound_http, "RouterNasStatusServer active");
@@ -323,12 +361,14 @@ pub(crate) async fn run_daemon(
             let root_key = opts.macaroon_root_key.ok_or_else(|| {
                 anyhow::anyhow!("built-in WebDAV needs a macaroon root key (F-43)")
             })?;
-            let handle = vfs.spawn_webdav_server(
+            let handle = vfs.spawn_webdav_server_served(
                 webdav_addr,
                 parvault::vfs::WebdavVerifier::RootKey(root_key),
+                edges.webdav.clone(),
             )?;
             println!(
-                "[parvault] Built-in VFS WebDAV listening on http://{} (in-process GatewayBus, socket={})",
+                "[parvault] Built-in VFS WebDAV listening on {}://{} (in-process GatewayBus, socket={})",
+                edges.webdav.scheme(),
                 handle.local_addr(),
                 opts.ipc_socket.is_some()
             );
@@ -353,6 +393,7 @@ pub(crate) async fn run_daemon(
 
     #[cfg(not(unix))]
     {
+        let _ = &edges;
         let _ = (
             &opts.strict_allowed_peer_uids,
             opts.require_sealed_ingest_memfd,
@@ -743,6 +784,14 @@ fn spawn_folder_sync(opts: &DaemonLaunchOptions, cfg: &NodeConfig, block_store: 
                         store_cl
                     };
                     let mut engine = FolderSyncEngine::new(store_owner, mk, owner_id, sync_tier);
+                    // B-154 C3 (track B2, glue G-17): GC settings and the placement journal
+                    // hook, before the pass places any stripe.
+                    if gc_enabled {
+                        engine.set_gc(parvault::sync::gc_journal::GcSettings::appliance(
+                            &data_dir_cl,
+                            engine.store().mesh_client().cloned(),
+                        ));
+                    }
                     if snap_cl.exists() {
                         if let Ok(raw) = std::fs::read(&snap_cl) {
                             if let Ok(prev) = FolderSnapshotManifest::decode_bytes(&raw) {

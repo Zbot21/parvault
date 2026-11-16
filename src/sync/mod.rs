@@ -1,3 +1,4 @@
+pub mod catalog_resume;
 pub mod common;
 #[cfg(unix)]
 pub mod gateway;

@@ -111,7 +111,7 @@ fn l72_queued_scavenger_starts_within_n_plus_1_grants() {
     kani::cover!(grants == 1, "scavenger started at once");
 }
 
-use crate::vfs::{catalog_import_decision, CatalogImport};
+use crate::sync::catalog_resume::{catalog_import_decision, CatalogImport};
 
 /// B20-LIST: a catalog is applied only if it verifies, names this data dir's key and is newer
 /// than the loaded one; the same version is a no-op and an older one a rollback.

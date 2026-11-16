@@ -432,24 +432,23 @@ reach      B152-COUNT-REACH sym=src/storage/quota.rs::held_shard_decision from=s
 kani       B152-COUNT sym=src/storage/quota.rs::held_shard_decision harness=proof_held_shard_decision cover=shard over the bound refused
 kani       B152-BOUND sym=src/storage/quota.rs::held_shard_bound_from harness=proof_held_shard_bound_clamped_and_monotone cover=bound at the floor
 suite      S-L130    test=trust_enforcement_gc_host::l130_bound_follows_the_cgroup_limit needs=cmd:systemd-run   # L-130: 64 MiB and 256 MiB cgroup limits derive bounds 1:4; an override wins
-open       B152-COUNT expect=claim by=v0.5.6 ref=docs/security/TRUST_FINDINGS.md   # passes once integration glue G-15 (main.rs sets the bound from max_held_shards) lands; delete this line then
-open       S-L130    expect=suite by=v0.5.6 ref=docs/security/TRUST_FINDINGS.md   # passes once integration glue G-15 lands; delete this line then
 suite      S-B152-CYCLES test=trust_enforcement_gc_host::b152_two_cycles_of_2000_shards needs=cmd:sh   # arch056c 1.8: three paths, restart recount, second cycle no higher
 
-ratchet    R         open=3 waive=32
+ratchet    R         open=1 waive=32
 
 # --- v0.5.6 track C: restore path and fetch scheduler (plan 3.3 to 3.5) ---------------------------
-claim      B20-LIST  sym=src/vfs.rs::catalog_import_decision accept=trust_enforcement_restore::b20_readonly_token_lists_catalog reject=trust_enforcement_restore::b20_foreign_catalog_refused code=reject.catalog_foreign bin=parvault   # B-20: only a catalog this data dir's key wrote is listed
-claim      B20-LIST-RB sym=src/vfs.rs::catalog_import_decision accept=trust_enforcement_restore::b20_readonly_token_lists_catalog reject=trust_enforcement_restore::b20_rollback_catalog_refused code=reject.catalog_rollback bin=parvault   # B-20: an older catalog than the loaded one is not applied
+claim      B20-LIST  sym=src/sync/catalog_resume.rs::catalog_import_decision accept=trust_enforcement_restore::b20_readonly_token_lists_catalog reject=trust_enforcement_restore::b20_foreign_catalog_refused code=reject.catalog_foreign bin=parvault   # B-20: only a catalog this data dir's key wrote is listed
+claim      B20-LIST-RB sym=src/sync/catalog_resume.rs::catalog_import_decision accept=trust_enforcement_restore::b20_readonly_token_lists_catalog reject=trust_enforcement_restore::b20_rollback_catalog_refused code=reject.catalog_rollback bin=parvault   # B-20: an older catalog than the loaded one is not applied
 claim      L72-SCHED sym=src/fetch_sched.rs::fetch_slot_decision accept=trust_enforcement_restore::l72_foreground_ttfb_under_load reject=trust_enforcement_restore::l72_scavenger_waits_while_foreground_queued code=defer.scavenger_preempted bin=parvault   # L-72 (S1, S2, S7): foreground preempts the in-daemon scavenger at stripe admission
 suite      S-L72-MUT test=trust_enforcement_restore::l72_priority_mutant_fails_the_accept_test needs=cmd:sh   # S5: the no-priority mutant fails the accept condition
 suite      S-B24     test=trust_enforcement_restore::b24_concurrent_cold_reads_fetch_once needs=cmd:sh   # B-24: 8 cold readers, one fetch, 200 times
 suite      S-S6      test=trust_enforcement_restore::s6_foreground_join_promotes_a_queued_scavenger_fetch needs=cmd:sh   # S6: a foreground join promotes a queued scavenger fetch
 kani       L72-SCHED sym=src/fetch_sched.rs::fetch_slot_decision harness=l72_foreground_granted_when_queued_and_slot_free args=--lib cover=scavenger deferred for a foreground read
-kani       B20-LIST  sym=src/vfs.rs::catalog_import_decision harness=b20_catalog_import_decision args=--lib cover=foreign catalog refused
+kani       B20-LIST  sym=src/sync/catalog_resume.rs::catalog_import_decision harness=b20_catalog_import_decision args=--lib cover=foreign catalog refused
 claim      VAULTKEY  sym=src/vfs.rs::vaultkey_load_decision accept=trust_enforcement_restore::b20_seed_vault_listed_and_read reject=trust_enforcement_restore::b20_swapped_vaultkey_refused code=reject.vaultkey_mismatch bin=parvault   # archC1 cond. 1: a vault key file bound to its namespace, owner and DHT key
-claim      B20-LIST-SV sym=src/vfs.rs::catalog_import_decision accept=trust_enforcement_restore::b20_seed_vault_listed_and_read reject=trust_enforcement_restore::b20_seed_vault_foreign_catalog_refused code=reject.catalog_foreign bin=parvault   # archC1 cond. 3: another owner's validly signed catalog at the vault's DHT key
-claim      B20-LIST-SVRB sym=src/vfs.rs::catalog_import_decision accept=trust_enforcement_restore::b20_seed_vault_listed_and_read reject=trust_enforcement_restore::b20_seed_vault_rollback_refused code=reject.catalog_rollback bin=parvault   # archC1 cond. 3: rollback across a restart (vaults/<ns>.floor)
+claim      B20-LIST-SV sym=src/sync/catalog_resume.rs::catalog_import_decision accept=trust_enforcement_restore::b20_seed_vault_listed_and_read reject=trust_enforcement_restore::b20_seed_vault_foreign_catalog_refused code=reject.catalog_foreign bin=parvault   # archC1 cond. 3: another owner's validly signed catalog at the vault's DHT key
+claim      B20-LIST-SVRB sym=src/sync/catalog_resume.rs::catalog_import_decision accept=trust_enforcement_restore::b20_seed_vault_listed_and_read reject=trust_enforcement_restore::b20_seed_vault_rollback_refused code=reject.catalog_rollback bin=parvault   # archC1 cond. 3: rollback across a restart (vaults/<ns>.floor)
+suite      S-T2      test=trust_enforcement_restore::t2_freed_stripe_reimports_once_then_fails_cleanly needs=cmd:sh   # T2 (glue G-26): a GC-freed stripe re-imports once, retries once, fails cleanly
 suite      S-B20-SYNC test=trust_enforcement_restore::b20_parvault_sync_read_only_listing needs=cmd:sh   # B-20: parvault-sync read-only list and pull
 kani       VAULTKEY  sym=src/vfs.rs::vaultkey_load_decision harness=vaultkey_used_only_when_every_binding_holds args=--lib cover=renamed key file refused
 
@@ -461,6 +460,10 @@ kani       B152-DHT-STORE sym=src/storage/block_store.rs::dht_store_decision har
 kani       B152-KAD-BUDGET sym=src/network/server_events.rs::kad_record_decision harness=kad_record_budget_respected cover=full kad store refuses
 claim      B152-DHT-FULL sym=src/storage/block_store.rs::dht_store_decision accept=trust_enforcement_liveness::b152_envelope_keys_per_version_measured reject=trust_enforcement_liveness::b152_dht_store_full_refused code=reject.dht_store_full bin=parvault ref=docs/security/TRUST_FINDINGS.md   # A-152 4.1-4.3: refuse at the budget, never evict (PARVAULT_DHT_STORE_MAX_BYTES lowers it for the test)
 claim      B152-DHT-OWNER sym=src/storage/block_store.rs::dht_store_decision accept=trust_enforcement_liveness::b152_envelope_keys_per_version_measured reject=trust_enforcement_liveness::b152_dht_owner_key_cap_refused code=reject.dht_owner_key_cap bin=parvault ref=docs/security/TRUST_FINDINGS.md   # A-152 4.2: one owner at most three quarters of the keys and bytes
+suite      S-G28     test=trust_enforcement_liveness::g28_two_dht_writers_lose_no_envelope_or_version_floor needs=cmd:sh   # G-28: the sync engine and the wire handler share one ZeroTrustDhtStore
+suite      S-G28-PROC test=trust_enforcement_liveness::g28_two_processes_lose_no_envelope_or_floor needs=cmd:sh   # G-28: two processes on one store file (flock, re-read, merge)
+suite      S-G28-MERGE test=trust_enforcement_liveness::g28_merge_never_lowers_a_floor needs=cmd:sh   # G-28 merge rule: a lower version never replaces a higher one
+suite      S-G29     test=trust_enforcement_liveness::g29_router_soc_daemon_reports_its_profile_limits needs=cmd:sh   # G-29: info.profile_limits on a router-soc daemon
 
 # --- v0.5.6 track E: setup and ops (plan 3.12-3.15; arch056a A-146, arch056b K1-K12, arch056c 2) -
 claim      B174-LOCK sym=src/datadir_lock.rs::acquire accept=trust_enforcement_setup::b174_concurrent_init_one_ring reject=trust_enforcement_setup::b174_second_holder_refused code=reject.datadir_locked bin=parvault ref=docs/security/TRUST_FINDINGS.md   # A-146-1: one data dir, one holder; up holds it from its preflight until the daemon exits
@@ -506,3 +509,10 @@ claim      EDGE-FRAMING sym=src/http_edge.rs::head_framing_decision accept=trust
 kani       B1-PLAIN-K sym=src/http_edge.rs::edge_transport_decision harness=proof_edge_transport_never_plain_off_loopback_without_opt_out cover=plain non-loopback refused
 kani       B1-KEY-K  sym=src/http_edge.rs::tls_key_file_decision harness=proof_tls_key_file_owner_only cover=group or world bits refused
 kani       B1-PAIR-K sym=src/http_edge.rs::tls_key_pair_decision harness=proof_tls_key_pair_must_match cover=mismatched pair refused
+suite      S-E1      test=windows_equiv_acceptance::e1_windows_equivalent needs=cmd:curl   # v0.5.6 E1
+artifact   A-TLS-DOCKER script=scripts/docker_stage_webdav_tls.sh bin=parvault suite=docker_acceptance_gate::docker_acceptance_gate   # stage 14-webdav-tls, called by the acceptance gate
+
+# --- v0.5.6 integration (glue G-23, G-28; Lead design additions 2026-11-16) ---------------------
+claim      CATALOG-RESUME sym=src/sync/catalog_resume.rs::catalog_resume_decision accept=trust_enforcement_setup::b169_restored_owner_publishes_above_and_frees_nothing reject=trust_enforcement_setup::g23_unreachable_ring_refuses_to_publish code=reject.catalog_resume_unreachable bin=parvault ref=docs/security/TRUST_FINDINGS.md   # G-23, B-169 K11: a node with no snapshot resumes the vault from the ring's own catalog, never a foreign one; an unreachable ring refuses
+suite      S-G23-FRESH test=trust_enforcement_setup::g23_fresh_node_from_phrase_resumes needs=cmd:sh   # G-23: a fresh node from the phrase alone resumes too
+suite      S-G23-FOREIGN test=trust_enforcement_setup::g23_foreign_catalog_not_adopted needs=cmd:sh   # G-23: a squatted catalog at this vault's key is never adopted

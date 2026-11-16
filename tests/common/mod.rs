@@ -164,19 +164,3 @@ pub fn parvault_in(dir: &std::path::Path, args: &[&str]) -> Output {
         .args(args);
     output_within_deadline(&mut cmd)
 }
-
-/// `v0.5.6` T0: `out` is the seam refusal of the stub `entry` (a failed exit whose output
-/// names `reject.not_built_yet` and the entry). Each track replaces its stub's check with the
-/// real accept and reject tests.
-pub fn assert_not_built_yet(out: &Output, entry: &str) {
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(!out.status.success(), "{entry} succeeded: {text}");
-    assert!(
-        text.contains("reject.not_built_yet") && text.contains(entry),
-        "{entry}: no stub refusal in: {text}"
-    );
-}

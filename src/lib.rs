@@ -47,7 +47,6 @@ pub mod profile;
 pub mod router_nas;
 #[cfg(feature = "daemon-runtime")]
 pub mod runtime;
-pub mod seam;
 pub mod sharding;
 pub mod storage;
 pub mod sync;

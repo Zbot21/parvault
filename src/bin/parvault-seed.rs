@@ -42,14 +42,15 @@ use parvault::{
         DEFAULT_SUBTREE_SLASH_LIMIT,
     },
     por::PorVerifierEngine,
+    profile::HardwareProfile,
     router_nas::read_linux_process_memory_kib,
     sharding::merkle::hash_shard_leaf,
     storage::{
         load_or_generate_tracker_admin_identity, load_tracker_admin_identity,
-        AnonymousQuotaVoucher, BlindedShardCapability, BlindedShardId, BlockStore,
-        EvictionPurgeReport, EvictionTarget, PrivacyPreservingEvictionEngine,
-        PublicTrackerTakedownQueue, QuotaManager, ShardId, SignedBadActorEvictionOrder,
-        TakedownReviewStatus, TrustLevel, VoucherNullifierLedger,
+        quota::held_shard_bound_at_startup, AnonymousQuotaVoucher, BlindedShardCapability,
+        BlindedShardId, BlockStore, EvictionPurgeReport, EvictionTarget,
+        PrivacyPreservingEvictionEngine, PublicTrackerTakedownQueue, QuotaManager, ShardId,
+        SignedBadActorEvictionOrder, TakedownReviewStatus, TrustLevel, VoucherNullifierLedger,
     },
 };
 use std::collections::HashSet;
@@ -514,11 +515,20 @@ async fn main() -> anyhow::Result<()> {
                     .saturating_mul(1024 * 1024);
                 let mut quota = QuotaManager::new(ram_cap_bytes, ram_cap_bytes);
                 quota.set_min_free_disk_bytes(0);
+                // L-130 (glue G-16): the seed holds shards like a homelab NAS.
+                quota.set_held_shard_bound(held_shard_bound_at_startup(
+                    HardwareProfile::HomelabNas,
+                    None,
+                ));
                 BlockStore::new_in_memory(quota).with_mesh_client(mesh_client)
             } else {
                 let max_bytes = max_gb.saturating_mul(1024 * 1024 * 1024);
                 let grace_bytes = 2 * 1024 * 1024 * 1024;
-                let quota = QuotaManager::new(max_bytes, grace_bytes);
+                let mut quota = QuotaManager::new(max_bytes, grace_bytes);
+                quota.set_held_shard_bound(held_shard_bound_at_startup(
+                    HardwareProfile::HomelabNas,
+                    None,
+                ));
                 let bs = BlockStore::new(&data_dir, quota)?.with_mesh_client(mesh_client);
                 let mode_marker = match mode {
                     CliSeedMode::HomelabVault => "homelab-vault",

@@ -341,16 +341,15 @@ fn handle_status_conn(
                 send_response(stream, "200 OK", "application/json", &json)
             }
             Err(e) => {
-                // QA of T0: a refusal by code is answered with that code, not a bare 503: 501
-                // while the gateway has no live status yet (`reject.not_built_yet`), 503 else.
+                // A refusal by code is answered with that code in the body (QA of T0), 503.
                 let text = e.to_string();
                 let code = reject_code_in(&text);
-                tracing::warn!(peer = %peer, error = %e, "live status not served by the gateway");
-                let status = if code == Some(crate::seam::NOT_BUILT_YET) {
-                    "501 Not Implemented"
-                } else {
-                    "503 Service Unavailable"
-                };
+                tracing::warn!(
+                    peer = %peer,
+                    code = crate::live_status::live_refusal_code(&e),
+                    "refused a /live request"
+                );
+                let status = "503 Service Unavailable";
                 let body =
                     serde_json::json!({ "error": code.unwrap_or("reject.status_unavailable") });
                 send_response(

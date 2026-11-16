@@ -1588,7 +1588,7 @@ mod golden_wire {
         "resp Error 3 b7c04c4052c347008dfd50308f5eec48d49ea14b6799fbaf6766fd909f843bab",
         "resp StoreSuccessLocalOnly 4 89d1aa480b45d25c240e8e575927ccf33ddb8bdef94edaa84e56a433b1e369ad",
         "resp StatusSnapshot 5 91e96c3e3aa3aef402af076f2034354a657615f15706c1db41bc9c923896c556",
-        "resp LiveStatus 6 39939a09b92872610d559b5ea1aea4be5e6b26894de89f89d68994a6944630cb",
+        "resp LiveStatus 6 374c590caedec1bbf679bf57629878a6618127eaffdca4f813285471474d08a4",
     ];
 
     #[test]

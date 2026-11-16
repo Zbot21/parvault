@@ -949,7 +949,6 @@ fn b152_two_cycles_of_2000_shards() {
 /// B152-COUNT accept: under the held-shard bound (`max_held_shards = 2` in `config.toml`) a
 /// node stores up to the bound.
 #[test]
-#[ignore = "needs integration glue G-15 (main.rs sets the held-shard bound); un-ignore at integration with the open lines"]
 fn b152_put_within_held_shard_bound_accepted() {
     let node = spawn_node_with("count-a", Some("max_held_shards = 2\n"), &[]);
     node.assert_logged("info.held_shard_bound");
@@ -964,7 +963,6 @@ fn b152_put_within_held_shard_bound_accepted() {
 /// B152-COUNT reject: at the bound a new shard is refused (`reject.node_shard_count`) and not
 /// written; a freed slot is usable again.
 #[test]
-#[ignore = "needs integration glue G-15 (main.rs sets the held-shard bound); un-ignore at integration with the open lines"]
 fn b152_put_over_held_shard_bound_refused() {
     let node = spawn_node_with("count-r", Some("max_held_shards = 2\n"), &[]);
     let owner = key(0xE2);
@@ -1007,7 +1005,6 @@ fn logged_bound(node: &Node) -> (u64, String) {
 /// -p MemoryMax`, the limit it actually runs under) derives bounds in that ratio from the
 /// cgroup; a config value wins under the same limit.
 #[test]
-#[ignore = "needs integration glue G-15 (main.rs sets the held-shard bound); un-ignore at integration with the open lines"]
 fn l130_bound_follows_the_cgroup_limit() {
     let scope = |mem: &'static str| -> Vec<&'static str> {
         vec![

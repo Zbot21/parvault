@@ -207,4 +207,3 @@ fn b180_gateway_socket_group() {
     assert!(!ok && out.contains("reject.socket_group_unknown"), "{out}");
     gate_ran("edge_daemon_tls::b180_gateway_socket_group");
 }
-

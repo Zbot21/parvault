@@ -2497,6 +2497,7 @@ impl MeshClient {
                     }
                     .into());
                 }
+                crate::network::placement::note_placed(peer_addr, &shard_id);
                 Ok(())
             }
             other => Err(MeshClientError::ProtocolError(format!(
@@ -2762,9 +2763,6 @@ impl MeshClient {
         let expected = order.shard_ids.len();
         match self.send_request(peer_addr, MeshWireRequest::FreeShards { order }) {
             Ok(MeshWireResponse::FreeShardsAck { outcomes, error }) => match error {
-                Some(e) if e.contains(crate::seam::NOT_BUILT_YET) => {
-                    Ok(FreeShardsReply::Unsupported(e))
-                }
                 Some(e) => Ok(FreeShardsReply::Refused(e)),
                 None if outcomes.len() == expected => Ok(FreeShardsReply::Outcomes(outcomes)),
                 None => Ok(FreeShardsReply::Refused(format!(
@@ -3160,6 +3158,33 @@ impl MeshClient {
     /// Queries both the persistent Kademlia DHT and configured mesh peers (and `seed_addr`) for a
     /// `DhtWireEnvelope` by `dht_key`, verifies zero-knowledge signature integrity on every
     /// candidate, and returns the highest `monotonic_version` (`C3`).
+    /// G-23 (catalog resume): asks every ring endpoint for the vault catalog at `dht_key` and
+    /// returns how many answered (a "not found" is an answer), with every catalog they returned, unfiltered
+    /// (the caller checks the owner and key, so a foreign catalog is logged, never adopted).
+    /// `answered == 0` means the ring could not be asked.
+    pub fn fetch_vault_catalogs(
+        &self,
+        dht_key: &[u8; 32],
+    ) -> (usize, Vec<crate::sync::EncryptedVaultCatalogEnvelope>) {
+        let mut answered = 0;
+        let mut found = Vec::new();
+        for ep in self.all_network_endpoints() {
+            if let Ok(MeshWireResponse::GetDhtEnvelopeResult { envelope, .. }) = self.send_request(
+                &ep,
+                MeshWireRequest::GetDhtEnvelope {
+                    dht_key: *dht_key,
+                    kind: DhtEnvelopeKind::VaultCatalog,
+                },
+            ) {
+                answered += 1;
+                if let Some(DhtWireEnvelope::VaultCatalog(c)) = envelope {
+                    found.push(c);
+                }
+            }
+        }
+        (answered, found)
+    }
+
     pub fn get_dht_envelope(
         &self,
         dht_key: &[u8; 32],

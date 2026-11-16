@@ -107,16 +107,18 @@ impl GatewayIpcServer {
         &self.socket_path
     }
 
-    /// B-180 (`v0.5.6`): gives the bound socket to `group` with mode `0660`; `None` keeps
-    /// `0600`. T0 stub: a group is refused (`reject.not_built_yet`).
+    /// B-180 (`v0.5.6`): gives the bound socket to `group` (a name in `/etc/group` or a numeric
+    /// gid) with mode `0660`; `None` keeps `0600`. `--allow-peer-uid` still applies to every peer.
     pub fn with_socket_group(self, group: Option<&str>) -> io::Result<Self> {
-        match group {
-            None => Ok(self),
-            Some(_) => Err(crate::seam::not_built_yet(crate::seam::Unbuilt {
-                track: "A or E (B-180)",
-                entry: "--gateway-socket-group",
-            })),
-        }
+        use std::os::unix::fs::PermissionsExt;
+        let Some(group) = group else {
+            return Ok(self);
+        };
+        let gid = crate::capabilities::resolve_group_id(group)?;
+        std::os::unix::fs::chown(&self.socket_path, None, Some(gid))?;
+        std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o660))?;
+        tracing::info!(socket = %self.socket_path.display(), gid, "gateway socket group set (mode 0660)");
+        Ok(self)
     }
 
     pub fn engine(&self) -> &Arc<GatewayEngine> {

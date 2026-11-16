@@ -393,35 +393,9 @@ pub enum PathRemoval {
     Folder,
 }
 
-/// What [`catalog_import_decision`] allows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CatalogImport {
-    /// A newer catalog: apply it.
-    Apply,
-    /// The version already loaded: nothing to do.
-    Unchanged,
-}
-
-/// Claim `B20-LIST` (`@guard`): whether a fetched vault catalog is imported. A catalog that
-/// fails verification or names another vault key is foreign (`reject.catalog_foreign`); one
-/// older than the loaded version is a rollback (`reject.catalog_rollback`).
-pub const fn catalog_import_decision(
-    envelope_verifies: bool,
-    key_matches: bool,
-    envelope_version: u64,
-    loaded_version: u64,
-) -> Result<CatalogImport, &'static str> {
-    if !envelope_verifies || !key_matches {
-        return Err("reject.catalog_foreign");
-    }
-    if envelope_version < loaded_version {
-        return Err("reject.catalog_rollback");
-    }
-    if envelope_version == loaded_version {
-        return Ok(CatalogImport::Unchanged);
-    }
-    Ok(CatalogImport::Apply)
-}
+/// Claim `B20-LIST`: the catalog import decision lives in `sync::catalog_resume` (glue G-23:
+/// `watch-folder` resumes a vault through the same rule, also in a build without `vfs`).
+pub use crate::sync::catalog_resume::{catalog_import_decision, CatalogImport};
 
 /// Claim `VAULTKEY` (`@guard`, archC1 condition 1): whether a `vaults/<namespace>.vaultkey`
 /// file is used. It must unseal under this data dir's keystore, name the namespace its file

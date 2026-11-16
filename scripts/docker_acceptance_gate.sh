@@ -1157,6 +1157,12 @@ echo "Mounted MP4 gate verified: FUSE ${VFS_FUSE_RESULT}; WebDAV 206 PASS (plain
 # Stage 13 (v0.5.6 track B2): B-154 version GC on a 3-node ring (T1, T2, T4).
 source scripts/gate_stage13_version_gc.sh
 
+# --- Stage 14-webdav-tls (v0.5.6 track A; E1 steps 5 and 9) ------------------------------------
+# Read-only WebDAV over TLS from a bridge-mode container: the published-port leg with --tls-san and
+# an rclone copy (scripts/docker_stage_webdav_tls.sh; its own containers, labelled with this run).
+PARVAULT_GATE_RUN_ID="${RUN_ID}" PARVAULT_GATE_STAGE_DIR="$STAGE_DIR" bash scripts/docker_stage_webdav_tls.sh \
+    || { echo "ERROR: stage 14-webdav-tls failed"; exit 1; }
+
 echo "================================================================================"
 PARVAULT_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
 echo " PARVAULT v${PARVAULT_VERSION} MULTI-CONTAINER & ROUTER-SOC DOCKER ACCEPTANCE SUMMARY"
