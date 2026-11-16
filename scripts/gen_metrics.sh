@@ -122,8 +122,91 @@ adr_last="${adrs[adr_count - 1]}"
 [[ -f src/network/behaviour.rs ]] || fail "missing file: src/network/behaviour.rs"
 wire_variants="$(awk '/^pub enum MeshWireRequest \{/{p=1;next} p&&/^\}/{exit} p' src/network/behaviour.rs | grep -cE '^    [A-Z][A-Za-z0-9]*\b' || true)"
 positive wire_request_variants "$wire_variants"
-tests_unit="$(count "$test_re" "${src_rs[@]}")";                 positive tests_unit "$tests_unit"
-tests_int="$(count "$test_re" "${test_rs[@]}")";                 positive tests_integration "$tests_int"
+# B-168: a test counts only if some CI job runs it. A test under a feature-gated module (the cfg on
+# its `mod` line, inherited by submodules) or a feature-gated test fn is counted only when every
+# feature it needs is in `default` or in the --features of some `cargo test` step in
+# .github/workflows/*.yml (a "$VAR" value is read from that file's `VAR:` line), with the
+# features each one enables. Uncounted tests are listed on stderr.
+ci_tests="$(python3 -I - "$test_re" "${src_rs[@]}" -- "${test_rs[@]}" <<'PY'
+import glob, os, re, sys
+test_re = re.compile(sys.argv[1].replace(r"\s", r"[ \t]"))
+args = sys.argv[2:]; cut = args.index("--"); src, tests = args[:cut], args[cut + 1:]
+cargo = open("Cargo.toml").read()
+feat_block = re.search(r"^\[features\]\n(.*?)(?=^\[)", cargo, re.S | re.M).group(1)
+feats = {m.group(1): re.findall(r'"([^"]+)"', m.group(2))
+         for m in re.finditer(r'^([A-Za-z0-9_-]+)\s*=\s*\[(.*?)\]', feat_block, re.M)}
+def closure(names):
+    out, todo = set(), list(names)
+    while todo:
+        n = todo.pop()
+        if n in out or n.startswith("dep:"):
+            continue
+        out.add(n); todo += feats.get(n, [])
+    return out
+tested = closure(feats.get("default", []))
+for wf in glob.glob(".github/workflows/*.yml"):
+    text = open(wf).read()
+    env = dict(re.findall(r"^\s*([A-Z_][A-Z0-9_]*):\s*(\S+)\s*$", text, re.M))
+    for line in text.splitlines():
+        if "cargo test" not in line:
+            continue
+        for v in re.findall(r'--features[ =]("[^"]*"|\S+)', line):
+            v = v.strip('"')
+            v = env.get(v[1:], "") if v.startswith("$") else v
+            tested |= closure(x for x in re.split(r"[ ,]+", v) if x)
+CFG = re.compile(r"#\[cfg\((.*)\)\]")
+def needs(cfg):
+    cfg = re.sub(r'not\([^()]*\)', "", cfg)
+    return set(re.findall(r'feature\s*=\s*"([^"]+)"', cfg))
+gate = {}  # module file -> features its mod line needs (inherited)
+def mod_files(path, name):
+    d = os.path.dirname(path) if os.path.basename(path) in ("lib.rs", "main.rs", "mod.rs") else os.path.splitext(path)[0]
+    return [os.path.join(d, name + ".rs"), os.path.join(d, name, "mod.rs")]
+order = sorted(src, key=lambda p: p.count("/"))
+for path in order:
+    lines = open(path).read().splitlines()
+    for i, l in enumerate(lines):
+        m = re.match(r"\s*(pub(\([^)]*\))?\s+)?mod\s+([a-z0-9_]+)\s*;", l)
+        if not m:
+            continue
+        need = set()
+        j = i - 1
+        while j >= 0 and lines[j].strip().startswith("#["):
+            c = CFG.match(lines[j].strip())
+            if c:
+                need |= needs(c.group(1))
+            j -= 1
+        for f in mod_files(path, m.group(3)):
+            gate[f] = gate.get(f, set()) | need | gate.get(path, set())
+def count(files):
+    n, skipped = 0, []
+    for path in files:
+        lines = open(path).read().splitlines()
+        base = gate.get(path, set())
+        for i, l in enumerate(lines):
+            if not test_re.match(l):
+                continue
+            need = set(base)
+            j = i - 1
+            while j >= 0 and lines[j].strip().startswith("#["):
+                c = CFG.match(lines[j].strip())
+                if c:
+                    need |= needs(c.group(1))
+                j -= 1
+            if need <= tested:
+                n += 1
+            else:
+                skipped.append(f"{path}:{i + 1} needs {','.join(sorted(need - tested))}")
+    return n, skipped
+u, su = count(src); t, st = count(tests)
+for s in su + st:
+    print(f"gen_metrics.sh: not counted (no CI job runs it): {s}", file=sys.stderr)
+print(u, t)
+PY
+)" || fail "counting the tests CI runs failed"
+read -r tests_unit tests_int <<<"$ci_tests"
+positive tests_unit "$tests_unit"
+positive tests_integration "$tests_int"
 tests_total=$((tests_unit + tests_int))
 
 version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"

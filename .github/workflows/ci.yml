@@ -287,6 +287,19 @@ jobs:
           rc=0; bash scripts/check_no_insecure_metrics.sh --marker-only "$RUNNER_TEMP/nc2-parvault" || rc=$?
           [ "$rc" -eq 1 ] || { echo "::error::control 2: marker scan expected exit 1, got $rc"; exit 1; }
 
+  feature-gated-tests:
+    # B-168: the tests behind the debug-only lab-insecure-metrics feature (a release build with it
+    # is a compile error, so this is a dev-profile run). scripts/gen_metrics.sh counts a
+    # feature-gated test only when a `cargo test` step here enables its feature.
+    name: Feature-gated tests (lab-insecure-metrics, debug)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Lib tests with lab-insecure-metrics (debug build)
+        run: cargo test --locked --lib --features lab-insecure-metrics
+
   docs-commands:
     # L-34 (plan-7 section 3): every command block in README.md and QUICKSTART.md runs against
     # the release binaries in fresh ubuntu:24.04 containers (no Rust toolchain), or carries a
