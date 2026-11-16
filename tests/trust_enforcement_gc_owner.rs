@@ -520,21 +520,7 @@ fn spawn_host_with(config: &str) -> Host {
         std::fs::write(dir.join("config.toml"), config).unwrap();
     }
     let log = tmp.path().join("host.log");
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_parvault"));
-    cmd.env("PARVAULT_LAN_REGISTRY_DIR", tmp.path().join("lan-registry"))
-        .env("PARVAULT_GENESIS_SEED_HEX", GENESIS_SEED_HEX)
-        .env_remove("PARVAULT_PEERS")
-        .env_remove("PARVAULT_GENESIS_PUBKEY_HEX")
-        .arg("--data-dir")
-        .arg(&dir)
-        .args([
-            "--no-lan-discovery",
-            "daemon",
-            "start",
-            "--listen",
-            common::LOOPBACK_EPHEMERAL,
-        ]);
-    let (child, addr) = common::spawn_on_ephemeral_port(&mut cmd, &log);
+    let (child, addr) = start_host_daemon(tmp.path(), &dir, &log, common::LOOPBACK_EPHEMERAL);
     let id = parvault::crypto::NodeIdentity::load_or_generate_in_dir(&dir).unwrap();
     let pid = parvault::network::node_identity_libp2p_peer_id(&id).unwrap();
     Host {
@@ -546,7 +532,47 @@ fn spawn_host_with(config: &str) -> Host {
     }
 }
 
+/// Starts a storage daemon on `dir` listening on `listen`; returns it and its listen address.
+fn start_host_daemon(
+    tmp: &Path,
+    dir: &Path,
+    log: &Path,
+    listen: &str,
+) -> (std::process::Child, String) {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", tmp.join("lan-registry"))
+        .env("PARVAULT_GENESIS_SEED_HEX", GENESIS_SEED_HEX)
+        .env_remove("PARVAULT_PEERS")
+        .env_remove("PARVAULT_GENESIS_PUBKEY_HEX")
+        .arg("--data-dir")
+        .arg(dir)
+        .args(["--no-lan-discovery", "daemon", "start", "--listen", listen]);
+    common::spawn_on_ephemeral_port(&mut cmd, log)
+}
+
 impl Host {
+    /// The listen address without the `/p2p/` suffix (how the Docker gate names its peers).
+    fn plain_addr(&self) -> &str {
+        self.addr.split("/p2p/").next().unwrap()
+    }
+
+    /// Stops the daemon (as `docker stop` does).
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    /// Starts the daemon again on the same data directory and port (as `docker start` does).
+    fn restart(&mut self) {
+        let listen = self.plain_addr().to_string();
+        let log = self.log.with_extension("restart.log");
+        let tmp = self.log.parent().unwrap().to_path_buf();
+        let (child, addr) = start_host_daemon(&tmp, &self.dir, &log, &listen);
+        assert_eq!(addr, listen, "the host came back on another port");
+        self.child = child;
+        self.log = log;
+    }
+
     fn shard_names(&self) -> std::collections::BTreeSet<String> {
         std::fs::read_dir(self.dir.join("shards"))
             .map(|rd| {
@@ -594,6 +620,32 @@ fn ring_pass_args(f: &LocalFolder, peers: &str, extra: &[&str], limit: Duration)
         ])
         .args(extra);
     output_within(&mut cmd, limit)
+}
+
+/// A ring pass with a raw `--key-hex` and no vault phrase, as the Docker gate's stage 13 runs
+/// it: no catalog is published or fetched, so an unchanged pass dials a host only for GC.
+fn ring_pass_key_hex(f: &LocalFolder, peers: &str) -> Output {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", f.node.join("lan-registry"))
+        .env("PARVAULT_GENESIS_SEED_HEX", GENESIS_SEED_HEX)
+        .env("RUST_LOG", "info")
+        .env_remove("PARVAULT_SEED_PHRASE")
+        .env_remove("PARVAULT_PEERS")
+        .env_remove("PARVAULT_GENESIS_PUBKEY_HEX")
+        .arg("--data-dir")
+        .arg(&f.node)
+        .args(["--no-lan-discovery", "--peers", peers])
+        .args([
+            "watch-folder",
+            "--folder",
+            f.folder.to_str().unwrap(),
+            "--snapshot-out",
+            f.snap.to_str().unwrap(),
+            "--key-hex",
+            KEY_HEX,
+            "--once",
+        ]);
+    output_within(&mut cmd, Duration::from_secs(240))
 }
 
 /// `restore-folder --version` of `f` through the ring.
@@ -1061,4 +1113,122 @@ fn b154_up_no_gc_runs_without_versions() {
     let _ = child.wait();
     assert!(!VersionStore::for_snapshot(&snap).dir().exists());
     gate_ran("trust_enforcement_gc_owner::b154_up_no_gc_runs_without_versions");
+}
+
+// --- B154 T4 (C5): an offline host's garbage is freed within 3 passes of its return ----------
+
+/// B154-OFFLINE accept (C5, Docker gate stage 13 T4): with one of three hosts stopped, 4 changed
+/// passes leave its garbage journalled; once it is back on the same address, the journal is
+/// empty within 3 passes, unchanged passes included.
+#[test]
+fn b154_offline_host_freed_within_three_passes_of_return() {
+    let h1 = spawn_host();
+    let h2 = spawn_host();
+    let mut h3 = spawn_host();
+    let peers = format!(
+        "{},{},{}",
+        h1.plain_addr(),
+        h2.plain_addr(),
+        h3.plain_addr()
+    );
+    let f = LocalFolder::new();
+    let mut body = String::new();
+    let changed_pass = |body: &mut String, n: usize| {
+        body.push_str(&format!("line {n} {}\n", "x".repeat(4096)));
+        f.write(body);
+        let out = ring_pass_key_hex(&f, &peers);
+        let t = text(&out);
+        assert!(out.status.success(), "pass {n}: {t}");
+        t
+    };
+    for n in 0..5 {
+        changed_pass(&mut body, n);
+    }
+    h3.stop();
+    let mut t = String::new();
+    for n in 5..9 {
+        t = changed_pass(&mut body, n);
+    }
+    assert!(
+        !t.contains("Pending Frees      : 0 "),
+        "no frees journalled: {t}"
+    );
+    h3.restart();
+    std::thread::sleep(Duration::from_secs(3));
+    let mut outs = Vec::new();
+    let mut cleared = false;
+    for _ in 0..3 {
+        let out = ring_pass_key_hex(&f, &peers);
+        let t = text(&out);
+        assert!(out.status.success(), "{t}");
+        cleared = t.contains("Pending Frees      : 0 ");
+        outs.push(t);
+        if cleared {
+            break;
+        }
+    }
+    assert!(
+        cleared,
+        "journal not empty within 3 passes of the host's return:\n{}\n--- host 3 log ---\n{}",
+        outs.join("\n---\n"),
+        std::fs::read_to_string(&h3.log).unwrap_or_default()
+    );
+    gate_ran("trust_enforcement_gc_owner::b154_offline_host_freed_within_three_passes_of_return");
+}
+
+/// B154-OFFLINE reject half (T4 root cause): a free journalled for an address of a host the
+/// owner cannot dial (here: a dead loopback port under host 1's peer id, as a host's advertised
+/// loopback listen address is from another container) is sent to the address the owner was given
+/// for that peer id, and the journal empties; before the fix it was retried as unreachable for 30
+/// days.
+#[test]
+fn b154_free_for_unreachable_alias_goes_to_given_host() {
+    let h1 = spawn_host();
+    let h2 = spawn_host();
+    let peers = format!("{},{}", h1.plain_addr(), h2.plain_addr());
+    let f = LocalFolder::new();
+    f.write("one");
+    let out = ring_pass_key_hex(&f, &peers);
+    assert!(out.status.success(), "{}", text(&out));
+    let dead_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let pid = h1.addr.split("/p2p/").nth(1).unwrap();
+    let alias = format!("/ip4/127.0.0.1/tcp/{dead_port}/p2p/{pid}");
+    let paths = parvault::sync::gc_journal::GcPaths::for_snapshot(&f.snap);
+    let mut j = parvault::sync::gc_journal::GcJournal::load(&paths).unwrap();
+    j.pending.push(parvault::sync::gc_journal::PendingFree {
+        shard_id: parvault::storage::ShardId {
+            stripe_merkle_root: [0x5a; 32],
+            shard_index: 3,
+            shard_hash: [0xa5; 32],
+        },
+        shard_len: 4096,
+        host: alias.clone(),
+        attempts: 0,
+        first_attempt_ms: now_ms(),
+        next_pass: 0,
+        skew_refusals: 0,
+    });
+    j.save(&paths).unwrap();
+    let mut outs = Vec::new();
+    let mut cleared = false;
+    for _ in 0..3 {
+        let out = ring_pass_key_hex(&f, &peers);
+        let t = text(&out);
+        assert!(out.status.success(), "{t}");
+        cleared = t.contains("Pending Frees      : 0 ");
+        outs.push(t);
+        if cleared {
+            break;
+        }
+    }
+    assert!(
+        cleared,
+        "the alias free stayed pending ({alias}):\n{}",
+        outs.join("\n---\n")
+    );
+    gate_ran("trust_enforcement_gc_owner::b154_free_for_unreachable_alias_goes_to_given_host");
 }
