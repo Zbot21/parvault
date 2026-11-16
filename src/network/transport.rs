@@ -83,6 +83,26 @@ pub fn server_kad_params() -> KadParams {
 
 static SERVER_KAD: std::sync::Mutex<Option<KadParams>> = std::sync::Mutex::new(None);
 
+/// The test and tuning knob for the Kademlia replication interval (E4), in seconds.
+pub const KAD_REPLICATION_ENV: &str = "PARVAULT_KAD_REPLICATION_SECS";
+
+impl KadParams {
+    /// Applies [`KAD_REPLICATION_ENV`]'s value, if set: whole seconds, at least
+    /// [`MIN_KAD_REPLICATION_SECS`].
+    pub fn with_replication_env(self, raw: Option<&str>) -> Result<Self, &'static str> {
+        match raw {
+            None => Ok(self),
+            Some(v) => {
+                let secs: u64 = v
+                    .trim()
+                    .parse()
+                    .map_err(|_| "reject.kad_replication_invalid")?;
+                self.with_replication_secs(secs)
+            }
+        }
+    }
+}
+
 impl Default for KadParams {
     fn default() -> Self {
         Self::for_profile(crate::profile::HardwareProfile::Desktop)
@@ -217,6 +237,24 @@ fn build_swarm(
         std::sync::Arc::clone(&gate.set),
     )
     .boxed();
+    let mut gate = gate;
+    if kad_server {
+        let raw = std::env::var(KAD_REPLICATION_ENV).ok();
+        gate.kad = gate
+            .kad
+            .with_replication_env(raw.as_deref())
+            .map_err(|code| {
+                anyhow::anyhow!(
+                    "{code}: {KAD_REPLICATION_ENV} must be whole seconds, at least {MIN_KAD_REPLICATION_SECS}"
+                )
+            })?;
+        if raw.is_some() {
+            tracing::info!(
+                replication_secs = gate.kad.replication_secs,
+                "Kademlia replication interval set by {KAD_REPLICATION_ENV}"
+            );
+        }
+    }
     let behaviour = construct_behaviour(&keypair, enable_mdns, kad_server, &gate)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let peer_id = keypair.public().to_peer_id();
@@ -359,6 +397,19 @@ mod tests {
             Err("reject.kad_replication_too_short")
         );
         assert_eq!(d.with_replication_secs(60).unwrap().replication_secs, 60);
+        assert_eq!(d.with_replication_env(None), Ok(d));
+        assert_eq!(
+            d.with_replication_env(Some("90")).unwrap().replication_secs,
+            90
+        );
+        assert_eq!(
+            d.with_replication_env(Some("10")),
+            Err("reject.kad_replication_too_short")
+        );
+        assert_eq!(
+            d.with_replication_env(Some("1h")),
+            Err("reject.kad_replication_invalid")
+        );
     }
 
     /// B-41 / F-11: the client swarm never runs mDNS, so its event loop has no mDNS arm.

@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+- **Liveness and visibility (`v0.5.6` track D: B-157, B-148, B-149, B-152 b).** The daemon redials configured peers and admitted ring members after a disconnect: the backoff starts at 1 s, doubles to a 30 s cap with jitter, and resets only after a connection has held for 60 s. It dials their own listen addresses (at most 8), never an observed, mDNS or Kademlia address. `GET /live` on the status listener returns the daemon's live state (admitted and connected peers, listen addresses, anonymous memory); it needs the same read-only token as the other status routes. A new connection's "not yet admitted (no handshake yet)" line is now DEBUG; admission logs at INFO. `file store` prints placement as placed: shards and bytes per host by PeerId, the stored expansion (for example 4.0x with two hosts at 10-of-20), and whether every stripe survives the loss of one host. Kademlia intervals and record-store limits are set per profile (replication 1 h, or 6 h on `router-soc`; at most 1,024, 512 or 128 records and 64, 16 or 4 MiB), and inbound records over the budget are refused (`reject.dht_record_store_full`). The envelope store has a budget (256, 32 or 8 MiB; 8,192, 2,048 or 256 keys; one owner at most three quarters of either). At its budget it refuses new keys and never evicts (`reject.dht_store_full`, `reject.dht_owner_key_cap`). A store file that does not load is no longer treated as empty: every envelope put is refused until it is repaired or removed (`reject.dht_store_corrupt`).
+
 ---
 
 ## [`0.5.5`] - 2026-11-16

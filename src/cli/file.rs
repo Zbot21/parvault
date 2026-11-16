@@ -63,15 +63,19 @@ pub(crate) async fn file(env: CliEnv, command: Commands) -> anyhow::Result<()> {
                 "Encrypting (AES-256-GCM) and Reed-Solomon sharding file..."
             );
 
-            let (stored, local_only_stripes) = parvault::storage::local_only::track(|| {
-                store_with_owner.store_file_streaming(
-                    &owner_peer_id,
-                    &path,
-                    &master_key,
-                    effective_tier,
-                    cfg.stripe_size_bytes,
-                )
-            });
+            // B-149: every shard a host accepted is noted while the store runs.
+            let ((stored, local_only_stripes), placed) =
+                parvault::network::placement::track(|| {
+                    parvault::storage::local_only::track(|| {
+                        store_with_owner.store_file_streaming(
+                            &owner_peer_id,
+                            &path,
+                            &master_key,
+                            effective_tier,
+                            cfg.stripe_size_bytes,
+                        )
+                    })
+                });
             let manifest = stored?;
             let (dht_key, _) = manifest.to_encrypted_dht_record(&master_key)?;
 
@@ -91,6 +95,22 @@ pub(crate) async fn file(env: CliEnv, command: Commands) -> anyhow::Result<()> {
             );
             println!("Total Stripes    : {}", manifest.stripes.len());
             println!("Total Shards     : {}", manifest.stripes.len() * n);
+            if !placed.is_empty() {
+                let stripes: Vec<_> = manifest
+                    .stripes
+                    .iter()
+                    .map(|s| (s.stripe_merkle_root, s.k_data, s.shard_len as u64))
+                    .collect();
+                let summary = parvault::network::placement::PlacementSummary::build(
+                    &placed,
+                    |addr| mesh_client.pinned_peer_id(addr).map(|p| p.to_string()),
+                    &stripes,
+                    manifest.original_file_size,
+                );
+                for line in summary.lines(effective_tier.expansion_factor()) {
+                    println!("{line}");
+                }
+            }
             parvault::storage::local_only::finish_one_shot(local_only_stripes, allow_local_only);
         }
         FileAction::Restore {

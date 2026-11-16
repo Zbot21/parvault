@@ -2446,24 +2446,91 @@ pub struct DhtStoreLimits {
 }
 
 impl DhtStoreLimits {
-    /// Per profile (arch152b 4: budgets router-soc 8 MiB, homelab-nas 32 MiB, desktop 256 MiB;
-    /// arch152 4.2: keys 256, 2,048, 8,192). One owner may take three quarters of either, so one
-    /// ring member cannot fill the store for the others (provisional until per-owner counts are
-    /// measured on a real ring).
+    /// Per profile: byte budgets router-soc 8 MiB, homelab-nas 32 MiB, desktop 256 MiB
+    /// (arch152b 4). Key counts are one per 4 KiB of budget (2,048, 8,192, 65,536): every
+    /// changed file adds one manifest key per version and nothing removes envelopes until
+    /// B-182, so the key count is what version churn exhausts; the byte budget bounds memory.
+    /// One owner may take three quarters of either, so one ring member cannot fill the store
+    /// for the others.
     pub const fn for_profile(profile: crate::profile::HardwareProfile) -> Self {
         let (max_bytes, max_keys) = match profile {
-            crate::profile::HardwareProfile::RouterSoc => (8 << 20, 256),
-            crate::profile::HardwareProfile::HomelabNas => (32 << 20, 2_048),
-            crate::profile::HardwareProfile::Desktop => (256 << 20, 8_192),
+            crate::profile::HardwareProfile::RouterSoc => (8 << 20, 2_048),
+            crate::profile::HardwareProfile::HomelabNas => (32 << 20, 8_192),
+            crate::profile::HardwareProfile::Desktop => (256 << 20, 65_536),
         };
+        Self::with_totals(max_bytes, max_keys)
+    }
+
+    const fn with_totals(max_bytes: u64, max_keys: u64) -> Self {
+        let owner_bytes = max_bytes / 4 * 3;
+        let owner_keys = max_keys / 4 * 3;
         Self {
             max_bytes,
             max_keys,
-            max_owner_bytes: max_bytes / 4 * 3,
-            max_owner_keys: max_keys / 4 * 3,
+            max_owner_bytes: if owner_bytes == 0 { 1 } else { owner_bytes },
+            max_owner_keys: if owner_keys == 0 { 1 } else { owner_keys },
+        }
+    }
+
+    /// Applies the test and tuning knobs [`DHT_STORE_MAX_KEYS_ENV`] and
+    /// [`DHT_STORE_MAX_BYTES_ENV`] (raw values, if set). They only lower the limits; zero or a
+    /// value that does not parse is refused (`reject.dht_store_override_invalid`). The owner
+    /// shares follow the lowered totals.
+    pub fn with_overrides(
+        self,
+        keys: Option<&str>,
+        bytes: Option<&str>,
+    ) -> Result<Self, &'static str> {
+        let parse = |raw: Option<&str>, current: u64| -> Result<u64, &'static str> {
+            match raw {
+                None => Ok(current),
+                Some(v) => match v.trim().parse::<u64>() {
+                    Ok(n) if n > 0 => Ok(n.min(current)),
+                    _ => Err("reject.dht_store_override_invalid"),
+                },
+            }
+        };
+        let max_keys = parse(keys, self.max_keys)?;
+        let max_bytes = parse(bytes, self.max_bytes)?;
+        if max_keys == self.max_keys && max_bytes == self.max_bytes {
+            return Ok(self);
+        }
+        let l = Self::with_totals(max_bytes, max_keys);
+        Ok(Self {
+            max_owner_bytes: l.max_owner_bytes.min(self.max_owner_bytes),
+            max_owner_keys: l.max_owner_keys.min(self.max_owner_keys),
+            ..l
+        })
+    }
+
+    /// [`Self::with_overrides`] from the environment; a refused override is logged and the
+    /// limits stay as they were.
+    pub fn with_env_overrides(self) -> Self {
+        let keys = std::env::var(DHT_STORE_MAX_KEYS_ENV).ok();
+        let bytes = std::env::var(DHT_STORE_MAX_BYTES_ENV).ok();
+        match self.with_overrides(keys.as_deref(), bytes.as_deref()) {
+            Ok(l) => {
+                if l != self {
+                    tracing::info!(
+                        max_keys = l.max_keys,
+                        max_bytes = l.max_bytes,
+                        "DHT envelope store limits lowered by the environment"
+                    );
+                }
+                l
+            }
+            Err(code) => {
+                tracing::error!(code, "DHT envelope store limit override ignored");
+                self
+            }
         }
     }
 }
+
+/// Test and tuning knob: lowers the envelope store's key cap (never raises it).
+pub const DHT_STORE_MAX_KEYS_ENV: &str = "PARVAULT_DHT_STORE_MAX_KEYS";
+/// Test and tuning knob: lowers the envelope store's byte budget (never raises it).
+pub const DHT_STORE_MAX_BYTES_ENV: &str = "PARVAULT_DHT_STORE_MAX_BYTES";
 
 impl Default for DhtStoreLimits {
     fn default() -> Self {
@@ -2577,6 +2644,7 @@ impl ZeroTrustDhtStore {
         let path = data_dir.join(DHT_STORE_FILE);
         let mut store = Self {
             persistence_path: Some(path.clone()),
+            limits: DhtStoreLimits::default().with_env_overrides(),
             ..Self::default()
         };
         if !path.exists() {
@@ -2598,7 +2666,7 @@ impl ZeroTrustDhtStore {
             Err(error) => {
                 store.corrupt = true;
                 tracing::error!(
-                    code = "reject.dht_store_corrupt",
+                    code = "error.dht_store_unreadable",
                     path = %path.display(),
                     %error,
                     "the DHT envelope store does not load; refusing DHT puts until it is repaired or removed"
@@ -2610,8 +2678,9 @@ impl ZeroTrustDhtStore {
 
     /// Sets the capacity budget. Held envelopes over a smaller budget stay; new keys are
     /// refused until the store is back under it.
+    /// The environment knobs ([`DhtStoreLimits::with_env_overrides`]) still apply.
     pub fn set_limits(&mut self, limits: DhtStoreLimits) {
-        self.limits = limits;
+        self.limits = limits.with_env_overrides();
     }
 
     pub fn limits(&self) -> DhtStoreLimits {

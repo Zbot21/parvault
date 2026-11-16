@@ -32,6 +32,36 @@ pub struct LiveStatusSnapshot {
     pub shards_held: u64,
     /// Anonymous resident memory of the daemon, bytes (B-152).
     pub anon_rss_bytes: u64,
+    /// The node's held-shard bound (L-130, arch152 3.6), when known.
+    pub held_shard_bound: Option<u64>,
+    /// Where the bound came from (cgroup limit, physical RAM, config override); empty when
+    /// the bound is not known.
+    pub held_shard_bound_source: String,
+}
+
+/// The shard half of a [`LiveStatusSnapshot`], from the block store and the quota manager
+/// (`BlockStore::shards_held`, `QuotaManager::held_shard_bound`; integration glue G-5).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShardFacts {
+    pub shards_held: u64,
+    pub held_shard_bound: Option<u64>,
+    pub held_shard_bound_source: String,
+}
+
+/// Longest bound-source text a snapshot carries.
+pub const MAX_BOUND_SOURCE_LEN: usize = 64;
+
+/// The reason code of a refused `/live` request, for the status edge's own log line: the
+/// first `reject.` code in the refusal (the status decision's), else
+/// `reject.live_status_unavailable` (no daemon, or no code in the error).
+pub fn live_refusal_code(e: &dyn std::fmt::Display) -> String {
+    let text = e.to_string();
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '_'))
+        .find(|w| w.starts_with("reject.") && w.len() > "reject.".len())
+        .map_or_else(
+            || "reject.live_status_unavailable".to_string(),
+            str::to_string,
+        )
 }
 
 impl LiveStatusSnapshot {
@@ -43,6 +73,7 @@ impl LiveStatusSnapshot {
                 .peers
                 .iter()
                 .all(|p| p.addrs.len() <= MAX_LIVE_ADDRS_PER_PEER)
+            && self.held_shard_bound_source.chars().count() <= MAX_BOUND_SOURCE_LEN
     }
 }
 
@@ -51,13 +82,27 @@ impl LiveStatusSnapshot {
 /// [`crate::network::redial::book`], fed by `server_events`), its listen addresses, the fetch
 /// scheduler's counters and its anonymous resident memory. Lists are capped
 /// ([`MAX_LIVE_PEERS`], [`MAX_LIVE_ADDRS_PER_PEER`]); peers are sorted by PeerId.
+/// Until the shard facts are passed in (glue G-5), the shard fields are 0 and the bound is
+/// unknown.
 pub fn snapshot() -> std::io::Result<LiveStatusSnapshot> {
+    snapshot_with(&ShardFacts::default())
+}
+
+/// [`snapshot`] with the node's shard facts.
+pub fn snapshot_with(shards: &ShardFacts) -> std::io::Result<LiveStatusSnapshot> {
     #[cfg(feature = "daemon-runtime")]
     let mut snap = network_view();
     #[cfg(not(feature = "daemon-runtime"))]
     let mut snap = LiveStatusSnapshot::default();
     snap.fetch = crate::fetch_sched::counters();
     snap.anon_rss_bytes = anon_rss_bytes();
+    snap.shards_held = shards.shards_held;
+    snap.held_shard_bound = shards.held_shard_bound;
+    snap.held_shard_bound_source = shards
+        .held_shard_bound_source
+        .chars()
+        .take(MAX_BOUND_SOURCE_LEN)
+        .collect();
     debug_assert!(snap.within_caps());
     Ok(snap)
 }
@@ -124,6 +169,24 @@ mod tests {
         let s = "Name:\tparvault\nRssAnon:\t   12345 kB\nRssFile:\t 1 kB\n";
         assert_eq!(parse_rss_anon_kib(s), Some(12_345));
         assert_eq!(parse_rss_anon_kib("Name: x\n"), None);
+    }
+
+    #[test]
+    fn shard_facts_carried_and_refusal_codes() {
+        let s = snapshot_with(&ShardFacts {
+            shards_held: 7,
+            held_shard_bound: Some(4_096),
+            held_shard_bound_source: "x".repeat(200),
+        })
+        .unwrap();
+        assert_eq!((s.shards_held, s.held_shard_bound), (7, Some(4_096)));
+        assert!(s.within_caps());
+        let e = std::io::Error::other("QueryStatus refused: reject.example_code (x)");
+        assert_eq!(live_refusal_code(&e), "reject.example_code");
+        assert_eq!(
+            live_refusal_code(&"socket gone"),
+            "reject.live_status_unavailable"
+        );
     }
 
     #[test]
