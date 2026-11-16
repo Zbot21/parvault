@@ -164,11 +164,11 @@ tlc.distinct.ParVaultZeroKeyAdminAndQuorum.RootOffDisk = 873,792
 tlc.depth.ParVaultZeroKeyAdminAndQuorum.RootOffDisk = 21
 tlc.distinct.ParVaultGatewayPluginBus = 20,288
 tlc.depth.ParVaultGatewayPluginBus = 12
-# ParVaultPorAudit measured 2026-11-15 at b522cdb on evo-x2 (B-59; tla2tools v1.8.0):
-# java -cp tla2tools.jar tlc2.TLC -workers 4 -config ParVaultPorAudit.cfg ParVaultPorAudit.tla
-tlc.generated.ParVaultPorAudit = 16,201
-tlc.distinct.ParVaultPorAudit = 1,944
-tlc.depth.ParVaultPorAudit = 14
+# ParVaultPorAudit re-measured 2026-11-16 at 8bcaa50 on the box (B-113 handoff spec; every other
+# spec unchanged): bash scripts/gen_metrics.sh --measured tlc (pvjob 20261116-011432-integ055-3643191-17689)
+tlc.generated.ParVaultPorAudit = 837,217
+tlc.distinct.ParVaultPorAudit = 73,872
+tlc.depth.ParVaultPorAudit = 17
 
 # --- Latest PUBLISHED release ----------------------------------------------------
 # The newest tag that exists on GitHub with its release assets. Install and fetch
@@ -218,6 +218,6 @@ bench.soc.headroom_32m = 22.26 MiB
 bench.soc.headroom_48m = 38.26 MiB
 bench.soc.vmhwm_reduction = 5.9x
 aes.enc.span = 496.5–589.2 MiB/s
-tlc.generated = 2,016,158,172
-tlc.distinct = 1,413,824
+tlc.generated = 2,016,979,188
+tlc.distinct = 1,485,752
 # <<< end generated
