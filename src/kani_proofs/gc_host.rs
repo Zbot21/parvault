@@ -72,8 +72,8 @@ fn proof_held_shard_decision() {
 
 /// B152-BOUND (L-130): for each profile's real share, floor and ceiling, a derived bound lies in
 /// [floor, ceiling], more memory never lowers it, and an override wins. Memory is the only
-/// symbolic quantity (KiB-granular up to 4 TiB); a symbolic share and bounds made the products
-/// nonlinear and the run passed 15 minutes (`OPERATIONAL_LESSONS.md` 8.1, 8.2).
+/// symbolic quantity; a symbolic share and bounds made the products nonlinear and the run
+/// passed 15 minutes, and 32-bit KiB memory took 897 s (`OPERATIONAL_LESSONS.md` 8.1, 8.2).
 #[kani::proof]
 fn proof_held_shard_bound_clamped_and_monotone() {
     use crate::profile::HardwareProfile;
@@ -83,8 +83,10 @@ fn proof_held_shard_bound_clamped_and_monotone() {
         _ => HardwareProfile::Desktop,
     };
     let (share, floor, ceiling) = crate::storage::quota::held_shard_profile(profile);
-    let mem = u64::from(kani::any::<u32>()) << 10;
-    let more = mem + (u64::from(kani::any::<u32>()) << 10);
+    // MiB-granular memory up to 64 GiB: wide enough for every profile's floor-to-ceiling range
+    // (the desktop ceiling is reached at 52 GiB), narrow enough to verify in seconds.
+    let mem = u64::from(kani::any::<u16>()) << 20;
+    let more = mem + (u64::from(kani::any::<u16>()) << 20);
     let a =
         crate::storage::quota::held_shard_bound_from(Some(mem), true, share, floor, ceiling, None);
     let b =
