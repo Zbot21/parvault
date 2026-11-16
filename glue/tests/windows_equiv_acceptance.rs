@@ -91,12 +91,15 @@ fn e1_windows_equivalent() {
         ),
         "P-256"
     );
+    // basicConstraints, optionally critical (01 01 FF), holding CA:FALSE: an empty SEQUENCE, or
+    // (rcgen) one with an explicit cA FALSE.
+    let bc = edge_common::find(&der, &[0x06, 0x03, 0x55, 0x1D, 0x13]).expect("basicConstraints");
+    let after = &der[bc + 5..(bc + 15).min(der.len())];
+    let body = after.strip_prefix(&[0x01, 0x01, 0xFF][..]).unwrap_or(after);
     assert!(
-        has(
-            &der,
-            &[0x06, 0x03, 0x55, 0x1D, 0x13, 0x04, 0x02, 0x30, 0x00]
-        ),
-        "CA:FALSE"
+        body.starts_with(&[0x04, 0x02, 0x30, 0x00])
+            || body.starts_with(&[0x04, 0x05, 0x30, 0x03, 0x01, 0x01, 0x00]),
+        "CA:FALSE: {after:02x?}"
     );
     assert!(
         has(
