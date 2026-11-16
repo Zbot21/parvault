@@ -62,6 +62,39 @@ fn seam_check_fails_on_a_leftover_call_at_v0_5_6() {
     assert!(!ok && text.contains("names no track"), "{text}");
 }
 
+/// G3 non-vacuity (qa-t0 MEDIUM): at 0.5.6 the call scan alone is bypassed by an import alias,
+/// a call split across lines and a direct `seam::NOT_BUILT_YET`; each fails, as does a remaining
+/// `src/seam.rs`. At 0.5.5 the same trees pass (the mention check is release-only).
+#[test]
+fn seam_check_fails_on_bypass_forms_at_v0_5_6() {
+    let cargo = |v: &str| format!("[package]\nname = \"p\"\nversion = \"{v}\"\n");
+    let bypasses = [
+        "use crate::seam::not_built_yet as nb;\nfn f() { let _ = nb(x); }\n",
+        "fn f() { let _ = crate::seam::not_built_yet\n    (x); }\n",
+        "fn f() -> &'static str { crate::seam::NOT_BUILT_YET }\n",
+    ];
+    let needle = "src/a.rs:1: version 0.5.6: mentions the seam";
+    for body in bypasses {
+        let tree = planted_tree(&[("Cargo.toml", &cargo("0.5.6")), ("src/a.rs", body)]);
+        let (ok, text) = run_script_on("check_seam_unbuilt.sh", &[tree.path()]);
+        assert!(!ok && text.contains(needle), "{body}: {text}");
+        assert!(
+            !text.contains("[UNBUILT]"),
+            "the call scan should miss {body}: {text}"
+        );
+        let dev = planted_tree(&[("Cargo.toml", &cargo("0.5.5")), ("src/a.rs", body)]);
+        let (ok, text) = run_script_on("check_seam_unbuilt.sh", &[dev.path()]);
+        assert!(ok, "{body}: {text}");
+    }
+    let seam_left = planted_tree(&[
+        ("Cargo.toml", &cargo("0.5.6")),
+        ("src/seam.rs", "pub fn g() {}\n"),
+        ("src/a.rs", "fn f() {}\n"),
+    ]);
+    let (ok, text) = run_script_on("check_seam_unbuilt.sh", &[seam_left.path()]);
+    assert!(!ok && text.contains("src/seam.rs still exists"), "{text}");
+}
+
 /// Ruling change 5: no feature cfg inside a claimed or Kani-named function or its facts struct.
 #[test]
 fn claimed_functions_carry_no_feature_cfg() {
