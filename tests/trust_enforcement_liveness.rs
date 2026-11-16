@@ -967,17 +967,18 @@ fn g28_merge_never_lowers_a_floor() {
 const G28_ROUNDS: u64 = 150;
 
 /// G-28 helper: one writer process, spawned by `g28_two_processes_lose_no_envelope_or_floor`
-/// (a no-op when run on its own). It keeps one store open for its whole life, as a daemon or a
+/// with `--ignored` (ignored otherwise, so it never runs, or passes, on its own). It keeps one store open for its whole life, as a daemon or a
 /// `watch-folder` loop does, and per round puts its own key's next version and tries the shared
 /// key at an interleaved version (2i + id), recording the highest one it was granted.
 #[test]
+#[ignore = "helper process of g28_two_processes_lose_no_envelope_or_floor; run only by it"]
 fn g28_writer_child() {
     use parvault::crypto::MasterKey;
     use parvault::storage::{FileManifest, SignedDhtManifestEnvelope, ZeroTrustDhtStore};
-    let Ok(dir) = std::env::var("PV_G28_CHILD_DIR") else {
-        return;
-    };
-    let dir = PathBuf::from(dir);
+    let dir = PathBuf::from(
+        std::env::var("PV_G28_CHILD_DIR")
+            .expect("spawned by g28_two_processes_lose_no_envelope_or_floor"),
+    );
     let me: u64 = std::env::var("PV_G28_CHILD_ID").unwrap().parse().unwrap();
     let manifest =
         FileManifest::decode_bytes(&std::fs::read(dir.join("manifest.bin")).unwrap()).unwrap();
@@ -1044,6 +1045,7 @@ fn g28_two_processes_lose_no_envelope_or_floor() {
                 .args([
                     "g28_writer_child",
                     "--exact",
+                    "--ignored",
                     "--nocapture",
                     "--test-threads=1",
                 ])

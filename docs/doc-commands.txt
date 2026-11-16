@@ -60,7 +60,7 @@ parvault up --no-socket --vfs-seed-dir /mnt/usb-nas/shared --vfs-webdav-listen 1
 TOKEN="$(parvault token mint --read-only --ttl-secs 86400)"
 curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
 
-## README.md:246 node=main skip="needs the Rust toolchain, Docker, or cross linkers and this repository; CI's rust-tests and release jobs run these"
+## README.md:248 node=main skip="needs the Rust toolchain, Docker, or cross linkers and this repository; CI's rust-tests and release jobs run these"
 cargo run --release --bin parvault-bench -- run --payload-mib 64
 bash scripts/docker_acceptance_gate.sh
 bash scripts/build_bins.sh --profile soc --target x86_64-unknown-linux-musl --out dist
@@ -129,3 +129,12 @@ parvault up --no-socket --vfs-seed-dir ~/Documents --vfs-webdav-listen 127.0.0.1
 ## QUICKSTART.md:330 node=laptop
 TOKEN="$(parvault token mint --read-only --ttl-secs 86400)"
 curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
+
+## QUICKSTART.md:341 node=laptop background ready="Built-in VFS WebDAV listening on https://0.0.0.0:8443"
+parvault up --no-socket --vfs-seed-dir ~/Documents --vfs-webdav-listen 0.0.0.0:8443
+
+## QUICKSTART.md:346 node=laptop
+parvault tls show
+parvault tls export --out webdav.crt
+TOKEN="$(parvault token mint --read-only --ttl-secs 86400)"
+curl -fsS --cacert webdav.crt -u "token:$TOKEN" -X PROPFIND -H "Depth: 1" https://127.0.0.1:8443/

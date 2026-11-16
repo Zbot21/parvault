@@ -318,6 +318,9 @@ pub fn apply_cap(
                 out.dropped += 1;
             }
             None => {
+                // Kani locates the B154-CAP check here.
+                #[cfg(kani)]
+                kani::cover!(newest.is_some(), "newest alone over the cap");
                 out.below_one_version = true;
                 return out;
             }

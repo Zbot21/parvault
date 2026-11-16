@@ -313,7 +313,11 @@ pub fn no_change_decision<P: PartialEq, R: PartialEq>(
     prev_tombstones: &[P],
     next_tombstones: &[P],
 ) -> bool {
-    prev_files == next_files && prev_tombstones == next_tombstones
+    let same = prev_files == next_files && prev_tombstones == next_tombstones;
+    // Kani locates the B154-NOCHANGE check here (a pure comparison has no other check).
+    #[cfg(kani)]
+    kani::cover!(same, "no change");
+    same
 }
 
 /// B154-NOCHANGE on a pass: `Some(code)` when the pass is no change. The first pass of a

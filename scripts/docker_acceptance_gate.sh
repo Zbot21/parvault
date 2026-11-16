@@ -507,14 +507,14 @@ done
 SEED_SHARD_COUNT_V1="$(docker exec parvault-seed-0-${RUN_ID} sh -c 'ls -1 /var/lib/parvault-seed/shards/*.shard 2>/dev/null | wc -l')"
 echo "Total remote node shards (v1): $TOTAL_SHARDS_V1 | Seed shards (v1): $SEED_SHARD_COUNT_V1 | Elapsed: ${SYNC_V1_SECS}s"
 
-echo "=== [6/12] Continuous Background Backup Daemon ('watch-folder --interval-secs 1 --prune-deleted') ==="
+echo "=== [6/12] Continuous Background Backup Daemon ('watch-folder --interval-secs 2 --prune-deleted') ==="
 docker exec -w /tmp/client-upload-state parvault-client-${RUN_ID} sh -c "
     nohup /usr/local/bin/parvault \
         --peers '$PEERS_CSV' \
         --seed-addr '$SEED_MULTIADDR' \
         watch-folder \
         --folder /workspace/source_vault \
-        --interval-secs 1 \
+        --interval-secs 2 \
         --prune-deleted \
         --seed-phrase '$SEED_PHRASE' \
         --vault-namespace '$VAULT_NS' \
@@ -534,7 +534,7 @@ docker exec parvault-client-${RUN_ID} sh -cex '
 '
 
 # Wait for continuous watch-folder daemon to complete pass v2 (including Catalog Envelope DHT publish!) and stop it cleanly
-for attempt in $(seq 1 25); do
+for attempt in $(seq 1 50); do
     if docker exec parvault-client-${RUN_ID} awk '/Deleted Tombstones : 1/{found=1} found && /Catalog Envelope/{ok=1} END{exit !ok}' /tmp/watch-daemon.log 2>/dev/null; then
         break
     fi

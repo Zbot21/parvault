@@ -541,11 +541,24 @@ async fn run(
     let mut quota = QuotaManager::new(cfg.max_storage_bytes, cfg.bootstrap_grace_bytes);
     quota.set_min_free_disk_bytes(cfg.min_free_disk_bytes);
     quota.set_write_epoch_secs(cfg.quota_write_epoch_secs);
-    // L-130 (track B1, glue G-15): the held-shard bound, from `max_held_shards` or memory.
-    quota.set_held_shard_bound(parvault::storage::quota::held_shard_bound_at_startup(
-        cfg.hardware_profile,
-        cfg.max_held_shards,
-    ));
+    // L-130 (track B1, glue G-15): the held-shard bound, from `max_held_shards` or memory,
+    // logged (`info.held_shard_bound`) only by a command that starts the daemon: a CLI
+    // command's logs share stdout with its output (`discover --json`).
+    let starts_daemon = matches!(
+        cli.command,
+        Commands::Up { .. }
+            | Commands::Daemon {
+                action: DaemonAction::Start { .. }
+            }
+    );
+    quota.set_held_shard_bound(if starts_daemon {
+        parvault::storage::quota::held_shard_bound_at_startup(
+            cfg.hardware_profile,
+            cfg.max_held_shards,
+        )
+    } else {
+        parvault::storage::quota::held_shard_bound_quiet(cfg.hardware_profile, cfg.max_held_shards)
+    });
     let block_store = BlockStore::new(&cfg.data_dir, quota)?
         .with_stripe_size_bytes(cfg.stripe_size_bytes)
         .with_mesh_client(mesh_client.clone());

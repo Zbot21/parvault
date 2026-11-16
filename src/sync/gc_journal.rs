@@ -47,12 +47,12 @@ pub const LOCAL_HOST: &str = "local";
 
 /// B154-MARK: free a stripe only if no retained version or the pass marks it, it is not in the
 /// last acknowledged catalog (C6), and this vault's own version store produced it.
-pub const fn gc_free_decision(
-    marked: bool,
-    in_published_catalog: bool,
-    produced_here: bool,
-) -> bool {
-    !marked && !in_published_catalog && produced_here
+pub fn gc_free_decision(marked: bool, in_published_catalog: bool, produced_here: bool) -> bool {
+    let free = !marked && !in_published_catalog && produced_here;
+    // Kani locates the B154-MARK check here (a pure boolean has no other check).
+    #[cfg(kani)]
+    kani::cover!(!free && marked, "marked kept");
+    free
 }
 
 /// C4: a `snapshot_out` older than the newest version file (an old copy put back, or a missing
@@ -73,11 +73,14 @@ pub const fn stale_snapshot_decision(
 
 /// C10, C11 (signing half): one epoch per order, `max(last + 1, timestamp_ms)`, so a device
 /// recovered from the phrase (whose last is 0) is not refused by a host that saw the old one.
-pub const fn order_epoch(last_epoch: u64, timestamp_ms: u64) -> u64 {
+pub fn order_epoch(last_epoch: u64, timestamp_ms: u64) -> u64 {
     let next = last_epoch.saturating_add(1);
     if next > timestamp_ms {
         next
     } else {
+        // Kani locates the B154-EPOCH check here.
+        #[cfg(kani)]
+        kani::cover!(timestamp_ms > last_epoch, "timestamp epoch");
         timestamp_ms
     }
 }
@@ -95,7 +98,7 @@ pub enum QuotaRetry {
 
 /// B163-RETRY (C35): after a pass some host refused for quota, run GC and retry the pass once,
 /// only if GC freed something.
-pub const fn quota_retry_decision(
+pub fn quota_retry_decision(
     refused_quota: bool,
     retried_once: bool,
     gc_freed_any: bool,
@@ -105,6 +108,9 @@ pub const fn quota_retry_decision(
     } else if !retried_once && gc_freed_any {
         QuotaRetry::Retry
     } else {
+        // Kani locates the B163-RETRY check here.
+        #[cfg(kani)]
+        kani::cover!(retried_once || !gc_freed_any, "retry spent");
         QuotaRetry::Spent("warn.gc_quota_retry_spent")
     }
 }

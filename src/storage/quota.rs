@@ -382,6 +382,24 @@ pub fn cgroup_limit(proc_self_cgroup: &str, root: &std::path::Path) -> Option<u6
     None
 }
 
+/// [`held_shard_bound_at_startup`] without its log line, for a CLI command (its logs go to stdout,
+/// where a `--json` document must be alone).
+pub fn held_shard_bound_quiet(
+    profile: crate::profile::HardwareProfile,
+    config_override: Option<u64>,
+) -> HeldShardBound {
+    let (share, floor, ceiling) = held_shard_profile(profile);
+    let mem = read_memory_limit();
+    held_shard_bound_from(
+        mem.map(|m| m.0),
+        mem.is_some_and(|m| m.1),
+        share,
+        floor,
+        ceiling,
+        config_override,
+    )
+}
+
 /// L-130 at startup: the held-shard bound for `profile` from the memory the daemon runs under
 /// ([`read_memory_limit`]), an explicit config value winning; logged once with its source
 /// (`info.held_shard_bound`).
@@ -389,16 +407,7 @@ pub fn held_shard_bound_at_startup(
     profile: crate::profile::HardwareProfile,
     config_override: Option<u64>,
 ) -> HeldShardBound {
-    let (share, floor, ceiling) = held_shard_profile(profile);
-    let mem = read_memory_limit();
-    let b = held_shard_bound_from(
-        mem.map(|m| m.0),
-        mem.is_some_and(|m| m.1),
-        share,
-        floor,
-        ceiling,
-        config_override,
-    );
+    let b = held_shard_bound_quiet(profile, config_override);
     tracing::info!(
         code = "info.held_shard_bound",
         max_held_shards = b.max,

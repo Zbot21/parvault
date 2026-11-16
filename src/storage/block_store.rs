@@ -3217,7 +3217,8 @@ impl ZeroTrustDhtStore {
     }
 
     /// Re-reads the store file (under its lock) if it changed since this process last saw it,
-    /// and merges it in. A file that no longer decodes makes this store refuse every put.
+    /// and merges it in. A file that no longer decodes marks the store corrupt, so this put and
+    /// every later one is refused and the file is never rewritten.
     fn merge_from_disk(&mut self, path: &Path) -> Result<(), StorageError> {
         let stamp = file_stamp(path);
         if stamp.is_none() || stamp == self.seen {
@@ -3249,9 +3250,8 @@ impl ZeroTrustDhtStore {
                     %error,
                     "the DHT envelope store does not load; refusing DHT puts until it is repaired or removed"
                 );
-                Err(StorageError::Io(std::io::Error::other(
-                    "reject.dht_store_corrupt",
-                )))
+                // The put that follows is refused by `dht_store_decision` (store_corrupt).
+                Ok(())
             }
         }
     }
