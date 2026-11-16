@@ -445,16 +445,9 @@ impl FolderSyncEngine {
         snapshot: &FolderSnapshotManifest,
         data_dir: &Path,
     ) -> Result<super::gc_journal::GcReport, StorageError> {
-        let settings = self
-            .gc
-            .clone()
-            .unwrap_or_else(|| super::gc_journal::GcSettings {
-                snapshot_out: data_dir.join(APPLIANCE_SNAPSHOT_FILE),
-                policy: super::retention::RetentionPolicy::default(),
-                data_dir: data_dir.to_path_buf(),
-                client: self.store.mesh_client().cloned(),
-                fetched_catalog: None,
-            });
+        let settings = self.gc.clone().unwrap_or_else(|| {
+            super::gc_journal::GcSettings::appliance(data_dir, self.store.mesh_client().cloned())
+        });
         let now_ms = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

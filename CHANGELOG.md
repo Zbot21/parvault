@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- **Old folder versions are garbage-collected (B-154, track B2).** `watch-folder` keeps each version in `<snapshot>.versions/` (a tagged file per version; the snapshot file keeps its `v0.5.5` layout) and by default retains the last 3 versions plus the newest of each of the last 3 days; the newest is always kept, and a clock that is below this build's date or behind a retained version drops nothing for its age (`warn.retention_clock_implausible`). Shards of dropped versions are freed on every host that may hold them (the placed host, the seed, every ring peer on a ring smaller than a stripe, and hosts the PoR auditor found them on) with owner-signed, host-bound `FreeShards` orders, one epoch per order and at most 1,024 shards each; a host without `FreeShards` gets the old `DeleteShard`. Frees are journalled in `<snapshot>.gc/` first, so a crash at any step is finished by the next pass; a host that stays away is retried with backoff and after 30 days kept on an abandoned list, retried daily and shown. `restore-folder --version N` restores a retained version. `--no-gc` keeps the `v0.5.5` behaviour for this release (no version store, no frees). Each pass prints the versions kept, frees, pending and abandoned frees, the folder's size, its stored and expected on-ring bytes, the policy's maximum and the version store's size on this disk, and warns (`warn.folder_storage_ratio`) when expected bytes exceed 1.25x what the policy can hold. Versions written by older releases are not reclaimed.
+
+### Changed
+- **An unchanged folder keeps its version (B-154).** A pass that finds the same paths, contents and sizes (and the same deletions) no longer bumps the snapshot version or seals a new envelope or catalog, and leaves the snapshot file byte-identical (`Snapshot Version : 7 (no change)`, `Changes : none`); only modification times are refreshed when they moved. Each pass prints `Changes : N modified, N added, N deleted, X MB uploaded`. The suite's gateway engine (`parvault-sync`) follows the same rule.
+- **`watch-folder` refuses** an interval below 2 s (`reject.interval_below_floor`), a snapshot file older than its version store (`reject.gc_snapshot_stale`: an old copy put back would reuse freed shards; restore with `restore-folder --version` instead), and a second `watch-folder` on the same snapshot (`reject.gc_snapshot_locked`). When a device that continued this vault from its catalog publishes a newer catalog, nothing is freed (`reject.gc_foreign_catalog`; one writer per vault folder).
+- **`--prune-deleted` is deprecated:** with GC on, a deleted file is freed when the last retained version holding it ages out.
+- A host that answers full (`reject.node_shard_count`, `reject.node_capacity`) is skipped by placement for 10 minutes. After a pass a host refused for this owner's quota, `watch-folder` runs GC and, if it freed anything, retries the pass once (B-163 item 3).
+
 ---
 
 ## [`0.5.5`] - 2026-11-16

@@ -1,0 +1,12 @@
+diff --git a/specs/ParVaultVersionGC.tla b/specs/ParVaultVersionGC.tla
+--- a/specs/ParVaultVersionGC.tla
++++ b/specs/ParVaultVersionGC.tla
+@@ -80,7 +80,7 @@
+ \* ---- Guards: host side (track B1, `free_order_decision`) ----
+ Fresh(o) == clock <= o.ts + Window   \* @guard free-fresh
+ EpochOk(o) == o.e > hepoch[o.h]   \* @guard free-epoch
+-CreditAcct(s) == Acct(s)   \* @guard credit-accounted
++CreditAcct(s) == "owner"
+ 
+ Referenced == UNION {refs[v] : v \in retained} \cup pending
+ 

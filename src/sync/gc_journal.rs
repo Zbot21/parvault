@@ -13,6 +13,8 @@
 //! A crash anywhere is recovered by the next run: before step 3 nothing was freed and the
 //! dropped version files still exist; after it the journal drives the rest, and every step is
 //! idempotent. An entry whose stripe is marked again is dropped, never freed.
+//!
+//! Formal model: `specs/ParVaultVersionGC.tla` (guards `mark-includes-pass`, `catalog-pin`).
 
 use super::engine::FolderSnapshotManifest;
 use super::retention::{self, RetentionPolicy, VersionMeta, VersionStore, DAY_MS};
@@ -34,6 +36,8 @@ pub const ABANDON_AFTER_MS: u64 = 30 * DAY_MS;
 pub const MAX_ABANDONED_PER_HOST: usize = 4096;
 /// The longest backoff between retries, in passes (B-154 2.4).
 pub const MAX_BACKOFF_PASSES: u64 = 60;
+/// The retry reason of a host that did not answer.
+const UNREACHABLE: &str = "unreachable";
 /// The pseudo-host of the owner's own block store.
 pub const LOCAL_HOST: &str = "local";
 
@@ -76,14 +80,31 @@ pub const fn order_epoch(last_epoch: u64, timestamp_ms: u64) -> u64 {
     }
 }
 
+/// What C35 does after a pass in which a host refused this owner for quota.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaRetry {
+    /// No host refused for quota.
+    NotNeeded,
+    /// GC freed something: retry the pass once.
+    Retry,
+    /// The retry is spent, or GC freed nothing: the refused stripes stay local this pass.
+    Spent(&'static str),
+}
+
 /// B163-RETRY (C35): after a pass some host refused for quota, run GC and retry the pass once,
 /// only if GC freed something.
 pub const fn quota_retry_decision(
     refused_quota: bool,
     retried_once: bool,
     gc_freed_any: bool,
-) -> bool {
-    refused_quota && !retried_once && gc_freed_any
+) -> QuotaRetry {
+    if !refused_quota {
+        QuotaRetry::NotNeeded
+    } else if !retried_once && gc_freed_any {
+        QuotaRetry::Retry
+    } else {
+        QuotaRetry::Spent("warn.gc_quota_retry_spent")
+    }
 }
 
 /// What to do with a journal entry after a host's answer.
@@ -641,6 +662,20 @@ pub struct GcSettings {
     pub fetched_catalog: Option<(u64, Hash32)>,
 }
 
+impl GcSettings {
+    /// The daemon's appliance folder (`up --watch-folder`): its snapshot in `data_dir`, the
+    /// default policy, frees through `client`.
+    pub fn appliance(data_dir: &Path, client: Option<MeshClient>) -> Self {
+        Self {
+            snapshot_out: data_dir.join(super::engine::APPLIANCE_SNAPSHOT_FILE),
+            policy: RetentionPolicy::default(),
+            data_dir: data_dir.to_path_buf(),
+            client,
+            fetched_catalog: None,
+        }
+    }
+}
+
 /// What one GC run did, for the pass output and status.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GcReport {
@@ -1012,7 +1047,7 @@ impl<'a> GcRun<'a> {
             let Some(host_key) = host_key else {
                 for (is_p, i, _) in work {
                     if is_p {
-                        pending_result.insert(i, (FreeAction::Retry, "unreachable".into()));
+                        pending_result.insert(i, (FreeAction::Retry, UNREACHABLE.into()));
                     } else {
                         abandoned_result.insert(i, FreeAction::Retry);
                     }
@@ -1049,6 +1084,10 @@ impl<'a> GcRun<'a> {
                             tracing::warn!(host = %host, error = %e, "free order refused");
                             chunk.iter().map(|_| (a, e.clone(), false)).collect()
                         }
+                        Err(_) if !client.is_reachable(&host) => chunk
+                            .iter()
+                            .map(|_| (FreeAction::Retry, UNREACHABLE.to_string(), false))
+                            .collect(),
                         Ok(FreeShardsReply::Unsupported(_)) | Err(_) => {
                             // C15: a host without `FreeShards` (never with dedup, which v0.5.6 has
                             // not): the old `DeleteShard`, per shard.
@@ -1104,7 +1143,14 @@ impl<'a> GcRun<'a> {
                 }
                 Some((FreeAction::Retry, reason)) => {
                     p.attempts = p.attempts.saturating_add(1);
-                    p.next_pass = next_retry_pass(pass, p.attempts);
+                    // An unreachable host is probed every pass (one status request), so a host
+                    // that comes back is freed on its next pass (T4); a host that answers and
+                    // refuses backs off.
+                    p.next_pass = if reason == UNREACHABLE {
+                        pass.saturating_add(1)
+                    } else {
+                        next_retry_pass(pass, p.attempts)
+                    };
                     if abandon_decision(p.first_attempt_ms, now) {
                         to_abandon.push((p, reason));
                     } else {
@@ -1222,7 +1268,7 @@ pub fn folder_stats(
 ) -> FolderStats {
     let (k, _, n) = snapshot.tier.params();
     let (k, n) = (k as u64, n as u64);
-    let r = retention::replica_factor(n, hosts);
+    let r = retention::replica_factor(k, n, hosts);
     let disk_bytes: u64 = snapshot.files.values().map(|f| f.size_bytes).sum();
     let expected = report
         .stored_shard_bytes
@@ -1331,9 +1377,19 @@ mod tests {
         assert_eq!(order_epoch(5, 3), 6);
         assert_eq!(order_epoch(5, 100), 100);
         assert_eq!(order_epoch(u64::MAX, 0), u64::MAX);
-        assert!(quota_retry_decision(true, false, true));
-        assert!(!quota_retry_decision(true, true, true));
-        assert!(!quota_retry_decision(true, false, false));
+        assert_eq!(quota_retry_decision(true, false, true), QuotaRetry::Retry);
+        assert!(matches!(
+            quota_retry_decision(true, true, true),
+            QuotaRetry::Spent(_)
+        ));
+        assert!(matches!(
+            quota_retry_decision(true, false, false),
+            QuotaRetry::Spent(_)
+        ));
+        assert_eq!(
+            quota_retry_decision(false, false, true),
+            QuotaRetry::NotNeeded
+        );
         assert_eq!(next_retry_pass(10, 0), 11);
         assert_eq!(next_retry_pass(10, 3), 18);
         assert_eq!(next_retry_pass(10, 30), 70);

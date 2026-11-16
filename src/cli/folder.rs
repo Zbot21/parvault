@@ -681,17 +681,27 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                         .map(|c| c.quota_refusals())
                         .unwrap_or(0)
                         > quota_refusals_before;
-                    if parvault::sync::gc_journal::quota_retry_decision(
+                    match parvault::sync::gc_journal::quota_retry_decision(
                         refused,
                         retried_for_quota,
                         report.freed_any(),
                     ) {
-                        let n = engine.requeue_not_backed_up();
-                        println!(
-                            "[parvault] a host refused for quota (reject.peer_quota_exceeded); GC freed space, retrying {n} file(s) once"
-                        );
-                        retried_for_quota = true;
-                        continue;
+                        parvault::sync::gc_journal::QuotaRetry::Retry => {
+                            let n = engine.requeue_not_backed_up();
+                            println!(
+                                "[parvault] a host refused this owner for quota; GC freed space, retrying {n} file(s) once"
+                            );
+                            retried_for_quota = true;
+                            continue;
+                        }
+                        parvault::sync::gc_journal::QuotaRetry::Spent(code) => {
+                            tracing::warn!(
+                                code,
+                                retried = retried_for_quota,
+                                "a host refused this owner for quota and GC freed nothing more (or the retry is spent); the refused stripes stay on this machine"
+                            );
+                        }
+                        parvault::sync::gc_journal::QuotaRetry::NotNeeded => {}
                     }
                 }
                 Err(e) => {

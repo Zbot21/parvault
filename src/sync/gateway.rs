@@ -110,6 +110,8 @@ pub struct GatewayFolderSync {
     bus: GatewayBus,
     default_macaroon: Option<CapabilityMacaroon>,
     catalog: GatewayFolderCatalog,
+    /// The last pass changed nothing and kept the catalog version (B-154 3).
+    last_pass_no_change: bool,
 }
 
 impl GatewayFolderSync {
@@ -118,7 +120,13 @@ impl GatewayFolderSync {
             bus,
             default_macaroon: None,
             catalog: GatewayFolderCatalog::default(),
+            last_pass_no_change: false,
         }
+    }
+
+    /// Whether the last `sync_folder_once` changed nothing (B-154 3).
+    pub const fn last_pass_no_change(&self) -> bool {
+        self.last_pass_no_change
     }
 
     pub fn with_catalog(bus: GatewayBus, catalog: GatewayFolderCatalog) -> Self {
@@ -126,6 +134,7 @@ impl GatewayFolderSync {
             bus,
             default_macaroon: None,
             catalog,
+            last_pass_no_change: false,
         }
     }
 
@@ -261,25 +270,52 @@ impl GatewayFolderSync {
             };
 
             file_roots.push(entry.ephemeral_manifest.file_merkle_root);
-            self.catalog.deleted_tombstones.remove(&rel_path);
             next_files.insert(rel_path, entry);
         }
 
-        self.catalog.version = self.catalog.version.saturating_add(1);
-
+        // B-154 3 (same rule as the daemon engine's `no_change_decision`): an unchanged folder
+        // (same paths, roots and sizes, same tombstones) keeps its catalog version. The first
+        // pass (version 0) is always a change.
+        let next_version = self.catalog.version.saturating_add(1);
+        let mut next_tombstones = self.catalog.deleted_tombstones.clone();
+        for path in next_files.keys() {
+            next_tombstones.remove(path);
+        }
         for (old_path, old_entry) in &self.catalog.files {
             if !next_files.contains_key(old_path) {
-                self.catalog.deleted_tombstones.insert(
+                next_tombstones.insert(
                     old_path.clone(),
                     DeletedFileTombstone {
                         relative_path: old_path.clone(),
-                        deleted_at_version: self.catalog.version,
+                        deleted_at_version: next_version,
                         previous_merkle_root: old_entry.ephemeral_manifest.file_merkle_root,
                     },
                 );
             }
         }
-
+        let triples =
+            |m: &BTreeMap<String, GatewaySyncedFileEntry>| -> Vec<(String, [u8; 32], u64)> {
+                m.iter()
+                    .map(|(p, e)| {
+                        (
+                            p.clone(),
+                            e.ephemeral_manifest.file_merkle_root,
+                            e.size_bytes,
+                        )
+                    })
+                    .collect()
+            };
+        self.last_pass_no_change = self.catalog.version > 0
+            && triples(&self.catalog.files) == triples(&next_files)
+            && self
+                .catalog
+                .deleted_tombstones
+                .keys()
+                .eq(next_tombstones.keys());
+        if !self.last_pass_no_change {
+            self.catalog.version = next_version;
+        }
+        self.catalog.deleted_tombstones = next_tombstones;
         self.catalog.files = next_files;
         self.catalog.folder_merkle_root = compute_file_merkle_root(&file_roots);
 

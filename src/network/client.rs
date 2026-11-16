@@ -432,12 +432,7 @@ fn dispatch_rpc_on_established_peer(
         };
         match bincode::serialize(env) {
             Ok(bytes) => {
-                let record = kad::Record {
-                    key: kad::RecordKey::new(&dht_key),
-                    value: bytes,
-                    publisher: Some(peer_id),
-                    expires: None,
-                };
+                let record = envelope_kad_record(&dht_key, bytes, *swarm.local_peer_id());
                 let _ = swarm
                     .behaviour_mut()
                     .kademlia
@@ -1110,6 +1105,21 @@ pub struct MeshClient {
     full_hosts: Arc<Mutex<HashMap<String, Instant>>>,
     /// B-163 item 3 (C35): `PutShard` refusals with `reject.peer_quota_exceeded` seen so far.
     quota_refusals: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// The Kademlia record an envelope put publishes (B-181): its publisher is this node, never
+/// the peer the RPC goes to.
+pub(crate) fn envelope_kad_record(
+    dht_key: &[u8; 32],
+    value: Vec<u8>,
+    local: PeerId,
+) -> kad::Record {
+    kad::Record {
+        key: kad::RecordKey::new(dht_key),
+        value,
+        publisher: Some(local),
+        expires: None,
+    }
 }
 
 /// The owner's placement journal hook (B-154 C3): `(shard ids, candidate hosts)` of one stripe,
@@ -2771,6 +2781,13 @@ impl MeshClient {
         }
     }
 
+    /// Whether `addr` answers a status request now (B-154: tells an offline host from one
+    /// that cannot decode `FreeShards`).
+    pub fn is_reachable(&self, addr: &str) -> bool {
+        self.send_request(addr, MeshWireRequest::QueryNodeStatus)
+            .is_ok()
+    }
+
     /// Sets the placement journal hook (B-154 C3).
     pub fn with_pre_place_hook(mut self, hook: PrePlaceHook) -> Self {
         self.pre_place_hook = Some(hook);
@@ -3618,6 +3635,17 @@ impl IpLocalityExt for IpAddr {
 
 #[cfg(test)]
 mod tests {
+    /// B-181: an envelope's Kademlia record names the publishing node, not the destination.
+    #[test]
+    fn envelope_record_publisher_is_the_local_node() {
+        let local = node_identity_libp2p_peer_id(&NodeIdentity::from_seed([0x51; 32])).unwrap();
+        let dest = node_identity_libp2p_peer_id(&NodeIdentity::from_seed([0x52; 32])).unwrap();
+        let r = envelope_kad_record(&[7; 32], vec![1, 2, 3], local);
+        assert_eq!(r.publisher, Some(local));
+        assert_ne!(r.publisher, Some(dest));
+        assert_eq!(r.key, kad::RecordKey::new(&[7u8; 32]));
+    }
+
     /// D5: the swarm runtime's blocking pool holds `SWARM_MAX_BLOCKING_THREADS` threads; one
     /// more blocking task waits for a free thread instead of starting a new one.
     #[test]

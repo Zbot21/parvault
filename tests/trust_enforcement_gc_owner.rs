@@ -459,3 +459,374 @@ mod v055 {
         pub deleted_tombstones: BTreeMap<String, DeletedFileTombstone>,
     }
 }
+
+// --- Ring tests: one real storage daemon ----------------------------------------------------
+
+/// The ring genesis the host and the owner are provisioned with.
+const GENESIS_SEED_HEX: &str = "4747474747474747474747474747474747474747474747474747474747474747";
+const PHRASE: &str = "b2 version gc ring test passphrase";
+
+/// A storage daemon on an ephemeral loopback port.
+struct Host {
+    child: std::process::Child,
+    dir: PathBuf,
+    log: PathBuf,
+    addr: String,
+    _tmp: tempfile::TempDir,
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_host() -> Host {
+    spawn_host_with("")
+}
+
+/// A host whose `config.toml` is `config`.
+fn spawn_host_with(config: &str) -> Host {
+    let tmp = tempfile::Builder::new()
+        .prefix("pv-b2-host-")
+        .tempdir()
+        .unwrap();
+    let dir = tmp.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    parvault::crypto::NodeIdentity::load_or_generate_in_dir(&dir).unwrap();
+    if !config.is_empty() {
+        std::fs::write(dir.join("config.toml"), config).unwrap();
+    }
+    let log = tmp.path().join("host.log");
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", tmp.path().join("lan-registry"))
+        .env("PARVAULT_GENESIS_SEED_HEX", GENESIS_SEED_HEX)
+        .env_remove("PARVAULT_PEERS")
+        .env_remove("PARVAULT_GENESIS_PUBKEY_HEX")
+        .arg("--data-dir")
+        .arg(&dir)
+        .args([
+            "--no-lan-discovery",
+            "daemon",
+            "start",
+            "--listen",
+            common::LOOPBACK_EPHEMERAL,
+        ]);
+    let (child, addr) = common::spawn_on_ephemeral_port(&mut cmd, &log);
+    let id = parvault::crypto::NodeIdentity::load_or_generate_in_dir(&dir).unwrap();
+    let pid = parvault::network::node_identity_libp2p_peer_id(&id).unwrap();
+    Host {
+        child,
+        dir,
+        log,
+        addr: format!("{addr}/p2p/{pid}"),
+        _tmp: tmp,
+    }
+}
+
+impl Host {
+    fn shard_names(&self) -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(self.dir.join("shards"))
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.ends_with(".shard"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// A `watch-folder --once` pass of `f` against `host` with the vault phrase (the catalog is
+/// published to the ring).
+fn ring_pass(f: &LocalFolder, host: &Host) -> Output {
+    ring_pass_peers(f, &host.addr)
+}
+
+/// A `watch-folder --once` pass of `f` against the hosts in `peers` (comma-separated).
+fn ring_pass_peers(f: &LocalFolder, peers: &str) -> Output {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", f.node.join("lan-registry"))
+        .env("PARVAULT_GENESIS_SEED_HEX", GENESIS_SEED_HEX)
+        .env("PARVAULT_SEED_PHRASE", PHRASE)
+        .env("RUST_LOG", "info")
+        .env_remove("PARVAULT_PEERS")
+        .env_remove("PARVAULT_GENESIS_PUBKEY_HEX")
+        .arg("--data-dir")
+        .arg(&f.node)
+        .args(["--no-lan-discovery", "--peers", peers])
+        .args([
+            "watch-folder",
+            "--folder",
+            f.folder.to_str().unwrap(),
+            "--snapshot-out",
+            f.snap.to_str().unwrap(),
+            "--vault-namespace",
+            "b2-ring",
+            "--once",
+        ]);
+    output_within(&mut cmd, Duration::from_secs(240))
+}
+
+/// `restore-folder --version` of `f` through the ring.
+fn ring_restore(f: &LocalFolder, host: &Host, version: u64, out: &Path) -> Output {
+    let v = version.to_string();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", f.node.join("lan-registry"))
+        .env("PARVAULT_GENESIS_SEED_HEX", GENESIS_SEED_HEX)
+        .env("PARVAULT_SEED_PHRASE", PHRASE)
+        .env_remove("PARVAULT_PEERS")
+        .env_remove("PARVAULT_GENESIS_PUBKEY_HEX")
+        .arg("--data-dir")
+        .arg(&f.node)
+        .args(["--no-lan-discovery", "--peers", &host.addr])
+        .args([
+            "restore-folder",
+            "--snapshot",
+            f.snap.to_str().unwrap(),
+            "--out-dir",
+            out.to_str().unwrap(),
+            "--vault-namespace",
+            "b2-ring",
+            "--version",
+            &v,
+        ]);
+    output_within(&mut cmd, Duration::from_secs(120))
+}
+
+/// Runs `cmd` to completion within `limit` (ring passes over many shards outlast
+/// `common::EXIT_DEADLINE`).
+fn output_within(cmd: &mut std::process::Command, limit: Duration) -> Output {
+    use std::io::Read;
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut so = child.stdout.take().unwrap();
+    let mut se = child.stderr.take().unwrap();
+    let t1 = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = so.read_to_end(&mut b);
+        b
+    });
+    let t2 = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = se.read_to_end(&mut b);
+        b
+    });
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if start.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("command did not exit within {}s", limit.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    Output {
+        status,
+        stdout: t1.join().unwrap(),
+        stderr: t2.join().unwrap(),
+    }
+}
+
+fn ring_pass_ok(f: &LocalFolder, host: &Host) -> String {
+    let out = ring_pass(f, host);
+    let t = text(&out);
+    assert!(
+        out.status.success(),
+        "{t}\nhost log:\n{}",
+        std::fs::read_to_string(&host.log).unwrap_or_default()
+    );
+    t
+}
+
+/// The shard file names of the stripes only `version` references (not the unchanged file).
+fn shard_names_of(f: &LocalFolder, version: u64, path: &str) -> Vec<String> {
+    let snap = VersionStore::for_snapshot(&f.snap).load(version).unwrap();
+    let entry = &snap.files[path];
+    entry
+        .manifest
+        .stripes
+        .iter()
+        .flat_map(|s| {
+            s.shard_hashes.iter().enumerate().map(|(i, h)| {
+                format!(
+                    "{}.shard",
+                    parvault::storage::ShardId {
+                        stripe_merkle_root: s.stripe_merkle_root,
+                        shard_index: i as u32,
+                        shard_hash: *h,
+                    }
+                    .file_key()
+                )
+            })
+        })
+        .collect()
+}
+
+/// Four changed passes of `a.txt` beside an unchanged `b.txt`; returns version 1's `a.txt` and
+/// `b.txt` shard names.
+fn ring_history(f: &LocalFolder, host: &Host) -> (Vec<String>, Vec<String>) {
+    std::fs::write(f.folder.join("b.txt"), "unchanged in every version").unwrap();
+    f.write("a v1");
+    ring_pass_ok(f, host);
+    let a1 = shard_names_of(f, 1, "a.txt");
+    let b1 = shard_names_of(f, 1, "b.txt");
+    let held = host.shard_names();
+    assert!(
+        a1.iter().chain(&b1).all(|n| held.contains(n)),
+        "placed on the host"
+    );
+    for body in ["a v2", "a v3"] {
+        f.write(body);
+        ring_pass_ok(f, host);
+    }
+    (a1, b1)
+}
+
+/// B154-FOREIGN accept (C6, C7): with this device's own catalog on the ring, version 1 ages out
+/// at version 4 and its shards are freed on the host; the unchanged file's shards (marked by
+/// every retained version) stay.
+#[test]
+fn b154_own_catalog_frees_on_host() {
+    let host = spawn_host();
+    let f = LocalFolder::new();
+    let (a1, b1) = ring_history(&f, &host);
+    f.write("a v4");
+    let t = ring_pass_ok(&f, &host);
+    assert!(!t.contains("reject.gc_foreign_catalog"), "{t}");
+    assert_eq!(f.versions(), vec![2, 3, 4], "{t}");
+    let held = host.shard_names();
+    assert!(
+        a1.iter().all(|n| !held.contains(n)),
+        "v1 freed on the host\n{t}"
+    );
+    assert!(
+        b1.iter().all(|n| held.contains(n)),
+        "a marked stripe is kept\n{t}"
+    );
+    let out_dir = f.node.parent().unwrap().join("restored");
+    let out = ring_restore(&f, &host, 2, &out_dir);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(std::fs::read(out_dir.join("a.txt")).unwrap(), b"a v2");
+    gate_ran("trust_enforcement_gc_owner::b154_own_catalog_frees_on_host");
+}
+
+/// B154-FOREIGN reject (C7): a second device continued this vault from its catalog and
+/// published a newer one; this device's next pass refuses to free anything
+/// (`reject.gc_foreign_catalog`): version 1's shards and version file stay.
+#[test]
+fn b154_foreign_catalog_frees_nothing() {
+    let host = spawn_host();
+    let f = LocalFolder::new();
+    let (a1, _) = ring_history(&f, &host);
+    // The second device: the same phrase, this vault's snapshot (as recovered from the
+    // catalog), one changed pass: it publishes version 4.
+    let g = LocalFolder::new();
+    std::fs::copy(&f.snap, &g.snap).unwrap();
+    std::fs::write(g.folder.join("b.txt"), "unchanged in every version").unwrap();
+    g.write("second device");
+    let tg = ring_pass_ok(&g, &host);
+    assert!(tg.contains("Snapshot Version   : 4"), "{tg}");
+    f.write("a v4");
+    let t = ring_pass_ok(&f, &host);
+    assert!(t.contains("reject.gc_foreign_catalog"), "{t}");
+    assert!(f.versions().contains(&1), "{t}");
+    let held = host.shard_names();
+    assert!(a1.iter().all(|n| held.contains(n)), "nothing freed\n{t}");
+    gate_ran("trust_enforcement_gc_owner::b154_foreign_catalog_frees_nothing");
+}
+
+/// C24 (over 1024 shards): 60 changed files of one stripe each (Homelab, 20 shards) on one
+/// host; when version 1 ages out its 1,200 shards go in two orders (1024 + 176), every one
+/// freed.
+#[test]
+fn b154_over_1024_shards_freed_in_two_orders() {
+    let host = spawn_host();
+    let f = LocalFolder::new();
+    let names: Vec<String> = (0..60).map(|i| format!("f{i:02}.txt")).collect();
+    let write_all = |tag: &str| {
+        for n in &names {
+            std::fs::write(f.folder.join(n), format!("{tag} {n}")).unwrap();
+        }
+    };
+    write_all("v1");
+    ring_pass_ok(&f, &host);
+    let v1: Vec<String> = names
+        .iter()
+        .flat_map(|n| shard_names_of(&f, 1, n))
+        .collect();
+    assert_eq!(v1.len(), 1200);
+    for tag in ["v2", "v3"] {
+        write_all(tag);
+        ring_pass_ok(&f, &host);
+    }
+    write_all("v4");
+    let t = ring_pass_ok(&f, &host);
+    assert!(t.contains("2 order(s)"), "{t}");
+    let held = host.shard_names();
+    assert!(v1.iter().all(|n| !held.contains(n)), "{t}");
+    assert!(t.contains("Pending Frees      : 0 "), "{t}");
+    gate_ran("trust_enforcement_gc_owner::b154_over_1024_shards_freed_in_two_orders");
+}
+
+// --- B154-WARN (L-122, C43, C44) -------------------------------------------------------------
+
+/// 1 MiB of incompressible bytes tagged `tag`.
+fn mib_body(tag: u8) -> Vec<u8> {
+    let mut x = 0x2545_F491u32 ^ ((tag as u32) << 8);
+    (0..1_048_576)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        })
+        .collect()
+}
+
+/// Rewrites a 1 MiB file `passes` times against two hosts, stopping the second after the first
+/// pass when `stop_second`; returns the last pass's output.
+fn churn_two_hosts(passes: u8, stop_second: bool) -> String {
+    let h1 = spawn_host();
+    let mut h2 = spawn_host();
+    let peers = format!("{},{}", h1.addr, h2.addr);
+    let f = LocalFolder::new();
+    let mut last = String::new();
+    for tag in 1..=passes {
+        std::fs::write(f.folder.join("a.bin"), mib_body(tag)).unwrap();
+        let out = ring_pass_peers(&f, &peers);
+        last = text(&out);
+        assert!(out.status.success(), "pass {tag}: {last}");
+        if tag == 1 && stop_second {
+            let _ = h2.child.kill();
+            let _ = h2.child.wait();
+        }
+    }
+    last
+}
+
+/// B154-WARN accept (L-122): normal churn under the default policy (frees succeed) stays below
+/// 1.25x what the policy can hold: no warning.
+#[test]
+fn b154_storage_within_policy_is_silent() {
+    let t = churn_two_hosts(8, false);
+    assert!(!t.contains("warn.folder_storage_ratio"), "{t}");
+    assert!(t.contains("Pending Frees      : 0 "), "{t}");
+    gate_ran("trust_enforcement_gc_owner::b154_storage_within_policy_is_silent");
+}
+
+/// B154-WARN reject (C44): with one host gone, its frees stay pending; once pending and
+/// retained bytes pass 1.25x the policy maximum the pass warns (`warn.folder_storage_ratio`).
+#[test]
+fn b154_stuck_frees_warn() {
+    let t = churn_two_hosts(14, true);
+    assert!(t.contains("warn.folder_storage_ratio"), "{t}");
+    gate_ran("trust_enforcement_gc_owner::b154_stuck_frees_warn");
+}

@@ -1,0 +1,12 @@
+diff --git a/specs/ParVaultVersionGC.tla b/specs/ParVaultVersionGC.tla
+--- a/specs/ParVaultVersionGC.tla
++++ b/specs/ParVaultVersionGC.tla
+@@ -75,7 +75,7 @@
+ DropPhases == {"journaled"}   \* @guard journal-before-drop
+ \* C9 (gate for v0.5.7 dedup): no stripe is referenced again while a sent order for it can
+ \* still be accepted (no acknowledgement and inside the window).
+-FenceOk(s) == \A o \in unacked : o.s = s => clock > o.ts + Window   \* @guard c9-fence
++FenceOk(s) == TRUE
+ 
+ \* ---- Guards: host side (track B1, `free_order_decision`) ----
+ Fresh(o) == clock <= o.ts + Window   \* @guard free-fresh

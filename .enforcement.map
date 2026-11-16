@@ -385,5 +385,16 @@ claim      B154-STALE sym=src/sync/gc_journal.rs::stale_snapshot_decision accept
 claim      B154-RESTORE-VERSION sym=src/sync/retention.rs::version_restore_decision accept=trust_enforcement_gc_owner::b154_restore_retained_version reject=trust_enforcement_gc_owner::b154_restore_dropped_version_refused code=reject.version_not_retained bin=parvault ref=docs/security/TRUST_FINDINGS.md   # T5: restore-folder --version N
 claim      B154-INTERVAL sym=src/sync/retention.rs::watch_interval_decision accept=trust_enforcement_gc_owner::b154_interval_at_floor_runs reject=trust_enforcement_gc_owner::b154_interval_below_floor_refused code=reject.interval_below_floor bin=parvault ref=docs/security/TRUST_FINDINGS.md   # C37: the minimum watch-folder interval, refused not clamped
 claim      B154-RETAIN sym=src/sync/retention.rs::retention_decision accept=trust_enforcement_gc_owner::b154_old_versions_dropped reject=trust_enforcement_gc_owner::b154_implausible_clock_drops_nothing code=warn.retention_clock_implausible bin=parvault ref=docs/security/TRUST_FINDINGS.md   # C25, C28: newest and last N always kept; an implausible clock drops nothing for its age
+claim      B154-FOREIGN sym=src/sync/gc_journal.rs::foreign_catalog_decision accept=trust_enforcement_gc_owner::b154_own_catalog_frees_on_host reject=trust_enforcement_gc_owner::b154_foreign_catalog_frees_nothing code=reject.gc_foreign_catalog bin=parvault ref=docs/security/TRUST_FINDINGS.md   # C6, C7: one writer per vault folder; a foreign catalog on the ring stops every free
+claim      B154-WARN sym=src/sync/retention.rs::storage_warning_decision accept=trust_enforcement_gc_owner::b154_storage_within_policy_is_silent reject=trust_enforcement_gc_owner::b154_stuck_frees_warn code=warn.folder_storage_ratio bin=parvault ref=docs/security/TRUST_FINDINGS.md   # L-122: warn above 1.25x what the policy can hold (stuck or abandoned frees)
+reach      TR-GC-MARK sym=src/sync/gc_journal.rs::mark from=src/sync/engine.rs::gc_after_pass   # ParVaultVersionGC guard mark-includes-pass
+reach      TR-GC-FREE sym=src/sync/gc_journal.rs::gc_free_decision from=src/sync/engine.rs::gc_after_pass   # ParVaultVersionGC guard catalog-pin
+tla-mutant TM-GC-MARK-PASS   spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-mark-includes-pass.patch
+tla-mutant TM-GC-CATALOG-PIN spec=specs/ParVaultVersionGC.tla inv=PublishedRecoverable patch=specs/mutants/ParVaultVersionGC-catalog-pin.patch
+tla-mutant TM-GC-JOURNAL-FIRST spec=specs/ParVaultVersionGC.tla inv=NoLeakedGarbage patch=specs/mutants/ParVaultVersionGC-journal-before-drop.patch
+tla-mutant TM-GC-C9-FENCE    spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-c9-fence.patch
+tla-mutant TM-GC-FREE-FRESH  spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-free-fresh.patch
+tla-mutant TM-GC-FREE-EPOCH  spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-free-epoch.patch
+tla-mutant TM-GC-CREDIT      spec=specs/ParVaultVersionGC.tla inv=QuotaMatchesHeld patch=specs/mutants/ParVaultVersionGC-credit-accounted.patch
 
 ratchet    R         open=1 waive=32

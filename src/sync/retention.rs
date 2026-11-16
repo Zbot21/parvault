@@ -371,12 +371,24 @@ pub fn policy_max_bytes(
     v.min(u64::MAX as u128) as u64
 }
 
-/// The replica factor of a stripe of `n_total` shards on a ring of `hosts` (B-149 replica shift).
-pub const fn replica_factor(n_total: u64, hosts: u64) -> u64 {
+/// The replica factor of a stripe of `k_data`-of-`n_total` shards on a ring of `hosts`: how
+/// many hosts each shard is put to under the B-149 replica shift (`client.rs`,
+/// `distribute_stripe_shards_partial`: with fewer hosts than shards, `min(ceil(n / hosts) + 1,
+/// hosts)` when `k x ceil(n / hosts) > hosts`).
+pub const fn replica_factor(k_data: u64, n_total: u64, hosts: u64) -> u64 {
     if hosts == 0 || hosts >= n_total {
-        1
+        return 1;
+    }
+    let per_host = n_total.div_ceil(hosts);
+    if k_data.saturating_mul(per_host) > hosts {
+        let shifts = per_host + 1;
+        if shifts < hosts {
+            shifts
+        } else {
+            hosts
+        }
     } else {
-        n_total.div_ceil(hosts)
+        1
     }
 }
 
@@ -675,8 +687,10 @@ mod tests {
             policy_max_bytes(&p, 10, 16, 20, 1),
             policy_max_bytes(&p, WARN_FOLDER_FLOOR_BYTES, 16, 20, 1)
         );
-        assert_eq!(replica_factor(20, 3), 7);
-        assert_eq!(replica_factor(20, 25), 1);
+        assert_eq!(replica_factor(16, 20, 3), 3);
+        assert_eq!(replica_factor(16, 20, 2), 2);
+        assert_eq!(replica_factor(16, 20, 10), 3);
+        assert_eq!(replica_factor(16, 20, 25), 1);
     }
 
     #[test]
