@@ -108,7 +108,9 @@ PIN="$(pv tls show | sed -n 's/^pin (curl): *//p')"
 pv token mint --ttl-secs 3600 --out /var/lib/parvault/d/webdav.token >/dev/null
 TOKEN="$(docker exec "$EDGE" cat /var/lib/parvault/d/webdav.token)"
 [ "${#TOKEN}" -lt 255 ] || fail "token is ${#TOKEN} characters (L-123 Q4: under 255)"
-HP="$(docker port "$EDGE" 8443/tcp | sed -n 's/^127\.0\.0\.1:\([0-9]*\)$/\1/p' | head -1)"
+PORTS="$(docker port "$EDGE" 8443/tcp)"
+HP="$(sed -n 's/^127\.0\.0\.1:\([0-9]*\)$/\1/p' <<<"$PORTS")"
+HP="${HP%%$'\n'*}"
 [ -n "$HP" ] || fail "no published port"
 EDGE_IP="$(docker inspect -f "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}" "$EDGE")"
 
