@@ -50,6 +50,19 @@ fn parse_hex32(hex_str: &str, what: &str) -> Result<[u8; 32], CryptoError> {
     Ok(out)
 }
 
+/// Fsyncs a directory so a rename in it is durable (B-174, A-146-2, K9).
+pub fn fsync_dir(dir: &Path) -> Result<(), CryptoError> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 pub fn write_secret_file_atomic_0600(path: &Path, data: &[u8]) -> Result<(), CryptoError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -454,9 +467,14 @@ impl NodeIdentity {
         Ok(Some(id))
     }
 
-    /// The explicit first-node action (`parvault wot init`): creates a new ring genesis in
-    /// `<data_dir>/ring_genesis.seed` (0600) and pins its public key. Refuses if this node already
-    /// has any ring genesis source.
+    /// The explicit first-node action (`parvault wot init`, `up --init-if-absent`): creates a new
+    /// ring genesis in `<data_dir>/ring_genesis.seed` (0600) and pins its public key. Refuses if
+    /// this node already has any ring genesis source.
+    ///
+    /// The caller holds the data-dir lock (B-174, A-146-1), so the check and the writes are one
+    /// step. Each write is staged, fsynced and renamed, and the directory is fsynced after each:
+    /// the seed first, then the pin, so a kill in between leaves a seed without its pin, which
+    /// [`Self::resume_ring_pin_from_seed_file`] completes (A-146-2); never a pin without a seed.
     pub fn init_ring_genesis_in_dir(data_dir: &Path) -> Result<Self, KeyError> {
         if let Ok(pk) = Self::resolve_genesis_root_pubkey_in_dir(data_dir, None) {
             return Err(CryptoError::RingMembership(format!(
@@ -470,8 +488,79 @@ impl NodeIdentity {
         write_secret_file_atomic_0600(&data_dir.join(RING_GENESIS_SEED_FILE), &seed)?;
         let id = Self::from_seed(seed);
         seed.zeroize();
+        fsync_dir(data_dir)?;
         Self::pin_ring_genesis_pubkey_in_dir(data_dir, id.public_key_bytes())?;
+        fsync_dir(data_dir)?;
         Ok(id)
+    }
+
+    /// A-146-2 (arch056c 2.1): completes an init that was killed between its two writes. Derives
+    /// the pin only from a 32-byte on-disk `ring_genesis.seed` (never the env seed), pins it
+    /// through [`Self::pin_ring_genesis_pubkey_in_dir`] (which refuses a different pin), and
+    /// requires `PARVAULT_GENESIS_PUBKEY_HEX`, when set, to name the same key. The caller holds
+    /// the data-dir lock.
+    pub fn resume_ring_pin_from_seed_file(data_dir: &Path) -> Result<[u8; 32], KeyError> {
+        let path = data_dir.join(RING_GENESIS_SEED_FILE);
+        let mut raw =
+            std::fs::read(&path).map_err(|e| CryptoError::InvalidKeyMaterial(e.to_string()))?;
+        if raw.len() != 32 {
+            raw.zeroize();
+            return Err(CryptoError::InvalidKeyMaterial(format!(
+                "{} must hold 32 bytes",
+                path.display()
+            )));
+        }
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&raw);
+        raw.zeroize();
+        let pk = Self::from_seed(seed).public_key_bytes();
+        seed.zeroize();
+        if let Some(h) = env_nonempty("PARVAULT_GENESIS_PUBKEY_HEX") {
+            let env_pk = parse_hex32(&h, "genesis pubkey")?;
+            if env_pk != pk {
+                return Err(CryptoError::RingMembership(format!(
+                    "conflicting ring genesis sources: the ring genesis seed={}, \
+                     PARVAULT_GENESIS_PUBKEY_HEX={}",
+                    hex::encode(pk),
+                    hex::encode(env_pk)
+                )));
+            }
+        }
+        Self::pin_ring_genesis_pubkey_in_dir(data_dir, pk)?;
+        fsync_dir(data_dir)?;
+        Ok(pk)
+    }
+
+    /// arch056c 2.4: removes the staging files a kill before a rename leaves
+    /// (`.tmp.ring_genesis.seed.<hex>` from [`write_secret_file_atomic_0600`] and
+    /// `.ring_genesis.pub.tmp.<hex>` from `atomic_write_file`). The caller holds the data-dir
+    /// lock, so no live writer owns them. Returns how many were removed.
+    pub fn sweep_genesis_staging_files(data_dir: &Path) -> std::io::Result<usize> {
+        let seed_prefix = format!(".tmp.{RING_GENESIS_SEED_FILE}.");
+        let pin_prefix = format!(".{RING_GENESIS_PUB_FILE}.tmp.");
+        let entries = match std::fs::read_dir(data_dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        let mut removed = 0;
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let staged = [&seed_prefix, &pin_prefix].iter().any(|p| {
+                name.strip_prefix(p.as_str())
+                    .is_some_and(|rest| rest.len() == 16 && hex::decode(rest).is_ok())
+            });
+            if staged && entry.file_type()?.is_file() {
+                std::fs::remove_file(entry.path())?;
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            fsync_dir(data_dir).map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
+        Ok(removed)
     }
 
     /// Pins the ring genesis public key (`parvault wot install-chain`, `wot init`). Refuses to

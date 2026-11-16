@@ -49,19 +49,13 @@ pub(crate) async fn up(env: CliEnv, command: Commands) -> anyhow::Result<()> {
     else {
         unreachable!("up() is only dispatched for Commands::Up")
     };
-    if no_gc {
-        // v0.5.6 T0 stub (G3): track B2 builds the version GC this turns off.
-        return Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt {
-            track: "B2",
-            entry: "--no-gc",
-        })
-        .into());
+    // C37: the watch interval has a floor (B2 exports MIN_WATCH_INTERVAL_SECS).
+    if interval_secs < 2 {
+        anyhow::bail!("reject.interval_below_floor: --interval-secs must be at least 2");
     }
-    // B-174 (track E): the daemon holds the data-dir lock for its lifetime.
-    let _datadir_lock = parvault::datadir_lock::DataDirLock::acquire(
-        &cfg.data_dir,
-        parvault::datadir_lock::LockPurpose::Daemon,
-    )?;
+    // B-174 (track E): the daemon holds the data-dir lock for its lifetime: the one
+    // `onboarding::up_setup_preflight` took before any file was created.
+    let _datadir_lock = parvault::datadir_lock::daemon_lock(&cfg.data_dir)?;
     validate_builtin_vfs_flags(
         vfs_webdav_listen.as_deref(),
         vfs_fuse_fd,
@@ -102,7 +96,7 @@ pub(crate) async fn up(env: CliEnv, command: Commands) -> anyhow::Result<()> {
         vfs_seed_dir,
         vfs_cache_mib,
         watch_folder: effective_folder,
-        sync_interval_secs: interval_secs.max(1),
+        sync_interval_secs: interval_secs, // C37; B2 exports MIN_WATCH_INTERVAL_SECS
         sync_tier: effective_tier,
         wan_announce: !deterministic && (wan || !wan_seeds.is_empty()),
         wan_seeds,
@@ -167,10 +161,7 @@ pub(crate) async fn daemon(env: CliEnv, command: Commands) -> anyhow::Result<()>
             lab_insecure_metrics,
         } => {
             // B-174 (track E): the daemon holds the data-dir lock for its lifetime.
-            let _datadir_lock = parvault::datadir_lock::DataDirLock::acquire(
-                &cfg.data_dir,
-                parvault::datadir_lock::LockPurpose::Daemon,
-            )?;
+            let _datadir_lock = parvault::datadir_lock::daemon_lock(&cfg.data_dir)?;
             validate_builtin_vfs_flags(
                 vfs_webdav_listen.as_deref(),
                 vfs_fuse_fd,

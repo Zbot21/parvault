@@ -4,10 +4,10 @@
 # Container Manager shows; change it on each upgrade. (In the repo it is
 # parvault:<Cargo.toml version>-dev; scripts/gen_metrics.sh fails otherwise.)
 #
-#  - init:      run once; creates the ring on the very first start. On later starts it logs
-#               "Error: Invalid key or hex encoding: this node is already in the ring <key>" (versions after 0.5.3
-#               drop the "Invalid key or hex encoding:" prefix) and exits 1. That is harmless.
-#  - parvault:  the daemon. Healthy means it is running in a ring.
+#  - parvault:  the daemon, the only service. On an empty volume its first start creates the ring
+#               (`up --init-if-absent`, "Started a new ring" in its Log tab); later starts find the
+#               ring and just run. A volume that holds anything else is refused, never overwritten.
+#               Healthy means it is running in a ring.
 #  - invite-*:  add one per joining node, AFTER the first start (see the commented example and
 #               docs/SYNOLOGY.md "Add a node"). Its token appears in its Log tab.
 name: parvault
@@ -27,9 +27,6 @@ x-oneshot: &oneshot
   volumes:
     - parvault-data:/var/lib/parvault
 services:
-  init:
-    <<: *oneshot
-    command: ["--data-dir", "/var/lib/parvault", "wot", "init"]
   parvault:
     image: parvault:0.5.5-dev
     pull_policy: never
@@ -40,15 +37,14 @@ services:
     # own address. A bridge network would hide both behind NAT. Container Manager then shows 0
     # network use for this container; that is expected.
     network_mode: host
-    # Starts after init has started. On the very first start the daemon may exit once, "not in a
-    # ring", before init has written the ring; `restart` brings it back within seconds.
-    depends_on:
-      init:
-        condition: service_started
+    # Only while restoring this node from an encrypted ring backup (see ring-restore below):
+    # depends_on:
+    #   ring-restore:
+    #     condition: service_completed_successfully
     # The image starts no status page. This project opts in, token-gated, on loopback only. With
     # host networking a LAN address here is the NAS's own: to view it from the LAN, replace
     # 127.0.0.1 with the NAS's LAN IP (never 0.0.0.0 or a WAN-facing address).
-    command: ["--data-dir", "/var/lib/parvault", "up",
+    command: ["--data-dir", "/var/lib/parvault", "up", "--init-if-absent",
               "--ipc-socket", "/run/parvault/parvault.sock",
               "--status-http", "127.0.0.1:4080"]
     cap_drop: [ALL]
@@ -78,6 +74,23 @@ services:
   #     parvault:
   #       condition: service_healthy
   #   command: ["--data-dir", "/var/lib/parvault", "wot", "invite", "--peer", "NODE_KEY_64_HEX"]
+  # Restore this node from an encrypted ring backup (docs/SYNOLOGY.md "Encrypted ring backup"),
+  # on a NEW volume that no daemon has started on: uncomment this service, the depends_on block
+  # in `parvault` and `parvault-secrets` under volumes; set the bundle's file name and its ring
+  # id; build once. Then comment all three again and build: a second restore refuses the
+  # now-used volume and would hold the daemon back.
+  # ring-restore:
+  #   <<: *oneshot
+  #   command: ["--data-dir", "/var/lib/parvault", "ring", "restore",
+  #             "--from", "/backup/BUNDLE_FILE_NAME", "--passphrase-file", "/secrets/passphrase",
+  #             "--expect-ring", "RING_ID_64_HEX", "--confirm-move"]
+  #   volumes:
+  #     - parvault-data:/var/lib/parvault
+  #     - parvault-secrets:/secrets:ro
+  #     - /volume1/parvault-backup:/backup:ro
 volumes:
   parvault-data:
     name: parvault-data   # fixed name: the project's services and later rebuilds share it
+  # parvault-secrets:     # only while restoring (made by the parvault-passphrase project)
+  #   external: true
+  #   name: parvault-secrets
