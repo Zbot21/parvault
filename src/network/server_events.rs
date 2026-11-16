@@ -16,9 +16,9 @@ use libp2p::kad::{self, store::RecordStore};
 use libp2p::request_response::ResponseChannel;
 use libp2p::request_response::{self, Message};
 use libp2p::swarm::SwarmEvent;
-use libp2p::{mdns, Multiaddr, Swarm};
+use libp2p::{identify, mdns, Multiaddr, Swarm};
 use std::collections::HashMap;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Onion relay forwards in flight on this node, across all peers (F-18, F-33). The default; see
 /// [`max_inflight_relays`] for the per-profile cap.
@@ -167,6 +167,22 @@ pub struct KadRecordFacts {
     pub candidate: Option<RecordIdentity>,
     /// The record already stored under that key, if any.
     pub existing: Option<RecordIdentity>,
+    /// The record store's budget (B-152 b, arch152b 2.3-2.4): its usage now, the candidate's
+    /// value size and the size of the value it would replace.
+    pub budget: KadStoreBudget,
+}
+
+/// The Kademlia record store's usage and limits for one inbound record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+pub struct KadStoreBudget {
+    pub records: u64,
+    pub bytes: u64,
+    pub candidate_len: u64,
+    /// The value size of the record under the same key (0 when none).
+    pub existing_len: u64,
+    pub max_records: u64,
+    pub max_bytes: u64,
 }
 
 /// Stores an inbound Kademlia record only if it is a valid DHT envelope for its key, does not
@@ -187,7 +203,28 @@ pub fn kad_record_decision(facts: &KadRecordFacts) -> Result<(), &'static str> {
             return Err("reject.dht_record_rollback");
         }
     }
+    // B-152 b (arch152b 2.3-2.4): the store's record and byte budget. Replacing a held key is
+    // allowed whenever the total stays within the byte budget; a new key also needs a free
+    // record slot. Nothing is evicted.
+    let b = &facts.budget;
+    let replaces = facts.existing.is_some();
+    let after = b
+        .bytes
+        .saturating_sub(if replaces { b.existing_len } else { 0 })
+        .saturating_add(b.candidate_len);
+    if after > b.max_bytes || (!replaces && b.records >= b.max_records) {
+        return Err("reject.dht_record_store_full");
+    }
     Ok(())
+}
+
+/// The reason code of a Kademlia record-store error.
+pub fn kad_store_error_code(e: &kad::store::Error) -> &'static str {
+    match e {
+        kad::store::Error::MaxRecords => "reject.kad_store_max_records",
+        kad::store::Error::ValueTooLarge => "reject.dht_record_too_large",
+        kad::store::Error::MaxProvidedKeys => "reject.dht_provider_store_full",
+    }
 }
 
 /// The owner and version of `record` if it is a valid DHT envelope for its key.
@@ -328,6 +365,14 @@ impl ServerSwarmEvents {
             } => {
                 self.peer_remote_addrs
                     .insert(peer_id.to_string(), endpoint.get_remote_address().clone());
+                // B-157: the redial task's connected-since clock; the dialled address (never the
+                // observed one of an inbound connection, R2) maps a configured address to its peer.
+                let dialled = endpoint.is_dialer().then(|| endpoint.get_remote_address());
+                crate::network::redial::book().on_established(
+                    peer_id,
+                    dialled,
+                    std::time::Instant::now(),
+                );
                 None
             }
             SwarmEvent::ConnectionClosed {
@@ -337,7 +382,16 @@ impl ServerSwarmEvents {
             } => {
                 if num_established == 0 {
                     self.peer_remote_addrs.remove(&peer_id.to_string());
+                    crate::network::redial::book().on_closed(&peer_id);
                 }
+                None
+            }
+            SwarmEvent::Behaviour(MeshNetworkBehaviourEvent::Identify(
+                identify::Event::Received { peer_id, info, .. },
+            )) => {
+                // B-157 (R2): a peer's own listen addresses, the only addresses besides the
+                // configured ones that the redial task dials (and only once it is admitted).
+                crate::network::redial::book().on_identify(peer_id, &info.listen_addrs);
                 None
             }
             SwarmEvent::Behaviour(MeshNetworkBehaviourEvent::Mdns(mdns::Event::Discovered(
@@ -362,8 +416,10 @@ impl ServerSwarmEvents {
                 | kad::Event::PendingRoutablePeer { peer, .. }
                 | kad::Event::UnroutablePeer { peer },
             )) => {
+                // B-148 item 1: admission is lazy (the peer's handshake comes before its first
+                // request that needs it), so this is expected on every new connection.
                 if let Err(code) = kad_routing_decision(false) {
-                    info!(code, %peer, "peer not added to the Kademlia routing table");
+                    debug!(code, %peer, "not yet admitted (no handshake yet)");
                 }
                 None
             }
@@ -377,15 +433,33 @@ impl ServerSwarmEvents {
                         ..
                     } => {
                         let store = swarm.behaviour_mut().kademlia.store_mut();
-                        let existing = store.get(&record.key).and_then(|r| record_identity(&r));
+                        let held = store.get(&record.key).map(|r| r.into_owned());
+                        let existing = held.as_ref().and_then(record_identity);
+                        let limits = crate::network::transport::server_kad_params();
+                        let (records, bytes) = store.records().fold((0u64, 0u64), |(n, b), r| {
+                            (n + 1, b.saturating_add(r.value.len() as u64))
+                        });
                         let facts = KadRecordFacts {
                             source_admitted: self.admitted_peers.contains(&source),
                             candidate: record_identity(&record),
                             existing,
+                            budget: KadStoreBudget {
+                                records,
+                                bytes,
+                                candidate_len: record.value.len() as u64,
+                                existing_len: held.map_or(0, |r| r.value.len() as u64),
+                                max_records: limits.max_records as u64,
+                                max_bytes: limits.max_total_bytes,
+                            },
                         };
                         match kad_record_decision(&facts) {
                             Ok(()) => {
-                                let _ = store.put(record);
+                                // arch152 2.3: a store refusal is logged with a code, never
+                                // discarded.
+                                if let Err(e) = store.put(record) {
+                                    let code = kad_store_error_code(&e);
+                                    warn!(code, %source, error = %e, "Kademlia store refused a record");
+                                }
                             }
                             Err(code) => warn!(code, %source, "refused an inbound Kademlia record"),
                         }
@@ -494,7 +568,10 @@ impl ServerSwarmEvents {
                     }
                 };
                 if kad_routing_decision(admits_sender(&response)).is_ok() {
-                    self.admitted_peers.insert(peer);
+                    if self.admitted_peers.insert(peer) {
+                        info!(%peer, "peer admitted (handshake accepted)");
+                    }
+                    crate::network::redial::book().on_admitted(peer);
                     if let Some(addr) = remote_addr {
                         if crate::network::traversal_gate::gate_addr_decision(
                             &addr,
@@ -513,7 +590,20 @@ impl ServerSwarmEvents {
                     .send_response(channel, response);
                 None
             }
-            other => Some(other),
+            other => {
+                // Live status (B-148 item 2): this node's own listen addresses. The caller still
+                // gets the event.
+                match &other {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        crate::network::redial::book().on_new_listen_addr(address.clone());
+                    }
+                    SwarmEvent::ExpiredListenAddr { address, .. } => {
+                        crate::network::redial::book().on_expired_listen_addr(address);
+                    }
+                    _ => {}
+                }
+                Some(other)
+            }
         }
     }
 }
@@ -580,6 +670,11 @@ mod tests {
                 source_admitted: true,
                 candidate,
                 existing,
+                budget: KadStoreBudget {
+                    max_records: 4,
+                    max_bytes: 100,
+                    ..KadStoreBudget::default()
+                },
             };
         let a = |v| Some((vec![1u8], v));
         assert_eq!(kad_record_decision(&facts(a(2), None)), Ok(()));
@@ -606,8 +701,33 @@ mod tests {
                 source_admitted: false,
                 candidate: a(2),
                 existing: None,
+                budget: KadStoreBudget::default(),
             }),
             Err("reject.dht_record_source_not_admitted")
         );
+    }
+
+    #[test]
+    fn kad_store_budget_rules() {
+        let f = |records, bytes, candidate_len, existing_len| KadRecordFacts {
+            source_admitted: true,
+            candidate: Some((vec![1u8], 2)),
+            existing: (existing_len > 0).then(|| (vec![1u8], 1)),
+            budget: KadStoreBudget {
+                records,
+                bytes,
+                candidate_len,
+                existing_len,
+                max_records: 4,
+                max_bytes: 100,
+            },
+        };
+        let full = Err("reject.dht_record_store_full");
+        assert_eq!(kad_record_decision(&f(3, 50, 50, 0)), Ok(()));
+        assert_eq!(kad_record_decision(&f(4, 10, 1, 0)), full);
+        assert_eq!(kad_record_decision(&f(3, 60, 41, 0)), full);
+        // Replacing at the record cap, within bytes.
+        assert_eq!(kad_record_decision(&f(4, 100, 40, 40)), Ok(()));
+        assert_eq!(kad_record_decision(&f(4, 100, 41, 40)), full);
     }
 }

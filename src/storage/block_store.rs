@@ -2418,64 +2418,312 @@ impl SignedDhtManifestEnvelope {
     }
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Deserialize, Default)]
 struct PersistedZeroTrustDhtState {
     records: HashMap<[u8; 32], SignedDhtManifestEnvelope>,
     pq_records: HashMap<[u8; 32], crate::crypto::PqSignedDhtManifestEnvelope>,
     catalog_records: HashMap<[u8; 32], crate::sync::EncryptedVaultCatalogEnvelope>,
 }
 
+/// The same layout as [`PersistedZeroTrustDhtState`], serialised by reference (A-152 4.5: no
+/// clone of the three maps per put).
+#[derive(Serialize)]
+struct PersistedZeroTrustDhtStateRef<'a> {
+    records: &'a HashMap<[u8; 32], SignedDhtManifestEnvelope>,
+    pq_records: &'a HashMap<[u8; 32], crate::crypto::PqSignedDhtManifestEnvelope>,
+    catalog_records: &'a HashMap<[u8; 32], crate::sync::EncryptedVaultCatalogEnvelope>,
+}
+
+/// The envelope store's budget (B-152 b, A-152 part 4): total bytes, total keys, and keys and
+/// bytes per owner. At the cap a new key is refused, never another evicted (an evicted key loses
+/// its version floor and may be the only copy of an ADR-18 catalog).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DhtStoreLimits {
+    pub max_bytes: u64,
+    pub max_keys: u64,
+    pub max_owner_bytes: u64,
+    pub max_owner_keys: u64,
+}
+
+impl DhtStoreLimits {
+    /// Per profile (arch152b 4: budgets router-soc 8 MiB, homelab-nas 32 MiB, desktop 256 MiB;
+    /// arch152 4.2: keys 256, 2,048, 8,192). One owner may take three quarters of either, so one
+    /// ring member cannot fill the store for the others (provisional until per-owner counts are
+    /// measured on a real ring).
+    pub const fn for_profile(profile: crate::profile::HardwareProfile) -> Self {
+        let (max_bytes, max_keys) = match profile {
+            crate::profile::HardwareProfile::RouterSoc => (8 << 20, 256),
+            crate::profile::HardwareProfile::HomelabNas => (32 << 20, 2_048),
+            crate::profile::HardwareProfile::Desktop => (256 << 20, 8_192),
+        };
+        Self {
+            max_bytes,
+            max_keys,
+            max_owner_bytes: max_bytes / 4 * 3,
+            max_owner_keys: max_keys / 4 * 3,
+        }
+    }
+}
+
+impl Default for DhtStoreLimits {
+    fn default() -> Self {
+        Self::for_profile(crate::profile::HardwareProfile::Desktop)
+    }
+}
+
+/// What the envelope-store capacity decision needs (an envelope that already passed its
+/// signature and version checks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+pub struct DhtStoreFacts {
+    /// The store file did not load (unreadable or undecodable): every put is refused.
+    pub store_corrupt: bool,
+    /// The key is already held (an update by its owner).
+    pub replaces_existing: bool,
+    /// Serialised size of the new envelope and of the one it replaces (0 if none).
+    pub new_len: u64,
+    pub old_len: u64,
+    /// The store's totals now.
+    pub total_bytes: u64,
+    pub total_keys: u64,
+    /// The envelope owner's totals now.
+    pub owner_bytes: u64,
+    pub owner_keys: u64,
+}
+
+/// The envelope-store capacity rule (A-152 4.1-4.4): a corrupt store refuses every put; an
+/// update of a held key is accepted whenever the total stays within the byte budget; a new key
+/// needs room in the total keys and bytes (`reject.dht_store_full`) and in its owner's share
+/// (`reject.dht_owner_key_cap`). Nothing is ever evicted.
+pub fn dht_store_decision(f: &DhtStoreFacts, l: &DhtStoreLimits) -> Result<(), &'static str> {
+    if f.store_corrupt {
+        return Err("reject.dht_store_corrupt");
+    }
+    let after = f
+        .total_bytes
+        .saturating_sub(if f.replaces_existing { f.old_len } else { 0 })
+        .saturating_add(f.new_len);
+    if after > l.max_bytes {
+        return Err("reject.dht_store_full");
+    }
+    if f.replaces_existing {
+        return Ok(());
+    }
+    if f.total_keys >= l.max_keys {
+        return Err("reject.dht_store_full");
+    }
+    if f.owner_keys >= l.max_owner_keys
+        || f.owner_bytes.saturating_add(f.new_len) > l.max_owner_bytes
+    {
+        return Err("reject.dht_owner_key_cap");
+    }
+    Ok(())
+}
+
+/// An envelope's owner, as the store counts it: the Ed25519 owner key, or a SHA-256 of the
+/// serialised hybrid post-quantum owner key.
+type OwnerTag = [u8; 32];
+
+fn pq_owner_tag(k: &crate::crypto::HybridPqPublicKey) -> OwnerTag {
+    use sha2::Digest;
+    let raw = bincode::serialize(k).unwrap_or_default();
+    sha2::Sha256::digest(&raw).into()
+}
+
+/// Per-owner usage (keys, bytes).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct OwnerUsage {
+    keys: u64,
+    bytes: u64,
+}
+
 /// Zero-Trust Kademlia DHT Manifest Table enforcing Ed25519 key ownership and strict version
-/// monotonicity (`new.monotonic_version > existing.monotonic_version`) to block poisoning and rollbacks.
+/// monotonicity (`new.monotonic_version > existing.monotonic_version`) to block poisoning and
+/// rollbacks, within a capacity budget ([`DhtStoreLimits`], [`dht_store_decision`]).
 #[derive(Debug, Default, Clone)]
 pub struct ZeroTrustDhtStore {
     records: HashMap<[u8; 32], SignedDhtManifestEnvelope>,
     pq_records: HashMap<[u8; 32], crate::crypto::PqSignedDhtManifestEnvelope>,
     catalog_records: HashMap<[u8; 32], crate::sync::EncryptedVaultCatalogEnvelope>,
     persistence_path: Option<PathBuf>,
+    limits: DhtStoreLimits,
+    /// Serialised size of each held envelope, by (kind, key).
+    sizes: HashMap<(u8, [u8; 32]), (OwnerTag, u64)>,
+    total_bytes: u64,
+    owners: HashMap<OwnerTag, OwnerUsage>,
+    /// The store file exists but did not load: puts are refused and the file is never
+    /// rewritten, so every version floor it holds survives (A-152 4.4).
+    corrupt: bool,
 }
+
+const KIND_CLASSICAL: u8 = 0;
+const KIND_PQ: u8 = 1;
+const KIND_CATALOG: u8 = 2;
+
+/// The store file's name in the data directory.
+pub const DHT_STORE_FILE: &str = "zero_trust_dht_store.bin";
 
 impl ZeroTrustDhtStore {
     pub fn new() -> Self {
-        Self {
-            records: HashMap::new(),
-            pq_records: HashMap::new(),
-            catalog_records: HashMap::new(),
-            persistence_path: None,
-        }
+        Self::default()
     }
 
     /// Initializes `ZeroTrustDhtStore` backed by `data_dir/zero_trust_dht_store.bin` so
-    /// DHT manifest and vault catalog envelopes survive process and daemon restarts.
+    /// DHT manifest and vault catalog envelopes survive process and daemon restarts. A file
+    /// that exists but does not read or decode is never treated as empty: the store refuses
+    /// every put (`reject.dht_store_corrupt`) and leaves the file as it is.
     pub fn with_persistence_dir(data_dir: &Path) -> Self {
         let _ = fs::create_dir_all(data_dir);
-        let path = data_dir.join("zero_trust_dht_store.bin");
-        let (records, pq_records, catalog_records) = if path.exists() {
-            fs::read(&path)
-                .ok()
-                .and_then(|bytes| bincode::deserialize::<PersistedZeroTrustDhtState>(&bytes).ok())
-                .map(|s| (s.records, s.pq_records, s.catalog_records))
-                .unwrap_or_default()
-        } else {
-            (HashMap::new(), HashMap::new(), HashMap::new())
+        let path = data_dir.join(DHT_STORE_FILE);
+        let mut store = Self {
+            persistence_path: Some(path.clone()),
+            ..Self::default()
         };
-        Self {
-            records,
-            pq_records,
-            catalog_records,
-            persistence_path: Some(path),
+        if !path.exists() {
+            return store;
+        }
+        let loaded = fs::read(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| {
+                bincode::deserialize::<PersistedZeroTrustDhtState>(&bytes)
+                    .map_err(|e| e.to_string())
+            });
+        match loaded {
+            Ok(s) => {
+                store.records = s.records;
+                store.pq_records = s.pq_records;
+                store.catalog_records = s.catalog_records;
+                store.recount();
+            }
+            Err(error) => {
+                store.corrupt = true;
+                tracing::error!(
+                    code = "reject.dht_store_corrupt",
+                    path = %path.display(),
+                    %error,
+                    "the DHT envelope store does not load; refusing DHT puts until it is repaired or removed"
+                );
+            }
+        }
+        store
+    }
+
+    /// Sets the capacity budget. Held envelopes over a smaller budget stay; new keys are
+    /// refused until the store is back under it.
+    pub fn set_limits(&mut self, limits: DhtStoreLimits) {
+        self.limits = limits;
+    }
+
+    pub fn limits(&self) -> DhtStoreLimits {
+        self.limits
+    }
+
+    /// Whether the store file failed to load (every put is refused).
+    pub fn is_corrupt(&self) -> bool {
+        self.corrupt
+    }
+
+    /// (keys, bytes) held in total.
+    pub fn usage(&self) -> (u64, u64) {
+        (self.sizes.len() as u64, self.total_bytes)
+    }
+
+    /// Distinct keys each owner holds, largest first (B-182 measurement).
+    pub fn keys_per_owner(&self) -> Vec<u64> {
+        let mut v: Vec<u64> = self.owners.values().map(|u| u.keys).collect();
+        v.sort_unstable_by(|a, b| b.cmp(a));
+        v
+    }
+
+    fn recount(&mut self) {
+        self.sizes.clear();
+        self.owners.clear();
+        self.total_bytes = 0;
+        let mut add = |kind: u8, key: [u8; 32], owner: OwnerTag, len: u64| {
+            self.sizes.insert((kind, key), (owner, len));
+            self.total_bytes = self.total_bytes.saturating_add(len);
+            let u = self.owners.entry(owner).or_default();
+            u.keys += 1;
+            u.bytes = u.bytes.saturating_add(len);
+        };
+        for (k, e) in &self.records {
+            add(KIND_CLASSICAL, *k, e.owner_pubkey, serialized_len(e));
+        }
+        for (k, e) in &self.pq_records {
+            add(
+                KIND_PQ,
+                *k,
+                pq_owner_tag(&e.owner_pq_pubkey),
+                serialized_len(e),
+            );
+        }
+        for (k, e) in &self.catalog_records {
+            add(KIND_CATALOG, *k, e.owner_pubkey, serialized_len(e));
         }
     }
 
+    /// The capacity check for a valid envelope; on `Ok` the accounting is updated.
+    fn admit(
+        &mut self,
+        kind: u8,
+        key: [u8; 32],
+        owner: OwnerTag,
+        new_len: u64,
+    ) -> Result<(), StorageError> {
+        let old = self.sizes.get(&(kind, key)).copied();
+        let usage = self.owners.get(&owner).copied().unwrap_or_default();
+        let facts = DhtStoreFacts {
+            store_corrupt: self.corrupt,
+            replaces_existing: old.is_some(),
+            new_len,
+            old_len: old.map_or(0, |(_, l)| l),
+            total_bytes: self.total_bytes,
+            total_keys: self.sizes.len() as u64,
+            owner_bytes: usage.bytes,
+            owner_keys: usage.keys,
+        };
+        if let Err(code) = dht_store_decision(&facts, &self.limits) {
+            tracing::warn!(
+                code,
+                keys = facts.total_keys,
+                bytes = facts.total_bytes,
+                owner_keys = facts.owner_keys,
+                "refused a DHT envelope"
+            );
+            return Err(StorageError::Io(std::io::Error::other(code)));
+        }
+        if let Some((old_owner, old_len)) = old {
+            self.total_bytes = self.total_bytes.saturating_sub(old_len);
+            if let Some(u) = self.owners.get_mut(&old_owner) {
+                u.bytes = u.bytes.saturating_sub(old_len);
+                u.keys = u.keys.saturating_sub(1);
+            }
+        }
+        self.sizes.insert((kind, key), (owner, new_len));
+        self.total_bytes = self.total_bytes.saturating_add(new_len);
+        let u = self.owners.entry(owner).or_default();
+        u.keys += 1;
+        u.bytes = u.bytes.saturating_add(new_len);
+        Ok(())
+    }
+
     fn persist_if_configured(&self) {
+        if self.corrupt {
+            return;
+        }
         if let Some(ref path) = self.persistence_path {
-            let state = PersistedZeroTrustDhtState {
-                records: self.records.clone(),
-                pq_records: self.pq_records.clone(),
-                catalog_records: self.catalog_records.clone(),
+            let state = PersistedZeroTrustDhtStateRef {
+                records: &self.records,
+                pq_records: &self.pq_records,
+                catalog_records: &self.catalog_records,
             };
-            if let Ok(raw) = bincode::serialize(&state) {
-                let _ = BlockStore::atomic_write_file(path, &raw);
+            match bincode::serialize(&state) {
+                Ok(raw) => {
+                    if let Err(e) = BlockStore::atomic_write_file(path, &raw) {
+                        tracing::warn!(error = %e, "DHT envelope store not persisted");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "DHT envelope store not serialised"),
             }
         }
     }
@@ -2484,6 +2732,7 @@ impl ZeroTrustDhtStore {
     /// 1. Its zero-knowledge Ed25519 signature and SHA-256 commitment are valid.
     /// 2. If `dht_key` already exists, `owner_pubkey` matches the original owner AND
     ///    `monotonic_version` is strictly greater than the stored version.
+    /// 3. The store has room for it ([`dht_store_decision`]).
     pub fn put_manifest_envelope(
         &mut self,
         envelope: SignedDhtManifestEnvelope,
@@ -2498,6 +2747,12 @@ impl ZeroTrustDhtStore {
                 return Err(StorageError::DhtManifestPoisonedOrRollback);
             }
         }
+        self.admit(
+            KIND_CLASSICAL,
+            envelope.dht_key,
+            envelope.owner_pubkey,
+            serialized_len(&envelope),
+        )?;
         self.records.insert(envelope.dht_key, envelope);
         self.persist_if_configured();
         Ok(())
@@ -2508,7 +2763,8 @@ impl ZeroTrustDhtStore {
     }
 
     /// Validates and stores a post-quantum `PqSignedDhtManifestEnvelope` (`Ed25519 + ML-DSA-65`)
-    /// enforcing composite signature validity, owner key immutability, and strict version monotonicity.
+    /// enforcing composite signature validity, owner key immutability, strict version
+    /// monotonicity and the capacity budget.
     pub fn put_pq_manifest_envelope(
         &mut self,
         envelope: crate::crypto::PqSignedDhtManifestEnvelope,
@@ -2523,6 +2779,12 @@ impl ZeroTrustDhtStore {
                 return Err(StorageError::DhtManifestPoisonedOrRollback);
             }
         }
+        self.admit(
+            KIND_PQ,
+            envelope.dht_key,
+            pq_owner_tag(&envelope.owner_pq_pubkey),
+            serialized_len(&envelope),
+        )?;
         self.pq_records.insert(envelope.dht_key, envelope);
         self.persist_if_configured();
         Ok(())
@@ -2535,8 +2797,9 @@ impl ZeroTrustDhtStore {
         self.pq_records.get(dht_key)
     }
 
-    /// Validates and stores an `EncryptedVaultCatalogEnvelope` (`ADR-18` disaster recovery root catalog)
-    /// enforcing Ed25519 signature validity, owner key immutability, and strict version monotonicity.
+    /// Validates and stores an `EncryptedVaultCatalogEnvelope` (`ADR-18` disaster recovery root
+    /// catalog) enforcing Ed25519 signature validity, owner key immutability, strict version
+    /// monotonicity and the capacity budget.
     pub fn put_vault_catalog_envelope(
         &mut self,
         envelope: crate::sync::EncryptedVaultCatalogEnvelope,
@@ -2551,6 +2814,12 @@ impl ZeroTrustDhtStore {
                 return Err(StorageError::DhtManifestPoisonedOrRollback);
             }
         }
+        self.admit(
+            KIND_CATALOG,
+            envelope.dht_key,
+            envelope.owner_pubkey,
+            serialized_len(&envelope),
+        )?;
         self.catalog_records.insert(envelope.dht_key, envelope);
         self.persist_if_configured();
         Ok(())
@@ -2562,6 +2831,10 @@ impl ZeroTrustDhtStore {
     ) -> Option<&crate::sync::EncryptedVaultCatalogEnvelope> {
         self.catalog_records.get(dht_key)
     }
+}
+
+fn serialized_len<T: Serialize>(v: &T) -> u64 {
+    bincode::serialized_size(v).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
