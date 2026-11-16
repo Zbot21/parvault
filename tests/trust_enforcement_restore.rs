@@ -1367,9 +1367,16 @@ fn d16_backup_names_each_skipped_floor() {
     let out = qafix056::backup_and_restore(&a, &b, root.path());
     let line = out
         .lines()
-        .find(|l| l.contains("warn.ring_backup_floor_skipped") && l.contains(OLD))
-        .unwrap_or_else(|| panic!("no warning names {OLD:?}:\n{out}"));
-    assert!(line.contains("outside the current rule"), "{line}");
+        .find(|l| {
+            l.contains("warn.ring_backup_floor_skipped")
+                && l.contains(OLD)
+                && l.contains("outside the current rule")
+        })
+        .unwrap_or_else(|| panic!("no warning names {OLD:?} and why:\n{out}"));
+    assert!(
+        line.starts_with("Warning (warn.ring_backup_floor_skipped)"),
+        "{line}"
+    );
     assert!(!out.contains("\"photos\""), "{out}");
     assert!(b.join("vaults/photos.floor").exists());
     assert!(!b.join(format!("vaults/{OLD}.floor")).exists());

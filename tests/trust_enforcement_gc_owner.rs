@@ -598,7 +598,8 @@ fn ring_pass_peers(f: &LocalFolder, peers: &str) -> Output {
 
 /// A ring pass with `extra` watch-folder flags, within `limit`.
 fn ring_pass_args(f: &LocalFolder, peers: &str, extra: &[&str], limit: Duration) -> Output {
-    ring_pass_env(f, peers, extra, &[], limit)
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_parvault"));
+    ring_pass_run(&mut cmd, f, peers, extra, limit)
 }
 
 /// [`ring_pass_args`] with `env` set on the owner process.
@@ -611,6 +612,17 @@ fn ring_pass_env(
 ) -> Output {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_parvault"));
     cmd.envs(env.iter().copied());
+    ring_pass_run(&mut cmd, f, peers, extra, limit)
+}
+
+/// Runs `cmd` (the real binary) as a ring pass of `f` with `extra` watch-folder flags.
+fn ring_pass_run(
+    cmd: &mut std::process::Command,
+    f: &LocalFolder,
+    peers: &str,
+    extra: &[&str],
+    limit: Duration,
+) -> Output {
     cmd.env("PARVAULT_LAN_REGISTRY_DIR", f.node.join("lan-registry"))
         .env("PARVAULT_GENESIS_SEED_HEX", GENESIS_SEED_HEX)
         .env("PARVAULT_SEED_PHRASE", PHRASE)
@@ -631,7 +643,7 @@ fn ring_pass_env(
             "--once",
         ])
         .args(extra);
-    output_within(&mut cmd, limit)
+    output_within(cmd, limit)
 }
 
 /// A ring pass with a raw `--key-hex` and no vault phrase, as the Docker gate's stage 13 runs
@@ -2205,7 +2217,7 @@ fn d22_oversize_catalog_refused_visibly() {
         &[SMALL_DHT_BUDGET],
         Duration::from_secs(120),
     );
-    let t = text(&out);
+    let t = strip_ansi(&text(&out));
     let warn = t
         .lines()
         .find(|l| l.contains("warn.dht_envelope_refused") && l.contains("reject.catalog_too_large"))
@@ -2256,4 +2268,22 @@ fn d24_no_gc_refusals_in_folder_status() {
     assert!(st.status.success(), "{s}");
     assert!(s.contains("Envelope Refusals  : 1 "), "{s}");
     gate_ran("trust_enforcement_gc_owner::d24_no_gc_refusals_in_folder_status");
+}
+
+/// `s` without ANSI colour sequences (`ESC [ ... m`), as a terminal would show it.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
