@@ -2982,9 +2982,9 @@ pub enum ManifestPublish {
 }
 
 /// B182-1: folder sync (and the lite path) never publish a per-file manifest envelope; their
-/// vault catalog (ADR-18, one key per vault, replaced in place) is the folder's only ring
-/// record, so an owner's key count follows its vaults, not its versions. `file store` and the
-/// gateway keep publishing (a single stored file has no catalog).
+/// disaster-recovery vault catalog (ADR-18, one key per vault, replaced in place) is the
+/// folder's only ring record, so an owner's key count follows its vaults, not its versions.
+/// `file store` and the gateway keep publishing (a single stored file has no catalog).
 pub const fn manifest_publish_decision(origin: ManifestOrigin) -> ManifestPublish {
     match origin {
         ManifestOrigin::FolderSync | ManifestOrigin::LiteSeed => ManifestPublish::LocalOnly,
