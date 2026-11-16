@@ -409,9 +409,12 @@ pub const FREE_ORDER_SKEW_MS: u64 = 30_000;
 
 /// C11: a signer's epoch mark may be dropped this long after the order that set it was
 /// accepted. Any order it guards is stale by then: an accepted order was signed at most
-/// [`FREE_ORDER_SKEW_MS`] after its acceptance, and is refused [`FREE_ORDER_SKEW_MS`] after
-/// it was signed.
-pub const FREE_EPOCH_TTL_MS: u64 = 2 * FREE_ORDER_SKEW_MS;
+/// [`FREE_ORDER_SKEW_MS`] after its acceptance, and is fresh up to and including
+/// [`FREE_ORDER_SKEW_MS`] after it was signed, so it is fresh at most until
+/// `accepted + 2 x skew` inclusive. The TTL is strictly longer (D15: one second over), so no
+/// instant exists where an accepted order is both fresh and unmarked.
+pub const FREE_EPOCH_TTL_MS: u64 = 2 * FREE_ORDER_SKEW_MS + 1_000;
+const _: () = assert!(FREE_EPOCH_TTL_MS > 2 * FREE_ORDER_SKEW_MS);
 
 /// Most signers whose epoch mark a host holds at once (entries expire after
 /// [`FREE_EPOCH_TTL_MS`]); a new signer is refused while the store is full.
@@ -554,7 +557,7 @@ impl FreeEpochStore {
             tracing::warn!(
                 code = "warn.free_epoch_state_corrupt",
                 path = %path.display(),
-                "free-order epoch marks unreadable; refusing orders for 60 s"
+                "free-order epoch marks unreadable; refusing orders for 61 s"
             );
             s.refuse_until_ms = now_ms.saturating_add(FREE_EPOCH_TTL_MS);
         }
@@ -2449,6 +2452,46 @@ mod chunk_admit_tests {
         epoch: u64,
     ) -> crate::network::FreeShardsOrder {
         sign_free_order(owner, host, ts, epoch, vec![sid(1), sid(2)])
+    }
+
+    /// D15 (qa056): no instant exists at which an accepted order is fresh again and its epoch
+    /// mark is gone. The worst case is an order signed `FREE_ORDER_SKEW_MS` ahead of the host's
+    /// clock, accepted at once: fresh until `accepted + 2 x skew`.
+    #[test]
+    fn an_accepted_order_is_never_fresh_and_unmarked() {
+        let owner = NodeIdentity::from_seed([0xA5; 32]);
+        let host = [0x11; 32];
+        let a = 5_000_000;
+        for ts in [
+            a - FREE_ORDER_SKEW_MS,
+            a,
+            a + FREE_ORDER_SKEW_MS - 1,
+            a + FREE_ORDER_SKEW_MS,
+        ] {
+            let mut e = engine();
+            let order = signed(&owner, host, ts, 7);
+            assert_eq!(e.free_order_check(&order, &host, a), Ok(()));
+            e.advance_free_epoch(owner.public_key_bytes(), 7, a);
+            let last_fresh = ts + FREE_ORDER_SKEW_MS;
+            for t in [
+                a,
+                a + 1,
+                last_fresh - 1,
+                last_fresh,
+                last_fresh + 1,
+                a + FREE_EPOCH_TTL_MS - 1,
+                a + FREE_EPOCH_TTL_MS,
+            ] {
+                let r = e.free_order_check(&order, &host, t);
+                assert_ne!(
+                    r,
+                    Ok(()),
+                    "replayed: ts=a{:+} at a+{}",
+                    ts as i64 - a as i64,
+                    t - a
+                );
+            }
+        }
     }
 
     #[test]

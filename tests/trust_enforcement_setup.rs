@@ -1512,3 +1512,144 @@ fn b169_write_v1_fixture() {
     std::fs::write(std::env::var("PARVAULT_WRITE_FIXTURE").unwrap(), &b).unwrap();
     println!("FIXTURE_HEX={}", hex::encode(&b));
 }
+
+// --- v0.5.6 qafix D10: the vault key file is sealed like `master_key.sealed` -----------------
+
+/// The sealing passphrase the D10 nodes set in `config.toml` only (never in the environment).
+const D10_PASS: &str = "d10 config-only sealing passphrase";
+const D10_PHRASE: &str = "d10 seed vault recovery phrase words";
+
+/// A node whose `config.toml` sets `device_sealing_passphrase` before `init`, so its master
+/// key is sealed under the passphrase and it has no `enclave_sealing.seed` of its own.
+fn d10_node(tmp: &Path, name: &str) -> PathBuf {
+    let d = tmp.join(name);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("config.toml"),
+        format!("device_sealing_passphrase = \"{D10_PASS}\"\n"),
+    )
+    .unwrap();
+    for args in [&["init"][..], &["wot", "init"][..]] {
+        let o = run(&d, args);
+        assert!(o.status.success(), "{}", text(&o));
+    }
+    d
+}
+
+/// One `watch-folder --seed-phrase --once` pass with no ring host answering: it registers the
+/// vault key file (then refuses to publish, G-23); `extra` goes before the subcommand.
+fn d10_register(d: &Path, folder: &Path, extra: &[&str]) -> String {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let o = common::output_within_deadline(
+        pv(d)
+            .env("PARVAULT_SEED_PHRASE", D10_PHRASE)
+            .args(extra)
+            .args(["--peers", &format!("/ip4/127.0.0.1/tcp/{port}")])
+            .args(["watch-folder", "--folder"])
+            .arg(folder)
+            .args(["--vault-namespace", "photos", "--once"]),
+    );
+    text(&o)
+}
+
+/// Whether `dir`'s `vaults/photos.vaultkey` unseals with the keystore `pass` gives in `dir`
+/// (its file key, sealed after the `PVVK`, version and length header).
+fn d10_vaultkey_unseals(dir: &Path, pass: Option<&str>) -> bool {
+    use parvault::crypto::{LocalFileKeystore, LocalKeystoreSealer};
+    let blob = std::fs::read(dir.join("vaults/photos.vaultkey")).unwrap();
+    assert_eq!(&blob[..4], b"PVVK");
+    let n = u16::from_be_bytes([blob[5], blob[6]]) as usize;
+    let ks = LocalFileKeystore::from_passphrase_or_csprng_in_dir(dir, pass).unwrap();
+    ks.unseal_key(&blob[7..7 + n]).is_ok()
+}
+
+/// `dir`'s master key unsealed with the keystore `pass` gives, if it unseals.
+fn d10_master_key(dir: &Path, pass: Option<&str>) -> Option<[u8; 32]> {
+    use parvault::crypto::{LocalFileKeystore, LocalKeystoreSealer};
+    let ks = LocalFileKeystore::from_passphrase_or_csprng_in_dir(dir, pass).unwrap();
+    ks.unseal_key(&std::fs::read(dir.join("master_key.sealed")).unwrap())
+        .ok()
+}
+
+/// A copy of the data dir `from` without `config.toml` (a stolen disk where the passphrase was
+/// kept elsewhere).
+fn d10_copy_without_config(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let name = e.file_name();
+        if name == "config.toml" {
+            continue;
+        }
+        if e.file_type().unwrap().is_dir() {
+            d10_copy_without_config(&e.path(), &to.join(&name));
+        } else {
+            std::fs::copy(e.path(), to.join(&name)).unwrap();
+        }
+    }
+}
+
+/// D10 (VAULTKEY-SEAL): with `device_sealing_passphrase` set only in `config.toml`, the vault
+/// key file is sealed under it like `master_key.sealed`: a copy of the data dir without the
+/// config unseals neither, the passphrase unseals both, and `ring backup` then `ring restore`
+/// work on such a node (the restored master key unseals under the restored config's
+/// passphrase, to the same key).
+#[test]
+fn d10_vaultkey_sealed_by_config_passphrase() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = d10_node(tmp.path(), "d");
+    let folder = tmp.path().join("folder");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("f.txt"), "x").unwrap();
+    let log = d10_register(&d, &folder, &[]);
+    assert!(d.join("vaults/photos.vaultkey").exists(), "{log}");
+    assert!(d10_vaultkey_unseals(&d, Some(D10_PASS)), "{log}");
+    let mk = d10_master_key(&d, Some(D10_PASS)).expect("master key under the passphrase");
+    let copy = tmp.path().join("copy");
+    d10_copy_without_config(&d, &copy);
+    assert!(
+        !d10_vaultkey_unseals(&copy, None),
+        "a copied data dir without the passphrase unseals the vault key file"
+    );
+    assert_eq!(d10_master_key(&copy, None), None);
+    // Ring backup and restore on this node.
+    let pass = pass_file(tmp.path(), "pass", PASS.as_bytes());
+    let bundle = backup(&d, &tmp.path().join("out"), &pass);
+    let target = tmp.path().join("restored");
+    let out = restore(&target, &bundle, &pass, &["--confirm-move"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        d10_master_key(&target, Some(D10_PASS)),
+        Some(mk),
+        "the restored master key is sealed under the restored config's passphrase"
+    );
+    assert!(!target.join("vaults/photos.vaultkey").exists());
+    gate_ran("trust_enforcement_setup::d10_vaultkey_sealed_by_config_passphrase");
+}
+
+/// D10 migration: a vault key file sealed the old way (by `enclave_sealing.seed`, here by a
+/// pass with a config that sets no passphrase) is resealed under the configured passphrase by
+/// the next registration (`watch-folder --seed-phrase`); the seed then no longer unseals it.
+#[test]
+fn d10_legacy_vaultkey_resealed_on_next_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = d10_node(tmp.path(), "d");
+    let folder = tmp.path().join("folder");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("f.txt"), "x").unwrap();
+    let bare = tmp.path().join("bare.toml");
+    std::fs::write(&bare, "").unwrap();
+    let log = d10_register(&d, &folder, &["--config", bare.to_str().unwrap()]);
+    assert!(d10_vaultkey_unseals(&d, None), "legacy seal\n{log}");
+    let log = d10_register(&d, &folder, &[]);
+    assert!(d10_vaultkey_unseals(&d, Some(D10_PASS)), "{log}");
+    assert!(
+        !d10_vaultkey_unseals(&d, None),
+        "the old seal still opens it\n{log}"
+    );
+    gate_ran("trust_enforcement_setup::d10_legacy_vaultkey_resealed_on_next_write");
+}

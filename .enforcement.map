@@ -402,12 +402,16 @@ kani       B154-WARN sym=src/sync/retention.rs::storage_warning_decision harness
 kani       B154-CAP sym=src/sync/retention.rs::apply_cap harness=proof_apply_cap_never_drops_newest cover=newest alone over the cap
 reach      TR-GC-MARK sym=src/sync/gc_journal.rs::mark from=src/sync/engine.rs::gc_after_pass   # ParVaultVersionGC guard mark-includes-pass
 reach      TR-GC-FREE sym=src/sync/gc_journal.rs::gc_free_decision from=src/sync/engine.rs::gc_after_pass   # ParVaultVersionGC guard catalog-pin
-tla-mutant TM-GC-MARK-PASS   spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-mark-includes-pass.patch
+tla-mutant TM-GC-MARK-PASS   spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-mark-includes-pass.patch   # also violates PublishedRecoverable: line TM-GC-MARK-PASS-PUB (D17)
+tla-mutant TM-GC-MARK-PASS-PUB spec=specs/ParVaultVersionGC.tla inv=PublishedRecoverable patch=specs/mutants/ParVaultVersionGC-mark-includes-pass.patch   # D17: inherent (the published version is retained)
 tla-mutant TM-GC-CATALOG-PIN spec=specs/ParVaultVersionGC.tla inv=PublishedRecoverable patch=specs/mutants/ParVaultVersionGC-catalog-pin.patch
 tla-mutant TM-GC-JOURNAL-FIRST spec=specs/ParVaultVersionGC.tla inv=NoLeakedGarbage patch=specs/mutants/ParVaultVersionGC-journal-before-drop.patch
-tla-mutant TM-GC-C9-FENCE    spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-c9-fence.patch
-tla-mutant TM-GC-FREE-FRESH  spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-free-fresh.patch
-tla-mutant TM-GC-FREE-EPOCH  spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-free-epoch.patch
+tla-mutant TM-GC-C9-FENCE    spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-c9-fence.patch   # also violates PublishedRecoverable: line TM-GC-C9-FENCE-PUB (D17)
+tla-mutant TM-GC-C9-FENCE-PUB spec=specs/ParVaultVersionGC.tla inv=PublishedRecoverable patch=specs/mutants/ParVaultVersionGC-c9-fence.patch   # D17: inherent (the published version is retained)
+tla-mutant TM-GC-FREE-FRESH  spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-free-fresh.patch   # also violates PublishedRecoverable: line TM-GC-FREE-FRESH-PUB (D17)
+tla-mutant TM-GC-FREE-FRESH-PUB spec=specs/ParVaultVersionGC.tla inv=PublishedRecoverable patch=specs/mutants/ParVaultVersionGC-free-fresh.patch   # D17: inherent (the published version is retained)
+tla-mutant TM-GC-FREE-EPOCH  spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-free-epoch.patch   # also violates PublishedRecoverable: line TM-GC-FREE-EPOCH-PUB (D17)
+tla-mutant TM-GC-FREE-EPOCH-PUB spec=specs/ParVaultVersionGC.tla inv=PublishedRecoverable patch=specs/mutants/ParVaultVersionGC-free-epoch.patch   # D17: inherent (the published version is retained)
 tla-mutant TM-GC-CREDIT      spec=specs/ParVaultVersionGC.tla inv=QuotaMatchesHeld patch=specs/mutants/ParVaultVersionGC-credit-accounted.patch
 
 # --- v0.5.6 track B1: version GC host side (plan 3.7; B-154 C11-C19, B-158, B-159, B-178, B-147) ---
@@ -516,6 +520,14 @@ artifact   A-TLS-DOCKER script=scripts/docker_stage_webdav_tls.sh bin=parvault s
 claim      CATALOG-RESUME sym=src/sync/catalog_resume.rs::catalog_resume_decision accept=trust_enforcement_setup::b169_restored_owner_publishes_above_and_frees_nothing reject=trust_enforcement_setup::g23_unreachable_ring_refuses_to_publish code=reject.catalog_resume_unreachable bin=parvault ref=docs/security/TRUST_FINDINGS.md   # G-23, B-169 K11: a node with no snapshot resumes the vault from the ring's own catalog, never a foreign one; an unreachable ring refuses
 suite      S-G23-FRESH test=trust_enforcement_setup::g23_fresh_node_from_phrase_resumes needs=cmd:sh   # G-23: a fresh node from the phrase alone resumes too
 suite      S-G23-FOREIGN test=trust_enforcement_setup::g23_foreign_catalog_not_adopted needs=cmd:sh   # G-23: a squatted catalog at this vault's key is never adopted
+
+# --- v0.5.6 QA fixes, vaultfix056 (qa056 D10, D13, D16) -------------------------------------------
+suite      S-D10-SEAL test=trust_enforcement_setup::d10_vaultkey_sealed_by_config_passphrase needs=cmd:sh   # D10: .vaultkey and master key sealed under the config's passphrase; ring backup and restore work
+suite      S-D10-MIGRATE test=trust_enforcement_setup::d10_legacy_vaultkey_resealed_on_next_write needs=cmd:sh   # D10: a seed-sealed .vaultkey is resealed by the next registration
+suite      S-D10-LEGACY-READ test=trust_enforcement_restore::d10_daemon_reads_legacy_sealed_vaultkey needs=cmd:sh   # D10: the daemon still reads a seed-sealed .vaultkey (warn.vaultkey_legacy_seal)
+suite      S-D13-LIVE test=trust_enforcement_restore::d13_running_daemon_lists_other_process_catalog needs=cmd:sh   # D13: a running daemon lists a catalog another process wrote, no restart
+suite      S-D16-FLOOR test=trust_enforcement_restore::d16_floor_of_any_registered_namespace_survives_backup needs=cmd:sh   # D16: one namespace rule; every registered floor survives backup, others refused (reject.vault_namespace_unsupported)
+suite      S-D16-UPGRADE test=trust_enforcement_restore::d16_existing_unsupported_registration_still_listed_and_warned needs=cmd:sh   # D16: an earlier registration outside the rule is still listed and warned at start (warn.vault_namespace_unsupported)
 
 # --- v0.5.6 B-182: envelope growth (arch182, L-141; B182-1 to B182-8, B182-10) --------------------
 claim      B182-CATALOG-INPLACE sym=src/storage/block_store.rs::dht_store_decision accept=trust_enforcement_b182::b182_catalog_updates_in_place_over_cap reject=trust_enforcement_b182::b182_owner_refusals_surface code=reject.dht_owner_key_cap bin=parvault ref=docs/security/TRUST_FINDINGS.md   # B182-5: a held catalog updates at or over the owner share; a new key there is refused

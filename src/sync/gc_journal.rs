@@ -38,6 +38,17 @@ pub const MAX_ABANDONED_PER_HOST: usize = 4096;
 pub const MAX_BACKOFF_PASSES: u64 = 60;
 /// How long one `FreeShards` order may take (up to 1024 shards purged on the host).
 pub const FREE_ORDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// D12: the most one pass spends sending one host its frees; the rest of that host's work is
+/// carried to the next pass, so a stalled host costs the others at most this (plus the order
+/// in flight, [`FREE_ORDER_TIMEOUT`]).
+pub const FREE_HOST_BUDGET_MS: u64 = 60_000;
+/// D12: the most one pass spends on frees in all; hosts not reached in it are carried.
+pub const FREE_PASS_BUDGET_MS: u64 = 300_000;
+// One order in flight fits in a host's budget, and two stalled hosts leave the pass budget.
+const _: () = assert!(
+    FREE_ORDER_TIMEOUT.as_millis() < FREE_HOST_BUDGET_MS as u128
+        && 2 * FREE_HOST_BUDGET_MS < FREE_PASS_BUDGET_MS
+);
 /// The retry reason of a host that did not answer.
 const UNREACHABLE: &str = "unreachable";
 /// The pseudo-host of the owner's own block store.
@@ -113,6 +124,18 @@ pub fn quota_retry_decision(
         kani::cover!(retried_once || !gc_freed_any, "retry spent");
         QuotaRetry::Spent("warn.gc_quota_retry_spent")
     }
+}
+
+/// D12: whether a pass may send one more free request (an order, or one fallback
+/// `DeleteShard`) after spending `host_spent_ms` on this host and `pass_spent_ms` on frees in
+/// all. Work not sent stays journalled, untouched, for the next pass.
+pub const fn free_send_decision(host_spent_ms: u64, pass_spent_ms: u64) -> bool {
+    host_spent_ms < FREE_HOST_BUDGET_MS && pass_spent_ms < FREE_PASS_BUDGET_MS
+}
+
+/// Milliseconds since `t`, saturating.
+fn spent_ms(t: std::time::Instant) -> u64 {
+    u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// What to do with a journal entry after a host's answer.
@@ -725,6 +748,9 @@ pub struct GcReport {
     pub foreign_catalog: bool,
     pub cap_below_one_version: bool,
     pub fallback_deletes: usize,
+    /// D12: due frees not sent this pass (a host's or the pass's time budget ran out); they
+    /// stay journalled for the next pass.
+    pub frees_deferred: usize,
     /// Unique pre-erasure bytes of the retained versions.
     pub stored_cipher_bytes: u64,
     /// Unique shard bytes (`shard_len x n`) of the retained versions, before the replica factor.
@@ -1031,7 +1057,9 @@ impl<'a> GcRun<'a> {
     }
 
     /// Step 6: one order per host per chunk of at most 1024 shards, each with its own epoch
-    /// (C10), persisted before it is sent.
+    /// (C10), persisted before it is sent, and timestamped and signed when it is sent (D12).
+    /// Each host gets at most [`FREE_HOST_BUDGET_MS`] and the pass [`FREE_PASS_BUDGET_MS`];
+    /// work not sent in them stays journalled, untouched, for the next pass (D12).
     pub fn step6_send_orders(&mut self) -> Result<(), GcError> {
         if self.report.foreign_catalog {
             return Ok(());
@@ -1039,12 +1067,16 @@ impl<'a> GcRun<'a> {
         self.journal.pass = self.journal.pass.saturating_add(1);
         let pass = self.journal.pass;
         let now = self.now_ms;
-        let Some(client) = self.settings.client.clone() else {
+        let started = std::time::Instant::now();
+        let Some(probe) = self.settings.client.clone() else {
             return self.journal.save(&self.paths);
         };
         // A host purges each shard of an order (shred, fsync): a full order takes seconds, far
         // over the default 1.2 s request timeout (track B1 measured 2.3 s for 666 shards).
-        let client = client.with_timeout(FREE_ORDER_TIMEOUT);
+        // Only orders and fallback deletes get the long timeout; status probes and key lookups
+        // keep the short one, so a host that holds a connection without answering costs one
+        // short probe, not a long timeout per probe (D12).
+        let client = probe.clone().with_timeout(FREE_ORDER_TIMEOUT);
         // Every address known for a host: the client's endpoints (given and discovered) and the
         // journal's own, before entries merge under one address per peer id.
         let mut known = client.all_network_endpoints();
@@ -1080,6 +1112,13 @@ impl<'a> GcRun<'a> {
         let mut pending_result: BTreeMap<usize, (FreeAction, String)> = BTreeMap::new();
         let mut abandoned_result: BTreeMap<usize, FreeAction> = BTreeMap::new();
         for host in hosts {
+            if !free_send_decision(0, spent_ms(started)) {
+                // The pass's budget is spent: this host's due work waits for the next pass.
+                let n = by_host.get(&host).map_or(0, Vec::len)
+                    + abandoned_due.get(&host).map_or(0, Vec::len);
+                self.report.frees_deferred += n;
+                continue;
+            }
             let p_idx = by_host.get(&host).cloned().unwrap_or_default();
             let a_idx = abandoned_due.get(&host).cloned().unwrap_or_default();
             let mut work: Vec<(bool, usize, ShardId)> = p_idx
@@ -1098,12 +1137,12 @@ impl<'a> GcRun<'a> {
             if addr_peer_id(&host).is_some() {
                 let reachable = send_candidates(&host, &known)
                     .into_iter()
-                    .find(|a| client.is_reachable(a));
+                    .find(|a| probe.is_reachable(a));
                 if let Some(a) = reachable {
                     send_to = a;
                 }
             }
-            let host_key = match client.remote_ed25519_pubkey(&send_to) {
+            let host_key = match probe.remote_ed25519_pubkey(&send_to) {
                 Ok(k) => Some(k),
                 Err(e) => {
                     tracing::info!(host = %host, error = %e, "host unreachable; frees retried later");
@@ -1120,14 +1159,27 @@ impl<'a> GcRun<'a> {
                 }
                 continue;
             };
+            let host_started = std::time::Instant::now();
             while !work.is_empty() {
+                if !free_send_decision(spent_ms(host_started), spent_ms(started)) {
+                    tracing::warn!(
+                        host = %host,
+                        deferred = work.len(),
+                        "free budget spent on this host; the rest is sent next pass"
+                    );
+                    self.report.frees_deferred += work.len();
+                    break;
+                }
                 let take = work.len().min(MAX_FREE_ORDER_SHARDS);
                 let chunk: Vec<(bool, usize, ShardId)> = work.drain(..take).collect();
-                let epoch = order_epoch(self.journal.last_epoch, now);
+                // D12: stamped now, at send, not at the pass start: a slow host before this one
+                // must not make the order stale on arrival (`reject.free_stale`).
+                let ts = now.saturating_add(spent_ms(started));
+                let epoch = order_epoch(self.journal.last_epoch, ts);
                 self.journal.last_epoch = epoch;
                 self.journal.save(&self.paths)?;
                 let ids: Vec<ShardId> = chunk.iter().map(|c| c.2).collect();
-                let order = sign_free_order(self.owner, host_key, now, epoch, ids.clone());
+                let order = sign_free_order(self.owner, host_key, ts, epoch, ids.clone());
                 self.report.orders_sent += 1;
                 let actions: Vec<(FreeAction, String, bool)> =
                     match client.free_shards(&send_to, order) {
@@ -1166,16 +1218,22 @@ impl<'a> GcRun<'a> {
                             tracing::warn!(host = %host, error = %e, "free order refused");
                             chunk.iter().map(|_| (a, e.clone(), false)).collect()
                         }
-                        Err(_) if !client.is_reachable(&send_to) => chunk
+                        Err(_) if !probe.is_reachable(&send_to) => chunk
                             .iter()
                             .map(|_| (FreeAction::Retry, UNREACHABLE.to_string(), false))
                             .collect(),
                         Ok(FreeShardsReply::Unsupported(_)) | Err(_) => {
                             // C15: a host without `FreeShards` (never with dedup, which v0.5.6 has
-                            // not): the old `DeleteShard`, per shard.
-                            ids.iter()
-                                .map(|id| {
-                                    self.report.fallback_deletes += 1;
+                            // not): the old `DeleteShard`, per shard, within the host's budget (D12);
+                            // the shards not tried get no result and stay journalled.
+                            let mut acts = Vec::with_capacity(ids.len());
+                            for id in &ids {
+                                if !free_send_decision(spent_ms(host_started), spent_ms(started)) {
+                                    self.report.frees_deferred += ids.len() - acts.len();
+                                    break;
+                                }
+                                self.report.fallback_deletes += 1;
+                                acts.push(
                                     match client.delete_shard_outcome(&send_to, *id, self.owner) {
                                         Ok(true) => (FreeAction::Done, String::new(), true),
                                         Ok(false) => (FreeAction::Done, String::new(), false),
@@ -1183,9 +1241,10 @@ impl<'a> GcRun<'a> {
                                             let t = e.to_string();
                                             (refusal_action(&t), t, false)
                                         }
-                                    }
-                                })
-                                .collect()
+                                    },
+                                );
+                            }
+                            acts
                         }
                     };
                 for ((is_p, i, _), (action, reason, freed)) in chunk.into_iter().zip(actions) {
@@ -1608,6 +1667,18 @@ mod tests {
         assert!(foreign_catalog_decision(None, 5, Some((5, [9; 32]))).is_ok());
         assert!(foreign_catalog_decision(None, 5, Some((6, [9; 32]))).is_err());
         assert!(foreign_catalog_decision(None, 5, None).is_ok());
+    }
+
+    /// D12: a host gets at most its budget, and the pass at most its own.
+    #[test]
+    fn free_budgets_bound_a_host_and_the_pass() {
+        assert!(free_send_decision(0, 0));
+        assert!(free_send_decision(
+            FREE_HOST_BUDGET_MS - 1,
+            FREE_PASS_BUDGET_MS - 1
+        ));
+        assert!(!free_send_decision(FREE_HOST_BUDGET_MS, 0));
+        assert!(!free_send_decision(0, FREE_PASS_BUDGET_MS));
     }
 
     #[test]

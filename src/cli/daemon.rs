@@ -339,7 +339,11 @@ pub(crate) async fn run_daemon(
         };
         // B-20 (track C): the vault catalogs this data dir holds keys for, imported at start and
         // on a timer, then hydrated by the scavenger (S1).
-        vfs.start_catalog_import(&cfg.data_dir, &block_store)?;
+        vfs.start_catalog_import(
+            &cfg.data_dir,
+            &block_store,
+            cfg.device_sealing_passphrase.as_deref(),
+        )?;
         if let Some(fuse_fd) = opts.vfs_fuse_fd {
             let fuse_dev = parvault::os_sys::adopt_fuse_dev_fd(fuse_fd)?;
             let vfs_fuse = vfs.clone();

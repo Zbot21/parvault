@@ -53,6 +53,11 @@ pub(crate) trait RingTarget {
     fn configured_genesis(&self) -> Option<&str> {
         None
     }
+    /// The config's `device_sealing_passphrase` (D10): `master_key.sealed` is unsealed and
+    /// resealed under it, as `main` seals it.
+    fn sealing_passphrase(&self) -> Option<&str> {
+        None
+    }
 }
 
 impl RingTarget for std::path::PathBuf {
@@ -77,6 +82,9 @@ impl RingTarget for parvault::config::NodeConfig {
             .as_deref()
             .filter(|s| !s.trim().is_empty())
     }
+    fn sealing_passphrase(&self) -> Option<&str> {
+        self.device_sealing_passphrase.as_deref()
+    }
 }
 
 pub(crate) fn run<T: RingTarget + ?Sized>(action: RingAction, target: &T) -> anyhow::Result<()> {
@@ -87,7 +95,13 @@ pub(crate) fn run<T: RingTarget + ?Sized>(action: RingAction, target: &T) -> any
             passphrase_file,
         } => {
             let _lock = DataDirLock::acquire(data_dir, LockPurpose::RingBackup)?;
-            backup(data_dir, &out, &passphrase_file, target.writer_kdf())
+            backup(
+                data_dir,
+                &out,
+                &passphrase_file,
+                target.writer_kdf(),
+                target.sealing_passphrase(),
+            )
         }
         RingAction::Restore {
             from,
@@ -97,7 +111,14 @@ pub(crate) fn run<T: RingTarget + ?Sized>(action: RingAction, target: &T) -> any
         } => {
             let _lock = DataDirLock::acquire(data_dir, LockPurpose::RingRestore)?;
             let expected = expected_rings(expect_ring.as_deref(), target.configured_genesis())?;
-            restore(data_dir, &from, &passphrase_file, &expected, confirm_move)
+            restore(
+                data_dir,
+                &from,
+                &passphrase_file,
+                &expected,
+                confirm_move,
+                target.sealing_passphrase(),
+            )
         }
     }
 }
@@ -194,19 +215,14 @@ fn parse_hex32(text: &[u8]) -> Option<[u8; 32]> {
 /// does (archC1 condition 5: the seed phrase recovers it).
 const VAULTS_DIR: &str = "vaults";
 
-/// `vaults/<ns>.floor`, `<ns>` of 1 to 128 ASCII letters, digits, `-`, `_` or `.`, not starting
-/// with `.`.
+/// `vaults/<ns>.floor` for a namespace the shared rule allows (D16,
+/// `sync::catalog_resume::vault_namespace_ok`): the rule `register_vault_keys` enforces, so the
+/// floor of every registered vault goes in the bundle.
 fn is_floor_name(name: &str) -> bool {
     name.strip_prefix(VAULTS_DIR)
         .and_then(|r| r.strip_prefix('/'))
         .and_then(|r| r.strip_suffix(".floor"))
-        .is_some_and(|ns| {
-            (1..=128).contains(&ns.len())
-                && !ns.starts_with('.')
-                && ns
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        })
+        .is_some_and(parvault::sync::catalog_resume::vault_namespace_ok)
 }
 
 /// The subdirectory a bundle entry lives in, if any.
@@ -232,6 +248,7 @@ fn backup(
     out: &Path,
     passphrase_file: &Path,
     kdf: KdfParams,
+    sealing_passphrase: Option<&str>,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(out)?;
     let pass = read_passphrase(passphrase_file, Some(out))?;
@@ -272,12 +289,15 @@ fn backup(
     let sealed = data_dir.join("master_key.sealed");
     if sealed.exists() {
         anyhow::ensure!(
-            data_dir.join("enclave_sealing.seed").exists()
+            sealing_passphrase.is_some_and(|p| !p.trim().is_empty())
+                || data_dir.join("enclave_sealing.seed").exists()
                 || std::env::var_os("PARVAULT_PASSPHRASE").is_some(),
-            "cannot unseal {}: no enclave_sealing.seed and no PARVAULT_PASSPHRASE",
+            "cannot unseal {}: no device_sealing_passphrase, no enclave_sealing.seed and no \
+             PARVAULT_PASSPHRASE",
             sealed.display()
         );
-        let keystore = LocalFileKeystore::from_passphrase_or_csprng_in_dir(data_dir, None)?;
+        let keystore =
+            LocalFileKeystore::from_passphrase_or_csprng_in_dir(data_dir, sealing_passphrase)?;
         let blob = std::fs::read(&sealed)?;
         let mut raw = keystore.unseal_key(&blob)?;
         body.entries
@@ -388,6 +408,7 @@ fn restore(
     passphrase_file: &Path,
     expected: &[[u8; 32]],
     confirm_move: bool,
+    sealing_passphrase: Option<&str>,
 ) -> anyhow::Result<()> {
     use std::io::Read;
     let pass = read_passphrase(passphrase_file, None)?;
@@ -451,7 +472,7 @@ fn restore(
     }
     let body = body.expect("decided Ok");
     let header = header.expect("decided Ok");
-    write_restore(data_dir, &body, &pending)?;
+    write_restore(data_dir, &body, &pending, sealing_passphrase)?;
     println!(
         "Restored node {} of ring {} into {}. This is a move: retire the old node; do not \
          start both.",
@@ -465,7 +486,21 @@ fn restore(
 /// K9: stage every file (0600, fsynced), write the list, rename each into place, fsync, then
 /// drop the stage and last the list. A kill at any point leaves either nothing of the restore or the
 /// list, which the next run clears before it starts over.
-fn write_restore(data_dir: &Path, body: &BackupBody, pending: &[String]) -> anyhow::Result<()> {
+/// The `device_sealing_passphrase` of the bundle's `config.toml`, if it sets one: the restored
+/// node loads that config, so its master key is resealed under it (D10).
+fn bundle_sealing_passphrase(body: &BackupBody) -> Option<Zeroizing<String>> {
+    let text = std::str::from_utf8(body.get("config.toml")?).ok()?;
+    let table: toml::Table = text.parse().ok()?;
+    let pass = table.get("device_sealing_passphrase")?.as_str()?;
+    Some(Zeroizing::new(pass.to_string()))
+}
+
+fn write_restore(
+    data_dir: &Path,
+    body: &BackupBody,
+    pending: &[String],
+    sealing_passphrase: Option<&str>,
+) -> anyhow::Result<()> {
     for name in pending {
         match std::fs::remove_file(data_dir.join(name)) {
             Ok(()) => {}
@@ -496,7 +531,11 @@ fn write_restore(data_dir: &Path, body: &BackupBody, pending: &[String]) -> anyh
     }
     if let Some(mk) = body.get(VAULT_MASTER_KEY) {
         let mut raw: [u8; 32] = mk.try_into().expect("checked 32 bytes");
-        let keystore = LocalFileKeystore::from_passphrase_or_csprng_in_dir(&stage, None)?;
+        // Sealed as the restored node will unseal it: under this command's configured
+        // passphrase, else the restored `config.toml`'s, else as `main` does without one.
+        let from_bundle = bundle_sealing_passphrase(body);
+        let pass = sealing_passphrase.or(from_bundle.as_deref().map(String::as_str));
+        let keystore = LocalFileKeystore::from_passphrase_or_csprng_in_dir(&stage, pass)?;
         let blob = keystore.seal_key(&raw)?;
         zeroize::Zeroize::zeroize(&mut raw);
         write_secret_file_atomic_0600(&stage.join("master_key.sealed"), &blob)?;
