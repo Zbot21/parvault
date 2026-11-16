@@ -14,6 +14,20 @@
 # T4 (offline host): with one host stopped, 4 changed passes leave its garbage journalled; once it
 # is back, within 3 passes its shards are freed and the journal is empty.
 
+# Everything the owner writes lives under S13_ROOT: the image runs as uid 65532, and only
+# /var/lib/parvault (and /tmp) is writable there.
+S13_ROOT=/var/lib/parvault/s13
+S13_LOGS="$S13_ROOT/logs"
+S13_HOME="$S13_ROOT/owner"
+# No step may hang the gate: every docker exec has a deadline, and so does the whole stage.
+S13_EXEC_SECS=${S13_EXEC_SECS:-300}
+S13_DEADLINE=$(( $(date +%s) + ${S13_STAGE_SECS:-5400} ))
+s13_fail() { echo "ERROR: stage 13: $*"; exit 1; }
+s13_exec() { timeout --kill-after=10 "$S13_EXEC_SECS" docker exec "$@"; }
+s13_check_deadline() {
+    [ "$(date +%s)" -le "$S13_DEADLINE" ] || s13_fail "over its ${S13_STAGE_SECS:-5400} s deadline ($1)"
+}
+
 S13_NODES=()
 S13_PEERS=()
 for j in 1 2 3; do
@@ -37,43 +51,50 @@ s13_start_node() {
 s13_host_bytes() {
     local total=0 b
     for n in "${S13_NODES[@]}"; do
-        b="$(docker exec "$n" sh -c 'cat /var/lib/parvault/.parvault-data/shards/*.shard 2>/dev/null | wc -c' 2>/dev/null || echo 0)"
+        b="$(s13_exec "$n" sh -c 'cat /var/lib/parvault/.parvault-data/shards/*.shard 2>/dev/null | wc -c' 2>/dev/null || echo 0)"
         total=$((total + b))
     done
     echo "$total"
 }
 
 s13_pass() {
-    docker exec -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" "$S13_OWNER" \
-        /usr/local/bin/parvault --data-dir /var/lib/owner --no-lan-discovery --peers "$S13_PEERS_CSV" \
-        watch-folder --folder /var/lib/logs --snapshot-out /var/lib/owner/logs.snap \
+    s13_exec -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" "$S13_OWNER" \
+        /usr/local/bin/parvault --data-dir "$S13_HOME" --no-lan-discovery --peers "$S13_PEERS_CSV" \
+        watch-folder --folder "$S13_LOGS" --snapshot-out "$S13_HOME/logs.snap" \
         --key-hex 7373737373737373737373737373737373737373737373737373737373737373 --once
 }
 
 echo "=== [13] B-154 version GC: log churn (T1), unchanged pass (T2), offline host (T4) ==="
-for j in 1 2 3; do s13_start_node "$j"; done
+# Setup fails fast: a container that does not start or a directory that cannot be made stops the
+# stage here, with the reason.
+for j in 1 2 3; do s13_start_node "$j" || s13_fail "host $j did not start"; done
 docker run -d --name "$S13_OWNER" --label "$RUN_LABEL" "${CONFINE[@]}" \
     -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
     --network "$NET_NAME" --ip "${NET_PREFIX}.74" \
-    "$IMG_ACCEPT" sleep 7200 >/dev/null
+    "$IMG_ACCEPT" sleep 7200 >/dev/null || s13_fail "the owner container did not start"
 sleep 3
-docker exec "$S13_OWNER" sh -c 'mkdir -p /var/lib/logs /var/lib/owner'
+for n in "${S13_NODES[@]}"; do
+    [ "$(docker inspect -f '{{.State.Running}}' "$n" 2>/dev/null)" = true ] \
+        || { docker logs "$n" 2>&1 | tail -20; s13_fail "host $n is not running"; }
+done
+s13_exec "$S13_OWNER" mkdir -p "$S13_LOGS" "$S13_HOME" || s13_fail "cannot create $S13_LOGS and $S13_HOME"
 
 # T1: the churn. Each pass appends 24 KiB of fresh random text to each log; a log reaching
 # 512 KiB rotates first.
 S13_DISK=()
 S13_BYTES=()
 for pass in $(seq 1 60); do
-    docker exec "$S13_OWNER" sh -c '
-        cd /var/lib/logs
+    s13_check_deadline "T1 pass $pass"
+    s13_exec "$S13_OWNER" sh -c '
+        cd "$1" || exit 1
         for l in a b c; do
             if [ -f "$l.log" ] && [ "$(wc -c < "$l.log")" -ge 524288 ]; then
                 rm -f "$l.log.2"; [ -f "$l.log.1" ] && mv "$l.log.1" "$l.log.2"; mv "$l.log" "$l.log.1"
             fi
             head -c 18432 /dev/urandom | base64 >> "$l.log"
-        done'
+        done' s13 "$S13_LOGS" || s13_fail "T1 pass $pass: could not append to the logs"
     S13_OUT="$(s13_pass 2>&1)" || { echo "$S13_OUT"; echo "ERROR: stage 13: T1 pass $pass failed"; exit 1; }
-    S13_DISK+=("$(docker exec "$S13_OWNER" sh -c 'cat /var/lib/logs/* | wc -c')")
+    S13_DISK+=("$(s13_exec "$S13_OWNER" sh -c 'cat "$1"/* | wc -c' s13 "$S13_LOGS")")
     S13_BYTES+=("$(s13_host_bytes)")
     # The bound uses the largest folder among the retained passes (the last 3).
     MAXD=0
@@ -97,15 +118,18 @@ if [ $(( LATE * 10 )) -gt $(( EARLY * 12 )) ]; then
 fi
 grep -q "Version GC" <<<"$S13_OUT" || { echo "$S13_OUT"; echo "ERROR: stage 13: no GC line"; exit 1; }
 # Every retained version restores byte-identically to the bytes it recorded (its file hashes).
-for v in $(docker exec "$S13_OWNER" sh -c 'ls /var/lib/owner/logs.snap.versions' | sed -n 's/^v0*\([0-9][0-9]*\)\.snap$/\1/p'); do
-    docker exec -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" "$S13_OWNER" \
-        /usr/local/bin/parvault --data-dir /var/lib/owner --no-lan-discovery --peers "$S13_PEERS_CSV" \
-        restore-folder --snapshot /var/lib/owner/logs.snap --version "$v" --out-dir "/tmp/r$v" \
+S13_VERSIONS="$(s13_exec "$S13_OWNER" ls "$S13_HOME/logs.snap.versions" | sed -n 's/^v0*\([0-9][0-9]*\)\.snap$/\1/p')"
+[ -n "$S13_VERSIONS" ] || s13_fail "T1 no retained version in $S13_HOME/logs.snap.versions"
+for v in $S13_VERSIONS; do
+    s13_check_deadline "T1 restore of version $v"
+    s13_exec -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" "$S13_OWNER" \
+        /usr/local/bin/parvault --data-dir "$S13_HOME" --no-lan-discovery --peers "$S13_PEERS_CSV" \
+        restore-folder --snapshot "$S13_HOME/logs.snap" --version "$v" --out-dir "$S13_ROOT/r$v" \
         --key-hex 7373737373737373737373737373737373737373737373737373737373737373 >/dev/null \
         || { echo "ERROR: stage 13: T1 retained version $v does not restore"; exit 1; }
 done
-S13_LAST="$(docker exec "$S13_OWNER" sh -c 'ls /var/lib/owner/logs.snap.versions | tail -1' | sed -n 's/^v0*\([0-9][0-9]*\)\.snap$/\1/p')"
-docker exec "$S13_OWNER" sh -c "cd /var/lib/logs && for f in *; do cmp \"\$f\" \"/tmp/r$S13_LAST/\$f\" || exit 1; done" \
+S13_LAST="$(tail -1 <<<"$S13_VERSIONS")"
+s13_exec "$S13_OWNER" sh -c 'cd "$1" && for f in *; do cmp "$f" "$2/$f" || exit 1; done' s13 "$S13_LOGS" "$S13_ROOT/r$S13_LAST" \
     || { echo "ERROR: stage 13: T1 the newest version does not restore byte-identically"; exit 1; }
 echo "T1: 60 passes; hosts ${S13_BYTES[59]} B at the end (passes 21-40 max $EARLY B, 41-60 max $LATE B)"
 
@@ -119,7 +143,9 @@ echo "T2: unchanged pass kept the version; host bytes unchanged"
 # T4: host 3 offline for 4 changed passes, then back.
 docker stop "pv-b2-node-3-${RUN_ID}" >/dev/null
 for pass in 1 2 3 4; do
-    docker exec "$S13_OWNER" sh -c 'head -c 4096 /dev/urandom | base64 >> /var/lib/logs/a.log'
+    s13_check_deadline "T4 offline pass $pass"
+    s13_exec "$S13_OWNER" sh -c 'head -c 4096 /dev/urandom | base64 >> "$1/a.log"' s13 "$S13_LOGS" \
+        || s13_fail "T4 pass $pass: could not append"
     S13_OUT="$(s13_pass 2>&1)" || true
 done
 grep -Eq "Pending Frees      : [1-9]" <<<"$S13_OUT" || { echo "$S13_OUT"; echo "ERROR: stage 13: T4 no pending frees while host 3 is offline"; exit 1; }
@@ -127,6 +153,7 @@ docker start "pv-b2-node-3-${RUN_ID}" >/dev/null
 sleep 3
 S13_CLEARED=0
 for pass in 1 2 3; do
+    s13_check_deadline "T4 return pass $pass"
     S13_OUT="$(s13_pass 2>&1)" || true
     if grep -q "Pending Frees      : 0 " <<<"$S13_OUT"; then S13_CLEARED=1; break; fi
 done
