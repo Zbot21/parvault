@@ -632,7 +632,9 @@ impl BlockStore {
                     }
                     if let Err(code) = q.quota_decision(owner_peer_id, shard_size) {
                         tracing::warn!(code, owner = owner_peer_id, "refused a shard over quota");
-                        return Err(StorageError::QuotaExceeded(owner_peer_id.to_string()));
+                        return Err(StorageError::QuotaExceeded(format!(
+                            "{code} ({owner_peer_id})"
+                        )));
                     }
                 }
                 q.max_storage_bytes()
@@ -682,7 +684,9 @@ impl BlockStore {
             // shards held for other accounts to admit a put.
             if let Err(code) = q.quota_decision(owner_peer_id, shard_size) {
                 tracing::warn!(code, owner = owner_peer_id, "refused a shard over quota");
-                return Err(StorageError::QuotaExceeded(owner_peer_id.to_string()));
+                return Err(StorageError::QuotaExceeded(format!(
+                    "{code} ({owner_peer_id})"
+                )));
             }
         }
 
@@ -2130,7 +2134,9 @@ impl BlockStore {
             // B-161: as `put_shard`, refuse rather than evict other accounts' shards.
             if let Err(code) = q.quota_decision(owner_peer_id, shard_size) {
                 tracing::warn!(code, owner = owner_peer_id, "refused a shard over quota");
-                return Err(StorageError::QuotaExceeded(owner_peer_id.to_string()));
+                return Err(StorageError::QuotaExceeded(format!(
+                    "{code} ({owner_peer_id})"
+                )));
             }
         }
         let path = self.shard_path(id);
@@ -2424,6 +2430,34 @@ impl SignedDhtManifestEnvelope {
         buf.extend_from_slice(&updated_at_unix_ms.to_be_bytes());
         buf.extend_from_slice(ciphertext_sha256);
         buf
+    }
+}
+
+/// Track B1 tests of `BlockStore` refusals.
+#[cfg(test)]
+mod b1_refusal_tests {
+    use super::*;
+
+    /// B2 (C35, arch152 3.5): a put refusal carries its reason code in the error text, which
+    /// the wire arm returns as `PutShardAck.error` (`e.to_string()`), so a client tells
+    /// `reject.peer_quota_exceeded` and `reject.node_capacity` apart.
+    #[test]
+    fn put_refusals_carry_their_reason_code() {
+        let put = |q: QuotaManager, owner: &str, len: usize| -> String {
+            let dir = tempfile::tempdir().unwrap();
+            let store = BlockStore::new(dir.path(), q).unwrap();
+            let bytes = vec![7u8; len];
+            let id = ShardId {
+                stripe_merkle_root: [3; 32],
+                shard_index: 0,
+                shard_hash: hash_shard_leaf(0, &bytes),
+            };
+            store.put_shard(owner, &id, &bytes).unwrap_err().to_string()
+        };
+        let e = put(QuotaManager::new(1 << 30, 100), "peer", 200);
+        assert!(e.contains("reject.peer_quota_exceeded (peer)"), "{e}");
+        let e = put(QuotaManager::new(100, 1 << 30), "peer", 200);
+        assert!(e.contains("reject.node_capacity (peer)"), "{e}");
     }
 }
 
