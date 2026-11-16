@@ -1,7 +1,7 @@
 diff --git a/specs/ParVaultVersionGC.tla b/specs/ParVaultVersionGC.tla
 --- a/specs/ParVaultVersionGC.tla
 +++ b/specs/ParVaultVersionGC.tla
-@@ -75,7 +75,7 @@
+@@ -82,7 +82,7 @@
  DropPhases == {"journaled"}   \* @guard journal-before-drop
  \* C9 (gate for v0.5.7 dedup): no stripe is referenced again while a sent order for it can
  \* still be accepted (no acknowledgement and inside the window).

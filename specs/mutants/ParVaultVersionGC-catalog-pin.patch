@@ -1,7 +1,7 @@
 diff --git a/specs/ParVaultVersionGC.tla b/specs/ParVaultVersionGC.tla
 --- a/specs/ParVaultVersionGC.tla
 +++ b/specs/ParVaultVersionGC.tla
-@@ -70,7 +70,7 @@
+@@ -77,7 +77,7 @@
  \* The marks: every kept version and the pass being written.
  Marks(keep) == (UNION {refs[v] : v \in keep}) \cup pending   \* @guard mark-includes-pass sym=src/sync/gc_journal.rs::mark
  \* A GC run keeps the newest version and the last acknowledged catalog.

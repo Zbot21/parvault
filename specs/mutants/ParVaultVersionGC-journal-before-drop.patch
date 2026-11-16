@@ -1,7 +1,7 @@
 diff --git a/specs/ParVaultVersionGC.tla b/specs/ParVaultVersionGC.tla
 --- a/specs/ParVaultVersionGC.tla
 +++ b/specs/ParVaultVersionGC.tla
-@@ -72,7 +72,7 @@
+@@ -79,7 +79,7 @@
  \* A GC run keeps the newest version and the last acknowledged catalog.
  KeepOk(keep) == ver \in keep /\ (published > 0 => published \in keep)   \* @guard catalog-pin sym=src/sync/gc_journal.rs::gc_free_decision
  \* Version files are dropped only after the garbage is journalled.
