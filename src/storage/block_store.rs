@@ -1475,6 +1475,10 @@ impl BlockStore {
         let mut migrated_blinded_shards_count = 0usize;
         let mut total_bytes_handed_off = 0u64;
         let mut manifest_entries: Vec<u8> = Vec::new();
+        // B-113: shards handed off with no owner grant or no registered session key. The new
+        // host admits only the departing node's audits of those (no grant), with a key the owner
+        // does not use, so they stay unauditable by the owner (fails closed).
+        let mut unauditable_handoffs = 0usize;
 
         let default_mesh_pool = self.root_dir.join("mesh_evacuated_pool");
         let effective_targets: Vec<PathBuf> = if target_handoff_dirs.is_empty() {
@@ -1538,6 +1542,9 @@ impl BlockStore {
                     });
                     let (maybe_session_key, maybe_grant) =
                         por_verifier.get_shard_session_and_grant(&shard_id);
+                    if maybe_session_key.is_none() || maybe_grant.is_none() {
+                        unauditable_handoffs += 1;
+                    }
                     let session_key = maybe_session_key.unwrap_or_else(|| {
                         departing_identity
                             .derive_stripe_por_session_key(&shard_id.stripe_merkle_root)
@@ -1627,6 +1634,13 @@ impl BlockStore {
             }
         }
 
+        if unauditable_handoffs > 0 {
+            tracing::warn!(
+                code = "warn.handoff_unauditable",
+                count = unauditable_handoffs,
+                "shards handed off without the owner's grant or session key: their owners cannot audit them at the new host"
+            );
+        }
         let handoff_manifest_sha256 = compute_sha256(&manifest_entries);
         let departure_timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -9087,10 +9087,35 @@ fn spawn_auditing_seed(label: &str, peers: &[&str]) -> Node {
     spawn(cmd, root, dir, log)
 }
 
-/// A device syndicates one lite stripe through `seed` to its mesh host; every shard lands.
+/// `bseed_synd` with the device's grant naming `witnesses` (B-113: a v0.5.5 lite client names
+/// its seed).
+fn seed_synd_with_grant(
+    seed: &Node,
+    device: &NodeIdentity,
+    fill: u8,
+    witnesses: Vec<[u8; 32]>,
+) -> (MeshWireRequest, [u8; 32]) {
+    let (mut req, root) = bseed_synd(seed, device, fill);
+    if let MeshWireRequest::SyndicateLiteStripe { repair_grant, .. } = &mut req {
+        *repair_grant = Some(RepairGrant::issue(
+            device,
+            root,
+            witnesses,
+            ErasureTier::Homelab,
+        ));
+    }
+    (req, root)
+}
+
+/// A device syndicates one lite stripe through `seed` to its mesh host, with a grant naming the
+/// seed as witness; every shard lands.
 fn seed_fan_out(seed: &Node, host: &Node, fill: u8) {
+    seed_fan_out_naming(seed, host, fill, vec![seed.identity().public_key_bytes()]);
+}
+
+fn seed_fan_out_naming(seed: &Node, host: &Node, fill: u8, witnesses: Vec<[u8; 32]>) {
     let device = key(fill);
-    let (req, _root) = bseed_synd(seed, &device, fill);
+    let (req, _root) = seed_synd_with_grant(seed, &device, fill, witnesses);
     let resp = send_with(
         client(&device).with_timeout(Duration::from_secs(30)),
         seed,
@@ -9113,9 +9138,10 @@ fn seed_audit_state(seed: &Node) -> Option<serde_json::Value> {
     serde_json::from_str(&s).ok()
 }
 
-/// F-06-SEED accept (B-59 change 9): the seed indexes the lite stripe it fanned out and audits
-/// the mesh host over the real wire as the storer; the honest host passes. The index and the
-/// counts are on the seed only (L-29).
+/// F-06-SEED accept (B-59 change 9, B-113): the seed indexes the lite stripe it fanned out and
+/// audits the mesh host over the real wire. The device's grant names the seed, so the host
+/// admits the seed through the witness arm; the honest host passes. The index and the counts
+/// are on the seed only (L-29).
 #[test]
 fn f06_seed_lite_audit_passes() {
     let host = spawn_daemon("f06-seed-a-host");
@@ -9129,6 +9155,11 @@ fn f06_seed_lite_audit_passes() {
     assert!(
         !host.log_text().contains("reject.por_not_storer"),
         "{}",
+        host.log_text()
+    );
+    assert!(
+        !host.log_text().contains("repair grant not registered"),
+        "the witness grant must be registered on the host: {}",
         host.log_text()
     );
     gate_ran("trust_enforcement::f06_seed_lite_audit_passes");
@@ -9744,4 +9775,575 @@ fn gfetch_no_root_key_refused() {
     );
     srv.shutdown();
     gate_ran("trust_enforcement::gfetch_no_root_key_refused");
+}
+
+// --- B-113: B59-HANDOFF, the owner audits handed-off shards ------------------------------------
+
+/// `parvault leave --handoff-to <to>` on `departing`'s data dir (the real CLI, as that node's
+/// key, a ring member).
+fn b59_leave(departing: &Node, to: &str, keep_local: bool) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+        .env("PARVAULT_LAN_REGISTRY_DIR", departing.dir.join("leave-reg"))
+        .env_remove("PARVAULT_PEERS")
+        .arg("--data-dir")
+        .arg(&departing.dir)
+        .args(["--no-lan-discovery", "leave", "--handoff-to", to]);
+    if keep_local {
+        cmd.arg("--keep-local");
+    }
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "leave: {}", out_text(&out));
+}
+
+/// O (a raw ring key) stores a 3-chunk shard on daemon D with O's grant (naming O) and the
+/// fixture session key; D then leaves to a fresh daemon H. Returns (D, H, shard).
+fn b59_handoff_raw(label: &str, owner: &NodeIdentity, keep_local: bool) -> (Node, Node, ShardId) {
+    let mut d = spawn_daemon(&format!("{label}-d"));
+    let h = spawn_daemon(&format!("{label}-h"));
+    let (sid, bytes) = shard(0x3B, 2 * 4096 + 17);
+    let grant = RepairGrant::issue(
+        owner,
+        sid.stripe_merkle_root,
+        vec![owner.public_key_bytes()],
+        ErasureTier::Homelab,
+    );
+    assert!(stored(&send(
+        owner,
+        &d,
+        put_shard("", sid, bytes, Some(grant))
+    )));
+    if !keep_local {
+        // D stops before it leaves (its data dir stays).
+        let _ = d.child.kill();
+        let _ = d.child.wait();
+    }
+    b59_leave(&d, &h.addr, keep_local);
+    assert!(
+        shard_files(&h.dir) >= 1,
+        "nothing handed off:\n{}",
+        h.log_text()
+    );
+    assert!(
+        !h.log_text().contains("repair grant not registered"),
+        "{}",
+        h.log_text()
+    );
+    (d, h, sid)
+}
+
+/// An owner data dir that stored one file on `host_addr` only (homelab, every shard there).
+fn b59_owner_store(label: &str, host_addr: &str) -> (TempDir, PathBuf) {
+    let root = temp_root(&format!("{label}-owner"));
+    let dir = root.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    owner_store(&dir, root.path(), host_addr, &[0x5Bu8; 9_000]);
+    (root, dir)
+}
+
+/// The owner daemon with `--peers <peers>` (its ring endpoints, the probe candidates), auditing
+/// every second, with `members` paired in its `known_peers.json` (admitted ring members).
+fn b59_owner_daemon(root: TempDir, dir: PathBuf, peers: &[&str], members: &[&Node]) -> Node {
+    fast_audit_config(&dir);
+    if !members.is_empty() {
+        let mut store = KnownPeersStore::default();
+        for m in members {
+            let pid = m.peer_id().to_string();
+            store.peers.insert(
+                pid.clone(),
+                parvault::network::discovery::KnownPeerRecord {
+                    libp2p_peer_id: pid,
+                    device_peer_id: m.identity().device_peer_id(),
+                    node_label: "ring-member".into(),
+                    role: "peer".into(),
+                    multiaddr: m.addr.clone(),
+                    available_bytes: 0,
+                    last_seen_ms: now_ms(),
+                    ed25519_pubkey: Some(m.identity().public_key_bytes()),
+                    owner_pq_fingerprint: None,
+                },
+            );
+        }
+        store.save(&dir).unwrap();
+    }
+    let reg = root.path().join("lan-registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    let log = root.path().join("owner.log");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
+        .arg("--data-dir")
+        .arg(&dir)
+        .arg("--peers")
+        .arg(peers.join(","))
+        .args([
+            "--no-lan-discovery",
+            "daemon",
+            "start",
+            "--listen",
+            common::LOOPBACK_EPHEMERAL,
+        ]);
+    spawn(cmd, root, dir, log)
+}
+
+fn b59_relocations(owner: &Node) -> serde_json::Value {
+    std::fs::read_to_string(owner.dir.join("por_audit_state.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .map(|v| v["relocations"].clone())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// B59-HANDOFF / B59-RELOCATE accept: the owner stores a file on D; D leaves to H (the real
+/// CLI) and stops. The owner's audit loop finds D unanswered twice, probes H (a paired ring
+/// member), H proves the shard under the forwarded grant (owner arm), and the owner records the
+/// relocation and a pass credited to H.
+#[test]
+fn b59_handoff_shard_audited_by_owner() {
+    let mut d = spawn_daemon("b59-acc-d");
+    let h = spawn_daemon("b59-acc-h");
+    let (root, dir) = b59_owner_store("b59-acc", &d.addr);
+    let _ = d.child.kill();
+    let _ = d.child.wait();
+    b59_leave(&d, &h.addr, false);
+    assert!(shard_files(&h.dir) >= 1, "nothing handed off");
+    let owner = b59_owner_daemon(root, dir, &[&d.addr, &h.addr], &[&h]);
+    assert_audit_logged(&owner, "relocation.accepted");
+    let h_id = device_id_of(&h.dir);
+    assert!(
+        eventually(|| owner_ledger(&owner, &h_id).is_some_and(|a| a.por_passes >= 1)),
+        "no pass credited to the new host {h_id}:\n{}",
+        owner.log_text()
+    );
+    // The pass is booked in the quota ledger before the auditor state file (with the new
+    // relocation) is saved in the same tick, so poll the file too.
+    assert!(
+        eventually(|| b59_relocations(&owner)
+            .as_object()
+            .is_some_and(|m| m.values().any(|r| r["host_addr"] == h.addr.as_str()))),
+        "no relocation to {} saved: {}\n{}",
+        h.addr,
+        b59_relocations(&owner),
+        owner.log_text()
+    );
+    assert!(
+        !h.log_text().contains("reject.por_not_storer"),
+        "{}",
+        h.log_text()
+    );
+    gate_ran("trust_enforcement::b59_handoff_shard_audited_by_owner");
+}
+
+/// B59-HANDOFF reject: after the handoff, a co-host holding the stripe's session key sends a
+/// valid-HMAC chunk audit for the handed-off shard to H: refused (`reject.por_not_storer`), and
+/// the owner's own audit is still answered (budget untouched).
+#[test]
+fn b59_handoff_shard_foreign_sender_refused() {
+    let owner = key(0xE1);
+    let co_host = key(0xE2);
+    let (_d, h, sid) = b59_handoff_raw("b59-foreign", &owner, false);
+    let (mut other, other_bytes) = shard(0x3B, 4096);
+    other.shard_index = 1;
+    other.shard_hash = parvault::sharding::merkle::hash_shard_leaf(1, &other_bytes);
+    assert!(stored(&send(
+        &co_host,
+        &h,
+        put_shard("", other, other_bytes, None)
+    )));
+    let resp = send(&co_host, &h, chunk_audit(sid));
+    assert!(
+        matches!(resp, MeshWireResponse::ChunkAuditResult(None)),
+        "{resp:?}"
+    );
+    assert_logged(&h, "reject.por_not_storer");
+    let resp = send(&owner, &h, chunk_audit(sid));
+    assert!(
+        matches!(resp, MeshWireResponse::ChunkAuditResult(Some(_))),
+        "{resp:?}\n{}",
+        h.log_text()
+    );
+    gate_ran("trust_enforcement::b59_handoff_shard_foreign_sender_refused");
+}
+
+/// B59-HANDOFF-DEPART reject (A-113 C2, D-45 Q6): D hands off with `--keep-local` and stays
+/// online; D is the accounted owner at H, but the registered grant decides alone, so D's audit
+/// of the shard at H is refused, while the owner's is answered.
+#[test]
+fn b59_handoff_departing_node_refused() {
+    let owner = key(0xE3);
+    let (d, h, sid) = b59_handoff_raw("b59-depart", &owner, true);
+    let resp = send(&d.identity(), &h, chunk_audit(sid));
+    assert!(
+        matches!(resp, MeshWireResponse::ChunkAuditResult(None)),
+        "{resp:?}"
+    );
+    assert_logged(&h, "reject.por_not_storer");
+    let resp = send(&owner, &h, chunk_audit(sid));
+    assert!(
+        matches!(resp, MeshWireResponse::ChunkAuditResult(Some(_))),
+        "{resp:?}\n{}",
+        h.log_text()
+    );
+    gate_ran("trust_enforcement::b59_handoff_departing_node_refused");
+}
+
+/// B59-HANDOFF-SELFGRANT reject (A-113 C3): a departing node D binds a self-issued grant for
+/// the owner's shard at H first. The owner's audit is refused (`reject.por_not_storer`) and the
+/// owner's later re-put with its own grant is refused by F-38-GRANT. Fails closed (B-139).
+#[test]
+fn b59_handoff_self_grant_locks_owner_out() {
+    let h = spawn_daemon("b59-selfgrant");
+    let owner = key(0xE4);
+    let departing = key(0xE5);
+    let (sid, bytes) = shard(0x3D, 2 * 4096 + 17);
+    assert!(stored(&send(
+        &departing,
+        &h,
+        put_shard("", sid, bytes.clone(), Some(self_grant(&departing, &sid)))
+    )));
+    let resp = send(&owner, &h, chunk_audit(sid));
+    assert!(
+        matches!(resp, MeshWireResponse::ChunkAuditResult(None)),
+        "{resp:?}"
+    );
+    assert_logged(&h, "reject.por_not_storer");
+    let resp = send(
+        &owner,
+        &h,
+        put_shard("", sid, bytes, Some(self_grant(&owner, &sid))),
+    );
+    assert!(!stored(&resp), "{resp:?}");
+    assert_logged(&h, "reject.shard_bound_to_another_owner");
+    gate_ran("trust_enforcement::b59_handoff_self_grant_locks_owner_out");
+}
+
+/// B59-WITNESS-BOUND reject: a grant naming nine witnesses registers nothing
+/// (`reject.repair_grant_too_many_witnesses`); the shard is stored with no grant, so a named
+/// witness gets no witness arm and its audit is refused.
+#[test]
+fn b59_grant_nine_witnesses_not_registered() {
+    let h = spawn_daemon("b59-nine");
+    let owner = key(0xE6);
+    let witness = key(0xE7);
+    let (sid, bytes) = shard(0x3E, 2 * 4096 + 17);
+    let mut witnesses = vec![witness.public_key_bytes()];
+    witnesses.extend((0..8u8).map(|i| key(0x70 + i).public_key_bytes()));
+    let grant = RepairGrant::issue(
+        &owner,
+        sid.stripe_merkle_root,
+        witnesses,
+        ErasureTier::Homelab,
+    );
+    assert!(stored(&send(
+        &owner,
+        &h,
+        put_shard("", sid, bytes, Some(grant))
+    )));
+    assert_logged(&h, "reject.repair_grant_too_many_witnesses");
+    let resp = send(&witness, &h, chunk_audit(sid));
+    assert!(
+        matches!(resp, MeshWireResponse::ChunkAuditResult(None)),
+        "{resp:?}"
+    );
+    assert_logged(&h, "reject.por_not_storer");
+    gate_ran("trust_enforcement::b59_grant_nine_witnesses_not_registered");
+}
+
+/// A-113 C9 reject: the owner's grant names witness W. A co-host then puts another shard of
+/// the stripe (`Bind`), and re-puts W's shard (`Keep`), each with the owner's older grant that
+/// names no witness. Both puts are stored, the registered grant is kept
+/// (`reject.repair_grant_witness_downgrade`), and W's audits of both shards are still answered.
+/// A `Keep` re-put with a superset grant (W, W2) does replace it: W2 is then admitted.
+#[test]
+fn b59_grant_witness_downgrade_ignored() {
+    let h = spawn_daemon("b59-downgrade");
+    let owner = key(0xE8);
+    let witness = key(0xE9);
+    let co_host = key(0xEA);
+    let (sid, bytes) = shard(0x3F, 2 * 4096 + 17);
+    let up = RepairGrant::issue(
+        &owner,
+        sid.stripe_merkle_root,
+        vec![witness.public_key_bytes()],
+        ErasureTier::Homelab,
+    );
+    let old = self_grant(&owner, &sid);
+    assert!(stored(&send(
+        &owner,
+        &h,
+        put_shard("", sid, bytes.clone(), Some(up))
+    )));
+    let (mut other, other_bytes) = shard(0x3F, 2 * 4096 + 17);
+    other.shard_index = 1;
+    other.shard_hash = parvault::sharding::merkle::hash_shard_leaf(1, &other_bytes);
+    assert!(stored(&send(
+        &co_host,
+        &h,
+        put_shard("", other, other_bytes, Some(old.clone()))
+    )));
+    assert_logged(&h, "reject.repair_grant_witness_downgrade");
+    let before = h
+        .log_text()
+        .matches("reject.repair_grant_witness_downgrade")
+        .count();
+    assert!(stored(&send(
+        &co_host,
+        &h,
+        put_shard("", sid, bytes.clone(), Some(old))
+    )));
+    assert!(
+        eventually(|| h
+            .log_text()
+            .matches("reject.repair_grant_witness_downgrade")
+            .count()
+            > before),
+        "the Keep path did not refuse the downgrade:\n{}",
+        h.log_text()
+    );
+    for s in [sid, other] {
+        let resp = send(&witness, &h, chunk_audit(s));
+        assert!(
+            matches!(resp, MeshWireResponse::ChunkAuditResult(Some(_))),
+            "{resp:?}\n{}",
+            h.log_text()
+        );
+    }
+    // C9 on the Keep path, accept side: a co-host's re-put of a held shard with a superset
+    // grant (W and W2) replaces the registered one, so W2 is admitted on both shards.
+    let witness2 = key(0xEC);
+    let sup = RepairGrant::issue(
+        &owner,
+        sid.stripe_merkle_root,
+        vec![witness.public_key_bytes(), witness2.public_key_bytes()],
+        ErasureTier::Homelab,
+    );
+    let refused = h
+        .log_text()
+        .matches("reject.repair_grant_witness_downgrade")
+        .count();
+    assert!(stored(&send(
+        &co_host,
+        &h,
+        put_shard("", sid, bytes, Some(sup))
+    )));
+    for s in [sid, other] {
+        let resp = send(&witness2, &h, chunk_audit(s));
+        assert!(
+            matches!(resp, MeshWireResponse::ChunkAuditResult(Some(_))),
+            "Keep-path superset not registered: {resp:?}\n{}",
+            h.log_text()
+        );
+    }
+    assert_eq!(
+        h.log_text()
+            .matches("reject.repair_grant_witness_downgrade")
+            .count(),
+        refused,
+        "a superset was refused as a downgrade"
+    );
+    gate_ran("trust_enforcement::b59_grant_witness_downgrade_ignored");
+}
+
+/// B59-RELOCATE reject: D stops without a handoff; the only other ring endpoint is a paired
+/// member that holds a different shard. Its probe answer proves nothing, so the owner logs
+/// `reject.relocation_unproven` and records no relocation.
+#[test]
+fn b59_relocation_unproven_host_not_recorded() {
+    let mut d = spawn_daemon("b59-unproven-d");
+    let m = spawn_daemon("b59-unproven-m");
+    let stranger_owner = key(0xEB);
+    let (other, other_bytes) = shard(0x40, 9_000);
+    assert!(stored(&send(
+        &stranger_owner,
+        &m,
+        put_shard("", other, other_bytes, None)
+    )));
+    let (root, dir) = b59_owner_store("b59-unproven", &d.addr);
+    let _ = d.child.kill();
+    let _ = d.child.wait();
+    let owner = b59_owner_daemon(root, dir, &[&d.addr, &m.addr], &[&m]);
+    assert_audit_logged(&owner, "reject.relocation_unproven");
+    assert!(
+        b59_relocations(&owner)
+            .as_object()
+            .is_none_or(|r| r.is_empty()),
+        "{}",
+        b59_relocations(&owner)
+    );
+    assert!(!owner.log_text().contains("relocation.accepted"));
+    gate_ran("trust_enforcement::b59_relocation_unproven_host_not_recorded");
+}
+
+/// B59-RELOCATE reject twin: D hands off to X, which proves the shard, but X is neither paired
+/// with the owner nor admitted in its ring registry: `reject.relocation_unproven`, nothing
+/// recorded, no credit.
+#[test]
+fn b59_relocation_non_member_not_recorded() {
+    let mut d = spawn_daemon("b59-nonmember-d");
+    let x = spawn_daemon("b59-nonmember-x");
+    let (root, dir) = b59_owner_store("b59-nonmember", &d.addr);
+    let _ = d.child.kill();
+    let _ = d.child.wait();
+    b59_leave(&d, &x.addr, false);
+    let owner = b59_owner_daemon(root, dir, &[&d.addr, &x.addr], &[]);
+    assert_audit_logged(&owner, "reject.relocation_unproven");
+    assert!(
+        b59_relocations(&owner)
+            .as_object()
+            .is_none_or(|r| r.is_empty()),
+        "{}",
+        b59_relocations(&owner)
+    );
+    // X served the probe (the refusal is the owner's membership check, not a failed proof).
+    assert!(
+        !x.log_text().contains("reject.por_not_storer"),
+        "{}",
+        x.log_text()
+    );
+    let x_id = device_id_of(&x.dir);
+    assert!(owner_ledger(&owner, &x_id).is_none_or(|a| a.por_passes == 0));
+    gate_ran("trust_enforcement::b59_relocation_non_member_not_recorded");
+}
+
+/// B-113 (A-113 §10.3, D-45 Q7): a pre-upgrade lite stripe (grant with no witness) still fans
+/// out; the seed logs `warn.lite_grant_no_seed_witness`, sends no challenge for it and counts
+/// it unwitnessed. Re-syndicating the stripe with a grant naming the seed (what
+/// `--resyndicate-lite` sends) replaces the grant on the host; the next audit passes and the
+/// count drops to 0.
+#[test]
+fn f06_seed_unwitnessed_lite_stripe_skipped() {
+    let host = spawn_daemon("f06-unw-host");
+    let seed = spawn_auditing_seed("f06-unw", &[&host.addr]);
+    seed_fan_out_naming(&seed, &host, 0xA8, Vec::new());
+    assert_logged(&seed, "warn.lite_grant_no_seed_witness");
+    assert!(
+        eventually(|| seed_audit_state(&seed).is_some_and(|v| v["unwitnessed"].as_u64() == Some(1))),
+        "no unwitnessed count:\n{}",
+        seed.log_text()
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        !seed.log_text().lines().any(|l| l.contains("por.audit")),
+        "a challenge was sent for an unwitnessed stripe:\n{}",
+        seed.log_text()
+    );
+    assert!(!host.log_text().contains("reject.por_not_storer"));
+    seed_fan_out(&seed, &host, 0xA8);
+    assert_audit_logged(&seed, "pass");
+    assert!(
+        eventually(|| seed_audit_state(&seed).is_some_and(|v| v["unwitnessed"].as_u64() == Some(0))),
+        "unwitnessed not cleared"
+    );
+    gate_ran("trust_enforcement::f06_seed_unwitnessed_lite_stripe_skipped");
+}
+
+/// B-113 reject twin for the witness arm: a ring host the grant does not name sends a
+/// valid-HMAC chunk audit with the seed's session key: `reject.por_not_storer`.
+#[test]
+fn f06_seed_foreign_witness_refused() {
+    let host = spawn_daemon("f06-fw-host");
+    let seed = spawn_seed_with_peers("f06-fw", &[&host.addr]);
+    seed_fan_out(&seed, &host, 0xA9);
+    let ct = vec![0xA9u8; 32 * 1024];
+    let set = encode_ciphertext_stripe(0, &ct, ErasureTier::Homelab).unwrap();
+    let sid = ShardId {
+        stripe_merkle_root: set.stripe_merkle_root,
+        shard_index: 0,
+        shard_hash: set.shard_hashes[0],
+    };
+    let seed_key = seed
+        .identity()
+        .derive_stripe_por_session_key(&sid.stripe_merkle_root);
+    let n = parvault::por::chunk_merkle::chunk_count_u64(set.shards[0].len() as u64);
+    let audit = |who: &NodeIdentity| {
+        send(
+            who,
+            &host,
+            MeshWireRequest::ChunkAudit(parvault::por::generate_chunk_challenge(
+                &seed_key,
+                sid,
+                n,
+                1,
+                now_ms(),
+            )),
+        )
+    };
+    let resp = audit(&key(0xAA));
+    assert!(
+        matches!(resp, MeshWireResponse::ChunkAuditResult(None)),
+        "{resp:?}"
+    );
+    assert_logged(&host, "reject.por_not_storer");
+    // The seed itself (the named witness) is answered.
+    let resp = audit(&seed.identity());
+    assert!(
+        matches!(resp, MeshWireResponse::ChunkAuditResult(Some(_))),
+        "{resp:?}\n{}",
+        host.log_text()
+    );
+    gate_ran("trust_enforcement::f06_seed_foreign_witness_refused");
+}
+
+/// `parvault watch-folder --once` as a lite client of `seed` (the real CLI).
+fn b59_lite_pass(seed: &Node, client_dir: &Path, folder: &Path, extra: &[&str]) -> String {
+    let snap = client_dir.join("snap.bin");
+    let out = Command::new(env!("CARGO_BIN_EXE_parvault"))
+        .env("PARVAULT_GENESIS_SEED_HEX", hex::encode(GENESIS_SEED))
+        .env("PARVAULT_LAN_REGISTRY_DIR", client_dir.join("reg"))
+        .env_remove("PARVAULT_PEERS")
+        .env_remove("PARVAULT_SEED_PHRASE")
+        .arg("--data-dir")
+        .arg(client_dir)
+        .args(["--no-lan-discovery", "watch-folder", "--folder"])
+        .arg(folder)
+        .arg("--snapshot-out")
+        .arg(&snap)
+        .args(["--tier", "homelab", "--vault-namespace", "b59-lite"])
+        .args(["--seed-phrase", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"])
+        .args(["--lite-seed-dir", &seed.addr, "--once"])
+        .args(extra)
+        .output()
+        .unwrap();
+    let text = out_text(&out);
+    assert!(out.status.success(), "{text}\nseed:\n{}", seed.log_text());
+    text
+}
+
+/// B-113 (A-113 §10.2, C12): the real lite client names its seed's pinned key in each grant,
+/// so the seed's audits of the fan-out host pass (witness arm) and the seed logs no
+/// unwitnessed stripe. A client whose stripes predate the witness (no marker, stripes already
+/// on the seed) prints the unwitnessed notice; `--resyndicate-lite` re-sends them and stops it.
+#[test]
+fn b59_lite_client_names_seed_and_resyndicates() {
+    let host = spawn_daemon("b59-lite-host");
+    let seed = spawn_auditing_seed("b59-lite", &[&host.addr]);
+    let root = temp_root("b59-lite-client");
+    let client_dir = root.path().join("data");
+    let folder = root.path().join("folder");
+    std::fs::create_dir_all(&client_dir).unwrap();
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::copy(
+        seed.dir.join("owner_pq_keypair.bin"),
+        client_dir.join("owner_pq_keypair.bin"),
+    )
+    .unwrap();
+    std::fs::write(folder.join("a.txt"), vec![0x5C; 4096]).unwrap();
+    let first = b59_lite_pass(&seed, &client_dir, &folder, &[]);
+    assert!(!first.contains("lite stripes unwitnessed"), "{first}");
+    assert_audit_logged(&seed, "pass");
+    assert!(!seed.log_text().contains("warn.lite_grant_no_seed_witness"));
+    assert!(
+        !host.log_text().contains("reject.por_not_storer"),
+        "{}",
+        host.log_text()
+    );
+    // As after an upgrade: stripes on the seed, no witness marker.
+    std::fs::remove_file(client_dir.join("lite_seed_witness.v1")).unwrap();
+    let again = b59_lite_pass(&seed, &client_dir, &folder, &[]);
+    assert!(again.contains("lite stripes unwitnessed"), "{again}");
+    let resynd = b59_lite_pass(&seed, &client_dir, &folder, &["--resyndicate-lite"]);
+    assert!(resynd.contains("re-syndicated 1 lite stripe"), "{resynd}");
+    assert!(client_dir.join("lite_seed_witness.v1").exists());
+    let after = b59_lite_pass(&seed, &client_dir, &folder, &[]);
+    assert!(!after.contains("lite stripes unwitnessed"), "{after}");
+    gate_ran("trust_enforcement::b59_lite_client_names_seed_and_resyndicates");
 }

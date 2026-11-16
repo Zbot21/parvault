@@ -20,9 +20,10 @@ pub use challenger::{
 pub use chunk_merkle::{chunk_proof_decision, ChunkProof, ChunkProofFacts};
 #[cfg(feature = "daemon-runtime")]
 pub use verifier::{
-    por_rate_decision, por_storer_decision, shard_bound_to_another_owner_code,
-    shard_rebind_decision, AuditOutcome, ChunkProveSpec, EgressWithholdingEvidence, PorError,
-    PorRateFacts, PorVerifierEngine, RepairGrant, ShardBinding, ShardRebindFacts,
-    WitnessFailureReceipt, CHUNK_AUDITS_PER_MINUTE_ROUTER, MAX_POR_RANGE_BYTES,
-    MAX_SEEN_NONCES_RAM, MIN_WITNESS_SIGNATURES_FOR_REPAIR,
+    grant_registration_decision, grant_replace_decision, por_rate_decision, por_storer_decision,
+    shard_bound_to_another_owner_code, shard_rebind_decision, AuditOutcome, ChunkProveSpec,
+    EgressWithholdingEvidence, GrantRegFacts, GrantStorers, PorError, PorRateFacts, PorStorerFacts,
+    PorVerifierEngine, RepairGrant, ShardBinding, ShardRebindFacts, WitnessFailureReceipt,
+    CHUNK_AUDITS_PER_MINUTE_ROUTER, MAX_GRANT_WITNESSES, MAX_POR_RANGE_BYTES, MAX_SEEN_NONCES_RAM,
+    MIN_WITNESS_SIGNATURES_FOR_REPAIR,
 };

@@ -1797,3 +1797,269 @@ fn proof_readonly_refuses_write_and_write_permit() {
     };
     assert_eq!(permit, expected);
 }
+
+/// One 32-byte key from a pool of three: `A`, `A` with only its last byte changed, and `B`.
+/// Fully symbolic keys made CBMC blow up (80 GB on the superset harness); the pool keeps the
+/// cases that matter (equal, a one-byte near miss that only an all-32-byte compare tells
+/// apart, and unrelated) with constant bytes.
+fn any_pool_key() -> [u8; 32] {
+    const A: [u8; 32] = [0xA5; 32];
+    const A_NEAR: [u8; 32] = {
+        let mut k = [0xA5; 32];
+        k[31] = 0x5A;
+        k
+    };
+    const B: [u8; 32] = [0x3C; 32];
+    match kani::any::<u8>() % 3 {
+        0 => A,
+        1 => A_NEAR,
+        _ => B,
+    }
+}
+
+/// `N` keys from [`any_pool_key`]. The length is a constant on each path, so CBMC unrolls the
+/// decision's slice loops `N` times; a symbolic length made it unroll every loop to the
+/// harness's unwind bound (34), nested over the 32-byte compares, and the run did not finish.
+fn pool_keys<const N: usize>() -> [[u8; 32]; N] {
+    core::array::from_fn(|_| any_pool_key())
+}
+
+/// One of 0, 1 or 2, symbolic.
+fn any_len_upto2() -> u8 {
+    let n: u8 = kani::any();
+    kani::assume(n <= 2);
+    n
+}
+
+/// A device id chosen from a small set (equal and unequal pairs both reachable).
+fn any_device_id() -> Option<&'static str> {
+    match kani::any::<u8>() % 3 {
+        0 => None,
+        1 => Some("parvault-peer-a"),
+        _ => Some("parvault-peer-b"),
+    }
+}
+
+/// B-113 (A-113 C2): with a grant registered, only the grant owner and its witnesses pass, on
+/// all 32 bytes, whatever the device ids say: a sender that is neither is refused even when it
+/// is the accounted owner (no fall-through). A missing key with a grant is refused. With no
+/// grant, the rule is the accounted owner (F-34-STORER).
+///
+/// Bound: keys come from [`any_pool_key`] (3 constants: `A`, `A` with byte 31 changed, `B`) and
+/// witness sets hold at most 2. The decision only compares keys for equality, so its outcome
+/// depends only on which keys are equal; 3 keys with sets of 2 reach every equal/unequal
+/// pattern of sender, owner and witnesses, and the near miss forces a full 32-byte compare.
+/// The 8-witness bound itself is in `proof_grant_registration_witness_bound` and unit tests.
+#[kani::proof]
+#[kani::unwind(34)]
+fn proof_por_storer_decision() {
+    let o = match any_len_upto2() {
+        0 => check_por_storer_decision::<0>(),
+        1 => check_por_storer_decision::<1>(),
+        _ => check_por_storer_decision::<2>(),
+    };
+    if o.has_grant {
+        kani::cover!(o.ok && o.key_is_owner, "grant owner admitted");
+        kani::cover!(o.ok && !o.key_is_owner, "witness admitted");
+        kani::cover!(
+            !o.ok && o.has_key && !o.key_is_owner,
+            "non-witness refused under a grant"
+        );
+        kani::cover!(
+            !o.ok && o.near_miss,
+            "one-byte near miss of the owner refused"
+        );
+        kani::cover!(!o.ok && !o.has_key, "no key refused under a grant");
+        kani::cover!(
+            !o.ok && o.sender_is_accounted,
+            "accounted owner, no witness, refused"
+        );
+    } else {
+        kani::cover!(o.ok, "accounted owner admitted without a grant");
+        kani::cover!(!o.ok, "non-owner refused without a grant");
+    }
+    // The map's cited cover on a direct call (one witness): the sender is the accounted owner
+    // and a grant is registered; only the grant's keys decide.
+    use crate::por::{por_storer_decision, GrantStorers, PorStorerFacts};
+    let w: [[u8; 32]; 1] = pool_keys();
+    let (owner, key, id) = (any_pool_key(), any_pool_key(), any_device_id());
+    let r = por_storer_decision(&PorStorerFacts {
+        sender_device_id: id,
+        sender_key: Some(key),
+        accounted_owner: id,
+        grant: Some(GrantStorers {
+            owner,
+            witnesses: &w,
+        }),
+    });
+    assert_eq!(r.is_ok(), key == owner || key == w[0]);
+    kani::cover!(
+        r.is_err() && id.is_some(),
+        "accounted owner refused under a grant"
+    );
+}
+
+/// What one storer check saw, for the harness's covers.
+struct StorerOutcome {
+    ok: bool,
+    has_grant: bool,
+    has_key: bool,
+    key_is_owner: bool,
+    near_miss: bool,
+    sender_is_accounted: bool,
+}
+
+/// The storer decision with `N` witnesses; asserts the rule and returns what it saw.
+fn check_por_storer_decision<const N: usize>() -> StorerOutcome {
+    use crate::por::{por_storer_decision, GrantStorers, PorStorerFacts};
+    let witnesses: [[u8; 32]; N] = pool_keys();
+    let owner = any_pool_key();
+    let has_grant: bool = kani::any();
+    let has_key: bool = kani::any();
+    let key = any_pool_key();
+    let f = PorStorerFacts {
+        sender_device_id: any_device_id(),
+        sender_key: has_key.then_some(key),
+        accounted_owner: any_device_id(),
+        grant: has_grant.then_some(GrantStorers {
+            owner,
+            witnesses: &witnesses,
+        }),
+    };
+    let ok = por_storer_decision(&f).is_ok();
+    let sender_is_accounted =
+        f.sender_device_id.is_some() && f.sender_device_id == f.accounted_owner;
+    if has_grant {
+        let mut named = key == owner;
+        let mut i = 0;
+        while i < N {
+            named |= key == witnesses[i];
+            i += 1;
+        }
+        // (a) no fall-through and (b) no key, no audit.
+        assert_eq!(ok, has_key && named);
+    } else {
+        // (c) today's rule.
+        assert_eq!(ok, sender_is_accounted);
+    }
+    StorerOutcome {
+        ok,
+        has_grant,
+        has_key,
+        key_is_owner: key == owner,
+        near_miss: has_key && key[31] != owner[31] && key[..31] == owner[..31],
+        sender_is_accounted,
+    }
+}
+
+/// B59-WITNESS-BOUND: a grant naming more than `MAX_GRANT_WITNESSES` witnesses never
+/// registers, so the storer check scans a bounded slice.
+#[kani::proof]
+fn proof_grant_registration_witness_bound() {
+    use crate::por::{grant_registration_decision, GrantRegFacts, MAX_GRANT_WITNESSES};
+    let f = GrantRegFacts {
+        grant_valid: kani::any(),
+        root_matches: kani::any(),
+        witnesses_len: kani::any(),
+    };
+    let decision = grant_registration_decision(&f);
+    kani::cover!(
+        decision.is_err() && f.grant_valid && f.root_matches,
+        "too many witnesses refused"
+    );
+    kani::cover!(decision.is_ok(), "grant registered");
+    if f.witnesses_len > MAX_GRANT_WITNESSES {
+        assert!(decision.is_err());
+    }
+    assert_eq!(
+        decision.is_ok(),
+        f.grant_valid && f.root_matches && f.witnesses_len <= MAX_GRANT_WITNESSES
+    );
+}
+
+/// A-113 C9: a same-owner grant replaces the registered one only if it names every registered
+/// witness (all 32 bytes), so a replayed older grant can never drop a witness.
+///
+/// Bound: keys come from [`any_pool_key`] (3 constants: `A`, `A` with byte 31 changed, `B`) and
+/// witness sets hold at most 2. The decision only compares keys for equality, so its outcome
+/// depends only on which keys are equal; 3 keys with sets of 2 reach every equal/unequal
+/// pattern of the registered and incoming witness sets, and the near miss forces a full 32-byte compare.
+/// The 8-witness bound itself is in `proof_grant_registration_witness_bound` and unit tests.
+#[kani::proof]
+#[kani::unwind(34)]
+fn proof_grant_replace_witness_superset() {
+    let (ok, has_old, n_old, n_new) = match (any_len_upto2(), any_len_upto2()) {
+        (0, 0) => check_grant_replace::<0, 0>(),
+        (0, 1) => check_grant_replace::<0, 1>(),
+        (0, _) => check_grant_replace::<0, 2>(),
+        (1, 0) => check_grant_replace::<1, 0>(),
+        (1, 1) => check_grant_replace::<1, 1>(),
+        (1, _) => check_grant_replace::<1, 2>(),
+        (_, 0) => check_grant_replace::<2, 0>(),
+        (_, 1) => check_grant_replace::<2, 1>(),
+        (_, _) => check_grant_replace::<2, 2>(),
+    };
+    // The map's cited cover on a direct call: two registered witnesses, one incoming.
+    use crate::por::grant_replace_decision;
+    let (reg, inc): ([[u8; 32]; 2], [[u8; 32]; 1]) = (pool_keys(), pool_keys());
+    let r = grant_replace_decision(Some(&reg), &inc);
+    assert_eq!(r.is_ok(), reg[0] == inc[0] && reg[1] == inc[0]);
+    kani::cover!(r.is_err(), "witness downgrade kept out");
+    kani::cover!(!ok && n_new == 0, "witness downgrade to none kept out");
+    kani::cover!(!ok && n_new > 0, "partial overlap kept out");
+    kani::cover!(ok && has_old && n_old > 0, "superset replaces");
+    kani::cover!(
+        ok && has_old && n_old == 0,
+        "grant with no witnesses replaced"
+    );
+    kani::cover!(ok && !has_old, "no registered grant: replaced");
+}
+
+/// The replace decision with `OLD` registered and `NEW` incoming witnesses; asserts the
+/// superset rule and returns (accepted, has_old, OLD, NEW) for the harness's covers.
+fn check_grant_replace<const OLD: usize, const NEW: usize>() -> (bool, bool, usize, usize) {
+    use crate::por::grant_replace_decision;
+    let old: [[u8; 32]; OLD] = pool_keys();
+    let new: [[u8; 32]; NEW] = pool_keys();
+    let has_old: bool = kani::any();
+    let ok = grant_replace_decision(has_old.then_some(&old[..]), &new).is_ok();
+    let mut superset = true;
+    let mut i = 0;
+    while i < OLD {
+        let mut named = false;
+        let mut j = 0;
+        while j < NEW {
+            named |= old[i] == new[j];
+            j += 1;
+        }
+        superset &= named;
+        i += 1;
+    }
+    assert_eq!(ok, !has_old || superset);
+    (ok, has_old, OLD, NEW)
+}
+
+/// B59-RELOCATE (A-113 C5): a probe answer is recorded as a relocation only when every fact
+/// holds: a verified proof, from another node that is an admitted member, inside the RTT
+/// bound, with room in the map.
+#[kani::proof]
+fn proof_relocation_accept_decision() {
+    use crate::por::auditor::{relocation_accept_decision, RelocationFacts};
+    let f = RelocationFacts {
+        proof_verified: kani::any(),
+        prover_is_self: kani::any(),
+        prover_admitted: kani::any(),
+        rtt_ok: kani::any(),
+        map_full: kani::any(),
+    };
+    let decision = relocation_accept_decision(&f);
+    kani::cover!(
+        decision.is_err() && f.proof_verified && !f.prover_admitted,
+        "verified proof from a non-member refused"
+    );
+    kani::cover!(decision.is_ok(), "relocation accepted");
+    assert_eq!(
+        decision.is_ok(),
+        f.proof_verified && !f.prover_is_self && f.prover_admitted && f.rtt_ok && !f.map_full
+    );
+}

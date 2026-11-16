@@ -1,6 +1,7 @@
 --------------------------- MODULE ParVaultPorAudit ---------------------------
 \* @traceability
 \*   adr      ADR-03
+\*   const    OwnerWitnesses -> model-only: the keys the owner's grant names (a seed stand-in; RepairGrant::authorized_witness_pubkeys)
 \* @end
 EXTENDS Naturals, FiniteSets
 
@@ -21,12 +22,21 @@ EXTENDS Naturals, FiniteSets
 \*     times out. Guard `verdict-classes` (only an invalid proof is a failure, L-27).
 \*   - EventuallyRecorded (PROPERTY): a dropped chunk is eventually seen as a failed proof or an
 \*     unanswered audit. Counters saturate; there is no audit bound and no state constraint.
+\*   - B-113 handoff: "cheat" leaves and hands its shard to host "new" (accounted to "cheat",
+\*     F-04) with a grant it chooses: none, the owner's (forwarded; witnesses OwnerWitnesses, a
+\*     seed stand-in) or its own (any witnesses). DepartedCannotRebuild: under the owner's grant
+\*     "cheat" fetches nothing from "new". OwnerCanAuditNew: under the owner's grant the owner
+\*     and every witness it named may audit "new". Guard `chunk-storer` on "new".
 \* Not modelled: SHA-256 (a proof is valid iff it names the challenged index and carries the
 \* stored content), the session-key HMAC and the rate limits (E-POR, F-06-RATE claims).
 \* Nothing in this model quarantines: `record_failure` has no caller (the assumption
 \* leaf-quarantine-not-run is declared in ParVaultProtocol).
 
+CONSTANT OwnerWitnesses   \* the keys the owner's grant names (cfg: {"honest"})
+
 Owner == "self"
+NewHost == "new"
+Grants == {"None", Owner, "cheat"}
 Hosts == {"self", "honest", "cheat"}
 Chunks == 1..2
 NoChallenge == 0
@@ -48,9 +58,19 @@ VARIABLES
     passes,        \* host -> credited passes (saturating at 1)
     fails,         \* host -> recorded failures (saturating at 1)
     cheatVerdict,  \* the last verdict recorded for "cheat"
-    badCredit      \* a pass was credited for a chunk the host did not store (ground truth)
+    badCredit,     \* a pass was credited for a chunk the host did not store (ground truth)
+    newHeld,       \* "new" holds the shard "cheat" handed off
+    newGrant,      \* the owner of the grant registered for it on "new"
+    newWitnesses,  \* the witnesses that grant names
+    newFetched     \* chunks "cheat" fetched from "new" with its own chunk audits
 
-vars == <<cheatStored, cheatFetched, pending, passes, fails, cheatVerdict, badCredit>>
+vars == <<cheatStored, cheatFetched, pending, passes, fails, cheatVerdict, badCredit,
+          newHeld, newGrant, newWitnesses, newFetched>>
+newVars == <<newHeld, newGrant, newWitnesses, newFetched>>
+
+\* B-113 on "new": a registered grant decides alone (its owner or a witness it names); with no
+\* grant, the accounted owner ("cheat", the sender of the handoff).
+StorerOkAt(s) == IF newGrant = "None" THEN s = "cheat" ELSE s = newGrant \/ s \in newWitnesses   \* @guard chunk-storer-grant sym=src/por/verifier.rs::por_storer_decision
 
 Stored(h) == IF h = "cheat" THEN cheatStored ELSE Chunks
 Have(h) == IF h = "cheat" THEN cheatStored \cup cheatFetched ELSE Chunks
@@ -64,6 +84,10 @@ TypeOK ==
     /\ fails \in [Hosts -> 0..1]
     /\ cheatVerdict \in Verdicts
     /\ badCredit \in BOOLEAN
+    /\ newHeld \in BOOLEAN
+    /\ newGrant \in Grants
+    /\ newWitnesses \subseteq Hosts
+    /\ newFetched \subseteq Chunks
 
 Init ==
     /\ cheatStored = Chunks
@@ -73,12 +97,17 @@ Init ==
     /\ fails = [h \in Hosts |-> 0]
     /\ cheatVerdict = "None"
     /\ badCredit = FALSE
+    /\ newHeld = FALSE
+    /\ newGrant = "None"
+    /\ newWitnesses = {}
+    /\ newFetched = {}
 
 \* The owner challenges chunk i of host h (indices from the OS RNG: any chunk).
 Challenge(h, i) ==
     /\ pending[h] = NoChallenge
     /\ pending' = [pending EXCEPT ![h] = i]
     /\ UNCHANGED <<cheatStored, cheatFetched, passes, fails, cheatVerdict, badCredit>>
+    /\ UNCHANGED newVars
 
 \* Records verdict v for host h, challenged on chunk i.
 Record(h, i, v) ==
@@ -98,12 +127,14 @@ Answer(h, j, valid) ==
     /\ h # "cheat" => (j = pending[h] /\ valid)
     /\ Record(h, pending[h], IF ProofOk(pending[h], j, valid) THEN "Pass" ELSE "Invalid")
     /\ UNCHANGED <<cheatStored, cheatFetched>>
+    /\ UNCHANGED newVars
 
 \* No answer within the bound (any host, the honest one included).
 Timeout(h) ==
     /\ pending[h] # NoChallenge
     /\ Record(h, pending[h], "Timeout")
     /\ UNCHANGED <<cheatStored, cheatFetched>>
+    /\ UNCHANGED newVars
 
 Respond(h) == Timeout(h) \/ \E j \in Chunks, valid \in BOOLEAN : Answer(h, j, valid)
 
@@ -112,6 +143,7 @@ Drop(i) ==
     /\ i \in cheatStored
     /\ cheatStored' = cheatStored \ {i}
     /\ UNCHANGED <<cheatFetched, pending, passes, fails, cheatVerdict, badCredit>>
+    /\ UNCHANGED newVars
 
 \* "cheat", a co-host holding the stripe key, sends its own chunk audit to "honest" to rebuild
 \* chunk i (Reed-Solomon, position-wise). "honest" answers only the accounted owner.
@@ -119,12 +151,37 @@ CoHostFetch(i) ==
     /\ StorerOk("cheat")
     /\ cheatFetched' = cheatFetched \cup {i}
     /\ UNCHANGED <<cheatStored, pending, passes, fails, cheatVerdict, badCredit>>
+    /\ UNCHANGED newVars
+
+\* B-113: "cheat" leaves and hands its shard to "new" once, as itself (accounted to "cheat").
+\* It chooses the grant sent with it: the owner's (forwarded, naming OwnerWitnesses), its own
+\* (naming any hosts it likes) or none.
+Handoff ==
+    /\ ~newHeld
+    /\ newHeld' = TRUE
+    /\ \E g \in Grants :
+        /\ newGrant' = g
+        /\ newWitnesses' \in (IF g = Owner THEN {OwnerWitnesses}
+                              ELSE IF g = "cheat" THEN SUBSET Hosts
+                              ELSE {{}})
+    /\ UNCHANGED <<newFetched, cheatStored, cheatFetched, pending, passes, fails,
+                   cheatVerdict, badCredit>>
+
+\* "cheat", still holding the stripe key, sends chunk audits of the handed-off shard to "new".
+CheatFetchNew(i) ==
+    /\ newHeld
+    /\ StorerOkAt("cheat")
+    /\ newFetched' = newFetched \cup {i}
+    /\ UNCHANGED <<newHeld, newGrant, newWitnesses, cheatStored, cheatFetched, pending, passes,
+                   fails, cheatVerdict, badCredit>>
 
 Next ==
     \/ \E h \in Hosts, i \in Chunks : Challenge(h, i)
     \/ \E h \in Hosts : Respond(h)
     \/ \E i \in Chunks : Drop(i)
     \/ \E i \in Chunks : CoHostFetch(i)
+    \/ Handoff
+    \/ \E i \in Chunks : CheatFetchNew(i)
 
 Fairness ==
     /\ \A i \in Chunks : SF_vars(Challenge("cheat", i))
@@ -135,6 +192,10 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 NoCreditWithoutProof == ~badCredit
 SelfNeverCredited == passes[Owner] = 0 /\ fails[Owner] = 0
 HonestNeverFails == fails["honest"] = 0
+DepartedCannotRebuild == newGrant = Owner => newFetched = {}
+OwnerCanAuditNew ==
+    newHeld /\ newGrant = Owner =>
+        StorerOkAt(Owner) /\ \A w \in OwnerWitnesses : StorerOkAt(w)
 
 EventuallyRecorded ==
     \A i \in Chunks :

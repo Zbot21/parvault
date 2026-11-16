@@ -32,7 +32,10 @@ use tracing::warn;
 pub const LITE_AUDIT_INDEX_FILE: &str = "lite_audit_index.bin";
 /// The byte bound (estimated record sizes, see [`LiteAuditRecord::cost`]).
 pub const LITE_AUDIT_INDEX_MAX_BYTES: usize = 8 * 1024 * 1024;
-const LITE_AUDIT_INDEX_VERSION: u32 = 1;
+/// Version 2 (B-113) adds [`LiteAuditRecord::unwitnessed`]; a version 1 file loads with every
+/// record unwitnessed (its lite clients named no seed witness).
+const LITE_AUDIT_INDEX_VERSION: u32 = 2;
+const LITE_AUDIT_INDEX_VERSION_V1: u32 = 1;
 /// The largest index file `load` reads (the encoding is below the charged cost; twice the byte
 /// bound leaves room for the header).
 pub const LITE_AUDIT_INDEX_MAX_FILE: u64 = 2 * LITE_AUDIT_INDEX_MAX_BYTES as u64;
@@ -65,6 +68,27 @@ pub struct LiteAuditRecord {
     pub stripe_merkle_root: [u8; 32],
     pub shard_len: u64,
     pub shards: Vec<LiteAuditShard>,
+    /// B-113 (A-113 §10.3): the lite client's grant does not name this seed as a witness (a
+    /// pre-upgrade client), so the hosts refuse the seed's audits. The seed's auditor skips the
+    /// record and counts it until a re-syndication with a witness grant replaces it.
+    pub unwitnessed: bool,
+}
+
+/// A version 1 record (before B-113).
+#[derive(Deserialize)]
+struct LiteAuditRecordV1 {
+    client: String,
+    stripe_merkle_root: [u8; 32],
+    shard_len: u64,
+    shards: Vec<LiteAuditShard>,
+}
+
+#[derive(Deserialize)]
+struct OnDiskV1 {
+    #[allow(dead_code)]
+    version: u32,
+    dropped: u64,
+    records: Vec<LiteAuditRecordV1>,
 }
 
 impl LiteAuditRecord {
@@ -138,14 +162,37 @@ impl LiteAuditIndex {
         match read_bounded(&path, LITE_AUDIT_INDEX_MAX_FILE) {
             Ok(None) => return Err("reject.lite_audit_index_oversized"),
             Ok(Some(raw)) => {
-                let d = bincode::deserialize::<OnDisk>(&raw)
-                    .map_err(|_| "reject.lite_audit_index_corrupt")?;
-                if d.version != LITE_AUDIT_INDEX_VERSION {
-                    return Err("reject.lite_audit_index_version");
-                }
-                idx.dropped = d.dropped;
-                for r in d.records {
-                    idx.push(r);
+                let version = raw
+                    .get(..4)
+                    .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                    .map(u32::from_le_bytes)
+                    .ok_or("reject.lite_audit_index_corrupt")?;
+                match version {
+                    LITE_AUDIT_INDEX_VERSION => {
+                        let d = bincode::deserialize::<OnDisk>(&raw)
+                            .map_err(|_| "reject.lite_audit_index_corrupt")?;
+                        idx.dropped = d.dropped;
+                        for r in d.records {
+                            idx.push(r);
+                        }
+                    }
+                    LITE_AUDIT_INDEX_VERSION_V1 => {
+                        let d = bincode::deserialize::<OnDiskV1>(&raw)
+                            .map_err(|_| "reject.lite_audit_index_corrupt")?;
+                        idx.dropped = d.dropped;
+                        for r in d.records {
+                            idx.push(LiteAuditRecord {
+                                client: r.client,
+                                stripe_merkle_root: r.stripe_merkle_root,
+                                shard_len: r.shard_len,
+                                shards: r.shards,
+                                unwitnessed: true,
+                            });
+                        }
+                        // Rewritten as version 2 on the next flush.
+                        idx.dirty = true;
+                    }
+                    _ => return Err("reject.lite_audit_index_version"),
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -253,9 +300,16 @@ impl LiteAuditIndex {
         }
     }
 
+    /// Records the seed cannot audit because their grant names no seed witness (B-113).
+    pub fn unwitnessed_count(&self) -> usize {
+        self.records.iter().filter(|r| r.unwitnessed).count()
+    }
+
     /// The auditable shards of up to `k` random records (the bounded scan; RAM only, no decrypt).
+    /// Unwitnessed records are skipped: no challenge is sent for them (B-113).
     pub fn sample_targets(&self, k: usize) -> Vec<AuditTarget> {
-        let mut picks: Vec<&LiteAuditRecord> = self.records.iter().collect();
+        let mut picks: Vec<&LiteAuditRecord> =
+            self.records.iter().filter(|r| !r.unwitnessed).collect();
         picks.shuffle(&mut OsRng);
         picks
             .into_iter()
@@ -309,7 +363,47 @@ mod tests {
                     host_addr: format!("/ip4/127.0.0.1/tcp/{}", 4000 + i),
                 })
                 .collect(),
+            unwitnessed: false,
         }
+    }
+
+    /// B-113: a version 1 file loads with every record unwitnessed, and the sampler skips
+    /// unwitnessed records; a re-syndicated (witnessed) record replaces one and clears it.
+    #[test]
+    fn v1_records_load_unwitnessed_and_are_not_sampled() {
+        #[derive(Serialize)]
+        struct V1Rec {
+            client: String,
+            stripe_merkle_root: [u8; 32],
+            shard_len: u64,
+            shards: Vec<LiteAuditShard>,
+        }
+        #[derive(Serialize)]
+        struct V1 {
+            version: u32,
+            dropped: u64,
+            records: Vec<V1Rec>,
+        }
+        let r = rec("a", 1, 2);
+        let raw = bincode::serialize(&V1 {
+            version: 1,
+            dropped: 3,
+            records: vec![V1Rec {
+                client: r.client.clone(),
+                stripe_merkle_root: r.stripe_merkle_root,
+                shard_len: r.shard_len,
+                shards: r.shards.clone(),
+            }],
+        })
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(LITE_AUDIT_INDEX_FILE), raw).unwrap();
+        let mut idx = LiteAuditIndex::load(dir.path()).unwrap();
+        assert_eq!((idx.len(), idx.dropped, idx.unwitnessed_count()), (1, 3, 1));
+        assert!(idx.sample_targets(10).is_empty());
+        idx.insert(r);
+        assert_eq!(idx.unwitnessed_count(), 0);
+        assert_eq!(idx.sample_targets(10).len(), 2);
     }
 
     #[test]

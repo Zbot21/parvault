@@ -1120,11 +1120,20 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                     };
                 }
                 Ok(ShardBinding::Keep) => {
-                    // Already held for the same grant owner: verify the bytes, change nothing.
+                    // Already held for the same grant owner: verify the bytes, change no
+                    // owner or session. A grant naming a superset of the registered witnesses
+                    // still replaces it (A-113 C9); any other is kept out.
                     let ok = crate::sharding::merkle::hash_shard_leaf(
                         shard_id.shard_index,
                         &shard_bytes,
                     ) == shard_id.shard_hash;
+                    if let (true, Some(grant)) = (ok, repair_grant) {
+                        if let Err(code) =
+                            por_verifier.register_repair_grant_for_stored(grant, &[shard_id])
+                        {
+                            warn!(code, peer = %remote_peer_id, "repair grant not registered");
+                        }
+                    }
                     return MeshWireResponse::PutShardAck {
                         stored: ok,
                         error: (!ok).then(|| "shard bytes do not match the shard hash".to_string()),
@@ -1237,17 +1246,16 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                 warn!(code, peer = remote_peer_id, "refused a chunk audit");
                 return MeshWireResponse::ChunkAuditResult(None);
             }
-            let sender = peer
-                .pubkey
-                .map(|pk| NodeIdentity::device_peer_id_for_pubkey(&pk));
             let accounted_owner = block_store.quota().lock().ok().and_then(|q| {
                 q.shard_owner(&challenge.shard_id.file_key())
                     .map(str::to_string)
             });
             let shard_id = challenge.shard_id;
+            // B-113: the registered grant (owner or witness) decides when there is one; the
+            // accounted owner only when there is none.
             match por_verifier.admit_chunk_challenge(
                 &challenge,
-                sender.as_deref(),
+                peer.pubkey,
                 accounted_owner.as_deref(),
                 now_unix_ms(),
                 || block_store.regular_shard_len(&shard_id),
