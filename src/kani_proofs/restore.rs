@@ -136,3 +136,16 @@ fn b20_catalog_import_decision() {
     kani::cover!(r == Ok(CatalogImport::Apply), "newer catalog applied");
     kani::cover!(r == Ok(CatalogImport::Unchanged), "same version unchanged");
 }
+
+use crate::vfs::vaultkey_load_decision;
+
+/// VAULTKEY (archC1 condition 1): a vault key file is used only when every binding holds.
+#[kani::proof]
+fn vaultkey_used_only_when_every_binding_holds() {
+    let (u, n, o, d): (bool, bool, bool, bool) =
+        (kani::any(), kani::any(), kani::any(), kani::any());
+    let r = vaultkey_load_decision(u, n, o, d);
+    assert!(r.is_ok() == (u && n && o && d));
+    kani::cover!(r.is_err() && u && o && d, "renamed key file refused");
+    kani::cover!(r.is_ok(), "bound key file used");
+}

@@ -1959,7 +1959,7 @@ pub mod catalog {
                     }
                 }
             }
-            cands.sort_by(|a, b| b.monotonic_version.cmp(&a.monotonic_version));
+            cands.sort_by_key(|e| std::cmp::Reverse(e.monotonic_version));
             let floor = read_floor(&self.data_dir, &keys.namespace);
             let mut last = Ok(ImportReport::default());
             for env in cands {

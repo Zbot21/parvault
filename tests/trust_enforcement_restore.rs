@@ -824,7 +824,6 @@ fn b20_parvault_sync_read_only_listing() {
 
 #[cfg(unix)]
 mod seedvault {
-    use super::b20::*;
     use super::*;
     use parvault::crypto::{MasterKey, NodeIdentity};
     use parvault::storage::{BlockStore, QuotaManager};
