@@ -389,6 +389,17 @@ claim      B154-FOREIGN sym=src/sync/gc_journal.rs::foreign_catalog_decision acc
 claim      B154-WARN sym=src/sync/retention.rs::storage_warning_decision accept=trust_enforcement_gc_owner::b154_storage_within_policy_is_silent reject=trust_enforcement_gc_owner::b154_stuck_frees_warn code=warn.folder_storage_ratio bin=parvault ref=docs/security/TRUST_FINDINGS.md   # L-122: warn above 1.25x what the policy can hold (stuck or abandoned frees)
 claim      B163-RETRY sym=src/sync/gc_journal.rs::quota_retry_decision accept=trust_enforcement_gc_owner::b163_full_owner_gcs_then_stores reject=trust_enforcement_gc_owner::b163_quota_retry_spent_without_frees code=warn.gc_quota_retry_spent bin=parvault ref=docs/security/TRUST_FINDINGS.md   # C35: at its allowance, an owner frees, then retries once
 claim      B154-CEIL sym=src/sync/retention.rs::retention_policy_decision accept=trust_enforcement_gc_owner::b154_ceilings_accepted reject=trust_enforcement_gc_owner::b154_above_ceiling_refused code=reject.retention_above_ceiling bin=parvault ref=docs/security/TRUST_FINDINGS.md   # L-119: client ceilings 50/90/52, refused not clamped
+kani       B154-RETAIN sym=src/sync/retention.rs::retention_decision harness=proof_retention_decision_floors cover=a version dropped
+kani       B154-RETAIN-RANK sym=src/sync/retention.rs::keep_by_rank harness=proof_keep_by_rank_floors_monotone_and_clock cover=dropped
+kani       B154-CEIL sym=src/sync/retention.rs::retention_policy_decision harness=proof_retention_policy_ceilings_refused_not_clamped cover=refused
+kani       B154-NOCHANGE sym=src/sync/engine.rs::no_change_decision harness=proof_no_change_decision cover=no change
+kani       B154-MARK sym=src/sync/gc_journal.rs::gc_free_decision harness=proof_gc_free_decision_never_frees_marked cover=marked kept
+kani       B154-EPOCH sym=src/sync/gc_journal.rs::order_epoch harness=proof_order_epoch_increases cover=timestamp epoch
+kani       B163-RETRY sym=src/sync/gc_journal.rs::quota_retry_decision harness=proof_quota_retry_at_most_once cover=retry spent
+kani       B154-STALE sym=src/sync/gc_journal.rs::stale_snapshot_decision harness=proof_stale_snapshot_decision cover=stale refused
+kani       B154-FOREIGN sym=src/sync/gc_journal.rs::foreign_catalog_decision harness=proof_foreign_catalog_decision cover=foreign
+kani       B154-WARN sym=src/sync/retention.rs::storage_warning_decision harness=proof_storage_warning_threshold cover=warns
+kani       B154-CAP sym=src/sync/retention.rs::apply_cap harness=proof_apply_cap_never_drops_newest cover=newest alone over the cap
 reach      TR-GC-MARK sym=src/sync/gc_journal.rs::mark from=src/sync/engine.rs::gc_after_pass   # ParVaultVersionGC guard mark-includes-pass
 reach      TR-GC-FREE sym=src/sync/gc_journal.rs::gc_free_decision from=src/sync/engine.rs::gc_after_pass   # ParVaultVersionGC guard catalog-pin
 tla-mutant TM-GC-MARK-PASS   spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-mark-includes-pass.patch

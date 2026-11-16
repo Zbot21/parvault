@@ -209,9 +209,9 @@ pub const fn keep_by_rank(facts: RankFacts, policy: &RetentionPolicy, plausible:
     daily || weekly
 }
 
-/// The rank facts of `versions[i]` at `now_ms`. Versions are distinct by `version`, in any
-/// order; the representative of a bucket is its highest version.
-pub fn rank_facts(versions: &[VersionMeta], i: usize, now_ms: u64) -> RankFacts {
+/// The rank of `versions[i]` (versions newer than it) and whether it is the newest of its UTC
+/// day and of its 7-day window. Takes no clock: an implausible clock cannot move them (C28).
+pub fn rank_and_reps(versions: &[VersionMeta], i: usize) -> (u64, bool, bool) {
     let me = versions[i];
     let my_day = me.created_unix_ms / DAY_MS;
     let my_week = me.created_unix_ms / WEEK_MS;
@@ -229,12 +229,20 @@ pub fn rank_facts(versions: &[VersionMeta], i: usize, now_ms: u64) -> RankFacts 
             }
         }
     }
+    (rank, day_rep, week_rep)
+}
+
+/// The rank facts of `versions[i]` at `now_ms`. Versions are distinct by `version`, in any
+/// order; the representative of a bucket is its highest version. Only the ages use the clock.
+pub fn rank_facts(versions: &[VersionMeta], i: usize, now_ms: u64) -> RankFacts {
+    let (rank, day_rep, week_rep) = rank_and_reps(versions, i);
+    let created = versions[i].created_unix_ms;
     RankFacts {
         rank,
         day_rep,
-        days_ago: (now_ms / DAY_MS).saturating_sub(my_day),
+        days_ago: (now_ms / DAY_MS).saturating_sub(created / DAY_MS),
         week_rep,
-        weeks_ago: (now_ms / WEEK_MS).saturating_sub(my_week),
+        weeks_ago: (now_ms / WEEK_MS).saturating_sub(created / WEEK_MS),
     }
 }
 
@@ -691,6 +699,44 @@ mod tests {
         assert_eq!(replica_factor(16, 20, 2), 2);
         assert_eq!(replica_factor(16, 20, 10), 3);
         assert_eq!(replica_factor(16, 20, 25), 1);
+    }
+
+    /// `policy_max_bytes` grows with the folder size and never overflows (sampled; the 128-bit
+    /// arithmetic does not finish under CBMC, so this is a property test, not a Kani harness).
+    #[test]
+    fn policy_max_bytes_monotone_sampled() {
+        let mut x = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..20_000 {
+            let p = RetentionPolicy::checked(
+                1 + (next() % 50) as u32,
+                (next() % 91) as u32,
+                (next() % 53) as u32,
+                if next() % 2 == 0 { Some(next()) } else { None },
+            )
+            .unwrap();
+            let (a, b) = (next(), next());
+            let (a, b) = (a.min(b), a.max(b));
+            let k = 1 + next() % 32;
+            let n = k + next() % 32;
+            let r = 1 + next() % 8;
+            assert!(policy_max_bytes(&p, a, k, n, r) <= policy_max_bytes(&p, b, k, n, r));
+        }
+        assert_eq!(
+            policy_max_bytes(
+                &RetentionPolicy::checked(50, 90, 52, None).unwrap(),
+                u64::MAX,
+                1,
+                255,
+                255
+            ),
+            u64::MAX
+        );
     }
 
     #[test]

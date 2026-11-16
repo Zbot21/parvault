@@ -9,7 +9,7 @@ use crate::sync::gc_journal::{
     stale_snapshot_decision, QuotaRetry, MAX_BACKOFF_PASSES,
 };
 use crate::sync::retention::{
-    apply_cap, keep_by_rank, retention_decision, retention_policy_decision,
+    apply_cap, keep_by_rank, rank_facts, retention_decision, retention_policy_decision,
     storage_warning_decision, version_restore_decision, watch_interval_decision, RankFacts,
     RetentionPolicy, VersionMeta, KEEP_DAILY_CEILING, KEEP_LAST_CEILING, KEEP_WEEKLY_CEILING,
     MIN_WATCH_INTERVAL_SECS,
@@ -103,11 +103,13 @@ fn proof_retention_decision_floors() {
     kani::cover!(plausible && kept < 4, "a version dropped");
 }
 
-/// B154-RETAIN on 4 versions (C28): keeping is monotone in each policy field, and on an
-/// implausible clock the decision does not depend on the time.
+/// B154-RETAIN on 4 versions (C28): keeping is monotone in each policy field at any clock.
+/// `retention_decision` keeps `versions[i]` iff `keep_by_rank(rank_facts(versions, i, now),
+/// policy, plausible)`, and the facts do not depend on the policy, so the facts are computed
+/// once (two full `retention_decision` calls do not finish in CBMC).
 #[kani::proof]
 #[kani::unwind(5)]
-fn proof_retention_decision_monotone_and_clock_independent() {
+fn proof_retention_decision_monotone() {
     let vs = four_versions();
     let p = any_policy();
     let q = any_policy();
@@ -115,20 +117,35 @@ fn proof_retention_decision_monotone_and_clock_independent() {
     kani::assume(q.keep_daily >= p.keep_daily);
     kani::assume(q.keep_weekly >= p.keep_weekly);
     let now: u64 = kani::any();
-    let mut kp = [false; 4];
-    let mut kq = [false; 4];
-    let plausible = retention_decision(&vs, &p, now, &mut kp);
-    retention_decision(&vs, &q, now, &mut kq);
+    let plausible: bool = kani::any();
+    let mut grew = false;
     for i in 0..4 {
-        assert!(!kp[i] || kq[i]);
+        let f = rank_facts(&vs, i, now);
+        let kp = keep_by_rank(f, &p, plausible);
+        let kq = keep_by_rank(f, &q, plausible);
+        assert!(!kp || kq);
+        grew |= kq && !kp;
     }
-    let later: u64 = kani::any();
-    let mut kl = [false; 4];
-    let plausible_later = retention_decision(&vs, &p, later, &mut kl);
-    if !plausible && !plausible_later {
-        assert!(kp == kl, "an implausible clock does not move retention");
-    }
-    kani::cover!(kp != kq, "a larger policy keeps more");
+    kani::cover!(grew, "a larger policy keeps more");
+}
+
+/// B154-RETAIN (C28): on an implausible clock keeping ignores the ages; the ranks and bucket
+/// representatives come from `rank_and_reps`, which takes no clock, so an implausible clock
+/// does not move retention (nothing is dropped for its age).
+#[kani::proof]
+fn proof_retention_decision_clock_independent() {
+    let a = any_rank_facts();
+    let b = RankFacts {
+        days_ago: kani::any(),
+        weeks_ago: kani::any(),
+        ..a
+    };
+    let p = any_policy();
+    assert!(keep_by_rank(a, &p, false) == keep_by_rank(b, &p, false));
+    kani::cover!(
+        a.days_ago != b.days_ago && keep_by_rank(a, &p, false),
+        "kept whatever its age"
+    );
 }
 
 /// C25, C26: the cap drops the oldest kept versions only, never the newest, and stops at or
@@ -174,15 +191,16 @@ fn proof_retention_policy_ceilings_refused_not_clamped() {
     let w: u32 = kani::any();
     let ok =
         (1..=KEEP_LAST_CEILING).contains(&l) && d <= KEEP_DAILY_CEILING && w <= KEEP_WEEKLY_CEILING;
-    match retention_policy_decision(l, d, w, None) {
+    let r = retention_policy_decision(l, d, w, None);
+    match r {
         Ok(p) => {
             assert!(ok);
             assert!(p.keep_last == l && p.keep_daily == d && p.keep_weekly == w);
         }
         Err(_) => assert!(!ok),
     }
-    kani::cover!(ok, "accepted");
-    kani::cover!(!ok, "refused");
+    kani::cover!(r.is_ok(), "accepted");
+    kani::cover!(r.is_err(), "refused");
 }
 
 /// B154-NOCHANGE (C20): over fixed arrays of 3 small ids, no change exactly when the
@@ -343,20 +361,4 @@ fn proof_retry_backoff_bounded() {
     let next = next_retry_pass(pass, attempts);
     assert!(next > pass && next - pass <= MAX_BACKOFF_PASSES);
     kani::cover!(next - pass == MAX_BACKOFF_PASSES, "capped");
-}
-
-/// L-122: `policy_max_bytes` never overflows and grows with the folder size.
-#[kani::proof]
-fn proof_policy_max_bytes_monotone() {
-    let p = any_policy();
-    let a: u64 = kani::any();
-    let b: u64 = kani::any();
-    kani::assume(a <= b);
-    let k: u8 = kani::any();
-    let n: u8 = kani::any();
-    let r: u8 = kani::any();
-    let ma = retention::policy_max_bytes(&p, a, k as u64, n as u64, r as u64);
-    let mb = retention::policy_max_bytes(&p, b, k as u64, n as u64, r as u64);
-    assert!(ma <= mb);
-    kani::cover!(ma < mb, "a larger folder may hold more");
 }

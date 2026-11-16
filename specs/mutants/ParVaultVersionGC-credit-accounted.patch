@@ -8,5 +8,5 @@ diff --git a/specs/ParVaultVersionGC.tla b/specs/ParVaultVersionGC.tla
 -CreditAcct(s) == Acct(s)   \* @guard credit-accounted
 +CreditAcct(s) == "owner"
  
- Referenced == UNION {refs[v] : v \in retained} \cup pending
+ Referenced == (UNION {refs[v] : v \in retained}) \cup pending
  

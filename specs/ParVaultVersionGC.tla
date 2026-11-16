@@ -68,7 +68,7 @@ vars == <<clock, ver, refs, retained, published, phase, pending, inflight, gcKee
 
 \* ---- Guards: owner side (track B2) ----
 \* The marks: every kept version and the pass being written.
-Marks(keep) == UNION {refs[v] : v \in keep} \cup pending   \* @guard mark-includes-pass sym=src/sync/gc_journal.rs::mark
+Marks(keep) == (UNION {refs[v] : v \in keep}) \cup pending   \* @guard mark-includes-pass sym=src/sync/gc_journal.rs::mark
 \* A GC run keeps the newest version and the last acknowledged catalog.
 KeepOk(keep) == ver \in keep /\ (published > 0 => published \in keep)   \* @guard catalog-pin sym=src/sync/gc_journal.rs::gc_free_decision
 \* Version files are dropped only after the garbage is journalled.
@@ -82,7 +82,7 @@ Fresh(o) == clock <= o.ts + Window   \* @guard free-fresh
 EpochOk(o) == o.e > hepoch[o.h]   \* @guard free-epoch
 CreditAcct(s) == Acct(s)   \* @guard credit-accounted
 
-Referenced == UNION {refs[v] : v \in retained} \cup pending
+Referenced == (UNION {refs[v] : v \in retained}) \cup pending
 
 Init ==
     /\ clock = 0
@@ -150,7 +150,7 @@ Mark(keep) ==
     /\ keep \subseteq retained
     /\ KeepOk(keep)
     /\ gcKeep' = keep
-    /\ gcGarbage' = (UNION {refs[v] : v \in retained \ keep} \cup inflight) \ Marks(keep)
+    /\ gcGarbage' = ((UNION {refs[v] : v \in retained \ keep}) \cup inflight) \ Marks(keep)
     /\ phase' = "marked"
     /\ UNCHANGED <<clock, ver, refs, retained, published, pending, inflight, journal, held,
                    charged, orders, unacked, oepoch, hepoch, crashes>>
@@ -172,9 +172,10 @@ Drop ==
     /\ UNCHANGED <<clock, ver, refs, published, pending, inflight, gcKeep, gcGarbage, journal,
                    held, charged, orders, unacked, oepoch, hepoch, crashes>>
 
-\* Steps 5 and 6: an entry is re-checked against the marks (a marked stripe leaves the journal,
+\* Steps 5 and 6 (after the version files are dropped): an entry is re-checked against the marks (a marked stripe leaves the journal,
 \* never freed), else signed with a fresh epoch and sent (C10, C11: max(last + 1, clock)).
 Free(s, h) ==
+    /\ phase \in {"idle", "placed", "written"}   \* step 6 runs after step 4 (or a later pass)
     /\ <<s, h>> \in journal
     /\ IF s \in Marks(retained)
        THEN /\ journal' = journal \ {<<s, h>>}
