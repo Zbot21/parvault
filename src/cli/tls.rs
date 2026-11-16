@@ -14,5 +14,5 @@ pub(crate) fn run(action: TlsAction, data_dir: &Path) -> anyhow::Result<()> {
         TlsAction::Export { out: _ } => "tls export",
         TlsAction::Rotate => "tls rotate",
     };
-    Err(parvault::seam::not_built_yet(parvault::seam::Stub { track: "A", entry }).into())
+    Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt { track: "A", entry }).into())
 }

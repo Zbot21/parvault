@@ -5,7 +5,7 @@
 # so the release gate catches a leftover stub. src/seam.rs itself (the definition) is not a call
 # site; the Lead deletes it at integration. A call with no `track: "<X>"` within its next six
 # lines fails at any version.
-# Usage: scripts/check_seam_stubs.sh [repo-root]
+# Usage: scripts/check_seam_unbuilt.sh [repo-root]
 set -euo pipefail
 ROOT=${1:-.}
 exec python3 -I - "$ROOT" <<'PY'
@@ -40,11 +40,11 @@ for d, _, files in os.walk(os.path.join(root, "src")):
                 if track is None:
                     fails.append(f"{rel}:{i + 1}: a not_built_yet call names no track")
 for rel, ln, track in calls:
-    print(f"[STUB] {rel}:{ln} track={track}")
+    print(f"[UNBUILT] {rel}:{ln} track={track}")
 if version >= (0, 5, 6) and calls:
     fails.append(f"version {'.'.join(map(str, version))}: {len(calls)} not_built_yet stub(s) remain (G3)")
 for f in fails:
     print("[FAIL]", f)
-print(f"seam-stubs: {len(calls)} call site(s), version {'.'.join(map(str, version))}, {len(fails)} failure(s)")
+print(f"seam-unbuilt: {len(calls)} call site(s), version {'.'.join(map(str, version))}, {len(fails)} failure(s)")
 sys.exit(1 if fails else 0)
 PY

@@ -66,7 +66,7 @@ pub fn ensure_cert(
     let _ = data_dir;
     if cfg.any_flag() {
         return Err(EdgeTlsRefusal::NotBuiltYet(crate::seam::not_built_yet(
-            crate::seam::Stub {
+            crate::seam::Unbuilt {
                 track: "A",
                 entry: "--tls-san / --insecure-plain-http",
             },

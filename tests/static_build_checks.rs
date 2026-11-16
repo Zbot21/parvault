@@ -32,30 +32,33 @@ fn plugin_feature_sets_link_no_async_runtime() {
 /// G3 (v0.5.6 T0): every `seam::not_built_yet` stub names its track, and none remains once the
 /// package version is 0.5.6 or later.
 #[test]
-fn seam_stubs_are_listed_and_gone_by_v0_5_6() {
-    run_script("check_seam_stubs.sh");
+fn seam_unbuilt_calls_are_listed_and_gone_by_v0_5_6() {
+    run_script("check_seam_unbuilt.sh");
 }
 
 /// G3 non-vacuity: a stub left in a 0.5.6 tree fails; the same tree without it passes; a stub
 /// with no track fails at any version.
 #[test]
-fn seam_stub_check_fails_on_a_leftover_stub_at_v0_5_6() {
-    let stub = "fn f() { let _ = crate::seam::not_built_yet(crate::seam::Stub {\n track: \"A\",\n entry: \"x\" }); }\n";
+fn seam_check_fails_on_a_leftover_call_at_v0_5_6() {
+    let call = "fn f() { let _ = crate::seam::not_built_yet(crate::seam::Unbuilt {\n track: \"A\",\n entry: \"x\" }); }\n";
     let cargo = |v: &str| format!("[package]\nname = \"p\"\nversion = \"{v}\"\n");
-    let left = planted_tree(&[("Cargo.toml", &cargo("0.5.6")), ("src/a.rs", stub)]);
-    let (ok, text) = run_script_on("check_seam_stubs.sh", &[left.path()]);
-    assert!(!ok && text.contains("[STUB] src/a.rs:1 track=A"), "{text}");
-    let dev = planted_tree(&[("Cargo.toml", &cargo("0.5.5")), ("src/a.rs", stub)]);
-    let (ok, text) = run_script_on("check_seam_stubs.sh", &[dev.path()]);
+    let left = planted_tree(&[("Cargo.toml", &cargo("0.5.6")), ("src/a.rs", call)]);
+    let (ok, text) = run_script_on("check_seam_unbuilt.sh", &[left.path()]);
+    assert!(
+        !ok && text.contains("[UNBUILT] src/a.rs:1 track=A"),
+        "{text}"
+    );
+    let dev = planted_tree(&[("Cargo.toml", &cargo("0.5.5")), ("src/a.rs", call)]);
+    let (ok, text) = run_script_on("check_seam_unbuilt.sh", &[dev.path()]);
     assert!(ok, "{text}");
     let gone = planted_tree(&[("Cargo.toml", &cargo("0.5.6")), ("src/a.rs", "fn f() {}\n")]);
-    let (ok, text) = run_script_on("check_seam_stubs.sh", &[gone.path()]);
+    let (ok, text) = run_script_on("check_seam_unbuilt.sh", &[gone.path()]);
     assert!(ok, "{text}");
     let untracked = planted_tree(&[
         ("Cargo.toml", &cargo("0.5.5")),
         ("src/a.rs", "fn f() { not_built_yet(s); }\n"),
     ]);
-    let (ok, text) = run_script_on("check_seam_stubs.sh", &[untracked.path()]);
+    let (ok, text) = run_script_on("check_seam_unbuilt.sh", &[untracked.path()]);
     assert!(!ok && text.contains("names no track"), "{text}");
 }
 

@@ -23,7 +23,7 @@ pub(crate) fn run(action: WotAction, data_dir: &Path) -> anyhow::Result<()> {
         WotAction::Invite { peer, out } => {
             if out.is_some() {
                 // v0.5.6 T0 stub (G3): track E writes the file (A-146-6).
-                return Err(parvault::seam::not_built_yet(parvault::seam::Stub {
+                return Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt {
                     track: "E",
                     entry: "wot invite --out",
                 })

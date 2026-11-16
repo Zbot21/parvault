@@ -78,7 +78,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn t0_stub_passes_through_and_writes_nothing() {
+    fn t0_lock_passes_through_and_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let a = DataDirLock::acquire(dir.path(), LockPurpose::Daemon).unwrap();
         let b = DataDirLock::acquire(dir.path(), LockPurpose::RingInit).unwrap();

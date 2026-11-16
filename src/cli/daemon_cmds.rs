@@ -51,7 +51,7 @@ pub(crate) async fn up(env: CliEnv, command: Commands) -> anyhow::Result<()> {
     };
     if no_gc {
         // v0.5.6 T0 stub (G3): track B2 builds the version GC this turns off.
-        return Err(parvault::seam::not_built_yet(parvault::seam::Stub {
+        return Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt {
             track: "B2",
             entry: "--no-gc",
         })

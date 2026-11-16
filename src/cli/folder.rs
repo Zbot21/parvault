@@ -165,7 +165,7 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
     };
     if no_gc {
         // v0.5.6 T0 stub (G3): track B2 builds the version GC this turns off.
-        return Err(parvault::seam::not_built_yet(parvault::seam::Stub {
+        return Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt {
             track: "B2",
             entry: "--no-gc",
         })
@@ -663,7 +663,7 @@ pub(crate) async fn restore_folder(env: CliEnv, command: Commands) -> anyhow::Re
     };
     if version.is_some() {
         // v0.5.6 T0 stub (G3): track B2 restores from the version store.
-        return Err(parvault::seam::not_built_yet(parvault::seam::Stub {
+        return Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt {
             track: "B2",
             entry: "restore-folder --version",
         })

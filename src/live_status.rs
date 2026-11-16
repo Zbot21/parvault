@@ -52,7 +52,7 @@ impl LiveStatusSnapshot {
 /// The daemon's live status, after the caller authorised the request (`status_auth_decision`).
 /// T0 stub: refuses.
 pub fn snapshot() -> std::io::Result<LiveStatusSnapshot> {
-    Err(crate::seam::not_built_yet(crate::seam::Stub {
+    Err(crate::seam::not_built_yet(crate::seam::Unbuilt {
         track: "D",
         entry: "status --live / QueryLiveStatus / GET /live",
     }))

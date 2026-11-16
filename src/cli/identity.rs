@@ -15,7 +15,7 @@ pub(crate) async fn status(env: CliEnv, command: Commands) -> anyhow::Result<()>
     };
     if live {
         // v0.5.6 T0 stub (G3): track D asks the daemon (`QueryLiveStatus`).
-        return Err(parvault::seam::not_built_yet(parvault::seam::Stub {
+        return Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt {
             track: "D",
             entry: "status --live",
         })

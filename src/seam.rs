@@ -11,7 +11,7 @@ use std::io;
 
 /// Which stubbed entry point refused, for the log and the error text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Stub {
+pub struct Unbuilt {
     /// The track that fills it in (`A`, `B1`, `B2`, `C`, `D`, `E`).
     pub track: &'static str,
     /// The entry point, as a user or peer reaches it (a flag, command, variant or route).
@@ -22,18 +22,18 @@ pub struct Stub {
 pub const NOT_BUILT_YET: &str = "reject.not_built_yet";
 
 /// Logs and returns the refusal of a stubbed entry point.
-pub fn not_built_yet(stub: Stub) -> io::Error {
+pub fn not_built_yet(unbuilt: Unbuilt) -> io::Error {
     tracing::warn!(
         code = NOT_BUILT_YET,
-        track = stub.track,
-        entry = stub.entry,
+        track = unbuilt.track,
+        entry = unbuilt.entry,
         "refused: not built yet (v0.5.6 T0 stub)"
     );
     io::Error::new(
         io::ErrorKind::Unsupported,
         format!(
             "{NOT_BUILT_YET}: {} is not built yet (v0.5.6 track {})",
-            stub.entry, stub.track
+            unbuilt.entry, unbuilt.track
         ),
     )
 }
@@ -44,7 +44,7 @@ mod tests {
 
     #[test]
     fn the_refusal_names_the_code_and_the_entry() {
-        let e = not_built_yet(Stub {
+        let e = not_built_yet(Unbuilt {
             track: "A",
             entry: "tls show",
         });

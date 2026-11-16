@@ -20,7 +20,7 @@ fn gate_ran(name: &str) {
 /// T0 stubs of track E: `wot invite --out`, `ring backup|restore`, `up --init-if-absent`,
 /// `up --join-token-file`.
 #[test]
-fn track_e_stubs_refuse_not_built_yet() {
+fn track_e_unbuilt_entries_refuse() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("node");
     let peer = "11".repeat(32);
@@ -50,7 +50,7 @@ fn track_e_stubs_refuse_not_built_yet() {
     ] {
         common::assert_not_built_yet(&common::parvault_in(&dir, &args), entry);
     }
-    gate_ran("trust_enforcement_setup::track_e_stubs_refuse_not_built_yet");
+    gate_ran("trust_enforcement_setup::track_e_unbuilt_entries_refuse");
 }
 
 /// B-174 at T0: `wot init` runs under the (pass-through) lock exactly as before: one genesis,

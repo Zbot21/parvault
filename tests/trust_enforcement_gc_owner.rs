@@ -19,7 +19,7 @@ fn gate_ran(name: &str) {
 
 /// T0 stub of track B2: `restore-folder --version`.
 #[test]
-fn track_b2_stubs_refuse_not_built_yet() {
+fn track_b2_unbuilt_entries_refuse() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("node");
     let snap = tmp.path().join("s.manifest.bin");
@@ -51,5 +51,5 @@ fn track_b2_stubs_refuse_not_built_yet() {
     ] {
         common::assert_not_built_yet(&common::parvault_in(&dir, &args), "--no-gc");
     }
-    gate_ran("trust_enforcement_gc_owner::track_b2_stubs_refuse_not_built_yet");
+    gate_ran("trust_enforcement_gc_owner::track_b2_unbuilt_entries_refuse");
 }

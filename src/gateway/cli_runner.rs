@@ -428,7 +428,7 @@ pub fn execute_token_cli(action: TokenAction, data_dir: &Path) -> anyhow::Result
             let _ = read_only; // the default since B-16
             if out.is_some() {
                 // v0.5.6 T0 stub (G3): track A writes the file.
-                return Err(crate::seam::not_built_yet(crate::seam::Stub {
+                return Err(crate::seam::not_built_yet(crate::seam::Unbuilt {
                     track: "A",
                     entry: "token mint --out",
                 })

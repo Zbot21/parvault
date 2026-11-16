@@ -160,7 +160,7 @@ fn pipelining_stops_at_a_refusal_and_at_connection_close() {
 /// T0 stubs of track A: `tls show|export|rotate`, `token mint --out`, `up --tls-san`,
 /// `up --insecure-plain-http`.
 #[test]
-fn track_a_stubs_refuse_not_built_yet() {
+fn track_a_unbuilt_entries_refuse() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("node");
     // `up` refuses a node in no ring before it reaches the edge; start one.
@@ -211,5 +211,5 @@ fn track_a_stubs_refuse_not_built_yet() {
         String::from_utf8_lossy(&no_sock.stderr).contains("needs --ipc-socket"),
         "{no_sock:?}"
     );
-    gate_ran("trust_enforcement_edge::track_a_stubs_refuse_not_built_yet");
+    gate_ran("trust_enforcement_edge::track_a_unbuilt_entries_refuse");
 }

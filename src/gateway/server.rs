@@ -112,7 +112,7 @@ impl GatewayIpcServer {
     pub fn with_socket_group(self, group: Option<&str>) -> io::Result<Self> {
         match group {
             None => Ok(self),
-            Some(_) => Err(crate::seam::not_built_yet(crate::seam::Stub {
+            Some(_) => Err(crate::seam::not_built_yet(crate::seam::Unbuilt {
                 track: "A or E (B-180)",
                 entry: "--gateway-socket-group",
             })),

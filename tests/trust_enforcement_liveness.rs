@@ -20,11 +20,11 @@ fn gate_ran(name: &str) {
 /// T0 stub of track D: `status --live` (and `live_status::snapshot`, behind `QueryLiveStatus`
 /// and `GET /live`).
 #[test]
-fn track_d_stubs_refuse_not_built_yet() {
+fn track_d_unbuilt_entries_refuse() {
     let tmp = tempfile::tempdir().unwrap();
     let out = common::parvault_in(&tmp.path().join("node"), &["status", "--live"]);
     common::assert_not_built_yet(&out, "status --live");
     let e = parvault::live_status::snapshot().unwrap_err();
     assert!(e.to_string().contains("reject.not_built_yet"), "{e}");
-    gate_ran("trust_enforcement_liveness::track_d_stubs_refuse_not_built_yet");
+    gate_ran("trust_enforcement_liveness::track_d_unbuilt_entries_refuse");
 }

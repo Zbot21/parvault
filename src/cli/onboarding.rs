@@ -15,7 +15,7 @@ pub(crate) fn up_setup_preflight(
     if !init_if_absent && join_token_file.is_none() {
         return Ok(());
     }
-    Err(parvault::seam::not_built_yet(parvault::seam::Stub {
+    Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt {
         track: "E",
         entry: "up --init-if-absent / --join-token-file",
     })

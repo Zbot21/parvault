@@ -15,5 +15,5 @@ pub(crate) fn run(action: RingAction, data_dir: &Path) -> anyhow::Result<()> {
         RingAction::Restore { .. } => (LockPurpose::RingRestore, "ring restore"),
     };
     let _lock = DataDirLock::acquire(data_dir, purpose)?;
-    Err(parvault::seam::not_built_yet(parvault::seam::Stub { track: "E", entry }).into())
+    Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt { track: "E", entry }).into())
 }

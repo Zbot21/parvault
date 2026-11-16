@@ -1258,7 +1258,7 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
             // T0 stub (G3): track B1 replaces this arm with `free_order_decision`, then
             // `shard_delete_decision` and `remove_held_shard` per shard.
             let _ = order;
-            let refusal = crate::seam::not_built_yet(crate::seam::Stub {
+            let refusal = crate::seam::not_built_yet(crate::seam::Unbuilt {
                 track: "B1",
                 entry: "MeshWireRequest::FreeShards",
             });
