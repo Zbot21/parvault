@@ -8,17 +8,23 @@
 # Steps: verify -> load -> ring -> health -> identity -> invite -> join -> health -> roundtrip
 #        -> upgrade (ring kept) -> remove. Everything is removed at the end.
 # Usage: scripts/test_docker_doc.sh <dir with SHA256SUMS, SHA256SUMS.sig, parvault-image-amd64-dev.tar>
-#        PORT_BASE (default 4201) picks the two mesh ports.
+#        Safe to run twice at once: each run takes a free 10-port slot (4201+10k, k<10, held by
+#        flock; two mesh ports used) and, after the doc's own `load` block (which retags the doc's
+#        tag; the tag is put back and the load is serialised), runs every later block with IMG set
+#        to this run's own tag of the loaded image. PORT_BASE picks the ports by hand.
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 DOC="$REPO/docs/DOCKER.md"
 DIST=$(cd "${1:?usage: test_docker_doc.sh <dist dir>}" && pwd)
-PB=${PORT_BASE:-4201}
 ID="pvdd-$$"
+# shellcheck source=lib_test_slots.sh
+source "$(dirname "$0")/lib_test_slots.sh"
+if [[ -n "${PORT_BASE:-}" ]]; then PB=$PORT_BASE; else pick_port_base doc 4201 10 10 || exit 1; fi
 WORK=$(mktemp -d)
 cleanup() {
-  command docker rm -f "$ID-a" "$ID-b" >/dev/null 2>&1 || true
+  command docker rm -fv "$ID-a" "$ID-b" >/dev/null 2>&1 || true
   command docker volume rm "$ID-a" "$ID-b" >/dev/null 2>&1 || true
+  command docker rmi "pvdd-img:$ID" >/dev/null 2>&1 || true
   rm -rf "$WORK" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -45,7 +51,7 @@ run() {
   {
     echo 'set -euo pipefail'
     echo 'docker() { if [[ "$1" == run ]]; then shift; command docker run -e PARVAULT_NO_LAN_DISCOVERY=1 "$@"; else command docker "$@"; fi; }'
-    echo "IMG=$IMG VOL=$ID-$node NAME=$ID-$node PORT=$port PEERS=$peers CHECK=$WORK/check-$node BACKUP=$WORK/backup-$node"
+    echo "IMG=${RUN_IMG:-$IMG} VOL=$ID-$node NAME=$ID-$node PORT=$port PEERS=$peers CHECK=$WORK/check-$node BACKUP=$WORK/backup-$node"
     echo "$pre"
     block "$name" | grep -vE '^(KEY|TOKEN)=PASTE_'
   } > "$WORK/$node-$name.sh"
@@ -62,8 +68,16 @@ out=$(run a verify 'curl() { echo "(test: dev-allowed-signers from the repo)"; }
 grep -q 'Good "parvault-dev-build" signature for parvault-dev' <<<"$out" || fail "verify: $out"
 grep -q 'parvault-image-amd64-dev.tar: OK' <<<"$out" || fail "verify sha256: $out"
 ok "verify: $(grep -o 'Good "parvault-dev-build" signature[^$]*' <<<"$out" | head -1); $(head -n1 "$DIST/SHA256SUMS"); tar sha256 OK"
-out=$(run a load)
-grep -q "^Loaded image: $IMG" <<<"$out" || fail "load: $out"
+# The load block retags $IMG (the doc's tag); under one lock, give the loaded image this run's tag
+# and put $IMG back on what it was, then run every later block on the run's tag.
+PRIOR=$(command docker image inspect -f '{{.Id}}' "$IMG" 2>/dev/null || true)
+load_and_adopt() {
+  out=$(run a load) || return 1
+  grep -q "^Loaded image: $IMG" <<<"$out" || fail "load: $out"
+  adopt_loaded_image "$IMG" "$PRIOR" "pvdd-img:$ID" || fail "could not tag the loaded image"
+}
+with_image_lock load_and_adopt
+RUN_IMG="pvdd-img:$ID"
 ok "load: $(tr '\n' ' ' <<<"$out")"
 
 # 2. start a ring on node a

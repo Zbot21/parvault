@@ -81,8 +81,8 @@ RING_GENESIS_SEED_HEX="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
 
 cleanup() {
     if [ "${KEEP_CONTAINERS:-0}" != "1" ]; then
-        docker rm -f "${CONTAINERS[@]}" >/dev/null 2>&1 || true
-        docker ps -aq --filter "label=${RUN_LABEL}" | xargs -r docker rm -f >/dev/null 2>&1 || true
+        docker rm -fv "${CONTAINERS[@]}" >/dev/null 2>&1 || true
+        docker ps -aq --filter "label=${RUN_LABEL}" | xargs -r docker rm -fv >/dev/null 2>&1 || true
         docker volume rm -f "$SOC_VOL_NAME" >/dev/null 2>&1 || true
         docker network rm "$NET_NAME" >/dev/null 2>&1 || true
         docker rmi "$IMG_ACCEPT" "$IMG_VFS" "$IMG_SOC" >/dev/null 2>&1 || true
@@ -303,7 +303,7 @@ assert_oneshot_confined() {
 # --- B-106 container policy (end) ---
 
 echo "=== [2/12] Creating isolated Docker bridge network (per-run 172.28.X.0/24) ==="
-docker rm -f "${CONTAINERS[@]}" >/dev/null 2>&1 || true
+docker rm -fv "${CONTAINERS[@]}" >/dev/null 2>&1 || true
 docker network rm "$NET_NAME" >/dev/null 2>&1 || true
 # X starts at a hash of RUN_ID; Docker refuses an overlapping pool, so a taken X moves on.
 NET_X0=$(( $(printf '%s' "$RUN_ID" | cksum | cut -d' ' -f1) % 256 ))
@@ -768,10 +768,10 @@ docker build -f deploy/Dockerfile.router-soc -t "$IMG_SOC" .
 docker images "$IMG_SOC"
 ROUTER_SOC_IMAGE_SIZE="$(docker images "$IMG_SOC" --format '{{.Size}}')"
 
-docker rm -f parvault-soc-extract-${RUN_ID} >/dev/null 2>&1 || true
+docker rm -fv parvault-soc-extract-${RUN_ID} >/dev/null 2>&1 || true
 docker create --name parvault-soc-extract-${RUN_ID} "$IMG_SOC" >/dev/null
 docker cp parvault-soc-extract-${RUN_ID}:/parvault "$RUN_TMP/soc-bin"
-docker rm -f parvault-soc-extract-${RUN_ID} >/dev/null
+docker rm -fv parvault-soc-extract-${RUN_ID} >/dev/null
 SOC_BIN_BYTES="$(stat -c%s "$RUN_TMP/soc-bin")"
 SOC_BIN_MIB="$(awk "BEGIN {printf \"%.2f MiB\", ${SOC_BIN_BYTES}/1048576}")"
 echo "Stripped parvault (--profile soc, musl) binary size: ${SOC_BIN_MIB} (${SOC_BIN_BYTES} bytes)"
@@ -869,7 +869,7 @@ echo "$SOC_STORE_OUT"
 
 SOC_STORE_OOM="$(docker inspect -f '{{.State.OOMKilled}}' parvault-soc-store-${RUN_ID})"
 SOC_STORE_EXIT="$(docker inspect -f '{{.State.ExitCode}}' parvault-soc-store-${RUN_ID})"
-docker rm -f parvault-soc-store-${RUN_ID} >/dev/null
+docker rm -fv parvault-soc-store-${RUN_ID} >/dev/null
 if [ "$SOC_STORE_OOM" != "false" ] || [ "$SOC_STORE_EXIT" != "0" ]; then
     echo "ERROR: parvault-soc-store-${RUN_ID} hit OOM or failed in 48m cgroup (OOMKilled=$SOC_STORE_OOM, Exit=$SOC_STORE_EXIT)"
     exit 1
@@ -896,7 +896,7 @@ echo "$SOC_RESTORE_OUT"
 
 SOC_RESTORE_OOM="$(docker inspect -f '{{.State.OOMKilled}}' parvault-soc-restore-${RUN_ID})"
 SOC_RESTORE_EXIT="$(docker inspect -f '{{.State.ExitCode}}' parvault-soc-restore-${RUN_ID})"
-docker rm -f parvault-soc-restore-${RUN_ID} >/dev/null
+docker rm -fv parvault-soc-restore-${RUN_ID} >/dev/null
 if [ "$SOC_RESTORE_OOM" != "false" ] || [ "$SOC_RESTORE_EXIT" != "0" ]; then
     echo "ERROR: parvault-soc-restore-${RUN_ID} hit OOM or failed in 48m cgroup (OOMKilled=$SOC_RESTORE_OOM, Exit=$SOC_RESTORE_EXIT)"
     exit 1
@@ -1009,7 +1009,7 @@ VFS_FUSE_RESULT="SKIPPED (no /dev/fuse)"
 # The /dev/fuse probe needs no privilege and runs as uid 65532.
 if [ -c /dev/fuse ] && docker run --rm --label "$RUN_LABEL" --device /dev/fuse \
         --security-opt apparmor:unconfined --entrypoint test "$IMG_VFS" -c /dev/fuse; then
-    docker rm -f "$FUSE_WAIVED" >/dev/null 2>&1 || true
+    docker rm -fv "$FUSE_WAIVED" >/dev/null 2>&1 || true
     docker create --label "$RUN_LABEL" --name "$FUSE_WAIVED" --user 0:0 --device /dev/fuse --cap-add SYS_ADMIN \
         --security-opt no-new-privileges --security-opt apparmor:unconfined -e GATES_REQUIRE_REAL=1 "$IMG_VFS" \
         fuse_mount_mp4_probe_and_random_seek parvault_fuse_plugin_mount_rss_under_16_mib >/dev/null
@@ -1017,7 +1017,7 @@ if [ -c /dev/fuse ] && docker run --rm --label "$RUN_LABEL" --device /dev/fuse \
     docker start "$FUSE_WAIVED" >/dev/null
     VFS_FUSE_RC="$(timeout --kill-after=30 600 docker wait "$FUSE_WAIVED")" || VFS_FUSE_RC="timeout"
     docker logs "$FUSE_WAIVED" 2>&1 || true
-    docker rm -f "$FUSE_WAIVED" >/dev/null 2>&1 || true
+    docker rm -fv "$FUSE_WAIVED" >/dev/null 2>&1 || true
     [ "$VFS_FUSE_RC" = "0" ] || { echo "ERROR: stage 12c: the FUSE leg failed or exceeded 600 s (exit $VFS_FUSE_RC)"; exit 1; }
     VFS_FUSE_RESULT="PASS"
 elif [ "${GATES_REQUIRE_REAL:-0}" = "1" ]; then
@@ -1040,7 +1040,7 @@ VFS_NETEM="$NETEM_TC_TARGET"
 # B-106: the test container runs as uid 65532 with no capability. A one-shot root sidecar,
 # NETEM_TC_WAIVED (waived by name in assert_nonroot), joins its network namespace with only
 # NET_ADMIN and adds netem on lo; the test waits for that, then runs.
-docker rm -f "$VFS_NETEM" "$NETEM_TC_WAIVED" >/dev/null 2>&1 || true
+docker rm -fv "$VFS_NETEM" "$NETEM_TC_WAIVED" >/dev/null 2>&1 || true
 docker run -d --name "$VFS_NETEM" --label "$RUN_LABEL" "${CONFINE[@]}" -e GATES_REQUIRE_REAL=1 -e PARVAULT_VFS_TTFB_BUDGET_MS=100 \
     -e PARVAULT_VFS_GATE_LATENCY=1 \
     --entrypoint sh "$IMG_VFS" -c \
@@ -1055,13 +1055,13 @@ docker create --label "$RUN_LABEL" --name "$NETEM_TC_WAIVED" --network "containe
 assert_nonroot "$NETEM_TC_WAIVED"
 docker start -a "$NETEM_TC_WAIVED" \
     || { echo "ERROR: stage 12c: the netem sidecar could not add netem on lo"; exit 1; }
-docker rm -f "$NETEM_TC_WAIVED" >/dev/null
+docker rm -fv "$NETEM_TC_WAIVED" >/dev/null
 VFS_NETEM_QDISC="$(docker exec "$VFS_NETEM" tc qdisc show dev lo)"
 grep -q "netem" <<<"$VFS_NETEM_QDISC" || { echo "ERROR: stage 12c: no netem qdisc on lo: $VFS_NETEM_QDISC"; exit 1; }
 docker exec "$VFS_NETEM" touch /tmp/netem.ready
 VFS_NETEM_RC="$(timeout --kill-after=30 600 docker wait "$VFS_NETEM")" || VFS_NETEM_RC="timeout"
 docker logs "$VFS_NETEM" 2>&1 || true
-docker rm -f "$VFS_NETEM" >/dev/null 2>&1 || true
+docker rm -fv "$VFS_NETEM" >/dev/null 2>&1 || true
 [ "$VFS_NETEM_RC" = "0" ] \
     || { echo "ERROR: stage 12c: the WebDAV leg under netem 15ms/2% failed or exceeded 600 s (exit $VFS_NETEM_RC)"; exit 1; }
 echo "Mounted MP4 gate verified: FUSE ${VFS_FUSE_RESULT}; WebDAV 206 PASS (plain and under netem)."

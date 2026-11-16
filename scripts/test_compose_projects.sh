@@ -15,13 +15,19 @@
 # Each run uses its own project and volume names (pvct-<pid>-<n>) and loopback ports, adds
 # --no-lan-discovery so it never meets a real ring, and removes everything with `down -v`.
 # Usage: scripts/test_compose_projects.sh [image tag]   (default parvault:<Cargo.toml version>-dev,
-#        already loaded). PORT_BASE (default 4101) picks the mesh ports PORT_BASE..PORT_BASE+5.
+#        already loaded). Safe to run twice at once: each run takes a free 10-port slot (mesh 4101+10k
+#        .. +5, status +1000; k<10, held by flock) and tests its own tag of the image, so a
+#        concurrent `docker load` that retags <image tag> cannot change what it tests.
+#        PORT_BASE picks the ports by hand and skips the slot search.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
-TAG=${1:-parvault:$version-dev}
-PB=${PORT_BASE:-4101}
+SRC_TAG=${1:-parvault:$version-dev}
 ID="pvct-$$"
+# shellcheck source=lib_test_slots.sh
+source "$(dirname "$0")/lib_test_slots.sh"
+if [[ -n "${PORT_BASE:-}" ]]; then PB=$PORT_BASE; else pick_port_base compose 4101 10 10 || exit 1; fi
+TAG="pvct-img:$ID"   # this run's own tag of the image, removed at the end
 WORK=$(mktemp -d)
 cleanup() {
   # the export tar is root-owned 0600: remove it from inside a container
@@ -30,6 +36,7 @@ cleanup() {
     [[ -e "$f" ]] && { docker compose -f "$f" down -v --remove-orphans >/dev/null 2>&1 || true; }
   done
   docker volume rm "$ID-6-data" "$ID-7-data" >/dev/null 2>&1 || true   # the backup test's volumes
+  docker rmi "$TAG" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
 BB=$(sed -n 's#^ *image: \(busybox@sha256:[0-9a-f]*\).*#\1#p' docs/SYNOLOGY.md | head -1)
@@ -37,7 +44,8 @@ BB=$(sed -n 's#^ *image: \(busybox@sha256:[0-9a-f]*\).*#\1#p' docs/SYNOLOGY.md |
 trap cleanup EXIT
 fail() { echo "test_compose_projects: FAIL: $*" >&2; exit 1; }
 ok() { echo "ok: $*"; }
-docker image inspect "$TAG" >/dev/null 2>&1 || fail "image $TAG is not loaded (docker load -i parvault-image-<arch>-dev.tar)"
+docker image inspect "$SRC_TAG" >/dev/null 2>&1 || fail "image $SRC_TAG is not loaded (docker load -i parvault-image-<arch>-dev.tar)"
+docker tag "$SRC_TAG" "$TAG" || fail "could not tag $SRC_TAG"
 
 # variant <src> <n> <port> [peers]: unique project/volume, no container_name, loopback ports,
 # no LAN discovery, the test's tag. Everything else is the shipped file.
@@ -246,4 +254,4 @@ refuse "empty backup folder" "$WORK/empty"
 echo hello > "$WORK/other/f.txt"; tar -C "$WORK/other" -cf "$WORK/other/parvault-data.tar" f.txt; rm "$WORK/other/f.txt"
 refuse "tar that is not a ParVault export" "$WORK/other"
 ok "import refuses an empty share and a foreign tar, and leaves the volume untouched"
-echo "test_compose_projects: PASS ($TAG)"
+echo "test_compose_projects: PASS ($SRC_TAG = $(docker image inspect -f '{{.Id}}' "$TAG"))"
