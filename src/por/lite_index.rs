@@ -85,8 +85,8 @@ struct LiteAuditRecordV1 {
 
 #[derive(Deserialize)]
 struct OnDiskV1 {
-    #[allow(dead_code)]
-    version: u32,
+    /// Read from the header before decoding; bincode still needs the field for the layout.
+    _version: u32,
     dropped: u64,
     records: Vec<LiteAuditRecordV1>,
 }

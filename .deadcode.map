@@ -1,0 +1,14 @@
+# Dead-code gate (run_enforcement_gates.sh --release; check_dead_code.sh). The shipped feature
+# sets are declared: the derived bin set `daemon-runtime` alone names no manifest and does not
+# build by design (L-16 S1), so each daemon set names one.
+set        default
+set        no-default default-features=no
+set        ipc-client features=ipc-client default-features=no
+set        vfs features=vfs default-features=no
+set        status-ui features=status-ui default-features=no
+set        daemon-runtime features=daemon-runtime,manifest-household-ring-v1 default-features=no
+set        manifest-household-ring-v1 features=daemon-runtime,vfs,status-ui,manifest-household-ring-v1 default-features=no
+set        manifest-test-restricted features=daemon-runtime,vfs,status-ui,manifest-test-restricted default-features=no
+# One audited lint allow: tests/common/mod.rs:4 (docs/SAFETY_AND_LINT_AUDIT.md). No allowed
+# unused dependency.
+ratchet    allows=1 deps=0
