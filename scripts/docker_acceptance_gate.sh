@@ -816,6 +816,16 @@ status_get() {
         printf "%s\n" "$out"
     ' sh "$1" "${2:-}" "${3:-}" || true
 }
+# status_get_tls <url> <ca file> [token] [host]: the same over HTTPS from the host (v0.5.6, B-1):
+# curl checks the edge certificate against <ca file>; prints the status code then the response.
+status_get_tls() {
+    local hdr=() out
+    [ -n "${3:-}" ] && hdr+=(-H "Authorization: Bearer $3")
+    [ -n "${4:-}" ] && hdr+=(-H "Host: $4")
+    out="$(curl -sS -i --max-time 20 --cacert "$2" "${hdr[@]}" "$1" 2>&1)" || true
+    printf '%s\n' "$out" | awk '/^HTTP\/1.1 [0-9]+/ {print $2; exit}'
+    printf '%s\n' "$out"
+}
 
 assert_nonroot --daemon "parvault-router-soc-${RUN_ID}"
 
@@ -836,24 +846,46 @@ if [ "$SOC_DAEMON_OOM" != "false" ] || [ "$SOC_DAEMON_RUNNING" != "true" ]; then
     exit 1
 fi
 
-# Verify embedded RouterNasStatusServer HTTP telemetry on ${NET_PREFIX}.60:4080
-SOC_NO_TOKEN_CODE="$(status_get http://${NET_PREFIX}.60:4080/api/v1/health | head -1)"
+# Verify embedded RouterNasStatusServer telemetry on ${NET_PREFIX}.60:4080. v0.5.6 (B-1, L-81,
+# track A): a non-loopback status bind serves HTTPS with the daemon's own certificate (made at its
+# first start; integration glue G-11). The scheme comes from the daemon's start line; over HTTPS
+# the host's curl checks the certificate copied out of the appliance's data dir.
+SOC_SCHEME="$(docker logs parvault-router-soc-${RUN_ID} 2>&1 | sed -n 's/.*Status Server listening on \(https\{0,1\}\):\/\/.*/\1/p' | head -1)"
+SOC_SCHEME="${SOC_SCHEME:-http}"
+SOC_CA=""
+if [ "$SOC_SCHEME" = "https" ]; then
+    command -v curl >/dev/null || { echo "ERROR: router-soc serves HTTPS and the host has no curl"; exit 1; }
+    docker cp "parvault-router-soc-${RUN_ID}:/mnt/nas/.parvault-data/edge_tls.pem" "$RUN_TMP/soc_edge.pem" \
+        || { echo "ERROR: no edge_tls.pem in the router-soc data dir"; exit 1; }
+    sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' "$RUN_TMP/soc_edge.pem" > "$RUN_TMP/soc_ca.pem"
+    rm -f "$RUN_TMP/soc_edge.pem"
+    SOC_CA="$RUN_TMP/soc_ca.pem"
+fi
+# soc_get <path> [token]: status code then body, over the appliance's scheme.
+soc_get() {
+    if [ "$SOC_SCHEME" = "https" ]; then
+        status_get_tls "https://${NET_PREFIX}.60:4080$1" "$SOC_CA" "${2:-}"
+    else
+        status_get "http://${NET_PREFIX}.60:4080$1" "${2:-}"
+    fi
+}
+SOC_NO_TOKEN_CODE="$(soc_get /api/v1/health | head -1)"
 if [ "$SOC_NO_TOKEN_CODE" != "401" ]; then
-    echo "ERROR: router-soc status page answered $SOC_NO_TOKEN_CODE without a token (want 401)"
+    echo "ERROR: router-soc status page ($SOC_SCHEME) answered $SOC_NO_TOKEN_CODE without a token (want 401)"
     exit 1
 fi
-SOC_HEALTH_JSON="$(status_get http://${NET_PREFIX}.60:4080/api/v1/health "$SOC_STATUS_TOKEN")"
-echo "parvault-router-soc-${RUN_ID} /api/v1/health: $SOC_HEALTH_JSON"
+SOC_HEALTH_JSON="$(soc_get /api/v1/health "$SOC_STATUS_TOKEN")"
+echo "parvault-router-soc-${RUN_ID} /api/v1/health ($SOC_SCHEME): $SOC_HEALTH_JSON"
 echo "$SOC_HEALTH_JSON" | grep -Eq '"hardware_profile"[[:space:]]*:[[:space:]]*"router-soc"'
 soc_proc idle
 
 # v0.5.4 NEW-3 (docs/METRICS.md): /metrics on the same listener, behind the same token.
-SOC_METRICS_NONE="$(status_get http://${NET_PREFIX}.60:4080/metrics | head -1)"
+SOC_METRICS_NONE="$(soc_get /metrics | head -1)"
 if [ "$SOC_METRICS_NONE" != "401" ]; then
     echo "ERROR: router-soc /metrics answered $SOC_METRICS_NONE without a token (want 401)"
     exit 1
 fi
-SOC_METRICS="$(status_get http://${NET_PREFIX}.60:4080/metrics "$SOC_STATUS_TOKEN")"
+SOC_METRICS="$(soc_get /metrics "$SOC_STATUS_TOKEN")"
 if ! printf '%s\n' "$SOC_METRICS" | grep -Eq '^parvault_build_info\{version="[^"]+",profile="router-soc",deterministic="0"\} 1$'; then
     echo "ERROR: router-soc /metrics has no parvault_build_info line"
     printf '%s\n' "$SOC_METRICS" | head -20
@@ -952,9 +984,20 @@ soc_proc after_transfer
 echo "=== [12b/12] parvault-status sidecar: no key, token-gated status over the gateway socket ==="
 SIDE_KEY="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
 SIDE_TOKEN="$(mint_status_token "$SIDE_KEY")"
+# v0.5.6 (B-1, L-81, A-TLS-3): parvault-status refuses plain HTTP on a non-loopback --listen; it
+# serves HTTPS with a PEM it loads (it never generates one). The gate makes a P-256 leaf with
+# openssl on the host; the container writes it 0600 as its own user (the key-file rule).
+command -v openssl >/dev/null && command -v curl >/dev/null \
+    || { echo "ERROR: stage 12b needs openssl and curl on the host (sidecar over TLS)"; exit 1; }
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj "/CN=parvault-status" \
+    -addext "subjectAltName=IP:${NET_PREFIX}.61" -addext "basicConstraints=critical,CA:FALSE" \
+    -addext "extendedKeyUsage=serverAuth" -keyout "$RUN_TMP/side.key" -out "$RUN_TMP/side_ca.pem" 2>/dev/null \
+    || { echo "ERROR: openssl could not make the sidecar certificate"; exit 1; }
+SIDE_PEM="$(cat "$RUN_TMP/side_ca.pem" "$RUN_TMP/side.key")"
+rm -f "$RUN_TMP/side.key"
 docker run -d --name parvault-status-sidecar-${RUN_ID} "${CONFINE[@]}" \
     -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
-    -e SIDE_KEY="$SIDE_KEY" -e SIDE_TOKEN="$SIDE_TOKEN" \
+    -e SIDE_KEY="$SIDE_KEY" -e SIDE_TOKEN="$SIDE_TOKEN" -e SIDE_PEM="$SIDE_PEM" \
     --network "$NET_NAME" --ip ${NET_PREFIX}.61 \
     --memory=48m --memory-swap=48m \
     "$IMG_ACCEPT" sh -c '
@@ -963,27 +1006,34 @@ docker run -d --name parvault-status-sidecar-${RUN_ID} "${CONFINE[@]}" \
             --ipc-socket /run/pv/gw.sock --macaroon-root-key-hex "$SIDE_KEY" > /tmp/daemon.log 2>&1 &
         i=0; while [ ! -S /run/pv/gw.sock ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i+1)); done
         cd /tmp/sidecar-cwd
-        (umask 077; printf "%s\n" "$SIDE_TOKEN" > /run/pv/status.token)
-        exec /usr/local/bin/parvault-status --socket /run/pv/gw.sock --listen 0.0.0.0:4081 --macaroon-file /run/pv/status.token'
+        (umask 077; printf "%s\n" "$SIDE_TOKEN" > /run/pv/status.token; printf "%s\n" "$SIDE_PEM" > /run/pv/edge.pem)
+        unset SIDE_PEM
+        exec /usr/local/bin/parvault-status --socket /run/pv/gw.sock --listen 0.0.0.0:4081 --macaroon-file /run/pv/status.token \
+            --tls-pem /run/pv/edge.pem'
 SIDE_UP=0
 for _ in $(seq 1 100); do
-    if docker logs parvault-status-sidecar-${RUN_ID} 2>&1 | grep -q "Status Server listening"; then SIDE_UP=1; break; fi
+    if docker logs parvault-status-sidecar-${RUN_ID} 2>&1 | grep -q "Status Server listening on https://"; then SIDE_UP=1; break; fi
     sleep 0.2
 done
 if [ "$SIDE_UP" != "1" ]; then
-    echo "ERROR: parvault-status did not start"; docker logs parvault-status-sidecar-${RUN_ID} || true
+    echo "ERROR: parvault-status did not start over HTTPS"; docker logs parvault-status-sidecar-${RUN_ID} || true
     docker exec parvault-status-sidecar-${RUN_ID} cat /tmp/daemon.log || true
     exit 1
 fi
 assert_nonroot --daemon "parvault-status-sidecar-${RUN_ID}"
 assert_nonroot "parvault-outsider-${RUN_ID}"
-SIDE_OK="$(status_get http://${NET_PREFIX}.61:4081/api/v1/health "$SIDE_TOKEN")"
-SIDE_NONE="$(status_get http://${NET_PREFIX}.61:4081/api/v1/health | head -1)"
-SIDE_DNS="$(status_get http://${NET_PREFIX}.61:4081/api/v1/health "$SIDE_TOKEN" rebind.example:4081 | head -1)"
-SIDE_QUERY="$(status_get "http://${NET_PREFIX}.61:4081/api/v1/health?token=$SIDE_TOKEN" | head -1)"
-echo "sidecar: token=$(echo "$SIDE_OK" | head -1) none=$SIDE_NONE dns-host=$SIDE_DNS query-token=$SIDE_QUERY"
+SIDE_URL="https://${NET_PREFIX}.61:4081/api/v1/health"
+SIDE_CA="$RUN_TMP/side_ca.pem"
+SIDE_OK="$(status_get_tls "$SIDE_URL" "$SIDE_CA" "$SIDE_TOKEN")"
+SIDE_NONE="$(status_get_tls "$SIDE_URL" "$SIDE_CA" | head -1)"
+SIDE_DNS="$(status_get_tls "$SIDE_URL" "$SIDE_CA" "$SIDE_TOKEN" rebind.example:4081 | head -1)"
+SIDE_QUERY="$(status_get_tls "$SIDE_URL?token=$SIDE_TOKEN" "$SIDE_CA" | head -1)"
+# Plain HTTP to the TLS port gets no HTTP answer.
+SIDE_PLAIN="$(status_get "http://${NET_PREFIX}.61:4081/api/v1/health" "$SIDE_TOKEN" | head -1)"
+echo "sidecar (https): token=$(echo "$SIDE_OK" | head -1) none=$SIDE_NONE dns-host=$SIDE_DNS query-token=$SIDE_QUERY plain-http=${SIDE_PLAIN:-none}"
 if [ "$(echo "$SIDE_OK" | head -1)" != "200" ] || ! echo "$SIDE_OK" | grep -q '"version"' \
-    || [ "$SIDE_NONE" != "401" ] || [ "$SIDE_DNS" != "403" ] || [ "$SIDE_QUERY" != "401" ]; then
+    || [ "$SIDE_NONE" != "401" ] || [ "$SIDE_DNS" != "403" ] || [ "$SIDE_QUERY" != "401" ] \
+    || [ -n "$SIDE_PLAIN" ]; then
     echo "ERROR: parvault-status sidecar answers wrong"; docker logs parvault-status-sidecar-${RUN_ID} || true
     exit 1
 fi
