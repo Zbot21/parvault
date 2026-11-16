@@ -496,6 +496,14 @@ pub enum Commands {
         /// Ask the running daemon for its live state (peers, scheduler, memory; B-148, `v0.5.6`).
         #[arg(long, default_value_t = false)]
         live: bool,
+
+        /// The daemon's gateway socket (`up --ipc-socket`); required with --live.
+        #[arg(long, value_name = "SOCK_PATH", requires = "live")]
+        socket: Option<PathBuf>,
+
+        /// File with a read-only token (mode 600). Default: one minted from <data>/macaroon_root.key.
+        #[arg(long, value_name = "PATH", requires = "live")]
+        macaroon_file: Option<PathBuf>,
     },
     /// Display or initialize the persistent NodeIdentity, Post-Quantum Owner Key, and Master Key fingerprints.
     Identity {
@@ -584,7 +592,7 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
 
-        /// Prune local shards belonging to deleted file tombstones after syncing.
+        /// Deprecated (B-154): with version GC on, a deleted file is freed when the last retained version holding it ages out; with --no-gc, prunes deleted files' shards at once as before.
         #[arg(long, default_value_t = false)]
         prune_deleted: bool,
 
@@ -620,6 +628,28 @@ pub enum Commands {
         /// Do not garbage-collect old versions after the pass (B-154; one release).
         #[arg(long, default_value_t = false)]
         no_gc: bool,
+
+        /// Recent versions kept (B-154 L-119; 1-50, default 3).
+        #[arg(long, default_value_t = 3)]
+        keep_last: u32,
+
+        /// Newest version of each of the last D UTC days kept (0-90, default 3).
+        #[arg(long, default_value_t = 3)]
+        keep_daily: u32,
+
+        /// Newest version of each of the last W 7-day windows kept (0-52, default 0).
+        #[arg(long, default_value_t = 0)]
+        keep_weekly: u32,
+
+        /// Per-folder cap on stored (pre-erasure) bytes; drops the oldest retained versions first, never the newest.
+        #[arg(long, value_name = "BYTES")]
+        max_stored_bytes: Option<u64>,
+    },
+    /// Show the retained versions and storage of a watched folder (B-154, `v0.5.6` track B2).
+    FolderStatus {
+        /// Path to the folder's `.manifest.bin` snapshot.
+        #[arg(long, default_value = "./folder_snapshot.manifest.bin")]
+        snapshot: PathBuf,
     },
     /// Browse and list all files, sizes, and stripe counts in a Folder Snapshot Manifest without downloading shards (ADR-20).
     ListSnapshot {
@@ -979,6 +1009,9 @@ pub struct NodeConfig {
     /// may write up to 4x its allowance to this node; a restart also starts a new epoch.
     #[serde(default)]
     pub quota_write_epoch_secs: u64,
+    /// L-130: an explicit max held regular shards; wins over the memory-derived bound (`max_held_shards` in config.toml).
+    #[serde(default)]
+    pub max_held_shards: Option<u64>,
     /// Deterministic lab mode (`[lab]`, `docs/LAB_MODE.md`).
     #[serde(default)]
     pub lab: LabConfig,
@@ -1037,6 +1070,7 @@ impl Default for NodeConfig {
             por_audit_interval_secs: 0,
             por_audit_rtt_ms: 0,
             quota_write_epoch_secs: 0,
+            max_held_shards: None,
             lab: LabConfig::default(),
         }
     }

@@ -159,6 +159,11 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
         device_cert,
         resyndicate_lite,
         no_gc,
+        // B-154 retention (track B2): bound here when the version GC is built.
+        keep_last: _,
+        keep_daily: _,
+        keep_weekly: _,
+        max_stored_bytes: _,
     } = command
     else {
         unreachable!("watch_folder() is only dispatched for Commands::WatchFolder")
@@ -1053,6 +1058,20 @@ pub(crate) async fn recover_from_seed(env: CliEnv, command: Commands) -> anyhow:
         println!("Files Restored     : {}", recovered_count);
     }
     Ok(())
+}
+
+/// `folder-status` (B-154, track B2): the retained versions and stored bytes of a folder.
+/// T0b stub: refused until track B2 builds it.
+pub(crate) async fn folder_status(env: CliEnv, command: Commands) -> anyhow::Result<()> {
+    let _ = env;
+    let Commands::FolderStatus { snapshot: _ } = command else {
+        unreachable!("folder_status() is only dispatched for Commands::FolderStatus")
+    };
+    Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt {
+        track: "B2",
+        entry: "folder-status",
+    })
+    .into())
 }
 
 #[cfg(test)]
