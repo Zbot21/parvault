@@ -719,13 +719,11 @@ mod tests {
         let info = a.cert.unwrap();
         assert!(
             info.sans.contains(&"nas.local".to_string()),
-            "{:?}",
-            info.sans
+            "nas.local in the SANs"
         );
         assert!(
             info.sans.contains(&"127.0.0.1".to_string()),
-            "{:?}",
-            info.sans
+            "127.0.0.1 in the SANs"
         );
         assert!(info.not_after_unix_secs.is_some());
         let b = prepare_edges(dir.path(), &EdgeTlsConfig::default(), &binds).unwrap();

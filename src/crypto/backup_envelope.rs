@@ -30,7 +30,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::Rng;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
@@ -145,14 +145,10 @@ impl BackupHeader {
     /// Reads the fields of a header without judging its version or parameters.
     pub fn decode(h: &[u8; HEADER_LEN]) -> Self {
         let u32_at = |o: usize| u32::from_le_bytes([h[o], h[o + 1], h[o + 2], h[o + 3]]);
-        let mut salt = [0u8; 16];
-        salt.copy_from_slice(&h[23..39]);
-        let mut nonce = [0u8; 24];
-        nonce.copy_from_slice(&h[39..63]);
-        let mut ring_id = [0u8; 32];
-        ring_id.copy_from_slice(&h[63..95]);
-        let mut node_id = [0u8; 32];
-        node_id.copy_from_slice(&h[95..127]);
+        let salt: [u8; 16] = h[23..39].try_into().expect("a 16-byte header field");
+        let nonce: [u8; 24] = h[39..63].try_into().expect("a 24-byte header field");
+        let ring_id: [u8; 32] = h[63..95].try_into().expect("a 32-byte header field");
+        let node_id: [u8; 32] = h[95..127].try_into().expect("a 32-byte header field");
         Self {
             version: u16::from_le_bytes([h[8], h[9]]),
             kdf_id: h[10],
@@ -290,10 +286,9 @@ pub fn seal(
         "the backup body is {} bytes, above the {MAX_BODY_LEN}-byte limit",
         body.len()
     );
-    let mut salt = [0u8; 16];
-    OsRng.fill_bytes(&mut salt);
-    let mut nonce = [0u8; 24];
-    OsRng.fill_bytes(&mut nonce);
+    // Fresh from the OS RNG, never a literal (L-114).
+    let salt: [u8; 16] = OsRng.gen();
+    let nonce: [u8; 24] = OsRng.gen();
     let header = BackupHeader {
         version: VERSION,
         kdf_id: KDF_ARGON2ID_HKDF,
@@ -482,7 +477,7 @@ mod tests {
 
     #[test]
     fn kdf_params_outside_reader_limits_are_refused_before_allocating() {
-        let salt = [0u8; 16];
+        let salt: [u8; 16] = rand::random();
         for (m_kib, t, p) in [
             (4 * 1024 * 1024, 3, 4),
             (65_536, 1, 4),

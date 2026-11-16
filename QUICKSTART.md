@@ -334,7 +334,17 @@ curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
 
 Clients that cannot send a Bearer token (Finder, davfs2, Windows) use any user name and the token as the password.
 
-On a loopback bind (`127.0.0.1`) the edge serves plain HTTP: nothing leaves the machine. Any other bind serves **HTTPS only** (`v0.5.6`): the first such `up` makes a self-signed certificate in the data dir, and clients register it once:
+On a loopback bind (`127.0.0.1`) the edge serves plain HTTP: nothing leaves the machine. Any other bind serves **HTTPS only** (`v0.5.6`): the first such `up` makes a self-signed certificate in the data dir, and clients register it once.
+
+The LAN daemon below replaces the loopback one: a data directory serves one process at a time, so a second `up` on it is refused (`reject.datadir_locked`). Stop the loopback daemon first, with Ctrl-C in its terminal or from another one:
+
+<!-- doc-cmd: node laptop -->
+```bash
+pkill -INT -f -- '--vfs-webdav-listen 127.0.0.1:8088'
+while pkill -0 -f -- '--vfs-webdav-listen 127.0.0.1:8088'; do sleep 0.2; done
+```
+
+Then start it on the LAN address:
 
 <!-- doc-cmd: node laptop -->
 <!-- doc-cmd: background ready="Built-in VFS WebDAV listening on https://0.0.0.0:8443" -->
