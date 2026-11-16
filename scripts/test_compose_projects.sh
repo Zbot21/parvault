@@ -45,7 +45,7 @@ trap cleanup EXIT
 fail() { echo "test_compose_projects: FAIL: $*" >&2; exit 1; }
 ok() { echo "ok: $*"; }
 docker image inspect "$SRC_TAG" >/dev/null 2>&1 || fail "image $SRC_TAG is not loaded (docker load -i parvault-image-<arch>-dev.tar)"
-docker tag "$SRC_TAG" "$TAG" || fail "could not tag $SRC_TAG"
+with_image_lock docker tag "$SRC_TAG" "$TAG" || fail "could not tag $SRC_TAG"
 
 # variant <src> <n> <port> [peers]: unique project/volume, no container_name, loopback ports,
 # no LAN discovery, the test's tag. Everything else is the shipped file.
@@ -172,12 +172,12 @@ ok "docker-host node joined on tcp/$((PB + 4)), healthy through the image HEALTH
 
 # 5. The documented backup: export one tar, import it into a NEW volume, same ring.
 doc_project() { # <project name> <out file> <volume> <backup dir>: the yaml block of that project in docs/SYNOLOGY.md
-  python3 -I - "$1" docs/SYNOLOGY.md "$3" "$4" > "$2" <<'EOF2'
+  python3 -I - "$1" docs/SYNOLOGY.md "$3" "$4" "$ID" > "$2" <<'EOF2'
 import re, sys
-name, doc, vol, bak = sys.argv[1:]
+name, doc, vol, bak, pid = sys.argv[1:]
 m = re.search(r'```yaml\n(name: %s\n.*?)```' % re.escape(name), open(doc).read(), re.S)
 if not m: sys.exit("no yaml block for " + name)
-print(m.group(1).replace("name: parvault-data", "name: " + vol).replace("/volume1/parvault-backup", bak), end="")
+print(m.group(1).replace("name: parvault-export\n", "name: %s-export\n" % pid).replace("name: parvault-import\n", "name: %s-import\n" % pid).replace("name: parvault-data", "name: " + vol).replace("/volume1/parvault-backup", bak), end="")
 EOF2
 }
 docker image inspect "$BB" >/dev/null 2>&1 || fail "pinned busybox $BB is not pulled (docker pull busybox:1.37.0)"

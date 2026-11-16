@@ -4,7 +4,7 @@ For any Linux host with Docker, used from a local shell or over SSH: a server, a
 
 The image `parvault:<version>-dev` is a **dev build** (B-131, L-113), signed with the ParVault dev/test key. It has no OS and no shell: five static binaries, user `65532:65532`, data in `/var/lib/parvault`, and a built-in healthcheck (`parvault gateway health`, exec form).
 
-`scripts/test_docker_doc.sh` runs the command blocks of this page verbatim on a real Docker host, with its own names and ports; `scripts/test_compose_projects.sh` runs the compose file.
+`scripts/test_docker_doc.sh` runs the command blocks of this page verbatim on a real Docker host, with its own names and ports; `scripts/test_compose_projects.sh` runs the compose file. During the verbatim `docker load`, the shared tag `parvault:<version>-dev` briefly (about 1 s, under the tests' image lock) points at the test build, then is put back; a running container is unaffected, and only a compose recreate in that window would pick up the test build.
 
 Every block below uses these shell variables. Set them first, in the shell you run the blocks from:
 

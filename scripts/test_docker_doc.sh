@@ -22,6 +22,7 @@ source "$(dirname "$0")/lib_test_slots.sh"
 if [[ -n "${PORT_BASE:-}" ]]; then PB=$PORT_BASE; else pick_port_base doc 4201 10 10 || exit 1; fi
 WORK=$(mktemp -d)
 cleanup() {
+  restore_shared_tag
   command docker rm -fv "$ID-a" "$ID-b" >/dev/null 2>&1 || true
   command docker volume rm "$ID-a" "$ID-b" >/dev/null 2>&1 || true
   command docker rmi "pvdd-img:$ID" >/dev/null 2>&1 || true
@@ -70,11 +71,11 @@ grep -q 'parvault-image-amd64-dev.tar: OK' <<<"$out" || fail "verify sha256: $ou
 ok "verify: $(grep -o 'Good "parvault-dev-build" signature[^$]*' <<<"$out" | head -1); $(head -n1 "$DIST/SHA256SUMS"); tar sha256 OK"
 # The load block retags $IMG (the doc's tag); under one lock, give the loaded image this run's tag
 # and put $IMG back on what it was, then run every later block on the run's tag.
-PRIOR=$(command docker image inspect -f '{{.Id}}' "$IMG" 2>/dev/null || true)
 load_and_adopt() {
+  begin_load "$IMG"   # records the tag's current image, inside the lock
   out=$(run a load) || return 1
   grep -q "^Loaded image: $IMG" <<<"$out" || fail "load: $out"
-  adopt_loaded_image "$IMG" "$PRIOR" "pvdd-img:$ID" || fail "could not tag the loaded image"
+  adopt_loaded_image "$IMG" "pvdd-img:$ID" || fail "could not tag the loaded image"
 }
 with_image_lock load_and_adopt
 RUN_IMG="pvdd-img:$ID"
