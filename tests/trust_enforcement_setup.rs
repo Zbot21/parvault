@@ -1539,6 +1539,11 @@ fn d10_node(tmp: &Path, name: &str) -> PathBuf {
 /// One `watch-folder --seed-phrase --once` pass with no ring host answering: it registers the
 /// vault key file (then refuses to publish, G-23); `extra` goes before the subcommand.
 fn d10_register(d: &Path, folder: &Path, extra: &[&str]) -> String {
+    d10_register_ns(d, folder, extra, "photos")
+}
+
+/// [`d10_register`] for the vault namespace `ns`.
+fn d10_register_ns(d: &Path, folder: &Path, extra: &[&str], ns: &str) -> String {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -1551,7 +1556,7 @@ fn d10_register(d: &Path, folder: &Path, extra: &[&str]) -> String {
             .args(["--peers", &format!("/ip4/127.0.0.1/tcp/{port}")])
             .args(["watch-folder", "--folder"])
             .arg(folder)
-            .args(["--vault-namespace", "photos", "--once"]),
+            .args(["--vault-namespace", ns, "--once"]),
     );
     text(&o)
 }
@@ -1559,8 +1564,13 @@ fn d10_register(d: &Path, folder: &Path, extra: &[&str]) -> String {
 /// Whether `dir`'s `vaults/photos.vaultkey` unseals with the keystore `pass` gives in `dir`
 /// (its file key, sealed after the `PVVK`, version and length header).
 fn d10_vaultkey_unseals(dir: &Path, pass: Option<&str>) -> bool {
+    d10_vaultkey_ns_unseals(dir, "photos", pass)
+}
+
+/// [`d10_vaultkey_unseals`] for `vaults/<ns>.vaultkey`.
+fn d10_vaultkey_ns_unseals(dir: &Path, ns: &str, pass: Option<&str>) -> bool {
     use parvault::crypto::{LocalFileKeystore, LocalKeystoreSealer};
-    let blob = std::fs::read(dir.join("vaults/photos.vaultkey")).unwrap();
+    let blob = std::fs::read(dir.join(format!("vaults/{ns}.vaultkey"))).unwrap();
     assert_eq!(&blob[..4], b"PVVK");
     let n = u16::from_be_bytes([blob[5], blob[6]]) as usize;
     let ks = LocalFileKeystore::from_passphrase_or_csprng_in_dir(dir, pass).unwrap();
@@ -1652,4 +1662,42 @@ fn d10_legacy_vaultkey_resealed_on_next_write() {
         "the old seal still opens it\n{log}"
     );
     gate_ran("trust_enforcement_setup::d10_legacy_vaultkey_resealed_on_next_write");
+}
+
+/// D10 with D16 (qa056 re-verification): a vault an earlier build registered under a namespace
+/// the rule now refuses (non-ASCII here), its key file sealed by `enclave_sealing.seed`. The
+/// next `watch-folder --seed-phrase` with a passphrase configured does not register it again
+/// (`reject.vault_namespace_unsupported`) but reseals the existing file under the passphrase:
+/// the seed no longer unseals it.
+#[cfg(unix)]
+#[test]
+fn d10_out_of_rule_vaultkey_resealed() {
+    const OLD: &str = "fotos-\u{fc}";
+    let tmp = tempfile::tempdir().unwrap();
+    let d = d10_node(tmp.path(), "d");
+    let folder = tmp.path().join("folder");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("f.txt"), "x").unwrap();
+    assert!(parvault::vfs::register_vault_keys(&d, D10_PHRASE, OLD, Some(D10_PASS)).is_err());
+    // The legacy seal: no passphrase given, so `enclave_sealing.seed`.
+    parvault::vfs::catalog::write_vault_keys_unchecked(&d, D10_PHRASE, OLD, None).unwrap();
+    assert!(d10_vaultkey_ns_unseals(&d, OLD, None), "legacy seal");
+    let before = std::fs::read(d.join(format!("vaults/{OLD}.vaultkey"))).unwrap();
+    let log = d10_register_ns(&d, &folder, &[], OLD);
+    assert!(log.contains("reject.vault_namespace_unsupported"), "{log}");
+    assert_ne!(
+        std::fs::read(d.join(format!("vaults/{OLD}.vaultkey"))).unwrap(),
+        before,
+        "{log}"
+    );
+    assert!(d10_vaultkey_ns_unseals(&d, OLD, Some(D10_PASS)), "{log}");
+    assert!(
+        !d10_vaultkey_ns_unseals(&d, OLD, None),
+        "the old seal still opens it\n{log}"
+    );
+    // A refused namespace with no key file gets none.
+    let log = d10_register_ns(&d, &folder, &[], "neu-\u{fc}");
+    assert!(log.contains("reject.vault_namespace_unsupported"), "{log}");
+    assert!(!d.join("vaults/neu-\u{fc}.vaultkey").exists(), "{log}");
+    gate_ran("trust_enforcement_setup::d10_out_of_rule_vaultkey_resealed");
 }

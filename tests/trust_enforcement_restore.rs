@@ -1200,8 +1200,9 @@ mod qafix056 {
         std::fs::write(dir.join("ring_genesis.pub"), hex::encode(ring)).unwrap();
     }
 
-    /// `ring backup` of `dir` then `ring restore` into the new data dir `target`.
-    pub fn backup_and_restore(dir: &Path, target: &Path, tmp: &Path) {
+    /// `ring backup` of `dir` then `ring restore` into the new data dir `target`; returns the
+    /// backup's output.
+    pub fn backup_and_restore(dir: &Path, target: &Path, tmp: &Path) -> String {
         use std::os::unix::fs::PermissionsExt;
         let pass = tmp.join("backup.pass");
         std::fs::write(&pass, BACKUP_PASS).unwrap();
@@ -1215,6 +1216,7 @@ mod qafix056 {
                 .arg(&pass),
         );
         assert!(o.status.success(), "backup: {}", text(&o));
+        let backup_out = text(&o);
         let bundle: PathBuf = std::fs::read_dir(&out)
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -1229,6 +1231,7 @@ mod qafix056 {
                 .arg("--confirm-move"),
         );
         assert!(o.status.success(), "restore: {}", text(&o));
+        backup_out
     }
 
     fn common_out(cmd: &mut Command) -> Output {
@@ -1342,6 +1345,35 @@ fn d16_floor_of_any_registered_namespace_survives_backup() {
     d.assert_logged("reject.catalog_rollback");
     d.stop();
     gate_ran("trust_enforcement_restore::d16_floor_of_any_registered_namespace_survives_backup");
+}
+
+/// D16 (qa056 re-verification): `ring backup` of a node holding a floor an earlier build wrote
+/// under a namespace the rule now refuses names that vault and why on stderr
+/// (`warn.ring_backup_floor_skipped`), not silently; the floor of a supported namespace is
+/// carried, the refused one is not.
+#[cfg(unix)]
+#[test]
+fn d16_backup_names_each_skipped_floor() {
+    const OLD: &str = "fotos-\u{fc}";
+    let root = tempfile::tempdir().unwrap();
+    let a = b20::data_dir(root.path(), "a");
+    let vaults = a.join("vaults");
+    std::fs::create_dir_all(&vaults).unwrap();
+    for ns in [OLD, "photos"] {
+        std::fs::write(vaults.join(format!("{ns}.floor")), 7u64.to_be_bytes()).unwrap();
+    }
+    qafix056::make_ring_node(&a);
+    let b = root.path().join("b");
+    let out = qafix056::backup_and_restore(&a, &b, root.path());
+    let line = out
+        .lines()
+        .find(|l| l.contains("warn.ring_backup_floor_skipped") && l.contains(OLD))
+        .unwrap_or_else(|| panic!("no warning names {OLD:?}:\n{out}"));
+    assert!(line.contains("outside the current rule"), "{line}");
+    assert!(!out.contains("\"photos\""), "{out}");
+    assert!(b.join("vaults/photos.floor").exists());
+    assert!(!b.join(format!("vaults/{OLD}.floor")).exists());
+    gate_ran("trust_enforcement_restore::d16_backup_names_each_skipped_floor");
 }
 
 /// D10 migration, reader side: a daemon whose `config.toml` sets `device_sealing_passphrase`

@@ -1754,3 +1754,274 @@ fn b154_stalled_host_does_not_starve_the_others() {
     assert!(t.contains("Pending Frees      : 1 "), "{t}");
     gate_ran("trust_enforcement_gc_owner::b154_stalled_host_does_not_starve_the_others");
 }
+
+/// An in-process GC run of one owner: its block store, journal and settings in a scratch dir,
+/// frees through `client`.
+struct OwnerRun {
+    _tmp: tempfile::TempDir,
+    store: parvault::storage::BlockStore,
+    owner: parvault::crypto::NodeIdentity,
+    settings: parvault::sync::gc_journal::GcSettings,
+}
+
+impl OwnerRun {
+    fn new(seed: u8, client: parvault::network::MeshClient) -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = parvault::storage::BlockStore::new(
+            tmp.path().join("store"),
+            parvault::storage::QuotaManager::new(1 << 30, 1 << 20),
+        )
+        .unwrap();
+        let settings = parvault::sync::gc_journal::GcSettings {
+            snapshot_out: tmp.path().join("s.manifest.bin"),
+            policy: Default::default(),
+            data_dir: tmp.path().to_path_buf(),
+            client: Some(client),
+            fetched_catalog: None,
+        };
+        Self {
+            _tmp: tmp,
+            store,
+            owner: parvault::crypto::NodeIdentity::from_seed([seed; 32]),
+            settings,
+        }
+    }
+
+    fn paths(&self) -> parvault::sync::gc_journal::GcPaths {
+        parvault::sync::gc_journal::GcPaths::for_snapshot(&self.settings.snapshot_out)
+    }
+
+    /// Journals `ids` as due frees on `host`.
+    fn seed(&self, ids: &[parvault::storage::ShardId], host: &str) {
+        let mut j = parvault::sync::gc_journal::GcJournal::load(&self.paths()).unwrap();
+        for id in ids {
+            j.pending.push(parvault::sync::gc_journal::PendingFree {
+                shard_id: *id,
+                shard_len: 4096,
+                host: host.to_string(),
+                attempts: 0,
+                first_attempt_ms: now_ms(),
+                next_pass: 0,
+                skew_refusals: 0,
+            });
+        }
+        j.save(&self.paths()).unwrap();
+    }
+
+    fn pending(&self) -> Vec<parvault::storage::ShardId> {
+        parvault::sync::gc_journal::GcJournal::load(&self.paths())
+            .unwrap()
+            .pending
+            .iter()
+            .map(|p| p.shard_id)
+            .collect()
+    }
+}
+
+/// D12 (qa056 re-verification): steps 1 to 5 of a run took 31 s (about 4,000 local frees),
+/// longer than a host's 30 s skew. The run's clock pair is read at its start, before that
+/// work; the orders of step 6 are stamped with the wall time at their send, so the host
+/// applies them (`info.free_order_applied`) and none is refused `reject.free_stale`.
+#[test]
+fn d12_orders_after_a_slow_step5_are_fresh() {
+    let host = spawn_host();
+    let client = parvault::network::MeshClient::new(
+        parvault::crypto::NodeIdentity::from_seed([0xE1; 32]),
+        Vec::new(),
+        None,
+    )
+    .with_lan_discovery(false)
+    .with_admission(parvault::network::admission::AdmissionSource::from_genesis(
+        parvault::crypto::NodeIdentity::from_seed([0x47; 32]),
+    ));
+    let r = OwnerRun::new(0xE1, client);
+    r.seed(&[absent_shard(0x61), absent_shard(0x62)], &host.addr);
+    let slow = Duration::from_secs(31);
+    let started = std::time::Instant::now()
+        .checked_sub(slow)
+        .expect("uptime over 31 s");
+    let mut run = parvault::sync::gc_journal::GcRun::new_started(
+        &r.settings,
+        &r.store,
+        &r.owner,
+        now_ms() - slow.as_millis() as u64,
+        started,
+    )
+    .unwrap();
+    run.step6_send_orders().unwrap();
+    let report = run.finish();
+    assert_eq!(report.clock_skew_refusals, 0, "{report:?}");
+    assert_eq!(report.orders_sent, 1, "{report:?}");
+    assert_eq!(report.shards_not_held, 2, "{report:?}");
+    assert!(r.pending().is_empty(), "{:?}", r.pending());
+    assert_eq!(applied_orders(&host), vec!["2".to_string()]);
+    let log = std::fs::read_to_string(&host.log).unwrap_or_default();
+    assert!(!log.contains("free_stale"), "{log}");
+    gate_ran("trust_enforcement_gc_owner::d12_orders_after_a_slow_step5_are_fresh");
+}
+
+/// The shard ids of each `FreeShards` order a peer saw.
+type SeenOrders = std::sync::Arc<std::sync::Mutex<Vec<Vec<parvault::storage::ShardId>>>>;
+
+/// A wire peer that accepts every connection and status request but never answers its first
+/// `FreeShards` order nor any `DeleteShard` (it holds each response open past the owner's
+/// timeout); later `FreeShards` orders are answered `NotHeld` for every shard. Returns its
+/// `/p2p/` address and the shard ids of each `FreeShards` order it saw.
+fn spawn_stalling_free_peer() -> (String, SeenOrders) {
+    use libp2p::futures::StreamExt;
+    use libp2p::request_response::{self, ProtocolSupport};
+    use libp2p::swarm::SwarmEvent;
+    use parvault::network::behaviour::{BincodeWireCodec, FreeShardOutcome};
+    use parvault::network::wire_handler::{reject_response, NOT_ADMITTED_TEXT};
+    use parvault::network::{MeshWireRequest, MeshWireResponse};
+    let seen: SeenOrders = Default::default();
+    let log = std::sync::Arc::clone(&seen);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let ident = parvault::crypto::NodeIdentity::from_seed([0xD5; 32]);
+            let mut swarm =
+                libp2p::SwarmBuilder::with_existing_identity(ident.to_libp2p_keypair().unwrap())
+                    .with_tokio()
+                    .with_tcp(
+                        libp2p::tcp::Config::default(),
+                        libp2p::noise::Config::new,
+                        libp2p::yamux::Config::default,
+                    )
+                    .unwrap()
+                    .with_behaviour(|_| {
+                        request_response::Behaviour::with_codec(
+                            BincodeWireCodec::default(),
+                            [(
+                                libp2p::StreamProtocol::new("/parvault/wire/1.0.0"),
+                                ProtocolSupport::Full,
+                            )],
+                            // Held responses outlive the owner's 30 s order timeout.
+                            request_response::Config::default()
+                                .with_request_timeout(Duration::from_secs(600)),
+                        )
+                    })
+                    .unwrap()
+                    .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(600)))
+                    .build();
+            swarm
+                .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+                .unwrap();
+            let pid = *swarm.local_peer_id();
+            let mut held = Vec::new();
+            loop {
+                match swarm.select_next_some().await {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        let _ = tx.send(format!("{address}/p2p/{pid}"));
+                    }
+                    SwarmEvent::Behaviour(request_response::Event::Message {
+                        message:
+                            request_response::Message::Request {
+                                request, channel, ..
+                            },
+                        ..
+                    }) => {
+                        let resp = match request {
+                            MeshWireRequest::HandshakeWoT { .. } => {
+                                MeshWireResponse::HandshakeAck {
+                                    accepted: true,
+                                    reason: None,
+                                }
+                            }
+                            MeshWireRequest::FreeShards { order } => {
+                                let first = {
+                                    let mut l = log.lock().unwrap();
+                                    l.push(order.shard_ids.clone());
+                                    l.len() == 1
+                                };
+                                if first {
+                                    held.push(channel);
+                                    continue;
+                                }
+                                MeshWireResponse::FreeShardsAck {
+                                    outcomes: vec![
+                                        FreeShardOutcome::NotHeld;
+                                        order.shard_ids.len()
+                                    ],
+                                    error: None,
+                                }
+                            }
+                            MeshWireRequest::DeleteShard { .. } => {
+                                held.push(channel);
+                                continue;
+                            }
+                            other => reject_response(&other, NOT_ADMITTED_TEXT.to_string()),
+                        };
+                        let _ = swarm.behaviour_mut().send_response(channel, resp);
+                    }
+                    _ => {}
+                }
+            }
+        });
+    });
+    let addr = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("stalling peer listening");
+    (addr, seen)
+}
+
+/// D12 (qa056 re-verification): a host that accepts the `FreeShards` order and never answers
+/// (nor the per-shard `DeleteShard` fallback) costs the pass at most its host budget plus the
+/// order in flight; the shards not tried are deferred, stay journalled, and the next pass sends
+/// them (that host answers this time), which empties them from the journal.
+#[test]
+fn d12_stall_inside_free_shards_is_bounded_and_carried() {
+    use parvault::sync::gc_journal::{GcRun, FREE_HOST_BUDGET_MS, FREE_ORDER_TIMEOUT};
+    let (peer, seen) = spawn_stalling_free_peer();
+    let client = parvault::network::MeshClient::new(
+        parvault::crypto::NodeIdentity::from_seed([0xE2; 32]),
+        Vec::new(),
+        None,
+    )
+    .with_lan_discovery(false);
+    let r = OwnerRun::new(0xE2, client);
+    let ids = [absent_shard(0x71), absent_shard(0x72), absent_shard(0x73)];
+    r.seed(&ids, &peer);
+
+    let t0 = std::time::Instant::now();
+    let mut run = GcRun::new(&r.settings, &r.store, &r.owner, now_ms()).unwrap();
+    run.step6_send_orders().unwrap();
+    let report = run.finish();
+    let spent = t0.elapsed();
+    let bound = Duration::from_millis(FREE_HOST_BUDGET_MS) + FREE_ORDER_TIMEOUT;
+    assert!(
+        spent >= FREE_ORDER_TIMEOUT,
+        "the order did not stall: {spent:?}"
+    );
+    assert!(spent < bound, "the stall cost {spent:?}, over {bound:?}");
+    assert_eq!(report.frees_deferred, 2, "{report:?}");
+    assert_eq!(
+        report.shards_freed + report.shards_not_held,
+        0,
+        "{report:?}"
+    );
+    assert_eq!(r.pending().len(), 3, "every shard stays journalled");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    // The next pass: the deferred shards are due and sent; the host answers and they leave the
+    // journal.
+    let mut run = GcRun::new(&r.settings, &r.store, &r.owner, now_ms()).unwrap();
+    run.step6_send_orders().unwrap();
+    let report = run.finish();
+    let orders = seen.lock().unwrap().clone();
+    assert_eq!(orders.len(), 2, "{orders:?}");
+    for id in &ids[1..] {
+        assert!(
+            orders[1].contains(id),
+            "deferred {id:?} not sent: {orders:?}"
+        );
+    }
+    assert!(report.shards_not_held >= 2, "{report:?}");
+    let left = r.pending();
+    assert!(
+        ids[1..].iter().all(|id| !left.contains(id)),
+        "deferred shards still journalled: {left:?}"
+    );
+    gate_ran("trust_enforcement_gc_owner::d12_stall_inside_free_shards_is_bounded_and_carried");
+}

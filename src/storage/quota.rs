@@ -331,7 +331,7 @@ pub fn read_memory_limit() -> Option<(u64, bool)> {
     read_memory_limit_at(std::path::Path::new("/"))
 }
 
-/// [`read_memory_limit`] under `root` (`/` in production; a fake tree in tests).
+/// [`read_memory_limit`] under `root` (`/` in production; a scratch tree in tests).
 pub fn read_memory_limit_at(root: &std::path::Path) -> Option<(u64, bool)> {
     let ram = std::fs::read_to_string(root.join("proc/meminfo"))
         .ok()
@@ -1363,9 +1363,9 @@ mod tests {
         assert_eq!(v1_cgroup_dir("/other", "/docker/x", "/m"), None);
     }
 
-    /// A fake `/` for [`read_memory_limit_at`]: 8 GiB of RAM, `cgroup` as `/proc/self/cgroup`,
+    /// A scratch `/` tree for [`read_memory_limit_at`]: 8 GiB of RAM, `cgroup` as `/proc/self/cgroup`,
     /// `mountinfo` as `/proc/self/mountinfo`, and `files` (path under `/`, contents).
-    fn fake_root(cgroup: &str, mountinfo: &str, files: &[(&str, &str)]) -> tempfile::TempDir {
+    fn cgroup_tree(cgroup: &str, mountinfo: &str, files: &[(&str, &str)]) -> tempfile::TempDir {
         let t = tempfile::tempdir().unwrap();
         let r = t.path();
         std::fs::create_dir_all(r.join("proc/self")).unwrap();
@@ -1399,7 +1399,7 @@ mod tests {
              710 709 0:22 /docker/{DOCKER_ID} /sys/fs/cgroup/cpu,cpuacct ro,nosuid,nodev,noexec,relatime - cgroup cgroup rw,cpu,cpuacct\n\
              711 709 0:23 /docker/{DOCKER_ID} /sys/fs/cgroup/memory ro,nosuid,nodev,noexec,relatime - cgroup cgroup rw,memory\n"
         );
-        let t = fake_root(
+        let t = cgroup_tree(
             &cg,
             &mi,
             &[
@@ -1423,10 +1423,10 @@ mod tests {
     fn qa056_d2_cgroup_v1_docker_falls_back_to_the_mount_point() {
         let cg = format!("4:memory:/docker/{DOCKER_ID}\n");
         let files = [("sys/fs/cgroup/memory/memory.limit_in_bytes", "67108864\n")];
-        let t = fake_root(&cg, "", &files);
+        let t = cgroup_tree(&cg, "", &files);
         assert_eq!(read_memory_limit_at(t.path()), Some((64 << 20, true)));
         let mi = "711 709 0:23 / /sys/fs/cgroup/memory ro,relatime - cgroup cgroup rw,memory\n";
-        let t = fake_root(&cg, mi, &files);
+        let t = cgroup_tree(&cg, mi, &files);
         assert_eq!(read_memory_limit_at(t.path()), Some((64 << 20, true)));
     }
 
@@ -1436,7 +1436,7 @@ mod tests {
     fn qa056_d2_cgroup_v1_host_and_unlimited() {
         let cg = "4:cpu:/x\n3:memory:/svc\n";
         let mi = "30 25 0:27 / /sys/fs/cgroup/memory rw,relatime - cgroup cgroup rw,memory\n";
-        let t = fake_root(
+        let t = cgroup_tree(
             cg,
             mi,
             &[
@@ -1448,7 +1448,7 @@ mod tests {
             ],
         );
         assert_eq!(read_memory_limit_at(t.path()), Some((128 << 20, true)));
-        let t = fake_root(
+        let t = cgroup_tree(
             cg,
             mi,
             &[
@@ -1465,10 +1465,26 @@ mod tests {
         let mi = format!(
             "711 709 0:23 /docker/{DOCKER_ID} /sys/fs/cgroup/memory ro - cgroup cgroup rw,memory\n"
         );
-        let t = fake_root(
+        let t = cgroup_tree(
             &cg,
             &mi,
             &[("sys/fs/cgroup/memory/memory.limit_in_bytes", V1_UNLIMITED)],
+        );
+        assert_eq!(read_memory_limit_at(t.path()), Some((GIB8, false)));
+    }
+
+    /// QA qa056 (minor): the process's v1 cgroup path lies outside the only memory mount's root
+    /// (another container's cgroup is mounted there): no limit, as the JDK reads it, not the
+    /// sibling cgroup's 64 MiB at the mount point.
+    #[test]
+    fn qa056_cgroup_v1_path_outside_the_mount_root_is_no_limit() {
+        let mi = format!(
+            "711 709 0:23 /docker/{DOCKER_ID} /sys/fs/cgroup/memory ro - cgroup cgroup rw,memory\n"
+        );
+        let t = cgroup_tree(
+            "4:memory:/system.slice/pv.service\n",
+            &mi,
+            &[("sys/fs/cgroup/memory/memory.limit_in_bytes", "67108864\n")],
         );
         assert_eq!(read_memory_limit_at(t.path()), Some((GIB8, false)));
     }
@@ -1478,9 +1494,9 @@ mod tests {
     #[test]
     fn qa056_d2_cgroup_v2_container_host_and_none() {
         let mi = "35 24 0:30 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw\n";
-        let t = fake_root("0::/\n", mi, &[("sys/fs/cgroup/memory.max", "67108864\n")]);
+        let t = cgroup_tree("0::/\n", mi, &[("sys/fs/cgroup/memory.max", "67108864\n")]);
         assert_eq!(read_memory_limit_at(t.path()), Some((64 << 20, true)));
-        let t = fake_root(
+        let t = cgroup_tree(
             "0::/system.slice/pv.service\n",
             mi,
             &[
@@ -1489,7 +1505,7 @@ mod tests {
             ],
         );
         assert_eq!(read_memory_limit_at(t.path()), Some((256 << 20, true)));
-        let t = fake_root("", "", &[]);
+        let t = cgroup_tree("", "", &[]);
         assert_eq!(read_memory_limit_at(t.path()), Some((GIB8, false)));
     }
 

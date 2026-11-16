@@ -772,7 +772,11 @@ pub struct GcRun<'a> {
     pub settings: &'a GcSettings,
     store: &'a BlockStore,
     owner: &'a NodeIdentity,
+    /// The wall clock (ms) when the run started.
     now_ms: u64,
+    /// The monotonic clock at the same moment as `now_ms`: an order is stamped
+    /// `now_ms + started.elapsed()`, the wall time at its send (D12).
+    started: std::time::Instant,
     paths: GcPaths,
     versions: VersionStore,
     pub journal: GcJournal,
@@ -788,6 +792,18 @@ impl<'a> GcRun<'a> {
         owner: &'a NodeIdentity,
         now_ms: u64,
     ) -> Result<Self, GcError> {
+        Self::new_started(settings, store, owner, now_ms, std::time::Instant::now())
+    }
+
+    /// [`Self::new`] for a run whose wall time `now_ms` was read at the monotonic instant
+    /// `started` (a caller that read both clocks earlier, before work of its own).
+    pub fn new_started(
+        settings: &'a GcSettings,
+        store: &'a BlockStore,
+        owner: &'a NodeIdentity,
+        now_ms: u64,
+        started: std::time::Instant,
+    ) -> Result<Self, GcError> {
         let paths = GcPaths::for_snapshot(&settings.snapshot_out);
         let journal = GcJournal::load(&paths)?;
         Ok(Self {
@@ -795,6 +811,7 @@ impl<'a> GcRun<'a> {
             store,
             owner,
             now_ms,
+            started,
             versions: VersionStore::for_snapshot(&settings.snapshot_out),
             paths,
             journal,
