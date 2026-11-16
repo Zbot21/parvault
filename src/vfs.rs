@@ -111,6 +111,23 @@ impl LruBlockCache {
         self.sizes.len()
     }
 
+    /// Whether `(ino, block_idx)` is cached (no hit or miss is counted).
+    pub fn contains(&self, ino: u64, block_idx: u64) -> bool {
+        self.sizes.contains_key(&(ino, block_idx))
+    }
+
+    /// Drops every cached block of `ino` (a replaced or removed file).
+    pub fn forget_ino(&mut self, ino: u64) {
+        let keys: Vec<(u64, u64)> = self.sizes.keys().filter(|k| k.0 == ino).copied().collect();
+        for key in keys {
+            if let Some(sz) = self.sizes.remove(&key) {
+                self.used_bytes = self.used_bytes.saturating_sub(sz);
+            }
+            let _ = fs::remove_file(self.block_path(key.0, key.1));
+        }
+        self.lru_order.retain(|k| k.0 != ino);
+    }
+
     fn block_path(&self, ino: u64, block_idx: u64) -> PathBuf {
         self.cache_dir.join(format!("ino{ino}_blk{block_idx}.blk"))
     }
@@ -376,6 +393,53 @@ pub enum PathRemoval {
     Folder,
 }
 
+/// What [`catalog_import_decision`] allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogImport {
+    /// A newer catalog: apply it.
+    Apply,
+    /// The version already loaded: nothing to do.
+    Unchanged,
+}
+
+/// Claim `B20-LIST` (`@guard`): whether a fetched vault catalog is imported. A catalog that
+/// fails verification or names another vault key is foreign (`reject.catalog_foreign`); one
+/// older than the loaded version is a rollback (`reject.catalog_rollback`).
+pub const fn catalog_import_decision(
+    envelope_verifies: bool,
+    key_matches: bool,
+    envelope_version: u64,
+    loaded_version: u64,
+) -> Result<CatalogImport, &'static str> {
+    if !envelope_verifies || !key_matches {
+        return Err("reject.catalog_foreign");
+    }
+    if envelope_version < loaded_version {
+        return Err("reject.catalog_rollback");
+    }
+    if envelope_version == loaded_version {
+        return Ok(CatalogImport::Unchanged);
+    }
+    Ok(CatalogImport::Apply)
+}
+
+/// Claim `VAULTKEY` (`@guard`, archC1 condition 1): whether a `vaults/<namespace>.vaultkey`
+/// file is used. It must unseal under this data dir's keystore, name the namespace its file
+/// name says, and hold keys whose owner public key and catalog DHT key are the ones recorded
+/// in it; a file swapped in from another vault, data dir or name is refused.
+pub const fn vaultkey_load_decision(
+    unsealed: bool,
+    namespace_matches: bool,
+    owner_matches: bool,
+    dht_key_matches: bool,
+) -> Result<(), &'static str> {
+    if unsealed && namespace_matches && owner_matches && dht_key_matches {
+        Ok(())
+    } else {
+        Err("reject.vaultkey_mismatch")
+    }
+}
+
 /// Path segments as [`VirtualVaultFs::register_lazy_file`] reads them (`.` and `..` dropped).
 #[cfg(unix)]
 fn vfs_path_parts(virtual_path: &str) -> Vec<&str> {
@@ -409,6 +473,25 @@ mod unix_vfs {
         children: Arc<Mutex<HashMap<u64, BTreeMap<String, u64>>>>,
         next_ino: Arc<Mutex<u64>>,
         cache: Arc<Mutex<LruBlockCache>>,
+        /// B-24: one in-flight fetch per `(inode, block)`; concurrent misses join it.
+        inflight: Arc<Mutex<InflightMap>>,
+        /// B-20 (T2): re-imports the catalogs once after a failed read of a catalog file.
+        reimport: Arc<Mutex<Option<ReimportHook>>>,
+    }
+
+    /// The catalog re-import a failed read calls (T2).
+    pub type ReimportHook = Arc<dyn Fn() + Send + Sync>;
+
+    type InflightMap = HashMap<(u64, u64), Arc<BlockFlight>>;
+    /// A finished fetch: the bytes, or the error's kind and text (`io::Error` is not `Clone`).
+    type FlightResult = Result<Vec<u8>, (io::ErrorKind, String)>;
+
+    /// One in-flight block fetch (B-24).
+    struct BlockFlight {
+        result: Mutex<Option<FlightResult>>,
+        done: std::sync::Condvar,
+        /// Set when a scavenger owns the fetch: a joining foreground reader promotes it (S6).
+        promote: Option<Arc<std::sync::atomic::AtomicBool>>,
     }
 
     impl VirtualVaultFs {
@@ -488,6 +571,8 @@ mod unix_vfs {
                 children: Arc::new(Mutex::new(children)),
                 next_ino: Arc::new(Mutex::new(2)),
                 cache: Arc::new(Mutex::new(cache)),
+                inflight: Arc::new(Mutex::new(HashMap::new())),
+                reimport: Arc::new(Mutex::new(None)),
             })
         }
 
@@ -503,19 +588,29 @@ mod unix_vfs {
             self
         }
 
-        /// B-20 (`v0.5.6` track C): starts importing the vault catalogs `data_dir` holds keys
-        /// for (`derive_vault_root_dht_key`), at start and on a timer, through
-        /// [`Self::upsert_file`] and [`Self::remove_path`]; the scavenger then hydrates them
-        /// (L-94, S1). Called by the daemon once the built-in VFS exists. T0 stub: imports
-        /// nothing, so the mount lists only `--vfs-seed-dir` files, as before `v0.5.6`.
+        /// B-20 (`v0.5.6` track C): imports the vault catalogs `data_dir` holds keys for, at
+        /// start and on a timer, through [`Self::upsert_file`] and [`Self::remove_path`]; the
+        /// scavenger then hydrates them (L-94, S1). Called by the daemon once the built-in VFS
+        /// exists. A socket-bus VFS (a plugin) has no engine to index manifests in, so it
+        /// imports nothing.
         #[cfg(feature = "daemon-runtime")]
         pub fn start_catalog_import(
             &self,
             data_dir: &Path,
             block_store: &crate::storage::BlockStore,
         ) -> io::Result<()> {
-            let _ = (data_dir, block_store);
-            Ok(())
+            let GatewayBus::InProcess(engine) = &self.bus else {
+                return Ok(());
+            };
+            // Built now, so a set test switch is logged at startup.
+            let _ = crate::fetch_sched::global();
+            let importer = super::catalog::CatalogImporter::new(
+                self.clone(),
+                Arc::clone(engine),
+                block_store,
+                data_dir,
+            );
+            importer.start()
         }
 
         /// Registers a virtual file path (e.g. `"/movies/archive_10gb.bin"` or `"backup.tar"`)
@@ -604,19 +699,110 @@ mod unix_vfs {
         /// bytes is served for it (T1: the cache is keyed by inode and block). Parent folders
         /// are created as needed. A folder at `virtual_path` is refused.
         pub fn upsert_file(&self, virtual_path: &str, spec: LazyFileSpec) -> io::Result<Ino> {
-            if self.remove_path(virtual_path) == PathRemoval::Folder {
+            let parts = vfs_path_parts(virtual_path);
+            let Some((name, dirs)) = parts.split_last() else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "upsert_file: the path is a folder",
+                    "virtual_path must name a file",
                 ));
-            }
-            let ino = self.register_lazy_file(virtual_path, spec.manifest, spec.macaroon)?;
-            if let Some(mtime) = spec.mtime_unix_secs {
-                if let Some(n) = self.nodes.lock().unwrap().get_mut(&ino) {
-                    n.mtime_unix_secs = mtime;
+            };
+            let parent = self.ensure_dirs(dirs)?;
+            let ino = self.alloc_ino();
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let node = VfsLazyNode {
+                ino,
+                parent_ino: parent,
+                name: (*name).to_string(),
+                is_dir: false,
+                size_bytes: spec.manifest.total_size,
+                mtime_unix_secs: spec.mtime_unix_secs.unwrap_or(now_secs),
+                mode: 0o100644,
+                manifest: Some(spec.manifest),
+                macaroon: spec.macaroon,
+            };
+            // The new node exists before its name points at it, and the name moves in one step
+            // under the children lock, so a reader's lookup finds the old file or the new one,
+            // never neither (qa-t0 INFO: the T0 version removed first).
+            self.nodes.lock().unwrap().insert(ino, node);
+            let replaced = {
+                let mut ch = self.children.lock().unwrap();
+                let entries = ch.entry(parent).or_default();
+                let old = entries.get(*name).copied();
+                let old_is_dir = old
+                    .is_some_and(|o| self.nodes.lock().unwrap().get(&o).is_some_and(|n| n.is_dir));
+                if old_is_dir {
+                    None
+                } else {
+                    entries.insert((*name).to_string(), ino);
+                    Some(old)
+                }
+            };
+            match replaced {
+                None => {
+                    self.nodes.lock().unwrap().remove(&ino);
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "upsert_file: the path is a folder",
+                    ))
+                }
+                Some(old) => {
+                    if let Some(old) = old {
+                        self.nodes.lock().unwrap().remove(&old);
+                        self.cache.lock().unwrap().forget_ino(old);
+                    }
+                    Ok(ino)
                 }
             }
-            Ok(ino)
+        }
+
+        /// The folder inode at `dirs` under the root, creating missing folders.
+        fn ensure_dirs(&self, dirs: &[&str]) -> io::Result<Ino> {
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let mut cur = VFS_ROOT_INO;
+            for dir_name in dirs {
+                let mut ch = self.children.lock().unwrap();
+                let existing = ch.get(&cur).and_then(|m| m.get(*dir_name)).copied();
+                if let Some(ino) = existing {
+                    drop(ch);
+                    match self.getattr(ino) {
+                        Some(n) if n.is_dir => cur = ino,
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "a parent of the path is a file",
+                            ))
+                        }
+                    }
+                    continue;
+                }
+                let dir_ino = self.alloc_ino();
+                self.nodes.lock().unwrap().insert(
+                    dir_ino,
+                    VfsLazyNode {
+                        ino: dir_ino,
+                        parent_ino: cur,
+                        name: (*dir_name).to_string(),
+                        is_dir: true,
+                        size_bytes: 0,
+                        mtime_unix_secs: now_secs,
+                        mode: 0o040755,
+                        manifest: None,
+                        macaroon: None,
+                    },
+                );
+                ch.entry(cur)
+                    .or_default()
+                    .insert((*dir_name).to_string(), dir_ino);
+                ch.entry(dir_ino).or_default();
+                cur = dir_ino;
+            }
+            Ok(cur)
         }
 
         /// Removes the file at `virtual_path` (T4: a file gone from the catalog leaves the
@@ -643,17 +829,17 @@ mod unix_vfs {
                 m.remove(*name);
             }
             self.nodes.lock().unwrap().remove(&node.ino);
+            self.cache.lock().unwrap().forget_ino(node.ino);
             PathRemoval::Removed
         }
 
         /// The entries of the folder at `virtual_path`, or `None` when it is not a folder.
         pub fn list_children(&self, virtual_path: &str) -> Option<Vec<VfsLazyNode>> {
-            let mut cur = VFS_ROOT_INO;
+            let mut node = self.getattr(VFS_ROOT_INO)?;
             for p in vfs_path_parts(virtual_path) {
-                cur = self.lookup(cur, p)?.ino;
+                node = self.lookup(node.ino, p)?;
             }
-            let node = self.getattr(cur)?;
-            node.is_dir.then(|| self.readdir(cur))
+            node.is_dir.then(|| self.readdir(node.ino))
         }
 
         fn alloc_ino(&self) -> u64 {
@@ -668,14 +854,12 @@ mod unix_vfs {
         }
 
         pub fn lookup(&self, parent_ino: u64, name: &str) -> Option<VfsLazyNode> {
-            let child_ino = self
-                .children
-                .lock()
-                .unwrap()
-                .get(&parent_ino)
-                .and_then(|m| m.get(name))
-                .copied()?;
-            self.getattr(child_ino)
+            // Both locks at once (children, then nodes, the order every writer takes), so a
+            // name being swapped by `upsert_file` resolves to the old node or the new one.
+            let ch = self.children.lock().unwrap();
+            let child_ino = ch.get(&parent_ino).and_then(|m| m.get(name)).copied()?;
+            let nodes = self.nodes.lock().unwrap();
+            nodes.get(&child_ino).cloned()
         }
 
         pub fn lookup_path(&self, virtual_path: &str) -> Option<VfsLazyNode> {
@@ -687,19 +871,18 @@ mod unix_vfs {
             if parts.is_empty() {
                 return self.getattr(VFS_ROOT_INO);
             }
-            let mut cur = VFS_ROOT_INO;
+            // The last lookup's node itself, not a second read by inode: a name swapped by
+            // `upsert_file` in between would otherwise resolve to a removed inode.
+            let mut node = self.getattr(VFS_ROOT_INO)?;
             for p in parts {
-                let node = self.lookup(cur, p)?;
-                cur = node.ino;
+                node = self.lookup(node.ino, p)?;
             }
-            self.getattr(cur)
+            Some(node)
         }
 
         pub fn readdir(&self, dir_ino: u64) -> Vec<VfsLazyNode> {
-            let child_inos: Vec<u64> = self
-                .children
-                .lock()
-                .unwrap()
+            let ch = self.children.lock().unwrap();
+            let child_inos: Vec<u64> = ch
                 .get(&dir_ino)
                 .map(|m| m.values().copied().collect())
                 .unwrap_or_default();
@@ -726,6 +909,47 @@ mod unix_vfs {
         /// ranges over `/var/run/parvault.sock` (`FetchRange` + `SCM_RIGHTS` `memfd`), populating
         /// `LruBlockCache`, and returning `(bytes, time_to_first_byte)`.
         pub fn read_range_with_ttfb(
+            &self,
+            ino: u64,
+            offset: u64,
+            length: u64,
+        ) -> io::Result<(Vec<u8>, Duration)> {
+            let first = self.read_range_once(ino, offset, length);
+            let Err(e) = first else {
+                return first;
+            };
+            // T2: a catalog file whose read fails (for example a stripe freed by version GC)
+            // re-imports the catalogs once; if that gave the path a new inode, read it once.
+            let hook = self.reimport.lock().unwrap().clone();
+            let (Some(hook), Some(node)) = (hook, self.getattr(ino)) else {
+                return Err(e);
+            };
+            if node.is_dir || node.manifest.is_none() {
+                return Err(e);
+            }
+            hook();
+            match self.lookup(node.parent_ino, &node.name) {
+                Some(n) if n.ino != ino && !n.is_dir => self.read_range_once(n.ino, offset, length),
+                _ => Err(e),
+            }
+        }
+
+        /// Sets the catalog re-import a failed read calls (T2).
+        pub fn set_reimport_hook(&self, hook: Option<ReimportHook>) {
+            *self.reimport.lock().unwrap() = hook;
+        }
+
+        /// The block size reads are split into.
+        pub const fn block_size(&self) -> usize {
+            self.block_size
+        }
+
+        /// Whether `(ino, block)` is in the cache now (counts neither a hit nor a miss).
+        pub fn block_cached(&self, ino: u64, blk_idx: u64) -> bool {
+            self.cache.lock().unwrap().contains(ino, blk_idx)
+        }
+
+        fn read_range_once(
             &self,
             ino: u64,
             offset: u64,
@@ -762,24 +986,12 @@ mod unix_vfs {
                 // F-43 (L-44 item 4): a cache hit is served without a gateway `FetchRange`, so for
                 // WebDAV the edge `webdav_auth_decision` (for the plugin host: `is_attenuation_of`
                 // against the pinned token) is the only check on this read.
-                let cached = self.cache.lock().unwrap().get(ino, blk_idx)?;
-                let blk_bytes = match cached {
-                    Some(hit_bytes) => hit_bytes,
-                    None => {
-                        let effective_mac = node
-                            .macaroon
-                            .clone()
-                            .or_else(|| self.default_macaroon.clone());
-                        let fetched = self.bus.fetch_range_bytes_sync(
-                            &manifest,
-                            blk_start,
-                            blk_len,
-                            effective_mac,
-                        )?;
-                        self.cache.lock().unwrap().insert(ino, blk_idx, &fetched)?;
-                        fetched
-                    }
-                };
+                let effective_mac = node
+                    .macaroon
+                    .clone()
+                    .or_else(|| self.default_macaroon.clone());
+                let blk_bytes =
+                    self.read_block(ino, blk_idx, &manifest, blk_start, blk_len, effective_mac)?;
 
                 if ttfb.is_none() {
                     ttfb = Some(t0.elapsed());
@@ -793,6 +1005,80 @@ mod unix_vfs {
             }
 
             Ok((out, ttfb.unwrap_or_else(|| t0.elapsed())))
+        }
+
+        /// One block through the cache, with single-flight misses (B-24): the first reader of a
+        /// missing block fetches it; concurrent readers of the same block wait for that fetch.
+        /// A foreground reader joining a scavenger's fetch promotes it (S6).
+        fn read_block(
+            &self,
+            ino: u64,
+            blk_idx: u64,
+            manifest: &EphemeralShardManifest,
+            blk_start: u64,
+            blk_len: u64,
+            mac: Option<CapabilityMacaroon>,
+        ) -> io::Result<Vec<u8>> {
+            use crate::fetch_sched::{self as fs_sched, FetchClass};
+            use std::sync::atomic::AtomicBool;
+            let key = (ino, blk_idx);
+            let (flight, leader) = {
+                let mut inflight = self.inflight.lock().unwrap();
+                if let Some(f) = inflight.get(&key) {
+                    (Arc::clone(f), false)
+                } else {
+                    // F-43 (L-44 item 4): a cache hit is served without a gateway `FetchRange`,
+                    // so for WebDAV the edge `webdav_auth_decision` is the only check on it.
+                    if let Some(hit) = self.cache.lock().unwrap().get(ino, blk_idx)? {
+                        return Ok(hit);
+                    }
+                    let promote = (fs_sched::current_class() == FetchClass::Scavenger)
+                        .then(|| Arc::new(AtomicBool::new(false)));
+                    let f = Arc::new(BlockFlight {
+                        result: Mutex::new(None),
+                        done: std::sync::Condvar::new(),
+                        promote,
+                    });
+                    inflight.insert(key, Arc::clone(&f));
+                    (f, true)
+                }
+            };
+            if !leader {
+                if fs_sched::current_class() == FetchClass::Foreground {
+                    if let Some(p) = &flight.promote {
+                        fs_sched::global().promote(p);
+                    }
+                }
+                let mut g = flight.result.lock().unwrap();
+                while g.is_none() {
+                    g = flight.done.wait(g).unwrap();
+                }
+                return match g.as_ref() {
+                    Some(Ok(b)) => Ok(b.clone()),
+                    Some(Err((kind, msg))) => Err(io::Error::new(*kind, msg.clone())),
+                    None => unreachable!("loop exits with a result"),
+                };
+            }
+            fs_sched::note_cache_miss();
+            let fetch = || {
+                self.bus
+                    .fetch_range_bytes_sync(manifest, blk_start, blk_len, mac)
+            };
+            let res = match &flight.promote {
+                Some(p) => fs_sched::run_as_scavenger(Arc::clone(p), fetch),
+                None => fetch(),
+            };
+            let res = res.and_then(|b| {
+                self.cache.lock().unwrap().insert(ino, blk_idx, &b)?;
+                Ok(b)
+            });
+            *flight.result.lock().unwrap() = Some(match &res {
+                Ok(b) => Ok(b.clone()),
+                Err(e) => Err((e.kind(), e.to_string())),
+            });
+            self.inflight.lock().unwrap().remove(&key);
+            flight.done.notify_all();
+            res
         }
 
         /// Convenience POSIX `pread`-equivalent returning the requested byte range.
@@ -1228,6 +1514,731 @@ mod unix_vfs {
 pub use crate::webdav::VfsWebdavServerHandle;
 #[cfg(unix)]
 pub use unix_vfs::VirtualVaultFs;
+
+#[cfg(all(unix, feature = "daemon-runtime"))]
+pub use catalog::register_vault_keys;
+
+/// B-20 catalog import and the in-daemon scavenger (L-94, arch056b S1), `v0.5.6` track C.
+#[cfg(all(unix, feature = "daemon-runtime"))]
+pub mod catalog {
+    use super::{
+        catalog_import_decision, vaultkey_load_decision, CatalogImport, Ino, LazyFileSpec,
+        VirtualVaultFs,
+    };
+    use crate::crypto::{
+        LocalFileKeystore, LocalKeystoreSealer, MasterKey, NodeIdentity, PqVaultMasterKey,
+    };
+    use crate::fetch_sched;
+    use crate::gateway::engine::VaultReader;
+    use crate::gateway::GatewayEngine;
+    use crate::storage::BlockStore;
+    use crate::sync::{sanitize_sync_relative_path, FolderSnapshotManifest};
+    use std::collections::{BTreeMap, VecDeque};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, Weak};
+    use std::time::{Duration, Instant};
+    use zeroize::Zeroize;
+
+    /// The snapshot the daemon's own folder sync (`up --watch-folder`) keeps in its data dir.
+    pub const DEVICE_SNAPSHOT_FILE: &str = "appliance_folder_snapshot.manifest.bin";
+    /// The folder the device vault is listed under (`/<folder>/`).
+    pub const DEVICE_FOLDER: &str = "watched";
+    /// Catalog import period.
+    pub const IMPORT_INTERVAL: Duration = Duration::from_secs(60);
+    /// How often a catalog file is checked for a change (its length and mtime); a change
+    /// imports at once.
+    pub const CHANGE_POLL: Duration = Duration::from_secs(1);
+    /// The scavenger's hourly byte cap.
+    pub const SCAVENGER_BYTES_PER_HOUR: u64 = 4 * 1024 * 1024 * 1024;
+    /// The scavenger fills the block cache up to this share (percent).
+    pub const SCAVENGER_CACHE_SHARE_PCT: u64 = 75;
+
+    /// The folder of vault key files in a data dir (archC1).
+    pub const VAULTS_DIR: &str = "vaults";
+    const VAULTKEY_MAGIC: &[u8; 4] = b"PVVK";
+    /// The `.vaultkey` format version.
+    pub const VAULTKEY_VERSION: u8 = 1;
+    /// A snapshot file larger than this is not decoded.
+    pub const MAX_SNAPSHOT_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
+    /// One registered seed vault's derived keys (never the phrase; archC1).
+    pub struct VaultKeys {
+        pub namespace: String,
+        pub owner_pubkey: [u8; 32],
+        pub dht_key: [u8; 32],
+        master_key: MasterKey,
+        pq_key: PqVaultMasterKey,
+        owner: NodeIdentity,
+    }
+
+    fn vaultkey_path(data_dir: &Path, namespace: &str) -> PathBuf {
+        data_dir
+            .join(VAULTS_DIR)
+            .join(format!("{namespace}.vaultkey"))
+    }
+
+    fn namespace_is_segment(ns: &str) -> bool {
+        !(ns.is_empty()
+            || ns.contains('/')
+            || ns.contains('\\')
+            || ns.contains('\0')
+            || ns == "."
+            || ns == ".."
+            || ns == DEVICE_FOLDER)
+    }
+
+    fn io_err(e: impl std::fmt::Display) -> std::io::Error {
+        std::io::Error::other(e.to_string())
+    }
+
+    /// archC1: writes `<data_dir>/vaults/<namespace>.vaultkey` with the keys derived from
+    /// `seed_phrase` for `vault_namespace` (vault master key, PQ catalog key, owner identity
+    /// seed), never the phrase. The payload names its namespace, owner public key and catalog
+    /// DHT key; it is encrypted under a fresh file key sealed like `master_key.sealed` (the
+    /// data dir's keystore: `PARVAULT_PASSPHRASE` or `enclave_sealing.seed`) and written
+    /// atomically with mode `0600`. Called by `watch-folder --seed-phrase` on the vault's
+    /// writer node. Writing it again for the same namespace gives the same keys.
+    pub fn register_vault_keys(
+        data_dir: &Path,
+        seed_phrase: &str,
+        vault_namespace: &str,
+    ) -> std::io::Result<PathBuf> {
+        if !namespace_is_segment(vault_namespace) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "vault namespace must be one path segment other than the device folder",
+            ));
+        }
+        let canonical = crate::crypto::validate_recovery_seed_phrase_or_passphrase(seed_phrase)
+            .map_err(io_err)?;
+        let mk = MasterKey::from_recovery_seed_phrase(&canonical, vault_namespace);
+        let pq = PqVaultMasterKey::from_recovery_seed_phrase(&canonical, vault_namespace);
+        let owner = NodeIdentity::from_recovery_seed_phrase(&canonical, vault_namespace);
+        let dht_key = mk.derive_vault_root_dht_key(vault_namespace);
+        let ns = vault_namespace.as_bytes();
+        let mut payload = Vec::with_capacity(1 + 2 + ns.len() + 32 * 4 + 64);
+        payload.push(VAULTKEY_VERSION);
+        payload.extend_from_slice(&(ns.len() as u16).to_be_bytes());
+        payload.extend_from_slice(ns);
+        payload.extend_from_slice(&owner.public_key_bytes());
+        payload.extend_from_slice(&dht_key);
+        payload.extend_from_slice(mk.as_bytes());
+        payload.extend_from_slice(pq.as_bytes());
+        let mut id_seed = owner.master_seed_bytes();
+        payload.extend_from_slice(&id_seed);
+        id_seed.zeroize();
+        let sealer =
+            LocalFileKeystore::from_passphrase_or_csprng_in_dir(data_dir, None).map_err(io_err)?;
+        let file_key = MasterKey::generate();
+        let sealed_file_key = sealer.seal_key(file_key.as_bytes()).map_err(io_err)?;
+        let ct = crate::crypto::encrypt_manifest(&file_key, &payload).map_err(io_err)?;
+        payload.zeroize();
+        let mut blob = Vec::with_capacity(4 + 1 + 2 + sealed_file_key.len() + ct.len());
+        blob.extend_from_slice(VAULTKEY_MAGIC);
+        blob.push(VAULTKEY_VERSION);
+        blob.extend_from_slice(&(sealed_file_key.len() as u16).to_be_bytes());
+        blob.extend_from_slice(&sealed_file_key);
+        blob.extend_from_slice(&ct);
+        let dir = data_dir.join(VAULTS_DIR);
+        std::fs::create_dir_all(&dir)?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let path = vaultkey_path(data_dir, vault_namespace);
+        crate::crypto::write_secret_file_atomic_0600(&path, &blob).map_err(io_err)?;
+        Ok(path)
+    }
+
+    /// The payload fields of a `.vaultkey` file, or `None` when it does not parse.
+    struct VaultKeyPayload {
+        namespace: String,
+        owner_pubkey: [u8; 32],
+        dht_key: [u8; 32],
+        mk: [u8; 32],
+        pq: [u8; 64],
+        id_seed: [u8; 32],
+    }
+
+    impl Drop for VaultKeyPayload {
+        fn drop(&mut self) {
+            self.mk.zeroize();
+            self.pq.zeroize();
+            self.id_seed.zeroize();
+        }
+    }
+
+    fn unseal_vaultkey(data_dir: &Path, blob: &[u8]) -> Option<VaultKeyPayload> {
+        if blob.len() < 7 || &blob[..4] != VAULTKEY_MAGIC || blob[4] != VAULTKEY_VERSION {
+            return None;
+        }
+        let sealed_len = u16::from_be_bytes([blob[5], blob[6]]) as usize;
+        let sealed = blob.get(7..7 + sealed_len)?;
+        let ct = blob.get(7 + sealed_len..)?;
+        let sealer = LocalFileKeystore::from_passphrase_or_csprng_in_dir(data_dir, None).ok()?;
+        let mut file_key = sealer.unseal_key(sealed).ok()?;
+        let fk = MasterKey::from_bytes(file_key);
+        file_key.zeroize();
+        let mut p = crate::crypto::decrypt_manifest(&fk, ct).ok()?;
+        let parsed = (|| {
+            if p.first() != Some(&VAULTKEY_VERSION) {
+                return None;
+            }
+            let ns_len = u16::from_be_bytes([*p.get(1)?, *p.get(2)?]) as usize;
+            let ns = std::str::from_utf8(p.get(3..3 + ns_len)?).ok()?.to_string();
+            let mut at = 3 + ns_len;
+            let mut take = |n: usize| {
+                let v = p.get(at..at + n).map(<[u8]>::to_vec);
+                at += n;
+                v
+            };
+            let owner: [u8; 32] = take(32)?.try_into().ok()?;
+            let dht: [u8; 32] = take(32)?.try_into().ok()?;
+            let mut mk_v = take(32)?;
+            let mut pq_v = take(64)?;
+            let mut id_v = take(32)?;
+            let out = VaultKeyPayload {
+                namespace: ns,
+                owner_pubkey: owner,
+                dht_key: dht,
+                mk: mk_v.as_slice().try_into().ok()?,
+                pq: pq_v.as_slice().try_into().ok()?,
+                id_seed: id_v.as_slice().try_into().ok()?,
+            };
+            mk_v.zeroize();
+            pq_v.zeroize();
+            id_v.zeroize();
+            (at == p.len()).then_some(out)
+        })();
+        p.zeroize();
+        parsed
+    }
+
+    /// Loads `vaults/<namespace>.vaultkey` through [`vaultkey_load_decision`].
+    pub fn load_vault_keys(data_dir: &Path, namespace: &str) -> Result<VaultKeys, &'static str> {
+        let blob = std::fs::read(vaultkey_path(data_dir, namespace)).unwrap_or_default();
+        let payload = unseal_vaultkey(data_dir, &blob);
+        let Some(p) = payload else {
+            return vaultkey_load_decision(false, false, false, false).map(|()| unreachable!());
+        };
+        let mk = MasterKey::from_bytes(p.mk);
+        let owner = NodeIdentity::from_seed(p.id_seed);
+        let decision = vaultkey_load_decision(
+            true,
+            p.namespace == namespace,
+            owner.public_key_bytes() == p.owner_pubkey,
+            mk.derive_vault_root_dht_key(&p.namespace) == p.dht_key,
+        );
+        decision.map(|()| VaultKeys {
+            namespace: p.namespace.clone(),
+            owner_pubkey: p.owner_pubkey,
+            dht_key: p.dht_key,
+            master_key: mk,
+            pq_key: PqVaultMasterKey::from_bytes(p.pq),
+            owner,
+        })
+    }
+
+    /// The namespaces with a `.vaultkey` file in `data_dir`.
+    pub fn registered_namespaces(data_dir: &Path) -> Vec<String> {
+        let Ok(rd) = std::fs::read_dir(data_dir.join(VAULTS_DIR)) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = rd
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                name.strip_suffix(".vaultkey").map(str::to_string)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn floor_path(data_dir: &Path, namespace: &str) -> PathBuf {
+        data_dir.join(VAULTS_DIR).join(format!("{namespace}.floor"))
+    }
+
+    /// The highest catalog version applied for a seed vault, kept across restarts so an older
+    /// catalog is a rollback after a restart too.
+    fn read_floor(data_dir: &Path, namespace: &str) -> u64 {
+        std::fs::read(floor_path(data_dir, namespace))
+            .ok()
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0)
+    }
+
+    /// What one import did.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct ImportReport {
+        pub upserted: usize,
+        pub removed: usize,
+        pub unchanged: usize,
+    }
+
+    #[derive(Default)]
+    struct SourceState {
+        loaded_version: u64,
+        /// Listed path to (file Merkle root, inode).
+        files: BTreeMap<String, ([u8; 32], Ino)>,
+    }
+
+    /// Imports vault catalogs into a [`VirtualVaultFs`] and hydrates them (S1).
+    pub struct CatalogImporter {
+        vfs: VirtualVaultFs,
+        engine: Arc<GatewayEngine>,
+        store: BlockStore,
+        data_dir: PathBuf,
+        sources: Mutex<BTreeMap<String, SourceState>>,
+        hydrate: Mutex<VecDeque<Ino>>,
+        hydrated_bytes: AtomicU64,
+    }
+
+    impl CatalogImporter {
+        pub fn new(
+            vfs: VirtualVaultFs,
+            engine: Arc<GatewayEngine>,
+            store: &BlockStore,
+            data_dir: &Path,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                vfs,
+                engine,
+                store: store.clone(),
+                data_dir: data_dir.to_path_buf(),
+                sources: Mutex::new(BTreeMap::new()),
+                hydrate: Mutex::new(VecDeque::new()),
+                hydrated_bytes: AtomicU64::new(0),
+            })
+        }
+
+        /// Bytes the scavenger has hydrated so far.
+        pub fn hydrated_bytes(&self) -> u64 {
+            self.hydrated_bytes.load(Ordering::Relaxed)
+        }
+
+        /// Files waiting for the scavenger.
+        pub fn hydrate_queue_len(&self) -> usize {
+            self.hydrate.lock().unwrap_or_else(|e| e.into_inner()).len()
+        }
+
+        /// Applies `snapshot` under `/<folder>/` if [`catalog_import_decision`] allows: a changed
+        /// file gets a new inode (T1), a file gone from the catalog leaves the listing (T4),
+        /// an unchanged one keeps its inode and cached blocks.
+        pub fn import_snapshot(
+            &self,
+            folder: &str,
+            envelope_verifies: bool,
+            key_matches: bool,
+            snapshot: &FolderSnapshotManifest,
+        ) -> Result<ImportReport, &'static str> {
+            self.import_source(
+                folder,
+                envelope_verifies,
+                key_matches,
+                snapshot.version,
+                0,
+                || Some(snapshot.clone()),
+                None,
+            )
+        }
+
+        /// The decision, then (only on `Apply`) `open` and the listing changes. `floor` is a
+        /// version already applied in an earlier run; `reader` serves a seed vault's files.
+        #[allow(clippy::too_many_arguments)]
+        fn import_source(
+            &self,
+            folder: &str,
+            envelope_verifies: bool,
+            key_matches: bool,
+            version: u64,
+            floor: u64,
+            open: impl FnOnce() -> Option<FolderSnapshotManifest>,
+            reader: Option<Arc<VaultReader>>,
+        ) -> Result<ImportReport, &'static str> {
+            // A folder name that is not one path segment is not one of this data dir's vaults.
+            let folder_ok =
+                !(folder.is_empty() || folder.contains('/') || folder == "." || folder == "..");
+            if !folder_ok {
+                return catalog_import_decision(true, false, 0, 0).map(|_| ImportReport::default());
+            }
+            let mut sources = self.sources.lock().unwrap_or_else(|e| e.into_inner());
+            let st = sources.entry(folder.to_string()).or_default();
+            let loaded = st.loaded_version.max(floor);
+            let decision = catalog_import_decision(envelope_verifies, key_matches, version, loaded);
+            match decision {
+                Err(code) => {
+                    tracing::warn!(code, folder, version, loaded, "catalog refused");
+                    return Err(code);
+                }
+                Ok(CatalogImport::Unchanged) if st.loaded_version == version => {
+                    return Ok(ImportReport {
+                        unchanged: st.files.len(),
+                        ..ImportReport::default()
+                    })
+                }
+                // The version applied in an earlier run, not yet listed in this one.
+                Ok(CatalogImport::Unchanged) | Ok(CatalogImport::Apply) => {}
+            }
+            let Some(snapshot) = open() else {
+                tracing::warn!(folder, version, "catalog did not open; listing unchanged");
+                return Ok(ImportReport::default());
+            };
+            let mut report = ImportReport::default();
+            let mut next = BTreeMap::new();
+            let mut fresh = Vec::new();
+            for entry in snapshot.files.values() {
+                let Some(rel) = sanitize_sync_relative_path(&entry.relative_path) else {
+                    continue;
+                };
+                let path = format!("/{folder}/{rel}");
+                if let Some(&(root, ino)) = st.files.get(&path) {
+                    if root == entry.file_merkle_root && self.vfs.getattr(ino).is_some() {
+                        next.insert(path, (root, ino));
+                        report.unchanged += 1;
+                        continue;
+                    }
+                }
+                let eph = match &reader {
+                    Some(r) => self
+                        .engine
+                        .index_vault_manifest(entry.manifest.clone(), Arc::clone(r)),
+                    None => self.engine.index_catalog_manifest(entry.manifest.clone()),
+                };
+                let spec = LazyFileSpec {
+                    manifest: eph,
+                    macaroon: None,
+                    mtime_unix_secs: Some(entry.modified_unix_ms / 1000),
+                };
+                match self.vfs.upsert_file(&path, spec) {
+                    Ok(ino) => {
+                        next.insert(path, (entry.file_merkle_root, ino));
+                        fresh.push(ino);
+                        report.upserted += 1;
+                    }
+                    Err(e) => tracing::warn!(path, error = %e, "catalog file not listed"),
+                }
+            }
+            for path in st.files.keys() {
+                if !next.contains_key(path) {
+                    self.vfs.remove_path(path);
+                    report.removed += 1;
+                }
+            }
+            st.files = next;
+            st.loaded_version = version;
+            drop(sources);
+            self.hydrate
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(fresh);
+            Ok(report)
+        }
+
+        /// A registered seed vault (archC1): its catalog envelope from this node's DHT store
+        /// and, with mesh peers, from the DHT. Each candidate goes through the decision, newest
+        /// first: it must verify and carry both the registered DHT key and owner key
+        /// (`reject.catalog_foreign`), and not be older than the version applied before, also
+        /// across restarts (`reject.catalog_rollback`). Only reads happen here.
+        pub fn import_vault(&self, keys: &VaultKeys) -> Result<ImportReport, &'static str> {
+            let mut cands = Vec::new();
+            if let Some(env) = self.store.get_dht_vault_catalog_envelope(&keys.dht_key) {
+                cands.push(env);
+            }
+            if let Some(client) = self.store.mesh_client() {
+                if !client.all_network_endpoints().is_empty() {
+                    if let Ok(crate::network::DhtWireEnvelope::VaultCatalog(env)) = client
+                        .get_dht_envelope(
+                            &keys.dht_key,
+                            crate::network::DhtEnvelopeKind::VaultCatalog,
+                        )
+                    {
+                        cands.push(env);
+                    }
+                }
+            }
+            cands.sort_by_key(|e| std::cmp::Reverse(e.monotonic_version));
+            let floor = read_floor(&self.data_dir, &keys.namespace);
+            let mut last = Ok(ImportReport::default());
+            for env in cands {
+                let verifies = env.verify_zero_knowledge();
+                let key_matches =
+                    env.dht_key == keys.dht_key && env.owner_pubkey == keys.owner_pubkey;
+                let reader = Arc::new(VaultReader::new(
+                    keys.master_key.clone(),
+                    &keys.owner,
+                    &self.store,
+                ));
+                let r = self.import_source(
+                    &keys.namespace,
+                    verifies,
+                    key_matches,
+                    env.monotonic_version,
+                    floor,
+                    || env.open(&keys.master_key, &keys.pq_key).ok(),
+                    Some(reader),
+                );
+                match r {
+                    Ok(rep) => {
+                        if env.monotonic_version > floor {
+                            let _ = crate::storage::BlockStore::atomic_write_file(
+                                &floor_path(&self.data_dir, &keys.namespace),
+                                &env.monotonic_version.to_be_bytes(),
+                            );
+                        }
+                        return Ok(rep);
+                    }
+                    Err(code) => last = Err(code),
+                }
+            }
+            last
+        }
+
+        /// Every registered seed vault (`vaults/*.vaultkey`); a refused key file is logged.
+        pub fn import_vaults(&self) {
+            for ns in registered_namespaces(&self.data_dir) {
+                match load_vault_keys(&self.data_dir, &ns) {
+                    Ok(keys) => {
+                        if let Ok(r) = self.import_vault(&keys) {
+                            if r.upserted + r.removed > 0 {
+                                tracing::info!(
+                                    vault = %ns,
+                                    upserted = r.upserted,
+                                    removed = r.removed,
+                                    "vault catalog imported"
+                                );
+                            }
+                        }
+                    }
+                    Err(code) => tracing::warn!(code, vault = %ns, "vault key file refused"),
+                }
+            }
+        }
+
+        /// The device vault: the snapshot the daemon's own folder sync writes in its data dir,
+        /// under the data dir's key (a local source: the daemon wrote it, so it verifies).
+        pub fn import_device_snapshot(&self) -> Option<Result<ImportReport, &'static str>> {
+            let path = self.data_dir.join(DEVICE_SNAPSHOT_FILE);
+            let too_big = std::fs::metadata(&path).ok()?.len() > MAX_SNAPSHOT_FILE_BYTES;
+            let raw = if too_big {
+                Vec::new()
+            } else {
+                std::fs::read(&path).ok()?
+            };
+            let Ok(snap) = FolderSnapshotManifest::decode_bytes(&raw) else {
+                // A file that does not decode does not verify.
+                let refused = catalog_import_decision(false, false, 0, 0);
+                if let Err(code) = refused {
+                    tracing::warn!(code, "device catalog does not decode");
+                }
+                return Some(refused.map(|_| ImportReport::default()));
+            };
+            // The snapshot's signed manifest envelope proves whose key wrote it: it must be
+            // signed by this data dir's owner and open under its key. An empty snapshot has
+            // none and lists nothing.
+            let (verifies, key_matches) = match &snap.signed_dht_envelope {
+                Some(env) => (
+                    env.verify_zero_knowledge(),
+                    self.engine.owns_signed_manifest(env),
+                ),
+                None => (snap.files.is_empty(), snap.files.is_empty()),
+            };
+            Some(self.import_snapshot(DEVICE_FOLDER, verifies, key_matches, &snap))
+        }
+
+        /// The length and mtime of every catalog file and vault key file (a change triggers an
+        /// import).
+        fn sources_stamp(&self) -> Vec<(u64, Option<std::time::SystemTime>)> {
+            let mut paths = vec![
+                self.data_dir.join(DEVICE_SNAPSHOT_FILE),
+                self.data_dir.join("zero_trust_dht_store.bin"),
+            ];
+            for ns in registered_namespaces(&self.data_dir) {
+                paths.push(vaultkey_path(&self.data_dir, &ns));
+            }
+            paths
+                .iter()
+                .map(|p| match std::fs::metadata(p) {
+                    Ok(m) => (m.len(), m.modified().ok()),
+                    Err(_) => (0, None),
+                })
+                .collect()
+        }
+
+        /// One import of every source this data dir holds keys for.
+        pub fn import_all(&self) {
+            self.import_vaults();
+            if let Some(Ok(r)) = self.import_device_snapshot() {
+                if r.upserted + r.removed > 0 {
+                    tracing::info!(
+                        upserted = r.upserted,
+                        removed = r.removed,
+                        "catalog imported"
+                    );
+                }
+            }
+        }
+
+        /// One scavenger pass over the queued files: each block not cached is read as the
+        /// scavenger (S4) by `SLOTS` workers, so its fetches fill what the scheduler lets it
+        /// hold (S2) and a foreground read is granted ahead of a queued one
+        /// (`defer.scavenger_preempted`). Workers pause while a foreground read is queued and
+        /// stay within the hourly cap and the cache share. Returns the bytes hydrated.
+        pub fn hydrate_pass(&self, hour: &Mutex<HourBudget>) -> u64 {
+            let bs = self.vfs.block_size() as u64;
+            let cache_cap = self.vfs.cache_stats().capacity_bytes;
+            let share_cap = cache_cap / 100 * SCAVENGER_CACHE_SHARE_PCT;
+            let pass_bytes = AtomicU64::new(0);
+            loop {
+                let next = self
+                    .hydrate
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pop_front();
+                let Some(ino) = next else {
+                    return pass_bytes.into_inner();
+                };
+                let Some(node) = self.vfs.getattr(ino) else {
+                    continue;
+                };
+                tracing::info!(ino, bytes = node.size_bytes, "scavenger: hydrating");
+                let blocks = node.size_bytes.div_ceil(bs.max(1));
+                let next_blk = AtomicU64::new(0);
+                let stop = AtomicBool::new(false);
+                std::thread::scope(|sc| {
+                    for _ in 0..fetch_sched::SLOTS {
+                        sc.spawn(|| loop {
+                            let blk = next_blk.fetch_add(1, Ordering::Relaxed);
+                            if blk >= blocks || stop.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            if self.vfs.getattr(ino).is_none() {
+                                stop.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                            if self.vfs.block_cached(ino, blk) {
+                                continue;
+                            }
+                            let len = node.size_bytes.saturating_sub(blk * bs).min(bs);
+                            // Capped by cache size: the scavenger fills at most its share of
+                            // the cache, so it never evicts what readers fetched.
+                            let used = self.vfs.cache_stats().used_bytes;
+                            if used.saturating_add(len) > share_cap {
+                                stop.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                            pass_bytes.fetch_add(len, Ordering::Relaxed);
+                            hour.lock().unwrap_or_else(|e| e.into_inner()).wait_for(len);
+                            while fetch_sched::global().queued().0 > 0 {
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
+                            let flag = Arc::new(AtomicBool::new(false));
+                            let res = fetch_sched::run_as_scavenger(flag, || {
+                                self.vfs.read_at(ino, blk * bs, len)
+                            });
+                            match res {
+                                Ok(_) => {
+                                    self.hydrated_bytes.fetch_add(len, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    tracing::debug!(ino, blk, error = %e, "scavenger skipped a file");
+                                    stop.store(true, Ordering::Relaxed);
+                                    return;
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+        }
+
+        /// Starts the import timer and the scavenger threads; sets the VFS re-import hook (T2).
+        pub fn start(self: &Arc<Self>) -> std::io::Result<()> {
+            self.import_all();
+            let weak: Weak<Self> = Arc::downgrade(self);
+            self.vfs.set_reimport_hook(Some(Arc::new(move || {
+                if let Some(me) = weak.upgrade() {
+                    me.import_all();
+                }
+            })));
+            let me = Arc::clone(self);
+            std::thread::Builder::new()
+                .name("pv-catalog".into())
+                .spawn(move || {
+                    let mut last = fetch_sched::counters();
+                    let mut stamp = me.sources_stamp();
+                    let mut imported = Instant::now();
+                    loop {
+                        std::thread::sleep(CHANGE_POLL);
+                        let now = me.sources_stamp();
+                        if now != stamp || imported.elapsed() >= IMPORT_INTERVAL {
+                            stamp = now;
+                            imported = Instant::now();
+                            me.import_all();
+                        }
+                        // S7: the counters in the log too (live status reads `counters()`).
+                        let c = fetch_sched::counters();
+                        if c != last {
+                            tracing::info!(
+                                preempted = c.scavenger_preempted,
+                                cache_misses = c.cache_misses,
+                                fetches = c.network_fetches,
+                                hydrated = me.hydrated_bytes(),
+                                "fetch_sched counters"
+                            );
+                            last = c;
+                        }
+                    }
+                })?;
+            let me = Arc::clone(self);
+            std::thread::Builder::new()
+                .name("pv-scavenger".into())
+                .spawn(move || {
+                    let hour = Mutex::new(HourBudget::new(SCAVENGER_BYTES_PER_HOUR));
+                    loop {
+                        if me.hydrate_pass(&hour) == 0 {
+                            std::thread::sleep(Duration::from_millis(200));
+                        }
+                    }
+                })?;
+            Ok(())
+        }
+    }
+
+    /// The scavenger's hourly byte cap.
+    pub struct HourBudget {
+        cap: u64,
+        window: Instant,
+        used: u64,
+    }
+
+    impl HourBudget {
+        pub fn new(cap: u64) -> Self {
+            Self {
+                cap,
+                window: Instant::now(),
+                used: 0,
+            }
+        }
+
+        /// Blocks until `len` more bytes fit in the current hour, then counts them.
+        pub fn wait_for(&mut self, len: u64) {
+            loop {
+                if self.window.elapsed() >= Duration::from_secs(3600) {
+                    self.window = Instant::now();
+                    self.used = 0;
+                }
+                if self.used.saturating_add(len) <= self.cap {
+                    self.used += len;
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+}
 
 #[cfg(all(test, unix))]
 mod upsert_api_tests {

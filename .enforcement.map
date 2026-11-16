@@ -437,3 +437,18 @@ open       S-L130    expect=suite by=v0.5.6 ref=docs/security/TRUST_FINDINGS.md 
 suite      S-B152-CYCLES test=trust_enforcement_gc_host::b152_two_cycles_of_2000_shards needs=cmd:sh   # arch056c 1.8: three paths, restart recount, second cycle no higher
 
 ratchet    R         open=3 waive=32
+
+# --- v0.5.6 track C: restore path and fetch scheduler (plan 3.3 to 3.5) ---------------------------
+claim      B20-LIST  sym=src/vfs.rs::catalog_import_decision accept=trust_enforcement_restore::b20_readonly_token_lists_catalog reject=trust_enforcement_restore::b20_foreign_catalog_refused code=reject.catalog_foreign bin=parvault   # B-20: only a catalog this data dir's key wrote is listed
+claim      B20-LIST-RB sym=src/vfs.rs::catalog_import_decision accept=trust_enforcement_restore::b20_readonly_token_lists_catalog reject=trust_enforcement_restore::b20_rollback_catalog_refused code=reject.catalog_rollback bin=parvault   # B-20: an older catalog than the loaded one is not applied
+claim      L72-SCHED sym=src/fetch_sched.rs::fetch_slot_decision accept=trust_enforcement_restore::l72_foreground_ttfb_under_load reject=trust_enforcement_restore::l72_scavenger_waits_while_foreground_queued code=defer.scavenger_preempted bin=parvault   # L-72 (S1, S2, S7): foreground preempts the in-daemon scavenger at stripe admission
+suite      S-L72-MUT test=trust_enforcement_restore::l72_priority_mutant_fails_the_accept_test needs=cmd:sh   # S5: the no-priority mutant fails the accept condition
+suite      S-B24     test=trust_enforcement_restore::b24_concurrent_cold_reads_fetch_once needs=cmd:sh   # B-24: 8 cold readers, one fetch, 200 times
+suite      S-S6      test=trust_enforcement_restore::s6_foreground_join_promotes_a_queued_scavenger_fetch needs=cmd:sh   # S6: a foreground join promotes a queued scavenger fetch
+kani       L72-SCHED sym=src/fetch_sched.rs::fetch_slot_decision harness=l72_foreground_granted_when_queued_and_slot_free args=--lib cover=scavenger deferred for a foreground read
+kani       B20-LIST  sym=src/vfs.rs::catalog_import_decision harness=b20_catalog_import_decision args=--lib cover=foreign catalog refused
+claim      VAULTKEY  sym=src/vfs.rs::vaultkey_load_decision accept=trust_enforcement_restore::b20_seed_vault_listed_and_read reject=trust_enforcement_restore::b20_swapped_vaultkey_refused code=reject.vaultkey_mismatch bin=parvault   # archC1 cond. 1: a vault key file bound to its namespace, owner and DHT key
+claim      B20-LIST-SV sym=src/vfs.rs::catalog_import_decision accept=trust_enforcement_restore::b20_seed_vault_listed_and_read reject=trust_enforcement_restore::b20_seed_vault_foreign_catalog_refused code=reject.catalog_foreign bin=parvault   # archC1 cond. 3: another owner's validly signed catalog at the vault's DHT key
+claim      B20-LIST-SVRB sym=src/vfs.rs::catalog_import_decision accept=trust_enforcement_restore::b20_seed_vault_listed_and_read reject=trust_enforcement_restore::b20_seed_vault_rollback_refused code=reject.catalog_rollback bin=parvault   # archC1 cond. 3: rollback across a restart (vaults/<ns>.floor)
+suite      S-B20-SYNC test=trust_enforcement_restore::b20_parvault_sync_read_only_listing needs=cmd:sh   # B-20: parvault-sync read-only list and pull
+kani       VAULTKEY  sym=src/vfs.rs::vaultkey_load_decision harness=vaultkey_used_only_when_every_binding_holds args=--lib cover=renamed key file refused
