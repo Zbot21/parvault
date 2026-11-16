@@ -361,8 +361,12 @@ impl ServerSwarmEvents {
     {
         match event {
             SwarmEvent::ConnectionEstablished {
-                peer_id, endpoint, ..
+                peer_id,
+                endpoint,
+                connection_id,
+                ..
             } => {
+                crate::network::redial::book().on_dial_finished(connection_id);
                 self.peer_remote_addrs
                     .insert(peer_id.to_string(), endpoint.get_remote_address().clone());
                 // B-157: the redial task's connected-since clock; the dialled address (never the
@@ -594,6 +598,16 @@ impl ServerSwarmEvents {
                 // Live status (B-148 item 2): this node's own listen addresses. The caller still
                 // gets the event.
                 match &other {
+                    // B-157: dials in flight, so the redial task never doubles one.
+                    SwarmEvent::Dialing {
+                        peer_id,
+                        connection_id,
+                    } => {
+                        crate::network::redial::book().on_dialing(*peer_id, *connection_id);
+                    }
+                    SwarmEvent::OutgoingConnectionError { connection_id, .. } => {
+                        crate::network::redial::book().on_dial_finished(*connection_id);
+                    }
                     SwarmEvent::NewListenAddr { address, .. } => {
                         crate::network::redial::book().on_new_listen_addr(address.clone());
                     }

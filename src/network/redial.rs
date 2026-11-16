@@ -126,6 +126,9 @@ pub struct PeerBook {
     dialled_as: HashMap<Multiaddr, PeerId>,
     /// This node's own listen addresses.
     own_listen: Vec<Multiaddr>,
+    /// Outgoing dials to an address with no known PeerId that have not finished yet (the
+    /// start-up dial of a configured address without `/p2p/`, or a redial of one).
+    dialing_unknown: HashSet<libp2p::swarm::ConnectionId>,
 }
 
 impl PeerBook {
@@ -149,6 +152,23 @@ impl PeerBook {
                 self.dialled_as.insert(base, peer);
             }
         }
+    }
+
+    /// An outgoing dial started (`SwarmEvent::Dialing`).
+    pub fn on_dialing(&mut self, peer: Option<PeerId>, id: libp2p::swarm::ConnectionId) {
+        if peer.is_none() && self.dialing_unknown.len() < MAX_BOOK_PEERS {
+            self.dialing_unknown.insert(id);
+        }
+    }
+
+    /// An outgoing dial finished (established or failed).
+    pub fn on_dial_finished(&mut self, id: libp2p::swarm::ConnectionId) {
+        self.dialing_unknown.remove(&id);
+    }
+
+    /// Whether a dial to an address with no known PeerId is still in flight.
+    pub fn unknown_dial_in_flight(&self) -> bool {
+        !self.dialing_unknown.is_empty()
     }
 
     /// The last connection to `peer` closed.
@@ -375,7 +395,9 @@ impl RedialTask {
                     });
                     (swarm.is_connected(p), held, book.is_admitted(p))
                 }
-                TargetKey::Addr(_) => (false, None, false),
+                // A dial still in flight holds the clock like a connection does (no reset),
+                // so an address whose connect hangs is never dialled twice at once.
+                TargetKey::Addr(_) => (book().unknown_dial_in_flight(), None, false),
             };
             let b = self
                 .backoff
