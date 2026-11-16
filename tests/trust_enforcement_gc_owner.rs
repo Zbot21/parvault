@@ -1462,7 +1462,7 @@ fn signal_host(host: &Host, sig: &str) {
 /// stopped host's free stays journalled.
 #[test]
 fn b154_stalled_host_does_not_starve_the_others() {
-    let mut hosts = vec![spawn_host(), spawn_host(), spawn_host()];
+    let mut hosts = [spawn_host(), spawn_host(), spawn_host()];
     hosts.sort_by(|a, b| a.addr.cmp(&b.addr));
     let peers = hosts
         .iter()
