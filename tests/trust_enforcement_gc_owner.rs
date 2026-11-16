@@ -1373,3 +1373,75 @@ fn b154_alias_answered_by_another_node_frees_nothing_there() {
     assert!(applied_orders(&h1).is_empty());
     gate_ran("trust_enforcement_gc_owner::b154_alias_answered_by_another_node_frees_nothing_there");
 }
+
+// --- B-192: a host's advertised aliases (one entry per peer id) -------------------------------
+
+/// B-192 (3): data written before B-192 may name a shard's host by an alias the owner cannot
+/// reach. Every placement record naming host 1 is rewritten to a dead loopback alias under its
+/// peer id, the owner's local shards are removed and host 2 is stopped; a cold process restores
+/// the file byte-identically from host 1 alone (the alias is skipped for its known address).
+#[test]
+fn b192_shards_recorded_under_alias_restore_cold() {
+    let h1 = spawn_host();
+    let mut h2 = spawn_host();
+    let peers = format!("{},{}", h1.plain_addr(), h2.plain_addr());
+    let f = LocalFolder::new();
+    let body = big_body(7);
+    std::fs::write(f.folder.join("a.bin"), &body).unwrap();
+    let out = ring_pass_key_hex(&f, &peers);
+    assert!(out.status.success(), "{}", text(&out));
+    let mk = parvault::crypto::MasterKey::from_hex(KEY_HEX).unwrap();
+    let h1_pid = h1.addr.split("/p2p/").nth(1).unwrap().to_string();
+    let alias = dead_alias_of(&h1);
+    let mut rewritten = 0usize;
+    for e in std::fs::read_dir(f.node.join("manifests")).unwrap() {
+        let path = e.unwrap().path();
+        let raw = std::fs::read(&path).unwrap();
+        let Ok(mut fm) = parvault::storage::FileManifest::from_encrypted_dht_record(&mk, &raw)
+        else {
+            continue;
+        };
+        for st in &mut fm.stripes {
+            for a in &mut st.assigned_peers {
+                if a.as_str() == h1.plain_addr() || a.contains(&h1_pid) {
+                    *a = alias.clone();
+                    rewritten += 1;
+                }
+            }
+        }
+        let (_, enc) = fm.to_encrypted_dht_record(&mk).unwrap();
+        std::fs::write(&path, enc).unwrap();
+    }
+    assert!(rewritten > 0, "no placement record named host 1");
+    let _ = std::fs::remove_dir_all(f.node.join("shards"));
+    // Host 1, recorded only under the dead alias, is the only source left.
+    h2.stop();
+    let out_dir = f.node.parent().unwrap().join("restored");
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env("PARVAULT_LAN_REGISTRY_DIR", f.node.join("lan-registry"))
+        .env("PARVAULT_GENESIS_SEED_HEX", GENESIS_SEED_HEX)
+        .env_remove("PARVAULT_SEED_PHRASE")
+        .env_remove("PARVAULT_PEERS")
+        .env_remove("PARVAULT_GENESIS_PUBKEY_HEX")
+        .arg("--data-dir")
+        .arg(&f.node)
+        .args(["--no-lan-discovery", "--peers", &peers])
+        .args([
+            "restore-folder",
+            "--snapshot",
+            f.snap.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "--key-hex",
+            KEY_HEX,
+        ]);
+    let out = output_within(&mut cmd, Duration::from_secs(240));
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        std::fs::read(out_dir.join("a.bin")).unwrap(),
+        body,
+        "{}",
+        text(&out)
+    );
+    gate_ran("trust_enforcement_gc_owner::b192_shards_recorded_under_alias_restore_cold");
+}

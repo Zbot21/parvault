@@ -182,31 +182,15 @@ pub fn canonical_host(addr: &str, canon: &BTreeMap<String, String>) -> String {
     }
 }
 
-/// Whether `addr` is a loopback IP address (a host's own; from another machine or container it
-/// names the dialer itself).
+/// Whether `addr` is a loopback IP address.
 fn is_loopback_addr(addr: &str) -> bool {
-    crate::network::parse_peer_multiaddr(addr)
-        .ok()
-        .and_then(|m| crate::network::wire_handler::extract_ip_from_multiaddr(&m))
-        .is_some_and(|ip| ip.is_loopback())
+    crate::network::client::is_loopback_peer_addr(addr)
 }
 
-/// The addresses to try for a host journalled under `host`, in order: `host` itself, then the
-/// other addresses known for its peer id (non-loopback first). A host is unreachable only when
-/// none of them answers as that peer id.
+/// The addresses to try for a host journalled under `host` (B-192, shared with the client's
+/// read path): `host`, then the other known addresses of its peer id, non-loopback first.
 pub fn send_candidates(host: &str, known: &[String]) -> Vec<String> {
-    let mut out = vec![host.to_string()];
-    let Some(pid) = addr_peer_id(host) else {
-        return out;
-    };
-    let mut same: Vec<&String> = known
-        .iter()
-        .filter(|a| a.as_str() != host && addr_peer_id(a).as_deref() == Some(pid.as_str()))
-        .collect();
-    same.sort_by_key(|a| (is_loopback_addr(a), a.as_str()));
-    same.dedup();
-    out.extend(same.into_iter().cloned());
-    out
+    crate::network::client::peer_address_candidates(host, known)
 }
 
 /// Peer id -> address for the hosts the owner was given (`--peers`, the seed) whose peer id is

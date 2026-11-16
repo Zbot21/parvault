@@ -337,6 +337,93 @@ fn extract_ip_from_multiaddr(maddr: &Multiaddr) -> Option<IpAddr> {
     })
 }
 
+/// B-192: whether `addr`, an address a remote peer reported for itself (Identify, Kademlia), may
+/// be learned. Unspecified addresses never are; a loopback address only over a loopback
+/// connection (a same-host rig): from another machine or container it names the dialer itself.
+pub fn remote_addr_learnable(addr: &Multiaddr, connection_is_loopback: bool) -> bool {
+    match extract_ip_from_multiaddr(addr) {
+        Some(ip) if ip.is_unspecified() => false,
+        Some(ip) if ip.is_loopback() => connection_is_loopback,
+        _ => true,
+    }
+}
+
+/// Whether `addr` is a loopback IP address.
+pub fn is_loopback_peer_addr(addr: &str) -> bool {
+    parse_peer_multiaddr(addr)
+        .ok()
+        .and_then(|m| extract_ip_from_multiaddr(&m))
+        .is_some_and(|ip| ip.is_loopback())
+}
+
+/// The peer id an address names in its `/p2p/` suffix.
+pub fn peer_id_of_addr(addr: &str) -> Option<PeerId> {
+    parse_peer_multiaddr(addr)
+        .ok()
+        .and_then(|m| extract_expected_peer_id(&m))
+}
+
+/// B-192: one endpoint per peer id. `entries` are `(address, given)` in order (`given`: a
+/// `--peers` or seed address); `pid_of` names an address's peer id when known. Of the addresses
+/// of one peer id the first given one is kept, else the first non-loopback one, else the first,
+/// at the position of the group's first address. An address with no known peer id passes
+/// through. Pure; placement, evacuation, GC and host counts see one entry per host.
+pub fn dedup_endpoints_by_peer_id(
+    entries: &[(String, bool)],
+    pid_of: impl Fn(&str) -> Option<PeerId>,
+) -> Vec<String> {
+    let rank = |(a, given): &(String, bool)| (!*given, is_loopback_peer_addr(a));
+    let mut best: HashMap<PeerId, usize> = HashMap::new();
+    let pids: Vec<Option<PeerId>> = entries.iter().map(|(a, _)| pid_of(a)).collect();
+    for (i, pid) in pids.iter().enumerate() {
+        if let Some(pid) = pid {
+            match best.get(pid) {
+                Some(&j) if rank(&entries[j]) <= rank(&entries[i]) => {}
+                _ => {
+                    best.insert(*pid, i);
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(entries.len());
+    let mut emitted: HashSet<PeerId> = HashSet::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (i, pid) in pids.iter().enumerate() {
+        let addr = match pid {
+            Some(pid) => {
+                if !emitted.insert(*pid) {
+                    continue;
+                }
+                &entries[best[pid]].0
+            }
+            None => &entries[i].0,
+        };
+        if seen.insert(addr.as_str()) {
+            out.push(addr.clone());
+        }
+    }
+    out
+}
+
+/// B-192: the addresses to try for a host recorded as `host`, in order: `host` itself, then the
+/// other addresses in `known` with the same `/p2p/` peer id (non-loopback first). A plain
+/// address has no others. Every one is dialed with that peer id expected, so another node
+/// answering at one is a mismatch, never the host.
+pub fn peer_address_candidates(host: &str, known: &[String]) -> Vec<String> {
+    let mut out = vec![host.to_string()];
+    let Some(pid) = peer_id_of_addr(host) else {
+        return out;
+    };
+    let mut same: Vec<&String> = known
+        .iter()
+        .filter(|a| a.as_str() != host && peer_id_of_addr(a) == Some(pid))
+        .collect();
+    same.sort_by_key(|a| (is_loopback_peer_addr(a), a.as_str()));
+    same.dedup();
+    out.extend(same.into_iter().cloned());
+    out
+}
+
 /// Cached telemetry snapshot returned by a storage node via `MeshWireResponse::NodeStatusResult`.
 #[derive(Debug, Clone)]
 pub struct CachedNodeStatus {
@@ -589,6 +676,8 @@ fn spawn_swarm_worker(
                 }
 
                 let mut pending_dials: Vec<PendingDialRpc> = Vec::new();
+                // B-192: peers this worker reached over a loopback connection (a same-host rig).
+                let mut loopback_peers: HashSet<PeerId> = HashSet::new();
                 let mut inflight_requests: HashMap<OutboundRequestId, InflightRpc> = HashMap::new();
                 let mut pending_kad_gets: HashMap<kad::QueryId, PendingKadGet> = HashMap::new();
                 let mut cleanup_interval = tokio::time::interval(Duration::from_secs(15));
@@ -713,6 +802,11 @@ fn spawn_swarm_worker(
                                 } => {
                                     let remote_addr = endpoint.get_remote_address().clone();
                                     let remote_base = strip_p2p_protocol(&remote_addr);
+                                    if extract_ip_from_multiaddr(&remote_addr)
+                                        .is_some_and(|ip| ip.is_loopback())
+                                    {
+                                        loopback_peers.insert(peer_id);
+                                    }
                                     // Lab mode: Kademlia gets no learned address (the dial-set
                                     // entries were added at worker start).
                                     if !fixed {
@@ -902,11 +996,12 @@ fn spawn_swarm_worker(
                                     // Lab mode: remote-supplied listen addresses are never
                                     // learned.
                                     let learned = if fixed { Vec::new() } else { info.listen_addrs };
+                                    let over_loopback = loopback_peers.contains(&peer_id);
                                     for addr in learned {
-                                        if let Some(ip) = extract_ip_from_multiaddr(&addr) {
-                                            if ip.is_unspecified() {
-                                                continue;
-                                            }
+                                        // B-192: never a remote's unspecified address, nor its
+                                        // loopback one unless this connection is loopback.
+                                        if !remote_addr_learnable(&addr, over_loopback) {
+                                            continue;
                                         }
                                         let base = strip_p2p_protocol(&addr);
                                         swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
@@ -923,8 +1018,12 @@ fn spawn_swarm_worker(
                                     if fixed {
                                         continue;
                                     }
+                                    let over_loopback = loopback_peers.contains(&peer);
                                     if let Ok(mut disc) = discovered_peers.lock() {
                                         for addr in addresses.iter() {
+                                            if !remote_addr_learnable(addr, over_loopback) {
+                                                continue;
+                                            }
                                             let base = strip_p2p_protocol(addr);
                                             disc.insert(format!("{base}/p2p/{peer}"));
                                         }
@@ -1203,7 +1302,14 @@ impl MeshClient {
                 if !t.is_empty() && seen.insert(t.to_string()) {
                     if let Ok(maddr) = parse_peer_multiaddr(t) {
                         if let Some(pid) = extract_expected_peer_id(&maddr) {
-                            initial_healed.insert(pid, t.to_string());
+                            // B-192: of two given addresses of one peer id, a loopback one
+                            // never replaces a routable one.
+                            let keep = initial_healed.get(&pid).is_some_and(|prev: &String| {
+                                !is_loopback_peer_addr(prev) && is_loopback_peer_addr(t)
+                            });
+                            if !keep {
+                                initial_healed.insert(pid, t.to_string());
+                            }
                         }
                     }
                     normalized_peers.push(t.to_string());
@@ -1569,9 +1675,9 @@ impl MeshClient {
     pub fn all_network_endpoints(&self) -> Vec<String> {
         let self_pid = node_identity_libp2p_peer_id(&self.identity).ok();
         let build_list = || -> Vec<String> {
-            let mut list = Vec::new();
+            let mut list: Vec<(String, bool)> = Vec::new();
             let mut seen = HashSet::new();
-            let mut push_unique = |addr: String| {
+            let mut push_unique = |addr: String, given: bool| {
                 if let Some(local_pid) = self_pid {
                     if let Ok(m) = parse_peer_multiaddr(&addr) {
                         if extract_expected_peer_id(&m) == Some(local_pid) {
@@ -1580,38 +1686,39 @@ impl MeshClient {
                     }
                 }
                 if seen.insert(addr.clone()) {
-                    list.push(addr);
+                    list.push((addr, given));
                 }
             };
 
             if !self.peers.is_empty() {
                 for p in &self.peers {
                     if let Some(healed) = self.resolve_healed_peer_addr(p) {
-                        push_unique(healed);
+                        push_unique(healed, true);
                     } else {
-                        push_unique(p.clone());
+                        push_unique(p.clone(), true);
                     }
                 }
                 if self.discovery_data_dir.is_some() {
                     for d in self.discovered_peers() {
-                        push_unique(d);
+                        push_unique(d, false);
                     }
                 }
             } else {
                 for d in self.discovered_peers() {
                     if let Some(healed) = self.resolve_healed_peer_addr(&d) {
-                        push_unique(healed);
+                        push_unique(healed, false);
                     } else {
-                        push_unique(d);
+                        push_unique(d, false);
                     }
                 }
             }
             if let Some(ref seed) = self.seed_addr {
                 if is_network_peer_addr(seed) {
-                    push_unique(seed.clone());
+                    push_unique(seed.clone(), true);
                 }
             }
-            list
+            // B-192: one entry per peer id (a host's advertised aliases are not more hosts).
+            dedup_endpoints_by_peer_id(&list, |a| self.pinned_peer_id(a))
         };
 
         let mut out = build_list();
@@ -1857,6 +1964,13 @@ impl MeshClient {
                         return Ok(resp);
                     }
                 }
+                // B-192: an address naming `/p2p/X` that does not answer (a recorded alias, or
+                // an old address): X's other known addresses, each dialed expecting X.
+                for alt in self.other_addresses_of_peer(trimmed) {
+                    if let Ok(resp) = self.send_request_once(&alt, request.clone()) {
+                        return Ok(resp);
+                    }
+                }
                 if self.maybe_refresh_lan_peers_throttled() {
                     if let Some(healed) = self.resolve_healed_peer_addr(trimmed) {
                         if let Ok(resp) = self.send_request_once(&healed, request) {
@@ -1868,6 +1982,39 @@ impl MeshClient {
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// B-192: the addresses other than `addr` known for the peer id `addr` names in its `/p2p/`
+    /// suffix (empty for a plain address): the endpoints whose peer id is that one, given ones
+    /// first. A given address not yet pinned is dialed once (one status request) to learn its
+    /// peer id, so a cold process finds the host behind an alias it cannot reach.
+    pub fn other_addresses_of_peer(&self, addr: &str) -> Vec<String> {
+        let Some(pid) = peer_id_of_addr(addr) else {
+            return Vec::new();
+        };
+        let mut given: Vec<String> = self.peers.clone();
+        if let Some(seed) = &self.seed_addr {
+            given.push(seed.clone());
+        }
+        let mut known: Vec<String> = Vec::new();
+        for g in given.iter().filter(|g| is_network_peer_addr(g)) {
+            if self.pinned_peer_id(g).is_none() {
+                let _ = self.send_request_once(g, MeshWireRequest::QueryNodeStatus);
+            }
+            if self.pinned_peer_id(g) == Some(pid) {
+                known.push(g.clone());
+            }
+        }
+        let mut rest: Vec<String> = self
+            .discovered_peers()
+            .into_iter()
+            .filter(|d| peer_id_of_addr(d) == Some(pid))
+            .collect();
+        rest.sort_by_key(|a| (is_loopback_peer_addr(a), a.clone()));
+        known.extend(rest);
+        known.retain(|a| a.trim() != addr.trim());
+        known.dedup();
+        known
     }
 
     pub fn is_peer_marked_dead(&self, peer_addr: &str) -> bool {
@@ -3314,13 +3461,19 @@ impl MeshClient {
         session_key: [u8; 32],
     ) -> anyhow::Result<Vec<Option<String>>> {
         let raw_peers = if !self.peers.is_empty() && self.discovery_data_dir.is_none() {
-            self.peers
+            // B-192: one candidate per peer id here too.
+            let given: Vec<(String, bool)> = self
+                .peers
                 .iter()
                 .map(|p| {
-                    self.resolve_healed_peer_addr(p)
-                        .unwrap_or_else(|| p.clone())
+                    (
+                        self.resolve_healed_peer_addr(p)
+                            .unwrap_or_else(|| p.clone()),
+                        true,
+                    )
                 })
-                .collect()
+                .collect();
+            dedup_endpoints_by_peer_id(&given, |a| self.pinned_peer_id(a))
         } else {
             self.all_network_endpoints()
         };
@@ -3660,6 +3813,103 @@ impl IpLocalityExt for IpAddr {
 
 #[cfg(test)]
 mod tests {
+
+    /// B-192: one endpoint per peer id: the given address first, then a non-loopback one; an
+    /// address with no known peer id passes through.
+    #[test]
+    fn endpoints_dedup_by_peer_id() {
+        let x = node_identity_libp2p_peer_id(&NodeIdentity::from_seed([0x61; 32])).unwrap();
+        let y = node_identity_libp2p_peer_id(&NodeIdentity::from_seed([0x62; 32])).unwrap();
+        let given_x = "/ip4/172.28.1.71/tcp/4001".to_string();
+        let entries = vec![
+            (given_x.clone(), true),
+            (format!("/ip4/127.0.0.1/tcp/4001/p2p/{x}"), false),
+            (format!("/ip4/127.0.0.1/tcp/4001/p2p/{y}"), false),
+            (format!("/ip4/172.28.1.72/tcp/4001/p2p/{y}"), false),
+            (format!("/ip4/172.28.1.71/tcp/4001/p2p/{x}"), false),
+            ("/ip4/172.28.1.73/tcp/4001".to_string(), true),
+        ];
+        let pinned = given_x.clone();
+        let pid_of = |a: &str| {
+            if a == pinned {
+                Some(x)
+            } else {
+                parse_peer_multiaddr(a)
+                    .ok()
+                    .and_then(|m| extract_expected_peer_id(&m))
+            }
+        };
+        let out = dedup_endpoints_by_peer_id(&entries, pid_of);
+        assert_eq!(
+            out,
+            vec![
+                given_x,
+                format!("/ip4/172.28.1.72/tcp/4001/p2p/{y}"),
+                "/ip4/172.28.1.73/tcp/4001".to_string(),
+            ]
+        );
+        // Host count: three hosts (x, y and the unpinned plain address), never six.
+        assert_eq!(out.len(), 3);
+    }
+
+    /// B-192: host counts are distinct peer ids. A client given two addresses of one node and
+    /// one of another reports two endpoints, and placement gets two candidates.
+    #[test]
+    fn client_endpoints_count_distinct_peer_ids() {
+        let x = node_identity_libp2p_peer_id(&NodeIdentity::from_seed([0x63; 32])).unwrap();
+        let y = node_identity_libp2p_peer_id(&NodeIdentity::from_seed([0x64; 32])).unwrap();
+        let client = MeshClient::new(
+            NodeIdentity::from_seed([0x65; 32]),
+            vec![
+                format!("/ip4/10.9.0.1/tcp/4001/p2p/{x}"),
+                format!("/ip4/127.0.0.1/tcp/4001/p2p/{x}"),
+                format!("/ip4/10.9.0.2/tcp/4001/p2p/{y}"),
+            ],
+            None,
+        );
+        assert_eq!(
+            client.all_network_endpoints(),
+            vec![
+                format!("/ip4/10.9.0.1/tcp/4001/p2p/{x}"),
+                format!("/ip4/10.9.0.2/tcp/4001/p2p/{y}"),
+            ]
+        );
+    }
+
+    /// B-192: a remote's loopback address is learned only over a loopback connection; an
+    /// unspecified one never.
+    #[test]
+    fn remote_loopback_learned_only_over_loopback() {
+        let lo: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().unwrap();
+        let any: Multiaddr = "/ip4/0.0.0.0/tcp/4001".parse().unwrap();
+        let lan: Multiaddr = "/ip4/172.28.1.71/tcp/4001".parse().unwrap();
+        let lo6: Multiaddr = "/ip6/::1/tcp/4001".parse().unwrap();
+        assert!(!remote_addr_learnable(&lo, false));
+        assert!(!remote_addr_learnable(&lo6, false));
+        assert!(remote_addr_learnable(&lo, true));
+        assert!(!remote_addr_learnable(&any, true));
+        assert!(remote_addr_learnable(&lan, false));
+    }
+
+    /// B-192: candidates for a recorded alias: itself, then the same peer id's other addresses,
+    /// non-loopback first; never another peer's.
+    #[test]
+    fn peer_address_candidates_by_peer_id() {
+        let x = node_identity_libp2p_peer_id(&NodeIdentity::from_seed([0x66; 32])).unwrap();
+        let y = node_identity_libp2p_peer_id(&NodeIdentity::from_seed([0x67; 32])).unwrap();
+        let alias = format!("/ip4/127.0.0.1/tcp/4001/p2p/{x}");
+        let real = format!("/ip4/10.9.0.1/tcp/4001/p2p/{x}");
+        let known = vec![
+            format!("/ip4/10.9.0.2/tcp/4001/p2p/{y}"),
+            real.clone(),
+            alias.clone(),
+        ];
+        assert_eq!(peer_address_candidates(&alias, &known), vec![alias, real]);
+        assert_eq!(
+            peer_address_candidates("/ip4/10.9.0.3/tcp/4001", &known),
+            vec!["/ip4/10.9.0.3/tcp/4001".to_string()]
+        );
+    }
     /// B-181: an envelope's Kademlia record names the publishing node, not the destination.
     #[test]
     fn envelope_record_publisher_is_the_local_node() {
