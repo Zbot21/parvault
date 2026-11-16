@@ -58,7 +58,8 @@ s13_host_bytes() {
 }
 
 s13_pass() {
-    s13_exec -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" "$S13_OWNER" \
+    s13_exec -e PARVAULT_GENESIS_SEED_HEX="$RING_GENESIS_SEED_HEX" \
+        -e RUST_LOG="${S13_RUST_LOG:-parvault=info,warn}" "$S13_OWNER" \
         /usr/local/bin/parvault --data-dir "$S13_HOME" --no-lan-discovery --peers "$S13_PEERS_CSV" \
         watch-folder --folder "$S13_LOGS" --snapshot-out "$S13_HOME/logs.snap" \
         --key-hex 7373737373737373737373737373737373737373737373737373737373737373 --once
@@ -163,13 +164,28 @@ for pass in 1 2 3 4; do
     S13_OUT="$(s13_pass 2>&1)" || true
 done
 grep -Eq "Pending Frees      : [1-9]" <<<"$S13_OUT" || { echo "$S13_OUT"; echo "ERROR: stage 13: T4 no pending frees while host 3 is offline"; exit 1; }
-docker start "pv-b2-node-3-${RUN_ID}" >/dev/null
-sleep 3
+S13_LISTEN_BEFORE="$(docker logs "pv-b2-node-3-${RUN_ID}" 2>&1 | grep -c 'Listening on' || true)"
+docker start "pv-b2-node-3-${RUN_ID}" >/dev/null || s13_fail "T4 host 3 did not restart"
+# Wait (with a deadline) until host 3 listens again, rather than a fixed sleep.
+S13_WAIT_END=$(( $(date +%s) + 60 ))
+until [ "$(docker logs "pv-b2-node-3-${RUN_ID}" 2>&1 | grep -c 'Listening on' || true)" -gt "$S13_LISTEN_BEFORE" ]; do
+    [ "$(date +%s)" -le "$S13_WAIT_END" ] || s13_fail "T4 host 3 not listening 60 s after its restart"
+    sleep 1
+done
+sleep 2
+S13_RUST_LOG="parvault=info,parvault::network::client=debug,parvault::sync::gc_journal=debug,warn"
 S13_CLEARED=0
+S13_T4_LOG=""
 for pass in 1 2 3; do
     s13_check_deadline "T4 return pass $pass"
     S13_OUT="$(s13_pass 2>&1)" || true
+    S13_T4_LOG+="--- T4 return pass $pass ---"$'\n'"$S13_OUT"$'\n'
     if grep -q "Pending Frees      : 0 " <<<"$S13_OUT"; then S13_CLEARED=1; break; fi
 done
-[ "$S13_CLEARED" = 1 ] || { echo "$S13_OUT"; echo "ERROR: stage 13: T4 the journal did not empty within 3 passes of the host's return"; exit 1; }
+if [ "$S13_CLEARED" != 1 ]; then
+    echo "$S13_T4_LOG"
+    echo "--- host 3 log (last 80 lines) ---"
+    docker logs "pv-b2-node-3-${RUN_ID}" 2>&1 | tail -80
+    s13_fail "T4 the journal did not empty within 3 passes of the host's return"
+fi
 echo "T4: host 3 back; journal empty within $pass pass(es)"

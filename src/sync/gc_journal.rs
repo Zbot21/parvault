@@ -1097,20 +1097,36 @@ impl<'a> GcRun<'a> {
                 self.report.orders_sent += 1;
                 let actions: Vec<(FreeAction, String, bool)> =
                     match client.free_shards(&host, order) {
-                        Ok(FreeShardsReply::Outcomes(outs)) => outs
-                            .iter()
-                            .map(|o| {
-                                let reason = match o {
-                                    FreeShardOutcome::Refused(c) => c.clone(),
-                                    _ => String::new(),
-                                };
-                                (
-                                    outcome_action(o),
-                                    reason,
-                                    matches!(o, FreeShardOutcome::Freed),
-                                )
-                            })
-                            .collect(),
+                        Ok(FreeShardsReply::Outcomes(outs)) => {
+                            // Per-shard refusals are retried silently otherwise: say which.
+                            let mut refused: BTreeMap<&str, usize> = BTreeMap::new();
+                            for o in &outs {
+                                if let FreeShardOutcome::Refused(c) = o {
+                                    *refused.entry(c.as_str()).or_default() += 1;
+                                }
+                            }
+                            if !refused.is_empty() {
+                                tracing::warn!(
+                                    host = %host,
+                                    refused = ?refused,
+                                    shards = outs.len(),
+                                    "free order: shards refused by the host"
+                                );
+                            }
+                            outs.iter()
+                                .map(|o| {
+                                    let reason = match o {
+                                        FreeShardOutcome::Refused(c) => c.clone(),
+                                        _ => String::new(),
+                                    };
+                                    (
+                                        outcome_action(o),
+                                        reason,
+                                        matches!(o, FreeShardOutcome::Freed),
+                                    )
+                                })
+                                .collect()
+                        }
                         Ok(FreeShardsReply::Refused(e)) => {
                             let a = refusal_action(&e);
                             tracing::warn!(host = %host, error = %e, "free order refused");
