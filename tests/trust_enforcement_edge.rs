@@ -919,3 +919,34 @@ fn b180_gateway_socket_group() {
     assert!(!ok && out.contains("reject.socket_group_unknown"), "{out}");
     gate_ran("trust_enforcement_edge::b180_gateway_socket_group");
 }
+
+/// WEBDAV-HOST reject (A-TLS-7): on the TLS edge a `Host` name outside the certificate's SANs
+/// (DNS rebinding) is refused 403 before the token is looked at, logged as
+/// `reject.webdav_host_mismatch`; a missing `Host` likewise.
+#[test]
+fn webdav_host_outside_sans_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("node");
+    let d = tls_daemon(&dir, &[]);
+    let (_, der) = export_cert(&dir);
+    let addr = d.webdav_lo();
+    let t = d.read_token();
+    let cfg = default_client(&der);
+    for host in [
+        format!("Host: rebind.example:{}\r\n", addr.port()),
+        String::new(),
+    ] {
+        let r = tls_once(
+            addr,
+            &cfg,
+            &format!("OPTIONS / HTTP/1.1\r\n{host}Authorization: Bearer {t}\r\n\r\n"),
+        );
+        assert_eq!(r.status(), 403, "{host:?}: {}", r.head);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !d.log_text().contains("reject.webdav_host_mismatch") {
+        assert!(Instant::now() < deadline, "{}", d.log_text());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    gate_ran("trust_enforcement_edge::webdav_host_outside_sans_refused");
+}

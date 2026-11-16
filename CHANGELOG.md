@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+- **Breaking: WebDAV and the status page serve HTTPS on any non-loopback bind (B-1, L-81; track A).** The first `up` with such a bind makes a self-signed certificate (`edge_tls.pem` in the data dir, `0600`, 825 days, never re-issued on its own); `parvault tls show | export | rotate`; `--tls-san` for bridge-mode containers. Loopback binds stay plain HTTP. Migration: a LAN setup that used `http://` registers the exported certificate and switches to `https://`, or passes `--insecure-plain-http` (token in clear). `parvault-fuse webdav` and `parvault-status` take `--tls-pem` and refuse plain HTTP off loopback without the opt-out. TLS 1.3 and 1.2; keep-alive after auth (100 requests, 15 s idle); `Host` may be a certificate name; request heads with a bare LF, folding, repeated or conflicting framing headers, or a signed length are refused (400). `parvault token mint --out <file>` writes the token `0600` and prints the path; `token mint` warns above 254 characters (Windows' password limit). `--gateway-socket-group` gives the gateway socket a group and mode `0660` (B-180). The status route `/live` answers 501 with its reason code until it is built. Windows guide: `docs/WINDOWS.md`.
+
 ---
 
 ## [`0.5.5`] - 2026-11-16

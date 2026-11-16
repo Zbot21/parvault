@@ -380,3 +380,17 @@ reach      PROBE-REACH sym=src/probe.rs::probe_target_decision from=src/cli/net.
 claim      B-142     sym=src/network/traversal_gate.rs::dial_peer_id_decision accept=traversal_metrics::b142_bootstrap_peer_id_matches_and_connects reject=traversal_metrics::b142_bootstrap_peer_id_mismatch_refused code=reject.dial_peer_id_mismatch bin=parvault ref=docs/security/TRUST_FINDINGS.md
 
 ratchet    R         open=1 waive=32
+
+# --- v0.5.6 track A: edge TLS, read-only WebDAV over TLS (B-1 P1-P3, L-81, A-TLS 1-9) -----------
+# The daemon serves TLS on every non-loopback edge bind (the certificate is made at the first such
+# `up`), so the plain-HTTP refusal is reachable only from the plugins, which load PEM (A-TLS-3).
+claim      B1-PLAIN-FUSE sym=src/http_edge.rs::edge_transport_decision accept=trust_enforcement_edge::b1_fuse_tls_nonloopback_serves reject=trust_enforcement_edge::b1_fuse_plain_nonloopback_refused code=reject.edge_plain_http_nonloopback bin=parvault-fuse
+claim      B1-KEY    sym=src/http_edge.rs::tls_key_file_decision accept=trust_enforcement_edge::b1_daemon_tls_owner_only_pair_served reject=trust_enforcement_edge::b1_key_group_readable_refused code=reject.tls_key_mode bin=parvault
+claim      B1-PAIR   sym=src/http_edge.rs::tls_key_pair_decision accept=trust_enforcement_edge::b1_daemon_tls_owner_only_pair_served reject=trust_enforcement_edge::b1_pair_mismatch_refused code=reject.tls_key_cert_mismatch bin=parvault
+claim      WEBDAV-HOST sym=src/webdav.rs::serve_webdav_request accept=trust_enforcement_edge::b1_daemon_tls_owner_only_pair_served reject=trust_enforcement_edge::webdav_host_outside_sans_refused code=reject.webdav_host_mismatch bin=parvault   # A-TLS-7 on the TLS edge
+claim      EDGE-FRAMING sym=src/http_edge.rs::head_framing_decision accept=trust_enforcement_edge::edge_framing_crlf_served reject=trust_enforcement_edge::edge_framing_bare_lf_refused code=reject.edge_bare_lf bin=parvault   # request smuggling (QA of T0)
+kani       B1-PLAIN-K sym=src/http_edge.rs::edge_transport_decision harness=proof_edge_transport_never_plain_off_loopback_without_opt_out cover=plain non-loopback refused
+kani       B1-KEY-K  sym=src/http_edge.rs::tls_key_file_decision harness=proof_tls_key_file_owner_only cover=group or world bits refused
+kani       B1-PAIR-K sym=src/http_edge.rs::tls_key_pair_decision harness=proof_tls_key_pair_must_match cover=mismatched pair refused
+suite      S-E1      test=windows_equiv_acceptance::e1_windows_equivalent needs=cmd:curl   # v0.5.6 E1 (steps 1-5, 10; 6-8 on integ)
+artifact   A-TLS-DOCKER script=scripts/docker_stage_webdav_tls.sh bin=parvault suite=docker_acceptance_gate::docker_acceptance_gate   # stage 14-webdav-tls, called by the acceptance gate
