@@ -53,7 +53,7 @@ docker run --rm --network none --user 65532:65532 --read-only --cap-drop ALL --s
 docker run -d --name "$NAME" --restart unless-stopped --network host --user 65532:65532 --read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /run/parvault:uid=65532,gid=65532,mode=0700 --tmpfs /tmp:mode=1777 -v "$VOL:/var/lib/parvault" "$IMG" --data-dir /var/lib/parvault up --ipc-socket /run/parvault/parvault.sock --listen "/ip4/0.0.0.0/tcp/$PORT"
 ```
 
-`wot init` prints `Started a new ring. Genesis public key: <64 hex>`. Run again, it refuses with `Error: Invalid key or hex encoding: this node is already in the ring <key>` (from 0.5.5 the `Invalid key or hex encoding:` prefix is dropped) and exit 1, and changes nothing. Wait for the daemon to turn healthy (usually seconds):
+`wot init` prints `Started a new ring. Genesis public key: <64 hex>`. Run again while the daemon runs, it refuses with `Error: reject.datadir_locked: the data dir is in use by another parvault process` (one data dir serves one process, from 0.5.6) and exit 1, and changes nothing; with the daemon stopped it refuses with `Error: this node is already in the ring <key>`. Wait for the daemon to turn healthy (usually seconds):
 
 <!-- docker-doc: health -->
 ```sh

@@ -88,8 +88,9 @@ G=$(sed -n 's/^Started a new ring. Genesis public key: //p' <<<"$out"); [[ ${#G}
 run a health >/dev/null
 ok "ring: genesis $G, daemon $ID-a healthy on tcp/$PB"
 if (run a ring) >/dev/null 2>&1; then fail "a second wot init (and run) should fail"; fi
-grep -q "already in the ring $G" "$WORK/a-ring.out" || fail "re-run of wot init: $(head -3 "$WORK/a-ring.out")"
-ok "re-run of the ring block stops at wot init: $(grep -o 'Error: .*already in the ring' "$WORK/a-ring.out")"
+# The daemon holds the data dir (B-174): the re-run's `wot init` is refused by the lock.
+grep -q "Error: reject.datadir_locked" "$WORK/a-ring.out" || fail "re-run of wot init: $(head -3 "$WORK/a-ring.out")"
+ok "re-run of the ring block stops at wot init: $(grep -o 'Error: reject.datadir_locked' "$WORK/a-ring.out")"
 
 # 3. join node b
 K=$(run b identity | sed -n 's/^Ed25519 Public Key (hex): //p'); [[ ${#K} == 64 ]] || fail "identity printed no key"
