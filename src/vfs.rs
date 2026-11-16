@@ -1589,6 +1589,29 @@ pub mod catalog {
                 ),
             ));
         }
+        write_vault_keys_unchecked(data_dir, seed_phrase, vault_namespace, sealing_passphrase)
+    }
+
+    /// [`register_vault_keys`] without the D16 namespace rule (only a path-safe single segment):
+    /// what builds before the rule wrote, so tests can make such a registration. Not for use
+    /// outside tests.
+    #[doc(hidden)]
+    pub fn write_vault_keys_unchecked(
+        data_dir: &Path,
+        seed_phrase: &str,
+        vault_namespace: &str,
+        sealing_passphrase: Option<&str>,
+    ) -> std::io::Result<PathBuf> {
+        let ns_ok = !(vault_namespace.is_empty()
+            || vault_namespace == "."
+            || vault_namespace == ".."
+            || vault_namespace.contains(['/', '\\', '\0']));
+        if !ns_ok {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "vault namespace must be one path segment",
+            ));
+        }
         let canonical = crate::crypto::validate_recovery_seed_phrase_or_passphrase(seed_phrase)
             .map_err(io_err)?;
         let mk = MasterKey::from_recovery_seed_phrase(&canonical, vault_namespace);
@@ -2193,6 +2216,17 @@ pub mod catalog {
 
         /// Starts the import timer and the scavenger threads; sets the VFS re-import hook (T2).
         pub fn start(self: &Arc<Self>) -> std::io::Result<()> {
+            // D16: a vault an earlier build registered under a namespace the rule now refuses
+            // is still listed, and said so at every start: its floor is not in ring backups.
+            for ns in registered_namespaces(&self.data_dir) {
+                if !namespace_ok(&ns) {
+                    tracing::warn!(
+                        code = "warn.vault_namespace_unsupported",
+                        vault = %ns,
+                        "vault {ns:?} was registered by an earlier build under a namespace the current rule refuses (1 to 128 printable ASCII characters, no '/' or '\\', not '.', '..' or '{DEVICE_FOLDER}'): it is still listed, but `ring backup` does not carry its rollback floor and `watch-folder --seed-phrase` no longer re-registers it; move it to a supported namespace"
+                    );
+                }
+            }
             self.import_all();
             let weak: Weak<Self> = Arc::downgrade(self);
             self.vfs.set_reimport_hook(Some(Arc::new(move || {

@@ -523,3 +523,4 @@ suite      S-D10-MIGRATE test=trust_enforcement_setup::d10_legacy_vaultkey_resea
 suite      S-D10-LEGACY-READ test=trust_enforcement_restore::d10_daemon_reads_legacy_sealed_vaultkey needs=cmd:sh   # D10: the daemon still reads a seed-sealed .vaultkey (warn.vaultkey_legacy_seal)
 suite      S-D13-LIVE test=trust_enforcement_restore::d13_running_daemon_lists_other_process_catalog needs=cmd:sh   # D13: a running daemon lists a catalog another process wrote, no restart
 suite      S-D16-FLOOR test=trust_enforcement_restore::d16_floor_of_any_registered_namespace_survives_backup needs=cmd:sh   # D16: one namespace rule; every registered floor survives backup, others refused (reject.vault_namespace_unsupported)
+suite      S-D16-UPGRADE test=trust_enforcement_restore::d16_existing_unsupported_registration_still_listed_and_warned needs=cmd:sh   # D16: an earlier registration outside the rule is still listed and warned at start (warn.vault_namespace_unsupported)

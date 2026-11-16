@@ -1376,3 +1376,32 @@ fn d10_daemon_reads_legacy_sealed_vaultkey() {
     d.stop();
     gate_ran("trust_enforcement_restore::d10_daemon_reads_legacy_sealed_vaultkey");
 }
+
+/// D16 upgrade: a vault an earlier build registered under a namespace the rule now refuses
+/// (non-ASCII here) is still listed, and the daemon warns at start with its name and why
+/// (`warn.vault_namespace_unsupported`: its floor is not in ring backups).
+#[cfg(unix)]
+#[test]
+fn d16_existing_unsupported_registration_still_listed_and_warned() {
+    use b20::*;
+    use seedvault::*;
+    const OLD: &str = "fotos-\u{fc}";
+    let root = tempfile::tempdir().unwrap();
+    let dir = data_dir(root.path(), "data");
+    let folder = root.path().join("src");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.txt"), b"registered before the rule").unwrap();
+    Writer::new_ns(&dir, SEED_A, OLD).pass(&folder);
+    assert!(parvault::vfs::register_vault_keys(&dir, SEED_A, OLD, None).is_err());
+    parvault::vfs::catalog::write_vault_keys_unchecked(&dir, SEED_A, OLD, None).unwrap();
+    let d = up(&dir, None, &[]);
+    d.assert_logged("warn.vault_namespace_unsupported");
+    assert!(d.log_text().contains(OLD), "{}", d.log_text());
+    wait_get(&d, "/fotos-%C3%BC/a.txt", "still listed", |st, b| {
+        st == 200 && b == b"registered before the rule"
+    });
+    d.stop();
+    gate_ran(
+        "trust_enforcement_restore::d16_existing_unsupported_registration_still_listed_and_warned",
+    );
+}
