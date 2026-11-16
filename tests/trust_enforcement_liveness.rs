@@ -783,3 +783,43 @@ fn e4_kad_replication_ticks_memory_flat() {
     );
     gate_ran("trust_enforcement_liveness::e4_kad_replication_ticks_memory_flat");
 }
+
+/// B-157 (in-flight guard): a configured address without `/p2p/` whose dial hangs (a listener
+/// that accepts TCP and never answers the Noise handshake) is not dialled again while that dial
+/// is in flight. Without the guard the redial task would open a new connection at 1, 3 and 7 s.
+#[test]
+fn b157_hanging_dial_not_doubled() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for conn in listener.incoming() {
+            match conn {
+                Ok(c) => {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    held.push(c); // never read or written: the handshake hangs
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let a_node = Node::new("b157h-a");
+    let a = a_node.start(
+        "a",
+        common::LOOPBACK_EPHEMERAL,
+        &[format!("/ip4/127.0.0.1/tcp/{port}")],
+    );
+    assert!(eventually(Duration::from_secs(10), || accepted
+        .load(Ordering::SeqCst)
+        >= 1));
+    std::thread::sleep(Duration::from_secs(10));
+    let n = accepted.load(Ordering::SeqCst);
+    let log = a.log_text();
+    // A dial that does fail (a handshake timeout) may be followed by one redial.
+    assert!(n <= 2, "{n} parallel dials to a hanging address:\n{log}");
+    gate_ran("trust_enforcement_liveness::b157_hanging_dial_not_doubled");
+}

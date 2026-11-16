@@ -126,9 +126,9 @@ pub struct PeerBook {
     dialled_as: HashMap<Multiaddr, PeerId>,
     /// This node's own listen addresses.
     own_listen: Vec<Multiaddr>,
-    /// Outgoing dials to an address with no known PeerId that have not finished yet (the
-    /// start-up dial of a configured address without `/p2p/`, or a redial of one).
-    dialing_unknown: HashSet<libp2p::swarm::ConnectionId>,
+    /// Redials to an address with no known PeerId that have not finished yet. (libp2p emits
+    /// `SwarmEvent::Dialing` only for behaviour-initiated dials, so the task records its own.)
+    dialing_unknown: HashMap<libp2p::swarm::ConnectionId, Multiaddr>,
 }
 
 impl PeerBook {
@@ -154,10 +154,10 @@ impl PeerBook {
         }
     }
 
-    /// An outgoing dial started (`SwarmEvent::Dialing`).
-    pub fn on_dialing(&mut self, peer: Option<PeerId>, id: libp2p::swarm::ConnectionId) {
-        if peer.is_none() && self.dialing_unknown.len() < MAX_BOOK_PEERS {
-            self.dialing_unknown.insert(id);
+    /// The redial task started dial `id` to `addr` (a target with no known PeerId).
+    pub fn on_redial_started(&mut self, id: libp2p::swarm::ConnectionId, addr: Multiaddr) {
+        if self.dialing_unknown.len() < MAX_BOOK_PEERS {
+            self.dialing_unknown.insert(id, addr);
         }
     }
 
@@ -166,9 +166,9 @@ impl PeerBook {
         self.dialing_unknown.remove(&id);
     }
 
-    /// Whether a dial to an address with no known PeerId is still in flight.
-    pub fn unknown_dial_in_flight(&self) -> bool {
-        !self.dialing_unknown.is_empty()
+    /// Whether a redial to `addr` is still in flight.
+    pub fn redial_in_flight(&self, addr: &Multiaddr) -> bool {
+        self.dialing_unknown.values().any(|a| a == addr)
     }
 
     /// The last connection to `peer` closed.
@@ -397,7 +397,7 @@ impl RedialTask {
                 }
                 // A dial still in flight holds the clock like a connection does (no reset),
                 // so an address whose connect hangs is never dialled twice at once.
-                TargetKey::Addr(_) => (book().unknown_dial_in_flight(), None, false),
+                TargetKey::Addr(a) => (book().redial_in_flight(a), None, false),
             };
             let b = self
                 .backoff
@@ -422,8 +422,14 @@ impl RedialTask {
                     .address(a.clone())
                     .build(),
             };
+            let id = opts.connection_id();
             match swarm.dial(opts) {
-                Ok(()) => tracing::info!(target = ?key, attempt, "redialling a ring peer"),
+                Ok(()) => {
+                    if let TargetKey::Addr(a) = &key {
+                        book().on_redial_started(id, a.clone());
+                    }
+                    tracing::info!(target = ?key, attempt, "redialling a ring peer")
+                }
                 Err(e) => {
                     tracing::debug!(target = ?key, attempt, error = %e, "redial not started")
                 }

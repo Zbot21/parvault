@@ -598,13 +598,7 @@ impl ServerSwarmEvents {
                 // Live status (B-148 item 2): this node's own listen addresses. The caller still
                 // gets the event.
                 match &other {
-                    // B-157: dials in flight, so the redial task never doubles one.
-                    SwarmEvent::Dialing {
-                        peer_id,
-                        connection_id,
-                    } => {
-                        crate::network::redial::book().on_dialing(*peer_id, *connection_id);
-                    }
+                    // B-157: a redial in flight finished, so the task may dial that address again.
                     SwarmEvent::OutgoingConnectionError { connection_id, .. } => {
                         crate::network::redial::book().on_dial_finished(*connection_id);
                     }

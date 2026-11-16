@@ -342,7 +342,8 @@ fn metrics_attempts_cover_outcomes() {
 }
 
 /// Real daemons on loopback: an `ok` (and B's inbound), a `refused`, a `peer_id_mismatch`, and
-/// TEST-NET-1 as `timeout` or `unreachable`.
+/// TEST-NET-1 as `timeout` or `unreachable`. A failing configured peer is redialled (B-157), so
+/// the failing cases count at least one outcome, all of the expected label.
 #[test]
 fn metrics_count_dial_outcomes() {
     let b = spawn_daemon("out-b", &[], true);
@@ -365,21 +366,26 @@ fn metrics_count_dial_outcomes() {
         &[format!("/ip4/127.0.0.1/tcp/{}", closed_port())],
         true,
     );
-    assert!(eventually(Duration::from_secs(15), || outcome(
-        &r.scrape(),
-        "daemon",
-        "tcp",
-        "refused"
-    ) == 1));
+    // B-157: a configured peer that fails is redialled, so the count grows; every outcome so
+    // far must be this one label.
+    assert!(
+        eventually(Duration::from_secs(15), || {
+            let s = r.scrape();
+            let got = outcome(&s, "daemon", "tcp", "refused");
+            got >= 1 && sum_outcomes(&s, "daemon") == got
+        }),
+        "{}",
+        r.scrape()
+    );
 
     let wrong = format!("{}/p2p/{}", b.mesh, c.peer_id());
     let m = spawn_daemon("out-m", &[wrong], true);
     assert!(
         eventually(Duration::from_secs(15), || {
             let s = m.scrape();
-            outcome(&s, "daemon", "tcp", "peer_id_mismatch")
-                + outcome(&s, "daemon", "none", "peer_id_mismatch")
-                == 1
+            let got = outcome(&s, "daemon", "tcp", "peer_id_mismatch")
+                + outcome(&s, "daemon", "none", "peer_id_mismatch");
+            got >= 1 && sum_outcomes(&s, "daemon") == got
         }),
         "{}",
         m.scrape()
@@ -389,8 +395,9 @@ fn metrics_count_dial_outcomes() {
     assert!(
         eventually(Duration::from_secs(150), || {
             let s = t.scrape();
-            outcome(&s, "daemon", "tcp", "timeout") + outcome(&s, "daemon", "tcp", "unreachable")
-                == 1
+            let got = outcome(&s, "daemon", "tcp", "timeout")
+                + outcome(&s, "daemon", "tcp", "unreachable");
+            got >= 1 && sum_outcomes(&s, "daemon") == got
         }),
         "{}",
         t.scrape()
