@@ -50,7 +50,8 @@ fn l72_foreground_granted_when_queued_and_slot_free() {
         kani::any(),
         kani::any(),
     );
-    let (d, defer) = fetch_slot_decision(fg, bg, free, bgf, skip);
+    let r = fetch_slot_decision(fg, bg, free, bgf, skip);
+    let (d, defer) = r;
     // The defer code marks exactly the foreground grants that pass a queued scavenger.
     assert!(defer.is_some() == (d == SlotDecision::GrantForeground && bg > 0));
     let aging = bg > 0 && bgf < SLOTS - 1 && skip >= AGING_N;
@@ -67,7 +68,7 @@ fn l72_foreground_granted_when_queued_and_slot_free() {
         aging && fg > 0 && free > 0 && d == SlotDecision::GrantScavenger,
         "aging step starts a scavenger"
     );
-    kani::cover!(defer.is_some(), "scavenger deferred for a foreground read");
+    kani::cover!(r.1.is_some(), "scavenger deferred for a foreground read");
 }
 
 /// S3: a queued scavenger that may hold a slot starts within `AGING_N + 1` grants, whatever

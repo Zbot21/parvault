@@ -1,8 +1,12 @@
 .enforcement.map
 AGENTS.md
 CHANGELOG.md
+CONTRIBUTING.md
 README.md
+build/c-changed-files.txt
+docs/ADR.md
 docs/BENCHMARKS.md
+docs/SAFETY_AND_LINT_AUDIT.md
 docs/SECURITY_AND_CRYPTOGRAPHY.md
 docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md
 docs/metrics.txt
