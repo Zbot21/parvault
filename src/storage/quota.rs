@@ -168,6 +168,21 @@ pub const fn epoch_rollover_decision(elapsed_ms: u64, epoch_len_ms: u64) -> bool
     elapsed_ms / epoch_len_ms >= 1
 }
 
+/// B-159 (C16, B154-QUOTA): which account a removal credits and by how much. A shard the
+/// ledger recorded credits its recorded owner its recorded size; only an unrecorded shard
+/// falls back to the caller's account and the file's length.
+pub fn removal_credit(
+    recorded_owner: Option<String>,
+    recorded_bytes: Option<u64>,
+    caller: &str,
+    file_bytes: u64,
+) -> (String, u64) {
+    (
+        recorded_owner.unwrap_or_else(|| caller.to_string()),
+        recorded_bytes.unwrap_or(file_bytes),
+    )
+}
+
 /// Loads `quota_state.bin` (B-52 QA): an absent file is a fresh state; any other read or decode
 /// failure is refused, since starting empty would forget every peer's used quota.
 pub fn quota_state_load_decision(
@@ -386,6 +401,24 @@ impl QuotaManager {
         self.persist();
     }
 
+    /// B-147 (G5): sets `peer_id`'s audit counters to journalled post-values (only the given
+    /// ones; the caller applies each only where it is above the current value) and persists.
+    pub fn apply_por_post_values(
+        &mut self,
+        peer_id: &str,
+        por_passes: Option<u64>,
+        por_failures: Option<u64>,
+    ) {
+        let acct = self.peer_accounts.entry(peer_id.to_string()).or_default();
+        if let Some(v) = por_passes {
+            acct.por_passes = v;
+        }
+        if let Some(v) = por_failures {
+            acct.por_failures = v;
+        }
+        self.persist();
+    }
+
     /// Checks whether `peer_id` is within both the node's physical disk ceiling and its
     /// tier-weighted reciprocity allowance (`bootstrap_grace_bytes + contributed / factor`).
     pub fn can_accept_shard(&self, peer_id: &str, shard_bytes: u64) -> bool {
@@ -507,16 +540,34 @@ impl QuotaManager {
         self.lru_queue.push_back(shard_key.to_string());
     }
 
-    /// Removes a shard from quota accounting.
+    /// Removes a shard from quota accounting (B-159, C16): the bytes recorded for it are
+    /// credited back to the account it was stored for (`shard_owners`), as
+    /// [`Self::evict_lru_to_fit`] does, never to whoever asked for the removal. `peer_id` and
+    /// `shard_bytes` are used only for a shard this ledger never recorded.
     pub fn record_shard_removed(&mut self, peer_id: &str, shard_key: &str, shard_bytes: u64) {
-        self.shard_sizes.remove(shard_key);
-        self.shard_owners.remove(shard_key);
-        self.lru_queue.retain(|k| k != shard_key);
-        self.used_storage_bytes = self.used_storage_bytes.saturating_sub(shard_bytes);
-        if let Some(acct) = self.peer_accounts.get_mut(peer_id) {
-            acct.bytes_hosted_for_peer = acct.bytes_hosted_for_peer.saturating_sub(shard_bytes);
-        }
+        self.record_shard_removed_deferred(peer_id, shard_key, shard_bytes);
         self.persist();
+    }
+
+    /// [`Self::record_shard_removed`] without the state write (call
+    /// [`Self::flush_persistence`] after the batch).
+    pub fn record_shard_removed_deferred(
+        &mut self,
+        peer_id: &str,
+        shard_key: &str,
+        shard_bytes: u64,
+    ) {
+        let (owner, bytes) = removal_credit(
+            self.shard_owners.remove(shard_key),
+            self.shard_sizes.remove(shard_key),
+            peer_id,
+            shard_bytes,
+        );
+        self.lru_queue.retain(|k| k != shard_key);
+        self.used_storage_bytes = self.used_storage_bytes.saturating_sub(bytes);
+        if let Some(acct) = self.peer_accounts.get_mut(&owner) {
+            acct.bytes_hosted_for_peer = acct.bytes_hosted_for_peer.saturating_sub(bytes);
+        }
     }
 
     /// Evicts least-recently-used shard keys until at least `needed_bytes` of free space is available.

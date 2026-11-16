@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+- **Hosts free shards on the owner's signed order (B-154 host side, B-158, B-159, B-178, B-147; `v0.5.6` track B1).** `FreeShards` frees up to 1024 shards per order, for the named host, signed within 30 s, with a new epoch per signer (`reject.free_wrong_host`, `reject.free_stale`, `reject.free_epoch_replay`); each shard answers `Freed`, `NotHeld` or a reason code. **Breaking for skewed clocks:** a `DeleteShard` token more than 30 s from the host's clock is now refused (`reject.delete_stale`). A removal now credits the account that stored the shard, not the sender, and a failed delete keeps the shard's owner binding. The PoR auditor journals each audit (`por_audit_journal.bin`), so a crash no longer splits the audit state from the quota ledger.
+
 ---
 
 ## [`0.5.5`] - 2026-11-16

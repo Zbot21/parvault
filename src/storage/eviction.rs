@@ -2114,6 +2114,22 @@ impl PrivacyPreservingEvictionEngine {
         self.persist_index()
     }
 
+    /// C18: forgets the attribution record of a regular shard removed outside eviction (an
+    /// owner's `DeleteShard` or `FreeShards`), and persists the index when one was removed.
+    /// Eviction's own purge removes its records itself and never calls this.
+    pub fn forget_regular_shard(&mut self, shard_id: &ShardId) -> Result<bool, StorageError> {
+        if self.index.regular_shards.remove(shard_id).is_none() {
+            return Ok(false);
+        }
+        self.persist_index()?;
+        Ok(true)
+    }
+
+    /// Regular shards with an attribution record (B-152 (a) tests).
+    pub fn regular_shard_count(&self) -> usize {
+        self.index.regular_shards.len()
+    }
+
     /// Records privacy-preserving HMAC ingress tags and `voucher_issuer_pubkey` cohort linkage
     /// for a newly stored anonymized `.bshard` file.
     pub fn record_blinded_shard_ingress(

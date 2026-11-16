@@ -26,3 +26,5 @@ Without symmetric storage accounting, rational users would upload terabytes of b
 Items 1 and 3 (per-peer quota with bootstrap grace, the 4x per-epoch write-amplification cap) are enforced on every `PutShard` by `QuotaManager::quota_decision` (claim ADR-07). Item 2 (tier-weighted SLA multipliers) is not implemented: peers earn no credit in v0.5.0 (F-07), so every remote peer's allowance is its bootstrap grace.
 
 v0.5.5 (B-161): a full file-backed node refuses a put with `reject.node_capacity` (`quota_decision`); it never evicts shards of any account, the putting one included, to admit one; a local (`local`/`self`) put skips the per-peer checks but not node capacity (claims B161-NO-EVICT, B161-NO-EVICT-LOCAL). The in-memory `--no-fs` store still evicts LRU shards (ADR-30; residual B-164).
+
+v0.5.6 (B-159, C16): a removed shard credits the account it was stored for, by the size recorded at the put (`record_shard_removed`, `removal_credit`), whoever asked for the removal; a seed's fan-out is credited back when the owner frees it (suites S-B159-QUOTA, S-B159-SENDER).

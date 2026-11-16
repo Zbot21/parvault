@@ -379,4 +379,20 @@ reach      PROBE-REACH sym=src/probe.rs::probe_target_decision from=src/cli/net.
 # --- B-142 (v0.5.4): a bootstrap address's /p2p/ PeerId is enforced on the daemon's startup dial ---
 claim      B-142     sym=src/network/traversal_gate.rs::dial_peer_id_decision accept=traversal_metrics::b142_bootstrap_peer_id_matches_and_connects reject=traversal_metrics::b142_bootstrap_peer_id_mismatch_refused code=reject.dial_peer_id_mismatch bin=parvault ref=docs/security/TRUST_FINDINGS.md
 
+# --- v0.5.6 track B1: version GC host side (plan 3.7; B-154 C11-C19, B-158, B-159, B-178, B-147) ---
+claim      B154-FREE sym=src/por/verifier.rs::free_order_decision accept=trust_enforcement_gc_host::b154_owner_order_frees_its_shard reject=trust_enforcement_gc_host::b154_order_for_another_host_refused code=reject.free_wrong_host bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-19-crash-safe-atomic-storage-and-lease-pinning.md covers=MeshWireRequest::FreeShards   # T5: host-bound orders (C12 order: shape, host, freshness, signature, epoch)
+claim      B154-FREE-STALE sym=src/por/verifier.rs::free_order_decision accept=trust_enforcement_gc_host::b154_owner_order_frees_its_shard reject=trust_enforcement_gc_host::b154_stale_order_refused code=reject.free_stale bin=parvault ref=docs/security/TRUST_FINDINGS.md   # T5 31 s; C24's future-dated order is b154_future_dated_order_refused
+claim      B154-FREE-EPOCH sym=src/por/verifier.rs::free_order_decision accept=trust_enforcement_gc_host::b154_owner_order_frees_its_shard reject=trust_enforcement_gc_host::b154_resent_order_is_a_replay_across_restart code=reject.free_epoch_replay bin=parvault ref=docs/security/TRUST_FINDINGS.md   # C11 verify half, C12: per-signer epoch mark, persisted (free_order_epochs.bin), RAM only on --no-fs
+claim      F-36-FREE sym=src/por/verifier.rs::shard_delete_decision accept=trust_enforcement_gc_host::b154_grant_owner_frees_a_shard_stored_by_another_key reject=trust_enforcement_gc_host::b154_ring_peer_cannot_free_owner_shard code=reject.delete_not_shard_owner bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::FreeShards   # B-154 F-36 extend: per shard, the grant owner else the accounted storer; not_held decided first (C14)
+reach      B154-FREE-REACH sym=src/por/verifier.rs::free_order_decision from=src/network/wire_handler.rs::handle_mesh_wire_request
+kani       B154-FREE sym=src/por/verifier.rs::free_order_decision harness=proof_free_order_needs_every_fact cover=free order refused
+claim      B158-FRESH sym=src/por/verifier.rs::delete_freshness_decision accept=trust_enforcement_gc_host::b158_fresh_delete_token_accepted reject=trust_enforcement_gc_host::b158_stale_delete_token_refused code=reject.delete_stale bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::DeleteShard   # B-158, D-47 Q5: DeleteShard v1 tokens 30 s fresh
+kani       B158-FRESH sym=src/por/verifier.rs::delete_freshness_decision harness=proof_delete_freshness_window cover=delete token stale
+suite      S-B159-QUOTA test=trust_enforcement_gc_host::b159_free_credits_the_account_that_stored_it needs=cmd:sh   # B154-QUOTA (C16, T6): removal_credit credits the accounted owner, not the sender
+suite      S-B159-SENDER test=trust_enforcement_gc_host::b159_free_does_not_credit_the_sender needs=cmd:sh
+suite      S-B178    test=trust_enforcement_gc_host::b178_failed_delete_keeps_shard_and_binding needs=cmd:sh   # C13: binding cleared only after a successful removal (remove_held_shard)
+suite      S-C19     test=trust_enforcement_gc_host::c19_place_stripe_has_only_owner_store_callers needs=cmd:sh   # C19 test only; the rule stays B-160 for L-27
+suite      S-B147    test=trust_enforcement_gc_host::b147_sigkill_between_writes_state_and_ledger_agree needs=cmd:sh   # G5: 20 SIGKILLs, state and ledger agree
+kani       B147-JOURNAL sym=src/por/audit_journal.rs::audit_journal_apply_decision harness=proof_audit_journal_apply_decision cover=journal ignored
+
 ratchet    R         open=1 waive=32

@@ -1007,16 +1007,104 @@ fn relay_ack(result: Result<(), String>) -> MeshWireResponse {
 /// 3. `por_verifier`: PoR session, grant and repair-grant entries, then the owner binding,
 ///    cleared only after step 1 removed the shard (C13, B-178).
 ///
-/// Returns whether a shard was removed (`false`: not held). T0 stub: step 1 only, exactly the
-/// `delete_shard` call `DeleteShard` made before `v0.5.6`.
+/// Returns whether a shard was removed (`false`: not held). An `Err` from step 1 leaves every
+/// index and the binding as they were (B-178: a failed delete can be retried by its owner).
 pub(crate) fn remove_held_shard(
     block_store: &BlockStore,
-    _eviction: &mut PrivacyPreservingEvictionEngine,
-    _por_verifier: &mut PorVerifierEngine,
+    eviction: &mut PrivacyPreservingEvictionEngine,
+    por_verifier: &mut PorVerifierEngine,
     owner: &str,
     shard_id: &crate::storage::ShardId,
 ) -> Result<bool, crate::storage::StorageError> {
-    block_store.delete_shard(owner, shard_id)
+    // 1. The shard, its quota credit (to the accounted owner, C16) and its shard-index entry.
+    let removed = block_store.delete_shard(owner, shard_id)?;
+    // 2. C18: the eviction attribution record. The shard is already gone, so a failed index
+    //    write is logged and the removal still stands.
+    if let Err(e) = eviction.forget_regular_shard(shard_id) {
+        warn!(error = %e, "eviction attribution not persisted after a shard removal");
+    }
+    // 3. C13: the binding, only now that step 1 succeeded (a shard not held has none to keep).
+    por_verifier.clear_shard_binding(shard_id);
+    Ok(removed)
+}
+
+/// The `FreeShards` arm (B-158, B-154 2.4): the order-level checks
+/// ([`crate::por::verifier::free_order_decision`]), then per shard `not_held` first (C14),
+/// [`crate::por::verifier::shard_delete_decision`] (the grant owner, else the accounted storer; never a witness) and
+/// [`remove_held_shard`]. The signer's epoch advances only after a valid order with at least
+/// one authorized shard (C12). The ack carries only reason codes (qa-t0, proposal f), never
+/// text from the peer or an error message: at most one per shard, an order is at most
+/// `MAX_FREE_ORDER_SHARDS` shards.
+fn free_shards(
+    order: &crate::network::FreeShardsOrder,
+    node_identity: &NodeIdentity,
+    block_store: &BlockStore,
+    eviction: &mut PrivacyPreservingEvictionEngine,
+    por_verifier: &mut PorVerifierEngine,
+    remote_peer_id: &str,
+) -> MeshWireResponse {
+    use crate::network::FreeShardOutcome;
+    let now = now_unix_ms();
+    if let Err(code) = por_verifier.free_order_check(order, &node_identity.public_key_bytes(), now)
+    {
+        warn!(code, peer = %remote_peer_id, "refused a free order");
+        return MeshWireResponse::FreeShardsAck {
+            outcomes: Vec::new(),
+            error: Some(code.to_string()),
+        };
+    }
+    let signer = order.owner_ed25519_pubkey;
+    let signer_device = NodeIdentity::device_peer_id_for_pubkey(&signer);
+    let mut outcomes = Vec::with_capacity(order.shard_ids.len());
+    let mut authorized_any = false;
+    let mut freed = 0usize;
+    for shard_id in &order.shard_ids {
+        if !block_store.has_shard(shard_id) {
+            outcomes.push(FreeShardOutcome::NotHeld);
+            continue;
+        }
+        let accounted_owner = block_store
+            .quota()
+            .lock()
+            .ok()
+            .and_then(|q| q.shard_owner(&shard_id.file_key()).map(str::to_string));
+        let facts = por_verifier.shard_delete_facts(shard_id, &signer, accounted_owner.as_deref());
+        if let Err(code) = crate::por::verifier::shard_delete_decision(&facts) {
+            warn!(code, peer = %remote_peer_id, "refused a free of a shard held for another owner");
+            outcomes.push(FreeShardOutcome::Refused(code.to_string()));
+            continue;
+        }
+        authorized_any = true;
+        let owner = accounted_owner.as_deref().unwrap_or(signer_device.as_str());
+        match remove_held_shard(block_store, eviction, por_verifier, owner, shard_id) {
+            Ok(true) => {
+                freed += 1;
+                outcomes.push(FreeShardOutcome::Freed);
+            }
+            Ok(false) => outcomes.push(FreeShardOutcome::NotHeld),
+            Err(e) => {
+                warn!(code = "reject.free_remove_failed", error = %e, "a shard of a free order was not removed");
+                outcomes.push(FreeShardOutcome::Refused(
+                    "reject.free_remove_failed".to_string(),
+                ));
+            }
+        }
+    }
+    if authorized_any {
+        por_verifier.advance_free_epoch(signer, order.gc_epoch, now);
+    }
+    info!(
+        code = "info.free_order_applied",
+        peer = %remote_peer_id,
+        shards = order.shard_ids.len(),
+        freed,
+        epoch = order.gc_epoch,
+        "applied a free order"
+    );
+    MeshWireResponse::FreeShardsAck {
+        outcomes,
+        error: None,
+    }
 }
 
 fn handle_mesh_wire_request<P: WireRolePolicy>(
@@ -1225,16 +1313,18 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                 .lock()
                 .ok()
                 .and_then(|q| q.shard_owner(&shard_id.file_key()).map(str::to_string));
-            if !por_verifier.authorize_owner_shard_delete(
+            if let Err(code) = por_verifier.authorize_owner_shard_delete(
                 &shard_id,
                 &owner_pub,
                 payload.as_slice(),
                 &sig64,
                 accounted_owner.as_deref(),
+                now_unix_ms(),
             ) {
+                warn!(code, peer = %remote_peer_id, "refused a shard delete");
                 return MeshWireResponse::DeleteShardAck {
                     deleted: false,
-                    error: Some("unauthorized owner shard delete signature".to_string()),
+                    error: Some(format!("{code}: unauthorized owner shard delete")),
                 };
             }
             let Some(owner) = shard_owner(peer, None) else {
@@ -1254,19 +1344,14 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                 },
             }
         }
-        MeshWireRequest::FreeShards { order } => {
-            // T0 stub (G3): track B1 replaces this arm with `free_order_decision`, then
-            // `shard_delete_decision` and `remove_held_shard` per shard.
-            let _ = order;
-            let refusal = crate::seam::not_built_yet(crate::seam::Unbuilt {
-                track: "B1",
-                entry: "MeshWireRequest::FreeShards",
-            });
-            MeshWireResponse::FreeShardsAck {
-                outcomes: Vec::new(),
-                error: Some(refusal.to_string()),
-            }
-        }
+        MeshWireRequest::FreeShards { order } => free_shards(
+            &order,
+            node_identity,
+            block_store,
+            eviction,
+            por_verifier,
+            remote_peer_id,
+        ),
         MeshWireRequest::PorAudit(challenge) => {
             let now_ms = now_unix_ms();
             match por_verifier.handle_incoming_challenge(&challenge, now_ms, block_store) {
