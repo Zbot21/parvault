@@ -9105,6 +9105,32 @@ fn f34_storer_chunk_audit_answered() {
     gate_ran("trust_enforcement::f34_storer_chunk_audit_answered");
 }
 
+/// B-192 (3), the audit path: a PoR chunk audit addressed to a dead loopback alias of the host's
+/// peer id (as a `v0.5.5` placement record may name it) is answered by the host through the
+/// transport's peer-id fallback, from a cold client given the host's plain address.
+#[test]
+fn b192_chunk_audit_to_dead_alias_answered_via_peer_id() {
+    let owner = key(0xB3);
+    let (node, sid, _bytes) = chunk_audit_host("b192-alias-audit", &owner);
+    let plain = node.addr.split("/p2p/").next().unwrap().to_string();
+    let dead_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let alias = format!("/ip4/127.0.0.1/tcp/{dead_port}/p2p/{}", node.peer_id());
+    let cold = MeshClient::new(owner.clone(), vec![plain], None)
+        .with_admission(AdmissionSource::from_genesis(genesis()));
+    let resp = cold
+        .send_request(&alias, chunk_audit(sid))
+        .unwrap_or_else(|e| panic!("audit via {alias}: {e}\n{}", node.log_text()));
+    let MeshWireResponse::ChunkAuditResult(Some(r)) = resp else {
+        panic!("{resp:?}")
+    };
+    assert_eq!(r.shard_id, sid);
+    gate_ran("trust_enforcement::b192_chunk_audit_to_dead_alias_answered_via_peer_id");
+}
+
 /// F-34-STORER reject (verdict change 1): a co-host holding the same per-stripe session key is
 /// refused before the rate check and any read, so it can neither fetch the shard's chunks nor
 /// spend the owner's audit budget.

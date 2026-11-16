@@ -164,6 +164,74 @@ pub const fn abandon_decision(first_attempt_ms: u64, now_ms: u64) -> bool {
     now_ms.saturating_sub(first_attempt_ms) >= ABANDON_AFTER_MS
 }
 
+/// The peer id an address names in its `/p2p/` suffix, as text.
+fn addr_peer_id(addr: &str) -> Option<String> {
+    let m = crate::network::parse_peer_multiaddr(addr).ok()?;
+    crate::network::client::extract_expected_peer_id(&m).map(|p| p.to_string())
+}
+
+/// C8 by identity: an address naming peer id `X` in its `/p2p/` suffix is the host the owner was
+/// given for `X` (`canon`: peer id -> its `--peers` or seed address) when it has one. A host
+/// advertises every listen address over Identify, its loopback one included; the owner cannot
+/// dial that one from another machine or container, and a free journalled for it would be
+/// retried as unreachable for 30 days (T4). Other addresses are unchanged.
+pub fn canonical_host(addr: &str, canon: &BTreeMap<String, String>) -> String {
+    match addr_peer_id(addr).and_then(|pid| canon.get(&pid)) {
+        Some(given) => given.clone(),
+        None => addr.to_string(),
+    }
+}
+
+/// Whether `addr` is a loopback IP address.
+fn is_loopback_addr(addr: &str) -> bool {
+    crate::network::client::is_loopback_peer_addr(addr)
+}
+
+/// The addresses to try for a host journalled under `host` (B-192, shared with the client's
+/// read path): `host`, then the other known addresses of its peer id, non-loopback first.
+pub fn send_candidates(host: &str, known: &[String]) -> Vec<String> {
+    crate::network::client::peer_address_candidates(host, known)
+}
+
+/// Peer id -> address for the hosts the owner was given (`--peers`, the seed) whose peer id is
+/// known: pinned by a connection this process made, or in the address. With `dial_for`, an
+/// unpinned given host is dialed once (one status request) while some peer id in `dial_for` is
+/// still unmapped.
+fn given_hosts(client: &MeshClient, dial_for: &BTreeSet<String>) -> BTreeMap<String, String> {
+    let mut given: Vec<String> = client
+        .peers()
+        .iter()
+        .filter(|p| crate::network::is_network_peer_addr(p))
+        .cloned()
+        .collect();
+    if let Some(seed) = client.seed_addr() {
+        if crate::network::is_network_peer_addr(seed) {
+            given.push(seed.to_string());
+        }
+    }
+    let mut canon = BTreeMap::new();
+    let mut unpinned = Vec::new();
+    for g in given {
+        match client.pinned_peer_id(&g) {
+            Some(pid) => {
+                canon.entry(pid.to_string()).or_insert(g);
+            }
+            None => unpinned.push(g),
+        }
+    }
+    for g in unpinned {
+        if dial_for.iter().all(|pid| canon.contains_key(pid)) {
+            break;
+        }
+        if client.remote_ed25519_pubkey(&g).is_ok() {
+            if let Some(pid) = client.pinned_peer_id(&g) {
+                canon.entry(pid.to_string()).or_insert(g);
+            }
+        }
+    }
+    canon
+}
+
 /// C7: the catalog fetched from the ring is not the one this store last published: another
 /// device writes this vault. No frees then (`reject.gc_foreign_catalog`).
 /// `published` is `(version, ciphertext digest)` of this store's last acknowledged catalog, or
@@ -821,11 +889,16 @@ impl<'a> GcRun<'a> {
                 tracing::warn!(error = %e, "relocation map unreadable; frees go to placed hosts only");
                 Vec::new()
             });
+        // Hosts by identity (C8): no dial here; step 6 maps what is still unmapped.
+        let canon = match &self.settings.client {
+            Some(client) => given_hosts(client, &BTreeSet::new()),
+            None => BTreeMap::new(),
+        };
         for (root, s) in &garbage {
             for id in &s.shard_ids {
-                let mut hosts = self.targets(s, id, &relocations);
+                let mut hosts = self.targets(s, id, &relocations, &canon);
                 if let Some(extra) = inflight_hosts.get(root) {
-                    hosts.extend(extra.iter().cloned());
+                    hosts.extend(extra.iter().map(|h| canonical_host(h, &canon)));
                 }
                 for host in hosts {
                     self.journal.add_pending(PendingFree {
@@ -879,6 +952,7 @@ impl<'a> GcRun<'a> {
         s: &StripeRef,
         id: &ShardId,
         relocations: &[crate::por::auditor::RelocationTarget],
+        canon: &BTreeMap<String, String>,
     ) -> BTreeSet<String> {
         let mut hosts = BTreeSet::new();
         hosts.insert(LOCAL_HOST.to_string());
@@ -909,6 +983,9 @@ impl<'a> GcRun<'a> {
             }
         }
         hosts
+            .into_iter()
+            .map(|h| canonical_host(&h, canon))
+            .collect()
     }
 
     /// Step 4: the dropped version files and the garbage's manifests (off the owner's PoR scan
@@ -968,6 +1045,18 @@ impl<'a> GcRun<'a> {
         // A host purges each shard of an order (shred, fsync): a full order takes seconds, far
         // over the default 1.2 s request timeout (track B1 measured 2.3 s for 666 shards).
         let client = client.with_timeout(FREE_ORDER_TIMEOUT);
+        // Every address known for a host: the client's endpoints (given and discovered) and the
+        // journal's own, before entries merge under one address per peer id.
+        let mut known = client.all_network_endpoints();
+        known.extend(
+            self.journal
+                .pending
+                .iter()
+                .map(|p| p.host.clone())
+                .chain(self.journal.abandoned.iter().map(|a| a.host.clone()))
+                .filter(|h| h != LOCAL_HOST),
+        );
+        self.canonicalize_hosts(&client);
         // Due work per host: pending entries whose backoff has passed, and abandoned entries
         // not retried for a day.
         let mut by_host: BTreeMap<String, Vec<usize>> = BTreeMap::new();
@@ -1002,7 +1091,19 @@ impl<'a> GcRun<'a> {
                         .map(|&i| (false, i, self.journal.abandoned[i].shard_id)),
                 )
                 .collect();
-            let host_key = match client.remote_ed25519_pubkey(&host) {
+            // The first known address of this host (by peer id) that answers as it; an address
+            // carrying a peer id is dialed with that id expected (Noise), so another node
+            // answering there is a mismatch, never a free.
+            let mut send_to = host.clone();
+            if addr_peer_id(&host).is_some() {
+                let reachable = send_candidates(&host, &known)
+                    .into_iter()
+                    .find(|a| client.is_reachable(a));
+                if let Some(a) = reachable {
+                    send_to = a;
+                }
+            }
+            let host_key = match client.remote_ed25519_pubkey(&send_to) {
                 Ok(k) => Some(k),
                 Err(e) => {
                     tracing::info!(host = %host, error = %e, "host unreachable; frees retried later");
@@ -1029,7 +1130,7 @@ impl<'a> GcRun<'a> {
                 let order = sign_free_order(self.owner, host_key, now, epoch, ids.clone());
                 self.report.orders_sent += 1;
                 let actions: Vec<(FreeAction, String, bool)> =
-                    match client.free_shards(&host, order) {
+                    match client.free_shards(&send_to, order) {
                         Ok(FreeShardsReply::Outcomes(outs)) => {
                             // Per-shard refusals are retried silently otherwise: say which.
                             let mut refused: BTreeMap<&str, usize> = BTreeMap::new();
@@ -1065,7 +1166,7 @@ impl<'a> GcRun<'a> {
                             tracing::warn!(host = %host, error = %e, "free order refused");
                             chunk.iter().map(|_| (a, e.clone(), false)).collect()
                         }
-                        Err(_) if !client.is_reachable(&host) => chunk
+                        Err(_) if !client.is_reachable(&send_to) => chunk
                             .iter()
                             .map(|_| (FreeAction::Retry, UNREACHABLE.to_string(), false))
                             .collect(),
@@ -1075,7 +1176,7 @@ impl<'a> GcRun<'a> {
                             ids.iter()
                                 .map(|id| {
                                     self.report.fallback_deletes += 1;
-                                    match client.delete_shard_outcome(&host, *id, self.owner) {
+                                    match client.delete_shard_outcome(&send_to, *id, self.owner) {
                                         Ok(true) => (FreeAction::Done, String::new(), true),
                                         Ok(false) => (FreeAction::Done, String::new(), false),
                                         Err(e) => {
@@ -1160,6 +1261,71 @@ impl<'a> GcRun<'a> {
             self.journal.abandon(p, reason, now);
         }
         self.journal.save(&self.paths)
+    }
+
+    /// Entries journalled for another address of a given host (a listen address it advertised,
+    /// or a journal from before this mapping) move to the address the owner was given for it, and
+    /// merge with an entry already there (C8 by identity; T4).
+    fn canonicalize_hosts(&mut self, client: &MeshClient) {
+        let given: BTreeSet<&str> = client
+            .peers()
+            .iter()
+            .map(String::as_str)
+            .chain(client.seed_addr())
+            .collect();
+        let dial_for: BTreeSet<String> = self
+            .journal
+            .pending
+            .iter()
+            .map(|p| p.host.as_str())
+            .chain(self.journal.abandoned.iter().map(|a| a.host.as_str()))
+            .filter(|h| *h != LOCAL_HOST && !given.contains(h))
+            .filter_map(addr_peer_id)
+            .collect();
+        if dial_for.is_empty() {
+            return;
+        }
+        let mut canon = given_hosts(client, &dial_for);
+        // A host the owner was not given (found by discovery): its journalled addresses merge
+        // under one, a non-loopback one first; step 6 still tries every address it knows.
+        let mut by_pid: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for h in self
+            .journal
+            .pending
+            .iter()
+            .map(|p| &p.host)
+            .chain(self.journal.abandoned.iter().map(|a| &a.host))
+        {
+            if let Some(pid) = addr_peer_id(h) {
+                if !canon.contains_key(&pid) {
+                    by_pid.entry(pid).or_default().push(h.clone());
+                }
+            }
+        }
+        for (pid, mut addrs) in by_pid {
+            addrs.sort_by(|a, b| (is_loopback_addr(a), a).cmp(&(is_loopback_addr(b), b)));
+            canon.insert(pid, addrs.swap_remove(0));
+        }
+        let mut seen = BTreeSet::new();
+        let mut pending = Vec::with_capacity(self.journal.pending.len());
+        for mut p in std::mem::take(&mut self.journal.pending) {
+            if p.host != LOCAL_HOST {
+                p.host = canonical_host(&p.host, &canon);
+            }
+            if seen.insert((key(&p.shard_id), p.host.clone())) {
+                pending.push(p);
+            }
+        }
+        self.journal.pending = pending;
+        let mut seen = BTreeSet::new();
+        let mut abandoned = Vec::with_capacity(self.journal.abandoned.len());
+        for mut a in std::mem::take(&mut self.journal.abandoned) {
+            a.host = canonical_host(&a.host, &canon);
+            if seen.insert((key(&a.shard_id), a.host.clone())) {
+                abandoned.push(a);
+            }
+        }
+        self.journal.abandoned = abandoned;
     }
 
     /// The report's journal totals.
@@ -1344,6 +1510,51 @@ pub fn check_snapshot_fresh(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_host_maps_by_peer_id() {
+        let pid = "12D3KooWQ5LDnSQSq9VXdV87F4JNArnT9HocahLHynC7h7PHrKej";
+        let other = "12D3KooWF34TMAzmQHG8czvSFwEua6C3cBsZ8iVWG3jsEurRKz11";
+        let mut canon = BTreeMap::new();
+        canon.insert(pid.to_string(), "/ip4/172.28.1.71/tcp/4001".to_string());
+        // A host's loopback alias goes to its given address.
+        assert_eq!(
+            canonical_host(&format!("/ip4/127.0.0.1/tcp/4001/p2p/{pid}"), &canon),
+            "/ip4/172.28.1.71/tcp/4001"
+        );
+        // Another peer id, a plain address, and the local pseudo-host are unchanged.
+        let o = format!("/ip4/127.0.0.1/tcp/4001/p2p/{other}");
+        assert_eq!(canonical_host(&o, &canon), o);
+        assert_eq!(
+            canonical_host("/ip4/172.28.1.73/tcp/4001", &canon),
+            "/ip4/172.28.1.73/tcp/4001"
+        );
+        assert_eq!(canonical_host(LOCAL_HOST, &canon), LOCAL_HOST);
+    }
+
+    #[test]
+    fn send_candidates_try_every_address_of_the_peer_id() {
+        let pid = "12D3KooWQ5LDnSQSq9VXdV87F4JNArnT9HocahLHynC7h7PHrKej";
+        let other = "12D3KooWF34TMAzmQHG8czvSFwEua6C3cBsZ8iVWG3jsEurRKz11";
+        let alias = format!("/ip4/127.0.0.1/tcp/4001/p2p/{pid}");
+        let real = format!("/ip4/172.28.1.71/tcp/4001/p2p/{pid}");
+        let lo2 = format!("/ip4/127.0.0.1/tcp/5001/p2p/{pid}");
+        let foreign = format!("/ip4/172.28.1.72/tcp/4001/p2p/{other}");
+        let known = vec![
+            lo2.clone(),
+            foreign,
+            real.clone(),
+            alias.clone(),
+            "/ip4/172.28.1.73/tcp/4001".to_string(),
+        ];
+        // The alias first (it is the journalled address), then the same peer's other addresses,
+        // non-loopback first; never another peer id's, never a plain address.
+        assert_eq!(send_candidates(&alias, &known), vec![alias, real, lo2]);
+        assert_eq!(
+            send_candidates("/ip4/172.28.1.73/tcp/4001", &known),
+            vec!["/ip4/172.28.1.73/tcp/4001".to_string()]
+        );
+    }
 
     #[test]
     fn decisions() {

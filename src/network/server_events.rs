@@ -395,7 +395,17 @@ impl ServerSwarmEvents {
             )) => {
                 // B-157 (R2): a peer's own listen addresses, the only addresses besides the
                 // configured ones that the redial task dials (and only once it is admitted).
-                crate::network::redial::book().on_identify(peer_id, &info.listen_addrs);
+                // B-192: a remote's loopback address only when it sees this node over loopback
+                // too (a same-host rig); never its unspecified one.
+                let over_loopback =
+                    crate::network::client::is_loopback_peer_addr(&info.observed_addr.to_string());
+                let learnable: Vec<_> = info
+                    .listen_addrs
+                    .iter()
+                    .filter(|a| crate::network::client::remote_addr_learnable(a, over_loopback))
+                    .cloned()
+                    .collect();
+                crate::network::redial::book().on_identify(peer_id, &learnable);
                 None
             }
             SwarmEvent::Behaviour(MeshNetworkBehaviourEvent::Mdns(mdns::Event::Discovered(
