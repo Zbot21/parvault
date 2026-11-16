@@ -4,7 +4,10 @@
 # passes; once Cargo.toml's package version is 0.5.6 or later it fails while any call remains,
 # so the release gate catches a leftover stub. src/seam.rs itself (the definition) is not a call
 # site; the Lead deletes it at integration. A call with no `track: "<X>"` within its next six
-# lines fails at any version.
+# lines fails at any version. At 0.5.6 or later the call scan alone can be bypassed (an import
+# alias, a call split across lines, `seam::NOT_BUILT_YET` used directly), so the gate also fails
+# while src/seam.rs exists or any file under src/ mentions `seam::`, `Unbuilt` or `NOT_BUILT_YET`
+# (comments included).
 # Usage: scripts/check_seam_unbuilt.sh [repo-root]
 set -euo pipefail
 ROOT=${1:-.}
@@ -41,10 +44,26 @@ for d, _, files in os.walk(os.path.join(root, "src")):
                     fails.append(f"{rel}:{i + 1}: a not_built_yet call names no track")
 for rel, ln, track in calls:
     print(f"[UNBUILT] {rel}:{ln} track={track}")
+vs = '.'.join(map(str, version))
 if version >= (0, 5, 6) and calls:
-    fails.append(f"version {'.'.join(map(str, version))}: {len(calls)} not_built_yet stub(s) remain (G3)")
+    fails.append(f"version {vs}: {len(calls)} not_built_yet stub(s) remain (G3)")
+if version >= (0, 5, 6):
+    if os.path.exists(os.path.join(root, "src", "seam.rs")):
+        fails.append(f"version {vs}: src/seam.rs still exists (G3)")
+    seam_ref = re.compile(r"seam::|\bUnbuilt\b|\bNOT_BUILT_YET\b")
+    for d, _, files in os.walk(os.path.join(root, "src")):
+        for f in sorted(files):
+            if not f.endswith(".rs"):
+                continue
+            path = os.path.join(d, f)
+            rel = os.path.relpath(path, root)
+            if rel == os.path.join("src", "seam.rs"):
+                continue
+            for i, line in enumerate(open(path).read().split("\n")):
+                if seam_ref.search(line):
+                    fails.append(f"{rel}:{i + 1}: version {vs}: mentions the seam (G3)")
 for f in fails:
     print("[FAIL]", f)
-print(f"seam-unbuilt: {len(calls)} call site(s), version {'.'.join(map(str, version))}, {len(fails)} failure(s)")
+print(f"seam-unbuilt: {len(calls)} call site(s), version {vs}, {len(fails)} failure(s)")
 sys.exit(1 if fails else 0)
 PY
