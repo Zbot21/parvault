@@ -164,14 +164,15 @@ mod unix_webdav {
         /// Spawns a background stoppable HTTP `Range` (`206 Partial Content`) + WebDAV
         /// (`OPTIONS` / `PROPFIND`) server returning an RAII [`VfsWebdavServerHandle`]. Every
         /// request must present a token `verifier` accepts (F-43); there is no unauthenticated
-        /// constructor. Plain HTTP: a non-loopback bind is refused (L-81,
-        /// `reject.edge_plain_http_nonloopback`); see [`Self::spawn_webdav_server_served`].
+        /// constructor. Plain HTTP on any bind, as before `v0.5.6` (a non-loopback bind is
+        /// logged as in clear); the daemon and the plugin serve through
+        /// [`Self::spawn_webdav_server_served`], which refuses it (L-81).
         pub fn spawn_webdav_server(
             &self,
             bind_addr: &str,
             verifier: WebdavVerifier,
         ) -> io::Result<VfsWebdavServerHandle> {
-            self.spawn_webdav_server_served(bind_addr, verifier, EdgeServe::Plain)
+            self.spawn_webdav_server_served(bind_addr, verifier, EdgeServe::InsecurePlain)
         }
 
         /// [`Self::spawn_webdav_server`] over `serve` (B-1 P1: TLS, or plain HTTP on loopback or
@@ -214,8 +215,8 @@ mod unix_webdav {
 
         /// Serves an unprivileged HTTP `Range` (`206 Partial Content`) + WebDAV (`OPTIONS` /
         /// `PROPFIND`) endpoint for locked-down `prplOS` / `RDK-B` LXC containers without
-        /// `/dev/fuse`. Every request must present a token `verifier` accepts (F-43). Plain HTTP,
-        /// loopback only (L-81).
+        /// `/dev/fuse`. Every request must present a token `verifier` accepts (F-43). Plain HTTP
+        /// on any bind, as before `v0.5.6`.
         pub fn serve_webdav_blocking(
             &self,
             bind_addr: &str,
@@ -223,7 +224,7 @@ mod unix_webdav {
         ) -> io::Result<()> {
             let listener = TcpListener::bind(bind_addr)?;
             let local_addr = listener.local_addr()?;
-            let serve = EdgeServe::Plain;
+            let serve = EdgeServe::InsecurePlain;
             serve.check_bind(local_addr)?;
             let slots = Arc::new(EdgeSlots::new(WEBDAV_MAX_CONNECTIONS));
             for conn in listener.incoming() {

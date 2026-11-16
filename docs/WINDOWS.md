@@ -1,6 +1,6 @@
 # Using ParVault from Windows
 
-Windows has no ParVault program. A NAS or Linux machine that runs `parvault` (the one holding the vault key) serves the vault as a read-only network drive over HTTPS (WebDAV), and Windows maps it with its built-in WebDAV client (the `WebClient` service). New backups come from a ParVault node's `watch-folder`, for example on a NAS shared folder you copy files into from Windows.
+Windows has no ParVault program. The vault's writer node, a NAS or Linux machine that runs `parvault` with the vault key and backs the folders up (`watch-folder`), also serves the vault as a read-only network drive over HTTPS (WebDAV), and Windows maps it with its built-in WebDAV client (the `WebClient` service). New backups come from that node's `watch-folder`, for example on a NAS shared folder you copy files into from Windows. Serving WebDAV from a second, read-only node of the same vault is planned for `v0.5.7`.
 
 What works from Windows in `v0.5.6`:
 

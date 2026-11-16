@@ -98,7 +98,7 @@ for _ in $(seq 1 600); do
 done
 grep -q "WebDAV listening on https://" <<<"$LOG" || fail "no TLS WebDAV listener"
 # Non-root: every process of the edge runs as 65532.
-docker top "$EDGE" -eo ruid,euid,comm | awk 'NR > 1 && ($1 == 0 || $2 == 0) { exit 1 }' || fail "the edge runs as root"
+docker top "$EDGE" -eo pid,ruid,euid,comm | awk 'NR > 1 && ($2 == 0 || $3 == 0) { exit 1 }' || fail "the edge runs as root"
 
 pv() { docker exec "$EDGE" parvault --data-dir /var/lib/parvault/d --no-lan-discovery "$@"; }
 pv tls export --out /var/lib/parvault/d/webdav.crt >/dev/null

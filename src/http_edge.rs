@@ -633,7 +633,7 @@ impl EdgeServe {
         match edge_transport_decision(loopback, self.is_tls(), opt_out) {
             Ok(_) => {
                 if opt_out && !loopback {
-                    tracing::warn!(%bound, "plain HTTP on a non-loopback edge (--insecure-plain-http): tokens cross the network in clear");
+                    tracing::warn!(%bound, "plain HTTP on a non-loopback edge: tokens cross the network in clear");
                 }
                 Ok(())
             }

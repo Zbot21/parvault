@@ -125,14 +125,15 @@ pub struct RouterNasStatusServer;
 impl RouterNasStatusServer {
     /// Binds `bind_addr` (`:0` for an ephemeral port) and serves the snapshot from `bus` to
     /// requests whose token `verifier` accepts. No default address: no flag, no listener. Plain
-    /// HTTP: a non-loopback bind is refused (L-81); see [`Self::bind_and_spawn_served`].
+    /// HTTP on any bind, as before `v0.5.6`; [`Self::bind_and_spawn_served`] refuses a
+    /// non-loopback plain bind (L-81).
     pub fn bind_and_spawn(
         bind_addr: SocketAddr,
         bus: GatewayBus,
         verifier: EdgeVerifier,
         extras: StatusEdgeExtras,
     ) -> io::Result<(SocketAddr, RouterNasServerHandle)> {
-        Self::bind_and_spawn_served(bind_addr, bus, verifier, extras, EdgeServe::Plain)
+        Self::bind_and_spawn_served(bind_addr, bus, verifier, extras, EdgeServe::InsecurePlain)
     }
 
     /// [`Self::bind_and_spawn`] over `serve` (B-1 P1: TLS, or plain on loopback or with the

@@ -96,6 +96,8 @@ pub enum EdgeTlsRefusal {
     Io(io::Error),
     /// The edge needs TLS on a platform without it.
     Unsupported,
+    /// The T0 stub's refusal (until glue G-11, G3).
+    NotBuiltYet(io::Error),
 }
 
 impl EdgeTlsRefusal {
@@ -107,6 +109,7 @@ impl EdgeTlsRefusal {
             Self::NoCertificate(_) => "reject.tls_no_certificate",
             Self::Io(_) => "reject.tls_cert_write",
             Self::Unsupported => "reject.tls_unsupported",
+            Self::NotBuiltYet(_) => crate::seam::NOT_BUILT_YET,
         }
     }
 }
@@ -133,6 +136,7 @@ impl std::fmt::Display for EdgeTlsRefusal {
             ),
             Self::Io(e) => write!(f, "{}: {e}", self.code()),
             Self::Unsupported => write!(f, "{}: edge TLS needs a Unix host", self.code()),
+            Self::NotBuiltYet(e) => write!(f, "{e}"),
         }
     }
 }
@@ -211,7 +215,7 @@ pub fn prepare_edges(
         });
     }
     let sans = sans_for(&tls_binds, &cfg.extra_sans);
-    let (server, info) = ensure_cert(data_dir, &sans)?;
+    let (server, info) = ensure_cert_for(data_dir, &sans)?;
     warn_uncovered(&tls_binds, &cfg.extra_sans, &info.sans);
     tracing::info!(
         spki_sha256 = %hex::encode(info.spki_sha256),
@@ -240,11 +244,30 @@ pub fn prepare_edges(
     })
 }
 
+/// The T0 entry point the pre-glue daemon calls (`cli/daemon.rs` at `dccaa6e`): no TLS flag
+/// gives `Ok(None)` (plain HTTP, as before `v0.5.6`); a flag is refused. Integration glue G-11
+/// replaces the call with [`prepare_edges`], and this function is deleted then.
+pub fn ensure_cert(
+    data_dir: &Path,
+    cfg: &EdgeTlsConfig,
+) -> Result<Option<CertInfo>, EdgeTlsRefusal> {
+    let _ = data_dir;
+    if cfg.any_flag() {
+        return Err(EdgeTlsRefusal::NotBuiltYet(crate::seam::not_built_yet(
+            crate::seam::Unbuilt {
+                track: "A",
+                entry: "--tls-san / --insecure-plain-http",
+            },
+        )));
+    }
+    Ok(None)
+}
+
 /// Loads the edge certificate in `data_dir`, or makes it with `sans` when there is none
 /// (A-TLS-6). A file that exists but does not load refuses the start: it is never replaced on
 /// its own (stable fingerprint). A leftover temporary file from a killed rotation is removed.
 #[cfg(unix)]
-pub fn ensure_cert(
+pub fn ensure_cert_for(
     data_dir: &Path,
     sans: &[String],
 ) -> Result<(EdgeTlsServer, CertInfo), EdgeTlsRefusal> {
@@ -264,7 +287,7 @@ pub fn ensure_cert(
 }
 
 #[cfg(not(unix))]
-pub fn ensure_cert(
+pub fn ensure_cert_for(
     _data_dir: &Path,
     _sans: &[String],
 ) -> Result<(EdgeTlsServer, CertInfo), EdgeTlsRefusal> {

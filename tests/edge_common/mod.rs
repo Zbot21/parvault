@@ -446,3 +446,188 @@ pub fn have(cmd: &str) -> bool {
         .map(|s| s.success())
         .unwrap_or(false)
 }
+
+/// The plugin edge (B-1 P1 on `parvault-fuse webdav --tls-pem`, A-TLS-3): a daemon serving its
+/// gateway socket (plain, local), and `parvault-fuse` serving the seeded files over TLS with a PEM
+/// file. Real binaries both; killed on drop.
+pub struct PluginEdge {
+    pub gateway: Daemon,
+    pub fuse: Child,
+    pub log: PathBuf,
+    pub addr: SocketAddr,
+    pub pem: PathBuf,
+    pub leaf_der: Vec<u8>,
+    pub parent: CapabilityMacaroon,
+}
+
+impl PluginEdge {
+    /// A read-only attenuation of the pinned token (what a client presents).
+    pub fn read_token(&self) -> String {
+        self.parent
+            .attenuate(Caveat::ReadOnly)
+            .unwrap()
+            .to_compact_token()
+    }
+    pub fn token_with(&self, caveats: Vec<Caveat>) -> String {
+        let mut t = self.parent.attenuate(Caveat::ReadOnly).unwrap();
+        for c in caveats {
+            t = t.attenuate(c).unwrap();
+        }
+        t.to_compact_token()
+    }
+    pub fn log_text(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+    pub fn client(&self) -> Arc<rustls::ClientConfig> {
+        default_client(&self.leaf_der)
+    }
+}
+
+impl Drop for PluginEdge {
+    fn drop(&mut self) {
+        let _ = self.fuse.kill();
+        let _ = self.fuse.wait();
+    }
+}
+
+/// The plugin binary (`$PARVAULT_PLUGIN_BIN_DIR` or cargo's).
+pub fn fuse_bin() -> PathBuf {
+    match std::env::var_os("PARVAULT_PLUGIN_BIN_DIR") {
+        Some(d) => Path::new(&d).join("parvault-fuse"),
+        None => PathBuf::from(env!("CARGO_BIN_EXE_parvault-fuse")),
+    }
+}
+
+/// An edge PEM file (certificate, key, SAN list) at `path`, mode 0600, as the daemon writes it.
+pub fn write_pem(path: &Path, sans: &[&str]) {
+    use std::os::unix::fs::PermissionsExt;
+    let sans: Vec<String> = sans.iter().map(|s| s.to_string()).collect();
+    std::fs::write(path, parvault::edge_tls::generate_pem(&sans).unwrap()).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// Starts the gateway daemon in `dir` and `parvault-fuse webdav --listen <listen> --tls-pem
+/// <dir>/edge.pem --seed-dir <files>`; waits until it serves HTTPS.
+pub fn plugin_edge(dir: &Path, listen: &str, files: &[(&str, Vec<u8>)]) -> PluginEdge {
+    let pem = dir.join("edge.pem");
+    std::fs::create_dir_all(dir).unwrap();
+    write_pem(&pem, &["127.0.0.1", "::1", "nas.local"]);
+    let (fuse, log, gateway, parent) =
+        spawn_plugin(dir, listen, files, &["--tls-pem", pem.to_str().unwrap()]);
+    let mut fuse = fuse;
+    let text = wait_plugin(&log, &mut fuse, "WebDAV VFS on https://");
+    let port: u16 = text
+        .split("WebDAV VFS on https://")
+        .nth(1)
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|u| u.rsplit(':').next())
+        .and_then(|p| p.parse().ok())
+        .expect("served port");
+    let ip: std::net::IpAddr = if listen.starts_with('[') {
+        std::net::Ipv6Addr::LOCALHOST.into()
+    } else {
+        [127, 0, 0, 1].into()
+    };
+    let leaf_der = leaf_der_of(&std::fs::read(&pem).unwrap());
+    PluginEdge {
+        gateway,
+        fuse,
+        log,
+        addr: SocketAddr::new(ip, port),
+        pem,
+        leaf_der,
+        parent,
+    }
+}
+
+/// The daemon (gateway socket only) and a `parvault-fuse webdav` with `extra` flags; the plugin
+/// may have exited (a refusal). Returns (plugin, its log, the daemon, the pinned token).
+pub fn spawn_plugin(
+    dir: &Path,
+    listen: &str,
+    files: &[(&str, Vec<u8>)],
+    extra: &[&str],
+) -> (Child, PathBuf, Daemon, CapabilityMacaroon) {
+    init_node(dir);
+    let key = [0x5D; 32];
+    std::fs::write(dir.join("macaroon_root.key"), hex::encode(key)).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            dir.join("macaroon_root.key"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let sock = dir.join("gw.sock");
+    let gateway = up(dir, &["--ipc-socket", sock.to_str().unwrap()]);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !sock.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "no gateway socket:\n{}",
+            gateway.log_text()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let parent = CapabilityMacaroon::mint(
+        &key,
+        [0x31; 32],
+        [0x32; 32],
+        vec![Caveat::ExpiresAtUnixMs(u64::MAX)],
+    )
+    .unwrap();
+    let seed = write_seed(&dir.join("plugin"), files);
+    let log = dir.join("fuse.log");
+    let file = std::fs::File::create(&log).unwrap();
+    let fuse = Command::new(fuse_bin())
+        .arg("--socket")
+        .arg(&sock)
+        .arg("--cache-dir")
+        .arg(dir.join("plugin-cache"))
+        .arg("--macaroon")
+        .arg(parent.to_compact_token())
+        .args(["webdav", "--listen", listen, "--seed-dir"])
+        .arg(&seed)
+        .args(extra)
+        .env("RUST_LOG", "info")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::from(file.try_clone().unwrap()))
+        .stderr(Stdio::from(file))
+        .spawn()
+        .unwrap();
+    (fuse, log, gateway, parent)
+}
+
+/// Waits for `marker` in the plugin log; panics with the log if the plugin exits first.
+pub fn wait_plugin(log: &Path, fuse: &mut Child, marker: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        if text.contains(marker) {
+            return text;
+        }
+        if let Ok(Some(st)) = fuse.try_wait() {
+            panic!("parvault-fuse exited ({st}):\n{text}");
+        }
+        assert!(Instant::now() < deadline, "no {marker:?}:\n{text}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Waits for the plugin to exit (a refusal); returns its log.
+pub fn plugin_refusal(log: &Path, fuse: &mut Child) -> String {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Ok(Some(st)) = fuse.try_wait() {
+            assert!(!st.success(), "parvault-fuse exited 0");
+            return std::fs::read_to_string(log).unwrap_or_default();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "parvault-fuse did not refuse:\n{}",
+            std::fs::read_to_string(log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

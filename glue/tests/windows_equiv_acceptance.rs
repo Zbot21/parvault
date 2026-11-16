@@ -4,9 +4,12 @@
 //!
 //! Steps here: 1 certificate, 2 pinning accept (TLS 1.3 and 1.2 ECDHE-ECDSA), 3 pinning reject,
 //! 4 the WebClient transcript (E1+), 5 read and Range read with `cmp` (64 MiB included), 10 log
-//! and environment hygiene. Steps 6 to 8 (a core node's `watch-folder` backup listed through
-//! the catalog, restore by version, scheduler counters) need tracks B2, C and D and are added on
-//! `v0.5.6/integ` (merge order, plan Section 2.3).
+//! and environment hygiene. Steps 6 to 8 need tracks B2, C and D and are added on
+//! `v0.5.6/integ` (merge order, plan Section 2.3), per archC1 (L-133): new files are written by
+//! the vault's writer node, the same node that serves WebDAV (no second writer for one vault,
+//! L-119, C7), then listed, read and restored over TLS; T3's cold read asserts the network-fetch
+//! counter rather than a second daemon holding the vault key; step 10 also greps for the seed
+//! phrase and the vault key hex those steps use (pushed onto `secrets`).
 //!
 //! Every test writes its sentinel (`gate_ran`) last, after its assertions.
 #![cfg(target_os = "linux")]
@@ -337,7 +340,9 @@ fn e1_windows_equivalent() {
     let basic = base64::engine::general_purpose::STANDARD.encode(&cred);
     let log = d.log_text();
     let environ = std::fs::read(format!("/proc/{}/environ", d.child.id())).unwrap_or_default();
-    for needle in [ro.as_str(), basic.as_str()] {
+    // Steps 6-8 (integ) push the seed phrase and the vault key hex here (archC1, L-133).
+    let secrets: Vec<&str> = vec![ro.as_str(), basic.as_str()];
+    for needle in secrets {
         assert!(!log.contains(needle), "token in the daemon log");
         assert!(
             !edge_common::find(&environ, needle.as_bytes()).is_some(),
