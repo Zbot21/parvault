@@ -57,11 +57,9 @@ pub(crate) async fn up(env: CliEnv, command: Commands) -> anyhow::Result<()> {
         })
         .into());
     }
-    // B-174 (track E): the daemon holds the data-dir lock for its lifetime.
-    let _datadir_lock = parvault::datadir_lock::DataDirLock::acquire(
-        &cfg.data_dir,
-        parvault::datadir_lock::LockPurpose::Daemon,
-    )?;
+    // B-174 (track E): the daemon holds the data-dir lock for its lifetime: the one
+    // `onboarding::up_setup_preflight` took before any file was created.
+    let _datadir_lock = parvault::datadir_lock::daemon_lock(&cfg.data_dir)?;
     validate_builtin_vfs_flags(
         vfs_webdav_listen.as_deref(),
         vfs_fuse_fd,
@@ -167,10 +165,7 @@ pub(crate) async fn daemon(env: CliEnv, command: Commands) -> anyhow::Result<()>
             lab_insecure_metrics,
         } => {
             // B-174 (track E): the daemon holds the data-dir lock for its lifetime.
-            let _datadir_lock = parvault::datadir_lock::DataDirLock::acquire(
-                &cfg.data_dir,
-                parvault::datadir_lock::LockPurpose::Daemon,
-            )?;
+            let _datadir_lock = parvault::datadir_lock::daemon_lock(&cfg.data_dir)?;
             validate_builtin_vfs_flags(
                 vfs_webdav_listen.as_deref(),
                 vfs_fuse_fd,

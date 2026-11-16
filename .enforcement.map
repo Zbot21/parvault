@@ -379,4 +379,13 @@ reach      PROBE-REACH sym=src/probe.rs::probe_target_decision from=src/cli/net.
 # --- B-142 (v0.5.4): a bootstrap address's /p2p/ PeerId is enforced on the daemon's startup dial ---
 claim      B-142     sym=src/network/traversal_gate.rs::dial_peer_id_decision accept=traversal_metrics::b142_bootstrap_peer_id_matches_and_connects reject=traversal_metrics::b142_bootstrap_peer_id_mismatch_refused code=reject.dial_peer_id_mismatch bin=parvault ref=docs/security/TRUST_FINDINGS.md
 
+# --- v0.5.6 track E: setup and ops (plan 3.12-3.15; arch056a A-146, arch056b K1-K12, arch056c 2) -
+claim      B174-LOCK sym=src/datadir_lock.rs::acquire accept=trust_enforcement_setup::b174_concurrent_init_one_ring reject=trust_enforcement_setup::b174_second_holder_refused code=reject.datadir_locked bin=parvault ref=docs/security/TRUST_FINDINGS.md   # A-146-1: one data dir, one holder; up holds it from its preflight until the daemon exits
+claim      B146-INIT sym=src/datadir_lock.rs::init_if_absent_decision accept=trust_enforcement_setup::b146_empty_volume_inits_once reject=trust_enforcement_setup::b146_unknown_volume_refused code=reject.init_volume_not_empty bin=parvault ref=docs/security/TRUST_FINDINGS.md   # Q6, A-146-3: only an empty volume inits
+claim      B146-PARTIAL sym=src/datadir_lock.rs::init_if_absent_decision accept=trust_enforcement_setup::b146_seed_without_pin_resumes reject=trust_enforcement_setup::b146_partial_states_refused_unchanged code=reject.init_partial_state bin=parvault ref=docs/security/TRUST_FINDINGS.md   # A-146-2, arch056c 2.1-2.3: resume a seed without its pin; never a second genesis
+kani       B146-INIT-K sym=src/datadir_lock.rs::init_if_absent_decision harness=proof_init_if_absent_never_second_genesis cover=unknown volume refused
+reach      B146-REACH sym=src/datadir_lock.rs::init_if_absent_decision from=src/cli/onboarding.rs::up_setup_preflight
+claim      B146-JOIN-MODE sym=src/cli/onboarding.rs::join_token_decision accept=trust_enforcement_setup::b146_join_token_file_joins_once reject=trust_enforcement_setup::b146_join_token_mode_refused code=reject.join_token_mode bin=parvault ref=docs/security/TRUST_FINDINGS.md   # A-146-5: join tokens from a 0600 file only
+claim      B146-JOIN-USED sym=src/cli/onboarding.rs::join_token_decision accept=trust_enforcement_setup::b146_join_token_file_joins_once reject=trust_enforcement_setup::b146_join_token_used_refused code=reject.join_token_used bin=parvault ref=docs/security/TRUST_FINDINGS.md   # A-146-4: a token is consumed once
+
 ratchet    R         open=1 waive=32

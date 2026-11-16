@@ -3,23 +3,197 @@
 use super::CliEnv;
 use crate::*;
 
-/// `up --init-if-absent` and `up --join-token-file` (B-146 item 8, A-146-1 to A-146-5; `v0.5.6`
-/// track E): run by `main` before `up` creates any file in the data dir. Without either flag
-/// it does nothing. T0 stub: either flag is refused (`reject.not_built_yet`).
+/// The file in the data dir that records the SHA-256 of every join token this node consumed
+/// (A-146-4: a token is consumed once).
+pub(crate) const JOIN_TOKEN_USED_FILE: &str = "join_tokens.used";
+
+/// Refusal: `PARVAULT_JOIN_TOKEN` is set; join tokens come from a file only (A-146-5).
+pub(crate) const JOIN_TOKEN_ENV: &str = "reject.join_token_env";
+
+/// `up` before it creates any file in the data dir (B-146 item 8, B-174, A-146-1 to A-146-5;
+/// `v0.5.6` track E), run by `main`. It takes the data-dir lock for every `up` and parks it for
+/// the daemon, which holds it until it exits (qa-t0, proposal g), so a second `up` on the same
+/// volume is refused (`reject.datadir_locked`) before it writes anything. Under the lock it
+/// sweeps the genesis staging files (arch056c 2.4) and, with `--init-if-absent` or
+/// `--join-token-file`, applies [`parvault::datadir_lock::init_if_absent_decision`].
 pub(crate) fn up_setup_preflight(
     data_dir: &Path,
     init_if_absent: bool,
     join_token_file: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let _ = data_dir;
-    if !init_if_absent && join_token_file.is_none() {
-        return Ok(());
+    use parvault::datadir_lock::{
+        classify_volume, hold_for_process, init_if_absent_decision, DataDirLock, InitIfAbsent,
+        LockPurpose,
+    };
+    if std::env::var_os("PARVAULT_JOIN_TOKEN").is_some() {
+        tracing::warn!(code = JOIN_TOKEN_ENV, "refused: PARVAULT_JOIN_TOKEN is set");
+        anyhow::bail!(
+            "{JOIN_TOKEN_ENV}: PARVAULT_JOIN_TOKEN is not read (an env var shows in `docker \
+             inspect`); put the token in a 0600 file and pass --join-token-file <FILE>"
+        );
     }
-    Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt {
-        track: "E",
-        entry: "up --init-if-absent / --join-token-file",
-    })
-    .into())
+    let lock = DataDirLock::acquire(data_dir, LockPurpose::Daemon)?;
+    let swept = NodeIdentity::sweep_genesis_staging_files(data_dir)?;
+    if swept > 0 {
+        tracing::info!(swept, "removed genesis staging files left by a killed init");
+    }
+    if init_if_absent || join_token_file.is_some() {
+        // The token file is ignored by name when it lives in the data dir (A-146-3).
+        let ignored = join_token_file
+            .filter(|f| f.parent().is_some_and(|p| same_dir(p, data_dir)))
+            .and_then(|f| f.file_name());
+        let state = classify_volume(data_dir, ignored)?;
+        match init_if_absent_decision(state, join_token_file.is_some(), init_if_absent) {
+            InitIfAbsent::Skip | InitIfAbsent::OwnRing => {}
+            InitIfAbsent::Init => {
+                let genesis = NodeIdentity::init_ring_genesis_in_dir(data_dir)?;
+                tracing::info!(
+                    ring = %hex::encode(genesis.public_key_bytes()),
+                    "started a new ring (up --init-if-absent)"
+                );
+                println!(
+                    "Started a new ring. Genesis public key: {}",
+                    hex::encode(genesis.public_key_bytes())
+                );
+            }
+            InitIfAbsent::ResumePin => {
+                let pk = NodeIdentity::resume_ring_pin_from_seed_file(data_dir)?;
+                tracing::info!(ring = %hex::encode(pk), "completed an interrupted ring init");
+            }
+            InitIfAbsent::Join => {
+                let file = join_token_file.expect("Join only with a token file");
+                join_from_token_file(data_dir, file)?;
+            }
+            InitIfAbsent::Refuse(code) => {
+                tracing::warn!(code, ?state, "refused: up --init-if-absent");
+                anyhow::bail!("{code}: {}", refusal_text(code, data_dir));
+            }
+        }
+    }
+    hold_for_process(lock);
+    Ok(())
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+fn refusal_text(code: &str, data_dir: &Path) -> String {
+    match code {
+        c if c.ends_with("volume_not_empty") => format!(
+            "{} is not empty and holds no ring; refusing to start a new ring over it (use an \
+             empty volume, or restore it with `parvault ring restore`)",
+            data_dir.display()
+        ),
+        _ => format!(
+            "{} holds a partial or conflicting ring state (a pin without its seed or chain, or \
+             a seed and pin for different keys); it is left as it is",
+            data_dir.display()
+        ),
+    }
+}
+
+/// What `up --join-token-file` does with a token (claim `B146-JOIN`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinStep {
+    /// Install it (first use).
+    Install,
+    /// Used before and this node is in its ring: nothing to do (a restart).
+    AlreadyMember,
+}
+
+/// The join-token decision (claim `B146-JOIN`, A-146-4, A-146-5): a token file that is not a
+/// regular `0600` file of this user is refused (`reject.join_token_mode`); a token whose hash
+/// is recorded is a no-op while this node is in its ring and is refused otherwise
+/// (`reject.join_token_used`: a consumed token is never replayed).
+pub(crate) fn join_token_decision(
+    owner_only: bool,
+    used_before: bool,
+    member: bool,
+) -> Result<JoinStep, &'static str> {
+    if !owner_only {
+        return Err("reject.join_token_mode");
+    }
+    match (used_before, member) {
+        (false, _) => Ok(JoinStep::Install),
+        (true, true) => Ok(JoinStep::AlreadyMember),
+        (true, false) => Err("reject.join_token_used"),
+    }
+}
+
+/// `up --join-token-file` (A-146-4, A-146-5): the token is read with the owner-only rule, then
+/// joined once, as this node's own key (A-146-7). A failed join is an error, never an init.
+fn join_from_token_file(data_dir: &Path, file: &Path) -> anyhow::Result<()> {
+    use parvault::capabilities::{read_owner_only_file, OwnerFileRefusal};
+    use sha2::{Digest, Sha256};
+    let (raw, owner_only) = match read_owner_only_file(file) {
+        Ok(raw) => (Some(raw), true),
+        Err(OwnerFileRefusal::NotOwnerOnly { is_file, uid, mode }) => {
+            tracing::warn!(is_file, uid, mode, "join token file is not owner-only");
+            (None, false)
+        }
+        Err(e) => anyhow::bail!("cannot read the join token file {}: {e:?}", file.display()),
+    };
+    if let Err(code) = join_token_decision(owner_only, false, false) {
+        tracing::warn!(code, "refused: join token file");
+        anyhow::bail!(
+            "{code}: {} must be a regular file owned by this user with mode 0600 (chmod 600)",
+            file.display()
+        );
+    }
+    let raw = raw.expect("read when owner-only");
+    let text = std::str::from_utf8(&raw)
+        .map_err(|_| anyhow::anyhow!("{} is not a token: it is not text", file.display()))?
+        .trim()
+        .to_string();
+    let hash = hex::encode(Sha256::digest(text.as_bytes()));
+    let used_path = data_dir.join(JOIN_TOKEN_USED_FILE);
+    let used = std::fs::read_to_string(&used_path).unwrap_or_default();
+    let used_before = used.lines().any(|l| l.trim() == hash);
+    let invitation = super::wot::decode_invitation(&text)?;
+    let member = used_before && super::wot::is_member_of(data_dir, &invitation);
+    match join_token_decision(true, used_before, member) {
+        Ok(JoinStep::AlreadyMember) => {
+            tracing::info!("join token already used; this node is in its ring");
+            return Ok(());
+        }
+        Ok(JoinStep::Install) => {}
+        Err(code) => {
+            tracing::warn!(code, "refused: join token reused");
+            anyhow::bail!(
+                "{code}: this join token was used before and this node is no longer in its \
+                 ring; ask the ring holder for a new invite"
+            );
+        }
+    }
+    // The invite is bound to the invitee's key (A-146-7): a daemon joins only as itself.
+    let node = NodeIdentity::load_or_generate_in_dir(data_dir)?;
+    if invitation.chain.leaf_pubkey() != Some(node.public_key_bytes()) {
+        anyhow::bail!(
+            "this join token is for the key {}, not this node's key {}: ask the ring holder to \
+             invite this node's key (`parvault identity`)",
+            invitation
+                .chain
+                .leaf_pubkey()
+                .map(hex::encode)
+                .unwrap_or_default(),
+            hex::encode(node.public_key_bytes())
+        );
+    }
+    let msg = super::wot::install_invitation(data_dir, &invitation)?;
+    let mut next = used;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str(&hash);
+    next.push('\n');
+    parvault::storage::fsio::atomic_write_file(&used_path, next.as_bytes())?;
+    tracing::info!("{msg}");
+    println!("{msg}");
+    Ok(())
 }
 
 pub(crate) async fn discover(env: CliEnv, command: Commands) -> anyhow::Result<()> {
