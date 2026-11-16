@@ -680,9 +680,10 @@ impl BlockStore {
         if let Some(ref mem) = self.in_memory {
             let max_cap = {
                 let mut q = self.quota.lock().expect("quota mutex poisoned");
-                q.roll_epoch_if_due(std::time::Instant::now()); // B-162
-                                                                // B-152 (a), C31: the held-shard bound is decided before any eviction; a
-                                                                // full count refuses, it never evicts to make room.
+                // B-162: a new write epoch once the current one has run its length.
+                q.roll_epoch_if_due(std::time::Instant::now());
+                // B-152 (a), C31: the held-shard bound is decided before any eviction; a full
+                // count refuses, it never evicts to make room.
                 if let Some((bound, held)) = q.held_shard_bound() {
                     if let Err(code) = crate::storage::quota::held_shard_decision(held, bound.max) {
                         tracing::warn!(
