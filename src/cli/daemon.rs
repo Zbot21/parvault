@@ -52,10 +52,8 @@ pub(crate) async fn run_daemon(
         .map_err(|code| anyhow::anyhow!("{code}"))?;
     parvault::config::lab_startup_decision(&opts.eff)
         .map_err(|(code, detail)| anyhow::anyhow!("{code}: {detail}"))?;
-    // B-180: the socket group applies to the gateway socket only.
-    if opts.gateway_socket_group.is_some() && opts.ipc_socket.is_none() {
-        anyhow::bail!("--gateway-socket-group needs --ipc-socket");
-    }
+    // B-180 (`--gateway-socket-group needs --ipc-socket`) and the T0 refusals of the edge TLS
+    // flags and the socket group: `main::validate_early_command_flags`, before any file exists.
     let deterministic = opts.eff.deterministic();
     let dial_set = Arc::new(opts.eff.dial_set());
     info!(config_digest = %opts.config_digest, deterministic, "effective configuration");
