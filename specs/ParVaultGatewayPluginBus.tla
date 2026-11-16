@@ -15,6 +15,7 @@
 \*   action   FetchRange        -> src/gateway/ipc.rs::IpcCommand::FetchRange
 \*   action   FetchPayload      -> src/gateway/ipc.rs::IpcCommand::FetchPayload
 \*   action   QueryStatus       -> src/gateway/ipc.rs::IpcCommand::QueryStatus
+\*   action   QueryStatus       -> src/gateway/ipc.rs::IpcCommand::QueryLiveStatus
 \*   action   RegisterManifest  -> src/gateway/ipc.rs::IpcCommand::RegisterManifest
 \*   action   QueryHealthStatus -> src/gateway/ipc.rs::IpcCommand::QueryHealthStatus
 \*   action   QueryHealthStatusAuthed -> src/gateway/ipc.rs::IpcCommand::QueryHealthStatusAuthed
@@ -29,8 +30,7 @@
 \* The gateway plugin bus (ADR-27, ADR-32): the SO_PEERCRED UID allowlist per connection, the
 \* macaroon check on every command (ADR-28; since B-16 store, register and health too, and no
 \* root key means no service), the immutable ingest memfd, and QueryStatus. Plan-4 ruling (L-49).
-\* rootKeySet stays a choice in Init: every shipped gateway has a key, but a library-built engine
-\* may not, and the model shows it then serves nothing.
+\* rootKeySet stays a choice in Init: every shipped gateway has a key, but a library-built engine may not, and the model shows it then serves nothing.
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS

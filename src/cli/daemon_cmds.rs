@@ -37,11 +37,31 @@ pub(crate) async fn up(env: CliEnv, command: Commands) -> anyhow::Result<()> {
         vfs_fuse_fd,
         vfs_seed_dir,
         vfs_cache_mib,
+        // Run by `main` before this (`onboarding::up_setup_preflight`, track E).
+        init_if_absent: _,
+        join_token_file: _,
+        tls_san,
+        insecure_plain_http,
+        gateway_socket_group,
+        no_gc,
         dump_config: _,
     } = command
     else {
         unreachable!("up() is only dispatched for Commands::Up")
     };
+    if no_gc {
+        // v0.5.6 T0 stub (G3): track B2 builds the version GC this turns off.
+        return Err(parvault::seam::not_built_yet(parvault::seam::Stub {
+            track: "B2",
+            entry: "--no-gc",
+        })
+        .into());
+    }
+    // B-174 (track E): the daemon holds the data-dir lock for its lifetime.
+    let _datadir_lock = parvault::datadir_lock::DataDirLock::acquire(
+        &cfg.data_dir,
+        parvault::datadir_lock::LockPurpose::Daemon,
+    )?;
     validate_builtin_vfs_flags(
         vfs_webdav_listen.as_deref(),
         vfs_fuse_fd,
@@ -90,6 +110,12 @@ pub(crate) async fn up(env: CliEnv, command: Commands) -> anyhow::Result<()> {
         public_trackers,
         external_addrs,
         trust_mode,
+        edge_tls: parvault::edge_tls::EdgeTlsConfig {
+            extra_sans: tls_san,
+            insecure_plain_http,
+        },
+        gateway_socket_group,
+        no_gc,
         eff,
         config_digest,
         #[cfg(feature = "lab-insecure-metrics")]
@@ -133,10 +159,18 @@ pub(crate) async fn daemon(env: CliEnv, command: Commands) -> anyhow::Result<()>
             vfs_fuse_fd,
             vfs_seed_dir,
             vfs_cache_mib,
+            tls_san,
+            insecure_plain_http,
+            gateway_socket_group,
             dump_config: _,
             #[cfg(feature = "lab-insecure-metrics")]
             lab_insecure_metrics,
         } => {
+            // B-174 (track E): the daemon holds the data-dir lock for its lifetime.
+            let _datadir_lock = parvault::datadir_lock::DataDirLock::acquire(
+                &cfg.data_dir,
+                parvault::datadir_lock::LockPurpose::Daemon,
+            )?;
             validate_builtin_vfs_flags(
                 vfs_webdav_listen.as_deref(),
                 vfs_fuse_fd,
@@ -178,6 +212,12 @@ pub(crate) async fn daemon(env: CliEnv, command: Commands) -> anyhow::Result<()>
                 public_trackers,
                 external_addrs,
                 trust_mode,
+                edge_tls: parvault::edge_tls::EdgeTlsConfig {
+                    extra_sans: tls_san,
+                    insecure_plain_http,
+                },
+                gateway_socket_group,
+                no_gc: false,
                 eff,
                 config_digest,
                 #[cfg(feature = "lab-insecure-metrics")]

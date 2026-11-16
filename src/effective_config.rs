@@ -627,6 +627,12 @@ impl EffectiveConfig {
                 vfs_fuse_fd,
                 vfs_seed_dir,
                 vfs_cache_mib,
+                init_if_absent,
+                join_token_file,
+                tls_san,
+                insecure_plain_http,
+                gateway_socket_group,
+                no_gc,
                 dump_config: _,
             } => {
                 if let Some(l) = listen {
@@ -673,6 +679,18 @@ impl EffectiveConfig {
                     ("vfs_fuse_fd", serde_json::json!(vfs_fuse_fd)),
                     ("vfs_seed_dir", serde_json::json!(vfs_seed_dir)),
                     ("vfs_cache_mib", serde_json::json!(vfs_cache_mib)),
+                    ("init_if_absent", serde_json::json!(init_if_absent)),
+                    ("join_token_file", serde_json::json!(join_token_file)),
+                    ("tls_san", serde_json::json!(tls_san)),
+                    (
+                        "insecure_plain_http",
+                        serde_json::json!(insecure_plain_http),
+                    ),
+                    (
+                        "gateway_socket_group",
+                        serde_json::json!(gateway_socket_group),
+                    ),
+                    ("no_gc", serde_json::json!(no_gc)),
                 ]);
             }
             Commands::Daemon {
@@ -692,6 +710,9 @@ impl EffectiveConfig {
                         vfs_fuse_fd,
                         vfs_seed_dir,
                         vfs_cache_mib,
+                        tls_san,
+                        insecure_plain_http,
+                        gateway_socket_group,
                         dump_config: _,
                         #[cfg(feature = "lab-insecure-metrics")]
                         lab_insecure_metrics,
@@ -746,6 +767,15 @@ impl EffectiveConfig {
                     ("vfs_fuse_fd", serde_json::json!(vfs_fuse_fd)),
                     ("vfs_seed_dir", serde_json::json!(vfs_seed_dir)),
                     ("vfs_cache_mib", serde_json::json!(vfs_cache_mib)),
+                    ("tls_san", serde_json::json!(tls_san)),
+                    (
+                        "insecure_plain_http",
+                        serde_json::json!(insecure_plain_http),
+                    ),
+                    (
+                        "gateway_socket_group",
+                        serde_json::json!(gateway_socket_group),
+                    ),
                 ]);
             }
             _ => {}

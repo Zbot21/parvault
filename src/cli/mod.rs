@@ -11,6 +11,8 @@ pub(crate) mod identity;
 pub(crate) mod maintenance;
 pub(crate) mod net;
 pub(crate) mod onboarding;
+pub(crate) mod ring_backup;
+pub(crate) mod tls;
 pub(crate) mod wot;
 
 use crate::*;

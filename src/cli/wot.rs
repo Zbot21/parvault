@@ -2,12 +2,15 @@
 
 use parvault::config::WotAction;
 use parvault::crypto::NodeIdentity;
+use parvault::datadir_lock::{DataDirLock, LockPurpose};
 use parvault::network::admission::{issue_invitation, AdmissionSource, RingInvitation};
 use std::path::Path;
 
 pub(crate) fn run(action: WotAction, data_dir: &Path) -> anyhow::Result<()> {
     match action {
         WotAction::Init => {
+            // B-174 (track E): init runs under the data-dir lock.
+            let _lock = DataDirLock::acquire(data_dir, LockPurpose::RingInit)?;
             let genesis = NodeIdentity::init_ring_genesis_in_dir(data_dir)?;
             println!(
                 "Started a new ring. Genesis public key: {}",
@@ -17,7 +20,15 @@ pub(crate) fn run(action: WotAction, data_dir: &Path) -> anyhow::Result<()> {
                 "Invite another node with: parvault wot invite --peer <its Ed25519 public key>"
             );
         }
-        WotAction::Invite { peer } => {
+        WotAction::Invite { peer, out } => {
+            if out.is_some() {
+                // v0.5.6 T0 stub (G3): track E writes the file (A-146-6).
+                return Err(parvault::seam::not_built_yet(parvault::seam::Stub {
+                    track: "E",
+                    entry: "wot invite --out",
+                })
+                .into());
+            }
             let raw = hex::decode(peer.trim())?;
             anyhow::ensure!(
                 raw.len() == 32,
@@ -38,6 +49,8 @@ pub(crate) fn run(action: WotAction, data_dir: &Path) -> anyhow::Result<()> {
             println!("{}", invitation.encode_hex()?);
         }
         WotAction::InstallChain { token } => {
+            // B-174 (track E): a join runs under the data-dir lock.
+            let _lock = DataDirLock::acquire(data_dir, LockPurpose::InstallChain)?;
             let invitation = RingInvitation::decode_hex(&token)?;
             anyhow::ensure!(
                 invitation.chain.hops.first().map(|h| h.inviter_pubkey)

@@ -58,6 +58,11 @@ pub enum TokenAction {
         /// Emit structured JSON output instead of the raw `PARVAULT-MAC-V1:...` string.
         #[arg(long, default_value_t = false)]
         json: bool,
+
+        /// Write the token to this file (`0600`, atomically) and print only its path
+        /// (`v0.5.6`, A-146-5; Q4: minted under 255 characters, a warning above).
+        #[arg(long, value_name = "FILE")]
+        out: Option<std::path::PathBuf>,
     },
 
     /// Offline caveat attenuation: narrow an existing `PARVAULT-MAC-V1:` token with zero root key access.
@@ -418,8 +423,17 @@ pub fn execute_token_cli(action: TokenAction, data_dir: &Path) -> anyhow::Result
             write,
             allow_peer_uid,
             json,
+            out,
         } => {
             let _ = read_only; // the default since B-16
+            if out.is_some() {
+                // v0.5.6 T0 stub (G3): track A writes the file.
+                return Err(crate::seam::not_built_yet(crate::seam::Stub {
+                    track: "A",
+                    entry: "token mint --out",
+                })
+                .into());
+            }
             let root_key = load_or_create_macaroon_root_key(data_dir, macaroon_key_hex.as_deref())?;
             let nonce_id: [u8; 32] = OsRng.gen();
             let issuer_fp = derive_key_id_bytes(&key_id);

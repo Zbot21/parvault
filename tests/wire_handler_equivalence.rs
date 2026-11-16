@@ -716,6 +716,7 @@ fn covering_case(req: &MeshWireRequest) -> &'static str {
         }
         MeshWireRequest::AdmitPublicTicket(_) => "admit_public_ticket",
         MeshWireRequest::ChunkAudit(_) => "chunk_audit",
+        MeshWireRequest::FreeShards { .. } => "free_shards",
     }
 }
 
@@ -1024,6 +1025,37 @@ fn delete_shard() {
     for fx in &t.fx {
         assert!(!fx.store.has_shard(&sid2), "{:?}: shard deleted", fx.role);
         assert_eq!(fx.hosted(&device), 0, "{:?}: released in full", fx.role);
+    }
+}
+
+// --- FreeShards (v0.5.6 T0 stub, identical) -----------------------------------------------------
+
+/// B-158: until track B1 builds the host path, both handlers refuse every order the same way
+/// and free nothing; B1 replaces this case with the real accept and refuse cases.
+#[test]
+fn free_shards() {
+    let _g = env_guard();
+    let mut t = Trio::new("free");
+    let peer = Peer::new(0x63, "198.51.100.4");
+    t.admit(&peer);
+    let device = peer.ident.device_peer_id();
+    let (sid, bytes) = shard(6, 1024);
+    t.run(&peer, &put_shard_req("", sid, bytes, [6; 32]));
+    let order = parvault::network::FreeShardsOrder {
+        host_ed25519_pubkey: [0; 32],
+        owner_ed25519_pubkey: peer.ident.public_key_bytes(),
+        timestamp_ms: now_ms(),
+        gc_epoch: 1,
+        shard_ids: vec![sid],
+        signature: vec![0; 64],
+    };
+    let o = t.run(&peer, &MeshWireRequest::FreeShards { order });
+    assert!(o[0].resp.starts_with("FreeShardsAck"), "{}", o[0].resp);
+    assert!(o[0].resp.contains("not_built_yet"), "{}", o[0].resp);
+    assert_identical(&o);
+    for fx in &t.fx {
+        assert!(fx.store.has_shard(&sid), "{:?}: nothing freed", fx.role);
+        assert_eq!(fx.hosted(&device), 1024, "{:?}: quota unchanged", fx.role);
     }
 }
 

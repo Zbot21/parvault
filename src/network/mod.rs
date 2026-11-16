@@ -5,6 +5,7 @@ pub mod council_fetch;
 pub mod discovery;
 pub mod placement;
 pub mod rate_limit;
+pub mod redial;
 pub mod server_events;
 pub mod transport;
 pub mod traversal_classify;
@@ -15,8 +16,9 @@ pub mod wot;
 
 pub use behaviour::{
     classify_ip_asn, effective_kademlia_distance, ipv4_same_slash24, ipv6_same_slash48,
-    is_routable_public_ip, DhtEnvelopeKind, DhtWireEnvelope, MeshNetworkBehaviour, MeshWireRequest,
-    MeshWireResponse,
+    is_routable_public_ip, DhtEnvelopeKind, DhtWireEnvelope, FreeShardOutcome, FreeShardsOrder,
+    MeshNetworkBehaviour, MeshWireRequest, MeshWireResponse, FREE_ORDER_DOMAIN,
+    MAX_FREE_ORDER_SHARDS,
 };
 pub use client::{is_network_peer_addr, parse_peer_multiaddr, MeshClient, OnionOriginator};
 pub use discovery::{

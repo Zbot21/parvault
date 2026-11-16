@@ -25,6 +25,12 @@ pub(crate) struct DaemonLaunchOptions {
     pub(crate) public_trackers: Vec<String>,
     pub(crate) external_addrs: Vec<String>,
     pub(crate) trust_mode: TrustPoolMode,
+    /// `--tls-san`, `--insecure-plain-http` (B-1, `v0.5.6` track A).
+    pub(crate) edge_tls: parvault::edge_tls::EdgeTlsConfig,
+    /// `--gateway-socket-group` (B-180, `v0.5.6`).
+    pub(crate) gateway_socket_group: Option<String>,
+    /// `up --no-gc`: no version GC in the background folder sync (B-154, `v0.5.6` track B2).
+    pub(crate) no_gc: bool,
     /// The resolved configuration (`docs/LAB_MODE.md`).
     pub(crate) eff: Arc<parvault::config::EffectiveConfig>,
     /// Hex SHA-256 of the `parvault.config-dump/1` of this command.
@@ -46,6 +52,10 @@ pub(crate) async fn run_daemon(
         .map_err(|code| anyhow::anyhow!("{code}"))?;
     parvault::config::lab_startup_decision(&opts.eff)
         .map_err(|(code, detail)| anyhow::anyhow!("{code}: {detail}"))?;
+    // B-180: the socket group applies to the gateway socket only.
+    if opts.gateway_socket_group.is_some() && opts.ipc_socket.is_none() {
+        anyhow::bail!("--gateway-socket-group needs --ipc-socket");
+    }
     let deterministic = opts.eff.deterministic();
     let dial_set = Arc::new(opts.eff.dial_set());
     info!(config_digest = %opts.config_digest, deterministic, "effective configuration");
@@ -162,6 +172,13 @@ pub(crate) async fn run_daemon(
     };
     let beacon_handle = spawn_beacon(&opts, &block_store, local, bound_tcp_port, init_explicit_ip);
 
+    // A-TLS-6 (track A): the edge certificate, made at the first `up` (never at `init`) and
+    // before any edge listener binds. `None`: plain HTTP, as before v0.5.6.
+    let edge_cert = parvault::edge_tls::ensure_cert(&cfg.data_dir, &opts.edge_tls)?;
+    if let Some(ref cert) = edge_cert {
+        info!(spki_sha256 = %hex::encode(cert.spki_sha256), "edge TLS certificate");
+    }
+
     let status_state = spawn_status_server(&opts, &cfg, &block_store, local, start_instant).await?;
 
     #[cfg(unix)]
@@ -222,8 +239,9 @@ pub(crate) async fn run_daemon(
     let mut ipc_gateway_handle = if let (Some(ref sock_path), Some(ref eng)) =
         (&opts.ipc_socket, &shared_gateway_engine)
     {
-        let handle =
-            parvault::gateway::ipc::GatewayIpcServer::bind(sock_path, Arc::clone(eng))?.spawn()?;
+        let handle = parvault::gateway::ipc::GatewayIpcServer::bind(sock_path, Arc::clone(eng))?
+            .with_socket_group(opts.gateway_socket_group.as_deref())?
+            .spawn()?;
         println!(
             "[parvault] Zero-Copy IPC Gateway listening on unix://{} (strict_plugins={}, sealed_memfd={})",
             sock_path.display(),
@@ -283,6 +301,9 @@ pub(crate) async fn run_daemon(
             Some(ref key) => vfs.with_default_macaroon(Some(builtin_vfs_read_token(key)?)),
             None => vfs,
         };
+        // B-20 (track C): the vault catalogs this data dir holds keys for, imported at start and
+        // on a timer, then hydrated by the scavenger (S1).
+        vfs.start_catalog_import(&cfg.data_dir, &block_store)?;
         if let Some(fuse_fd) = opts.vfs_fuse_fd {
             let fuse_dev = parvault::os_sys::adopt_fuse_dev_fd(fuse_fd)?;
             let vfs_fuse = vfs.clone();
@@ -363,6 +384,13 @@ pub(crate) async fn run_daemon(
     // No gossip topic is subscribed: slashing evidence is not applied from gossip until it is
     // proof-carrying (item 2c). A single reporter's accusation must never quarantine a key (F-01).
 
+    // B-157 (track D): configured peers are redialled after a close (R1-R4).
+    let mut redial = parvault::network::redial::RedialTask::new(
+        block_store
+            .mesh_client()
+            .map(|c| c.all_network_endpoints())
+            .unwrap_or_default(),
+    );
     if let Some(client) = block_store.mesh_client() {
         for peer_str in client.all_network_endpoints() {
             if let Ok(addr) = parvault::network::parse_peer_multiaddr(&peer_str) {
@@ -410,6 +438,9 @@ pub(crate) async fn run_daemon(
         tokio::select! {
             Some(done) = server_events.next_deferred(), if server_events.has_deferred() => {
                 server_events.send_deferred(&mut swarm, done);
+            }
+            () = redial.due() => {
+                redial.dial_due(&mut swarm);
             }
             event = swarm.select_next_some() => {
                 let unhandled = server_events.handle(&mut swarm, event, |peer_str, remote_addr, request, syndication_load| {
@@ -695,6 +726,7 @@ fn spawn_folder_sync(opts: &DaemonLaunchOptions, cfg: &NodeConfig, block_store: 
         let sync_store = block_store.clone();
         let sync_tier = opts.sync_tier;
         let sync_interval = opts.sync_interval_secs.max(1);
+        let gc_enabled = !opts.no_gc;
         info!(folder = %sync_folder.display(), interval_secs = sync_interval, "Starting background continuous folder sync");
         tokio::spawn(async move {
             let snap_path = sync_data_dir.join("appliance_folder_snapshot.manifest.bin");
@@ -734,6 +766,10 @@ fn spawn_folder_sync(opts: &DaemonLaunchOptions, cfg: &NodeConfig, block_store: 
                     let updated = updated?;
                     if let Ok(bytes) = bincode::serialize(&updated) {
                         let _ = BlockStore::atomic_write_file(&snap_cl, &bytes);
+                    }
+                    // B-154 (track B2): version GC after the pass, unless `up --no-gc`.
+                    if gc_enabled {
+                        engine.gc_after_pass(&updated, &data_dir_cl)?;
                     }
                     Ok(())
                 })

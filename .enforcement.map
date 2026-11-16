@@ -21,6 +21,12 @@ artifact   A-DOCKER  script=scripts/docker_acceptance_gate.sh bin=parvault suite
 enum       E-WIRE    sym=src/network/behaviour.rs::MeshWireRequest exclude=QueryNodeStatus,LookupWanRendezvous
 adr        D-ADR     path=docs/adr/*.md
 
+# --- v0.5.6 T0 seam (architecture/plans/v0.5.6-usability.md Section 2.1) -------------------------
+# `reject.not_built_yet` is written once, in src/seam.rs: the refusal of every stubbed new entry
+# point (flag, command, IPC command, wire request, route). A placeholder, not a trust decision, so
+# no claim. G3 (release gate E8): `grep -rn reject.not_built_yet src` is empty at v0.5.6; each track
+# deletes its stub calls, and the Lead deletes src/seam.rs at integration.
+
 # --- Reach: checks that exist but are not called on the wire path ----------------------------------
 reach      F-03      sym=src/network/wire_handler.rs::admission_decision from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
 reach      F-05      sym=src/network/wot.rs::verify_and_admit_public_ticket from=src/network/wire_handler.rs::handle_mesh_wire_request ref=docs/security/TRUST_FINDINGS.md
@@ -178,7 +184,7 @@ claim      F-25-DHT  sym=src/network/wire_handler.rs::admission_decision accept=
 # function exists (an unknown sym is an error even under expect=claim-missing).
 # Findings with no line yet (no check function exists to name): F-12.
 
-claim      F-36      sym=src/por/verifier.rs::shard_delete_decision accept=trust_enforcement::f36_storer_deletes_its_shard reject=trust_enforcement::f36_other_key_cannot_delete_shard code=reject.delete_not_shard_owner bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::DeleteShard
+claim      F-36      sym=src/por/verifier.rs::shard_delete_decision accept=trust_enforcement::f36_storer_deletes_its_shard reject=trust_enforcement::f36_other_key_cannot_delete_shard code=reject.delete_not_shard_owner bin=parvault ref=docs/security/TRUST_FINDINGS.md covers=MeshWireRequest::DeleteShard,MeshWireRequest::FreeShards   # v0.5.6 T0 (B-154 table, F-36 extend): FreeShards is decided per shard by shard_delete_decision once track B1 builds it; until then its dispatch arm is a reject.not_built_yet stub (G3)
 claim      F-54      sym=src/network/discovery.rs::wan_card_pairing_decision accept=trust_enforcement::b45_wan_card_of_code_identity_joined reject=trust_enforcement::b45_wan_card_of_other_identity_refused code=reject.wan_card_code_mismatch bin=parvault ref=docs/security/TRUST_FINDINGS.md   # B-45: raises the forging cost to about 2^44 offline hashes; PAKE pairing (v0.5.7) is the fix (B-92)
 claim      F-58      sym=src/network/discovery.rs::wan_ddns_card_decision accept=trust_enforcement::b91_ddns_card_of_pinned_peer_heals reject=trust_enforcement::b91_ddns_card_of_unknown_peer_refused code=reject.wan_ddns_peer_unknown bin=parvault ref=docs/security/TRUST_FINDINGS.md   # B-91: DDNS heals pinned peers only; public-tracker pinning is B-94
 claim      F-22      sym=src/network/wan_rendezvous.rs::rendezvous_register_decision accept=trust_enforcement::f22_rendezvous_within_quota_stored reject=trust_enforcement::f22_rendezvous_over_quota_refused code=reject.rendezvous_quota bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-23-online-wan-rendezvous-and-stun-over-noise.md covers=MeshWireRequest::RegisterWanRendezvous
@@ -298,10 +304,10 @@ noenforce  N-30      adr=docs/adr/ADR-30-filesystem-free-in-memory-seed-mode.md 
 noenforce  N-31      adr=docs/adr/ADR-31-unsafe-remediation-and-os-sys-ffi-boundary.md reason=enforced by audit_workspace_hardening.sh and crate attributes, not at runtime
 
 # --- F-43 (2c): every WebDAV request needs a read-only macaroon (L-43, L-44) ---
-claim      F-43      sym=src/vfs.rs::webdav_auth_decision accept=trust_enforcement::f43_valid_bearer_reads reject=trust_enforcement::f43_no_token_unauthorized code=reject.webdav_token_missing bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-29-pure-rust-fuse-and-webdav-lazy-vfs.md
-claim      F-43-ADR33 sym=src/vfs.rs::webdav_auth_decision accept=trust_enforcement::f43_valid_bearer_reads reject=trust_enforcement::f43_other_manifest_forbidden code=reject.webdav_scope_denied bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md
-claim      F-43-PLUGIN sym=src/vfs.rs::webdav_auth_decision accept=trust_enforcement::f43_plugin_attenuated_child_reads reject=trust_enforcement::f43_plugin_sibling_token_unauthorized code=reject.webdav_token_invalid bin=parvault-fuse ref=docs/security/TRUST_FINDINGS.md
-kani       F-43      sym=src/vfs.rs::webdav_auth_decision harness=proof_webdav_auth_decision cover=valid token out of scope
+claim      F-43      sym=src/webdav.rs::webdav_auth_decision accept=trust_enforcement::f43_valid_bearer_reads reject=trust_enforcement::f43_no_token_unauthorized code=reject.webdav_token_missing bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-29-pure-rust-fuse-and-webdav-lazy-vfs.md
+claim      F-43-ADR33 sym=src/webdav.rs::webdav_auth_decision accept=trust_enforcement::f43_valid_bearer_reads reject=trust_enforcement::f43_other_manifest_forbidden code=reject.webdav_scope_denied bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-33-dual-mode-vfs-and-sibling-gateway-sync.md
+claim      F-43-PLUGIN sym=src/webdav.rs::webdav_auth_decision accept=trust_enforcement::f43_plugin_attenuated_child_reads reject=trust_enforcement::f43_plugin_sibling_token_unauthorized code=reject.webdav_token_invalid bin=parvault-fuse ref=docs/security/TRUST_FINDINGS.md
+kani       F-43      sym=src/webdav.rs::webdav_auth_decision harness=proof_webdav_auth_decision cover=valid token out of scope
 
 # --- D-ADR (2c): gateway enforcement pairs ---
 claim      G-MAC     sym=src/gateway/engine.rs::gateway_macaroon_decision accept=trust_enforcement::gmac_frame_inside_caveat_served reject=trust_enforcement::gmac_frame_outside_caveat_refused code=reject.gateway_macaroon_caveat bin=parvault ref=docs/security/TRUST_FINDINGS.md adr=docs/adr/ADR-28-stateless-macaroon-capability-attenuation.md

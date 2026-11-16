@@ -167,16 +167,67 @@ where
     }
 }
 
+/// A connection the edge reads requests from and writes responses to (v0.5.6 T0, B-1 P0): the
+/// WebDAV and status handlers take this, not `TcpStream`, so track A can serve them over TLS.
+pub trait EdgeStream: Read + Write {
+    /// Bounds the next read (the head deadline shrinks it read by read).
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+    /// The client's address (logged with a refusal).
+    fn peer_addr(&self) -> io::Result<std::net::SocketAddr>;
+}
+
+impl EdgeStream for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+    fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+        TcpStream::peer_addr(self)
+    }
+}
+
+/// One request head and the bytes the client sent after it (A-TLS-4): a request body, or the
+/// next pipelined request. Derefs to the head bytes.
+pub struct RequestHead {
+    /// The head, through the blank line.
+    pub head: Vec<u8>,
+    /// Bytes read past the blank line; a handler consumes these before reading the stream again.
+    pub remainder: Vec<u8>,
+}
+
+impl std::ops::Deref for RequestHead {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.head
+    }
+}
+
 /// Reads the request head (through the blank line), or `None` after writing 431, on a
-/// timeout, or on EOF. Heads split across several writes are reassembled.
-pub fn read_request_head(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
+/// timeout, or on EOF. Heads split across several writes are reassembled. Bytes past the head
+/// are returned in [`RequestHead::remainder`], never dropped (A-TLS-4).
+pub fn read_request_head<S: EdgeStream + ?Sized>(
+    stream: &mut S,
+) -> io::Result<Option<RequestHead>> {
+    read_request_head_after(stream, Vec::new())
+}
+
+/// [`read_request_head`] for the next request on a connection: `carry` (the previous request's
+/// remainder) is consumed first, then the stream, under one head deadline and one size cap.
+pub fn read_request_head_after<S: EdgeStream + ?Sized>(
+    stream: &mut S,
+    carry: Vec<u8>,
+) -> io::Result<Option<RequestHead>> {
     let deadline = Instant::now() + EDGE_HEAD_TIMEOUT;
-    let mut head = Vec::with_capacity(1024);
+    let mut head = carry;
+    head.reserve(1024);
     let mut chunk = [0u8; 2048];
     loop {
-        if let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") {
-            head.truncate(end + 4);
-            return Ok(Some(head));
+        if let Some(end) = head
+            .windows(4)
+            .take(EDGE_MAX_HEAD_BYTES.saturating_sub(3))
+            .position(|w| w == b"\r\n\r\n")
+        {
+            let remainder = head.split_off(end + 4);
+            return Ok(Some(RequestHead { head, remainder }));
         }
         if head.len() >= EDGE_MAX_HEAD_BYTES {
             stream.write_all(RESP_431)?;
@@ -192,6 +243,57 @@ pub fn read_request_head(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> 
             Ok(n) => head.extend_from_slice(&chunk[..n]),
         }
     }
+}
+
+/// Most requests one connection may carry (A-TLS-5's cap; until track A adds keep-alive a
+/// connection carries more than one only when the client pipelined them, A-TLS-4).
+pub const EDGE_MAX_REQUESTS_PER_CONN: usize = 100;
+
+/// The `Content-Length` of a request head (0 when absent), or `None` when the body cannot be
+/// skipped exactly: a `Transfer-Encoding` header, a malformed or repeated length.
+pub fn request_body_len(head: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(head).ok()?;
+    let mut len = None;
+    for line in text.split("\r\n").skip(1) {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        if k.trim().eq_ignore_ascii_case("transfer-encoding") {
+            return None;
+        }
+        if k.trim().eq_ignore_ascii_case("content-length") {
+            if len.is_some() {
+                return None;
+            }
+            len = Some(v.trim().parse::<u64>().ok()?);
+        }
+    }
+    Some(len.unwrap_or(0))
+}
+
+/// Whether the request asked to close the connection after its answer (`Connection: close`).
+pub fn request_wants_close(head: &[u8]) -> bool {
+    String::from_utf8_lossy(head)
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|l| l.split_once(':'))
+        .filter(|(k, _)| k.trim().eq_ignore_ascii_case("connection"))
+        .any(|(_, v)| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("close")))
+}
+
+/// The bytes after this request's body when the client already sent the next request in the
+/// same read (pipelining, A-TLS-4): `Some(carry)` to serve it, `None` to close as before. A body
+/// is consumed from the remainder only; the stream is never read for one, so a connection
+/// carries a second request only when its bytes are already here. `Connection: close` ends it.
+pub fn pipelined_next(head: &RequestHead) -> Option<Vec<u8>> {
+    if request_wants_close(&head.head) {
+        return None;
+    }
+    let body = usize::try_from(request_body_len(&head.head)?).ok()?;
+    if head.remainder.len() <= body {
+        return None;
+    }
+    Some(head.remainder[body..].to_vec())
 }
 
 /// Longest token text accepted from a header (`PARVAULT-MAC-V1:` plus the hex of the largest
@@ -363,6 +465,89 @@ mod tests {
     const SOCK: StatusTransport = StatusTransport::Socket {
         peer_uid: Some(1000),
     };
+
+    /// A-TLS-4: the bytes past a head are kept, not dropped, and the next head starts there.
+    #[test]
+    fn request_head_keeps_its_remainder() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        client
+            .write_all(b"PROPFIND /a HTTP/1.1\r\nContent-Length: 3\r\n\r\nxyzGET /b HTTP/1.1\r\nHost: h\r\n\r\n")
+            .unwrap();
+        // Both requests may arrive in one read or two; the second head is complete either way.
+        let first = read_request_head(&mut server).unwrap().expect("first head");
+        assert!(first.head.starts_with(b"PROPFIND /a "));
+        assert!(first.head.ends_with(b"\r\n\r\n"));
+        assert_eq!(request_body_len(&first.head), Some(3));
+        let carry = pipelined_next(&first).unwrap_or_default();
+        let second = read_request_head_after(&mut server, carry)
+            .unwrap()
+            .expect("second head");
+        assert_eq!(&second.head[..], b"GET /b HTTP/1.1\r\nHost: h\r\n\r\n");
+        assert!(second.remainder.is_empty());
+    }
+
+    #[test]
+    fn pipelining_stops_at_close_chunked_or_a_short_body() {
+        let rh = |h: &[u8], rest: &[u8]| RequestHead {
+            head: h.to_vec(),
+            remainder: rest.to_vec(),
+        };
+        let next = b"GET / HTTP/1.1\r\n\r\n";
+        assert_eq!(
+            pipelined_next(&rh(b"GET / HTTP/1.1\r\n\r\n", next)).as_deref(),
+            Some(&next[..])
+        );
+        assert_eq!(pipelined_next(&rh(b"GET / HTTP/1.1\r\n\r\n", b"")), None);
+        assert_eq!(
+            pipelined_next(&rh(b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n", next)),
+            None
+        );
+        assert_eq!(
+            pipelined_next(&rh(
+                b"PUT / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+                next
+            )),
+            None
+        );
+        assert_eq!(
+            pipelined_next(&rh(
+                b"PROPFIND / HTTP/1.1\r\nContent-Length: 99\r\n\r\n",
+                next
+            )),
+            None
+        );
+        assert_eq!(
+            pipelined_next(&rh(
+                b"P / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n",
+                next
+            )),
+            None
+        );
+        assert_eq!(
+            pipelined_next(&rh(b"P / HTTP/1.1\r\nContent-Length: 2\r\n\r\n", b"abGET")).as_deref(),
+            Some(&b"GET"[..])
+        );
+    }
+
+    /// The head cap is unchanged by the carry: a head ending past 8 KiB is a 431.
+    #[test]
+    fn carried_bytes_count_toward_the_head_cap() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let mut carry = vec![b'a'; EDGE_MAX_HEAD_BYTES - 2];
+        carry.extend_from_slice(b"\r\n\r\n");
+        assert!(read_request_head_after(&mut server, carry)
+            .unwrap()
+            .is_none());
+        let mut resp = vec![0u8; RESP_431.len()];
+        client.read_exact(&mut resp).unwrap();
+        assert_eq!(resp, RESP_431);
+    }
 
     /// QA item 3, defect 3: every edge connection (WebDAV and status) gets a write deadline, so
     /// a client that stops reading cannot hold a slot.

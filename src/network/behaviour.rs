@@ -407,6 +407,43 @@ pub enum MeshWireRequest {
     /// A chunk-Merkle audit (F-34, ADR-03 as amended by B-59), appended. Answered only to the
     /// peer the shard is accounted to (`reject.por_not_storer`), after the RAM pre-screen.
     ChunkAudit(crate::por::ChunkChallenge),
+    /// B-158 (`v0.5.6`, appended): the vault owner's signed order to free shards on one host
+    /// (`architecture/plans/b154-version-storage.md` 2.4). Decided per order by
+    /// `free_order_decision`, then per shard by `shard_delete_decision` (track B1).
+    FreeShards { order: FreeShardsOrder },
+}
+
+/// Most shards one [`FreeShardsOrder`] may name (B-154 2.4).
+pub const MAX_FREE_ORDER_SHARDS: usize = 1024;
+
+/// Domain prefix of a [`FreeShardsOrder`] signature (B-154 2.4).
+pub const FREE_ORDER_DOMAIN: &[u8] = b"parvault-owner-shard-free-v2:";
+
+/// An owner-signed order to free shards on one host (B-158, `v0.5.6`). The Ed25519 signature by
+/// `owner_ed25519_pubkey` covers `FREE_ORDER_DOMAIN || host_ed25519_pubkey || timestamp_ms ||
+/// gc_epoch || u32 count || shard_ids[]` (integers big-endian); at most
+/// [`MAX_FREE_ORDER_SHARDS`] shards. `gc_epoch` must exceed the last epoch this host accepted
+/// from this signer (replay inside the clock-skew window).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreeShardsOrder {
+    /// The host the order is for (its node identity key).
+    pub host_ed25519_pubkey: [u8; 32],
+    /// The signer: the vault owner identity.
+    pub owner_ed25519_pubkey: [u8; 32],
+    pub timestamp_ms: u64,
+    pub gc_epoch: u64,
+    pub shard_ids: Vec<ShardId>,
+    /// 64-byte Ed25519 signature.
+    pub signature: Vec<u8>,
+}
+
+/// One shard's outcome in a [`MeshWireResponse::FreeShardsAck`] (B-154 2.4): already gone is
+/// `NotHeld`, not an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FreeShardOutcome {
+    Freed,
+    NotHeld,
+    Refused(String),
 }
 
 /// Wire-level response messages exchanged over `/parvault/wire/1.0.0`.
@@ -519,6 +556,12 @@ pub enum MeshWireResponse {
     /// Result of `ChunkAudit` (appended): `None` for every refusal (the verifier counts it as
     /// unanswered, never as a failed proof).
     ChunkAuditResult(Option<crate::por::ChunkAuditResponse>),
+    /// Result of `FreeShards` (appended, `v0.5.6`): one outcome per shard of the order, in its
+    /// order; a refusal of the whole order has no outcomes and an `error`.
+    FreeShardsAck {
+        outcomes: Vec<FreeShardOutcome>,
+        error: Option<String>,
+    },
 }
 
 /// Composite libp2p `NetworkBehaviour` combining Kademlia DHT, Gossipsub, mDNS, Ping, Identify,

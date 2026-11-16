@@ -10,9 +10,17 @@ pub(crate) async fn status(env: CliEnv, command: Commands) -> anyhow::Result<()>
         block_store,
         ..
     } = env;
-    let Commands::Status = command else {
+    let Commands::Status { live } = command else {
         unreachable!("status() is only dispatched for Commands::Status")
     };
+    if live {
+        // v0.5.6 T0 stub (G3): track D asks the daemon (`QueryLiveStatus`).
+        return Err(parvault::seam::not_built_yet(parvault::seam::Stub {
+            track: "D",
+            entry: "status --live",
+        })
+        .into());
+    }
     let node_id = NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?;
     let pq_keypair = HybridPqSigningKeypair::load_or_generate_in_dir(&cfg.data_dir)?;
     let pq_fp = pq_keypair.public_key().fingerprint_hex();

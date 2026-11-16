@@ -146,11 +146,12 @@ pub enum WireKind {
     DeleteBlindedShardSigned,
     GetCouncilManifest,
     ChunkAudit,
+    FreeShards,
 }
 
 impl WireKind {
     /// Every kind, in `MeshWireRequest` order.
-    pub const ALL: [WireKind; 24] = [
+    pub const ALL: [WireKind; 25] = [
         WireKind::HandshakeWoT,
         WireKind::PutShard,
         WireKind::PorAudit,
@@ -175,6 +176,7 @@ impl WireKind {
         WireKind::DeleteBlindedShardSigned,
         WireKind::GetCouncilManifest,
         WireKind::ChunkAudit,
+        WireKind::FreeShards,
     ];
 }
 
@@ -207,6 +209,7 @@ impl From<&MeshWireRequest> for WireKind {
             MeshWireRequest::DeleteBlindedShardSigned { .. } => WireKind::DeleteBlindedShardSigned,
             MeshWireRequest::GetCouncilManifest { .. } => WireKind::GetCouncilManifest,
             MeshWireRequest::ChunkAudit(_) => WireKind::ChunkAudit,
+            MeshWireRequest::FreeShards { .. } => WireKind::FreeShards,
         }
     }
 }

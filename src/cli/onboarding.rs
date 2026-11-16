@@ -3,6 +3,25 @@
 use super::CliEnv;
 use crate::*;
 
+/// `up --init-if-absent` and `up --join-token-file` (B-146 item 8, A-146-1 to A-146-5; `v0.5.6`
+/// track E): run by `main` before `up` creates any file in the data dir. Without either flag
+/// it does nothing. T0 stub: either flag is refused (`reject.not_built_yet`).
+pub(crate) fn up_setup_preflight(
+    data_dir: &Path,
+    init_if_absent: bool,
+    join_token_file: Option<&Path>,
+) -> anyhow::Result<()> {
+    let _ = data_dir;
+    if !init_if_absent && join_token_file.is_none() {
+        return Ok(());
+    }
+    Err(parvault::seam::not_built_yet(parvault::seam::Stub {
+        track: "E",
+        entry: "up --init-if-absent / --join-token-file",
+    })
+    .into())
+}
+
 pub(crate) async fn discover(env: CliEnv, command: Commands) -> anyhow::Result<()> {
     let CliEnv {
         cfg,

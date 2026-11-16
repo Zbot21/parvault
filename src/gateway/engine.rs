@@ -643,6 +643,17 @@ mod unix_engine {
             snap.ok_or_else(|| anyhow::anyhow!("QueryStatus refused: reject.status_unavailable"))
         }
 
+        /// `QueryLiveStatus` (`v0.5.6`, V1): the same decision as [`Self::query_status`], then
+        /// [`crate::live_status::snapshot`].
+        pub fn query_live_status(
+            &self,
+            macaroon: Option<&CapabilityMacaroon>,
+            peer_uid: Option<u32>,
+        ) -> anyhow::Result<crate::live_status::LiveStatusSnapshot> {
+            self.query_status(macaroon, peer_uid)?;
+            Ok(crate::live_status::snapshot()?)
+        }
+
         /// Returns `true` iff `StorePayload` requires `F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW` seals.
         pub fn require_sealed_ingest_memfd(&self) -> bool {
             self.require_sealed_ingest_memfd.load(Ordering::Acquire)

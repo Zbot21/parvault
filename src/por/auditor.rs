@@ -163,6 +163,45 @@ pub struct Relocation {
     pub unanswered: u32,
 }
 
+/// A shard the auditor found on a host other than the one it was placed on (B-113), as the
+/// owner's version GC needs it (G2, C8): free orders for that shard go to `host_addr` too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelocationTarget {
+    /// `ShardId::file_key()` of the shard.
+    pub shard_file_key: String,
+    pub host_addr: String,
+    /// The device id that proved it holds the shard.
+    pub device_id: String,
+}
+
+/// The B-113 relocation map of [`AUDIT_STATE_FILE`] in `data_dir` (`v0.5.6` T0, G2): track B2
+/// calls this and never reads the file. No state file is an empty map; a file that cannot be
+/// read, parsed or is another version is an error, so a caller never takes it for "none".
+pub fn relocation_targets(data_dir: &Path) -> std::io::Result<Vec<RelocationTarget>> {
+    let bytes = match std::fs::read(data_dir.join(AUDIT_STATE_FILE)) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let state: AuditorState = serde_json::from_slice(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if state.version != AUDIT_STATE_VERSION {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{AUDIT_STATE_FILE}: version {}", state.version),
+        ));
+    }
+    Ok(state
+        .relocations
+        .into_iter()
+        .map(|(shard_file_key, r)| RelocationTarget {
+            shard_file_key,
+            host_addr: r.host_addr,
+            device_id: r.device_id,
+        })
+        .collect())
+}
+
 /// The relocation probe of one shard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelocateProbe {
@@ -809,6 +848,35 @@ pub fn run_audit_job(ctx: &AuditJobCtx) -> AuditJobOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relocation_targets_read_the_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(relocation_targets(dir.path()).unwrap(), Vec::new());
+        let mut st = AuditorState::fresh();
+        st.relocations.insert(
+            "k1".into(),
+            Relocation {
+                host_addr: "/ip4/10.0.0.2/tcp/1".into(),
+                device_id: "dev".into(),
+                accepted_ms: 5,
+                unanswered: 0,
+            },
+        );
+        st.save(Some(dir.path()));
+        assert_eq!(
+            relocation_targets(dir.path()).unwrap(),
+            vec![RelocationTarget {
+                shard_file_key: "k1".into(),
+                host_addr: "/ip4/10.0.0.2/tcp/1".into(),
+                device_id: "dev".into(),
+            }]
+        );
+        std::fs::write(dir.path().join(AUDIT_STATE_FILE), br#"{"version":9}"#).unwrap();
+        assert!(relocation_targets(dir.path()).is_err());
+        std::fs::write(dir.path().join(AUDIT_STATE_FILE), b"{").unwrap();
+        assert!(relocation_targets(dir.path()).is_err());
+    }
 
     #[test]
     fn state_round_trips_and_refuses_other_versions() {

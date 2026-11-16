@@ -107,6 +107,18 @@ impl GatewayIpcServer {
         &self.socket_path
     }
 
+    /// B-180 (`v0.5.6`): gives the bound socket to `group` with mode `0660`; `None` keeps
+    /// `0600`. T0 stub: a group is refused (`reject.not_built_yet`).
+    pub fn with_socket_group(self, group: Option<&str>) -> io::Result<Self> {
+        match group {
+            None => Ok(self),
+            Some(_) => Err(crate::seam::not_built_yet(crate::seam::Stub {
+                track: "A or E (B-180)",
+                entry: "--gateway-socket-group",
+            })),
+        }
+    }
+
     pub fn engine(&self) -> &Arc<GatewayEngine> {
         &self.engine
     }
@@ -353,6 +365,15 @@ fn execute_engine_command(
         IpcCommand::QueryStatus { macaroon } => {
             match engine.query_status(macaroon.as_ref(), peer_uid) {
                 Ok(snap) => IpcResponse::StatusSnapshot(snap),
+                Err(e) => IpcResponse::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+        // v0.5.6 (B-148 item 2, V1): authorised as `QueryStatus`, then `live_status::snapshot`.
+        IpcCommand::QueryLiveStatus { macaroon } => {
+            match engine.query_live_status(macaroon.as_ref(), peer_uid) {
+                Ok(snap) => IpcResponse::LiveStatus(snap),
                 Err(e) => IpcResponse::Error {
                     message: e.to_string(),
                 },

@@ -320,6 +320,18 @@ impl FolderSyncEngine {
         &self.deleted_tombstones
     }
 
+    /// Version GC after a pass (B-154; `v0.5.6` track B2): retention, mark and sweep, and the
+    /// `FreeShards` orders, journalled in `data_dir`. The daemon's folder sync calls it unless
+    /// `up --no-gc`. T0 stub: does nothing (no GC before `v0.5.6`).
+    pub fn gc_after_pass(
+        &mut self,
+        snapshot: &FolderSnapshotManifest,
+        data_dir: &Path,
+    ) -> Result<(), StorageError> {
+        let _ = (snapshot, data_dir);
+        Ok(())
+    }
+
     /// Resumes incremental synchronization state from a previously saved `FolderSnapshotManifest`.
     pub fn load_previous_snapshot(&mut self, snapshot: &FolderSnapshotManifest) {
         self.current_version = snapshot.version;

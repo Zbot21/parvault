@@ -144,6 +144,8 @@ fn command_needs_network_discovery(cmd: &Commands) -> bool {
             | Commands::Gateway { .. }
             | Commands::Config { .. }
             | Commands::Net { .. }
+            | Commands::Tls { .. }
+            | Commands::Ring { .. }
     )
 }
 
@@ -410,6 +412,16 @@ async fn run(
         return cli::wot::run(action, &cfg.data_dir);
     }
 
+    // v0.5.6: the edge certificate (track A) and the genesis backup (track E) read only the
+    // data dir, like `wot`.
+    if let Commands::Tls { action } = cli.command {
+        return cli::tls::run(action, &cfg.data_dir);
+    }
+
+    if let Commands::Ring { action } = cli.command {
+        return cli::ring_backup::run(action, &cfg.data_dir);
+    }
+
     if let Commands::Token { action } = cli.command {
         return parvault::gateway::execute_token_cli(action, &cfg.data_dir);
     }
@@ -424,6 +436,21 @@ async fn run(
     }
 
     validate_early_command_flags(&cli.command)?;
+
+    // v0.5.6 (B-146 item 8, A-146; track E): `up --init-if-absent` and `--join-token-file` run
+    // before this command creates any file in the data dir.
+    if let Commands::Up {
+        init_if_absent,
+        ref join_token_file,
+        ..
+    } = cli.command
+    {
+        cli::onboarding::up_setup_preflight(
+            &cfg.data_dir,
+            init_if_absent,
+            join_token_file.as_deref(),
+        )?;
+    }
 
     let node_identity = NodeIdentity::load_or_generate_in_dir(&cfg.data_dir)?;
     let explicit_peers = eff.explicit_peers.clone();
@@ -505,7 +532,9 @@ async fn run(
         | Commands::Council { .. }
         | Commands::Gateway { .. }
         | Commands::Config { .. }
-        | Commands::Net { .. } => {
+        | Commands::Net { .. }
+        | Commands::Tls { .. }
+        | Commands::Ring { .. } => {
             unreachable!("handled above")
         }
 
@@ -517,7 +546,7 @@ async fn run(
         command @ Commands::ReportAbuse { .. } => cli::abuse::report_abuse(env, command).await?,
         command @ Commands::Daemon { .. } => cli::daemon_cmds::daemon(env, command).await?,
         command @ Commands::File { .. } => cli::file::file(env, command).await?,
-        command @ Commands::Status => cli::identity::status(env, command).await?,
+        command @ Commands::Status { .. } => cli::identity::status(env, command).await?,
         command @ Commands::Identity { .. } => cli::identity::identity(env, command).await?,
         command @ Commands::IssueDeviceCert { .. } => {
             cli::identity::issue_device_cert(env, command).await?

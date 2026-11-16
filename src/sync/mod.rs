@@ -10,4 +10,8 @@ pub use gateway::{
 #[cfg(feature = "daemon-runtime")]
 mod engine;
 #[cfg(feature = "daemon-runtime")]
+pub mod gc_journal;
+#[cfg(feature = "daemon-runtime")]
+pub mod retention;
+#[cfg(feature = "daemon-runtime")]
 pub use engine::*;

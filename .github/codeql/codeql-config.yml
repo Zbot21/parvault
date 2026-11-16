@@ -8,4 +8,10 @@ paths-ignore:
   - tests/bootstrap_and_earned_tier_tests.rs
   - tests/seed_server_integration.rs
   - tests/trust_enforcement.rs
+  - tests/trust_enforcement_edge.rs
+  - tests/trust_enforcement_gc_host.rs
+  - tests/trust_enforcement_gc_owner.rs
+  - tests/trust_enforcement_restore.rs
+  - tests/trust_enforcement_liveness.rs
+  - tests/trust_enforcement_setup.rs
   - tests/wire_handler_equivalence.rs

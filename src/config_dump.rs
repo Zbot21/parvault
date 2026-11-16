@@ -138,6 +138,14 @@ pub const DUMP_SCHEMA: &[(&str, FieldKind, FieldClass)] = &[
     ("vfs_seed_dir", Arg, Plain),
     ("vfs_cache_mib", Arg, Plain),
     ("lab_insecure_metrics", Arg, PlainUrl),
+    // v0.5.6 (T0): `up` and `daemon start` args of tracks A, B2 and E. A join token is read
+    // from its file, never passed as an arg (A-146-5).
+    ("init_if_absent", Arg, Plain),
+    ("join_token_file", Arg, Plain),
+    ("tls_san", Arg, PlainUrl),
+    ("insecure_plain_http", Arg, Plain),
+    ("gateway_socket_group", Arg, Plain),
+    ("no_gc", Arg, Plain),
     ("dump_config", Arg, Control),
     // Environment variables read under src/.
     ("PARVAULT_PEERS", Env, PlainUrl),

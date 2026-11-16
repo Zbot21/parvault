@@ -22,12 +22,18 @@ pub mod config;
 pub mod config_dump;
 pub mod crypto;
 #[cfg(feature = "daemon-runtime")]
+pub mod datadir_lock;
+#[cfg(feature = "daemon-runtime")]
+pub mod edge_tls;
+#[cfg(feature = "daemon-runtime")]
 pub mod effective_config;
+pub mod fetch_sched;
 pub mod gateway;
 pub mod http_edge;
 #[cfg(all(unix, feature = "lab-insecure-metrics"))]
 pub mod insecure_metrics;
 pub mod lab_dial;
+pub mod live_status;
 #[cfg(feature = "daemon-runtime")]
 pub mod manifest;
 #[cfg(feature = "daemon-runtime")]
@@ -41,6 +47,7 @@ pub mod profile;
 pub mod router_nas;
 #[cfg(feature = "daemon-runtime")]
 pub mod runtime;
+pub mod seam;
 pub mod sharding;
 pub mod storage;
 pub mod sync;
@@ -50,6 +57,8 @@ pub mod telemetry;
 pub mod traversal_metrics;
 #[cfg(feature = "vfs")]
 pub mod vfs;
+#[cfg(feature = "vfs")]
+pub mod webdav;
 
 pub use gateway::ipc;
 

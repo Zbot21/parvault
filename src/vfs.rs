@@ -351,158 +351,53 @@ pub const fn parse_fuse_read_in(payload: &[u8]) -> Option<FuseReadIn> {
     })
 }
 
-/// F-43 (L-43, L-44): what the WebDAV auth decision needs to know about one request. Token
-/// facts are known before any path lookup; `in_scope` (manifest and per-method byte-range
-/// caveats) is `true` in the pre-lookup pass and evaluated after the lookup.
+/// An inode number of the virtual file system.
+pub type Ino = u64;
+
+/// One file for [`VirtualVaultFs::upsert_file`] (`v0.5.6` T0 item 4): what a catalog import
+/// knows about it.
+#[derive(Debug, Clone)]
+pub struct LazyFileSpec {
+    pub manifest: EphemeralShardManifest,
+    /// A per-file token for its `FetchRange` calls (else the VFS default).
+    pub macaroon: Option<CapabilityMacaroon>,
+    /// Modification time to show (else the import time).
+    pub mtime_unix_secs: Option<u64>,
+}
+
+/// What [`VirtualVaultFs::remove_path`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WebdavAuthFacts {
-    /// An `Authorization: Bearer` or `Basic` header was sent.
-    pub token_present: bool,
-    /// It holds a well-formed `PARVAULT-MAC-V1:` token (Basic: as the password).
-    pub token_parses: bool,
-    /// The token's HMAC chain is valid (root key), or it attenuates the pinned token (plugin).
-    pub tag_valid: bool,
-    /// An `ExpiresAtUnixMs` caveat has passed.
-    pub expired: bool,
-    /// The token carries `ReadOnly` (required: the root key is shared with the gateway).
-    pub read_only: bool,
-    /// The token carries `AllowedPeerUid`, which has no meaning over TCP.
-    pub peer_uid_bound: bool,
-    /// Manifest and (for `GET`) byte-range caveats allow this path and range.
-    pub in_scope: bool,
+pub enum PathRemoval {
+    /// Nothing was at the path.
+    Absent,
+    /// A file was removed.
+    Removed,
+    /// A folder is at the path; it was left in place.
+    Folder,
 }
 
-/// A refused WebDAV request: `Unauthorized` answers 401 (byte-identical for every code),
-/// `Forbidden` answers 403. The code is only logged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WebdavAuthRefusal {
-    Unauthorized(&'static str),
-    Forbidden(&'static str),
+/// Path segments as [`VirtualVaultFs::register_lazy_file`] reads them (`.` and `..` dropped).
+#[cfg(unix)]
+fn vfs_path_parts(virtual_path: &str) -> Vec<&str> {
+    virtual_path
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        .collect()
 }
 
-/// F-43: every WebDAV request needs a valid, unexpired, read-only macaroon that covers it.
-pub fn webdav_auth_decision(facts: &WebdavAuthFacts) -> Result<(), WebdavAuthRefusal> {
-    if !facts.token_present {
-        return Err(WebdavAuthRefusal::Unauthorized(
-            "reject.webdav_token_missing",
-        ));
-    }
-    if !facts.token_parses {
-        return Err(WebdavAuthRefusal::Unauthorized(
-            "reject.webdav_token_malformed",
-        ));
-    }
-    if !facts.tag_valid {
-        return Err(WebdavAuthRefusal::Unauthorized(
-            "reject.webdav_token_invalid",
-        ));
-    }
-    if facts.expired {
-        return Err(WebdavAuthRefusal::Unauthorized(
-            "reject.webdav_token_expired",
-        ));
-    }
-    if !facts.read_only {
-        return Err(WebdavAuthRefusal::Forbidden(
-            "reject.webdav_token_not_read_only",
-        ));
-    }
-    if facts.peer_uid_bound || !facts.in_scope {
-        return Err(WebdavAuthRefusal::Forbidden("reject.webdav_scope_denied"));
-    }
-    Ok(())
-}
-
-// Token extraction moved to `http_edge` (item 3, #codehealth: one edge for WebDAV and status).
-pub use crate::http_edge::{
-    presented_token as presented_webdav_token, PresentedToken,
-    MAX_TOKEN_CHARS as WEBDAV_MAX_TOKEN_CHARS,
+// v0.5.6 T0 (B-1 P0): the WebDAV HTTP server and its F-43 decision live in `crate::webdav`;
+// these names stay importable from `vfs` so embedders and the plugin keep their paths.
+pub use crate::webdav::{
+    presented_webdav_token, webdav_auth_decision, PresentedToken, WebdavAuthFacts,
+    WebdavAuthRefusal, WebdavVerifier, WEBDAV_MAX_TOKEN_CHARS,
 };
-
-/// How a WebDAV server checks a token's chain (moved to `http_edge`, shared with the status
-/// page; item 3).
-pub use crate::http_edge::EdgeVerifier as WebdavVerifier;
 
 #[cfg(unix)]
 mod unix_vfs {
     use super::*;
     use std::io::{Read, Seek, SeekFrom, Write};
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
     use std::os::fd::AsRawFd;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    /// RAII handle controlling a background HTTP `Range` (`206 Partial Content`) + WebDAV server
-    /// spawned via [`VirtualVaultFs::spawn_webdav_server`].
-    pub struct VfsWebdavServerHandle {
-        local_addr: SocketAddr,
-        shutdown_flag: Arc<AtomicBool>,
-        join_handle: Option<std::thread::JoinHandle<()>>,
-    }
-
-    impl VfsWebdavServerHandle {
-        pub fn local_addr(&self) -> SocketAddr {
-            self.local_addr
-        }
-
-        /// Blocks until the server thread exits (for a foreground server, e.g. `parvault-fuse`).
-        pub fn wait(mut self) {
-            if let Some(h) = self.join_handle.take() {
-                let _ = h.join();
-            }
-        }
-
-        pub fn shutdown(&mut self) {
-            self.shutdown_flag.store(true, Ordering::SeqCst);
-            let wake_ip = if self.local_addr.ip().is_unspecified() {
-                if self.local_addr.is_ipv4() {
-                    IpAddr::V4(Ipv4Addr::LOCALHOST)
-                } else {
-                    IpAddr::V6(Ipv6Addr::LOCALHOST)
-                }
-            } else {
-                self.local_addr.ip()
-            };
-            let wake_addr = SocketAddr::new(wake_ip, self.local_addr.port());
-            // One wake connect is not enough: a lost SYN (packet loss on the listen interface)
-            // fails a short connect, the accept loop never wakes and the join blocks forever
-            // (B-56, netem 2% loss). Retry the wake until the accept thread has exited.
-            if let Some(jh) = self.join_handle.take() {
-                for _ in 0..WAKE_ATTEMPTS {
-                    if jh.is_finished() {
-                        break;
-                    }
-                    let _ = TcpStream::connect_timeout(&wake_addr, Duration::from_millis(250));
-                    for _ in 0..25 {
-                        if jh.is_finished() {
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                }
-                if jh.is_finished() {
-                    let _ = jh.join();
-                } else {
-                    // Bounded (B-68 QA): a thread still blocked after every wake is detached, not
-                    // joined; it exits at its next accept, since `shutdown_flag` is set.
-                    tracing::warn!(
-                        addr = %self.local_addr,
-                        attempts = WAKE_ATTEMPTS,
-                        "WebDAV accept thread did not exit after every wake connect; detaching it"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Wake connects tried by [`VfsWebdavServerHandle::shutdown`] (about 0.5 s each, so about
-    /// 20 s in all); an accept thread that has still not exited is then detached, not joined.
-    const WAKE_ATTEMPTS: usize = 40;
-
-    impl Drop for VfsWebdavServerHandle {
-        fn drop(&mut self) {
-            self.shutdown();
-        }
-    }
 
     /// Lazy-streaming Virtual File System backed by [`GatewayBus`] (`InProcess` or `UnixSocket`).
     #[derive(Clone)]
@@ -608,6 +503,21 @@ mod unix_vfs {
             self
         }
 
+        /// B-20 (`v0.5.6` track C): starts importing the vault catalogs `data_dir` holds keys
+        /// for (`derive_vault_root_dht_key`), at start and on a timer, through
+        /// [`Self::upsert_file`] and [`Self::remove_path`]; the scavenger then hydrates them
+        /// (L-94, S1). Called by the daemon once the built-in VFS exists. T0 stub: imports
+        /// nothing, so the mount lists only `--vfs-seed-dir` files, as before `v0.5.6`.
+        #[cfg(feature = "daemon-runtime")]
+        pub fn start_catalog_import(
+            &self,
+            data_dir: &Path,
+            block_store: &crate::storage::BlockStore,
+        ) -> io::Result<()> {
+            let _ = (data_dir, block_store);
+            Ok(())
+        }
+
         /// Registers a virtual file path (e.g. `"/movies/archive_10gb.bin"` or `"backup.tar"`)
         /// instantaneously as an in-memory lazy metadata inode without fetching any shard bytes.
         pub fn register_lazy_file(
@@ -687,6 +597,63 @@ mod unix_vfs {
                 .or_default()
                 .insert(file_name, ino);
             Ok(ino)
+        }
+
+        /// Inserts or replaces the file at `virtual_path` (`v0.5.6` T0 item 4, for B-20's
+        /// catalog import): a changed file gets a new inode, so no cached block of the old
+        /// bytes is served for it (T1: the cache is keyed by inode and block). Parent folders
+        /// are created as needed. A folder at `virtual_path` is refused.
+        pub fn upsert_file(&self, virtual_path: &str, spec: LazyFileSpec) -> io::Result<Ino> {
+            if self.remove_path(virtual_path) == PathRemoval::Folder {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "upsert_file: the path is a folder",
+                ));
+            }
+            let ino = self.register_lazy_file(virtual_path, spec.manifest, spec.macaroon)?;
+            if let Some(mtime) = spec.mtime_unix_secs {
+                if let Some(n) = self.nodes.lock().unwrap().get_mut(&ino) {
+                    n.mtime_unix_secs = mtime;
+                }
+            }
+            Ok(ino)
+        }
+
+        /// Removes the file at `virtual_path` (T4: a file gone from the catalog leaves the
+        /// listing). A folder is left in place.
+        pub fn remove_path(&self, virtual_path: &str) -> PathRemoval {
+            let parts = vfs_path_parts(virtual_path);
+            let Some((name, dirs)) = parts.split_last() else {
+                return PathRemoval::Folder;
+            };
+            let mut parent = VFS_ROOT_INO;
+            for d in dirs {
+                match self.lookup(parent, d) {
+                    Some(n) if n.is_dir => parent = n.ino,
+                    _ => return PathRemoval::Absent,
+                }
+            }
+            let Some(node) = self.lookup(parent, name) else {
+                return PathRemoval::Absent;
+            };
+            if node.is_dir {
+                return PathRemoval::Folder;
+            }
+            if let Some(m) = self.children.lock().unwrap().get_mut(&parent) {
+                m.remove(*name);
+            }
+            self.nodes.lock().unwrap().remove(&node.ino);
+            PathRemoval::Removed
+        }
+
+        /// The entries of the folder at `virtual_path`, or `None` when it is not a folder.
+        pub fn list_children(&self, virtual_path: &str) -> Option<Vec<VfsLazyNode>> {
+            let mut cur = VFS_ROOT_INO;
+            for p in vfs_path_parts(virtual_path) {
+                cur = self.lookup(cur, p)?.ino;
+            }
+            let node = self.getattr(cur)?;
+            node.is_dir.then(|| self.readdir(cur))
         }
 
         fn alloc_ino(&self) -> u64 {
@@ -899,343 +866,11 @@ mod unix_vfs {
             Ok(())
         }
 
-        /// Spawns a background stoppable HTTP `Range` (`206 Partial Content`) + WebDAV
-        /// (`OPTIONS` / `PROPFIND`) server returning an RAII [`VfsWebdavServerHandle`]. Every
-        /// request must present a token `verifier` accepts (F-43); there is no unauthenticated
-        /// constructor.
-        pub fn spawn_webdav_server(
-            &self,
-            bind_addr: &str,
-            verifier: WebdavVerifier,
-        ) -> io::Result<VfsWebdavServerHandle> {
-            let listener = TcpListener::bind(bind_addr)?;
-            listener.set_nonblocking(false)?;
-            let local_addr = listener.local_addr()?;
-            let shutdown_flag = Arc::new(AtomicBool::new(false));
-            let shutdown_cl = Arc::clone(&shutdown_flag);
-            let vfs = self.clone();
-
-            let join_handle = std::thread::Builder::new()
-                .name("parvault-vfs-webdav".into())
-                .spawn(move || {
-                    let slots = Arc::new(EdgeSlots::new(WEBDAV_MAX_CONNECTIONS));
-                    for conn in listener.incoming() {
-                        if shutdown_cl.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let Ok(stream) = conn else {
-                            continue;
-                        };
-                        spawn_webdav_conn(stream, &vfs, &verifier, &slots);
-                    }
-                })?;
-
-            Ok(VfsWebdavServerHandle {
-                local_addr,
-                shutdown_flag,
-                join_handle: Some(join_handle),
-            })
-        }
-
-        /// Serves an unprivileged HTTP `Range` (`206 Partial Content`) + WebDAV (`OPTIONS` /
-        /// `PROPFIND`) endpoint for locked-down `prplOS` / `RDK-B` LXC containers without
-        /// `/dev/fuse`. Every request must present a token `verifier` accepts (F-43).
-        pub fn serve_webdav_blocking(
-            &self,
-            bind_addr: &str,
-            verifier: WebdavVerifier,
-        ) -> io::Result<()> {
-            let listener = TcpListener::bind(bind_addr)?;
-            let slots = Arc::new(EdgeSlots::new(WEBDAV_MAX_CONNECTIONS));
-            for conn in listener.incoming() {
-                let Ok(stream) = conn else {
-                    continue;
-                };
-                spawn_webdav_conn(stream, self, &verifier, &slots);
-            }
-            Ok(())
-        }
-
         /// Serves the pure-Rust Linux `/dev/fuse` kernel wire protocol (`ABI 7.31`, zero C
         /// `libfuse` dependency) on an already-mounted `/dev/fuse` file descriptor.
         pub fn serve_fuse_fd_blocking(&self, fuse_dev: std::fs::File) -> io::Result<()> {
             serve_pure_rust_fuse_loop(fuse_dev, self)
         }
-    }
-
-    /// Most WebDAV connections served at once; more are dropped unanswered (pre-auth bound).
-    const WEBDAV_MAX_CONNECTIONS: usize = 64;
-    use crate::http_edge::{
-        read_request_head as read_webdav_head, spawn_edge_conn, EdgeSlots, RESP_403 as WEBDAV_403,
-        RESP_502 as WEBDAV_502, WEBDAV_401,
-    };
-
-    /// Runs one connection on its own thread within the server's slots (shared edge).
-    fn spawn_webdav_conn(
-        stream: TcpStream,
-        vfs: &VirtualVaultFs,
-        verifier: &WebdavVerifier,
-        slots: &Arc<EdgeSlots>,
-    ) {
-        let (vfs, verifier) = (vfs.clone(), verifier.clone());
-        spawn_edge_conn(stream, slots, "parvault-vfs-http", move |stream| {
-            let _ = handle_webdav_http_conn(stream, &vfs, &verifier);
-        });
-    }
-
-    fn now_unix_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
-    }
-
-    /// Answers a refusal (401 or 403) and logs only its code and the peer address.
-    fn refuse_webdav(stream: &mut TcpStream, refusal: WebdavAuthRefusal) -> io::Result<()> {
-        let peer = stream
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_default();
-        let (code, body) = match refusal {
-            WebdavAuthRefusal::Unauthorized(code) => (code, WEBDAV_401),
-            WebdavAuthRefusal::Forbidden(code) => (code, WEBDAV_403),
-        };
-        tracing::warn!(code, peer = %peer, "refused a WebDAV request");
-        stream.write_all(body)?;
-        stream.flush()
-    }
-
-    /// Whether `token`'s manifest caveats allow `node`, and (for `GET` of a file) its byte-range
-    /// caveats allow `[offset, offset + length)`. A manifest-scoped token covers only its own
-    /// file, never a collection or a missing path (no existence oracle).
-    fn webdav_scope_ok(
-        token: &CapabilityMacaroon,
-        node: Option<&VfsLazyNode>,
-        get_range: Option<(u64, u64)>,
-    ) -> bool {
-        use crate::capabilities::{AccessRequestContext, Caveat};
-        let file_root = node
-            .filter(|n| !n.is_dir)
-            .and_then(|n| n.manifest.as_ref())
-            .map(|m| m.file_merkle_root);
-        let (offset, length) = get_range.unwrap_or((0, 0));
-        let ctx = AccessRequestContext {
-            manifest_root: file_root.unwrap_or([0u8; 32]),
-            offset,
-            length,
-            is_write: false,
-            now_unix_ms: now_unix_ms(),
-            peer_uid: None,
-        };
-        token.caveats.iter().all(|c| match c {
-            Caveat::AllowedManifest(_) => file_root.is_some() && c.allows(&ctx),
-            Caveat::ByteRange { .. } => get_range.is_none_or(|_| c.allows(&ctx)),
-            _ => true,
-        })
-    }
-
-    fn handle_webdav_http_conn(
-        stream: &mut TcpStream,
-        vfs: &VirtualVaultFs,
-        verifier: &WebdavVerifier,
-    ) -> io::Result<()> {
-        use crate::capabilities::Caveat;
-        let Some(head) = read_webdav_head(stream)? else {
-            return Ok(());
-        };
-        let req_str = String::from_utf8_lossy(&head);
-        let mut lines = req_str.lines();
-        let Some(request_line) = lines.next() else {
-            return Ok(());
-        };
-        let mut parts = request_line.split_whitespace();
-        let method = parts.next().unwrap_or("GET");
-        let raw_path = parts.next().unwrap_or("/");
-
-        let mut range_header: Option<(u64, Option<u64>)> = None;
-        let mut authorization: Option<&str> = None;
-        for hdr in lines {
-            if hdr.is_empty() {
-                break;
-            }
-            if let Some((k, v)) = hdr.split_once(':') {
-                if k.eq_ignore_ascii_case("authorization") {
-                    authorization = Some(v);
-                } else if k.eq_ignore_ascii_case("range") {
-                    if let Some(spec) = v.trim().strip_prefix("bytes=") {
-                        if let Some((s, e)) = spec.split_once('-') {
-                            if let Ok(start) = s.trim().parse::<u64>() {
-                                let end_opt = e.trim().parse::<u64>().ok();
-                                range_header = Some((start, end_opt));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // F-43 pass 1: token checks before any lookup (no existence oracle).
-        let presented = presented_webdav_token(authorization);
-        let token = match &presented {
-            PresentedToken::Token(t) => Some(t),
-            _ => None,
-        };
-        let now = now_unix_ms();
-        let mut facts = WebdavAuthFacts {
-            token_present: !matches!(presented, PresentedToken::Missing),
-            token_parses: token.is_some(),
-            tag_valid: token.is_some_and(|t| verifier.chain_ok(t)),
-            expired: token.is_some_and(|t| {
-                t.caveats
-                    .iter()
-                    .any(|c| matches!(c, Caveat::ExpiresAtUnixMs(e) if now > *e))
-            }),
-            read_only: token.is_some_and(|t| t.caveats.contains(&Caveat::ReadOnly)),
-            peer_uid_bound: token.is_some_and(|t| {
-                t.caveats
-                    .iter()
-                    .any(|c| matches!(c, Caveat::AllowedPeerUid(_)))
-            }),
-            in_scope: true,
-        };
-        if let Err(refusal) = webdav_auth_decision(&facts) {
-            return refuse_webdav(stream, refusal);
-        }
-        let Some(token) = token.cloned() else {
-            return Ok(());
-        };
-
-        // F-43 pass 2: manifest and per-method byte-range caveats against the looked-up node.
-        let node = vfs.lookup_path(raw_path);
-        let get_range = match (method, &node) {
-            ("GET", Some(n)) if !n.is_dir => Some(match range_header {
-                Some((start, end_opt)) => {
-                    let end_incl = end_opt
-                        .unwrap_or_else(|| n.size_bytes.saturating_sub(1))
-                        .min(n.size_bytes.saturating_sub(1));
-                    (start, end_incl.saturating_sub(start) + 1)
-                }
-                None => (0, n.size_bytes),
-            }),
-            _ => None,
-        };
-        facts.in_scope = method == "OPTIONS" || webdav_scope_ok(&token, node.as_ref(), get_range);
-        if let Err(refusal) = webdav_auth_decision(&facts) {
-            return refuse_webdav(stream, refusal);
-        }
-
-        match method {
-            "OPTIONS" => {
-                stream.write_all(
-                    b"HTTP/1.1 200 OK\r\nDAV: 1\r\nAllow: OPTIONS, GET, HEAD, PROPFIND\r\nAccept-Ranges: bytes\r\nContent-Length: 0\r\n\r\n",
-                )?;
-            }
-            "PROPFIND" => {
-                let Some(node) = vfs.lookup_path(raw_path) else {
-                    stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")?;
-                    return Ok(());
-                };
-                let mut xml = String::from(
-                    "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:multistatus xmlns:D=\"DAV:\">",
-                );
-                let entries = if node.is_dir {
-                    let mut v = vec![node.clone()];
-                    v.extend(vfs.readdir(node.ino));
-                    v
-                } else {
-                    vec![node]
-                };
-                for item in entries {
-                    let href = if item.ino == VFS_ROOT_INO {
-                        "/".to_string()
-                    } else {
-                        format!("/{}", item.name)
-                    };
-                    let res_type = if item.is_dir { "<D:collection/>" } else { "" };
-                    xml.push_str(&format!(
-                        "<D:response><D:href>{href}</D:href><D:propstat><D:prop><D:resourcetype>{res_type}</D:resourcetype><D:getcontentlength>{}</D:getcontentlength></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>",
-                        item.size_bytes
-                    ));
-                }
-                xml.push_str("</D:multistatus>");
-                let hdr = format!(
-                    "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
-                    xml.len()
-                );
-                stream.write_all(hdr.as_bytes())?;
-                stream.write_all(xml.as_bytes())?;
-            }
-            "HEAD" | "GET" => {
-                let Some(node) = vfs.lookup_path(raw_path) else {
-                    stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")?;
-                    return Ok(());
-                };
-                if node.is_dir {
-                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")?;
-                    return Ok(());
-                }
-                // `(start, len, Some(end_incl))` for a 206, `(0, size, None)` for a 200.
-                let (start, len, partial) = match range_header {
-                    Some((start, end_opt)) => {
-                        if start >= node.size_bytes {
-                            stream.write_all(
-                                b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\n\r\n",
-                            )?;
-                            return Ok(());
-                        }
-                        let end_incl = end_opt
-                            .unwrap_or_else(|| node.size_bytes.saturating_sub(1))
-                            .min(node.size_bytes.saturating_sub(1));
-                        (start, end_incl.saturating_sub(start) + 1, Some(end_incl))
-                    }
-                    None => (0, node.size_bytes, None),
-                };
-                let block = DEFAULT_VFS_BLOCK_BYTES as u64;
-                // Read the first block before promising a status and a length: a failed read
-                // answers 502, never a silently truncated body.
-                let first = if method == "GET" && len > 0 {
-                    match vfs.read_at(node.ino, start, len.min(block)) {
-                        Ok(b) => b,
-                        Err(_) => {
-                            stream.write_all(WEBDAV_502)?;
-                            return stream.flush();
-                        }
-                    }
-                } else {
-                    Vec::new()
-                };
-                let hdr = match partial {
-                    Some(end_incl) => format!(
-                        "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end_incl}/{}\r\nContent-Length: {len}\r\n\r\n",
-                        node.size_bytes
-                    ),
-                    None => format!(
-                        "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Length: {len}\r\n\r\n"
-                    ),
-                };
-                stream.write_all(hdr.as_bytes())?;
-                if method == "GET" {
-                    // Stream block by block (a `Range: bytes=0-` never buffers the whole file);
-                    // a mid-body failure closes the connection short of Content-Length.
-                    stream.write_all(&first)?;
-                    let end = start + len;
-                    let mut off = start + first.len() as u64;
-                    while off < end && !first.is_empty() {
-                        let chunk = vfs.read_at(node.ino, off, (end - off).min(block))?;
-                        if chunk.is_empty() {
-                            break;
-                        }
-                        stream.write_all(&chunk)?;
-                        off += chunk.len() as u64;
-                    }
-                }
-            }
-            _ => {
-                stream
-                    .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")?;
-            }
-        }
-        stream.flush()
     }
 
     // Minimal Pure-Rust Linux FUSE Kernel Protocol (`ABI 7.31`, zero C `libfuse`, zero `unsafe`).
@@ -1590,4 +1225,57 @@ mod unix_vfs {
 }
 
 #[cfg(unix)]
-pub use unix_vfs::{VfsWebdavServerHandle, VirtualVaultFs};
+pub use crate::webdav::VfsWebdavServerHandle;
+#[cfg(unix)]
+pub use unix_vfs::VirtualVaultFs;
+
+#[cfg(all(test, unix))]
+mod upsert_api_tests {
+    use super::*;
+
+    fn spec(size: u64, root: u8) -> LazyFileSpec {
+        LazyFileSpec {
+            manifest: EphemeralShardManifest {
+                file_merkle_root: [root; 32],
+                shard_hashes: Vec::new(),
+                total_size: size,
+                stripe_size_bytes: 1 << 20,
+            },
+            macaroon: None,
+            mtime_unix_secs: Some(7),
+        }
+    }
+
+    fn vfs(dir: &Path) -> VirtualVaultFs {
+        VirtualVaultFs::new(dir.join("no.sock"), dir.join("cache"), 1 << 20).unwrap()
+    }
+
+    /// T0 item 4 (T1, T4): a changed file gets a new inode; a removed file leaves the listing;
+    /// folders are kept and never replaced by a file.
+    #[test]
+    fn upsert_replaces_with_a_new_inode_and_remove_drops_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = vfs(dir.path());
+        let a = fs.upsert_file("/docs/a.txt", spec(3, 1)).unwrap();
+        assert_eq!(fs.lookup_path("/docs/a.txt").unwrap().mtime_unix_secs, 7);
+        let b = fs.upsert_file("docs/a.txt", spec(5, 2)).unwrap();
+        assert_ne!(a, b, "a changed file gets a new inode");
+        assert!(fs.getattr(a).is_none(), "the old inode is gone");
+        assert_eq!(fs.lookup_path("/docs/a.txt").unwrap().size_bytes, 5);
+        let names: Vec<_> = fs
+            .list_children("/docs")
+            .unwrap()
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        assert_eq!(names, vec!["a.txt".to_string()]);
+        assert!(fs.list_children("/docs/a.txt").is_none());
+        assert!(fs.upsert_file("/docs", spec(1, 3)).is_err());
+        assert_eq!(fs.remove_path("/docs"), PathRemoval::Folder);
+        assert_eq!(fs.remove_path("/docs/a.txt"), PathRemoval::Removed);
+        assert_eq!(fs.remove_path("/docs/a.txt"), PathRemoval::Absent);
+        assert!(fs.lookup_path("/docs/a.txt").is_none());
+        assert_eq!(fs.list_children("/docs").unwrap().len(), 0);
+        assert_eq!(fs.list_children("/").unwrap().len(), 1);
+    }
+}

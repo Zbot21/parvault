@@ -432,6 +432,8 @@ pub const fn admission_class(request: &MeshWireRequest) -> AdmissionClass {
         | MeshWireRequest::DeleteBlindedShardSigned { .. }
         | MeshWireRequest::GetCiphertextShard { .. }
         | MeshWireRequest::DeleteShard { .. }
+        // B-158 (v0.5.6): owner-signed like `DeleteShard`; `free_order_decision` checks it.
+        | MeshWireRequest::FreeShards { .. }
         | MeshWireRequest::PorAudit(_)
         | MeshWireRequest::MultiSegmentPorAudit(_)
         | MeshWireRequest::ChunkAudit(_)
@@ -740,6 +742,10 @@ pub fn reject_response(request: &MeshWireRequest, reason: String) -> MeshWireRes
             deleted: false,
             error: Some(reason),
         },
+        MeshWireRequest::FreeShards { .. } => MeshWireResponse::FreeShardsAck {
+            outcomes: Vec::new(),
+            error: Some(reason),
+        },
         MeshWireRequest::QueryNodeStatus => MeshWireResponse::NodeStatusResult {
             peer_id: String::new(),
             asn: 0,
@@ -988,6 +994,31 @@ fn relay_ack(result: Result<(), String>) -> MeshWireResponse {
     }
 }
 
+/// The one removal path for a held regular shard on the wire side (`v0.5.6` T0; arch056c 1.1,
+/// B-152 (a), B-178): `DeleteShard` and `FreeShards` both remove through here, where every
+/// per-shard index is reachable. Track B1 fills it in; the signature is fixed by T0.
+///
+/// Lock order (B1 keeps it): each step takes and releases its own lock before the next, and
+/// never holds two at once.
+/// 1. `block_store`: the shard file, then (inside it) the `quota` mutex and the shard index.
+/// 2. `eviction`: the eviction attribution record (`&mut`, no lock). Eviction's own removal
+///    (`eviction.rs`, under its `&mut self`) never comes here, and this path never calls back
+///    into eviction's removal, so neither re-enters the other.
+/// 3. `por_verifier`: PoR session, grant and repair-grant entries, then the owner binding,
+///    cleared only after step 1 removed the shard (C13, B-178).
+///
+/// Returns whether a shard was removed (`false`: not held). T0 stub: step 1 only, exactly the
+/// `delete_shard` call `DeleteShard` made before `v0.5.6`.
+pub(crate) fn remove_held_shard(
+    block_store: &BlockStore,
+    _eviction: &mut PrivacyPreservingEvictionEngine,
+    _por_verifier: &mut PorVerifierEngine,
+    owner: &str,
+    shard_id: &crate::storage::ShardId,
+) -> Result<bool, crate::storage::StorageError> {
+    block_store.delete_shard(owner, shard_id)
+}
+
 fn handle_mesh_wire_request<P: WireRolePolicy>(
     peer: &WirePeer<'_>,
     request: MeshWireRequest,
@@ -1212,7 +1243,7 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                     error: Some(OWNER_NOT_SENDER_TEXT.to_string()),
                 };
             };
-            match block_store.delete_shard(&owner, &shard_id) {
+            match remove_held_shard(block_store, eviction, por_verifier, &owner, &shard_id) {
                 Ok(deleted) => MeshWireResponse::DeleteShardAck {
                     deleted,
                     error: None,
@@ -1221,6 +1252,19 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
                     deleted: false,
                     error: Some(e.to_string()),
                 },
+            }
+        }
+        MeshWireRequest::FreeShards { order } => {
+            // T0 stub (G3): track B1 replaces this arm with `free_order_decision`, then
+            // `shard_delete_decision` and `remove_held_shard` per shard.
+            let _ = order;
+            let refusal = crate::seam::not_built_yet(crate::seam::Stub {
+                track: "B1",
+                entry: "MeshWireRequest::FreeShards",
+            });
+            MeshWireResponse::FreeShardsAck {
+                outcomes: Vec::new(),
+                error: Some(refusal.to_string()),
             }
         }
         MeshWireRequest::PorAudit(challenge) => {
@@ -2384,13 +2428,27 @@ mod tests {
                 "CouncilManifestResult",
                 false,
             ),
+            (
+                MeshWireRequest::FreeShards {
+                    order: crate::network::behaviour::FreeShardsOrder {
+                        host_ed25519_pubkey: [0; 32],
+                        owner_ed25519_pubkey: [0; 32],
+                        timestamp_ms: 1,
+                        gc_epoch: 1,
+                        shard_ids: vec![shard_id],
+                        signature: vec![],
+                    },
+                },
+                "FreeShardsAck",
+                true,
+            ),
         ]
     }
 
     #[test]
     fn reject_response_matches_each_variant() {
         let reqs = all_requests();
-        assert_eq!(reqs.len(), 21);
+        assert_eq!(reqs.len(), 22);
         for (req, expected, carries_reason) in &reqs {
             let resp = format!("{:?}", reject_response(req, "admission-denied".into()));
             assert!(resp.starts_with(expected), "{expected}: {resp}");

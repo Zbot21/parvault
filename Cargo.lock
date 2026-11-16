@@ -2303,6 +2303,7 @@ dependencies = [
  "libc",
  "libp2p",
  "rand 0.8.8",
+ "rcgen",
  "reed-solomon-erasure",
  "serde",
  "serde_json",

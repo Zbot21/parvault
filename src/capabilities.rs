@@ -1013,53 +1013,105 @@ impl GatewayTokenSource {
     }
 }
 
+/// Largest file [`read_owner_only_file`] reads (keys, join tokens, passphrase files).
+pub const OWNER_FILE_MAX_BYTES: u64 = 64 * 1024;
+
+/// Why [`read_owner_only_file`] refused a file.
+#[derive(Debug)]
+pub enum OwnerFileRefusal {
+    /// It could not be opened (missing, a symlink: `O_NOFOLLOW`, or no permission).
+    Open(std::io::Error),
+    /// The open descriptor could not be stat'ed.
+    Stat(std::io::Error),
+    /// Not a regular file owned by the effective UID with mode exactly `0600`.
+    NotOwnerOnly { is_file: bool, uid: u32, mode: u32 },
+    /// Reading it failed.
+    Read(std::io::Error),
+    /// Longer than [`OWNER_FILE_MAX_BYTES`].
+    TooLarge,
+}
+
+/// The root-key file rule (B-16, A-16 C1), made public in `v0.5.6` T0 for TLS keys, join tokens
+/// and passphrase files (A-TLS-8, A-146-5, K8): opened without following a symlink and without
+/// blocking, then checked on the open descriptor (no check-then-open race): a regular file,
+/// owned by the effective UID, with mode exactly `0600`, at most [`OWNER_FILE_MAX_BYTES`]. The
+/// bytes are zeroized on drop.
+#[cfg(unix)]
+pub fn read_owner_only_file(
+    path: &std::path::Path,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, OwnerFileRefusal> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(OwnerFileRefusal::Open)?;
+    let meta = file.metadata().map_err(OwnerFileRefusal::Stat)?;
+    let euid = crate::os_sys::geteuid();
+    if !meta.file_type().is_file() || meta.uid() != euid || meta.mode() & 0o777 != 0o600 {
+        return Err(OwnerFileRefusal::NotOwnerOnly {
+            is_file: meta.file_type().is_file(),
+            uid: meta.uid(),
+            mode: meta.mode() & 0o777,
+        });
+    }
+    let mut raw = zeroize::Zeroizing::new(Vec::with_capacity(65));
+    file.take(OWNER_FILE_MAX_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(OwnerFileRefusal::Read)?;
+    if raw.len() as u64 > OWNER_FILE_MAX_BYTES {
+        return Err(OwnerFileRefusal::TooLarge);
+    }
+    Ok(raw)
+}
+
 /// Mints a gateway token for this process's effective UID from the root key file at `key_file`
-/// (B-16, A-16 C1). The file must be a regular file (no symlink) owned by the effective UID with
-/// mode `0600`; the key bytes are zeroized after the mint.
+/// (B-16, A-16 C1). The file must pass [`read_owner_only_file`]; the key bytes are zeroized
+/// after the mint.
 #[cfg(unix)]
 pub fn auto_mint_token(
     key_file: &std::path::Path,
     write: bool,
     expires_at_unix_ms: u64,
 ) -> Result<CapabilityMacaroon, String> {
-    use std::io::Read;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use zeroize::Zeroize;
     let shown = key_file.display();
     let hint = "pass --macaroon-file, or --data-dir of the running daemon (a daemon started with --macaroon-key-hex writes no key file)";
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(key_file)
-        .map_err(|e| {
-            format!("cannot auto-mint a gateway token: cannot open {shown}: {e}; {hint}")
-        })?;
-    let meta = file
-        .metadata()
-        .map_err(|e| format!("cannot auto-mint a gateway token: cannot stat {shown}: {e}"))?;
     let euid = crate::os_sys::geteuid();
-    if !meta.file_type().is_file() || meta.uid() != euid || meta.mode() & 0o777 != 0o600 {
-        return Err(format!(
-            "cannot auto-mint a gateway token: {shown} must be a regular file owned by UID {euid} with mode 0600 (it is UID {}, mode {:o}); {hint}",
-            meta.uid(),
-            meta.mode() & 0o777
-        ));
-    }
-    let mut raw = Vec::with_capacity(65);
-    let read = file.take(128).read_to_end(&mut raw);
+    let raw = match read_owner_only_file(key_file) {
+        Ok(raw) => Some(raw),
+        Err(OwnerFileRefusal::Open(e)) => {
+            return Err(format!(
+                "cannot auto-mint a gateway token: cannot open {shown}: {e}; {hint}"
+            ))
+        }
+        Err(OwnerFileRefusal::Stat(e)) => {
+            return Err(format!(
+                "cannot auto-mint a gateway token: cannot stat {shown}: {e}"
+            ))
+        }
+        Err(OwnerFileRefusal::NotOwnerOnly { uid, mode, .. }) => {
+            return Err(format!(
+                "cannot auto-mint a gateway token: {shown} must be a regular file owned by UID {euid} with mode 0600 (it is UID {uid}, mode {mode:o}); {hint}"
+            ))
+        }
+        // Unreadable or oversized: reported as not a key, as before v0.5.6.
+        Err(OwnerFileRefusal::Read(_) | OwnerFileRefusal::TooLarge) => None,
+    };
     let mut key = [0u8; 32];
-    let parsed = read.is_ok()
-        && match raw.len() {
-            32 => {
-                key.copy_from_slice(&raw);
-                true
-            }
-            _ => {
-                let text = std::str::from_utf8(&raw).unwrap_or("").trim();
-                text.len() == 64 && hex::decode_to_slice(text, &mut key).is_ok()
-            }
-        };
-    raw.zeroize();
+    let parsed = match raw.as_deref() {
+        Some(raw) if raw.len() == 32 => {
+            key.copy_from_slice(raw);
+            true
+        }
+        Some(raw) => {
+            let text = std::str::from_utf8(raw).unwrap_or("").trim();
+            text.len() == 64 && hex::decode_to_slice(text, &mut key).is_ok()
+        }
+        None => false,
+    };
+    drop(raw);
     if !parsed || key == [0u8; 32] {
         key.zeroize();
         return Err(format!(

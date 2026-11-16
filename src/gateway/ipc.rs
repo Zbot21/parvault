@@ -157,6 +157,12 @@ pub enum IpcCommand {
     QueryHealthStatusAuthed {
         macaroon: Option<CapabilityMacaroon>,
     },
+    /// Appended (`v0.5.6`, B-148 item 2, V1; index 7): the daemon's
+    /// [`LiveStatusSnapshot`](crate::live_status::LiveStatusSnapshot), under the same decision
+    /// as `QueryStatus`.
+    QueryLiveStatus {
+        macaroon: Option<CapabilityMacaroon>,
+    },
 }
 
 /// Control responses returned by [`GatewayIpcServer`] over `/var/run/parvault.sock`.
@@ -185,6 +191,8 @@ pub enum IpcResponse {
     },
     /// Appended (item 3): the answer to `QueryStatus`.
     StatusSnapshot(StatusSnapshot),
+    /// Appended (`v0.5.6`, index 6): the answer to `QueryLiveStatus`.
+    LiveStatus(crate::live_status::LiveStatusSnapshot),
 }
 
 /// Most LAN peers a [`StatusSnapshot`] carries (item 3, ruling change 3).
@@ -887,6 +895,24 @@ mod unix_impl {
             }
         }
 
+        /// `QueryLiveStatus` (`v0.5.6`, B-148 item 2): the daemon's live status, presenting
+        /// `macaroon`.
+        pub fn query_live_status(
+            &self,
+            macaroon: Option<CapabilityMacaroon>,
+        ) -> io::Result<crate::live_status::LiveStatusSnapshot> {
+            match self.send_request_sync(&IpcCommand::QueryLiveStatus { macaroon }, None)? {
+                IpcResponse::LiveStatus(snap) if snap.within_caps() => Ok(snap),
+                IpcResponse::LiveStatus(_) => Err(io::Error::other(
+                    "QueryLiveStatus: snapshot over its size caps",
+                )),
+                IpcResponse::Error { message } => Err(io::Error::other(message)),
+                other => Err(io::Error::other(format!(
+                    "unexpected QueryLiveStatus response: {other:?}"
+                ))),
+            }
+        }
+
         /// Queries live gateway IOPS, peer count, and PoR SLA compliance score synchronously.
         pub fn query_health_sync(&self) -> io::Result<(u64, usize, f32)> {
             let cmd = IpcCommand::QueryHealthStatusAuthed {
@@ -1345,6 +1371,20 @@ mod unix_impl {
             }
         }
 
+        /// `QueryLiveStatus` (`v0.5.6`) synchronously, like [`Self::query_status_sync`].
+        pub fn query_live_status_sync(
+            &self,
+            macaroon: Option<CapabilityMacaroon>,
+        ) -> io::Result<crate::live_status::LiveStatusSnapshot> {
+            match self {
+                #[cfg(feature = "daemon-runtime")]
+                Self::InProcess(engine) => engine
+                    .query_live_status(macaroon.as_ref(), Some(crate::os_sys::geteuid()))
+                    .map_err(|e| io::Error::other(e.to_string())),
+                Self::UnixSocket(client) => client.query_live_status(macaroon),
+            }
+        }
+
         /// Registers an existing or sparse virtual `FileManifest` synchronously.
         pub fn register_manifest_sync(
             &self,
@@ -1453,6 +1493,9 @@ mod golden_wire {
             IpcCommand::QueryHealthStatusAuthed {
                 macaroon: Some(tok()),
             },
+            IpcCommand::QueryLiveStatus {
+                macaroon: Some(tok()),
+            },
         ]
     }
 
@@ -1483,6 +1526,18 @@ mod golden_wire {
                 }],
                 ..StatusSnapshot::default()
             }),
+            IpcResponse::LiveStatus(crate::live_status::LiveStatusSnapshot {
+                peers: vec![crate::live_status::LivePeer {
+                    peer_id: "p".into(),
+                    admitted: true,
+                    connected: false,
+                    addrs: vec!["/ip4/127.0.0.1/tcp/1".into()],
+                }],
+                listen_addrs: vec!["/ip4/0.0.0.0/tcp/4001".into()],
+                shards_held: 3,
+                anon_rss_bytes: 4,
+                ..Default::default()
+            }),
         ]
     }
 
@@ -1496,6 +1551,7 @@ mod golden_wire {
             IpcCommand::QueryHealthStatus => "QueryHealthStatus",
             IpcCommand::QueryStatus { .. } => "QueryStatus",
             IpcCommand::QueryHealthStatusAuthed { .. } => "QueryHealthStatusAuthed",
+            IpcCommand::QueryLiveStatus { .. } => "QueryLiveStatus",
         }
     }
 
@@ -1507,6 +1563,7 @@ mod golden_wire {
             IpcResponse::Error { .. } => "Error",
             IpcResponse::StoreSuccessLocalOnly { .. } => "StoreSuccessLocalOnly",
             IpcResponse::StatusSnapshot(_) => "StatusSnapshot",
+            IpcResponse::LiveStatus(_) => "LiveStatus",
         }
     }
 
@@ -1523,12 +1580,15 @@ mod golden_wire {
         "cmd QueryHealthStatus 4 fb5e512425fc9449316ec95969ebe71e2d576dbab833d61e2a5b9330fd70ee02",
         "cmd QueryStatus 5 90690e4aee4f4c975bb59f0b9edcc0b1603f1e3e871933889e314a4e5d768f64",
         "cmd QueryHealthStatusAuthed 6 6b41862b8d62efa8a3116822fb4ac88c49909a308dd65a7dfc2ecc3bd7f3e818",
+        // v0.5.6 (appended; LiveStatus is new in v0.5.6 and track D may re-pin its row).
+        "cmd QueryLiveStatus 7 26c2a3540139e04d6f759ba7b5320a90e0ca07e413efedac6fa7bd7715ef56f3",
         "resp StoreSuccess 0 d0cbeed4caa773256e6190330f1d22bc4a0bb707981381ea504318bb9dd22d28",
         "resp FetchSuccess 1 3cf4c6d7d35690bf9cefc706492dccabc67d6e25ff145e0a681864bc0e3db0da",
         "resp HealthStatus 2 42c3ccd517cfe720bf02dd2c56c9f606cc40fbd10ff238e4d9ef3215faeda5a1",
         "resp Error 3 b7c04c4052c347008dfd50308f5eec48d49ea14b6799fbaf6766fd909f843bab",
         "resp StoreSuccessLocalOnly 4 89d1aa480b45d25c240e8e575927ccf33ddb8bdef94edaa84e56a433b1e369ad",
         "resp StatusSnapshot 5 91e96c3e3aa3aef402af076f2034354a657615f15706c1db41bc9c923896c556",
+        "resp LiveStatus 6 39939a09b92872610d559b5ea1aea4be5e6b26894de89f89d68994a6944630cb",
     ];
 
     #[test]

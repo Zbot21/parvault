@@ -1,4 +1,5 @@
 pub mod aes;
+pub mod backup_envelope;
 pub mod bip39;
 pub mod keys;
 pub mod pqc;

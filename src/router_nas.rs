@@ -13,12 +13,12 @@ use crate::capabilities::CapabilityMacaroon;
 use crate::gateway::ipc::GatewayBus;
 use crate::http_edge::{
     presented_token, read_request_head, spawn_edge_conn, status_auth_decision, status_auth_facts,
-    status_host_allowed, EdgeSlots, EdgeVerifier, PresentedToken, StatusAuthFacts, StatusTransport,
-    RESP_403, RESP_502, RESP_503, STATUS_401,
+    status_host_allowed, EdgeSlots, EdgeStream, EdgeVerifier, PresentedToken, RequestHead,
+    StatusAuthFacts, StatusTransport, RESP_403, RESP_502, RESP_503, STATUS_401,
 };
 use crate::traversal_metrics::TraversalCounters;
 use std::io::{self, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -210,7 +210,7 @@ fn status_refusal(f: &StatusAuthFacts) -> &'static [u8] {
 }
 
 fn handle_status_conn(
-    stream: &mut TcpStream,
+    stream: &mut dyn EdgeStream,
     bus: &GatewayBus,
     verifier: &EdgeVerifier,
     bound: SocketAddr,
@@ -220,6 +220,9 @@ fn handle_status_conn(
     let Some(head) = read_request_head(stream)? else {
         return Ok(());
     };
+    // A-TLS-4: every status answer closes the connection (`Connection: close`), so bytes past
+    // this head (a body, a pipelined request) are not served; track A's keep-alive uses them.
+    let RequestHead { head, remainder: _ } = head;
     let text = String::from_utf8_lossy(&head);
     let mut lines = text.split("\r\n");
     let mut request = lines.next().unwrap_or("").split_whitespace();
@@ -297,6 +300,20 @@ fn handle_status_conn(
             ),
         };
     }
+    // v0.5.6 (B-148 item 2, V1): live status, behind the same decision (track D fills it in).
+    if path == "/live" {
+        return match bus.query_live_status_sync(token.cloned()) {
+            Ok(live) => {
+                let json = serde_json::to_vec_pretty(&live).map_err(io::Error::other)?;
+                send_response(stream, "200 OK", "application/json", &json)
+            }
+            Err(e) => {
+                tracing::warn!(peer = %peer, error = %e, "live status not served by the gateway");
+                stream.write_all(RESP_503)?;
+                stream.flush()
+            }
+        };
+    }
     let snap = match bus.query_status_sync(token.cloned()) {
         Ok(s) => s,
         Err(e) => {
@@ -347,7 +364,12 @@ fn handle_status_conn(
 /// QA item 3: no scripts, no external loads, no framing; the dashboard's inline `<style>` only.
 const STATUS_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'";
 
-fn send_response(stream: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) -> io::Result<()> {
+fn send_response<W: Write + ?Sized>(
+    stream: &mut W,
+    status: &str,
+    ctype: &str,
+    body: &[u8],
+) -> io::Result<()> {
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: {STATUS_CSP}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         body.len()

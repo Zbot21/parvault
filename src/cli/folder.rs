@@ -158,10 +158,19 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
         lite_seed_dir,
         device_cert,
         resyndicate_lite,
+        no_gc,
     } = command
     else {
         unreachable!("watch_folder() is only dispatched for Commands::WatchFolder")
     };
+    if no_gc {
+        // v0.5.6 T0 stub (G3): track B2 builds the version GC this turns off.
+        return Err(parvault::seam::not_built_yet(parvault::seam::Stub {
+            track: "B2",
+            entry: "--no-gc",
+        })
+        .into());
+    }
     let effective_tier = if public_mode {
         println!(
             "[parvault] Public Commons mode active: zero-knowledge AES-256-GCM encryption + 10-of-20 Reed-Solomon sharding."
@@ -647,10 +656,19 @@ pub(crate) async fn restore_folder(env: CliEnv, command: Commands) -> anyhow::Re
         vault_namespace,
         file,
         filter,
+        version,
     } = command
     else {
         unreachable!("restore_folder() is only dispatched for Commands::RestoreFolder")
     };
+    if version.is_some() {
+        // v0.5.6 T0 stub (G3): track B2 restores from the version store.
+        return Err(parvault::seam::not_built_yet(parvault::seam::Stub {
+            track: "B2",
+            entry: "restore-folder --version",
+        })
+        .into());
+    }
     let (master_key, owner_identity) = vault_keys(
         effective_seed_phrase(seed_phrase).as_deref(),
         &vault_namespace,

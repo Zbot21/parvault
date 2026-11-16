@@ -50,6 +50,10 @@ pub enum WotAction {
         /// The invitee's 32-byte Ed25519 public key (64 hex characters, from `parvault identity`).
         #[arg(long)]
         peer: String,
+        /// Write the token to this file (`0600`, atomically) and print only its path
+        /// (A-146-6, `v0.5.6`).
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
     },
     /// Install a ring invitation token (from `parvault wot invite`): verifies the chain against the
     /// ring's genesis key, pins that key (`<data_dir>/ring_genesis.pub`) and stores the chain.
@@ -183,6 +187,49 @@ pub enum NetAction {
         /// Skip the `QueryNodeStatus` round trip.
         #[arg(long, default_value_t = false)]
         no_rpc: bool,
+    },
+}
+
+/// `parvault tls` subcommands (B-1, L-81; `v0.5.6`): the edge's self-signed certificate.
+#[derive(Debug, Clone, Subcommand)]
+pub enum TlsAction {
+    /// Print the edge certificate's SHA-256 SPKI pin, SANs and expiry.
+    Show,
+    /// Write the edge certificate (PEM, no key) to `--out`, for clients to register.
+    Export {
+        #[arg(long, value_name = "FILE")]
+        out: PathBuf,
+    },
+    /// Issue a new edge key and certificate (every client registers it again).
+    Rotate,
+}
+
+/// `parvault ring` subcommands (B-169; `v0.5.6`): the encrypted genesis backup.
+#[derive(Debug, Clone, Subcommand)]
+pub enum RingAction {
+    /// Write an encrypted backup of this node's ring identity and vault master key to `--out`.
+    Backup {
+        /// Directory the bundle is written to.
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+        /// File holding the passphrase (`0600`, at least 20 characters).
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: PathBuf,
+    },
+    /// Restore a backup bundle into an empty data dir (a move: the old node must be retired).
+    Restore {
+        /// The bundle file.
+        #[arg(long, value_name = "FILE")]
+        from: PathBuf,
+        /// File holding the passphrase (`0600`).
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: PathBuf,
+        /// Refuse unless the bundle is for this ring id (64 hex characters).
+        #[arg(long, value_name = "RING_ID")]
+        expect_ring: Option<String>,
+        /// Confirm that the old node is retired (required).
+        #[arg(long, default_value_t = false)]
+        confirm_move: bool,
     },
 }
 
@@ -343,6 +390,32 @@ pub enum Commands {
         #[arg(long, default_value_t = 64, value_name = "MIB")]
         vfs_cache_mib: u64,
 
+        /// Initialise a ring on an empty data dir, or start an existing one (B-146 item 8,
+        /// `v0.5.6`); an unknown non-empty data dir is refused.
+        #[arg(long, default_value_t = false)]
+        init_if_absent: bool,
+
+        /// Join the ring with the invitation token in this file (`0600`; A-146-4, A-146-5).
+        #[arg(long, value_name = "FILE")]
+        join_token_file: Option<PathBuf>,
+
+        /// Extra DNS name or IP for the edge TLS certificate (repeatable; bridge-mode containers).
+        #[arg(long, value_name = "NAME|IP")]
+        tls_san: Vec<String>,
+
+        /// Serve WebDAV and the status page over plain HTTP on a non-loopback bind (L-81 opt-out).
+        #[arg(long, default_value_t = false)]
+        insecure_plain_http: bool,
+
+        /// Group of the gateway socket; with it the socket is `0660` instead of `0600` (B-180).
+        #[arg(long, value_name = "GROUP")]
+        gateway_socket_group: Option<String>,
+
+        /// Do not garbage-collect old folder versions in the background folder sync (B-154; one
+        /// release).
+        #[arg(long, default_value_t = false)]
+        no_gc: bool,
+
         /// Print the effective configuration of this command (`parvault.config-dump/1`) and exit
         /// 0 without binding, creating, reading or writing any file but the config file.
         #[arg(long, default_value_t = false)]
@@ -419,7 +492,11 @@ pub enum Commands {
         action: FileAction,
     },
     /// Inspect local daemon health, SLA cohort tier, WoT peers, and storage quota.
-    Status,
+    Status {
+        /// Ask the running daemon for its live state (peers, scheduler, memory; B-148, `v0.5.6`).
+        #[arg(long, default_value_t = false)]
+        live: bool,
+    },
     /// Display or initialize the persistent NodeIdentity, Post-Quantum Owner Key, and Master Key fingerprints.
     Identity {
         /// Also print the Vault Device Peer ID of the vault this phrase and namespace derive
@@ -539,6 +616,10 @@ pub enum Commands {
         /// A full re-upload: run it on an unmetered link.
         #[arg(long, default_value_t = false)]
         resyndicate_lite: bool,
+
+        /// Do not garbage-collect old versions after the pass (B-154; one release).
+        #[arg(long, default_value_t = false)]
+        no_gc: bool,
     },
     /// Browse and list all files, sizes, and stripe counts in a Folder Snapshot Manifest without downloading shards (ADR-20).
     ListSnapshot {
@@ -576,6 +657,11 @@ pub enum Commands {
         /// Optional comma-separated glob or directory prefix filter (e.g. `"docs/*.md,src/"`) for selective partial restore (ADR-20).
         #[arg(long)]
         filter: Option<String>,
+
+        /// Restore version N of the folder from its version store (B-154, `v0.5.6`) instead of
+        /// the snapshot's current one.
+        #[arg(long, value_name = "N")]
+        version: Option<u64>,
     },
     /// Zero-Local-State "House Fire" Disaster Recovery from a memorized seed phrase and network peers or EncryptedVaultCatalogEnvelope (ADR-18). Recovers only folders backed up with
     /// `watch-folder --seed-phrase` and the same `--vault-namespace`.
@@ -633,6 +719,16 @@ pub enum Commands {
     Token {
         #[command(subcommand)]
         action: crate::gateway::TokenAction,
+    },
+    /// The edge's TLS certificate (`show`, `export`, `rotate`; B-1, `v0.5.6`).
+    Tls {
+        #[command(subcommand)]
+        action: TlsAction,
+    },
+    /// The encrypted genesis backup (`backup`, `restore`; B-169, `v0.5.6`).
+    Ring {
+        #[command(subcommand)]
+        action: RingAction,
     },
     /// Network tests (`probe`; `docs/LAB_MODE.md`).
     Net {
@@ -713,6 +809,18 @@ pub enum DaemonAction {
         /// Bounded local LRU block cache capacity in MiB for the built-in (`=y`) VFS.
         #[arg(long, default_value_t = 64, value_name = "MIB")]
         vfs_cache_mib: u64,
+
+        /// Extra DNS name or IP for the edge TLS certificate (repeatable; bridge-mode containers).
+        #[arg(long, value_name = "NAME|IP")]
+        tls_san: Vec<String>,
+
+        /// Serve WebDAV and the status page over plain HTTP on a non-loopback bind (L-81 opt-out).
+        #[arg(long, default_value_t = false)]
+        insecure_plain_http: bool,
+
+        /// Group of the gateway socket; with it the socket is `0660` instead of `0600` (B-180).
+        #[arg(long, value_name = "GROUP")]
+        gateway_socket_group: Option<String>,
 
         /// Print the effective configuration of this command (`parvault.config-dump/1`) and exit
         /// 0 without binding, creating, reading or writing any file but the config file.
