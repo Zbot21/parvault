@@ -624,7 +624,8 @@ fn test_gateway_folder_sync_inprocess_and_socket_incremental_macaroon_and_filter
         let cat2 = syncer
             .sync_folder_once(&src, RetentionPolicy::Persistent)
             .expect("sync v2 unchanged");
-        assert_eq!(cat2.version, 2);
+        assert_eq!(cat2.version, 1); // B-154: an unchanged pass keeps its version
+        assert!(syncer.last_pass_no_change());
         assert_eq!(cat2.folder_merkle_root, cat1.folder_merkle_root);
         assert_eq!(
             engine.traffic_counters().0,
@@ -650,7 +651,7 @@ fn test_gateway_folder_sync_inprocess_and_socket_incremental_macaroon_and_filter
         let cat3 = syncer
             .sync_folder_once(&src, RetentionPolicy::Persistent)
             .expect("sync v3");
-        assert_eq!(cat3.version, 3);
+        assert_eq!(cat3.version, 2);
         assert!(cat3.deleted_tombstones.contains_key("images/photo.raw"));
 
         let cat_path = mode_dir.join("gateway_catalog.bin");

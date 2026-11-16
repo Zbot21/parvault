@@ -1100,6 +1100,9 @@ docker rm -fv "$VFS_NETEM" >/dev/null 2>&1 || true
     || { echo "ERROR: stage 12c: the WebDAV leg under netem 15ms/2% failed or exceeded 600 s (exit $VFS_NETEM_RC)"; exit 1; }
 echo "Mounted MP4 gate verified: FUSE ${VFS_FUSE_RESULT}; WebDAV 206 PASS (plain and under netem)."
 
+# Stage 13 (v0.5.6 track B2): B-154 version GC on a 3-node ring (T1, T2, T4).
+source scripts/gate_stage13_version_gc.sh
+
 echo "================================================================================"
 PARVAULT_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
 echo " PARVAULT v${PARVAULT_VERSION} MULTI-CONTAINER & ROUTER-SOC DOCKER ACCEPTANCE SUMMARY"
@@ -1122,6 +1125,7 @@ echo " 48 MiB Cgroup SoC Gate : PASS (5 x 1 MiB stripes store+restore, 0 OOM kil
 echo " Status page (item 3)   : PASS (router-soc: no token 401, read-only token 200)"
 echo " parvault-status sidecar: PASS (200 / 401 / DNS Host 403 / ?token= 401; no files; ${SIDE_BIN_BYTES} B)"
 echo " Mounted MP4 (item 5)   : FUSE ${VFS_FUSE_RESULT}; WebDAV 206 PASS (plain + netem 15ms/2%, < 100 ms)"
+echo " Version GC (B-154)     : PASS (T1 60-pass log churn bounded, T2 no change, T4 offline host freed on return)"
 echo " Non-root (B-106)       : PASS (uid/gid 65532, CapEff empty, no-new-privileges in every daemon container; waived: ${FUSE_WAIVED} (FUSE harness, SYS_ADMIN), ${NETEM_TC_WAIVED} (tc sidecar, NET_ADMIN)"
 echo "================================================================================"
 echo "=== ACCEPTANCE GATE PASSED ==="

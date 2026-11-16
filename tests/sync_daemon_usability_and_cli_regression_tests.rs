@@ -1002,6 +1002,9 @@ fn test_live_libp2p_tcp_multi_daemon_network_backup_prune_and_seed_recovery() {
             "--vault-namespace",
             "live-tcp-test",
             "--prune-deleted",
+            // B-154: keeps the legacy immediate-prune path; with GC on, a deleted file is freed
+            // when the last retained version holding it ages out.
+            "--no-gc",
             "--once",
         ])
         .output()

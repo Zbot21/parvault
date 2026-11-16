@@ -432,12 +432,7 @@ fn dispatch_rpc_on_established_peer(
         };
         match bincode::serialize(env) {
             Ok(bytes) => {
-                let record = kad::Record {
-                    key: kad::RecordKey::new(&dht_key),
-                    value: bytes,
-                    publisher: Some(peer_id),
-                    expires: None,
-                };
+                let record = envelope_kad_record(&dht_key, bytes, *swarm.local_peer_id());
                 let _ = swarm
                     .behaviour_mut()
                     .kademlia
@@ -1102,6 +1097,81 @@ pub struct MeshClient {
     dial_set: Arc<crate::lab_dial::DialSet>,
     /// Under a fixed set: the configured endpoints that seed the worker's Kademlia.
     lab_kad_entries: Arc<Vec<String>>,
+    /// B-154 C3 (`v0.5.6`): called before a stripe's first `PutShard` with its shard ids and
+    /// every host it may reach; an error stops the placement (nothing is sent unjournalled).
+    pre_place_hook: Option<PrePlaceHook>,
+    /// arch152 3.5 (`v0.5.6`): hosts that answered "full" (`reject.node_shard_count`,
+    /// `reject.node_capacity`), skipped by placement until the time given.
+    full_hosts: Arc<Mutex<HashMap<String, Instant>>>,
+    /// B-163 item 3 (C35): `PutShard` refusals with `reject.peer_quota_exceeded` seen so far.
+    quota_refusals: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// The Kademlia record an envelope put publishes (B-181): its publisher is this node, never
+/// the peer the RPC goes to.
+pub(crate) fn envelope_kad_record(
+    dht_key: &[u8; 32],
+    value: Vec<u8>,
+    local: PeerId,
+) -> kad::Record {
+    kad::Record {
+        key: kad::RecordKey::new(dht_key),
+        value,
+        publisher: Some(local),
+        expires: None,
+    }
+}
+
+/// The owner's placement journal hook (B-154 C3): `(shard ids, candidate hosts)` of one stripe,
+/// called before any shard of it is sent.
+#[derive(Clone)]
+pub struct PrePlaceHook(pub Arc<PrePlaceFn>);
+
+/// The function behind a [`PrePlaceHook`].
+pub type PrePlaceFn = dyn Fn(&[ShardId], &[String]) -> std::io::Result<()> + Send + Sync;
+
+impl std::fmt::Debug for PrePlaceHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PrePlaceHook")
+    }
+}
+
+/// How long placement skips a host that answered "full" (arch152 3.5).
+pub const HOST_FULL_SKIP: Duration = Duration::from_secs(600);
+
+/// What a `PutShard` refusal means to placement (arch152 3.5, C35).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutRefusal {
+    /// The host is full (`reject.node_shard_count` or `reject.node_capacity`): place elsewhere
+    /// and skip it for [`HOST_FULL_SKIP`].
+    HostFull,
+    /// This owner is at its allowance on that host (`reject.peer_quota_exceeded`).
+    OwnerQuota,
+    Other,
+}
+
+/// Classifies a `PutShard` refusal by its reason code, matched by name (the code literals
+/// belong to the host's `quota_decision`).
+pub fn put_refusal_class(reason: &str) -> PutRefusal {
+    if reason.contains(".node_shard_count") || reason.contains(".node_capacity") {
+        PutRefusal::HostFull
+    } else if reason.contains(".peer_quota_exceeded") {
+        PutRefusal::OwnerQuota
+    } else {
+        PutRefusal::Other
+    }
+}
+
+/// A host's answer to one `FreeShards` order (B-154 2.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreeShardsReply {
+    /// One outcome per shard, in the order's order.
+    Outcomes(Vec<crate::network::behaviour::FreeShardOutcome>),
+    /// The whole order was refused (`reject.free_stale`, `reject.free_epoch_replay`, ...).
+    Refused(String),
+    /// The host does not take `FreeShards` (an older build, or a stub): fall back to
+    /// `DeleteShard` (C15).
+    Unsupported(String),
 }
 
 /// The process-wide lab dial set, installed once by the `parvault` binary in deterministic mode
@@ -1167,6 +1237,9 @@ impl MeshClient {
             admission_refused_at: Arc::new(Mutex::new(HashMap::new())),
             dial_set: Arc::new(crate::lab_dial::DialSet::Open),
             lab_kad_entries: Arc::new(Vec::new()),
+            pre_place_hook: None,
+            full_hosts: Arc::new(Mutex::new(HashMap::new())),
+            quota_refusals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
         .with_process_dial_set()
     }
@@ -2639,6 +2712,132 @@ impl MeshClient {
         }
     }
 
+    /// `DeleteShard` with its outcome (B-154 C15 fallback): `Ok(true)` deleted, `Ok(false)` not
+    /// held (no error), `Err` refused or unreachable. [`Self::delete_shard`] keeps its old
+    /// contract (not held is an error).
+    pub fn delete_shard_outcome(
+        &self,
+        peer_addr: &str,
+        shard_id: ShardId,
+        owner: &NodeIdentity,
+    ) -> anyhow::Result<bool> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let (owner_pub, payload, sig) =
+            PorVerifierEngine::sign_owner_shard_delete_token(owner, &shard_id, now_ms);
+        let (sig_r, sig_s) = split_ed25519_signature(&sig)?;
+        match self.send_request(
+            peer_addr,
+            MeshWireRequest::DeleteShard {
+                shard_id,
+                owner_signature: (owner_pub, payload, sig_r, sig_s),
+            },
+        )? {
+            MeshWireResponse::DeleteShardAck { deleted, error } => match (deleted, error) {
+                (true, _) => Ok(true),
+                (false, None) => Ok(false),
+                (false, Some(e)) => Err(MeshClientError::RemoteRejected {
+                    peer: peer_addr.to_string(),
+                    reason: e,
+                }
+                .into()),
+            },
+            other => Err(MeshClientError::ProtocolError(format!(
+                "unexpected response to DeleteShard: {other:?}"
+            ))
+            .into()),
+        }
+    }
+
+    /// Sends one owner-signed `FreeShards` order (B-154 2.4, track B2). A transport failure is
+    /// an `Err` (the journal keeps the entries); a host that cannot decode or does not build the
+    /// variant is [`FreeShardsReply::Unsupported`].
+    pub fn free_shards(
+        &self,
+        peer_addr: &str,
+        order: crate::network::behaviour::FreeShardsOrder,
+    ) -> anyhow::Result<FreeShardsReply> {
+        let expected = order.shard_ids.len();
+        match self.send_request(peer_addr, MeshWireRequest::FreeShards { order }) {
+            Ok(MeshWireResponse::FreeShardsAck { outcomes, error }) => match error {
+                Some(e) if e.contains(crate::seam::NOT_BUILT_YET) => {
+                    Ok(FreeShardsReply::Unsupported(e))
+                }
+                Some(e) => Ok(FreeShardsReply::Refused(e)),
+                None if outcomes.len() == expected => Ok(FreeShardsReply::Outcomes(outcomes)),
+                None => Ok(FreeShardsReply::Refused(format!(
+                    "reject.free_ack_length: {} outcomes for {expected} shards",
+                    outcomes.len()
+                ))),
+            },
+            Ok(other) => Ok(FreeShardsReply::Unsupported(format!(
+                "unexpected response to FreeShards: {other:?}"
+            ))),
+            // A transport failure, or an older host that fails to decode the appended variant
+            // and drops the stream: the caller falls back to `DeleteShard` on that host (C15).
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether `addr` answers a status request now (B-154: tells an offline host from one
+    /// that cannot decode `FreeShards`).
+    pub fn is_reachable(&self, addr: &str) -> bool {
+        self.send_request(addr, MeshWireRequest::QueryNodeStatus)
+            .is_ok()
+    }
+
+    /// Sets the placement journal hook (B-154 C3).
+    pub fn with_pre_place_hook(mut self, hook: PrePlaceHook) -> Self {
+        self.pre_place_hook = Some(hook);
+        self
+    }
+
+    /// `PutShard` refusals with `reject.peer_quota_exceeded` since this client (or a clone of
+    /// it) was built (C35).
+    pub fn quota_refusals(&self) -> u64 {
+        self.quota_refusals
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether placement currently skips `addr` as full (arch152 3.5).
+    pub fn host_is_full(&self, addr: &str) -> bool {
+        let Ok(mut full) = self.full_hosts.lock() else {
+            return false;
+        };
+        match full.get(addr) {
+            Some(until) if *until > Instant::now() => true,
+            Some(_) => {
+                full.remove(addr);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Records a refused `PutShard` for placement: a full host is skipped for a while; an
+    /// owner-quota refusal is counted.
+    fn note_put_refusal(&self, addr: &str, err: &anyhow::Error) {
+        match put_refusal_class(&err.to_string()) {
+            PutRefusal::HostFull => {
+                tracing::warn!(
+                    code = "warn.host_full",
+                    host = %addr,
+                    "host is full; placing elsewhere"
+                );
+                if let Ok(mut full) = self.full_hosts.lock() {
+                    full.insert(addr.to_string(), Instant::now() + HOST_FULL_SKIP);
+                }
+            }
+            PutRefusal::OwnerQuota => {
+                self.quota_refusals
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            PutRefusal::Other => {}
+        }
+    }
+
     pub fn por_audit(
         &self,
         peer_addr: &str,
@@ -3221,6 +3420,45 @@ impl MeshClient {
         let n_total = shard_set.shards.len();
         let mut assigned_peers = Vec::with_capacity(n_total);
 
+        // B-154 C3: journal the stripe's shards and every host they may reach before the first
+        // put, so a pass that dies mid-upload leaves no unrecorded shard on a host.
+        if let Some(hook) = &self.pre_place_hook {
+            let ids: Vec<ShardId> = (0..n_total)
+                .map(|idx| ShardId {
+                    stripe_merkle_root: shard_set.stripe_merkle_root,
+                    shard_index: idx as u32,
+                    shard_hash: shard_set.shard_hashes[idx],
+                })
+                .collect();
+            let mut hosts: Vec<String> = raw_peers.clone();
+            if let Some(seed) = &self.seed_addr {
+                if is_network_peer_addr(seed) && !hosts.contains(seed) {
+                    hosts.push(seed.clone());
+                }
+            }
+            (hook.0)(&ids, &hosts)
+                .map_err(|e| anyhow::anyhow!("placement journal write failed: {e}"))?;
+        }
+        let try_put = |peer_addr: &String, shard_id: ShardId, shard_bytes: &Vec<u8>| -> bool {
+            if self.host_is_full(peer_addr) {
+                return false;
+            }
+            match self.put_shard(
+                peer_addr,
+                &effective_owner_peer_id,
+                shard_id,
+                shard_bytes.clone(),
+                session_key,
+                Some(grant.clone()),
+            ) {
+                Ok(()) => true,
+                Err(e) => {
+                    self.note_put_refusal(peer_addr, &e);
+                    false
+                }
+            }
+        };
+
         // When the physical peer count P is smaller than the stripe width N, each node hosts
         // multiple shards (ceil(N / P)). Compute the fault-domain shift factor so correlated
         // multi-shard loss from offline nodes cannot drop surviving shards below K (`C12`).
@@ -3245,39 +3483,19 @@ impl MeshClient {
                 if self.is_peer_marked_dead(peer_addr) {
                     continue;
                 }
-                if self
-                    .put_shard(
-                        peer_addr,
-                        &effective_owner_peer_id,
-                        shard_id,
-                        shard_bytes.clone(),
-                        session_key,
-                        Some(grant.clone()),
-                    )
-                    .is_ok()
-                    && primary_peer.is_none()
-                {
+                if try_put(peer_addr, shard_id, shard_bytes) && primary_peer.is_none() {
                     primary_peer = Some(peer_addr.clone());
                 }
             }
 
-            // Failover pass 1: try any remaining live primary or standby peers (`C5`, `C11`).
+            // Failover pass 1: try any remaining live primary or standby peers (`C5`, `C11`); a
+            // full host is skipped (arch152 3.5).
             if primary_peer.is_none() {
                 for peer_addr in primary_peers.iter().chain(standby_peers.iter()) {
                     if self.is_peer_marked_dead(peer_addr) {
                         continue;
                     }
-                    if self
-                        .put_shard(
-                            peer_addr,
-                            &effective_owner_peer_id,
-                            shard_id,
-                            shard_bytes.clone(),
-                            session_key,
-                            Some(grant.clone()),
-                        )
-                        .is_ok()
-                    {
+                    if try_put(peer_addr, shard_id, shard_bytes) {
                         primary_peer = Some(peer_addr.clone());
                         break;
                     }
@@ -3287,17 +3505,7 @@ impl MeshClient {
             // Failover pass 2: if all live peers failed, retry peers previously marked dead.
             if primary_peer.is_none() {
                 for peer_addr in &raw_peers {
-                    if self
-                        .put_shard(
-                            peer_addr,
-                            &effective_owner_peer_id,
-                            shard_id,
-                            shard_bytes.clone(),
-                            session_key,
-                            Some(grant.clone()),
-                        )
-                        .is_ok()
-                    {
+                    if try_put(peer_addr, shard_id, shard_bytes) {
                         primary_peer = Some(peer_addr.clone());
                         break;
                     }
@@ -3307,14 +3515,7 @@ impl MeshClient {
             // Also syndicate to `seed_addr` if configured as a network Multiaddr
             if let Some(ref seed) = self.seed_addr {
                 if is_network_peer_addr(seed) {
-                    let _ = self.put_shard(
-                        seed,
-                        &effective_owner_peer_id,
-                        shard_id,
-                        shard_bytes.clone(),
-                        session_key,
-                        Some(grant.clone()),
-                    );
+                    let _ = try_put(seed, shard_id, shard_bytes);
                 }
             }
 
@@ -3434,6 +3635,17 @@ impl IpLocalityExt for IpAddr {
 
 #[cfg(test)]
 mod tests {
+    /// B-181: an envelope's Kademlia record names the publishing node, not the destination.
+    #[test]
+    fn envelope_record_publisher_is_the_local_node() {
+        let local = node_identity_libp2p_peer_id(&NodeIdentity::from_seed([0x51; 32])).unwrap();
+        let dest = node_identity_libp2p_peer_id(&NodeIdentity::from_seed([0x52; 32])).unwrap();
+        let r = envelope_kad_record(&[7; 32], vec![1, 2, 3], local);
+        assert_eq!(r.publisher, Some(local));
+        assert_ne!(r.publisher, Some(dest));
+        assert_eq!(r.key, kad::RecordKey::new(&[7u8; 32]));
+    }
+
     /// D5: the swarm runtime's blocking pool holds `SWARM_MAX_BLOCKING_THREADS` threads; one
     /// more blocking task waits for a free thread instead of starting a new one.
     #[test]

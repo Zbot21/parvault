@@ -159,23 +159,33 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
         device_cert,
         resyndicate_lite,
         no_gc,
-        // B-154 retention (track B2): bound here when the version GC is built.
-        keep_last: _,
-        keep_daily: _,
-        keep_weekly: _,
-        max_stored_bytes: _,
+        keep_last,
+        keep_daily,
+        keep_weekly,
+        max_stored_bytes,
     } = command
     else {
         unreachable!("watch_folder() is only dispatched for Commands::WatchFolder")
     };
-    if no_gc {
-        // v0.5.6 T0 stub (G3): track B2 builds the version GC this turns off.
-        return Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt {
-            track: "B2",
-            entry: "--no-gc",
-        })
-        .into());
+    // B-154: version GC is on unless `--no-gc` (one release), which keeps the `v0.5.5`
+    // behaviour: no version store, no frees, `--prune-deleted` as before.
+    let gc_on = !no_gc;
+    // C37: the shortest interval, refused below the floor (not clamped).
+    if let Err(code) =
+        parvault::sync::retention::watch_interval_decision(interval_secs, once || dry_run)
+    {
+        anyhow::bail!(
+            "{code}: --interval-secs must be at least {} (each pass uploads every changed file)",
+            parvault::sync::retention::MIN_WATCH_INTERVAL_SECS
+        );
     }
+    // L-119: the folder's tunables, checked against the client ceilings (refused, not clamped).
+    let policy = parvault::sync::retention::RetentionPolicy::checked(
+        keep_last,
+        keep_daily,
+        keep_weekly,
+        max_stored_bytes,
+    )?;
     let effective_tier = if public_mode {
         println!(
             "[parvault] Public Commons mode active: zero-knowledge AES-256-GCM encryption + 10-of-20 Reed-Solomon sharding."
@@ -221,9 +231,11 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
     );
 
     let mut prev_syndicated = false;
+    let mut prev_version = None;
     if snapshot_out.exists() {
         if let Ok(raw_prev) = std::fs::read(&snapshot_out) {
             if let Ok(prev_snapshot) = FolderSnapshotManifest::decode_bytes(&raw_prev) {
+                prev_version = Some(prev_snapshot.version);
                 prev_syndicated = prev_snapshot
                     .files
                     .values()
@@ -256,8 +268,54 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
         return Ok(());
     }
 
+    // B-154 2.3: one pass at a time per snapshot (the lock is held for the whole run), and C4:
+    // a snapshot file older than its version store is refused.
+    let gc_paths = parvault::sync::gc_journal::GcPaths::for_snapshot(&snapshot_out);
+    let _pass_lock = if gc_on {
+        let lock = parvault::sync::gc_journal::PassLock::acquire(&gc_paths)?;
+        parvault::sync::gc_journal::check_snapshot_fresh(&snapshot_out, prev_version)?;
+        Some(lock)
+    } else {
+        None
+    };
+    // Frees go through the owner's client; a lite client's go through its seed, as its
+    // stripes did.
+    let gc_client = if is_lite_net_seed {
+        Some(super::mesh_client(
+            &eff,
+            owner_identity.clone(),
+            mesh_client.all_network_endpoints(),
+            lite_seed_dir
+                .as_ref()
+                .map(|d| d.to_string_lossy().to_string()),
+        ))
+    } else {
+        engine.store().mesh_client().cloned()
+    };
+    if gc_on {
+        engine.set_gc(parvault::sync::gc_journal::GcSettings {
+            snapshot_out: snapshot_out.clone(),
+            policy,
+            data_dir: cfg.data_dir.clone(),
+            client: gc_client.clone(),
+            fetched_catalog: None,
+        });
+        if prune_deleted {
+            println!(
+                "[parvault] --prune-deleted is deprecated: version GC frees deleted files once no retained version holds them"
+            );
+        }
+    }
+    let catalog_dht_key = master_key.derive_vault_root_dht_key(&vault_namespace);
+    let mut retried_for_quota = false;
+
     loop {
         let mut pass_local_only = 0u64;
+        let quota_refusals_before = engine
+            .store()
+            .mesh_client()
+            .map(|c| c.quota_refusals())
+            .unwrap_or(0);
         let (snapshot, lite_receipts_count) = if let Some(seed_dir) = &lite_seed_dir {
             let pq_kp = HybridPqSigningKeypair::load_or_generate_in_dir(&cfg.data_dir)?;
             let cert = if let Some(cert_arg) = &device_cert {
@@ -495,10 +553,14 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
             pass_local_only += n;
             (snap?, 0)
         };
+        let pass = engine.last_pass();
         let raw_snapshot = bincode::serialize(&snapshot)?;
-        BlockStore::atomic_write_file(&snapshot_out, &raw_snapshot)?;
+        // B-154 3: an unchanged pass leaves the snapshot file byte-identical.
+        if std::fs::read(&snapshot_out).ok().as_deref() != Some(raw_snapshot.as_slice()) {
+            BlockStore::atomic_write_file(&snapshot_out, &raw_snapshot)?;
+        }
 
-        let pruned_shards = if prune_deleted {
+        let pruned_shards = if prune_deleted && !gc_on {
             if is_lite_net_seed {
                 let seed_str = lite_seed_dir
                     .as_ref()
@@ -525,12 +587,17 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
 
         println!("=== Neighborhood Cloud Folder Sync Pass Complete ===");
         println!("Watched Folder     : {}", folder.display());
-        println!("Snapshot Version   : {}", snapshot.version);
+        if pass.no_change {
+            println!("Snapshot Version   : {} (no change)", snapshot.version);
+        } else {
+            println!("Snapshot Version   : {}", snapshot.version);
+        }
         println!(
             "Folder Merkle Root : {}",
             hex::encode(snapshot.folder_merkle_root)
         );
         println!("Files Synced       : {}", snapshot.files.len());
+        println!("Changes            : {}", changes_line(&pass));
         if pass_local_only > 0 {
             println!(
                 "Not Backed Up      : {}",
@@ -544,54 +611,118 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                 lite_receipts_count
             );
         }
-        if prune_deleted {
+        if prune_deleted && !gc_on {
             println!("Pruned Shards      : {}", pruned_shards);
         }
         println!("Snapshot Saved To  : {}", snapshot_out.display());
 
-        if let Some(cat_path) = &catalog_out {
-            let phrase = effective_seed_phrase
-                .as_deref()
-                .expect("checked above: --catalog-out needs a seed phrase");
-            let envelope =
-                engine.export_encrypted_vault_catalog(phrase, &vault_namespace, &snapshot)?;
-            if is_lite_net_seed {
-                let seed_str = lite_seed_dir
-                    .as_ref()
-                    .map(|d| d.to_string_lossy().to_string());
-                let net_client = super::mesh_client(
-                    &eff,
-                    owner_identity.clone(),
-                    mesh_client.all_network_endpoints(),
-                    seed_str,
-                );
-                let _ =
-                    net_client.put_dht_envelope(DhtWireEnvelope::VaultCatalog(envelope.clone()));
+        if let Some(phrase) = effective_seed_phrase.as_deref() {
+            let cat_path = catalog_out
+                .clone()
+                .unwrap_or_else(|| snapshot_out.with_extension("catalog.bin"));
+            // B-154 3 and C6: a no-change pass seals no catalog, unless the last acknowledged
+            // one lags this version or the catalog file is missing.
+            let published = if gc_on {
+                parvault::sync::gc_journal::published_catalog_version(&snapshot_out)?
+            } else {
+                None
+            };
+            let lags = published.is_none_or(|v| v < snapshot.version);
+            if !pass.no_change || lags || !cat_path.exists() {
+                let (envelope, acked) = engine.publish_vault_catalog(
+                    phrase,
+                    &vault_namespace,
+                    &snapshot,
+                    gc_client.as_ref(),
+                )?;
+                if acked && gc_on {
+                    parvault::sync::gc_journal::record_published_catalog(
+                        &snapshot_out,
+                        envelope.monotonic_version,
+                        envelope.ciphertext_sha256,
+                    )?;
+                }
+                let raw_env = bincode::serialize(&envelope)?;
+                BlockStore::atomic_write_file(&cat_path, &raw_env)?;
             }
-            let raw_env = bincode::serialize(&envelope)?;
-            BlockStore::atomic_write_file(cat_path, &raw_env)?;
             println!("Catalog Envelope   : {}", cat_path.display());
-        } else if let Some(phrase) = effective_seed_phrase.as_deref() {
-            let default_cat = snapshot_out.with_extension("catalog.bin");
-            let envelope =
-                engine.export_encrypted_vault_catalog(phrase, &vault_namespace, &snapshot)?;
-            if is_lite_net_seed {
-                let seed_str = lite_seed_dir
+            // C7: the catalog the ring holds now must be the one this device published.
+            if gc_on {
+                let fetched = gc_client
                     .as_ref()
-                    .map(|d| d.to_string_lossy().to_string());
-                let net_client = super::mesh_client(
-                    &eff,
-                    owner_identity.clone(),
-                    mesh_client.all_network_endpoints(),
-                    seed_str,
-                );
-                let _ =
-                    net_client.put_dht_envelope(DhtWireEnvelope::VaultCatalog(envelope.clone()));
+                    .filter(|c| !c.all_network_endpoints().is_empty())
+                    .and_then(|c| {
+                        c.get_dht_envelope(&catalog_dht_key, DhtEnvelopeKind::VaultCatalog)
+                            .ok()
+                    })
+                    .and_then(|e| match e {
+                        DhtWireEnvelope::VaultCatalog(env) if env.verify_zero_knowledge() => {
+                            Some((env.monotonic_version, env.ciphertext_sha256))
+                        }
+                        _ => None,
+                    });
+                engine.set_fetched_catalog(fetched);
             }
-            let raw_env = bincode::serialize(&envelope)?;
-            BlockStore::atomic_write_file(&default_cat, &raw_env)?;
-            println!("Catalog Envelope   : {}", default_cat.display());
         }
+
+        if gc_on {
+            match engine.gc_after_pass(&snapshot, &cfg.data_dir) {
+                Ok(report) => {
+                    let hosts = gc_client
+                        .as_ref()
+                        .map(|c| c.all_network_endpoints().len() as u64)
+                        .unwrap_or(0);
+                    let stats = parvault::sync::gc_journal::folder_stats(
+                        &snapshot, &policy, &report, hosts,
+                    );
+                    if let Err(e) = parvault::sync::gc_journal::write_stats(
+                        &cfg.data_dir,
+                        &snapshot_out,
+                        &stats,
+                    ) {
+                        tracing::warn!(error = %e, "folder stats not written");
+                    }
+                    print_gc_lines(&report, &stats);
+                    // C35: at its allowance on some host, an owner frees first, then retries
+                    // the pass once.
+                    let refused = engine
+                        .store()
+                        .mesh_client()
+                        .map(|c| c.quota_refusals())
+                        .unwrap_or(0)
+                        > quota_refusals_before;
+                    match parvault::sync::gc_journal::quota_retry_decision(
+                        refused,
+                        retried_for_quota,
+                        report.freed_any(),
+                    ) {
+                        parvault::sync::gc_journal::QuotaRetry::Retry => {
+                            let n = engine.requeue_not_backed_up();
+                            println!(
+                                "[parvault] a host refused this owner for quota; GC freed space, retrying {n} file(s) once"
+                            );
+                            retried_for_quota = true;
+                            continue;
+                        }
+                        parvault::sync::gc_journal::QuotaRetry::Spent(code) => {
+                            tracing::warn!(
+                                code,
+                                retried = retried_for_quota,
+                                "a host refused this owner for quota and GC freed nothing more (or the retry is spent); the refused stripes stay on this machine"
+                            );
+                        }
+                        parvault::sync::gc_journal::QuotaRetry::NotNeeded => {}
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(code = "error.gc_failed", error = %e, "version GC failed; the journal is retried next pass");
+                    if once {
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+        retried_for_quota = false;
 
         if once {
             parvault::storage::local_only::finish_one_shot(pass_local_only, allow_local_only);
@@ -606,6 +737,87 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
         tokio::time::sleep(Duration::from_secs(interval_secs.max(1))).await;
     }
     Ok(())
+}
+
+/// `Changes : 2 modified, 0 added, 0 deleted, 1.6 MB uploaded` or `none` (B-154 3).
+fn changes_line(pass: &parvault::sync::PassSummary) -> String {
+    if pass.no_change {
+        return if pass.mtime_only {
+            "none (modification times only)".to_string()
+        } else {
+            "none".to_string()
+        };
+    }
+    format!(
+        "{} modified, {} added, {} deleted, {:.1} MB uploaded",
+        pass.modified,
+        pass.added,
+        pass.deleted,
+        pass.uploaded_bytes as f64 / 1_000_000.0
+    )
+}
+
+fn print_gc_lines(
+    report: &parvault::sync::gc_journal::GcReport,
+    stats: &parvault::sync::gc_journal::FolderStats,
+) {
+    println!(
+        "Versions Retained  : {} (policy: last {}, daily {}, weekly {}{})",
+        report.versions_kept,
+        stats.keep_last,
+        stats.keep_daily,
+        stats.keep_weekly,
+        stats
+            .max_stored_bytes
+            .map(|c| format!(", cap {c} bytes"))
+            .unwrap_or_default()
+    );
+    println!(
+        "Version GC         : {} version(s) dropped, {} shard(s) freed on hosts, {} local, {} order(s), {} DeleteShard fallback(s)",
+        report.versions_dropped,
+        report.shards_freed,
+        report.local_shards_freed,
+        report.orders_sent,
+        report.fallback_deletes
+    );
+    println!(
+        "Pending Frees      : {} ({} bytes); abandoned {} ({} bytes)",
+        report.pending, report.pending_bytes, report.abandoned, report.abandoned_bytes
+    );
+    if report.clock_skew_refusals > 0 {
+        println!(
+            "Clock Skew         : {} free(s) refused as stale (reject.free_stale): check this machine's clock",
+            report.clock_skew_refusals
+        );
+    }
+    println!(
+        "Folder Size        : {} bytes; stored {} bytes (expected on ring {} bytes, policy maximum {} bytes)",
+        stats.disk_bytes,
+        stats.stored_cipher_bytes,
+        stats.expected_stored_bytes,
+        stats.policy_max_bytes
+    );
+    println!(
+        "Version Store      : {} bytes on this disk",
+        stats.version_store_bytes
+    );
+    if report.foreign_catalog {
+        println!(
+            "Warning: another device publishes this vault's catalog; nothing was freed. One writer per vault folder."
+        );
+    }
+    if let Some(code) = stats.warn_code {
+        tracing::warn!(
+            code,
+            expected = stats.expected_stored_bytes,
+            policy_max = stats.policy_max_bytes,
+            "expected stored bytes exceed 1.25x what the retention policy can hold"
+        );
+        println!(
+            "Warning ({code}): this folder's expected stored bytes ({}) exceed 1.25x what its retention policy can hold ({}): frees may be stuck or abandoned; see Pending Frees",
+            stats.expected_stored_bytes, stats.policy_max_bytes
+        );
+    }
 }
 
 pub(crate) async fn list_snapshot(env: CliEnv, command: Commands) -> anyhow::Result<()> {
@@ -666,22 +878,33 @@ pub(crate) async fn restore_folder(env: CliEnv, command: Commands) -> anyhow::Re
     else {
         unreachable!("restore_folder() is only dispatched for Commands::RestoreFolder")
     };
-    if version.is_some() {
-        // v0.5.6 T0 stub (G3): track B2 restores from the version store.
-        return Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt {
-            track: "B2",
-            entry: "restore-folder --version",
-        })
-        .into());
-    }
     let (master_key, owner_identity) = vault_keys(
         effective_seed_phrase(seed_phrase).as_deref(),
         &vault_namespace,
         &cfg,
         key_hex.as_deref(),
     )?;
-    let raw_snapshot = std::fs::read(&snapshot)?;
-    let snapshot_manifest = FolderSnapshotManifest::decode_bytes(&raw_snapshot)?;
+    // B-154 (T5): `--version N` restores a retained version from the snapshot's version store.
+    let snapshot_manifest = match version {
+        Some(n) => {
+            let store = parvault::sync::retention::VersionStore::for_snapshot(&snapshot);
+            let kept = store.list()?;
+            if let Err(code) = parvault::sync::retention::version_restore_decision(&kept, n) {
+                anyhow::bail!(
+                    "{code}: version {n} is not retained; retained: {}",
+                    kept.iter()
+                        .map(|m| m.version.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            store.load(n)?
+        }
+        None => {
+            let raw_snapshot = std::fs::read(&snapshot)?;
+            FolderSnapshotManifest::decode_bytes(&raw_snapshot)?
+        }
+    };
     let store_with_owner = block_store
         .clone()
         .with_mesh_client(mesh_client.with_identity(owner_identity.clone()));
@@ -833,16 +1056,72 @@ pub(crate) async fn recover_from_seed(env: CliEnv, command: Commands) -> anyhow:
 
 /// `folder-status` (B-154, track B2): the retained versions and stored bytes of a folder.
 /// T0b stub: refused until track B2 builds it.
+/// `parvault folder-status` (B-154 C30, L-122): one folder's versions, policy, frees and
+/// accounting from its version store, journal and stats file. No network.
 pub(crate) async fn folder_status(env: CliEnv, command: Commands) -> anyhow::Result<()> {
-    let _ = env;
-    let Commands::FolderStatus { snapshot: _ } = command else {
+    let CliEnv { cfg, .. } = env;
+    let Commands::FolderStatus { snapshot } = command else {
         unreachable!("folder_status() is only dispatched for Commands::FolderStatus")
     };
-    Err(parvault::seam::not_built_yet(parvault::seam::Unbuilt {
-        track: "B2",
-        entry: "folder-status",
-    })
-    .into())
+    use parvault::sync::gc_journal::{stats_path, FolderStats, GcJournal, GcPaths};
+    let store = parvault::sync::retention::VersionStore::for_snapshot(&snapshot);
+    let versions = store.list()?;
+    if versions.is_empty() {
+        anyhow::bail!(
+            "no version store for {} (back it up with watch-folder first; --no-gc keeps none)",
+            snapshot.display()
+        );
+    }
+    let journal = GcJournal::load(&GcPaths::for_snapshot(&snapshot))?;
+    println!("=== Folder Status (B-154) ===");
+    println!("Snapshot           : {}", snapshot.display());
+    println!(
+        "Versions Retained  : {} ({})",
+        versions.len(),
+        versions
+            .iter()
+            .map(|m| m.version.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if let Some((l, d, w, cap)) = journal.policy {
+        println!(
+            "Policy             : last {l}, daily {d}, weekly {w}{}",
+            cap.map(|c| format!(", cap {c} bytes")).unwrap_or_default()
+        );
+    }
+    println!(
+        "Pending Frees      : {} ({} bytes); abandoned {} ({} bytes)",
+        journal.pending.len(),
+        journal.pending_bytes(),
+        journal.abandoned.len(),
+        journal.abandoned_bytes()
+    );
+    println!(
+        "Version Store      : {} bytes on this disk",
+        store.local_bytes()
+    );
+    match std::fs::read(stats_path(&cfg.data_dir, &snapshot))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<FolderStats>(&raw).ok())
+    {
+        Some(st) => {
+            println!("Folder Size        : {} bytes", st.disk_bytes);
+            println!(
+                "Stored             : {} bytes (pre-erasure)",
+                st.stored_cipher_bytes
+            );
+            println!(
+                "Expected On Ring   : {} bytes (expected; policy maximum {} bytes)",
+                st.expected_stored_bytes, st.policy_max_bytes
+            );
+            if st.warn {
+                println!("Warning            : expected bytes exceed 1.25x the policy maximum");
+            }
+        }
+        None => println!("Folder Size        : unknown (no stats file in this data dir)"),
+    }
+    Ok(())
 }
 
 #[cfg(test)]

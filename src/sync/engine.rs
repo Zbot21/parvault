@@ -24,6 +24,9 @@ use std::fs::{self, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+/// The daemon's watched-folder snapshot in its data dir (`up --watch-folder`).
+pub const APPLIANCE_SNAPSHOT_FILE: &str = "appliance_folder_snapshot.manifest.bin";
+
 /// Default stripe size (16 MiB) for incremental folder synchronization (ADR-01).
 pub const DEFAULT_SYNC_STRIPE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -283,6 +286,66 @@ pub struct FolderSyncEngine {
     cached_entries: BTreeMap<String, SyncedFileEntry>,
     deleted_tombstones: BTreeMap<String, DeletedFileTombstone>,
     dht_store: ZeroTrustDhtStore,
+    /// The previous pass's envelope, reused by a no-change pass (B-154 3).
+    last_envelope: Option<SignedDhtManifestEnvelope>,
+    /// What the last `sync_folder_once` did (B-154 3).
+    last_pass: PassSummary,
+    /// Version GC of this folder (B-154; `None`: the daemon's appliance folder defaults).
+    gc: Option<super::gc_journal::GcSettings>,
+}
+
+/// What one pass changed (B-154 3; the `FolderSyncDiff` counters).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PassSummary {
+    /// Nothing changed: same paths, roots and sizes, same tombstones; no new version.
+    pub no_change: bool,
+    /// Only modification times changed (the snapshot file is rewritten, the version kept).
+    pub mtime_only: bool,
+    pub added: usize,
+    pub modified: usize,
+    pub deleted: usize,
+    pub uploaded_bytes: u64,
+}
+
+/// B154-NOCHANGE: a pass is "no change" when the `(path, file root, size)` lists and the
+/// tombstone path lists are equal; modification times are not compared (B-154 3). Both lists
+/// are in path order.
+pub fn no_change_decision<P: PartialEq, R: PartialEq>(
+    prev_files: &[(P, R, u64)],
+    next_files: &[(P, R, u64)],
+    prev_tombstones: &[P],
+    next_tombstones: &[P],
+) -> bool {
+    prev_files == next_files && prev_tombstones == next_tombstones
+}
+
+/// B154-NOCHANGE on a pass: `Some(code)` when the pass is no change. The first pass of a
+/// folder (version 0) is always a change.
+pub fn pass_change_decision(
+    current_version: u64,
+    prev_files: &[(&str, Hash32, u64)],
+    next_files: &[(&str, Hash32, u64)],
+    prev_tombstones: &[&str],
+    next_tombstones: &[&str],
+) -> Option<&'static str> {
+    if current_version > 0
+        && no_change_decision(prev_files, next_files, prev_tombstones, next_tombstones)
+    {
+        tracing::info!(
+            code = "info.folder_unchanged",
+            version = current_version,
+            "no change: the version, envelope and catalog are kept"
+        );
+        Some("info.folder_unchanged")
+    } else {
+        None
+    }
+}
+
+fn file_triples(m: &BTreeMap<String, SyncedFileEntry>) -> Vec<(&str, Hash32, u64)> {
+    m.iter()
+        .map(|(p, e)| (p.as_str(), e.file_merkle_root, e.size_bytes))
+        .collect()
 }
 
 impl FolderSyncEngine {
@@ -305,7 +368,60 @@ impl FolderSyncEngine {
             cached_entries: BTreeMap::new(),
             deleted_tombstones: BTreeMap::new(),
             dht_store,
+            last_envelope: None,
+            last_pass: PassSummary::default(),
+            gc: None,
         }
+    }
+
+    /// What the last pass changed.
+    pub const fn last_pass(&self) -> PassSummary {
+        self.last_pass
+    }
+
+    /// Sets this folder's GC (B-154). The placement journal hook (C3) is installed on the
+    /// engine's mesh client, so every stripe this engine places is recorded before its first
+    /// shard is sent.
+    pub fn set_gc(&mut self, settings: super::gc_journal::GcSettings) {
+        let paths = super::gc_journal::GcPaths::for_snapshot(&settings.snapshot_out);
+        if let Some(client) = self.store.mesh_client().cloned() {
+            self.store.set_mesh_client(Some(
+                client.with_pre_place_hook(super::gc_journal::inflight_hook(&paths)),
+            ));
+        }
+        self.gc = Some(settings);
+    }
+
+    pub fn store(&self) -> &BlockStore {
+        &self.store
+    }
+
+    /// C7: the catalog fetched from the ring after this pass's publish.
+    pub fn set_fetched_catalog(&mut self, fetched: Option<(u64, Hash32)>) {
+        if let Some(gc) = &mut self.gc {
+            gc.fetched_catalog = fetched;
+        }
+    }
+
+    /// B-163 item 3 (C35): forgets the cached entry of every file with a stripe below `k`
+    /// shards on ring hosts, so the next pass stores it again (now that GC made room).
+    /// Returns how many files it forgot.
+    pub fn requeue_not_backed_up(&mut self) -> usize {
+        let before = self.cached_entries.len();
+        self.cached_entries.retain(|_, e| {
+            e.manifest.stripes.iter().all(|s| {
+                s.assigned_peers
+                    .iter()
+                    .filter(|p| crate::network::is_network_peer_addr(p))
+                    .count()
+                    >= s.k_data
+            })
+        });
+        before - self.cached_entries.len()
+    }
+
+    pub fn owner_identity(&self) -> &NodeIdentity {
+        &self.owner_identity
     }
 
     pub const fn current_version(&self) -> u64 {
@@ -321,15 +437,29 @@ impl FolderSyncEngine {
     }
 
     /// Version GC after a pass (B-154; `v0.5.6` track B2): retention, mark and sweep, and the
-    /// `FreeShards` orders, journalled in `data_dir`. The daemon's folder sync calls it unless
-    /// `up --no-gc`. T0 stub: does nothing (no GC before `v0.5.6`).
+    /// `FreeShards` orders, journalled next to the snapshot. The daemon's folder sync calls it
+    /// unless `up --no-gc`; without [`Self::set_gc`] it uses the daemon's appliance snapshot in
+    /// `data_dir`, the default policy and the engine's own mesh client.
     pub fn gc_after_pass(
         &mut self,
         snapshot: &FolderSnapshotManifest,
         data_dir: &Path,
-    ) -> Result<(), StorageError> {
-        let _ = (snapshot, data_dir);
-        Ok(())
+    ) -> Result<super::gc_journal::GcReport, StorageError> {
+        let settings = self.gc.clone().unwrap_or_else(|| {
+            super::gc_journal::GcSettings::appliance(data_dir, self.store.mesh_client().cloned())
+        });
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        super::gc_journal::run_gc(
+            &settings,
+            &self.store,
+            &self.owner_identity,
+            snapshot,
+            now_ms,
+        )
+        .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))
     }
 
     /// Resumes incremental synchronization state from a previously saved `FolderSnapshotManifest`.
@@ -341,6 +471,7 @@ impl FolderSyncEngine {
         if let Some(env) = &snapshot.signed_dht_envelope {
             let _ = self.dht_store.put_manifest_envelope(env.clone());
         }
+        self.last_envelope = snapshot.signed_dht_envelope.clone();
     }
 
     /// Prunes local shards and encrypted manifests belonging to deleted files recorded in
@@ -500,6 +631,7 @@ impl FolderSyncEngine {
 
         let mut next_entries = BTreeMap::new();
         let mut file_roots = Vec::with_capacity(discovered_files.len());
+        let mut summary = PassSummary::default();
 
         for (rel_path, abs_path) in discovered_files {
             let meta = fs::metadata(&abs_path)?;
@@ -523,8 +655,12 @@ impl FolderSyncEngine {
                     {
                         let mut updated = prev.clone();
                         updated.modified_unix_ms = modified_unix_ms;
+                        summary.mtime_only = true;
                         updated
                     } else {
+                        summary.modified += 1;
+                        summary.uploaded_bytes =
+                            summary.uploaded_bytes.saturating_add(streamed_size);
                         self.backup_single_file(
                             &rel_path,
                             &abs_path,
@@ -536,6 +672,8 @@ impl FolderSyncEngine {
                 }
             } else {
                 let (streamed_size, plaintext_sha256) = compute_file_sha256_streaming(&abs_path)?;
+                summary.added += 1;
+                summary.uploaded_bytes = summary.uploaded_bytes.saturating_add(streamed_size);
                 self.backup_single_file(
                     &rel_path,
                     &abs_path,
@@ -546,29 +684,59 @@ impl FolderSyncEngine {
             };
 
             file_roots.push(entry.file_merkle_root);
-            self.deleted_tombstones.remove(&rel_path);
             next_entries.insert(rel_path, entry);
         }
 
-        self.current_version = self.current_version.saturating_add(1);
-
-        // Record tombstones for any previously tracked files that were deleted in this pass.
+        // Tombstones as this pass would leave them (a file back is no longer deleted; a file
+        // gone is deleted at the next version).
+        let next_version = self.current_version.saturating_add(1);
+        let mut next_tombstones = self.deleted_tombstones.clone();
+        for path in next_entries.keys() {
+            next_tombstones.remove(path);
+        }
         for (old_path, old_entry) in &self.cached_entries {
             if !next_entries.contains_key(old_path) {
-                self.deleted_tombstones.insert(
+                summary.deleted += 1;
+                next_tombstones.insert(
                     old_path.clone(),
                     DeletedFileTombstone {
                         relative_path: old_path.clone(),
-                        deleted_at_version: self.current_version,
+                        deleted_at_version: next_version,
                         previous_merkle_root: old_entry.file_merkle_root,
                     },
                 );
             }
         }
 
+        // B-154 3: an unchanged folder keeps its version, envelope and catalog. The first pass
+        // of a folder (version 0) is always a change.
+        let prev_tomb: Vec<&str> = self.deleted_tombstones.keys().map(String::as_str).collect();
+        let next_tomb: Vec<&str> = next_tombstones.keys().map(String::as_str).collect();
+        summary.no_change = pass_change_decision(
+            self.current_version,
+            &file_triples(&self.cached_entries),
+            &file_triples(&next_entries),
+            &prev_tomb,
+            &next_tomb,
+        )
+        .is_some();
         self.cached_entries = next_entries.clone();
-
+        self.deleted_tombstones = next_tombstones;
         let folder_merkle_root = compute_file_merkle_root(&file_roots);
+        if summary.no_change {
+            self.last_pass = summary;
+            return Ok(FolderSnapshotManifest {
+                version: self.current_version,
+                folder_merkle_root,
+                tier: self.tier,
+                files: next_entries,
+                signed_dht_envelope: self.last_envelope.clone(),
+                deleted_tombstones: self.deleted_tombstones.clone(),
+            });
+        }
+        summary.mtime_only = false;
+        self.current_version = next_version;
+        self.last_pass = summary;
 
         // Seal a monotonic SignedDhtManifestEnvelope anchored at the first file's manifest (or synthetic folder root).
         let signed_dht_envelope = if let Some((_, first_entry)) = next_entries.iter().next() {
@@ -599,6 +767,7 @@ impl FolderSyncEngine {
         } else {
             None
         };
+        self.last_envelope = signed_dht_envelope.clone();
 
         Ok(FolderSnapshotManifest {
             version: self.current_version,
@@ -1140,6 +1309,51 @@ impl FolderSyncEngine {
             }
         }
         Ok(env)
+    }
+
+    /// Seals and publishes the catalog like [`Self::export_encrypted_vault_catalog`] and says
+    /// whether it was acknowledged (C6): by at least one ring host, or, with no ring endpoint,
+    /// by the local envelope store. Errors are no longer discarded silently.
+    pub fn publish_vault_catalog(
+        &self,
+        seed_phrase: &str,
+        vault_namespace: &str,
+        snapshot: &FolderSnapshotManifest,
+        client: Option<&crate::network::MeshClient>,
+    ) -> Result<(EncryptedVaultCatalogEnvelope, bool), StorageError> {
+        let canonical = crate::crypto::validate_recovery_seed_phrase_or_passphrase(seed_phrase)?;
+        let pq_master_key =
+            PqVaultMasterKey::from_recovery_seed_phrase(&canonical, vault_namespace);
+        let env = EncryptedVaultCatalogEnvelope::seal(
+            &self.master_key,
+            &pq_master_key,
+            &self.owner_identity,
+            vault_namespace,
+            snapshot,
+        )?;
+        let local_ok = self
+            .store
+            .put_dht_vault_catalog_envelope(env.clone())
+            .is_ok();
+        let client = client.or(self.store.mesh_client());
+        let acked = match client {
+            Some(c) if !c.all_network_endpoints().is_empty() => {
+                match c.put_dht_envelope(crate::network::DhtWireEnvelope::VaultCatalog(env.clone()))
+                {
+                    Ok(n) => n > 0,
+                    Err(e) => {
+                        tracing::warn!(
+                            code = "warn.catalog_publish_failed",
+                            error = %e,
+                            "no ring host acknowledged the catalog; it is republished next pass"
+                        );
+                        false
+                    }
+                }
+            }
+            _ => local_ok,
+        };
+        Ok((env, acked))
     }
 
     /// Zero-Local-State "House Fire" Disaster Recovery (`ADR-18`):

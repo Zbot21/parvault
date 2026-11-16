@@ -1,0 +1,12 @@
+diff --git a/specs/ParVaultVersionGC.tla b/specs/ParVaultVersionGC.tla
+--- a/specs/ParVaultVersionGC.tla
++++ b/specs/ParVaultVersionGC.tla
+@@ -70,7 +70,7 @@
+ \* The marks: every kept version and the pass being written.
+ Marks(keep) == (UNION {refs[v] : v \in keep}) \cup pending   \* @guard mark-includes-pass sym=src/sync/gc_journal.rs::mark
+ \* A GC run keeps the newest version and the last acknowledged catalog.
+-KeepOk(keep) == ver \in keep /\ (published > 0 => published \in keep)   \* @guard catalog-pin sym=src/sync/gc_journal.rs::gc_free_decision
++KeepOk(keep) == ver \in keep
+ \* Version files are dropped only after the garbage is journalled.
+ DropPhases == {"journaled"}   \* @guard journal-before-drop
+ \* C9 (gate for v0.5.7 dedup): no stripe is referenced again while a sent order for it can
