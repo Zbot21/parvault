@@ -1,7 +1,7 @@
 diff --git a/specs/ParVaultVersionGC.tla b/specs/ParVaultVersionGC.tla
 --- a/specs/ParVaultVersionGC.tla
 +++ b/specs/ParVaultVersionGC.tla
-@@ -68,7 +68,7 @@
+@@ -75,7 +75,7 @@
  
  \* ---- Guards: owner side (track B2) ----
  \* The marks: every kept version and the pass being written.

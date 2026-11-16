@@ -34,7 +34,14 @@ EXTENDS Naturals, FiniteSets
 \*     owner (C16). Guard credit-accounted.
 \* Not modelled: signatures and host binding (an order names one host; F-36 and B154-FREE claims
 \* check them), the retention policy (C29), offline hosts beyond lost messages, abandonment after
-\* 30 days, PoR penalties (an audit of a freed shard is Unanswered, never Invalid: B-59 claims).
+\* 30 days, PoR penalties (an audit of a freed shard is Unanswered, never Invalid: B-59 claims),
+\* and expiry of the host's epoch marks: hepoch is kept forever here, while a Rust host drops a
+\* signer's mark FREE_EPOCH_TTL_MS after the order that set it was accepted. That is safe because
+\* the TTL (2 x skew + 1 s) is strictly longer than the longest an accepted order stays fresh
+\* (accepted + 2 x skew: signed up to skew ahead, fresh up to skew after its timestamp), so an
+\* order a dropped mark guarded is already refused as stale (unit test
+\* an_accepted_order_is_never_fresh_and_unmarked, D15); a restarted host with unreadable marks
+\* refuses every order for the TTL.
 
 CONSTANTS Hosts, Stripes, SeedStripes, MaxVer, MaxEpoch, MaxClock, Window, MaxCrash
 
