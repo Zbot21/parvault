@@ -85,8 +85,10 @@ fn dht_store_decision_respects_budget() {
     }
     if !f.store_corrupt
         && f.replaces_existing
-        && f.old_len <= f.total_bytes
-        && f.total_bytes - f.old_len + f.new_len <= l.max_bytes
+        && f.total_bytes
+            .checked_sub(f.old_len)
+            .and_then(|b| b.checked_add(f.new_len))
+            .is_some_and(|after| after <= l.max_bytes)
     {
         assert!(r.is_ok());
     }
