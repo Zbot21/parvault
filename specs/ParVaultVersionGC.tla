@@ -241,6 +241,8 @@ Spec == Init /\ [][Next]_vars
 RetainedRecoverable ==
     \A s \in Referenced : \A h \in Hosts : s \in held[h]
 
+\* B-182 (v0.5.6, arch182, L-141): the vault catalog is the folder's only ring record; folder
+\* sync publishes no per-file or anchor manifest envelope, so this is the ring's whole restore claim.
 PublishedRecoverable ==
     published > 0 => \A s \in refs[published] : \A h \in Hosts : s \in held[h]
 
