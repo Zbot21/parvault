@@ -935,14 +935,20 @@ mod seedvault {
     pub struct Writer {
         engine: FolderSyncEngine,
         seed: &'static str,
+        ns: &'static str,
     }
 
     impl Writer {
         pub fn new(dir: &Path, seed: &'static str) -> Self {
+            Self::new_ns(dir, seed, NS)
+        }
+
+        /// The writer of the vault `ns`.
+        pub fn new_ns(dir: &Path, seed: &'static str, ns: &'static str) -> Self {
             let canonical =
                 parvault::crypto::validate_recovery_seed_phrase_or_passphrase(seed).unwrap();
-            let mk = MasterKey::from_recovery_seed_phrase(&canonical, NS);
-            let owner = NodeIdentity::from_recovery_seed_phrase(&canonical, NS);
+            let mk = MasterKey::from_recovery_seed_phrase(&canonical, ns);
+            let owner = NodeIdentity::from_recovery_seed_phrase(&canonical, ns);
             let store = BlockStore::new(dir, QuotaManager::new(1 << 30, 1 << 28)).unwrap();
             Self {
                 engine: FolderSyncEngine::new(
@@ -952,6 +958,7 @@ mod seedvault {
                     parvault::config::ErasureTier::Consumer,
                 ),
                 seed,
+                ns,
             }
         }
 
@@ -960,7 +967,7 @@ mod seedvault {
             let snap = self.engine.sync_folder_once(folder).unwrap();
             self.engine.load_previous_snapshot(&snap);
             self.engine
-                .export_encrypted_vault_catalog(self.seed, NS, &snap)
+                .export_encrypted_vault_catalog(self.seed, self.ns, &snap)
                 .unwrap()
         }
     }
@@ -1141,4 +1148,176 @@ fn b20_seed_vault_rollback_refused() {
     let (st, body) = http(&d.webdav, "GET", "/photos/a.txt", &read_token(), &[]);
     assert_ne!((st, body.as_slice()), (200, &b"vault v1"[..]));
     gate_ran("trust_enforcement_restore::b20_seed_vault_rollback_refused");
+}
+
+// --- v0.5.6 qafix (D13, D16) -------------------------------------------------------------
+
+#[cfg(unix)]
+mod qafix056 {
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output};
+
+    pub const BACKUP_PASS: &str = "qafix056 ring backup passphrase";
+
+    /// `parvault --data-dir <dir>` with the ring and passphrase environment cleared.
+    fn pv(dir: &Path) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
+        cmd.env_remove("PARVAULT_GENESIS_SEED_HEX")
+            .env_remove("PARVAULT_GENESIS_PUBKEY_HEX")
+            .env_remove("PARVAULT_PEERS")
+            .env_remove("PARVAULT_PASSPHRASE")
+            .env(
+                "PARVAULT_LAN_REGISTRY_DIR",
+                dir.with_extension("lan-registry"),
+            )
+            .arg("--data-dir")
+            .arg(dir)
+            .arg("--no-lan-discovery");
+        cmd
+    }
+
+    fn text(o: &Output) -> String {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
+    }
+
+    /// Makes `dir` (a `b20` daemon's data dir, ring from `PARVAULT_GENESIS_SEED_HEX`) a node a
+    /// ring backup accepts: its identity and the ring's public key on disk.
+    pub fn make_ring_node(dir: &Path) {
+        parvault::crypto::NodeIdentity::load_or_generate_in_dir(dir).unwrap();
+        let ring = parvault::crypto::NodeIdentity::from_seed([0x47; 32]).public_key_bytes();
+        std::fs::write(dir.join("ring_genesis.pub"), hex::encode(ring)).unwrap();
+    }
+
+    /// `ring backup` of `dir` then `ring restore` into the new data dir `target`.
+    pub fn backup_and_restore(dir: &Path, target: &Path, tmp: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let pass = tmp.join("backup.pass");
+        std::fs::write(&pass, BACKUP_PASS).unwrap();
+        std::fs::set_permissions(&pass, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let out = tmp.join("bundle");
+        let o = common_out(
+            pv(dir)
+                .args(["ring", "backup", "--out"])
+                .arg(&out)
+                .arg("--passphrase-file")
+                .arg(&pass),
+        );
+        assert!(o.status.success(), "backup: {}", text(&o));
+        let bundle: PathBuf = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|x| x == "pvbak"))
+            .unwrap();
+        let o = common_out(
+            pv(target)
+                .args(["ring", "restore", "--from"])
+                .arg(&bundle)
+                .arg("--passphrase-file")
+                .arg(&pass)
+                .arg("--confirm-move"),
+        );
+        assert!(o.status.success(), "restore: {}", text(&o));
+    }
+
+    fn common_out(cmd: &mut Command) -> Output {
+        super::common::output_within_deadline(cmd)
+    }
+}
+
+/// D13 (VFS-LIVE-CATALOG): a running daemon lists a catalog version another process (the vault's
+/// `watch-folder` writer, here this test process through the same envelope store) publishes into
+/// its data dir, without a restart.
+#[cfg(unix)]
+#[test]
+fn d13_running_daemon_lists_other_process_catalog() {
+    use b20::*;
+    use seedvault::*;
+    let root = tempfile::tempdir().unwrap();
+    let dir = data_dir(root.path(), "data");
+    let folder = root.path().join("src");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.txt"), b"live v1").unwrap();
+    let mut w = Writer::new(&dir, SEED_A);
+    w.pass(&folder);
+    parvault::vfs::register_vault_keys(&dir, SEED_A, NS).unwrap();
+    let d = up(&dir, None, &[]);
+    wait_get(&d, "/photos/a.txt", "v1 listed", |st, b| {
+        st == 200 && b == b"live v1"
+    });
+    std::fs::write(folder.join("b.txt"), b"published while the daemon runs").unwrap();
+    w.pass(&folder);
+    wait_get(
+        &d,
+        "/photos/b.txt",
+        "the new version, no restart",
+        |st, b| st == 200 && b == b"published while the daemon runs",
+    );
+    d.stop();
+    gate_ran("trust_enforcement_restore::d13_running_daemon_lists_other_process_catalog");
+}
+
+/// D16 (VAULT-FLOOR-BACKUP): a ring backup carries the version floor of every namespace a vault
+/// can be registered under (here one with a space, plus a leading '.', non-ASCII and a 200-byte
+/// name), so after a restore a rolled-back catalog is still refused.
+#[cfg(unix)]
+#[test]
+fn d16_floor_of_any_registered_namespace_survives_backup() {
+    use b20::*;
+    use seedvault::*;
+    const ODD: &str = "my photos";
+    let root = tempfile::tempdir().unwrap();
+    let a = data_dir(root.path(), "a");
+    let folder = root.path().join("src");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.txt"), b"odd v1").unwrap();
+    let mut w = Writer::new_ns(&a, SEED_A, ODD);
+    let env1 = w.pass(&folder);
+    std::fs::write(folder.join("a.txt"), b"odd v2").unwrap();
+    let env2 = w.pass(&folder);
+    drop(w);
+    parvault::vfs::register_vault_keys(&a, SEED_A, ODD).unwrap();
+    let floor = a.join("vaults").join(format!("{ODD}.floor"));
+    let d = up(&a, None, &[]);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while std::fs::read(&floor).ok() != Some(env2.monotonic_version.to_be_bytes().to_vec()) {
+        assert!(
+            Instant::now() < deadline,
+            "v2 never applied:\n{}",
+            d.log_text()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    d.stop();
+    let long = "n".repeat(200);
+    let others = [".hidden", "fotos-\u{fc}", long.as_str()];
+    for ns in others {
+        std::fs::write(
+            a.join("vaults").join(format!("{ns}.floor")),
+            7u64.to_be_bytes(),
+        )
+        .unwrap();
+    }
+    qafix056::make_ring_node(&a);
+    let b = root.path().join("b");
+    qafix056::backup_and_restore(&a, &b, root.path());
+    for ns in others.iter().copied().chain([ODD]) {
+        let name = format!("{ns}.floor");
+        assert_eq!(
+            std::fs::read(b.join("vaults").join(&name)).ok(),
+            std::fs::read(a.join("vaults").join(&name)).ok(),
+            "{name} not restored"
+        );
+    }
+    let b = data_dir(root.path(), "b");
+    parvault::vfs::register_vault_keys(&b, SEED_A, ODD).unwrap();
+    let key = env1.dht_key;
+    plant(&b, key, env1);
+    let d = up(&b, None, &[]);
+    d.assert_logged("reject.catalog_rollback");
+    d.stop();
+    gate_ran("trust_enforcement_restore::d16_floor_of_any_registered_namespace_survives_backup");
 }
