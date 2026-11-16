@@ -169,9 +169,11 @@ pub const DUMP_SCHEMA: &[(&str, FieldKind, FieldClass)] = &[
     ("HOSTNAME", Env, Plain),
     ("COMPUTERNAME", Env, Plain),
     ("PARVAULT_GENESIS_PUBKEY_HEX", Env, Plain),
+    ("PARVAULT_TEST_SCHED_NO_PRIORITY", Env, Plain),
     ("PARVAULT_PASSPHRASE", Env, Secret),
     ("PARVAULT_SEED_PHRASE", Env, Secret),
     ("PARVAULT_GENESIS_SEED_HEX", Env, Secret),
+    ("PARVAULT_JOIN_TOKEN", Env, Secret),
     // Key files in the data directory.
     ("macaroon_root.key", File, SecretPath),
     ("node_identity.seed", File, SecretPath),
