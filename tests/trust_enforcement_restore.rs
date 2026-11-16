@@ -197,18 +197,26 @@ fn upsert_never_hides_the_path_from_readers() {
     let (vfs, _) = vfs_with_file(dir.path(), 4096);
     cold_copy(&vfs, "/swap.bin");
     let stop = AtomicBool::new(false);
+    // The reader is running before the swaps begin (it could otherwise start after all of
+    // them), and looks up at least once before it checks `stop`.
+    let start = std::sync::Barrier::new(2);
     std::thread::scope(|s| {
         let reader = s.spawn(|| {
+            start.wait();
             let mut seen = 0u64;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            loop {
                 assert!(
                     vfs.lookup_path("/swap.bin").is_some(),
                     "path vanished mid-swap"
                 );
                 seen += 1;
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
             }
             seen
         });
+        start.wait();
         for _ in 0..2000 {
             cold_copy(&vfs, "/swap.bin");
         }

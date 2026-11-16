@@ -402,12 +402,16 @@ kani       B154-WARN sym=src/sync/retention.rs::storage_warning_decision harness
 kani       B154-CAP sym=src/sync/retention.rs::apply_cap harness=proof_apply_cap_never_drops_newest cover=newest alone over the cap
 reach      TR-GC-MARK sym=src/sync/gc_journal.rs::mark from=src/sync/engine.rs::gc_after_pass   # ParVaultVersionGC guard mark-includes-pass
 reach      TR-GC-FREE sym=src/sync/gc_journal.rs::gc_free_decision from=src/sync/engine.rs::gc_after_pass   # ParVaultVersionGC guard catalog-pin
-tla-mutant TM-GC-MARK-PASS   spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-mark-includes-pass.patch
+tla-mutant TM-GC-MARK-PASS   spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-mark-includes-pass.patch   # also violates PublishedRecoverable: line TM-GC-MARK-PASS-PUB (D17)
+tla-mutant TM-GC-MARK-PASS-PUB spec=specs/ParVaultVersionGC.tla inv=PublishedRecoverable patch=specs/mutants/ParVaultVersionGC-mark-includes-pass.patch   # D17: inherent (the published version is retained)
 tla-mutant TM-GC-CATALOG-PIN spec=specs/ParVaultVersionGC.tla inv=PublishedRecoverable patch=specs/mutants/ParVaultVersionGC-catalog-pin.patch
 tla-mutant TM-GC-JOURNAL-FIRST spec=specs/ParVaultVersionGC.tla inv=NoLeakedGarbage patch=specs/mutants/ParVaultVersionGC-journal-before-drop.patch
-tla-mutant TM-GC-C9-FENCE    spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-c9-fence.patch
-tla-mutant TM-GC-FREE-FRESH  spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-free-fresh.patch
-tla-mutant TM-GC-FREE-EPOCH  spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-free-epoch.patch
+tla-mutant TM-GC-C9-FENCE    spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-c9-fence.patch   # also violates PublishedRecoverable: line TM-GC-C9-FENCE-PUB (D17)
+tla-mutant TM-GC-C9-FENCE-PUB spec=specs/ParVaultVersionGC.tla inv=PublishedRecoverable patch=specs/mutants/ParVaultVersionGC-c9-fence.patch   # D17: inherent (the published version is retained)
+tla-mutant TM-GC-FREE-FRESH  spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-free-fresh.patch   # also violates PublishedRecoverable: line TM-GC-FREE-FRESH-PUB (D17)
+tla-mutant TM-GC-FREE-FRESH-PUB spec=specs/ParVaultVersionGC.tla inv=PublishedRecoverable patch=specs/mutants/ParVaultVersionGC-free-fresh.patch   # D17: inherent (the published version is retained)
+tla-mutant TM-GC-FREE-EPOCH  spec=specs/ParVaultVersionGC.tla inv=RetainedRecoverable patch=specs/mutants/ParVaultVersionGC-free-epoch.patch   # also violates PublishedRecoverable: line TM-GC-FREE-EPOCH-PUB (D17)
+tla-mutant TM-GC-FREE-EPOCH-PUB spec=specs/ParVaultVersionGC.tla inv=PublishedRecoverable patch=specs/mutants/ParVaultVersionGC-free-epoch.patch   # D17: inherent (the published version is retained)
 tla-mutant TM-GC-CREDIT      spec=specs/ParVaultVersionGC.tla inv=QuotaMatchesHeld patch=specs/mutants/ParVaultVersionGC-credit-accounted.patch
 
 # --- v0.5.6 track B1: version GC host side (plan 3.7; B-154 C11-C19, B-158, B-159, B-178, B-147) ---
