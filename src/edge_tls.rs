@@ -114,11 +114,24 @@ impl EdgeTlsRefusal {
 impl std::fmt::Display for EdgeTlsRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Load(p, e) => write!(
-                f,
-                "{e} ({}); the certificate is never re-issued on its own: fix the file or run `parvault tls rotate`",
-                p.display()
-            ),
+            Self::Load(p, e) => {
+                let advice = match e {
+                    // `tls rotate` replaces a file that reads but does not hold a usable pair.
+                    EdgeTlsLoadError::Invalid(_) | EdgeTlsLoadError::Mismatch { .. } => {
+                        "run `parvault tls rotate` to issue a new pair (every client registers it again), or fix the file"
+                    }
+                    // `tls rotate` refuses these too: never a link, a shared key or another owner's file.
+                    EdgeTlsLoadError::KeyMode { .. } => {
+                        "make it a regular file (not a symlink) owned by this user with mode 0600, or remove it"
+                    }
+                    EdgeTlsLoadError::Io(_) => "fix the file",
+                };
+                write!(
+                    f,
+                    "{e} ({}); the certificate is never re-issued on its own: {advice}",
+                    p.display()
+                )
+            }
             Self::InvalidSan(s) => write!(
                 f,
                 "{}: --tls-san {s:?} is not an IP address or a DNS name",
@@ -320,19 +333,50 @@ pub fn export(data_dir: &Path, out: &Path) -> Result<CertInfo, EdgeTlsRefusal> {
     Ok(info)
 }
 
+/// What `tls rotate` did: the new certificate, and why the file it replaced did not load when it
+/// did not (an invalid PEM or a key and certificate that do not match).
+#[derive(Debug)]
+pub struct Rotated {
+    pub info: CertInfo,
+    pub replaced_invalid: Option<EdgeTlsLoadError>,
+}
+
 /// Issues a new key and certificate in place of the current one (`tls rotate`): the stored SANs
 /// plus the host's current interface IPs (a changed DHCP lease), 825 days. Key and certificate
 /// are replaced together by one rename. Every client must register the new certificate.
+///
+/// A file that passes the key rule but does not hold a usable pair (invalid PEM, mismatched
+/// key and certificate) is replaced too, keeping the SANs still stored in it, with a warning
+/// naming what was wrong (QA D5). A file that fails the key rule (a symlink, another owner, a
+/// mode other than `0600`) or cannot be read is refused and left as it is.
 #[cfg(unix)]
-pub fn rotate(data_dir: &Path) -> Result<CertInfo, EdgeTlsRefusal> {
+pub fn rotate(data_dir: &Path) -> Result<Rotated, EdgeTlsRefusal> {
     sweep_tmp(data_dir);
     let path = data_dir.join(EDGE_TLS_FILE);
     if std::fs::symlink_metadata(&path).is_err() {
         return Err(EdgeTlsRefusal::NoCertificate(path));
     }
     // The current file must pass the key rule: rotation never follows a link or a shared key.
-    let (_, old) = load(&path)?;
-    let mut sans = old.sans.clone();
+    let (mut sans, replaced_invalid) = match load(&path) {
+        Ok((_, old)) => (old.sans, None),
+        Err(EdgeTlsRefusal::Load(
+            _,
+            e @ (EdgeTlsLoadError::Invalid(_) | EdgeTlsLoadError::Mismatch { .. }),
+        )) => {
+            // The file passed the key rule (the error is after it); read it again under the same
+            // rule for the SANs it still stores.
+            let sans = crate::capabilities::read_owner_only_file(&path)
+                .map(|pem| crate::http_edge::pem_edge_names(&pem))
+                .unwrap_or_default();
+            tracing::warn!(
+                code = e.code(),
+                path = %path.display(),
+                "tls rotate: the edge TLS file did not load ({e}); replacing it with a new pair"
+            );
+            (sans, Some(e))
+        }
+        Err(e) => return Err(e),
+    };
     for ip in usable_interface_ips() {
         let s = ip.to_string();
         if !sans.contains(&s) {
@@ -341,7 +385,10 @@ pub fn rotate(data_dir: &Path) -> Result<CertInfo, EdgeTlsRefusal> {
     }
     let pem = generate_pem(&sans).map_err(EdgeTlsRefusal::Io)?;
     write_owner_only_atomic(data_dir, EDGE_TLS_FILE, pem.as_bytes()).map_err(EdgeTlsRefusal::Io)?;
-    load(&path).map(|(_, i)| i)
+    load(&path).map(|(_, info)| Rotated {
+        info,
+        replaced_invalid,
+    })
 }
 
 /// The leaf as `tls export` writes it: one `CERTIFICATE` section, 64 columns, LF.
@@ -453,14 +500,17 @@ fn warn_uncovered(tls_binds: &[SocketAddr], extra: &[String], sans: &[String]) {
 
 /// A new self-signed leaf for `sans` with its key and SAN list, as one PEM file: ECDSA P-256,
 /// `CA:FALSE`, key usage `digitalSignature`, EKU `serverAuth`, 825 days from today (UTC), a
-/// random 128-bit serial.
-pub fn generate_pem(sans: &[String]) -> io::Result<String> {
+/// random 128-bit serial. The PEM holds the private key, so it is zeroized on drop.
+pub fn generate_pem(sans: &[String]) -> io::Result<zeroize::Zeroizing<String>> {
     let (pem, _) = generate(sans, unix_now_secs())?;
     Ok(pem)
 }
 
 /// [`generate_pem`] at `now_unix_secs`; also returns `notAfter` (Unix seconds).
-pub fn generate(sans: &[String], now_unix_secs: u64) -> io::Result<(String, u64)> {
+pub fn generate(
+    sans: &[String],
+    now_unix_secs: u64,
+) -> io::Result<(zeroize::Zeroizing<String>, u64)> {
     use rand::RngCore;
     let mut p = rcgen::CertificateParams::default();
     p.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
@@ -496,12 +546,19 @@ pub fn generate(sans: &[String], now_unix_secs: u64) -> io::Result<(String, u64)
     let not_after = not_after_day * 86_400;
     let mut names = sans.join("\n");
     names.push_str(&format!("\n#not_after={not_after}\n"));
-    let mut pem = pem_section("CERTIFICATE", &der);
+    let cert_pem = pem_section("CERTIFICATE", &der);
+    let names_pem = pem_section(EDGE_NAMES_PEM_LABEL, names.as_bytes());
+    // QA D4: the key is copied only into a zeroized buffer sized up front, so no growth leaves a
+    // freed, unwiped copy behind.
+    let mut pem = zeroize::Zeroizing::new(String::with_capacity(
+        cert_pem.len() + key.len() + 1 + names_pem.len(),
+    ));
+    pem.push_str(&cert_pem);
     pem.push_str(&key);
     if !pem.ends_with('\n') {
         pem.push('\n');
     }
-    pem.push_str(&pem_section(EDGE_NAMES_PEM_LABEL, names.as_bytes()));
+    pem.push_str(&names_pem);
     Ok((pem, not_after))
 }
 
@@ -579,6 +636,22 @@ pub fn host_interface_ips() -> std::io::Result<Vec<IpAddr>> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// QA D4: the generated PEM (it holds the private key) is a `Zeroizing<String>` through to
+    /// the write, and was built in one buffer (no reallocation left a copy).
+    #[test]
+    fn qa056_d4_generated_pem_is_zeroizing() {
+        let (pem, _): (zeroize::Zeroizing<String>, u64) =
+            generate(&["127.0.0.1".into()], 1_800_000_000).unwrap();
+        assert!(pem.contains("-----BEGIN PRIVATE KEY-----"));
+        assert!(
+            pem.capacity() == pem.len(),
+            "{} {}",
+            pem.capacity(),
+            pem.len()
+        );
+        let _: zeroize::Zeroizing<String> = generate_pem(&[]).unwrap();
+    }
 
     #[test]
     fn civil_dates() {
@@ -661,6 +734,8 @@ mod tests {
             "never re-issued"
         );
         let rotated = rotate(dir.path()).unwrap();
+        assert!(rotated.replaced_invalid.is_none());
+        let rotated = rotated.info;
         assert_ne!(rotated.spki_sha256, info.spki_sha256);
         assert!(rotated.sans.contains(&"nas.local".to_string()));
     }
