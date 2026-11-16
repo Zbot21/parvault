@@ -111,6 +111,18 @@ impl LruBlockCache {
         self.sizes.len()
     }
 
+    /// Drops every cached block of `ino` (a replaced or removed file).
+    pub fn forget_ino(&mut self, ino: u64) {
+        let keys: Vec<(u64, u64)> = self.sizes.keys().filter(|k| k.0 == ino).copied().collect();
+        for key in keys {
+            if let Some(sz) = self.sizes.remove(&key) {
+                self.used_bytes = self.used_bytes.saturating_sub(sz);
+            }
+            let _ = fs::remove_file(self.block_path(key.0, key.1));
+        }
+        self.lru_order.retain(|k| k.0 != ino);
+    }
+
     fn block_path(&self, ino: u64, block_idx: u64) -> PathBuf {
         self.cache_dir.join(format!("ino{ino}_blk{block_idx}.blk"))
     }
@@ -409,6 +421,20 @@ mod unix_vfs {
         children: Arc<Mutex<HashMap<u64, BTreeMap<String, u64>>>>,
         next_ino: Arc<Mutex<u64>>,
         cache: Arc<Mutex<LruBlockCache>>,
+        /// B-24: one in-flight fetch per `(inode, block)`; concurrent misses join it.
+        inflight: Arc<Mutex<InflightMap>>,
+    }
+
+    type InflightMap = HashMap<(u64, u64), Arc<BlockFlight>>;
+    /// A finished fetch: the bytes, or the error's kind and text (`io::Error` is not `Clone`).
+    type FlightResult = Result<Vec<u8>, (io::ErrorKind, String)>;
+
+    /// One in-flight block fetch (B-24).
+    struct BlockFlight {
+        result: Mutex<Option<FlightResult>>,
+        done: std::sync::Condvar,
+        /// Set when a scavenger owns the fetch: a joining foreground reader promotes it (S6).
+        promote: Option<Arc<std::sync::atomic::AtomicBool>>,
     }
 
     impl VirtualVaultFs {
@@ -488,6 +514,7 @@ mod unix_vfs {
                 children: Arc::new(Mutex::new(children)),
                 next_ino: Arc::new(Mutex::new(2)),
                 cache: Arc::new(Mutex::new(cache)),
+                inflight: Arc::new(Mutex::new(HashMap::new())),
             })
         }
 
@@ -604,19 +631,110 @@ mod unix_vfs {
         /// bytes is served for it (T1: the cache is keyed by inode and block). Parent folders
         /// are created as needed. A folder at `virtual_path` is refused.
         pub fn upsert_file(&self, virtual_path: &str, spec: LazyFileSpec) -> io::Result<Ino> {
-            if self.remove_path(virtual_path) == PathRemoval::Folder {
+            let parts = vfs_path_parts(virtual_path);
+            let Some((name, dirs)) = parts.split_last() else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "upsert_file: the path is a folder",
+                    "virtual_path must name a file",
                 ));
-            }
-            let ino = self.register_lazy_file(virtual_path, spec.manifest, spec.macaroon)?;
-            if let Some(mtime) = spec.mtime_unix_secs {
-                if let Some(n) = self.nodes.lock().unwrap().get_mut(&ino) {
-                    n.mtime_unix_secs = mtime;
+            };
+            let parent = self.ensure_dirs(dirs)?;
+            let ino = self.alloc_ino();
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let node = VfsLazyNode {
+                ino,
+                parent_ino: parent,
+                name: (*name).to_string(),
+                is_dir: false,
+                size_bytes: spec.manifest.total_size,
+                mtime_unix_secs: spec.mtime_unix_secs.unwrap_or(now_secs),
+                mode: 0o100644,
+                manifest: Some(spec.manifest),
+                macaroon: spec.macaroon,
+            };
+            // The new node exists before its name points at it, and the name moves in one step
+            // under the children lock, so a reader's lookup finds the old file or the new one,
+            // never neither (qa-t0 INFO: the T0 version removed first).
+            self.nodes.lock().unwrap().insert(ino, node);
+            let replaced = {
+                let mut ch = self.children.lock().unwrap();
+                let entries = ch.entry(parent).or_default();
+                let old = entries.get(*name).copied();
+                let old_is_dir = old
+                    .is_some_and(|o| self.nodes.lock().unwrap().get(&o).is_some_and(|n| n.is_dir));
+                if old_is_dir {
+                    None
+                } else {
+                    entries.insert((*name).to_string(), ino);
+                    Some(old)
+                }
+            };
+            match replaced {
+                None => {
+                    self.nodes.lock().unwrap().remove(&ino);
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "upsert_file: the path is a folder",
+                    ))
+                }
+                Some(old) => {
+                    if let Some(old) = old {
+                        self.nodes.lock().unwrap().remove(&old);
+                        self.cache.lock().unwrap().forget_ino(old);
+                    }
+                    Ok(ino)
                 }
             }
-            Ok(ino)
+        }
+
+        /// The folder inode at `dirs` under the root, creating missing folders.
+        fn ensure_dirs(&self, dirs: &[&str]) -> io::Result<Ino> {
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let mut cur = VFS_ROOT_INO;
+            for dir_name in dirs {
+                let mut ch = self.children.lock().unwrap();
+                let existing = ch.get(&cur).and_then(|m| m.get(*dir_name)).copied();
+                if let Some(ino) = existing {
+                    drop(ch);
+                    match self.getattr(ino) {
+                        Some(n) if n.is_dir => cur = ino,
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "a parent of the path is a file",
+                            ))
+                        }
+                    }
+                    continue;
+                }
+                let dir_ino = self.alloc_ino();
+                self.nodes.lock().unwrap().insert(
+                    dir_ino,
+                    VfsLazyNode {
+                        ino: dir_ino,
+                        parent_ino: cur,
+                        name: (*dir_name).to_string(),
+                        is_dir: true,
+                        size_bytes: 0,
+                        mtime_unix_secs: now_secs,
+                        mode: 0o040755,
+                        manifest: None,
+                        macaroon: None,
+                    },
+                );
+                ch.entry(cur)
+                    .or_default()
+                    .insert((*dir_name).to_string(), dir_ino);
+                ch.entry(dir_ino).or_default();
+                cur = dir_ino;
+            }
+            Ok(cur)
         }
 
         /// Removes the file at `virtual_path` (T4: a file gone from the catalog leaves the
@@ -643,6 +761,7 @@ mod unix_vfs {
                 m.remove(*name);
             }
             self.nodes.lock().unwrap().remove(&node.ino);
+            self.cache.lock().unwrap().forget_ino(node.ino);
             PathRemoval::Removed
         }
 
@@ -668,14 +787,12 @@ mod unix_vfs {
         }
 
         pub fn lookup(&self, parent_ino: u64, name: &str) -> Option<VfsLazyNode> {
-            let child_ino = self
-                .children
-                .lock()
-                .unwrap()
-                .get(&parent_ino)
-                .and_then(|m| m.get(name))
-                .copied()?;
-            self.getattr(child_ino)
+            // Both locks at once (children, then nodes, the order every writer takes), so a
+            // name being swapped by `upsert_file` resolves to the old node or the new one.
+            let ch = self.children.lock().unwrap();
+            let child_ino = ch.get(&parent_ino).and_then(|m| m.get(name)).copied()?;
+            let nodes = self.nodes.lock().unwrap();
+            nodes.get(&child_ino).cloned()
         }
 
         pub fn lookup_path(&self, virtual_path: &str) -> Option<VfsLazyNode> {
@@ -696,10 +813,8 @@ mod unix_vfs {
         }
 
         pub fn readdir(&self, dir_ino: u64) -> Vec<VfsLazyNode> {
-            let child_inos: Vec<u64> = self
-                .children
-                .lock()
-                .unwrap()
+            let ch = self.children.lock().unwrap();
+            let child_inos: Vec<u64> = ch
                 .get(&dir_ino)
                 .map(|m| m.values().copied().collect())
                 .unwrap_or_default();
@@ -762,24 +877,12 @@ mod unix_vfs {
                 // F-43 (L-44 item 4): a cache hit is served without a gateway `FetchRange`, so for
                 // WebDAV the edge `webdav_auth_decision` (for the plugin host: `is_attenuation_of`
                 // against the pinned token) is the only check on this read.
-                let cached = self.cache.lock().unwrap().get(ino, blk_idx)?;
-                let blk_bytes = match cached {
-                    Some(hit_bytes) => hit_bytes,
-                    None => {
-                        let effective_mac = node
-                            .macaroon
-                            .clone()
-                            .or_else(|| self.default_macaroon.clone());
-                        let fetched = self.bus.fetch_range_bytes_sync(
-                            &manifest,
-                            blk_start,
-                            blk_len,
-                            effective_mac,
-                        )?;
-                        self.cache.lock().unwrap().insert(ino, blk_idx, &fetched)?;
-                        fetched
-                    }
-                };
+                let effective_mac = node
+                    .macaroon
+                    .clone()
+                    .or_else(|| self.default_macaroon.clone());
+                let blk_bytes =
+                    self.read_block(ino, blk_idx, &manifest, blk_start, blk_len, effective_mac)?;
 
                 if ttfb.is_none() {
                     ttfb = Some(t0.elapsed());
@@ -793,6 +896,80 @@ mod unix_vfs {
             }
 
             Ok((out, ttfb.unwrap_or_else(|| t0.elapsed())))
+        }
+
+        /// One block through the cache, with single-flight misses (B-24): the first reader of a
+        /// missing block fetches it; concurrent readers of the same block wait for that fetch.
+        /// A foreground reader joining a scavenger's fetch promotes it (S6).
+        fn read_block(
+            &self,
+            ino: u64,
+            blk_idx: u64,
+            manifest: &EphemeralShardManifest,
+            blk_start: u64,
+            blk_len: u64,
+            mac: Option<CapabilityMacaroon>,
+        ) -> io::Result<Vec<u8>> {
+            use crate::fetch_sched::{self as fs_sched, FetchClass};
+            use std::sync::atomic::AtomicBool;
+            let key = (ino, blk_idx);
+            let (flight, leader) = {
+                let mut inflight = self.inflight.lock().unwrap();
+                if let Some(f) = inflight.get(&key) {
+                    (Arc::clone(f), false)
+                } else {
+                    // F-43 (L-44 item 4): a cache hit is served without a gateway `FetchRange`,
+                    // so for WebDAV the edge `webdav_auth_decision` is the only check on it.
+                    if let Some(hit) = self.cache.lock().unwrap().get(ino, blk_idx)? {
+                        return Ok(hit);
+                    }
+                    let promote = (fs_sched::current_class() == FetchClass::Scavenger)
+                        .then(|| Arc::new(AtomicBool::new(false)));
+                    let f = Arc::new(BlockFlight {
+                        result: Mutex::new(None),
+                        done: std::sync::Condvar::new(),
+                        promote,
+                    });
+                    inflight.insert(key, Arc::clone(&f));
+                    (f, true)
+                }
+            };
+            if !leader {
+                if fs_sched::current_class() == FetchClass::Foreground {
+                    if let Some(p) = &flight.promote {
+                        fs_sched::global().promote(p);
+                    }
+                }
+                let mut g = flight.result.lock().unwrap();
+                while g.is_none() {
+                    g = flight.done.wait(g).unwrap();
+                }
+                return match g.as_ref() {
+                    Some(Ok(b)) => Ok(b.clone()),
+                    Some(Err((kind, msg))) => Err(io::Error::new(*kind, msg.clone())),
+                    None => unreachable!("loop exits with a result"),
+                };
+            }
+            fs_sched::note_cache_miss();
+            let fetch = || {
+                self.bus
+                    .fetch_range_bytes_sync(manifest, blk_start, blk_len, mac)
+            };
+            let res = match &flight.promote {
+                Some(p) => fs_sched::run_as_scavenger(Arc::clone(p), fetch),
+                None => fetch(),
+            };
+            let res = res.and_then(|b| {
+                self.cache.lock().unwrap().insert(ino, blk_idx, &b)?;
+                Ok(b)
+            });
+            *flight.result.lock().unwrap() = Some(match &res {
+                Ok(b) => Ok(b.clone()),
+                Err(e) => Err((e.kind(), e.to_string())),
+            });
+            self.inflight.lock().unwrap().remove(&key);
+            flight.done.notify_all();
+            res
         }
 
         /// Convenience POSIX `pread`-equivalent returning the requested byte range.

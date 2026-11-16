@@ -1014,13 +1014,23 @@ mod unix_engine {
                 use std::io::{Seek, SeekFrom};
                 let _ = out_file.set_len(0);
                 let _ = out_file.seek(SeekFrom::Start(0));
-                let streamed = self.block_store.read_plaintext_range(
-                    fm,
-                    &self.master_key,
-                    offset,
-                    len,
-                    &mut out_file,
-                )?;
+                // L-72 (S2): each stripe is admitted by the fetch scheduler before it is read.
+                let end = offset.saturating_add(len).min(fm.original_file_size);
+                let stripe_sz = fm.stripe_size_bytes.max(1) as u64;
+                let mut streamed = 0u64;
+                let mut at = offset;
+                while at < end {
+                    let stripe_end = (at / stripe_sz + 1).saturating_mul(stripe_sz).min(end);
+                    let _slot = crate::fetch_sched::global().admit();
+                    streamed += self.block_store.read_plaintext_range(
+                        fm,
+                        &self.master_key,
+                        at,
+                        stripe_end - at,
+                        &mut out_file,
+                    )?;
+                    at = stripe_end;
+                }
                 let _ = out_file.seek(SeekFrom::Start(0));
                 self.ops_counter.fetch_add(1, Ordering::Relaxed);
                 self.bytes_served_lan.fetch_add(streamed, Ordering::Relaxed);
@@ -1035,7 +1045,11 @@ mod unix_engine {
             let mut out_cursor = 0u64;
             for stripe_idx in first_stripe..=last_stripe.min(fm.stripes.len().saturating_sub(1)) {
                 let stripe = &fm.stripes[stripe_idx];
-                let plaintext = self.reconstruct_and_decrypt_stripe(fm, stripe)?;
+                // L-72 (S2): stripe admission, before any lane sends.
+                let plaintext = {
+                    let _slot = crate::fetch_sched::global().admit();
+                    self.reconstruct_and_decrypt_stripe(fm, stripe)?
+                };
 
                 let stripe_byte_start = (stripe_idx as u64) * stripe_sz;
                 let slice_start = offset.saturating_sub(stripe_byte_start) as usize;
