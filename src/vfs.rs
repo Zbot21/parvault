@@ -575,7 +575,7 @@ mod unix_vfs {
         /// start and on a timer, through [`Self::upsert_file`] and [`Self::remove_path`]; the
         /// scavenger then hydrates them (L-94, S1). Called by the daemon once the built-in VFS
         /// exists. A socket-bus VFS (a plugin) has no engine to index manifests in, so it
-        /// imports nothing. `PARVAULT_CATALOG_IMPORT_SECS` overrides the period (tests).
+        /// imports nothing.
         #[cfg(feature = "daemon-runtime")]
         pub fn start_catalog_import(
             &self,
@@ -586,14 +586,9 @@ mod unix_vfs {
             let GatewayBus::InProcess(engine) = &self.bus else {
                 return Ok(());
             };
-            let interval = std::env::var("PARVAULT_CATALOG_IMPORT_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .map(|s| Duration::from_secs(s.max(1)))
-                .unwrap_or(super::catalog::IMPORT_INTERVAL);
             let importer =
                 super::catalog::CatalogImporter::new(self.clone(), Arc::clone(engine), data_dir);
-            importer.start(interval)
+            importer.start()
         }
 
         /// Registers a virtual file path (e.g. `"/movies/archive_10gb.bin"` or `"backup.tar"`)
@@ -1517,6 +1512,9 @@ pub mod catalog {
     pub const DEVICE_FOLDER: &str = "watched";
     /// Catalog import period.
     pub const IMPORT_INTERVAL: Duration = Duration::from_secs(60);
+    /// How often a catalog file is checked for a change (its length and mtime); a change
+    /// imports at once.
+    pub const CHANGE_POLL: Duration = Duration::from_secs(1);
     /// The scavenger's hourly byte cap.
     pub const SCAVENGER_BYTES_PER_HOUR: u64 = 4 * 1024 * 1024 * 1024;
     /// The scavenger fills the block cache up to this share (percent).
@@ -1677,6 +1675,12 @@ pub mod catalog {
             Some(self.import_snapshot(DEVICE_FOLDER, verifies, key_matches, &snap))
         }
 
+        /// The length and mtime of every catalog file (a change triggers an import).
+        fn sources_stamp(&self) -> Option<(u64, std::time::SystemTime)> {
+            let m = std::fs::metadata(self.data_dir.join(DEVICE_SNAPSHOT_FILE)).ok()?;
+            Some((m.len(), m.modified().ok()?))
+        }
+
         /// One import of every source this data dir holds keys for.
         pub fn import_all(&self) {
             if let Some(Ok(r)) = self.import_device_snapshot() {
@@ -1764,7 +1768,7 @@ pub mod catalog {
         }
 
         /// Starts the import timer and the scavenger threads; sets the VFS re-import hook (T2).
-        pub fn start(self: &Arc<Self>, interval: Duration) -> std::io::Result<()> {
+        pub fn start(self: &Arc<Self>) -> std::io::Result<()> {
             self.import_all();
             let weak: Weak<Self> = Arc::downgrade(self);
             self.vfs.set_reimport_hook(Some(Arc::new(move || {
@@ -1777,9 +1781,16 @@ pub mod catalog {
                 .name("pv-catalog".into())
                 .spawn(move || {
                     let mut last = fetch_sched::counters();
+                    let mut stamp = me.sources_stamp();
+                    let mut imported = Instant::now();
                     loop {
-                        std::thread::sleep(interval);
-                        me.import_all();
+                        std::thread::sleep(CHANGE_POLL);
+                        let now = me.sources_stamp();
+                        if now != stamp || imported.elapsed() >= IMPORT_INTERVAL {
+                            stamp = now;
+                            imported = Instant::now();
+                            me.import_all();
+                        }
                         // S7: the counters in the log too (live status reads `counters()`).
                         let c = fetch_sched::counters();
                         if c != last {

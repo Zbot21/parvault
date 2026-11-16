@@ -273,8 +273,8 @@ mod b20 {
         dir
     }
 
-    /// `parvault up --no-socket` on `dir` with WebDAV on an ephemeral port, catalog import
-    /// every second and, with `folder`, the daemon's own folder sync every second.
+    /// `parvault up --no-socket` on `dir` with WebDAV on an ephemeral port and, with `folder`,
+    /// the daemon's own folder sync every second (a changed catalog imports within a second).
     pub fn up(dir: &Path, folder: Option<&Path>, extra_env: &[(&str, &str)]) -> Daemon {
         up_with(dir, folder, extra_env, &[])
     }
@@ -293,7 +293,6 @@ mod b20 {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
         cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
             .env("PARVAULT_GENESIS_SEED_HEX", hex::encode([0x47u8; 32]))
-            .env("PARVAULT_CATALOG_IMPORT_SECS", "1")
             .env("RUST_LOG", "info")
             .env("NO_COLOR", "1")
             .env_remove("PARVAULT_PEERS")
