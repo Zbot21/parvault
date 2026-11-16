@@ -1380,6 +1380,9 @@ fn b154_alias_answered_by_another_node_frees_nothing_there() {
 /// reach. Every placement record naming host 1 is rewritten to a dead loopback alias under its
 /// peer id, the owner's local shards are removed and host 2 is stopped; a cold process restores
 /// the file byte-identically from host 1 alone (the alias is skipped for its known address).
+/// D7 (`v0.5.6` final QA): `restore-folder --snapshot` reads the manifests embedded in the
+/// snapshot file, so those are rewritten too, and the decoded snapshot is checked to name host 1
+/// only by the dead alias before the restore.
 #[test]
 fn b192_shards_recorded_under_alias_restore_cold() {
     let h1 = spawn_host();
@@ -1413,6 +1416,37 @@ fn b192_shards_recorded_under_alias_restore_cold() {
         std::fs::write(&path, enc).unwrap();
     }
     assert!(rewritten > 0, "no placement record named host 1");
+    // D7: the snapshot the restore reads embeds its own manifests.
+    let names_h1 = |a: &str| a == h1.plain_addr() || a.contains(&h1_pid);
+    let raw = std::fs::read(&f.snap).unwrap();
+    let mut snap = parvault::sync::FolderSnapshotManifest::decode_bytes(&raw).unwrap();
+    for fe in snap.files.values_mut() {
+        for st in &mut fe.manifest.stripes {
+            for a in &mut st.assigned_peers {
+                if names_h1(a) {
+                    *a = alias.clone();
+                }
+            }
+        }
+    }
+    std::fs::write(&f.snap, bincode::serialize(&snap).unwrap()).unwrap();
+    let snap =
+        parvault::sync::FolderSnapshotManifest::decode_bytes(&std::fs::read(&f.snap).unwrap())
+            .unwrap();
+    let recorded: Vec<&String> = snap
+        .files
+        .values()
+        .flat_map(|fe| fe.manifest.stripes.iter())
+        .flat_map(|st| st.assigned_peers.iter())
+        .collect();
+    assert!(
+        recorded.iter().any(|a| **a == alias),
+        "the snapshot does not name the alias: {recorded:?}"
+    );
+    assert!(
+        recorded.iter().all(|a| **a == alias || !names_h1(a)),
+        "the snapshot still names host 1 by a live address: {recorded:?}"
+    );
     let _ = std::fs::remove_dir_all(f.node.join("shards"));
     // Host 1, recorded only under the dead alias, is the only source left.
     h2.stop();
@@ -1444,4 +1478,227 @@ fn b192_shards_recorded_under_alias_restore_cold() {
         text(&out)
     );
     gate_ran("trust_enforcement_gc_owner::b192_shards_recorded_under_alias_restore_cold");
+}
+
+// --- v0.5.6 final QA D8, D9, D11: the client's view of hosts -----------------------------------
+
+/// A TCP listener that accepts connections and never answers (a peer that hangs every dial);
+/// returns its address and the count of connections it accepted.
+fn blackhole() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = format!("/ip4/127.0.0.1/tcp/{}", l.local_addr().unwrap().port());
+    let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = std::sync::Arc::clone(&n);
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for s in l.incoming().flatten() {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            held.push(s);
+        }
+    });
+    (addr, n)
+}
+
+/// A loopback port nothing listens on.
+fn closed_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// D8: a given peer that hangs every dial (powered off behind a route that drops packets) is
+/// probed for its peer id at most once, however many requests to a dead `/p2p/` alias fail, so
+/// N failures cost one dial timeout, not N.
+#[test]
+fn d8_down_given_peer_probed_once() {
+    use parvault::network::MeshWireRequest;
+    let (hole, accepted) = blackhole();
+    let x = parvault::network::node_identity_libp2p_peer_id(
+        &parvault::crypto::NodeIdentity::from_seed([0xD8; 32]),
+    )
+    .unwrap();
+    let alias = format!("/ip4/127.0.0.1/tcp/{}/p2p/{x}", closed_port());
+    let timeout = Duration::from_secs(2);
+    let client = parvault::network::MeshClient::new(
+        parvault::crypto::NodeIdentity::from_seed([0xD7; 32]),
+        vec![hole],
+        None,
+    )
+    .with_timeout(timeout);
+    let n = 6u32;
+    let t0 = std::time::Instant::now();
+    for _ in 0..n {
+        assert!(client
+            .send_request(&alias, MeshWireRequest::QueryNodeStatus)
+            .is_err());
+    }
+    let elapsed = t0.elapsed();
+    let dials = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(dials <= 1, "the down given peer was dialed {dials} times");
+    assert!(
+        elapsed < timeout * 3,
+        "{n} failing requests took {elapsed:?} (one probe is {timeout:?})"
+    );
+    gate_ran("trust_enforcement_gc_owner::d8_down_given_peer_probed_once");
+}
+
+/// D9: in a cold process (no pins), a plain `--peers` address and a discovered `/p2p/X` of the
+/// same host are one candidate: the endpoint list and the hosts placement journals and places
+/// on name the host once.
+#[test]
+fn d9_cold_placement_one_candidate_per_peer_id() {
+    let h1 = spawn_host();
+    let disc = tempfile::tempdir().unwrap();
+    let pid = h1.addr.split("/p2p/").nth(1).unwrap().to_string();
+    parvault::network::KnownPeersStore::update(disc.path(), |s| {
+        s.upsert_pinned_multiaddr(&pid, &h1.addr, Some("h1"), Some("node"));
+    })
+    .unwrap();
+    let owner = parvault::crypto::NodeIdentity::from_seed([0xD9; 32]);
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let seen_hook = std::sync::Arc::clone(&seen);
+    let client =
+        parvault::network::MeshClient::new(owner.clone(), vec![h1.plain_addr().to_string()], None)
+            .with_lan_discovery(false)
+            .with_data_dir_discovery(disc.path().to_path_buf(), closed_port())
+            .with_pre_place_hook(parvault::network::client::PrePlaceHook(
+                std::sync::Arc::new(move |_ids, hosts| {
+                    *seen_hook.lock().unwrap() = hosts.to_vec();
+                    Err(std::io::Error::other("stop before any put"))
+                }),
+            ));
+    assert!(client.discovered_peers().contains(&h1.addr));
+    assert_eq!(
+        client.all_network_endpoints(),
+        vec![h1.plain_addr().to_string()]
+    );
+    let set = parvault::sharding::reed_solomon::encode_ciphertext_stripe(
+        0,
+        &[0x5A; 4096],
+        parvault::config::ErasureTier::Consumer,
+    )
+    .unwrap();
+    let r = client.distribute_stripe_shards_partial(
+        &owner,
+        "",
+        &set,
+        parvault::config::ErasureTier::Consumer,
+        [0; 32],
+    );
+    assert!(r.is_err(), "the hook stops placement");
+    assert_eq!(*seen.lock().unwrap(), vec![h1.plain_addr().to_string()]);
+    assert!(h1.shard_names().is_empty());
+    gate_ran("trust_enforcement_gc_owner::d9_cold_placement_one_candidate_per_peer_id");
+}
+
+/// A wire peer that refuses every vault request with the handler's own "not admitted" reply
+/// (`reject_response`), as a node of another ring, or one whose manifest does not serve the
+/// variant, answers. Returns its `/p2p/` address and the requests it saw.
+fn spawn_refusing_peer() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use libp2p::futures::StreamExt;
+    use libp2p::request_response::{self, ProtocolSupport};
+    use libp2p::swarm::SwarmEvent;
+    use parvault::network::behaviour::BincodeWireCodec;
+    use parvault::network::wire_handler::{reject_response, NOT_ADMITTED_TEXT};
+    use parvault::network::{MeshWireRequest, MeshWireResponse};
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let log = std::sync::Arc::clone(&seen);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let ident = parvault::crypto::NodeIdentity::from_seed([0xDB; 32]);
+            let mut swarm =
+                libp2p::SwarmBuilder::with_existing_identity(ident.to_libp2p_keypair().unwrap())
+                    .with_tokio()
+                    .with_tcp(
+                        libp2p::tcp::Config::default(),
+                        libp2p::noise::Config::new,
+                        libp2p::yamux::Config::default,
+                    )
+                    .unwrap()
+                    .with_behaviour(|_| {
+                        request_response::Behaviour::with_codec(
+                            BincodeWireCodec::default(),
+                            [(
+                                libp2p::StreamProtocol::new("/parvault/wire/1.0.0"),
+                                ProtocolSupport::Full,
+                            )],
+                            request_response::Config::default(),
+                        )
+                    })
+                    .unwrap()
+                    .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
+                    .build();
+            swarm
+                .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+                .unwrap();
+            let pid = *swarm.local_peer_id();
+            loop {
+                match swarm.select_next_some().await {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        let _ = tx.send(format!("{address}/p2p/{pid}"));
+                    }
+                    SwarmEvent::Behaviour(request_response::Event::Message {
+                        message:
+                            request_response::Message::Request {
+                                request, channel, ..
+                            },
+                        ..
+                    }) => {
+                        let name = format!("{request:?}");
+                        log.lock()
+                            .unwrap()
+                            .push(name.split([' ', '(', '{']).next().unwrap_or("").to_string());
+                        let resp = match request {
+                            // Accept the handshake so every refusal is the vault request's own.
+                            MeshWireRequest::HandshakeWoT { .. } => {
+                                MeshWireResponse::HandshakeAck {
+                                    accepted: true,
+                                    reason: None,
+                                }
+                            }
+                            other => reject_response(&other, NOT_ADMITTED_TEXT.to_string()),
+                        };
+                        let _ = swarm.behaviour_mut().send_response(channel, resp);
+                    }
+                    _ => {}
+                }
+            }
+        });
+    });
+    let addr = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("refusing peer listening");
+    (addr, seen)
+}
+
+/// D11: a fresh owner (vault phrase, no local snapshot) whose every ring peer refuses the
+/// catalog query does not read the refusals as "the ring holds no catalog": the pass is refused
+/// `reject.catalog_resume_unreachable`, no version 1 is written and no catalog is published.
+#[test]
+fn d11_refusing_ring_rejects_resume() {
+    let (peer, seen) = spawn_refusing_peer();
+    let f = LocalFolder::new();
+    f.write("one");
+    let out = ring_pass_args(&f, &peer, &[], Duration::from_secs(120));
+    let t = text(&out);
+    let requests = seen.lock().unwrap().clone();
+    assert!(
+        requests.iter().any(|r| r == "GetDhtEnvelope"),
+        "the catalog was never asked for: {requests:?}\n{t}"
+    );
+    assert!(!out.status.success(), "{t}");
+    assert!(t.contains("reject.catalog_resume_unreachable"), "{t}");
+    assert!(!f.snap.exists(), "a snapshot was written:\n{t}");
+    assert!(f.versions().is_empty(), "a version was kept:\n{t}");
+    assert!(
+        !requests
+            .iter()
+            .any(|r| r == "PutDhtEnvelope" || r == "PutShard"),
+        "{requests:?}"
+    );
+    gate_ran("trust_enforcement_gc_owner::d11_refusing_ring_rejects_resume");
 }

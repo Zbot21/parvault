@@ -1204,6 +1204,11 @@ pub struct MeshClient {
     full_hosts: Arc<Mutex<HashMap<String, Instant>>>,
     /// B-163 item 3 (C35): `PutShard` refusals with `reject.peer_quota_exceeded` seen so far.
     quota_refusals: Arc<std::sync::atomic::AtomicU64>,
+    /// D8 (`v0.5.6`): when each given address was last probed for its peer id and did not pin
+    /// one; it is not probed again before [`GIVEN_PROBE_RETRY`].
+    given_probe_at: Arc<Mutex<HashMap<String, Instant>>>,
+    /// D8: peer-id probes of given addresses dialed by this client (for tests and logs).
+    given_probe_dials: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// The Kademlia record an envelope put publishes (B-181): its publisher is this node, never
@@ -1232,6 +1237,26 @@ pub type PrePlaceFn = dyn Fn(&[ShardId], &[String]) -> std::io::Result<()> + Sen
 impl std::fmt::Debug for PrePlaceHook {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PrePlaceHook")
+    }
+}
+
+/// D8 (`v0.5.6`): how long a given address whose peer-id probe failed is not probed again.
+pub const GIVEN_PROBE_RETRY: Duration = Duration::from_secs(600);
+
+/// D8: the most other addresses of a peer id one failed request tries.
+pub const MAX_ALIAS_ALTERNATIVES: usize = 4;
+
+/// The text a storage node answers a `GetDhtEnvelope` with when it holds no such envelope
+/// (`wire_handler`): an answer, not a refusal.
+pub const DHT_ENVELOPE_NOT_FOUND_TEXT: &str = "DHT envelope not found";
+
+/// D11 (`v0.5.6`): whether a `GetDhtEnvelope` reply counts as the ring having answered. A
+/// returned envelope or "not found" does; a refusal (not admitted, a variant this peer does not
+/// serve, any other error) does not, so a ring that refuses is unreachable, never empty.
+pub fn dht_reply_answered(error: Option<&str>) -> bool {
+    match error {
+        None => true,
+        Some(e) => e == DHT_ENVELOPE_NOT_FOUND_TEXT,
     }
 }
 
@@ -1346,6 +1371,8 @@ impl MeshClient {
             pre_place_hook: None,
             full_hosts: Arc::new(Mutex::new(HashMap::new())),
             quota_refusals: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            given_probe_at: Arc::new(Mutex::new(HashMap::new())),
+            given_probe_dials: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
         .with_process_dial_set()
     }
@@ -1718,7 +1745,7 @@ impl MeshClient {
                 }
             }
             // B-192: one entry per peer id (a host's advertised aliases are not more hosts).
-            dedup_endpoints_by_peer_id(&list, |a| self.pinned_peer_id(a))
+            self.dedup_resolving_given(&list)
         };
 
         let mut out = build_list();
@@ -1966,7 +1993,11 @@ impl MeshClient {
                 }
                 // B-192: an address naming `/p2p/X` that does not answer (a recorded alias, or
                 // an old address): X's other known addresses, each dialed expecting X.
-                for alt in self.other_addresses_of_peer(trimmed) {
+                for alt in self
+                    .other_addresses_of_peer(trimmed)
+                    .into_iter()
+                    .take(MAX_ALIAS_ALTERNATIVES)
+                {
                     if let Ok(resp) = self.send_request_once(&alt, request.clone()) {
                         return Ok(resp);
                     }
@@ -1988,21 +2019,16 @@ impl MeshClient {
     /// suffix (empty for a plain address): the endpoints whose peer id is that one, given ones
     /// first. A given address not yet pinned is dialed once (one status request) to learn its
     /// peer id, so a cold process finds the host behind an alias it cannot reach.
+    /// D8: given ones are probed under [`Self::given_peer_id`]'s at-most-once rule, and
+    /// dead-marked addresses are left out.
     pub fn other_addresses_of_peer(&self, addr: &str) -> Vec<String> {
         let Some(pid) = peer_id_of_addr(addr) else {
             return Vec::new();
         };
-        let mut given: Vec<String> = self.peers.clone();
-        if let Some(seed) = &self.seed_addr {
-            given.push(seed.clone());
-        }
         let mut known: Vec<String> = Vec::new();
-        for g in given.iter().filter(|g| is_network_peer_addr(g)) {
-            if self.pinned_peer_id(g).is_none() {
-                let _ = self.send_request_once(g, MeshWireRequest::QueryNodeStatus);
-            }
-            if self.pinned_peer_id(g) == Some(pid) {
-                known.push(g.clone());
+        for g in self.given_addresses() {
+            if self.given_peer_id(&g) == Some(pid) {
+                known.push(g);
             }
         }
         let mut rest: Vec<String> = self
@@ -2012,9 +2038,80 @@ impl MeshClient {
             .collect();
         rest.sort_by_key(|a| (is_loopback_peer_addr(a), a.clone()));
         known.extend(rest);
-        known.retain(|a| a.trim() != addr.trim());
-        known.dedup();
+        known.retain(|a| a.trim() != addr.trim() && !self.is_peer_marked_dead(a));
+        let mut seen = HashSet::new();
+        known.retain(|a| seen.insert(a.clone()));
         known
+    }
+
+    /// The network addresses this client was given (`--peers`, then the seed).
+    fn given_addresses(&self) -> Vec<String> {
+        let mut given: Vec<String> = self.peers.clone();
+        if let Some(seed) = &self.seed_addr {
+            given.push(seed.clone());
+        }
+        given.retain(|g| is_network_peer_addr(g));
+        given
+    }
+
+    /// D8/D9 (`v0.5.6`): the peer id of a given address. Pinned, or else learned by one status
+    /// request; a probe that pins nothing is not repeated before [`GIVEN_PROBE_RETRY`], so a
+    /// powered-off given peer costs one dial timeout per interval, not one per request.
+    pub fn given_peer_id(&self, addr: &str) -> Option<PeerId> {
+        if let Some(pid) = self.pinned_peer_id(addr) {
+            return Some(pid);
+        }
+        if !is_network_peer_addr(addr) {
+            return None;
+        }
+        let key = addr.trim().to_string();
+        {
+            let mut at = self.given_probe_at.lock().ok()?;
+            if at
+                .get(&key)
+                .is_some_and(|t| t.elapsed() < GIVEN_PROBE_RETRY)
+            {
+                return None;
+            }
+            // Recorded before the dial, so concurrent callers do not dial it too.
+            at.insert(key.clone(), Instant::now());
+        }
+        self.given_probe_dials
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.send_request_once(addr, MeshWireRequest::QueryNodeStatus);
+        let pid = self.pinned_peer_id(addr);
+        if pid.is_some() {
+            if let Ok(mut at) = self.given_probe_at.lock() {
+                at.remove(&key);
+            }
+        }
+        pid
+    }
+
+    /// D8: how many peer-id probes of given addresses this client has dialed.
+    pub fn given_probe_dials(&self) -> u64 {
+        self.given_probe_dials
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// D9 (`v0.5.6`): [`dedup_endpoints_by_peer_id`] with the given addresses' peer ids resolved
+    /// ([`Self::given_peer_id`]) whenever the list also holds a `/p2p/` address, so a plain
+    /// `--peers` address and a discovered `/p2p/X` of the same host are one candidate even in a
+    /// cold process. A list with no `/p2p/` address dials nothing.
+    fn dedup_resolving_given(&self, list: &[(String, bool)]) -> Vec<String> {
+        let any_p2p = list.iter().any(|(a, _)| peer_id_of_addr(a).is_some());
+        let given: HashSet<&str> = list
+            .iter()
+            .filter(|(_, g)| *g)
+            .map(|(a, _)| a.as_str())
+            .collect();
+        dedup_endpoints_by_peer_id(list, |a| {
+            self.pinned_peer_id(a).or_else(|| {
+                (any_p2p && given.contains(a))
+                    .then(|| self.given_peer_id(a))
+                    .flatten()
+            })
+        })
     }
 
     pub fn is_peer_marked_dead(&self, peer_addr: &str) -> bool {
@@ -3250,10 +3347,10 @@ impl MeshClient {
     }
 
     fn validate_dht_candidate(
-        &self,
         dht_key: &[u8; 32],
         kind: DhtEnvelopeKind,
         env: &DhtWireEnvelope,
+        expected_owner: [u8; 32],
     ) -> Option<u64> {
         let version = Self::self_consistent_version(dht_key, kind, env)?;
         // F-10a: classical manifests and vault catalogs are sealed by the identity that reads
@@ -3264,7 +3361,7 @@ impl MeshClient {
             DhtWireEnvelope::VaultCatalog(m) => Some(m.owner_pubkey),
             DhtWireEnvelope::PostQuantumManifest(_) => None,
         };
-        if let Err(code) = dht_candidate_decision(owner, self.identity.public_key_bytes()) {
+        if let Err(code) = dht_candidate_decision(owner, expected_owner) {
             warn!(
                 code,
                 owner = %owner.map(hex::encode).unwrap_or_default(),
@@ -3306,7 +3403,7 @@ impl MeshClient {
     /// `DhtWireEnvelope` by `dht_key`, verifies zero-knowledge signature integrity on every
     /// candidate, and returns the highest `monotonic_version` (`C3`).
     /// G-23 (catalog resume): asks every ring endpoint for the vault catalog at `dht_key` and
-    /// returns how many answered (a "not found" is an answer), with every catalog they returned, unfiltered
+    /// returns how many answered (a "not found" is an answer; a refusal is not, D11), with every catalog they returned, unfiltered
     /// (the caller checks the owner and key, so a foreign catalog is logged, never adopted).
     /// `answered == 0` means the ring could not be asked.
     pub fn fetch_vault_catalogs(
@@ -3316,13 +3413,20 @@ impl MeshClient {
         let mut answered = 0;
         let mut found = Vec::new();
         for ep in self.all_network_endpoints() {
-            if let Ok(MeshWireResponse::GetDhtEnvelopeResult { envelope, .. }) = self.send_request(
-                &ep,
-                MeshWireRequest::GetDhtEnvelope {
-                    dht_key: *dht_key,
-                    kind: DhtEnvelopeKind::VaultCatalog,
-                },
-            ) {
+            if let Ok(MeshWireResponse::GetDhtEnvelopeResult { envelope, error }) = self
+                .send_request(
+                    &ep,
+                    MeshWireRequest::GetDhtEnvelope {
+                        dht_key: *dht_key,
+                        kind: DhtEnvelopeKind::VaultCatalog,
+                    },
+                )
+            {
+                // D11: a refusal is not an answer ("the ring holds no catalog" would fork).
+                if !dht_reply_answered(error.as_deref()) {
+                    warn!(peer = %ep, error = ?error, "a peer refused the vault catalog query");
+                    continue;
+                }
                 answered += 1;
                 if let Some(DhtWireEnvelope::VaultCatalog(c)) = envelope {
                     found.push(c);
@@ -3336,6 +3440,19 @@ impl MeshClient {
         &self,
         dht_key: &[u8; 32],
         kind: DhtEnvelopeKind,
+    ) -> anyhow::Result<DhtWireEnvelope> {
+        self.get_dht_envelope_for_owner(dht_key, kind, self.identity.public_key_bytes())
+    }
+
+    /// D14 (`v0.5.6`): [`Self::get_dht_envelope`] for an envelope sealed by `owner_pubkey`, which
+    /// need not be this client's identity (a daemon importing a registered seed vault reads
+    /// catalogs its vault owner sealed). Every candidate must be self-consistent at `dht_key`
+    /// and signed by `owner_pubkey` (F-10a, the B-20 `key_matches` rule); any other is ignored.
+    pub fn get_dht_envelope_for_owner(
+        &self,
+        dht_key: &[u8; 32],
+        kind: DhtEnvelopeKind,
+        owner_pubkey: [u8; 32],
     ) -> anyhow::Result<DhtWireEnvelope> {
         let endpoints = self.all_network_endpoints();
         if endpoints.is_empty() {
@@ -3357,7 +3474,9 @@ impl MeshClient {
                 if let Ok(raw_records) = reply_rx.recv_timeout(kad_wait) {
                     for raw in raw_records {
                         if let Ok(env) = bincode::deserialize::<DhtWireEnvelope>(&raw) {
-                            if let Some(ver) = self.validate_dht_candidate(dht_key, kind, &env) {
+                            if let Some(ver) =
+                                Self::validate_dht_candidate(dht_key, kind, &env, owner_pubkey)
+                            {
                                 if best.as_ref().is_none_or(|(best_v, _)| ver > *best_v) {
                                     best = Some((ver, env));
                                 }
@@ -3383,7 +3502,7 @@ impl MeshClient {
                     kind,
                 },
             ) {
-                if let Some(ver) = self.validate_dht_candidate(dht_key, kind, &env) {
+                if let Some(ver) = Self::validate_dht_candidate(dht_key, kind, &env, owner_pubkey) {
                     if best.as_ref().is_none_or(|(best_v, _)| ver > *best_v) {
                         best = Some((ver, env));
                     }
@@ -3403,7 +3522,9 @@ impl MeshClient {
                         kind,
                     },
                 ) {
-                    if let Some(ver) = self.validate_dht_candidate(dht_key, kind, &env) {
+                    if let Some(ver) =
+                        Self::validate_dht_candidate(dht_key, kind, &env, owner_pubkey)
+                    {
                         if best.as_ref().is_none_or(|(best_v, _)| ver > *best_v) {
                             best = Some((ver, env));
                         }
@@ -3473,7 +3594,7 @@ impl MeshClient {
                     )
                 })
                 .collect();
-            dedup_endpoints_by_peer_id(&given, |a| self.pinned_peer_id(a))
+            self.dedup_resolving_given(&given)
         } else {
             self.all_network_endpoints()
         };
@@ -3814,25 +3935,35 @@ impl IpLocalityExt for IpAddr {
 #[cfg(test)]
 mod tests {
 
-    /// B-192: one endpoint per peer id: the given address first, then a non-loopback one; an
-    /// address with no known peer id passes through.
+    /// B-192, D9: one endpoint per peer id: the given address first, then a non-loopback one.
+    /// The resolver knows a given plain address's peer id once it has answered a probe (the
+    /// client resolves given addresses before dedup, `MeshClient::given_peer_id`), so a given
+    /// plain address and a discovered `/p2p/` of the same host are one entry; only a given
+    /// address whose peer id cannot be learned (down) passes through on its own.
     #[test]
     fn endpoints_dedup_by_peer_id() {
         let x = node_identity_libp2p_peer_id(&NodeIdentity::from_seed([0x61; 32])).unwrap();
         let y = node_identity_libp2p_peer_id(&NodeIdentity::from_seed([0x62; 32])).unwrap();
+        let z = node_identity_libp2p_peer_id(&NodeIdentity::from_seed([0x68; 32])).unwrap();
         let given_x = "/ip4/172.28.1.71/tcp/4001".to_string();
+        let given_z = "/ip4/172.28.1.73/tcp/4001".to_string();
+        let given_down = "/ip4/172.28.1.74/tcp/4001".to_string();
         let entries = vec![
             (given_x.clone(), true),
             (format!("/ip4/127.0.0.1/tcp/4001/p2p/{x}"), false),
             (format!("/ip4/127.0.0.1/tcp/4001/p2p/{y}"), false),
             (format!("/ip4/172.28.1.72/tcp/4001/p2p/{y}"), false),
             (format!("/ip4/172.28.1.71/tcp/4001/p2p/{x}"), false),
-            ("/ip4/172.28.1.73/tcp/4001".to_string(), true),
+            (format!("/ip4/172.28.1.73/tcp/4001/p2p/{z}"), false),
+            (given_z.clone(), true),
+            (given_down.clone(), true),
         ];
-        let pinned = given_x.clone();
+        let (gx, gz) = (given_x.clone(), given_z.clone());
         let pid_of = |a: &str| {
-            if a == pinned {
+            if a == gx {
                 Some(x)
+            } else if a == gz {
+                Some(z)
             } else {
                 parse_peer_multiaddr(a)
                     .ok()
@@ -3845,11 +3976,33 @@ mod tests {
             vec![
                 given_x,
                 format!("/ip4/172.28.1.72/tcp/4001/p2p/{y}"),
-                "/ip4/172.28.1.73/tcp/4001".to_string(),
+                given_z,
+                given_down,
             ]
         );
-        // Host count: three hosts (x, y and the unpinned plain address), never six.
-        assert_eq!(out.len(), 3);
+        // Host count: four hosts (x, y, z and the down given address), never eight.
+        assert_eq!(out.len(), 4);
+    }
+
+    /// D11: "not found" and a returned envelope are answers; a refusal is not.
+    #[test]
+    fn dht_refusal_is_not_an_answer() {
+        assert!(dht_reply_answered(None));
+        assert!(dht_reply_answered(Some(DHT_ENVELOPE_NOT_FOUND_TEXT)));
+        assert!(!dht_reply_answered(Some(
+            crate::network::wire_handler::NOT_ADMITTED_TEXT
+        )));
+        let refused = crate::network::wire_handler::reject_response(
+            &MeshWireRequest::GetDhtEnvelope {
+                dht_key: [0; 32],
+                kind: DhtEnvelopeKind::VaultCatalog,
+            },
+            crate::network::wire_handler::NOT_ADMITTED_TEXT.to_string(),
+        );
+        let MeshWireResponse::GetDhtEnvelopeResult { error, .. } = refused else {
+            panic!("{refused:?}");
+        };
+        assert!(!dht_reply_answered(error.as_deref()));
     }
 
     /// B-192: host counts are distinct peer ids. A client given two addresses of one node and

@@ -1142,3 +1142,95 @@ fn b20_seed_vault_rollback_refused() {
     assert_ne!((st, body.as_slice()), (200, &b"vault v1"[..]));
     gate_ran("trust_enforcement_restore::b20_seed_vault_rollback_refused");
 }
+
+/// D14 (`v0.5.6` final QA; archC1 condition 2 over the wire): a seed vault's catalog held only
+/// by a ring peer is imported over the network (the candidate is checked against the vault
+/// owner's key, not the daemon's node key), and the importing node, which only reads the vault,
+/// sends the peer nothing: the peer's shards and DHT store are unchanged and neither log shows a
+/// store, delete, free or publish.
+#[cfg(unix)]
+#[test]
+fn d14_seed_vault_catalog_imported_over_the_network() {
+    use b20::*;
+    use seedvault::*;
+    let root = tempfile::tempdir().unwrap();
+    let dir = data_dir(root.path(), "data");
+    let peer_dir = data_dir(root.path(), "peer");
+    let folder = root.path().join("src");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.txt"), b"seed vault over the wire").unwrap();
+    let env = Writer::new(&dir, SEED_A).pass(&folder);
+    let key = env.dht_key;
+    // The catalog lives on the peer only: the importing node's own DHT store has none.
+    let dht = dir.join("zero_trust_dht_store.bin");
+    if let Ok(raw) = std::fs::read(&dht) {
+        let mut st: parvault_dht_state::DhtState = bincode::deserialize(&raw).unwrap();
+        st.catalog_records.clear();
+        std::fs::write(&dht, bincode::serialize(&st).unwrap()).unwrap();
+    }
+    plant(&peer_dir, key, env);
+    parvault::crypto::NodeIdentity::load_or_generate_in_dir(&peer_dir).unwrap();
+    let peer_log = root.path().join("peer.log");
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_parvault"));
+    cmd.env(
+        "PARVAULT_LAN_REGISTRY_DIR",
+        root.path().join("peer-lan-registry"),
+    )
+    .env("PARVAULT_GENESIS_SEED_HEX", hex::encode([0x47u8; 32]))
+    .env_remove("PARVAULT_PEERS")
+    .env_remove("PARVAULT_GENESIS_PUBKEY_HEX")
+    .arg("--data-dir")
+    .arg(&peer_dir)
+    .args([
+        "--no-lan-discovery",
+        "daemon",
+        "start",
+        "--listen",
+        common::LOOPBACK_EPHEMERAL,
+    ]);
+    let (mut peer, peer_addr) = common::spawn_on_ephemeral_port(&mut cmd, &peer_log);
+    let peer_before = fingerprint(&peer_dir);
+    parvault::vfs::register_vault_keys(&dir, SEED_A, NS).unwrap();
+    let d = up(&dir, None, &[("PARVAULT_PEERS", peer_addr.as_str())]);
+    wait_get(
+        &d,
+        "/photos/a.txt",
+        "seed vault imported from the peer",
+        |st, b| st == 200 && b == b"seed vault over the wire",
+    );
+    std::thread::sleep(Duration::from_secs(4));
+    let log = d.log_text();
+    d.stop();
+    let _ = peer.kill();
+    let _ = peer.wait();
+    let peer_text = std::fs::read_to_string(&peer_log).unwrap_or_default();
+    assert_eq!(
+        fingerprint(&peer_dir),
+        peer_before,
+        "the reader changed the peer's shards or DHT store\n{peer_text}"
+    );
+    for word in ["PutShard", "DeleteShard", "FreeShards", "put_dht_envelope"] {
+        assert!(!log.contains(word), "{word} in the reader log:\n{log}");
+        assert!(
+            !peer_text.contains(word),
+            "{word} in the peer log:\n{peer_text}"
+        );
+    }
+    assert!(
+        !log.contains("not bound to this owner"),
+        "the vault owner's catalog was refused:\n{log}"
+    );
+    gate_ran("trust_enforcement_restore::d14_seed_vault_catalog_imported_over_the_network");
+}
+
+/// `zero_trust_dht_store.bin`'s layout (as `seedvault::plant` writes it).
+#[cfg(unix)]
+mod parvault_dht_state {
+    use std::collections::HashMap;
+    #[derive(serde::Serialize, serde::Deserialize, Default)]
+    pub struct DhtState {
+        pub records: HashMap<[u8; 32], parvault::storage::SignedDhtManifestEnvelope>,
+        pub pq_records: HashMap<[u8; 32], parvault::crypto::PqSignedDhtManifestEnvelope>,
+        pub catalog_records: HashMap<[u8; 32], parvault::sync::EncryptedVaultCatalogEnvelope>,
+    }
+}
