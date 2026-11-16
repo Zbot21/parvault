@@ -147,6 +147,14 @@ pub const DUMP_SCHEMA: &[(&str, FieldKind, FieldClass)] = &[
     ("gateway_socket_group", Arg, Plain),
     ("no_gc", Arg, Plain),
     ("dump_config", Arg, Control),
+    // v0.5.6: `watch-folder` retention args (track B2) and `status --live` args (track D); not
+    // args of `up` or `daemon start`, so no dump shows them yet.
+    ("keep_last", Arg, Plain),
+    ("keep_daily", Arg, Plain),
+    ("keep_weekly", Arg, Plain),
+    ("max_stored_bytes", Arg, Plain),
+    ("socket", Arg, Plain),
+    ("macaroon_file", Arg, Plain),
     // Environment variables read under src/.
     ("PARVAULT_PEERS", Env, PlainUrl),
     ("PARVAULT_SEED_ADDR", Env, PlainUrl),
@@ -171,7 +179,36 @@ pub const DUMP_SCHEMA: &[(&str, FieldKind, FieldClass)] = &[
     ("ring_genesis.seed", File, SecretPath),
     ("node_pq_kem.bin", File, SecretPath),
     ("owner_pq_keypair.bin", File, SecretPath),
+    // Per-vault key files (archC1 cond. 5): one `*` in the last component matches any file.
+    ("vaults/*.vaultkey", File, SecretPath),
 ];
+
+/// Whether the key file `name` exists under `data_dir`, from metadata only. A `*` in the last
+/// path component (`vaults/*.vaultkey`) matches any file name with the same prefix and suffix.
+pub fn secret_file_present(data_dir: &std::path::Path, name: &str) -> bool {
+    let path = data_dir.join(name);
+    let Some((prefix, suffix)) = path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .and_then(|f| f.split_once('*'))
+    else {
+        return path.exists();
+    };
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let f = e.file_name();
+        let f = f.to_string_lossy();
+        f.len() >= prefix.len() + suffix.len()
+            && f.starts_with(prefix)
+            && f.ends_with(suffix)
+            && e.file_type().is_ok_and(|t| t.is_file())
+    })
+}
 
 /// The class of `name` for `kind`, if classified.
 pub fn dump_class(name: &str, kind: FieldKind) -> Option<FieldClass> {
@@ -391,7 +428,7 @@ mod render {
                 FieldKind::File => {
                     let path = eff.cfg.data_dir.join(name);
                     // Metadata only: the file is never opened.
-                    let present = path.exists();
+                    let present = secret_file_present(&eff.cfg.data_dir, name);
                     if dump_field_repr(class, present) == DumpRepr::SetOnly {
                         secrets.insert(
                             name.to_string(),
@@ -489,6 +526,26 @@ pub use render::render_dump_error;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// archC1 cond. 5: `vaults/*.vaultkey` is set when any per-vault key file exists, and not
+    /// for a directory, another suffix or a missing `vaults/`.
+    #[test]
+    fn vaultkey_glob_matches_only_key_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let name = "vaults/*.vaultkey";
+        assert!(!secret_file_present(d, name));
+        std::fs::create_dir_all(d.join("vaults/dir.vaultkey")).unwrap();
+        std::fs::write(d.join("vaults/a.vaultkey.bak"), b"x").unwrap();
+        assert!(!secret_file_present(d, name));
+        std::fs::write(d.join("vaults/home.vaultkey"), b"x").unwrap();
+        assert!(secret_file_present(d, name));
+        assert_eq!(
+            dump_class(name, FieldKind::File),
+            Some(FieldClass::SecretPath)
+        );
+        assert!(!secret_file_present(d, "macaroon_root.key"));
+    }
 
     #[test]
     fn userinfo_is_removed_and_unparseable_values_are_hidden() {

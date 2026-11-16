@@ -184,6 +184,7 @@ fn command_needs_network_discovery(cmd: &Commands) -> bool {
             | Commands::VerifyDeviceCert { .. }
             | Commands::DiffFolder { .. }
             | Commands::ListSnapshot { .. }
+            | Commands::FolderStatus { .. }
             | Commands::Scrub
             | Commands::Token { .. }
             | Commands::Wot { .. }
@@ -604,6 +605,7 @@ async fn run(
         command @ Commands::DiffFolder { .. } => cli::folder::diff_folder(env, command).await?,
         command @ Commands::WatchFolder { .. } => cli::folder::watch_folder(env, command).await?,
         command @ Commands::ListSnapshot { .. } => cli::folder::list_snapshot(env, command).await?,
+        command @ Commands::FolderStatus { .. } => cli::folder::folder_status(env, command).await?,
         command @ Commands::RestoreFolder { .. } => {
             cli::folder::restore_folder(env, command).await?
         }
