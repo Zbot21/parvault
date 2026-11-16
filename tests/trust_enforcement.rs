@@ -5999,7 +5999,10 @@ fn b161_gateway_push(host: &Node) -> std::process::Output {
         "parvault-sync",
         env!("CARGO_BIN_EXE_parvault-sync"),
     ));
-    cmd.arg("--socket")
+    // B-16: push auto-mints a write token from the host daemon's data directory.
+    cmd.arg("--data-dir")
+        .arg(&host.dir)
+        .arg("--socket")
         .arg(root.join("gw.sock"))
         .arg("--catalog")
         .arg(root.join("catalog.bin"))
