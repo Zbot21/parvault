@@ -109,23 +109,23 @@ parvault recover-from-seed --vault-namespace documents --out-dir ./recovered-aft
 parvault issue-device-cert --device-peer-id "parvault-peer-8f3a9c12e4b07d11" --device-label "Work-Laptop"
 parvault-seed verify-device-cert --data-dir /mnt/nas/parvault-seed --cert "PARVAULT-CERT-V1:<hex>" --owner-pq-pubkey-hex <ISSUER_OWNER_PQ_PUBLIC_KEY_HEX>
 
-## QUICKSTART.md:265 node=laptop
+## QUICKSTART.md:270 node=laptop
 parvault status
 parvault scrub
 
-## QUICKSTART.md:279 node=main skip="needs a stripe root from an abuse report; the Docker gate (stages 7b, 9) runs evict"
+## QUICKSTART.md:284 node=main skip="needs a stripe root from an abuse report; the Docker gate (stages 7b, 9) runs evict"
 parvault evict --ip 203.0.113.42 --reason "Spam flood"
 parvault evict --merkle-root <STRIPE_MERKLE_ROOT_HEX> --propagate
 
-## QUICKSTART.md:296 node=main skip="no public tracker is hosted (the docs say so)"
+## QUICKSTART.md:301 node=main skip="no public tracker is hosted (the docs say so)"
 parvault report-abuse --tracker /ip4/<YOUR_SEED_IP>/tcp/4002/p2p/<SEED_PEER_ID> --manifest ./contraband.manifest.bin --disclosed-key-hex <DISCLOSED_KEY_HEX> --allegation "CSAM / DMCA takedown violation"
 parvault-seed admin list-takedowns --data-dir /mnt/nas/parvault-seed
 parvault-seed admin approve-takedown --data-dir /mnt/nas/parvault-seed --report-id <REPORT_ID> --note "Confirmed violation" --propagate
 parvault-seed admin emergency-evict --data-dir /mnt/nas/parvault-seed --ip 203.0.113.66 --warrant-ref "WARRANT-1234" --propagate
 
-## QUICKSTART.md:320 node=laptop background ready="Built-in VFS WebDAV listening on http://127.0.0.1:8088"
+## QUICKSTART.md:325 node=laptop background ready="Built-in VFS WebDAV listening on http://127.0.0.1:8088"
 parvault up --no-socket --vfs-seed-dir ~/Documents --vfs-webdav-listen 127.0.0.1:8088
 
-## QUICKSTART.md:325 node=laptop
+## QUICKSTART.md:330 node=laptop
 TOKEN="$(parvault token mint --read-only --ttl-secs 86400)"
 curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8088/
