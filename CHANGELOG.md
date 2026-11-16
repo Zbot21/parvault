@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+- **Restore path and fetch scheduler (`v0.5.6` track C).** The daemon's built-in VFS lists its catalog: at start and every minute it imports the snapshot its own folder sync keeps in the data dir, under `/watched/`, only if its signed manifest envelope is this data dir's (`reject.catalog_foreign`) and not older than the loaded one (`reject.catalog_rollback`). A changed file gets a new inode, a deleted one leaves the listing, and a failed read re-imports once. Concurrent misses of one block make one fetch (B-24). Foreground reads (WebDAV, FUSE, IPC) are admitted ahead of an in-daemon scavenger that hydrates imported files into the block cache (8 slots, the scavenger at most 7, aged in after 8 passes; `defer.scavenger_preempted`); `file restore` and `restore-folder` run in their own process and are not scheduled.
+
 ---
 
 ## [`0.5.5`] - 2026-11-16

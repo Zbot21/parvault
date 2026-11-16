@@ -681,6 +681,22 @@ mod unix_engine {
             self.index_manifest_in_ram(fm)
         }
 
+        /// B-20: indexes a manifest from an imported vault catalog in RAM only (the catalog is
+        /// its persistent home), so `FetchRange` resolves it.
+        pub fn index_catalog_manifest(&self, fm: FileManifest) -> EphemeralShardManifest {
+            self.index_manifest_in_ram(fm)
+        }
+
+        /// B-20: whether `env` is signed by this gateway's owner and opens under its key (a
+        /// catalog from this data dir, not a foreign one).
+        pub fn owns_signed_manifest(
+            &self,
+            env: &crate::storage::block_store::SignedDhtManifestEnvelope,
+        ) -> bool {
+            env.owner_pubkey == self.owner_identity.public_key_bytes()
+                && env.open(&self.master_key).is_ok()
+        }
+
         fn index_manifest_in_ram(&self, fm: FileManifest) -> EphemeralShardManifest {
             let eph = EphemeralShardManifest::from_file_manifest(&fm);
             let vec_hash = hash_shard_id_vector(&eph.shard_hashes);

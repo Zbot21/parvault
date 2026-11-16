@@ -111,6 +111,11 @@ impl LruBlockCache {
         self.sizes.len()
     }
 
+    /// Whether `(ino, block_idx)` is cached (no hit or miss is counted).
+    pub fn contains(&self, ino: u64, block_idx: u64) -> bool {
+        self.sizes.contains_key(&(ino, block_idx))
+    }
+
     /// Drops every cached block of `ino` (a replaced or removed file).
     pub fn forget_ino(&mut self, ino: u64) {
         let keys: Vec<(u64, u64)> = self.sizes.keys().filter(|k| k.0 == ino).copied().collect();
@@ -388,6 +393,36 @@ pub enum PathRemoval {
     Folder,
 }
 
+/// What [`catalog_import_decision`] allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogImport {
+    /// A newer catalog: apply it.
+    Apply,
+    /// The version already loaded: nothing to do.
+    Unchanged,
+}
+
+/// Claim `B20-LIST` (`@guard`): whether a fetched vault catalog is imported. A catalog that
+/// fails verification or names another vault key is foreign (`reject.catalog_foreign`); one
+/// older than the loaded version is a rollback (`reject.catalog_rollback`).
+pub const fn catalog_import_decision(
+    envelope_verifies: bool,
+    key_matches: bool,
+    envelope_version: u64,
+    loaded_version: u64,
+) -> Result<CatalogImport, &'static str> {
+    if !envelope_verifies || !key_matches {
+        return Err("reject.catalog_foreign");
+    }
+    if envelope_version < loaded_version {
+        return Err("reject.catalog_rollback");
+    }
+    if envelope_version == loaded_version {
+        return Ok(CatalogImport::Unchanged);
+    }
+    Ok(CatalogImport::Apply)
+}
+
 /// Path segments as [`VirtualVaultFs::register_lazy_file`] reads them (`.` and `..` dropped).
 #[cfg(unix)]
 fn vfs_path_parts(virtual_path: &str) -> Vec<&str> {
@@ -423,7 +458,12 @@ mod unix_vfs {
         cache: Arc<Mutex<LruBlockCache>>,
         /// B-24: one in-flight fetch per `(inode, block)`; concurrent misses join it.
         inflight: Arc<Mutex<InflightMap>>,
+        /// B-20 (T2): re-imports the catalogs once after a failed read of a catalog file.
+        reimport: Arc<Mutex<Option<ReimportHook>>>,
     }
+
+    /// The catalog re-import a failed read calls (T2).
+    pub type ReimportHook = Arc<dyn Fn() + Send + Sync>;
 
     type InflightMap = HashMap<(u64, u64), Arc<BlockFlight>>;
     /// A finished fetch: the bytes, or the error's kind and text (`io::Error` is not `Clone`).
@@ -515,6 +555,7 @@ mod unix_vfs {
                 next_ino: Arc::new(Mutex::new(2)),
                 cache: Arc::new(Mutex::new(cache)),
                 inflight: Arc::new(Mutex::new(HashMap::new())),
+                reimport: Arc::new(Mutex::new(None)),
             })
         }
 
@@ -530,19 +571,29 @@ mod unix_vfs {
             self
         }
 
-        /// B-20 (`v0.5.6` track C): starts importing the vault catalogs `data_dir` holds keys
-        /// for (`derive_vault_root_dht_key`), at start and on a timer, through
-        /// [`Self::upsert_file`] and [`Self::remove_path`]; the scavenger then hydrates them
-        /// (L-94, S1). Called by the daemon once the built-in VFS exists. T0 stub: imports
-        /// nothing, so the mount lists only `--vfs-seed-dir` files, as before `v0.5.6`.
+        /// B-20 (`v0.5.6` track C): imports the vault catalogs `data_dir` holds keys for, at
+        /// start and on a timer, through [`Self::upsert_file`] and [`Self::remove_path`]; the
+        /// scavenger then hydrates them (L-94, S1). Called by the daemon once the built-in VFS
+        /// exists. A socket-bus VFS (a plugin) has no engine to index manifests in, so it
+        /// imports nothing. `PARVAULT_CATALOG_IMPORT_SECS` overrides the period (tests).
         #[cfg(feature = "daemon-runtime")]
         pub fn start_catalog_import(
             &self,
             data_dir: &Path,
             block_store: &crate::storage::BlockStore,
         ) -> io::Result<()> {
-            let _ = (data_dir, block_store);
-            Ok(())
+            let _ = block_store;
+            let GatewayBus::InProcess(engine) = &self.bus else {
+                return Ok(());
+            };
+            let interval = std::env::var("PARVAULT_CATALOG_IMPORT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|s| Duration::from_secs(s.max(1)))
+                .unwrap_or(super::catalog::IMPORT_INTERVAL);
+            let importer =
+                super::catalog::CatalogImporter::new(self.clone(), Arc::clone(engine), data_dir);
+            importer.start(interval)
         }
 
         /// Registers a virtual file path (e.g. `"/movies/archive_10gb.bin"` or `"backup.tar"`)
@@ -767,12 +818,11 @@ mod unix_vfs {
 
         /// The entries of the folder at `virtual_path`, or `None` when it is not a folder.
         pub fn list_children(&self, virtual_path: &str) -> Option<Vec<VfsLazyNode>> {
-            let mut cur = VFS_ROOT_INO;
+            let mut node = self.getattr(VFS_ROOT_INO)?;
             for p in vfs_path_parts(virtual_path) {
-                cur = self.lookup(cur, p)?.ino;
+                node = self.lookup(node.ino, p)?;
             }
-            let node = self.getattr(cur)?;
-            node.is_dir.then(|| self.readdir(cur))
+            node.is_dir.then(|| self.readdir(node.ino))
         }
 
         fn alloc_ino(&self) -> u64 {
@@ -804,12 +854,13 @@ mod unix_vfs {
             if parts.is_empty() {
                 return self.getattr(VFS_ROOT_INO);
             }
-            let mut cur = VFS_ROOT_INO;
+            // The last lookup's node itself, not a second read by inode: a name swapped by
+            // `upsert_file` in between would otherwise resolve to a removed inode.
+            let mut node = self.getattr(VFS_ROOT_INO)?;
             for p in parts {
-                let node = self.lookup(cur, p)?;
-                cur = node.ino;
+                node = self.lookup(node.ino, p)?;
             }
-            self.getattr(cur)
+            Some(node)
         }
 
         pub fn readdir(&self, dir_ino: u64) -> Vec<VfsLazyNode> {
@@ -841,6 +892,47 @@ mod unix_vfs {
         /// ranges over `/var/run/parvault.sock` (`FetchRange` + `SCM_RIGHTS` `memfd`), populating
         /// `LruBlockCache`, and returning `(bytes, time_to_first_byte)`.
         pub fn read_range_with_ttfb(
+            &self,
+            ino: u64,
+            offset: u64,
+            length: u64,
+        ) -> io::Result<(Vec<u8>, Duration)> {
+            let first = self.read_range_once(ino, offset, length);
+            let Err(e) = first else {
+                return first;
+            };
+            // T2: a catalog file whose read fails (for example a stripe freed by version GC)
+            // re-imports the catalogs once; if that gave the path a new inode, read it once.
+            let hook = self.reimport.lock().unwrap().clone();
+            let (Some(hook), Some(node)) = (hook, self.getattr(ino)) else {
+                return Err(e);
+            };
+            if node.is_dir || node.manifest.is_none() {
+                return Err(e);
+            }
+            hook();
+            match self.lookup(node.parent_ino, &node.name) {
+                Some(n) if n.ino != ino && !n.is_dir => self.read_range_once(n.ino, offset, length),
+                _ => Err(e),
+            }
+        }
+
+        /// Sets the catalog re-import a failed read calls (T2).
+        pub fn set_reimport_hook(&self, hook: Option<ReimportHook>) {
+            *self.reimport.lock().unwrap() = hook;
+        }
+
+        /// The block size reads are split into.
+        pub const fn block_size(&self) -> usize {
+            self.block_size
+        }
+
+        /// Whether `(ino, block)` is in the cache now (counts neither a hit nor a miss).
+        pub fn block_cached(&self, ino: u64, blk_idx: u64) -> bool {
+            self.cache.lock().unwrap().contains(ino, blk_idx)
+        }
+
+        fn read_range_once(
             &self,
             ino: u64,
             offset: u64,
@@ -1405,6 +1497,350 @@ mod unix_vfs {
 pub use crate::webdav::VfsWebdavServerHandle;
 #[cfg(unix)]
 pub use unix_vfs::VirtualVaultFs;
+
+/// B-20 catalog import and the in-daemon scavenger (L-94, arch056b S1), `v0.5.6` track C.
+#[cfg(all(unix, feature = "daemon-runtime"))]
+pub mod catalog {
+    use super::{catalog_import_decision, CatalogImport, Ino, LazyFileSpec, VirtualVaultFs};
+    use crate::fetch_sched;
+    use crate::gateway::GatewayEngine;
+    use crate::sync::{sanitize_sync_relative_path, FolderSnapshotManifest};
+    use std::collections::{BTreeMap, VecDeque};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, Weak};
+    use std::time::{Duration, Instant};
+
+    /// The snapshot the daemon's own folder sync (`up --watch-folder`) keeps in its data dir.
+    pub const DEVICE_SNAPSHOT_FILE: &str = "appliance_folder_snapshot.manifest.bin";
+    /// The folder the device vault is listed under (`/<folder>/`).
+    pub const DEVICE_FOLDER: &str = "watched";
+    /// Catalog import period.
+    pub const IMPORT_INTERVAL: Duration = Duration::from_secs(60);
+    /// The scavenger's hourly byte cap.
+    pub const SCAVENGER_BYTES_PER_HOUR: u64 = 4 * 1024 * 1024 * 1024;
+    /// The scavenger fills the block cache up to this share (percent).
+    pub const SCAVENGER_CACHE_SHARE_PCT: u64 = 75;
+
+    /// What one import did.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct ImportReport {
+        pub upserted: usize,
+        pub removed: usize,
+        pub unchanged: usize,
+    }
+
+    #[derive(Default)]
+    struct SourceState {
+        loaded_version: u64,
+        /// Listed path to (file Merkle root, inode).
+        files: BTreeMap<String, ([u8; 32], Ino)>,
+    }
+
+    /// Imports vault catalogs into a [`VirtualVaultFs`] and hydrates them (S1).
+    pub struct CatalogImporter {
+        vfs: VirtualVaultFs,
+        engine: Arc<GatewayEngine>,
+        data_dir: PathBuf,
+        sources: Mutex<BTreeMap<String, SourceState>>,
+        hydrate: Mutex<VecDeque<Ino>>,
+        hydrated_bytes: AtomicU64,
+    }
+
+    impl CatalogImporter {
+        pub fn new(vfs: VirtualVaultFs, engine: Arc<GatewayEngine>, data_dir: &Path) -> Arc<Self> {
+            Arc::new(Self {
+                vfs,
+                engine,
+                data_dir: data_dir.to_path_buf(),
+                sources: Mutex::new(BTreeMap::new()),
+                hydrate: Mutex::new(VecDeque::new()),
+                hydrated_bytes: AtomicU64::new(0),
+            })
+        }
+
+        /// Bytes the scavenger has hydrated so far.
+        pub fn hydrated_bytes(&self) -> u64 {
+            self.hydrated_bytes.load(Ordering::Relaxed)
+        }
+
+        /// Files waiting for the scavenger.
+        pub fn hydrate_queue_len(&self) -> usize {
+            self.hydrate.lock().unwrap_or_else(|e| e.into_inner()).len()
+        }
+
+        /// Applies `snapshot` under `/<folder>/` if [`catalog_import_decision`] allows: a changed
+        /// file gets a new inode (T1), a file gone from the catalog leaves the listing (T4),
+        /// an unchanged one keeps its inode and cached blocks.
+        pub fn import_snapshot(
+            &self,
+            folder: &str,
+            envelope_verifies: bool,
+            key_matches: bool,
+            snapshot: &FolderSnapshotManifest,
+        ) -> Result<ImportReport, &'static str> {
+            // A folder name that is not one path segment is not one of this data dir's vaults.
+            let folder_ok =
+                !(folder.is_empty() || folder.contains('/') || folder == "." || folder == "..");
+            if !folder_ok {
+                return catalog_import_decision(true, false, 0, 0).map(|_| ImportReport::default());
+            }
+            let mut sources = self.sources.lock().unwrap_or_else(|e| e.into_inner());
+            let st = sources.entry(folder.to_string()).or_default();
+            let decision = catalog_import_decision(
+                envelope_verifies,
+                key_matches,
+                snapshot.version,
+                st.loaded_version,
+            );
+            match decision {
+                Err(code) => {
+                    tracing::warn!(code, folder, version = snapshot.version, "catalog refused");
+                    return Err(code);
+                }
+                Ok(CatalogImport::Unchanged) => {
+                    return Ok(ImportReport {
+                        unchanged: st.files.len(),
+                        ..ImportReport::default()
+                    })
+                }
+                Ok(CatalogImport::Apply) => {}
+            }
+            let mut report = ImportReport::default();
+            let mut next = BTreeMap::new();
+            let mut fresh = Vec::new();
+            for entry in snapshot.files.values() {
+                let Some(rel) = sanitize_sync_relative_path(&entry.relative_path) else {
+                    continue;
+                };
+                let path = format!("/{folder}/{rel}");
+                if let Some(&(root, ino)) = st.files.get(&path) {
+                    if root == entry.file_merkle_root && self.vfs.getattr(ino).is_some() {
+                        next.insert(path, (root, ino));
+                        report.unchanged += 1;
+                        continue;
+                    }
+                }
+                let eph = self.engine.index_catalog_manifest(entry.manifest.clone());
+                let spec = LazyFileSpec {
+                    manifest: eph,
+                    macaroon: None,
+                    mtime_unix_secs: Some(entry.modified_unix_ms / 1000),
+                };
+                match self.vfs.upsert_file(&path, spec) {
+                    Ok(ino) => {
+                        next.insert(path, (entry.file_merkle_root, ino));
+                        fresh.push(ino);
+                        report.upserted += 1;
+                    }
+                    Err(e) => tracing::warn!(path, error = %e, "catalog file not listed"),
+                }
+            }
+            for path in st.files.keys() {
+                if !next.contains_key(path) {
+                    self.vfs.remove_path(path);
+                    report.removed += 1;
+                }
+            }
+            st.files = next;
+            st.loaded_version = snapshot.version;
+            drop(sources);
+            self.hydrate
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(fresh);
+            Ok(report)
+        }
+
+        /// The device vault: the snapshot the daemon's own folder sync writes in its data dir,
+        /// under the data dir's key (a local source: the daemon wrote it, so it verifies).
+        pub fn import_device_snapshot(&self) -> Option<Result<ImportReport, &'static str>> {
+            let raw = std::fs::read(self.data_dir.join(DEVICE_SNAPSHOT_FILE)).ok()?;
+            let Ok(snap) = FolderSnapshotManifest::decode_bytes(&raw) else {
+                // A file that does not decode does not verify.
+                let refused = catalog_import_decision(false, false, 0, 0);
+                if let Err(code) = refused {
+                    tracing::warn!(code, "device catalog does not decode");
+                }
+                return Some(refused.map(|_| ImportReport::default()));
+            };
+            // The snapshot's signed manifest envelope proves whose key wrote it: it must be
+            // signed by this data dir's owner and open under its key. An empty snapshot has
+            // none and lists nothing.
+            let (verifies, key_matches) = match &snap.signed_dht_envelope {
+                Some(env) => (
+                    env.verify_zero_knowledge(),
+                    self.engine.owns_signed_manifest(env),
+                ),
+                None => (snap.files.is_empty(), snap.files.is_empty()),
+            };
+            Some(self.import_snapshot(DEVICE_FOLDER, verifies, key_matches, &snap))
+        }
+
+        /// One import of every source this data dir holds keys for.
+        pub fn import_all(&self) {
+            if let Some(Ok(r)) = self.import_device_snapshot() {
+                if r.upserted + r.removed > 0 {
+                    tracing::info!(
+                        upserted = r.upserted,
+                        removed = r.removed,
+                        "catalog imported"
+                    );
+                }
+            }
+        }
+
+        /// One scavenger pass over the queued files: each block not cached is read as the
+        /// scavenger (S4) by `SLOTS` workers, so its fetches fill what the scheduler lets it
+        /// hold (S2) and a foreground read is granted ahead of a queued one
+        /// (`defer.scavenger_preempted`). Workers pause while a foreground read is queued and
+        /// stay within the hourly cap and the cache share. Returns the bytes hydrated.
+        pub fn hydrate_pass(&self, hour: &Mutex<HourBudget>) -> u64 {
+            let bs = self.vfs.block_size() as u64;
+            let cache_cap = self.vfs.cache_stats().capacity_bytes;
+            let share_cap = cache_cap / 100 * SCAVENGER_CACHE_SHARE_PCT;
+            let pass_bytes = AtomicU64::new(0);
+            loop {
+                let next = self
+                    .hydrate
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pop_front();
+                let Some(ino) = next else {
+                    return pass_bytes.into_inner();
+                };
+                let Some(node) = self.vfs.getattr(ino) else {
+                    continue;
+                };
+                tracing::info!(ino, bytes = node.size_bytes, "scavenger: hydrating");
+                let blocks = node.size_bytes.div_ceil(bs.max(1));
+                let next_blk = AtomicU64::new(0);
+                let stop = AtomicBool::new(false);
+                std::thread::scope(|sc| {
+                    for _ in 0..fetch_sched::SLOTS {
+                        sc.spawn(|| loop {
+                            let blk = next_blk.fetch_add(1, Ordering::Relaxed);
+                            if blk >= blocks || stop.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            if self.vfs.getattr(ino).is_none() {
+                                stop.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                            if self.vfs.block_cached(ino, blk) {
+                                continue;
+                            }
+                            let len = node.size_bytes.saturating_sub(blk * bs).min(bs);
+                            // Capped by cache size: the scavenger fills at most its share of
+                            // the cache, so it never evicts what readers fetched.
+                            let used = self.vfs.cache_stats().used_bytes;
+                            if used.saturating_add(len) > share_cap {
+                                stop.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                            pass_bytes.fetch_add(len, Ordering::Relaxed);
+                            hour.lock().unwrap_or_else(|e| e.into_inner()).wait_for(len);
+                            while fetch_sched::global().queued().0 > 0 {
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
+                            let flag = Arc::new(AtomicBool::new(false));
+                            let res = fetch_sched::run_as_scavenger(flag, || {
+                                self.vfs.read_at(ino, blk * bs, len)
+                            });
+                            match res {
+                                Ok(_) => {
+                                    self.hydrated_bytes.fetch_add(len, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    tracing::debug!(ino, blk, error = %e, "scavenger skipped a file");
+                                    stop.store(true, Ordering::Relaxed);
+                                    return;
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+        }
+
+        /// Starts the import timer and the scavenger threads; sets the VFS re-import hook (T2).
+        pub fn start(self: &Arc<Self>, interval: Duration) -> std::io::Result<()> {
+            self.import_all();
+            let weak: Weak<Self> = Arc::downgrade(self);
+            self.vfs.set_reimport_hook(Some(Arc::new(move || {
+                if let Some(me) = weak.upgrade() {
+                    me.import_all();
+                }
+            })));
+            let me = Arc::clone(self);
+            std::thread::Builder::new()
+                .name("pv-catalog".into())
+                .spawn(move || {
+                    let mut last = fetch_sched::counters();
+                    loop {
+                        std::thread::sleep(interval);
+                        me.import_all();
+                        // S7: the counters in the log too (live status reads `counters()`).
+                        let c = fetch_sched::counters();
+                        if c != last {
+                            tracing::info!(
+                                preempted = c.scavenger_preempted,
+                                cache_misses = c.cache_misses,
+                                fetches = c.network_fetches,
+                                hydrated = me.hydrated_bytes(),
+                                "fetch_sched counters"
+                            );
+                            last = c;
+                        }
+                    }
+                })?;
+            let me = Arc::clone(self);
+            std::thread::Builder::new()
+                .name("pv-scavenger".into())
+                .spawn(move || {
+                    let hour = Mutex::new(HourBudget::new(SCAVENGER_BYTES_PER_HOUR));
+                    loop {
+                        if me.hydrate_pass(&hour) == 0 {
+                            std::thread::sleep(Duration::from_millis(200));
+                        }
+                    }
+                })?;
+            Ok(())
+        }
+    }
+
+    /// The scavenger's hourly byte cap.
+    pub struct HourBudget {
+        cap: u64,
+        window: Instant,
+        used: u64,
+    }
+
+    impl HourBudget {
+        pub fn new(cap: u64) -> Self {
+            Self {
+                cap,
+                window: Instant::now(),
+                used: 0,
+            }
+        }
+
+        /// Blocks until `len` more bytes fit in the current hour, then counts them.
+        pub fn wait_for(&mut self, len: u64) {
+            loop {
+                if self.window.elapsed() >= Duration::from_secs(3600) {
+                    self.window = Instant::now();
+                    self.used = 0;
+                }
+                if self.used.saturating_add(len) <= self.cap {
+                    self.used += len;
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+}
 
 #[cfg(all(test, unix))]
 mod upsert_api_tests {

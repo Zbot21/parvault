@@ -55,7 +55,8 @@ pub enum SlotDecision {
 /// scavengers in flight and how many foreground grants have passed the oldest queued scavenger.
 /// - no slot free: wait;
 /// - aging (S3): a scavenger queued and passed over `AGING_N` times starts if it may hold a slot;
-/// - otherwise a queued foreground is granted whenever a slot is free;
+/// - otherwise a queued foreground is granted whenever a slot is free; with a scavenger queued
+///   that grant defers it (`defer.scavenger_preempted`, the second value);
 /// - a scavenger starts only with no foreground queued and fewer than `SLOTS - 1` in flight.
 pub const fn fetch_slot_decision(
     fg_queued: u8,
@@ -63,21 +64,27 @@ pub const fn fetch_slot_decision(
     slots_free: u8,
     bg_in_flight: u8,
     bg_skipped: u8,
-) -> SlotDecision {
+) -> (SlotDecision, Option<&'static str>) {
     if slots_free == 0 {
-        return SlotDecision::Wait;
+        return (SlotDecision::Wait, None);
     }
     let bg_may_hold = bg_in_flight < SLOTS - 1;
     if bg_queued > 0 && bg_may_hold && bg_skipped >= AGING_N {
-        return SlotDecision::GrantScavenger;
+        return (SlotDecision::GrantScavenger, None);
     }
     if fg_queued > 0 {
-        return SlotDecision::GrantForeground;
+        if bg_queued > 0 {
+            return (
+                SlotDecision::GrantForeground,
+                Some("defer.scavenger_preempted"),
+            );
+        }
+        return (SlotDecision::GrantForeground, None);
     }
     if bg_queued > 0 && bg_may_hold {
-        return SlotDecision::GrantScavenger;
+        return (SlotDecision::GrantScavenger, None);
     }
-    SlotDecision::Wait
+    (SlotDecision::Wait, None)
 }
 
 /// The scheduler's state (the transition the Kani harnesses check).
@@ -97,7 +104,7 @@ impl SchedState {
 
     /// Applies one decision; returns it with the new state.
     pub const fn step(self) -> (SlotDecision, Self) {
-        let d = fetch_slot_decision(
+        let (d, _) = fetch_slot_decision(
             self.fg_queued,
             self.bg_queued,
             self.slots_free(),
@@ -330,7 +337,6 @@ impl FetchScheduler {
             FetchClass::Scavenger => g.bg.push_back(w),
         }
         self.cv.notify_all();
-        let mut counted_defer = false;
         loop {
             g.apply_promotions();
             let granted = if self.no_priority {
@@ -344,16 +350,20 @@ impl FetchScheduler {
                 self.cv.notify_all();
                 return SlotPermit { sched: self, class };
             }
-            if !counted_defer && !g.fg.is_empty() && g.bg.iter().any(|w| w.id == id) {
-                counted_defer = true;
-                SCAVENGER_PREEMPTED.fetch_add(1, Ordering::Relaxed);
-            }
             g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
 
     fn grant_priority(g: &mut Inner, id: u64) -> Option<FetchClass> {
-        let (d, next) = g.state().step();
+        let st = g.state();
+        let (_, defer) = fetch_slot_decision(
+            st.fg_queued,
+            st.bg_queued,
+            st.slots_free(),
+            st.bg_in_flight,
+            st.bg_skipped,
+        );
+        let (d, next) = st.step();
         let (queue_head, class) = match d {
             SlotDecision::GrantForeground => (g.fg.front().map(|w| w.id), FetchClass::Foreground),
             SlotDecision::GrantScavenger => (g.bg.front().map(|w| w.id), FetchClass::Scavenger),
@@ -373,6 +383,16 @@ impl FetchScheduler {
         g.fg_in_flight = next.fg_in_flight;
         g.bg_in_flight = next.bg_in_flight;
         g.bg_skipped = next.bg_skipped;
+        if let Some(code) = defer {
+            let n = SCAVENGER_PREEMPTED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n.is_multiple_of(256) {
+                tracing::info!(
+                    code,
+                    count = n,
+                    "fetch_sched: a scavenger fetch was deferred"
+                );
+            }
+        }
         Some(class)
     }
 
@@ -408,25 +428,28 @@ mod tests {
 
     #[test]
     fn decision_table() {
-        assert_eq!(fetch_slot_decision(1, 1, 0, 0, 0), SlotDecision::Wait);
+        assert_eq!(fetch_slot_decision(1, 1, 0, 0, 0).0, SlotDecision::Wait);
+        let (d, defer) = fetch_slot_decision(1, 1, 1, 0, 0);
+        assert_eq!(d, SlotDecision::GrantForeground);
+        assert!(defer.is_some(), "a queued scavenger is deferred");
         assert_eq!(
-            fetch_slot_decision(1, 1, 1, 0, 0),
-            SlotDecision::GrantForeground
+            fetch_slot_decision(1, 0, 1, 0, 0),
+            (SlotDecision::GrantForeground, None)
         );
         assert_eq!(
-            fetch_slot_decision(0, 1, 1, 0, 0),
+            fetch_slot_decision(0, 1, 1, 0, 0).0,
             SlotDecision::GrantScavenger
         );
         assert_eq!(
-            fetch_slot_decision(0, 1, 1, SLOTS - 1, 0),
+            fetch_slot_decision(0, 1, 1, SLOTS - 1, 0).0,
             SlotDecision::Wait
         );
         assert_eq!(
-            fetch_slot_decision(1, 1, 1, 0, AGING_N),
+            fetch_slot_decision(1, 1, 1, 0, AGING_N).0,
             SlotDecision::GrantScavenger
         );
         assert_eq!(
-            fetch_slot_decision(1, 1, 1, SLOTS - 1, AGING_N),
+            fetch_slot_decision(1, 1, 1, SLOTS - 1, AGING_N).0,
             SlotDecision::GrantForeground
         );
     }

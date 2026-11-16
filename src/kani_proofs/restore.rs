@@ -35,9 +35,9 @@ fn l72_scavenger_never_exceeds_s_minus_1() {
         SlotDecision::GrantScavenger => assert!(s.bg_queued > 0),
         SlotDecision::Wait => {}
     }
-    kani::cover!(d == SlotDecision::GrantForeground);
-    kani::cover!(d == SlotDecision::GrantScavenger);
-    kani::cover!(d == SlotDecision::Wait);
+    kani::cover!(d == SlotDecision::GrantForeground, "foreground granted");
+    kani::cover!(d == SlotDecision::GrantScavenger, "scavenger granted");
+    kani::cover!(d == SlotDecision::Wait, "nothing granted");
 }
 
 /// S3: a foreground is granted whenever one is queued with a slot free, except the aging step.
@@ -50,7 +50,9 @@ fn l72_foreground_granted_when_queued_and_slot_free() {
         kani::any(),
         kani::any(),
     );
-    let d = fetch_slot_decision(fg, bg, free, bgf, skip);
+    let (d, defer) = fetch_slot_decision(fg, bg, free, bgf, skip);
+    // The defer code marks exactly the foreground grants that pass a queued scavenger.
+    assert!(defer.is_some() == (d == SlotDecision::GrantForeground && bg > 0));
     let aging = bg > 0 && bgf < SLOTS - 1 && skip >= AGING_N;
     if fg > 0 && free > 0 && !aging {
         assert!(d == SlotDecision::GrantForeground);
@@ -61,7 +63,11 @@ fn l72_foreground_granted_when_queued_and_slot_free() {
     if fg > 0 && d == SlotDecision::GrantScavenger {
         assert!(aging);
     }
-    kani::cover!(aging && fg > 0 && free > 0 && d == SlotDecision::GrantScavenger);
+    kani::cover!(
+        aging && fg > 0 && free > 0 && d == SlotDecision::GrantScavenger,
+        "aging step starts a scavenger"
+    );
+    kani::cover!(defer.is_some(), "scavenger deferred for a foreground read");
 }
 
 /// S3: a queued scavenger that may hold a slot starts within `AGING_N + 1` grants, whatever
@@ -100,6 +106,33 @@ fn l72_queued_scavenger_starts_within_n_plus_1_grants() {
         }
     }
     assert!(started);
-    kani::cover!(grants == AGING_N + 1);
-    kani::cover!(grants == 1);
+    kani::cover!(grants == AGING_N + 1, "scavenger aged in at grant N+1");
+    kani::cover!(grants == 1, "scavenger started at once");
+}
+
+use crate::vfs::{catalog_import_decision, CatalogImport};
+
+/// B20-LIST: a catalog is applied only if it verifies, names this data dir's key and is newer
+/// than the loaded one; the same version is a no-op and an older one a rollback.
+#[kani::proof]
+fn b20_catalog_import_decision() {
+    let verifies: bool = kani::any();
+    let key_matches: bool = kani::any();
+    let env_v: u8 = kani::any();
+    let loaded_v: u8 = kani::any();
+    let r = catalog_import_decision(verifies, key_matches, env_v as u64, loaded_v as u64);
+    if r == Ok(CatalogImport::Apply) {
+        assert!(verifies && key_matches && env_v > loaded_v);
+    }
+    if !verifies || !key_matches {
+        assert!(r.is_err());
+    } else if env_v < loaded_v {
+        assert!(r.is_err());
+    } else if env_v == loaded_v {
+        assert!(r == Ok(CatalogImport::Unchanged));
+    }
+    kani::cover!(r.is_err() && !verifies, "foreign catalog refused");
+    kani::cover!(r.is_err() && verifies && key_matches, "rollback refused");
+    kani::cover!(r == Ok(CatalogImport::Apply), "newer catalog applied");
+    kani::cover!(r == Ok(CatalogImport::Unchanged), "same version unchanged");
 }
