@@ -9,14 +9,14 @@ exec python3 -I - "$ROOT" <<'PY'
 import os, re, sys
 root = sys.argv[1]
 rows = [l.split() for l in open(os.path.join(root, ".enforcement.map")) if l.startswith(("claim", "kani"))]
-targets = set()
+targets, harnesses = set(), set()
 for r in rows:
     for f in r[1:]:
         if f.startswith("sym="):
             path, fn = f[4:].split("::", 1)
             targets.add((path, fn))
         elif f.startswith("harness="):
-            targets.add(("src/kani_proofs.rs", f[8:]))
+            harnesses.add(f[8:])
 FEAT = re.compile(r"cfg!?\s*\(\s*(all|any|not)?\s*\(?\s*feature|cfg_attr\s*\(\s*feature")
 
 def block(src, start):
@@ -31,6 +31,20 @@ def block(src, start):
     raise ValueError("unbalanced braces")
 
 fails, checked = [], 0
+# v0.5.6 T0 (arch056c 5.2): the harnesses live in src/kani_proofs/*.rs (mod.rs plus one file per
+# track). Each `harness=` resolves to exactly one `fn` across those files; a duplicate fails.
+KDIR = "src/kani_proofs"
+kfiles = sorted(os.path.join(KDIR, n) for n in os.listdir(os.path.join(root, KDIR)) if n.endswith(".rs"))
+for h in sorted(harnesses):
+    name = h.rsplit("::", 1)[-1]
+    defs = [kf for kf in kfiles
+            if re.search(r"\bfn\s+" + re.escape(name) + r"\s*[<(]", open(os.path.join(root, kf)).read())]
+    if not defs:
+        fails.append(f"{KDIR}/*.rs::{name}: harness not found (stale map row)")
+    elif len(defs) > 1 or len(re.findall(r"\bfn\s+" + re.escape(name) + r"\s*[<(]", open(os.path.join(root, defs[0])).read())) > 1:
+        fails.append(f"{KDIR}/*.rs::{name}: harness defined more than once ({', '.join(defs)})")
+    else:
+        targets.add((defs[0], name))
 for path, fn in sorted(targets):
     full = os.path.join(root, path)
     if not os.path.exists(full):

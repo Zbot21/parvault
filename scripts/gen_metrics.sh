@@ -105,7 +105,9 @@ mapfile -t adrs < <(find docs/adr -maxdepth 1 -type f -name 'ADR-[0-9]*.md' -pri
 [[ ${#test_rs[@]} -gt 0 ]] || fail "no tests/*.rs"
 
 kani_total="$(count "$kani_re" "${src_rs[@]}")";                positive kani_harnesses "$kani_total"
-kani_module="$(count "$kani_re" src/kani_proofs.rs)";            positive kani_harnesses_module "$kani_module"
+# v0.5.6 T0 (arch056c 5.3): the module is a directory, mod.rs plus one file per track.
+mapfile -t kani_mod_rs < <(rs_under src/kani_proofs)
+kani_module="$(count "$kani_re" "${kani_mod_rs[@]}")";           positive kani_harnesses_module "$kani_module"
 kani_caps="$(count "$kani_re" src/capabilities.rs)";             positive kani_harnesses.capabilities "$kani_caps"
 kani_aes="$(count "$kani_re" src/crypto/aes.rs)";                positive kani_harnesses.aes "$kani_aes"
 kani_rs="$(count "$kani_re" src/sharding/reed_solomon.rs)";      positive kani_harnesses.reed_solomon "$kani_rs"

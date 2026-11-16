@@ -13,6 +13,17 @@
 //!    Reed-Solomon shard/memory bounds under `HardwareProfile::RouterSoc` (`< 32 MiB` ceiling)
 //!    and `HardwareProfile::Desktop`.
 
+// v0.5.6 T0 (plan Section 2.1 item 1): one harness file per track, so tracks never edit this
+// file (frozen after T0). The harnesses that existed before v0.5.6 stay here (arch056c 5.4).
+// A file under src/kani_proofs/ without a `mod` line below is never compiled, so its harnesses
+// would be skipped silently: scripts/check_kani_count.sh fails on that (arch056c 5.1).
+mod edge; // track A
+mod gc_host; // track B1
+mod gc_owner; // track B2
+mod liveness; // track D
+mod restore; // track C
+mod setup; // track E
+
 use crate::admin_rpc::{
     validate_admin_rpc_frame_header, validate_admin_rpc_slice_replay_and_auth_meta,
     MAX_ADMIN_RPC_CLOCK_SKEW_MS, MAX_ADMIN_RPC_FRAME_BYTES, MAX_ADMIN_RPC_INITIAL_ALLOC_BYTES,

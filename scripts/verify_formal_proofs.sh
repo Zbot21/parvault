@@ -15,7 +15,11 @@ if ! command -v cargo-kani >/dev/null 2>&1; then
   echo "ERROR: cargo-kani not found. Install via: cargo install --locked kani-verifier && cargo kani setup" >&2
   exit 1
 fi
-cargo kani
+KANI_LOG="$(mktemp)"
+trap 'rm -f "$KANI_LOG"' EXIT
+cargo kani 2>&1 | tee "$KANI_LOG"
+# v0.5.6 T0 (arch056c 5.1): Kani collected every #[kani::proof] under src/.
+bash scripts/check_kani_count.sh --log "$KANI_LOG"
 
 echo ""
 echo "================================================================================"
