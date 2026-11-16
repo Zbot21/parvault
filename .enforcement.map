@@ -549,3 +549,5 @@ suite      S-D10-OUT-OF-RULE test=trust_enforcement_setup::d10_out_of_rule_vault
 suite      S-D12-SLOW-STEP5 test=trust_enforcement_gc_owner::d12_orders_after_a_slow_step5_are_fresh needs=cmd:sh   # D12: orders after 31 s of steps 1-5 carry the wall time at send; none is free_stale
 suite      S-D12-STALL-BOUND test=trust_enforcement_gc_owner::d12_stall_inside_free_shards_is_bounded_and_carried needs=cmd:sh   # D12: a host that accepts an order and never answers costs at most its budget; deferred frees go next pass
 suite      S-D16-BACKUP-WARN test=trust_enforcement_restore::d16_backup_names_each_skipped_floor needs=cmd:sh   # D16: ring backup names each skipped floor and why (warn.ring_backup_floor_skipped)
+suite      S-D8-ALT-CAP test=trust_enforcement_gc_owner::d8_alias_alternatives_capped needs=cmd:sh   # D8: one failed alias request tries at most MAX_ALIAS_ALTERNATIVES (4) other addresses
+suite      S-D8-DEAD-SKIP test=trust_enforcement_gc_owner::d8_dead_alternative_skipped needs=cmd:sh   # D8: a dead-marked alternative is not dialed again

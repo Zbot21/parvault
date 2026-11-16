@@ -610,9 +610,11 @@ fn c19_place_stripe_has_only_owner_store_callers() {
     }
     callers.sort();
     callers.dedup();
+    // B-182 moved the owner stores into their `_with` variants (the manifest publish mode);
+    // `store_file_streaming` and `store_reader_streaming` only forward to them.
     assert_eq!(
         callers,
-        vec!["store_file_streaming", "store_reader_streaming"]
+        vec!["store_file_streaming_with", "store_reader_streaming_with"]
     );
     let mut others = Vec::new();
     let mut stack = vec![root.join("src")];

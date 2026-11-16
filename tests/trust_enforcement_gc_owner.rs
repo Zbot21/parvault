@@ -1537,11 +1537,104 @@ fn d8_down_given_peer_probed_once() {
     let elapsed = t0.elapsed();
     let dials = accepted.load(std::sync::atomic::Ordering::SeqCst);
     assert!(dials <= 1, "the down given peer was dialed {dials} times");
+    assert_eq!(client.given_probe_dials(), 1, "one peer-id probe in all");
     assert!(
         elapsed < timeout * 3,
         "{n} failing requests took {elapsed:?} (one probe is {timeout:?})"
     );
     gate_ran("trust_enforcement_gc_owner::d8_down_given_peer_probed_once");
+}
+
+/// `n` given addresses that accept and hang every dial, each pinned to the peer id of
+/// `/p2p/X` (`X` from `seed`), and a client that knows them; returns the client, a dead alias
+/// of `X`, and each address's accept counter.
+fn pinned_blackholes(
+    n: usize,
+    seed: u8,
+) -> (
+    parvault::network::MeshClient,
+    String,
+    Vec<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+) {
+    let x = parvault::network::node_identity_libp2p_peer_id(
+        &parvault::crypto::NodeIdentity::from_seed([seed; 32]),
+    )
+    .unwrap();
+    let (addrs, counts): (Vec<String>, Vec<_>) = (0..n).map(|_| blackhole()).unzip();
+    let client = parvault::network::MeshClient::new(
+        parvault::crypto::NodeIdentity::from_seed([seed ^ 0xFF; 32]),
+        addrs.clone(),
+        None,
+    )
+    .with_lan_discovery(false)
+    .with_timeout(Duration::from_secs(1));
+    for a in &addrs {
+        client.pin_peer_id(a, x);
+    }
+    let alias = format!("/ip4/127.0.0.1/tcp/{}/p2p/{x}", closed_port());
+    (client, alias, counts)
+}
+
+fn dials_of(counts: &[std::sync::Arc<std::sync::atomic::AtomicUsize>]) -> Vec<usize> {
+    counts
+        .iter()
+        .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+        .collect()
+}
+
+/// D8 (qa056 coverage): one failed request to a dead `/p2p/X` alias tries at most
+/// `MAX_ALIAS_ALTERNATIVES` (4) of X's other addresses, here 4 of 6, each dialed once; no
+/// peer-id probe is dialed for pinned given addresses.
+#[test]
+fn d8_alias_alternatives_capped() {
+    use parvault::network::client::MAX_ALIAS_ALTERNATIVES;
+    use parvault::network::MeshWireRequest;
+    assert_eq!(MAX_ALIAS_ALTERNATIVES, 4);
+    let (client, alias, counts) = pinned_blackholes(6, 0xC8);
+    assert_eq!(client.other_addresses_of_peer(&alias).len(), 6);
+    assert!(client
+        .send_request(&alias, MeshWireRequest::QueryNodeStatus)
+        .is_err());
+    // A dial that the hole accepts after the client gave up still counts: wait for stragglers.
+    std::thread::sleep(Duration::from_millis(500));
+    let dials = dials_of(&counts);
+    assert_eq!(
+        dials.iter().sum::<usize>(),
+        MAX_ALIAS_ALTERNATIVES,
+        "alternatives dialed: {dials:?}"
+    );
+    assert!(dials.iter().all(|&d| d <= 1), "{dials:?}");
+    assert_eq!(client.given_probe_dials(), 0);
+    gate_ran("trust_enforcement_gc_owner::d8_alias_alternatives_capped");
+}
+
+/// D8 (qa056 coverage): an alternative that failed is marked dead and left out of X's other
+/// addresses, so the next failed request to the alias does not dial it again.
+#[test]
+fn d8_dead_alternative_skipped() {
+    use parvault::network::MeshWireRequest;
+    let (client, alias, counts) = pinned_blackholes(2, 0xC9);
+    assert!(client
+        .send_request(&alias, MeshWireRequest::QueryNodeStatus)
+        .is_err());
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(dials_of(&counts), vec![1, 1]);
+    assert!(
+        client.other_addresses_of_peer(&alias).is_empty(),
+        "dead alternatives still listed: {:?}",
+        client.other_addresses_of_peer(&alias)
+    );
+    assert!(client
+        .send_request(&alias, MeshWireRequest::QueryNodeStatus)
+        .is_err());
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        dials_of(&counts),
+        vec![1, 1],
+        "a dead alternative was dialed again"
+    );
+    assert_eq!(client.given_probe_dials(), 0);
+    gate_ran("trust_enforcement_gc_owner::d8_dead_alternative_skipped");
 }
 
 /// D9: in a cold process (no pins), a plain `--peers` address and a discovered `/p2p/X` of the

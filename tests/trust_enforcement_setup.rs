@@ -1556,6 +1556,9 @@ fn d10_register_ns(d: &Path, folder: &Path, extra: &[&str], ns: &str) -> String 
             .args(["--peers", &format!("/ip4/127.0.0.1/tcp/{port}")])
             .args(["watch-folder", "--folder"])
             .arg(folder)
+            // D20: the snapshot (and its GC lock) under the test's own tempdir, never `./`.
+            .arg("--snapshot-out")
+            .arg(d.with_extension(format!("{ns}.snapshot.bin")))
             .args(["--vault-namespace", ns, "--once"]),
     );
     text(&o)
