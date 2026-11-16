@@ -296,7 +296,22 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
     // (never the phrase), so its daemon's VFS can list the vault. Idempotent.
     #[cfg(all(unix, feature = "vfs"))]
     if let Some(phrase) = effective_seed_phrase.as_deref() {
-        parvault::vfs::register_vault_keys(&cfg.data_dir, phrase, &vault_namespace)?;
+        match parvault::vfs::register_vault_keys(
+            &cfg.data_dir,
+            phrase,
+            &vault_namespace,
+            cfg.device_sealing_passphrase.as_deref(),
+        ) {
+            Ok(_) => {}
+            // D16: a namespace outside the shared rule still syncs; it is not listed.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                tracing::warn!(
+                    code = "reject.vault_namespace_unsupported",
+                    "{e}; this vault syncs but the daemon's VFS does not list it"
+                );
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
 
     let mut store_for_sync = block_store
@@ -1181,8 +1196,6 @@ pub(crate) async fn recover_from_seed(env: CliEnv, command: Commands) -> anyhow:
     Ok(())
 }
 
-/// `folder-status` (B-154, track B2): the retained versions and stored bytes of a folder.
-/// T0b stub: refused until track B2 builds it.
 /// `parvault folder-status` (B-154 C30, L-122): one folder's versions, policy, frees and
 /// accounting from its version store, journal and stats file. No network.
 pub(crate) async fn folder_status(env: CliEnv, command: Commands) -> anyhow::Result<()> {

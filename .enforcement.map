@@ -516,3 +516,10 @@ artifact   A-TLS-DOCKER script=scripts/docker_stage_webdav_tls.sh bin=parvault s
 claim      CATALOG-RESUME sym=src/sync/catalog_resume.rs::catalog_resume_decision accept=trust_enforcement_setup::b169_restored_owner_publishes_above_and_frees_nothing reject=trust_enforcement_setup::g23_unreachable_ring_refuses_to_publish code=reject.catalog_resume_unreachable bin=parvault ref=docs/security/TRUST_FINDINGS.md   # G-23, B-169 K11: a node with no snapshot resumes the vault from the ring's own catalog, never a foreign one; an unreachable ring refuses
 suite      S-G23-FRESH test=trust_enforcement_setup::g23_fresh_node_from_phrase_resumes needs=cmd:sh   # G-23: a fresh node from the phrase alone resumes too
 suite      S-G23-FOREIGN test=trust_enforcement_setup::g23_foreign_catalog_not_adopted needs=cmd:sh   # G-23: a squatted catalog at this vault's key is never adopted
+
+# --- v0.5.6 QA fixes, vaultfix056 (qa056 D10, D13, D16) -------------------------------------------
+suite      S-D10-SEAL test=trust_enforcement_setup::d10_vaultkey_sealed_by_config_passphrase needs=cmd:sh   # D10: .vaultkey and master key sealed under the config's passphrase; ring backup and restore work
+suite      S-D10-MIGRATE test=trust_enforcement_setup::d10_legacy_vaultkey_resealed_on_next_write needs=cmd:sh   # D10: a seed-sealed .vaultkey is resealed by the next registration
+suite      S-D10-LEGACY-READ test=trust_enforcement_restore::d10_daemon_reads_legacy_sealed_vaultkey needs=cmd:sh   # D10: the daemon still reads a seed-sealed .vaultkey (warn.vaultkey_legacy_seal)
+suite      S-D13-LIVE test=trust_enforcement_restore::d13_running_daemon_lists_other_process_catalog needs=cmd:sh   # D13: a running daemon lists a catalog another process wrote, no restart
+suite      S-D16-FLOOR test=trust_enforcement_restore::d16_floor_of_any_registered_namespace_survives_backup needs=cmd:sh   # D16: one namespace rule; every registered floor survives backup, others refused (reject.vault_namespace_unsupported)

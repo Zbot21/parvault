@@ -1026,7 +1026,7 @@ fn b20_seed_vault_listed_and_read() {
     std::fs::write(folder.join("a.bin"), &body).unwrap();
     std::fs::write(folder.join("b.txt"), b"seed vault b").unwrap();
     Writer::new(&dir, SEED_A).pass(&folder);
-    let kf = parvault::vfs::register_vault_keys(&dir, SEED_A, NS).unwrap();
+    let kf = parvault::vfs::register_vault_keys(&dir, SEED_A, NS, None).unwrap();
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&kf).unwrap().permissions().mode() & 0o777;
@@ -1077,7 +1077,7 @@ fn b20_swapped_vaultkey_refused() {
     std::fs::create_dir_all(&folder).unwrap();
     std::fs::write(folder.join("a.txt"), b"renamed key").unwrap();
     Writer::new(&dir, SEED_A).pass(&folder);
-    let kf = parvault::vfs::register_vault_keys(&dir, SEED_A, NS).unwrap();
+    let kf = parvault::vfs::register_vault_keys(&dir, SEED_A, NS, None).unwrap();
     std::fs::rename(&kf, kf.with_file_name("music.vaultkey")).unwrap();
     let d = up(&dir, None, &[]);
     d.assert_logged("reject.vaultkey_mismatch");
@@ -1104,7 +1104,7 @@ fn b20_seed_vault_foreign_catalog_refused() {
     std::fs::write(folder.join("a.txt"), b"not your vault").unwrap();
     let env_b = Writer::new(&other, SEED_B).pass(&folder);
     assert!(env_b.verify_zero_knowledge());
-    parvault::vfs::register_vault_keys(&dir, SEED_A, NS).unwrap();
+    parvault::vfs::register_vault_keys(&dir, SEED_A, NS, None).unwrap();
     let mk_a = parvault::crypto::MasterKey::from_recovery_seed_phrase(
         &parvault::crypto::validate_recovery_seed_phrase_or_passphrase(SEED_A).unwrap(),
         NS,
@@ -1135,7 +1135,7 @@ fn b20_seed_vault_rollback_refused() {
     let env2 = w.pass(&folder);
     assert!(env2.monotonic_version > env1.monotonic_version);
     drop(w);
-    parvault::vfs::register_vault_keys(&dir, SEED_A, NS).unwrap();
+    parvault::vfs::register_vault_keys(&dir, SEED_A, NS, None).unwrap();
     let d = up(&dir, None, &[]);
     wait_get(&d, "/photos/a.txt", "v2", |st, b| {
         st == 200 && b == b"vault v2"
@@ -1243,7 +1243,7 @@ fn d13_running_daemon_lists_other_process_catalog() {
     std::fs::write(folder.join("a.txt"), b"live v1").unwrap();
     let mut w = Writer::new(&dir, SEED_A);
     w.pass(&folder);
-    parvault::vfs::register_vault_keys(&dir, SEED_A, NS).unwrap();
+    parvault::vfs::register_vault_keys(&dir, SEED_A, NS, None).unwrap();
     let d = up(&dir, None, &[]);
     wait_get(&d, "/photos/a.txt", "v1 listed", |st, b| {
         st == 200 && b == b"live v1"
@@ -1261,8 +1261,10 @@ fn d13_running_daemon_lists_other_process_catalog() {
 }
 
 /// D16 (VAULT-FLOOR-BACKUP): a ring backup carries the version floor of every namespace a vault
-/// can be registered under (here one with a space, plus a leading '.', non-ASCII and a 200-byte
-/// name), so after a restore a rolled-back catalog is still refused.
+/// can be registered under (here one with a space, plus a leading '.' and a 128-byte name, the
+/// shared rule's edges), so after a restore a rolled-back catalog is still refused; a namespace
+/// outside the rule (non-ASCII, 129 bytes, a control character) is refused at registration
+/// (`reject.vault_namespace_unsupported`), so no floor can exist that a backup drops.
 #[cfg(unix)]
 #[test]
 fn d16_floor_of_any_registered_namespace_survives_backup() {
@@ -1279,7 +1281,7 @@ fn d16_floor_of_any_registered_namespace_survives_backup() {
     std::fs::write(folder.join("a.txt"), b"odd v2").unwrap();
     let env2 = w.pass(&folder);
     drop(w);
-    parvault::vfs::register_vault_keys(&a, SEED_A, ODD).unwrap();
+    parvault::vfs::register_vault_keys(&a, SEED_A, ODD, None).unwrap();
     let floor = a.join("vaults").join(format!("{ODD}.floor"));
     let d = up(&a, None, &[]);
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -1292,8 +1294,20 @@ fn d16_floor_of_any_registered_namespace_survives_backup() {
         std::thread::sleep(Duration::from_millis(200));
     }
     d.stop();
-    let long = "n".repeat(200);
-    let others = [".hidden", "fotos-\u{fc}", long.as_str()];
+    for bad in [
+        "fotos-\u{fc}".to_string(),
+        "n".repeat(129),
+        "tab\there".to_string(),
+    ] {
+        let e = parvault::vfs::register_vault_keys(&a, SEED_A, &bad, None).unwrap_err();
+        assert!(
+            e.to_string().contains("reject.vault_namespace_unsupported"),
+            "{bad:?}: {e}"
+        );
+        assert!(!a.join("vaults").join(format!("{bad}.vaultkey")).exists());
+    }
+    let long = "n".repeat(128);
+    let others = [".hidden", long.as_str()];
     for ns in others {
         std::fs::write(
             a.join("vaults").join(format!("{ns}.floor")),
@@ -1313,11 +1327,52 @@ fn d16_floor_of_any_registered_namespace_survives_backup() {
         );
     }
     let b = data_dir(root.path(), "b");
-    parvault::vfs::register_vault_keys(&b, SEED_A, ODD).unwrap();
+    parvault::vfs::register_vault_keys(&b, SEED_A, ODD, None).unwrap();
     let key = env1.dht_key;
     plant(&b, key, env1);
     let d = up(&b, None, &[]);
     d.assert_logged("reject.catalog_rollback");
     d.stop();
     gate_ran("trust_enforcement_restore::d16_floor_of_any_registered_namespace_survives_backup");
+}
+
+/// D10 migration, reader side: a daemon whose `config.toml` sets `device_sealing_passphrase`
+/// still lists a vault whose key file an older build sealed by `enclave_sealing.seed`
+/// (`warn.vaultkey_legacy_seal`); once the writer re-registers under the passphrase, it lists
+/// it without the warning.
+#[cfg(unix)]
+#[test]
+fn d10_daemon_reads_legacy_sealed_vaultkey() {
+    use b20::*;
+    use seedvault::*;
+    const PASS: &str = "d10 daemon config passphrase";
+    let root = tempfile::tempdir().unwrap();
+    let dir = data_dir(root.path(), "data");
+    std::fs::write(
+        dir.join("config.toml"),
+        format!("device_sealing_passphrase = \"{PASS}\"\n"),
+    )
+    .unwrap();
+    let folder = root.path().join("src");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.txt"), b"legacy sealed").unwrap();
+    Writer::new(&dir, SEED_A).pass(&folder);
+    parvault::vfs::register_vault_keys(&dir, SEED_A, NS, None).unwrap();
+    let d = up(&dir, None, &[]);
+    wait_get(
+        &d,
+        "/photos/a.txt",
+        "legacy-sealed vault listed",
+        |st, b| st == 200 && b == b"legacy sealed",
+    );
+    d.assert_logged("warn.vaultkey_legacy_seal");
+    d.stop();
+    parvault::vfs::register_vault_keys(&dir, SEED_A, NS, Some(PASS)).unwrap();
+    let d = up(&dir, None, &[]);
+    wait_get(&d, "/photos/a.txt", "resealed vault listed", |st, b| {
+        st == 200 && b == b"legacy sealed"
+    });
+    assert!(!d.log_text().contains("warn.vaultkey_legacy_seal"));
+    d.stop();
+    gate_ran("trust_enforcement_restore::d10_daemon_reads_legacy_sealed_vaultkey");
 }
