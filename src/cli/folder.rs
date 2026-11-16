@@ -346,6 +346,12 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
         effective_tier,
     );
 
+    // D22: the catalog is held to the active profile's per-owner envelope share.
+    engine.set_catalog_owner_share(
+        parvault::storage::block_store::DhtStoreLimits::for_profile(cfg.hardware_profile)
+            .with_env_overrides()
+            .max_owner_bytes,
+    );
     let mut prev_syndicated = false;
     let mut prev_version = None;
     if snapshot_out.exists() {
@@ -792,13 +798,44 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                 None
             };
             let lags = published.is_none_or(|v| v < snapshot.version);
-            if !pass.no_change || lags || !cat_path.exists() {
-                let (envelope, acked) = engine.publish_vault_catalog(
-                    phrase,
-                    &vault_namespace,
-                    &snapshot,
-                    gc_client.as_ref(),
-                )?;
+            // D21: a catalog of this very version already sealed (the catalog file, or this
+            // node's store) is never sealed again: the store and every host would refuse it
+            // as a rollback. With GC on and no host acknowledgement yet, that same envelope is
+            // put on the ring again; otherwise (and always under `--no-gc`) it counts as
+            // published.
+            let held = std::fs::read(&cat_path)
+                .ok()
+                .and_then(|raw| {
+                    bincode::deserialize::<parvault::sync::EncryptedVaultCatalogEnvelope>(&raw).ok()
+                })
+                .or_else(|| {
+                    engine
+                        .store()
+                        .get_dht_vault_catalog_envelope(&catalog_dht_key)
+                })
+                .filter(|e| {
+                    e.dht_key == catalog_dht_key
+                        && e.monotonic_version == snapshot.version
+                        && e.verify_zero_knowledge()
+                });
+            let put = match held {
+                Some(envelope) => {
+                    let acked = gc_on
+                        && lags
+                        && engine.put_vault_catalog(&envelope, gc_client.as_ref(), false);
+                    Some((envelope, acked))
+                }
+                None if !pass.no_change || lags || !cat_path.exists() => {
+                    Some(engine.publish_vault_catalog(
+                        phrase,
+                        &vault_namespace,
+                        &snapshot,
+                        gc_client.as_ref(),
+                    )?)
+                }
+                None => None,
+            };
+            if let Some((envelope, acked)) = put {
                 if acked && gc_on {
                     parvault::sync::gc_journal::record_published_catalog(
                         &snapshot_out,
@@ -841,6 +878,30 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
             );
         }
 
+        if !gc_on {
+            // D24: the refusal totals are kept under `--no-gc` too (the GC fields stay empty).
+            let hosts = gc_client
+                .as_ref()
+                .map(|c| c.all_network_endpoints().len() as u64)
+                .unwrap_or(0);
+            let mut stats = parvault::sync::gc_journal::folder_stats(
+                &snapshot,
+                &policy,
+                &parvault::sync::gc_journal::GcReport::default(),
+                hosts,
+            );
+            carry_refusals(
+                &mut stats,
+                &cfg.data_dir,
+                &snapshot_out,
+                envelope_refusals_pass,
+            );
+            if let Err(e) =
+                parvault::sync::gc_journal::write_stats(&cfg.data_dir, &snapshot_out, &stats)
+            {
+                tracing::warn!(error = %e, "folder stats not written");
+            }
+        }
         if gc_on {
             match engine.gc_after_pass(&snapshot, &cfg.data_dir) {
                 Ok(report) => {
@@ -851,24 +912,12 @@ pub(crate) async fn watch_folder(env: CliEnv, command: Commands) -> anyhow::Resu
                     let mut stats = parvault::sync::gc_journal::folder_stats(
                         &snapshot, &policy, &report, hosts,
                     );
-                    // B182-7: the refusal total carries over from the last stats file.
-                    let prev = std::fs::read(parvault::sync::gc_journal::stats_path(
+                    carry_refusals(
+                        &mut stats,
                         &cfg.data_dir,
                         &snapshot_out,
-                    ))
-                    .ok()
-                    .and_then(|raw| {
-                        serde_json::from_slice::<parvault::sync::gc_journal::FolderStats>(&raw).ok()
-                    });
-                    stats.envelope_refusals_total = prev
-                        .as_ref()
-                        .map_or(0, |p| p.envelope_refusals_total)
-                        .saturating_add(envelope_refusals_pass);
-                    stats.last_envelope_refusal = if envelope_refusals_pass > 0 {
-                        parvault::storage::block_store::last_envelope_refusal()
-                    } else {
-                        prev.and_then(|p| p.last_envelope_refusal)
-                    };
+                        envelope_refusals_pass,
+                    );
                     if let Err(e) = parvault::sync::gc_journal::write_stats(
                         &cfg.data_dir,
                         &snapshot_out,
@@ -949,6 +998,31 @@ fn changes_line(pass: &parvault::sync::PassSummary) -> String {
         pass.deleted,
         pass.uploaded_bytes as f64 / 1_000_000.0
     )
+}
+
+/// B182-7: the refusal total carries over from the last stats file of this folder, plus this
+/// pass's; the last refusal is this pass's, or the one recorded before.
+fn carry_refusals(
+    stats: &mut parvault::sync::gc_journal::FolderStats,
+    data_dir: &Path,
+    snapshot_out: &Path,
+    refusals_pass: u64,
+) {
+    let prev = std::fs::read(parvault::sync::gc_journal::stats_path(
+        data_dir,
+        snapshot_out,
+    ))
+    .ok()
+    .and_then(|raw| serde_json::from_slice::<parvault::sync::gc_journal::FolderStats>(&raw).ok());
+    stats.envelope_refusals_total = prev
+        .as_ref()
+        .map_or(0, |p| p.envelope_refusals_total)
+        .saturating_add(refusals_pass);
+    stats.last_envelope_refusal = if refusals_pass > 0 {
+        parvault::storage::block_store::last_envelope_refusal()
+    } else {
+        prev.and_then(|p| p.last_envelope_refusal)
+    };
 }
 
 /// B182-7: owner-side envelope refusals so far in this process: this node's own store's, the
@@ -1277,6 +1351,21 @@ pub(crate) async fn folder_status(env: CliEnv, command: Commands) -> anyhow::Res
     let store = parvault::sync::retention::VersionStore::for_snapshot(&snapshot);
     let versions = store.list()?;
     if versions.is_empty() {
+        // D24: a `--no-gc` folder has no version store, but its envelope refusals are kept.
+        if let Some(st) = std::fs::read(stats_path(&cfg.data_dir, &snapshot))
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<FolderStats>(&raw).ok())
+        {
+            println!("=== Folder Status (B-154) ===");
+            println!("Snapshot           : {}", snapshot.display());
+            println!("Versions Retained  : none (no version store; --no-gc keeps none)");
+            println!(
+                "Envelope Refusals  : {} (last: {})",
+                st.envelope_refusals_total,
+                st.last_envelope_refusal.as_deref().unwrap_or("none")
+            );
+            return Ok(());
+        }
         anyhow::bail!(
             "no version store for {} (back it up with watch-folder first; --no-gc keeps none)",
             snapshot.display()

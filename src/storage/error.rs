@@ -25,7 +25,7 @@ pub enum StorageError {
     Unauthorized,
     #[error("Shard integrity hash mismatch")]
     CorruptedShard,
-    #[error("Rejected DHT manifest update: invalid owner Ed25519 signature or version rollback")]
+    #[error("reject.dht_envelope_rollback: invalid owner Ed25519 signature, another owner, or a version not above the one held")]
     DhtManifestPoisonedOrRollback,
     #[error("Rejected unsafe or path-traversal restore path: {0}")]
     InvalidRestorePath(String),
