@@ -49,15 +49,14 @@ fn proof_audit_journal_apply_decision() {
     let current: u8 = kani::any();
     let journalled: u8 = kani::any();
     let (c, j) = (u64::from(current), u64::from(journalled));
-    let apply = crate::por::audit_journal::audit_journal_apply_decision(c, j);
-    kani::cover!(apply, "journal applied");
-    kani::cover!(!apply, "journal ignored");
-    let after = if apply { j } else { c };
+    let raise = crate::por::audit_journal::audit_journal_apply_decision(c, j);
+    kani::cover!(raise.is_some(), "journal applied");
+    kani::cover!(raise.is_none(), "journal ignored");
+    let after = c + raise.unwrap_or(0);
     assert!(after >= c);
     assert!(after >= j);
-    assert!(!crate::por::audit_journal::audit_journal_apply_decision(
-        after, j
-    ));
+    assert!(raise.is_none() || after == j);
+    assert!(crate::por::audit_journal::audit_journal_apply_decision(after, j).is_none());
 }
 
 /// B152-COUNT (arch152b 3.4): a new shard is refused exactly at the held-shard bound.
@@ -86,9 +85,10 @@ fn proof_held_shard_bound_clamped_and_monotone() {
     let (share, floor, ceiling) = crate::storage::quota::held_shard_profile(profile);
     let mem = u64::from(kani::any::<u32>()) << 10;
     let more = mem + (u64::from(kani::any::<u32>()) << 10);
-    let q = crate::storage::quota::held_shard_bound_from;
-    let a = q(Some(mem), true, share, floor, ceiling, None);
-    let b = q(Some(more), true, share, floor, ceiling, None);
+    let a =
+        crate::storage::quota::held_shard_bound_from(Some(mem), true, share, floor, ceiling, None);
+    let b =
+        crate::storage::quota::held_shard_bound_from(Some(more), true, share, floor, ceiling, None);
     kani::cover!(a.max == floor, "bound at the floor");
     kani::cover!(a.max == ceiling, "bound at the ceiling");
     kani::cover!(
@@ -99,5 +99,13 @@ fn proof_held_shard_bound_clamped_and_monotone() {
     assert!(b.max >= a.max);
     let o = u64::from(kani::any::<u32>());
     kani::assume(o > 0);
-    assert_eq!(q(Some(mem), true, share, floor, ceiling, Some(o)).max, o);
+    let r = crate::storage::quota::held_shard_bound_from(
+        Some(mem),
+        true,
+        share,
+        floor,
+        ceiling,
+        Some(o),
+    );
+    assert_eq!(r.max, o);
 }

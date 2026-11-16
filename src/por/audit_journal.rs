@@ -40,11 +40,15 @@ pub struct AuditJournalEntry {
     pub degraded: Option<String>,
 }
 
-/// G5: a journalled post-value is applied only when the current value is lower. A value at or
-/// above it already includes that audit (or a later one), so nothing is credited twice. Pure;
-/// a Kani target.
-pub const fn audit_journal_apply_decision(current: u64, journalled: u64) -> bool {
-    journalled > current
+/// G5: a journalled post-value is applied only when the current value is lower; returns how
+/// much it raises the value (logged), or `None`. A value at or above it already includes that
+/// audit (or a later one), so nothing is credited twice. Pure; a Kani target.
+pub const fn audit_journal_apply_decision(current: u64, journalled: u64) -> Option<u64> {
+    if journalled > current {
+        Some(journalled - current)
+    } else {
+        None
+    }
 }
 
 /// The journal bytes of `e` (tag, then bincode).
@@ -140,19 +144,19 @@ pub fn replay_journal(data_dir: &Path, st: &mut AuditorState, block_store: &Bloc
     if let Ok(mut q) = block_store.quota().lock() {
         let acct = q.peer_account(&entry.prover).cloned().unwrap_or_default();
         let passes = audit_journal_apply_decision(acct.por_passes, entry.por_passes)
-            .then_some(entry.por_passes);
+            .map(|_| entry.por_passes);
         let failures = audit_journal_apply_decision(acct.por_failures, entry.por_failures)
-            .then_some(entry.por_failures);
+            .map(|_| entry.por_failures);
         if passes.is_some() || failures.is_some() {
             q.apply_por_post_values(&entry.prover, passes, failures);
             changed = true;
         }
     }
-    if audit_journal_apply_decision(st.passed, entry.state_passed) {
+    if audit_journal_apply_decision(st.passed, entry.state_passed).is_some() {
         st.passed = entry.state_passed;
         changed = true;
     }
-    if audit_journal_apply_decision(st.failed, entry.state_failed) {
+    if audit_journal_apply_decision(st.failed, entry.state_failed).is_some() {
         st.failed = entry.state_failed;
         changed = true;
     }
@@ -190,9 +194,9 @@ mod tests {
 
     #[test]
     fn apply_decision_only_raises() {
-        assert!(audit_journal_apply_decision(3, 4));
-        assert!(!audit_journal_apply_decision(4, 4));
-        assert!(!audit_journal_apply_decision(5, 4));
+        assert_eq!(audit_journal_apply_decision(3, 4), Some(1));
+        assert_eq!(audit_journal_apply_decision(4, 4), None);
+        assert_eq!(audit_journal_apply_decision(5, 4), None);
     }
 
     /// Every crash prefix of the three writes (none, journal, journal + ledger, all) on a real
