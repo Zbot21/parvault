@@ -83,6 +83,7 @@ s13_exec "$S13_OWNER" mkdir -p "$S13_LOGS" "$S13_HOME" || s13_fail "cannot creat
 # 512 KiB rotates first.
 S13_DISK=()
 S13_BYTES=()
+S13_MAXD=()
 for pass in $(seq 1 60); do
     s13_check_deadline "T1 pass $pass"
     s13_exec "$S13_OWNER" sh -c '
@@ -103,17 +104,30 @@ for pass in $(seq 1 60); do
     done
     # 1.1 x 3 x MAXD x 20/16 x 3, plus one 64 KiB shard per stripe of padding slack per host.
     BOUND=$(( MAXD * 11 * 3 * 20 * 3 / (10 * 16) + 3 * 3 * 20 * 3 * 65536 ))
+    S13_MAXD+=("$MAXD")
     if [ "${S13_BYTES[$((pass - 1))]}" -gt "$BOUND" ]; then
         echo "$S13_OUT"
         echo "ERROR: stage 13: T1 pass $pass: hosts hold ${S13_BYTES[$((pass - 1))]} B, bound $BOUND B"
         exit 1
     fi
 done
-EARLY=0; LATE=0
-for k in $(seq 20 39); do [ "${S13_BYTES[$k]}" -gt "$EARLY" ] && EARLY="${S13_BYTES[$k]}"; done
-for k in $(seq 40 59); do [ "${S13_BYTES[$k]}" -gt "$LATE" ] && LATE="${S13_BYTES[$k]}"; done
-if [ $(( LATE * 10 )) -gt $(( EARLY * 12 )) ]; then
-    echo "ERROR: stage 13: T1 host bytes still grow (passes 41-60 max $LATE B, passes 21-40 max $EARLY B)"
+# The plateau: the live folder itself still grows through pass 60 (each log keeps .log, .log.1
+# and .log.2, steady only after about pass 63), so the windows compare host bytes per byte of the
+# largest retained folder (R, in thousandths), not raw bytes: GC that frees old versions keeps R
+# flat; a leak makes it grow.
+EARLY=0; LATE=0; R_EARLY=0; R_LATE=0
+for k in $(seq 20 59); do
+    R=$(( S13_BYTES[k] * 1000 / (S13_MAXD[k] > 0 ? S13_MAXD[k] : 1) ))
+    if [ "$k" -lt 40 ]; then
+        [ "${S13_BYTES[$k]}" -gt "$EARLY" ] && EARLY="${S13_BYTES[$k]}"
+        [ "$R" -gt "$R_EARLY" ] && R_EARLY="$R"
+    else
+        [ "${S13_BYTES[$k]}" -gt "$LATE" ] && LATE="${S13_BYTES[$k]}"
+        [ "$R" -gt "$R_LATE" ] && R_LATE="$R"
+    fi
+done
+if [ $(( R_LATE * 10 )) -gt $(( R_EARLY * 12 )) ]; then
+    echo "ERROR: stage 13: T1 host bytes per retained folder byte still grow (passes 41-60 max R $R_LATE, passes 21-40 max R $R_EARLY; raw $LATE B, $EARLY B)"
     exit 1
 fi
 grep -q "Version GC" <<<"$S13_OUT" || { echo "$S13_OUT"; echo "ERROR: stage 13: no GC line"; exit 1; }
@@ -131,7 +145,7 @@ done
 S13_LAST="$(tail -1 <<<"$S13_VERSIONS")"
 s13_exec "$S13_OWNER" sh -c 'cd "$1" && for f in *; do cmp "$f" "$2/$f" || exit 1; done' s13 "$S13_LOGS" "$S13_ROOT/r$S13_LAST" \
     || { echo "ERROR: stage 13: T1 the newest version does not restore byte-identically"; exit 1; }
-echo "T1: 60 passes; hosts ${S13_BYTES[59]} B at the end (passes 21-40 max $EARLY B, 41-60 max $LATE B)"
+echo "T1: 60 passes; hosts ${S13_BYTES[59]} B at the end (passes 21-40 max $EARLY B, 41-60 max $LATE B; host bytes per retained folder byte x1000: 21-40 max $R_EARLY, 41-60 max $R_LATE)"
 
 # T2 on the ring: an unchanged pass.
 S13_BEFORE="$(s13_host_bytes)"
