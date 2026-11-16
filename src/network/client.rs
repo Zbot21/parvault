@@ -3984,11 +3984,22 @@ mod tests {
         assert_eq!(out.len(), 4);
     }
 
-    /// D11: "not found" and a returned envelope are answers; a refusal is not.
+    /// D11: "not found" and a returned envelope are answers; a refusal is not. The not-found
+    /// text is the wire text `v0.5.5` peers send, byte for byte, so their replies still count.
     #[test]
     fn dht_refusal_is_not_an_answer() {
+        const V055_NOT_FOUND: &str = "DHT envelope not found";
+        assert_eq!(
+            DHT_ENVELOPE_NOT_FOUND_TEXT.as_bytes(),
+            V055_NOT_FOUND.as_bytes()
+        );
         assert!(dht_reply_answered(None));
         assert!(dht_reply_answered(Some(DHT_ENVELOPE_NOT_FOUND_TEXT)));
+        assert!(dht_reply_answered(Some(&V055_NOT_FOUND.to_string())));
+        assert!(!dht_reply_answered(Some(
+            crate::manifest::VARIANT_DISABLED_TEXT
+        )));
+        assert!(!dht_reply_answered(Some("DHT envelope not found; refused")));
         assert!(!dht_reply_answered(Some(
             crate::network::wire_handler::NOT_ADMITTED_TEXT
         )));

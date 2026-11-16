@@ -2110,7 +2110,7 @@ fn handle_mesh_wire_request<P: WireRolePolicy>(
             } else {
                 MeshWireResponse::GetDhtEnvelopeResult {
                     envelope: None,
-                    error: Some("DHT envelope not found".to_string()),
+                    error: Some(crate::network::client::DHT_ENVELOPE_NOT_FOUND_TEXT.to_string()),
                 }
             }
         }
