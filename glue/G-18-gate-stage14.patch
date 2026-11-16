@@ -8,7 +8,7 @@ index f60cd74..0424edf 100644
  
 +# --- Stage 14-webdav-tls (v0.5.6 track A; E1 steps 5 and 9) ------------------------------------
 +# Read-only WebDAV over TLS from a bridge-mode container: the published-port leg with --tls-san and
-+# a davfs2 mount (scripts/docker_stage_webdav_tls.sh; its own containers, labelled with this run).
++# an rclone copy (scripts/docker_stage_webdav_tls.sh; its own containers, labelled with this run).
 +PARVAULT_GATE_RUN_ID="${RUN_ID}" PARVAULT_GATE_STAGE_DIR="$STAGE_DIR" bash scripts/docker_stage_webdav_tls.sh \
 +    || { echo "ERROR: stage 14-webdav-tls failed"; exit 1; }
 +

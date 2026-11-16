@@ -246,7 +246,11 @@ fn handle_status_conn(
     deadline: std::time::Instant,
 ) -> io::Result<()> {
     let counters = view.counters;
-    let Some(head) = read_request_head_until(stream, Vec::new(), deadline)? else {
+    // The head is read under the connection's pre-auth deadline (A-TLS-5: on TLS the handshake
+    // spent part of it).
+    let read_request_head =
+        |s: &mut dyn EdgeStream| read_request_head_until(s, Vec::new(), deadline);
+    let Some(head) = read_request_head(stream)? else {
         return Ok(());
     };
     // A-TLS-4: every status answer closes the connection (`Connection: close`), so bytes past

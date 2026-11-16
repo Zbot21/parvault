@@ -415,11 +415,13 @@ mod unix_webdav {
             }
         };
         let normalized = format!("/{}", segments.join("/"));
+        tracing::debug!(method, path = %normalized, "WebDAV request");
         let raw_path = normalized.as_str();
 
         let mut range_header: Option<(u64, Option<u64>)> = None;
         let mut authorization: Option<&str> = None;
         let mut host: Option<&str> = None;
+        let mut depth_zero = false;
         for hdr in lines {
             if hdr.is_empty() {
                 break;
@@ -427,6 +429,8 @@ mod unix_webdav {
             if let Some((k, v)) = hdr.split_once(':') {
                 if k.eq_ignore_ascii_case("host") {
                     host = Some(v.trim());
+                } else if k.eq_ignore_ascii_case("depth") {
+                    depth_zero = v.trim() == "0";
                 } else if k.eq_ignore_ascii_case("authorization") {
                     authorization = Some(v);
                 } else if k.eq_ignore_ascii_case("range") {
@@ -522,7 +526,9 @@ mod unix_webdav {
                 let mut xml = String::from(
                     "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:multistatus xmlns:D=\"DAV:\">",
                 );
-                let entries = if node.is_dir {
+                // RFC 4918 9.1: Depth 0 is the resource alone; 1 (and infinity, served as 1)
+                // adds its members.
+                let entries = if node.is_dir && !depth_zero {
                     let mut v = vec![node.clone()];
                     v.extend(vfs.readdir(node.ino));
                     v

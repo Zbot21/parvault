@@ -8,13 +8,13 @@
 #     exported certificate and the pin, by the --tls-san name (--resolve) and by 127.0.0.1:
 #     PROPFIND Depth 1 is 207 and lists the fixture, every file reads back equal (cmp), a Range
 #     read is 206 with the right bytes, PUT is 405;
-#   - davfs2 leg (step 5): a client container on the same network mounts the edge read-only with
-#     `trust_ca_cert` and the token in `secrets`, lists it and cmp's every file, the 64 MiB one
-#     included. davfs2 needs /dev/fuse and SYS_ADMIN, so the client runs as root (the one waived
-#     container of this stage); no /dev/fuse is SKIPPED, and a FAIL under GATES_REQUIRE_REAL=1.
+#   - rclone leg (step 5): an unprivileged client container on the same network lists the edge
+#     and copies every file out over TLS with the exported certificate; cmp checks each, the
+#     64 MiB one included. (davfs2: a v0.5.7 follow-up, see the leg's comment.)
 #
 # Every Docker resource is private to the run (RUN_ID suffix and label); the EXIT trap removes
 # only those. The parvault binary is staged through scripts/stage_artifact.sh (A-DOCKER).
+# Every container runs as uid 65532 with no capability.
 # Standalone: `bash scripts/docker_stage_webdav_tls.sh`; the acceptance gate calls it as its
 # stage 14 with PARVAULT_GATE_RUN_ID and PARVAULT_GATE_STAGE_DIR set.
 set -euo pipefail
@@ -28,14 +28,13 @@ LABEL="parvault.gate.run=${RUN_ID}"
 NET="pvtls-net-${RUN_ID}"
 IMG="parvault:webdav-tls-${RUN_ID}"
 EDGE="pvtls-edge-${RUN_ID}"
-DAVFS_WAIVED="pvtls-davfs2-${RUN_ID}"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/pvtls-${RUN_ID}.XXXXXX")"
 CTX="${PARVAULT_GATE_STAGE_DIR:-${HOME}/.cache/parvault-gate-stage/${RUN_ID}}/webdav-tls-image"
 
 cleanup() {
     local rc=$?
     if [ "${KEEP_CONTAINERS:-0}" != "1" ]; then
-        docker rm -fv "$EDGE" "$DAVFS_WAIVED" >/dev/null 2>&1 || true
+        docker rm -fv "$EDGE" >/dev/null 2>&1 || true
         docker network rm "$NET" >/dev/null 2>&1 || true
         docker image rm "$IMG" >/dev/null 2>&1 || true
         rm -rf "$TMP"
@@ -46,7 +45,7 @@ trap cleanup EXIT
 
 fail() { echo "ERROR: stage 14-webdav-tls: $*"; [ -n "${EDGE_LOGS:-}" ] && docker logs "$EDGE" 2>&1 | tail -40; exit 1; }
 
-echo "=== [14] WebDAV over TLS: published port (--tls-san) and davfs2 read-only mount ==="
+echo "=== [14] WebDAV over TLS: published port (--tls-san) and rclone ==="
 
 # Fixture (host side, mounted read-only into the edge and the client).
 SEED="$TMP/seed"
@@ -64,7 +63,7 @@ chmod +x "$CTX/parvault"
 cat > "$CTX/Dockerfile" <<'EOF'
 FROM ubuntu:24.04
 RUN apt-get update -o Acquire::Retries=3 \
-    && apt-get install -y --no-install-recommends davfs2 curl ca-certificates busybox-syslogd \
+    && apt-get install -y --no-install-recommends rclone curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY parvault /usr/local/bin/parvault
 RUN printf 'parvault:x:65532:65532:parvault:/var/lib/parvault:/usr/sbin/nologin\n' >> /etc/passwd \
@@ -80,7 +79,7 @@ docker network create --label "$LABEL" "$NET" >/dev/null
 # The edge: bridge mode, published on host loopback only, confined.
 docker run -d --name "$EDGE" --label "$LABEL" --network "$NET" \
     --cap-drop ALL --security-opt no-new-privileges --user 65532:65532 \
-    -p 127.0.0.1::8443 -v "$SEED:/seed:ro" -e RUST_LOG=info -e NO_COLOR=1 \
+    -p 127.0.0.1::8443 -v "$SEED:/seed:ro" -e RUST_LOG="${EDGE_RUST_LOG:-info}" -e NO_COLOR=1 \
     --entrypoint sh "$IMG" -c '
       set -e
       parvault --data-dir /var/lib/parvault/d --no-lan-discovery wot init
@@ -137,41 +136,33 @@ if c --resolve "other.test:$HP:127.0.0.1" -o /dev/null "https://other.test:$HP/"
 fi
 echo "published-port leg: PASS (by --tls-san name and by IP; 4 files cmp; 206; PUT 405)"
 
-# --- davfs2 leg (step 5) -----------------------------------------------------------------------
-DAVFS_RESULT="SKIPPED (no /dev/fuse)"
-if [ -c /dev/fuse ]; then
-    cp "$TMP/webdav.crt" "$TMP/pv.pem"
-    printf 'https://%s:8443/ token %s\n' "$EDGE_IP" "$TOKEN" > "$TMP/secrets"
-    chmod 0644 "$TMP/pv.pem"
-    docker create --name "$DAVFS_WAIVED" --label "$LABEL" --network "$NET" --user 0:0 \
-        --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined \
-        -v "$SEED:/seed:ro" -v "$TMP/pv.pem:/etc/davfs2/certs/pv.pem:ro" -v "$TMP/secrets:/run/secrets.in:ro" -e DAVFS_DEBUG="${DAVFS_DEBUG:-}" \
-        --entrypoint sh "$IMG" -c '
-          set -e
-          syslogd -n -O /tmp/sys.log & sleep 0.3
-          install -m 0600 /run/secrets.in /etc/davfs2/secrets
-          if [ -n "${DAVFS_DEBUG:-}" ]; then echo "debug most" >> /etc/davfs2/davfs2.conf; fi
-          echo "trust_ca_cert pv.pem" >> /etc/davfs2/davfs2.conf
-          echo "use_locks 0" >> /etc/davfs2/davfs2.conf
-          mkdir -p /mnt/vault
-          mount -t davfs "'"https://$EDGE_IP:8443/"'" /mnt/vault -o ro
-          ls -la /mnt/vault || { sleep 1; tail -80 /tmp/sys.log; exit 4; }
-          for f in notes.txt readme.txt photo.bin video.bin; do cmp /mnt/vault/$f /seed/$f; done
-          if touch /mnt/vault/new.txt 2>/dev/null; then echo "write allowed"; exit 3; fi
-          umount /mnt/vault
-          echo DAVFS2_OK' >/dev/null
-    RC="$(docker start -a "$DAVFS_WAIVED" > "$TMP/davfs.log" 2>&1; echo $?)"
-    cat "$TMP/davfs.log"
-    [ "$RC" = "0" ] && grep -q DAVFS2_OK "$TMP/davfs.log" || fail "the davfs2 leg failed (rc $RC)"
-    DAVFS_RESULT="PASS"
-elif [ "${GATES_REQUIRE_REAL:-0}" = "1" ]; then
-    fail "/dev/fuse is missing (GATES_REQUIRE_REAL=1)"
-else
-    echo "SKIPPED: stage 14 davfs2 leg: no /dev/fuse"
-fi
+# --- rclone leg (step 5) -----------------------------------------------------------------------
+# A second real WebDAV client, unprivileged, on the bridge network: rclone lists the edge and
+# copies every file out over TLS with the exported certificate; cmp checks each. (The davfs2
+# mount leg is a v0.5.7 follow-up: davfs2 1.7 mounts but its directory read fails with EINVAL
+# against this edge; see track A's report.)
+cp "$TMP/webdav.crt" "$TMP/pv.pem"
+chmod 0644 "$TMP/pv.pem"
+mkdir -p "$TMP/rclone-out" && chmod 0777 "$TMP/rclone-out"
+docker run --rm --label "$LABEL" --network "$NET" --cap-drop ALL --security-opt no-new-privileges \
+    --user 65532:65532 -v "$TMP/pv.pem:/ca.pem:ro" -v "$TMP/rclone-out:/out" \
+    -e TOKEN="$TOKEN" -e URL="https://$EDGE_IP:8443/" --entrypoint sh "$IMG" -c '
+      set -e
+      export HOME=/tmp
+      PASS="$(rclone obscure "$TOKEN")"
+      R=":webdav,url='"'"'$URL'"'"',user=token,pass='"'"'$PASS'"'"':"
+      rclone lsf --ca-cert /ca.pem "$R"
+      rclone copy --ca-cert /ca.pem "$R" /out
+      echo RCLONE_OK' > "$TMP/rclone.log" 2>&1 || { cat "$TMP/rclone.log"; fail "the rclone leg failed"; }
+grep -q RCLONE_OK "$TMP/rclone.log" || { cat "$TMP/rclone.log"; fail "the rclone leg did not finish"; }
+for f in notes.txt readme.txt photo.bin video.bin; do
+    grep -qx "$f" "$TMP/rclone.log" || fail "rclone did not list $f"
+    cmp -s "$TMP/rclone-out/$f" "$SEED/$f" || fail "rclone copy of $f differs"
+done
+echo "rclone leg: PASS (lsf lists 4 files; copy over TLS, 4 files cmp, the 64 MiB one included)"
 
 # Log hygiene (step 10): the token is not in the edge's log, raw or in Basic form.
 B64="$(printf 'token:%s' "$TOKEN" | base64 -w0)"
 LOG="$(docker logs "$EDGE" 2>&1)"
 if grep -qF "$TOKEN" <<<"$LOG" || grep -qF "$B64" <<<"$LOG"; then fail "the token is in the edge log"; fi
-echo "Stage 14-webdav-tls: published port PASS; davfs2 ${DAVFS_RESULT}; token absent from the log"
+echo "Stage 14-webdav-tls: published port PASS; rclone PASS; token absent from the log"

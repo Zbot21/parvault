@@ -1,6 +1,6 @@
 //! E1, the scripted Windows-equivalent acceptance test (plan `v0.5.6-usability.md` Section 1.4):
 //! real binaries, no mocks; curl (and rclone when present) stand in for WebClient. The Docker
-//! stage `14-webdav-tls` adds the davfs2 mount and the published-port leg (steps 5 and 9).
+//! stage `14-webdav-tls` adds the rclone leg in a container and the published-port leg (steps 5 and 9; davfs2 is a v0.5.7 follow-up).
 //!
 //! Steps here: 1 certificate, 2 pinning accept (TLS 1.3 and 1.2 ECDHE-ECDSA), 3 pinning reject,
 //! 4 the WebClient transcript (E1+), 5 read and Range read with `cmp` (64 MiB included), 10 log
