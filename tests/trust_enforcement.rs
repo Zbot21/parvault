@@ -167,6 +167,34 @@ fn spawn_as_is(mut cmd: Command, root: TempDir, dir: PathBuf, log: PathBuf) -> N
     node
 }
 
+/// B-136: the admin RPC listens on a port the kernel assigns at bind time, read back from the
+/// seed's `Admin RPC Listen Addr` line. Never a port reserved and released first: another test
+/// or job can take it before the seed binds it, after building its swarm.
+const ADMIN_RPC_EPHEMERAL: &str = "127.0.0.1:0";
+
+/// `spawn`, then waits (20 s) for the admin RPC's bound address and returns it with the node.
+fn spawn_with_admin_rpc(cmd: Command, root: TempDir, dir: PathBuf, log: PathBuf) -> (Node, String) {
+    const LINE: &str = "Admin RPC Listen Addr     : ";
+    let mut node = spawn(cmd, root, dir, log);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let text = node.log_text();
+        if let Some(addr) = text.lines().find_map(|l| l.strip_prefix(LINE)) {
+            let addr = addr.trim().to_string();
+            wait_for_port(addr.rsplit_once(':').unwrap().1.parse().unwrap());
+            return (node, addr);
+        }
+        if let Ok(Some(status)) = node.child.try_wait() {
+            panic!("seed exited ({status}) before its admin RPC listened:\n{text}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "admin RPC not listening:\n{text}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// `parvault daemon start` on loopback with LAN discovery off, provisioned with the ring genesis.
 fn daemon_command(dir: &Path, reg: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault"));
@@ -7189,12 +7217,6 @@ fn bseed_silent_peer() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize
 /// `parvault-seed` (homelab vault) with `--peers` and an admin RPC for `admin`.
 fn bseed_seed(label: &str, peers: &[&str], admin: &NodeIdentity) -> (Node, String) {
     let (root, dir, reg, log) = prepare(label);
-    let admin_port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let admin_addr = format!("127.0.0.1:{admin_port}");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault-seed"));
     cmd.arg("--peers").arg(peers.join(","));
     cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
@@ -7206,13 +7228,13 @@ fn bseed_seed(label: &str, peers: &[&str], admin: &NodeIdentity) -> (Node, Strin
             "--listen",
             common::LOOPBACK_EPHEMERAL,
             "--admin-rpc-listen",
-            &admin_addr,
+            ADMIN_RPC_EPHEMERAL,
             "--admin-rpc-pubkey",
             &hex::encode(admin.public_key_bytes()),
             "--data-dir",
         ])
         .arg(&dir);
-    (spawn(cmd, root, dir, log), admin_addr)
+    spawn_with_admin_rpc(cmd, root, dir, log)
 }
 
 /// A syndication of a distinct stripe (filled with `fill`) by `device`, certified by the seed.
@@ -7682,12 +7704,6 @@ fn status_ipc_without_root_key_refused() {
 /// council scope root is `admin`.
 fn c1_public_seed(label: &str, admin: &NodeIdentity, extra: &[&str]) -> (Node, String) {
     let (root, dir, reg, log) = prepare(label);
-    let admin_port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let admin_addr = format!("127.0.0.1:{admin_port}");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault-seed"));
     cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg)
         .args([
@@ -7698,14 +7714,14 @@ fn c1_public_seed(label: &str, admin: &NodeIdentity, extra: &[&str]) -> (Node, S
             "--listen",
             common::LOOPBACK_EPHEMERAL,
             "--admin-rpc-listen",
-            &admin_addr,
+            ADMIN_RPC_EPHEMERAL,
             "--admin-rpc-pubkey",
             &hex::encode(admin.public_key_bytes()),
         ])
         .args(extra)
         .arg("--data-dir")
         .arg(&dir);
-    (spawn(cmd, root, dir, log), admin_addr)
+    spawn_with_admin_rpc(cmd, root, dir, log)
 }
 
 fn c1_manifest(
@@ -8372,12 +8388,6 @@ fn f53_seed(
         std::fs::write(dir.join("tracker_admin.seed"), [b; 32]).unwrap();
     }
     pre(&dir);
-    let admin_port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let admin_addr = format!("127.0.0.1:{admin_port}");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_parvault-seed"));
     cmd.env("PARVAULT_LAN_REGISTRY_DIR", &reg).args([
         "start",
@@ -8387,13 +8397,13 @@ fn f53_seed(
         "--listen",
         common::LOOPBACK_EPHEMERAL,
         "--admin-rpc-listen",
-        &admin_addr,
+        ADMIN_RPC_EPHEMERAL,
     ]);
     if let Some(f) = flag {
         cmd.args(["--admin-rpc-pubkey", &hex::encode(f.public_key_bytes())]);
     }
     cmd.arg("--data-dir").arg(&dir);
-    (spawn(cmd, root, dir, log), admin_addr)
+    spawn_with_admin_rpc(cmd, root, dir, log)
 }
 
 /// The tracker admin key a public seed advertises on rendezvous.
